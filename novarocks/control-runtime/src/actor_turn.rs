@@ -128,6 +128,13 @@ impl std::fmt::Display for ActorTurnError {
 }
 impl std::error::Error for ActorTurnError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectStartStatus {
+    Ready,
+    Blocked,
+    StoppedBusiness,
+}
+
 /// Read-only identity of one original actor registration. Cloning this witness
 /// grants no Work, publication or effect-ticket authority.
 #[derive(Clone)]
@@ -3978,6 +3985,20 @@ impl<A: Actor> ActorRuntime<A> {
         action: ActionId,
         withdrawn: bool,
     ) -> Result<bool, ActorTurnError> {
+        self.effect_start_status_for_dispatch(host, input, action, withdrawn)
+            .map(|status| status == EffectStartStatus::Ready)
+    }
+
+    /// Observe the exact pending action's start gate under the original locks.
+    /// A stopped business action may still have an owner-specific withdrawal
+    /// path. This observation changes neither the action nor its Work.
+    pub(crate) fn effect_start_status_for_dispatch(
+        &self,
+        host: &ActorHostTurn<A>,
+        input: InputId,
+        action: ActionId,
+        withdrawn: bool,
+    ) -> Result<EffectStartStatus, ActorTurnError> {
         if !host.active || !self.same_runtime(&host.runtime) {
             return Err(ActorTurnError::EffectTicketOriginMismatch);
         }
@@ -4000,7 +4021,7 @@ impl<A: Actor> ActorRuntime<A> {
             action,
             withdrawn,
         )
-        .map(|(ready, _)| ready)
+        .map(|(status, _)| status)
     }
     fn effect_start_status(
         node: &ActorCell<A>,
@@ -4010,7 +4031,7 @@ impl<A: Actor> ActorRuntime<A> {
         input: InputId,
         action: ActionId,
         withdrawn: bool,
-    ) -> Result<(bool, Generation), ActorTurnError> {
+    ) -> Result<(EffectStartStatus, Generation), ActorTurnError> {
         let batch = inbox
             .batches
             .get(&input)
@@ -4046,18 +4067,16 @@ impl<A: Actor> ActorRuntime<A> {
         if inbox.failed && inbox.failure_input != Some(input) {
             return Err(ActorTurnError::ActorFailed);
         }
-        // A withdrawn carrier may transfer metadata to run the existing
-        // unused teardown. Its original Work start gate remains closed.
-        if stopped
-            && !withdrawn
-            && descriptor.kind == novarocks_control_runtime_core::effect::EffectKind::Business
-        {
-            return Ok((false, author_generation));
-        }
-        Ok((
-            batch.state.ready(action, inbox.generation)?,
-            author_generation,
-        ))
+        let status = if !batch.state.ready(action, inbox.generation)? {
+            EffectStartStatus::Blocked
+        } else if stopped && !withdrawn && descriptor.kind == EffectKind::Business {
+            // A withdrawn carrier may transfer metadata for unused teardown.
+            // Its original Business Work start gate remains closed.
+            EffectStartStatus::StoppedBusiness
+        } else {
+            EffectStartStatus::Ready
+        };
+        Ok((status, author_generation))
     }
     /// Start is synchronized with the same failure fence as batch commitment.
     pub fn take_effect(
@@ -4084,7 +4103,7 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let (ready, author_generation) = Self::effect_start_status(
+        let (status, author_generation) = Self::effect_start_status(
             &node,
             &inbox,
             &ledger,
@@ -4093,7 +4112,7 @@ impl<A: Actor> ActorRuntime<A> {
             action,
             withdrawn,
         )?;
-        if !ready {
+        if status != EffectStartStatus::Ready {
             return Err(EffectError::NotReady.into());
         }
         let generation = inbox.generation;

@@ -22,6 +22,8 @@
 
 mod action;
 pub(crate) mod attempt;
+pub(crate) mod conflict;
+pub(crate) mod conflict_scope;
 mod data_file;
 pub mod data_writer;
 pub(crate) mod dependency;
@@ -37,6 +39,7 @@ pub(crate) mod model;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod new_manifests;
+pub(crate) use new_manifests::{RegisteredFile, RegisteredNewFiles, RegisteredPaths};
 pub(crate) mod operation;
 pub(crate) mod overwrite;
 mod overwrite_partitions;
@@ -50,6 +53,8 @@ pub mod ref_action;
 pub mod report;
 mod rewrite_data_files;
 mod row_delta;
+pub(crate) mod row_delta_facts;
+
 pub mod row_delta_dv_metadata;
 mod row_mutation_preparation;
 #[cfg(test)]

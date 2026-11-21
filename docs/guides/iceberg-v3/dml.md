@@ -17,9 +17,9 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# DML（INSERT / DELETE / UPDATE / MERGE / OVERWRITE / TRUNCATE）
+# DML（INSERT / DELETE / UPDATE / MERGE / OVERWRITE / TRUNCATE / ADD FILES）
 
-> NovaRocks 支持 INSERT、DELETE、UPDATE、MERGE、OVERWRITE 与 TRUNCATE；CTAS 使用标准 REST staged create。Catalog 写入准入和 v3 row-lineage 要求见各节，CDC sink 尚未实现。
+> NovaRocks 支持 INSERT、DELETE、UPDATE、MERGE、OVERWRITE、TRUNCATE 与 ADD FILES；CTAS 使用标准 REST staged create。Catalog 写入准入和 v3 row-lineage 要求见各节，CDC sink 尚未实现。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
@@ -33,6 +33,7 @@ under the License.
 | CTAS（`CREATE TABLE AS SELECT`） | ✅ | 标准 REST staged-create，显式 warehouse；Hadoop/HMS 在副作用前拒绝 |
 | CTAS 默认 V3 row-lineage | ✅ | 默认格式 v3，不注入 lineage 属性 |
 | TRUNCATE TABLE | ✅ | 清空目标 ref，保留 schema 和历史 |
+| ADD FILES（登记已有 Parquet） | ✅ | 按 catalog 启用，规划目标为 v1/v2 非分区表，见下文 |
 | CDC sink（Flink-style 持续写入） | ❌ | |
 
 ---
@@ -45,7 +46,7 @@ under the License.
 |---|---|
 | INSERT、INSERT SELECT、纯 MV 追加 | 无读依赖，可在新 head 上重新准备 |
 | 静态全表 INSERT OVERWRITE | 无读依赖，覆盖提交时的状态 |
-| ADD FILES | 源路径不在目标 ref 刷新后的存活文件集中 |
+| ADD FILES | 候选路径未在准确 `main` 快照存活。快照变化时复核候选，依赖名称映射时同时保护整版 metadata |
 | DELETE / UPDATE / MERGE | 目标 ref 与源读取基线相同 |
 | 动态分区覆盖、OPTIMIZE、TRUNCATE | 目标 ref 与源读取基线相同 |
 | 绑定基线的文档或分区演进提交 | 目标 ref 与输出基线相同 |
@@ -54,6 +55,32 @@ under the License.
 读依赖语句遇到 head 变化会以确定未提交的冲突结束，需要重新执行来读取新事实。它不会将旧输出
 盲目应用到新 head。只有 catalog 已确定拒绝且依赖仍成立，才允许重新准备；CommitUnknown 不能重试
 或清理。重试表属性、清理结果与人工核对见 [lake-publication](lake-publication.md)。
+
+## 登记已有 Parquet 文件
+
+在目标 Iceberg catalog 的 properties 中设置 `"iceberg.add-files-procedure.enabled" = "true"`。缺省关闭。目标在规划时须为 v1/v2，执行时须用非分区 spec，操作追加到 `main`。HMS 保持只读，MV 存储表保留原守卫。目录或单文件都可作为 `location`，`format` 须显式给出 `PARQUET`。
+
+```sql
+ALTER TABLE lake.sales.orders EXECUTE add_files(
+    location => 's3://landing/orders/2026-11-20',
+    format => 'PARQUET',
+    recursive_directory => 'false'
+);
+```
+
+| `recursive_directory` | 目录行为 |
+| --- | --- |
+| `'true'` | 登记可见的子目录文件 |
+| `'false'` | 跳过子目录，只登记顶层文件 |
+| `'fail'`（缺省） | 遇到可见子目录文件即失败 |
+
+目录中的隐藏条目及目录标记跳过，末尾斜杠不改变这个规则。候选按路径处理，读取时检查实际 Parquet footer。对象存储前缀完全不存在时返回 `NOT_FOUND`。存在的目录或前缀若只有 `_SUCCESS` 等跳过项，仍提交一次空 append。成功返回 `metric_name varchar` 和 `metric_value bigint`，一行 `('added_data_files', N)`。Trino update type 为 `ALTER TABLE EXECUTE`。
+
+标准 REST 登记有嵌入式 field ID 的文件。无 ID 文件需要能比较整版 metadata 并进行条件安装的 Hadoop catalog。已有 `schema.name-mapping.default` 时沿用，缺省时随 append 安装经核对的映射。已有映射的 REST 表可正常读取无 ID 文件，登记新无 ID 文件仍返回 `NOT_SUPPORTED`。
+
+登记先共享实际读取绑定，能正常忽略未映射的额外列。文件的原始字段只有部分 ID、目标绑定使用当前未支持的载体（如 INT96），都会拒绝。必填列有 NULL 或无法从 footer 确认其 NULL 个数为零时返回 `CONSTRAINT_VIOLATION`。重复的存活路径返回 `ICEBERG_COMMIT_ERROR`。成功后可从 `"orders$files"` 检查登记路径、记录数和列指标，并从 `"orders$snapshots"` 核对追加快照。
+
+准备期间保持输入路径和字节稳定。登记失败时，只清理操作生成且获得删除权的元数据。登记后，文件按表的快照生命周期管理，源在表目录之外也可能在最后一份引用快照过期后被清理。源在表目录内时，应与能扫描同一前缀的外部孤儿文件清理错开。遇到结果未知，按[发布核对流程](lake-publication.md#不确定提交)只读核对原快照标记。结论仍未知时保留对象并禁止自动重试。设计与并发边界见 [ADR-0246](../../adr/ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md).
 
 ## ✅ INSERT INTO
 

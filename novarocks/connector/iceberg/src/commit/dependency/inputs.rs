@@ -17,7 +17,7 @@
 
 //! Manifest input retains logical identities, including multiple DV blobs in one Puffin.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[cfg(test)]
 use super::super::manifest_sources::duplicate_identity;
@@ -43,6 +43,7 @@ pub struct LiveEntry {
 pub type LiveSet = BTreeMap<EntryIdentity, LiveEntry>;
 
 pub struct ValidationInputs<'a> {
+    pub(super) stage: Option<usize>,
     pub metadata: &'a TableMetadata,
     pub parent: Option<i64>,
     io: &'a dyn ArtifactWriter,
@@ -57,37 +58,13 @@ impl<'a> ValidationInputs<'a> {
         io: &'a dyn ArtifactWriter,
     ) -> Self {
         Self {
+            stage: None,
             metadata,
             parent,
             io,
             #[cfg(test)]
             live: None,
         }
-    }
-
-    pub(crate) async fn live_data_matches(
-        &self,
-        paths: &BTreeSet<&str>,
-    ) -> Result<BTreeSet<String>> {
-        self.io.check_active()?;
-        if paths.is_empty() {
-            return Ok(BTreeSet::new());
-        }
-        let Some(parent) = self.parent else {
-            return Ok(BTreeSet::new());
-        };
-        let snapshot = self.metadata.snapshot_by_id(parent).ok_or_else(|| {
-            invalid(format!(
-                "Target ref snapshot {parent} is absent from metadata"
-            ))
-        })?;
-        let sources = SnapshotSources::load(self.metadata, snapshot, self.io.file_io(), || {
-            self.io.check_active()
-        })
-        .await?;
-        sources
-            .live_data_matches(paths, self.io.file_io(), || self.io.check_active())
-            .await
     }
 
     pub(crate) async fn compact_live_entries(

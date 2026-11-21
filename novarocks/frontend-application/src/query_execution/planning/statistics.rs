@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
-use crate::catalog_application::query_bindings::{QueryTableBinding, QueryTableBindingStore};
 #[cfg(test)]
+use crate::catalog_application::query_bindings::parse_time_travel_overlay_identity;
 use crate::catalog_application::query_bindings::{
-    QueryTableBindingAdmission, parse_time_travel_overlay_identity,
+    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingStore,
 };
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
@@ -276,6 +276,12 @@ async fn project_binding_statistics_for_metrics_async(
         .resolve_async(
             &ResolvedStatisticsTable {
                 table: pin.table.clone(),
+                row_mutation_current: match &binding.admission {
+                    QueryTableBindingAdmission::RowMutationCurrent(_, source) => {
+                        Some(source.clone())
+                    }
+                    _ => None,
+                },
                 data_version: pin.data_version.clone(),
                 incarnation: control_binding.incarnation(),
             },

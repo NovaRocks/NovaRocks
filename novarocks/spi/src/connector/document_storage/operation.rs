@@ -574,6 +574,31 @@ impl ConnectorDocumentStorage {
         view.validate_for(&request)?;
         Ok(view)
     }
+    pub fn project_keyed_documents_from_observed(
+        &self,
+        table: &crate::connector::ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<super::KeyedDocumentView, super::KeyedDocumentReadError> {
+        let request = super::KeyedDocumentDefinitionRequest {
+            owner: self.owner().clone(),
+            catalog_handle: self.catalog_handle().clone(),
+            target: table.identity.clone(),
+            context,
+        };
+        request.validate()?;
+        let view = self
+            .observation()?
+            .project_keyed_documents_from_observed(&request, table)?;
+        view.validate_for(&super::KeyedDocumentObservationRequest {
+            owner: request.owner,
+            catalog_handle: request.catalog_handle,
+            target: request.target,
+            object_id: view.object_id.clone(),
+            context: request.context,
+        })?;
+        Ok(view)
+    }
+
     pub async fn observe_keyed_document_definition(
         &self,
         target: ConnectorTableIdentity,

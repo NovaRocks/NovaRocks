@@ -39,6 +39,7 @@ pub(crate) struct ConnectorAttemptAccessEntry {
     catalog_properties: CatalogProperties,
     planning_pin: ConnectorControlPlanningPin,
     access: ConnectorReadAttemptAccess,
+    rewritten_target_binding: Option<novarocks_sql::binding::SqlTableBindingId>,
 }
 
 /// The per-attempt access for one completed plan, keyed the way its wire form
@@ -110,7 +111,7 @@ impl PreparedAttemptAccess {
                 let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
                     continue;
                 };
-                let (_, access, generation, catalog) = reads
+                let (binding, access, generation, catalog) = reads
                     .remove(occurrence)
                     .expect("same original read prepared for this placement");
                 let node_id =
@@ -121,6 +122,7 @@ impl PreparedAttemptAccess {
                     Arc::new(ConnectorAttemptAccessEntry {
                         catalog_properties: catalog,
                         planning_pin: generation,
+                        rewritten_target_binding: access.rewritten_target_fact().map(|_| binding),
                         access,
                     }),
                 );
@@ -144,12 +146,13 @@ pub(crate) fn attempt_access_for_completed_plan(
             let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
                 continue;
             };
-            let (_, access, generation, catalog) = reads.remove(occurrence).ok_or_else(|| {
-                format!(
-                    "completed plan scans provider read occurrence {} with no frozen read",
-                    occurrence.get()
-                )
-            })?;
+            let (binding, access, generation, catalog) =
+                reads.remove(occurrence).ok_or_else(|| {
+                    format!(
+                        "completed plan scans provider read occurrence {} with no frozen read",
+                        occurrence.get()
+                    )
+                })?;
             let node_id = i32::try_from(node.id.get()).map_err(|_| {
                 format!("scan node {} exceeds the wire node identity", node.id.get())
             })?;
@@ -160,6 +163,7 @@ pub(crate) fn attempt_access_for_completed_plan(
                     Arc::new(ConnectorAttemptAccessEntry {
                         catalog_properties: catalog,
                         planning_pin: generation,
+                        rewritten_target_binding: access.rewritten_target_fact().map(|_| binding),
                         access,
                     }),
                 )
@@ -175,6 +179,28 @@ pub(crate) fn attempt_access_for_completed_plan(
 }
 
 impl LogicalExecutionAccessScope {
+    pub(crate) fn rewritten_target_fact(
+        &self,
+    ) -> Result<
+        Option<&novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact>,
+        String,
+    > {
+        let mut matches = self.entries.values().filter_map(|entry| {
+            entry
+                .rewritten_target_binding
+                .zip(entry.access.rewritten_target_fact())
+        });
+        let Some((binding, fact)) = matches.next() else {
+            return Ok(None);
+        };
+        if let Some((duplicate, _)) = matches.next() {
+            return Err(format!(
+                "writer attempt received multiple rewritten targets: {binding:?}, {duplicate:?}",
+            ));
+        }
+        Ok(Some(fact))
+    }
+
     pub(crate) fn share(
         &self,
         fragment_id: FragmentId,
@@ -211,6 +237,7 @@ impl ConnectorAttemptAccessEntry {
             catalog_properties,
             planning_pin,
             access,
+            rewritten_target_binding: None,
         })
     }
 

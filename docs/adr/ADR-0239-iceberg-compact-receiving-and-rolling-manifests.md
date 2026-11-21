@@ -5,6 +5,13 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0246
+    scope: "Rule 5 coverage for registered ADD FILES entries without receiving receipts"
+    link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"
+  - id: ADR-0244
+    scope: "Rule 6's RefUnchanged and no-retry policy for ordinary Iceberg row-level writes"
+    link: "ADR-0244-iceberg-row-dml-conflict-validation.md"
 partially-supersedes:
   - id: ADR-0171
     scope: "Section 1 addition representation for compact receiving; WholeSet intents, dependencies, inheritance and publication authority remain active"
@@ -35,6 +42,10 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/new_manifests.rs (StageNewFiles, prepare_added_manifests)"
   - "novarocks/connector/iceberg/src/commit/model/artifacts.rs (ArtifactLedger::seal_compact_stage)"
 ---
+
+> 裁决 5 的新增条目覆盖由 [ADR-0246](ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 扩展至 ADD FILES 登记来源。登记核对受检条目消费、ADDED 计数与发布覆盖。接收写入的创建回执、物理覆盖和删除权继续按本 ADR 执行。
+
+> [ADR-0244](ADR-0244-iceberg-row-dml-conflict-validation.md) 更新第 6 条普通 Iceberg 行级写入的依赖与重试政策。紧凑接收、滚动 manifest、按条目核对覆盖和固定 ref 的刷新政策继续适用。
 
 ## 问题
 

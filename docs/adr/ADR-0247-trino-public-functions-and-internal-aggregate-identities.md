@@ -1,5 +1,5 @@
 ---
-id: ADR-0246
+id: ADR-0247
 title: "Trino public functions and internal aggregate identities"
 domain: [sql-compiler]
 status: active

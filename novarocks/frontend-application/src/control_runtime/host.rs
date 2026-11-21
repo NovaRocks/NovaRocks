@@ -21,7 +21,7 @@
 //! executes an effect body, and never counts transport quota outside the ledger.
 
 #[cfg(test)]
-mod purpose_tests;
+pub(super) mod purpose_tests;
 
 use super::{
     actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendLaneKey},
@@ -44,7 +44,7 @@ use novarocks_control_runtime::{
     actor::ActorConfig,
     actor_turn::{
         ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket,
-        FailureSourceState,
+        FailureSourceState, TimerSourceState,
     },
     causal_input::CausalInputObligation,
     effect_dispatch::{DispatchError, EffectDispatch, EffectLanePolicy, EffectRelease},
@@ -238,6 +238,11 @@ pub(crate) trait EffectSource: Send + 'static {
     /// True only when no new original result loan can be issued. Closing the
     /// external gate alone does not close loans needed by admitted effects.
     fn result_admission_closed(&self) -> bool;
+    /// The original source seals the timer together with its drained actor
+    /// ingress. Already admitted results can still require timed Core turns.
+    fn seals_timer_with_drained_ingress(&self) -> bool {
+        false
+    }
     /// Progress only bounded original reports/inputs/custodies. Retired means
     /// every rich holder and Source role has actually exited, all report legs
     /// have retired and ready headers have reaped; only the actor slot remains.
@@ -1171,14 +1176,20 @@ impl HostRegistry {
         let mut timer_more = false;
         if hosted_timer {
             let actor = entry.registration.actor();
-            if (failed || source_closing) && !machine.timer_source_closed {
+            let close_timer = failed || !machine.source.seals_timer_with_drained_ingress();
+            if (failed || source_closing)
+                && !machine.timer_source_closed
+                && (close_timer || self.runtime.snapshot(actor)?.external_open)
+            {
                 if budget == 0 {
                     timer_more = true;
                 } else {
                     budget -= 1;
                     self.runtime.close_actor_admission(actor)?;
-                    self.runtime.close_timer_source(actor)?;
-                    machine.timer_source_closed = true;
+                    if close_timer {
+                        self.runtime.close_timer_source(actor)?;
+                        machine.timer_source_closed = true;
+                    }
                 }
             }
             if failed {
@@ -1372,11 +1383,10 @@ impl HostRegistry {
                 }
             }
             if hosted_timer
-                && (!machine.timer_source_closed
-                    || self
-                        .runtime
-                        .pending_timer_input(entry.registration.actor())?
-                        .is_some())
+                && self
+                    .runtime
+                    .timer_source_state(entry.registration.actor())?
+                    != TimerSourceState::ClosedDrained
             {
                 return Ok(HostProgress {
                     units: entry.budget - budget,
@@ -1487,11 +1497,13 @@ impl HostRegistry {
                 // original dependency/stop predicate currently blocks it.
                 *remaining -= 1;
                 budget -= 1;
-                let candidate = match machine.dispatch.peek_candidate_with_withdrawal(
+                let candidate = match machine.dispatch.peek_candidate_with_stop_observation(
                     &self.runtime,
                     turn,
-                    |metadata| match metadata {
-                        FrontendEffect::Attempt(effect) => effect.handoff().cloned(),
+                    |metadata, stopped_business| match metadata {
+                        FrontendEffect::Attempt(effect) => {
+                            effect.handoff_for_dispatch(stopped_business)
+                        }
                         _ => None,
                     },
                 ) {

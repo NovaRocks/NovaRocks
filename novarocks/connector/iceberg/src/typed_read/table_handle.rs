@@ -41,6 +41,15 @@ use super::column_handle::{
     ColumnIdentityCategory, IcebergColumnHandle, decode_tuple_domain, encode_tuple_domain, invalid,
 };
 
+pub(crate) fn validate_name_mapping_carrier(mapping: &str) -> Result<(), ConnectorError> {
+    if mapping.is_empty() || mapping.len() > MAX_JSON_BYTES {
+        return Err(invalid(
+            "iceberg name mapping json must be non-empty and bounded when present",
+        ));
+    }
+    Ok(())
+}
+
 fn nested_variant_path(data_type: &crate::iceberg::spec::Type, path: &str) -> Option<String> {
     use crate::iceberg::spec::Type;
     fn visit(data_type: &Type, path: String) -> Option<String> {
@@ -193,6 +202,7 @@ pub struct IcebergTableHandle {
     storage_properties: BTreeMap<String, String>,
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
     mutation_partition_type_json: Option<Arc<str>>,
+    rewritten_target: Option<crate::commit::conflict_scope::RewrittenTargetBinding>,
 }
 
 impl IcebergTableHandle {
@@ -245,12 +255,8 @@ impl IcebergTableHandle {
                 "iceberg table location must be non-empty and bounded",
             ));
         }
-        if let Some(name_mapping_json) = name_mapping_json.as_deref()
-            && (name_mapping_json.is_empty() || name_mapping_json.len() > MAX_JSON_BYTES)
-        {
-            return Err(invalid(
-                "iceberg name mapping json must be non-empty and bounded when present",
-            ));
+        if let Some(name_mapping_json) = name_mapping_json.as_deref() {
+            validate_name_mapping_carrier(name_mapping_json)?;
         }
         if partition_spec_jsons.len() > MAX_PARTITION_SPECS {
             return Err(ConnectorError::new(
@@ -337,6 +343,7 @@ impl IcebergTableHandle {
             storage_properties,
             pinned_data_files,
             mutation_partition_type_json: None,
+            rewritten_target: None,
         })
     }
 
@@ -528,6 +535,20 @@ impl IcebergTableHandle {
 
     pub const fn format_version(&self) -> i32 {
         self.format_version
+    }
+
+    pub(crate) fn with_rewritten_target(
+        mut self,
+        binding: crate::commit::conflict_scope::RewrittenTargetBinding,
+    ) -> Self {
+        self.rewritten_target = Some(binding);
+        self
+    }
+
+    pub(crate) const fn rewritten_target(
+        &self,
+    ) -> Option<crate::commit::conflict_scope::RewrittenTargetBinding> {
+        self.rewritten_target
     }
 
     pub const fn unenforced_predicate(&self) -> &TupleDomain<IcebergColumnHandle> {

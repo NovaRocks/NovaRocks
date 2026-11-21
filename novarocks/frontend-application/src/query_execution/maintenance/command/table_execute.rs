@@ -172,12 +172,12 @@ impl MaintenanceCommandExecutor {
         )
         .map_err(crate::query::procedure_command_error)?;
 
-        if let Procedure::AddFiles(location) = procedure {
+        if let Procedure::AddFiles(arguments) = procedure {
             return Ok(PreparedTableExecute::AddFiles(
                 crate::query_execution::dml::add_files::ResolvedAddFiles {
                     target,
                     planning,
-                    location,
+                    arguments,
                 },
             ));
         }
@@ -361,7 +361,7 @@ enum Procedure {
         older_than_ms: i64,
         duration: ConnectorMaintenanceDuration,
     },
-    AddFiles(String),
+    AddFiles(crate::query_execution::dml::add_files::AddFilesArguments),
     CatalogMutation(IcebergTableMutation),
     Tag(TrinoTagAction),
 }
@@ -518,35 +518,41 @@ fn project_bound(
         TableProcedureKind::Optimize => return Ok(Procedure::Optimize),
         TableProcedureKind::OptimizeManifests => return Ok(Procedure::RewriteManifests),
         TableProcedureKind::AddFiles => {
+            use crate::query_execution::dml::add_files::AddFilesArguments;
+
+            let mut arguments = AddFilesArguments::default();
             for (slot, value) in bound.into_arguments() {
-                if slot.name == "location" {
-                    return match value {
+                match (slot.name, value) {
+                    (
+                        "location",
                         BoundProcedureArgument::Present {
                             value: BoundProcedureValue::Value(DdlPropertyValue::Varchar(location)),
-                            span: actual_span,
-                        } => {
-                            if location.is_empty() {
-                                return Err(invalid_procedure_argument(
-                                    source,
-                                    actual_span.unwrap_or(span),
-                                    "Table procedure ADD_FILES requires a non-empty location",
-                                ));
-                            }
-                            Ok(Procedure::AddFiles(location))
-                        }
+                            ..
+                        },
+                    ) => arguments.location = Some(location.into()),
+                    (
+                        "format",
+                        BoundProcedureArgument::Present {
+                            value: BoundProcedureValue::AddFilesFormat(format),
+                            ..
+                        },
+                    ) => arguments.format = Some(format),
+                    (
+                        "recursive_directory",
+                        BoundProcedureArgument::Present {
+                            value: BoundProcedureValue::AddFilesRecursion(recursion),
+                            ..
+                        },
+                    ) => arguments.recursion = recursion,
+                    (
+                        _,
                         BoundProcedureArgument::Omitted
-                        | BoundProcedureArgument::ExplicitDefault(_) => {
-                            Err(invalid_procedure_argument(
-                                source,
-                                span,
-                                "Table procedure ADD_FILES requires 'location'",
-                            ))
-                        }
-                        _ => Err(invariant()),
-                    };
+                        | BoundProcedureArgument::ExplicitDefault(_),
+                    ) => {}
+                    _ => return Err(invariant()),
                 }
             }
-            return Err(invariant());
+            return Ok(Procedure::AddFiles(arguments));
         }
         TableProcedureKind::MoveColumn | TableProcedureKind::SetColumnNotNull => {
             return project_schema_change(source, span, bound)

@@ -108,7 +108,20 @@ impl ConnectorControlReadBinding {
         Ok(ConnectorReadAttemptAccess {
             source: request_control.seal_attempt_access(frozen)?,
             encoder: Arc::clone(&self.encoder),
+            rewritten_target: None,
         })
+    }
+
+    /// Keep the original provider's final predicate with this exact read occurrence.
+    pub fn seal_row_mutation_attempt_access(
+        &self,
+        request_control: &ConnectorReadRequestControl,
+        frozen: &ConnectorReadTableHandle,
+    ) -> Result<ConnectorReadAttemptAccess, ConnectorError> {
+        let fact = request_control.rewritten_target_fact(frozen)?;
+        let mut access = self.seal_attempt_access(request_control, frozen)?;
+        access.rewritten_target = Some(fact);
+        Ok(access)
     }
 }
 
@@ -117,9 +130,16 @@ impl ConnectorControlReadBinding {
 pub struct ConnectorReadAttemptAccess {
     source: ConnectorReadAttemptAccessSource,
     encoder: Arc<dyn ConnectorReadWireEncoder>,
+    rewritten_target: Option<crate::connector::read_stack::runtime::ConnectorRewrittenTargetFact>,
 }
 
 impl ConnectorReadAttemptAccess {
+    pub fn rewritten_target_fact(
+        &self,
+    ) -> Option<&crate::connector::read_stack::runtime::ConnectorRewrittenTargetFact> {
+        self.rewritten_target.as_ref()
+    }
+
     pub fn requires_metadata_split_preparation(&self) -> bool {
         self.source.requires_metadata_split_preparation()
     }

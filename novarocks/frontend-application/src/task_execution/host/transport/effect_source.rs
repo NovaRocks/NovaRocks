@@ -54,10 +54,7 @@ use novarocks_attempt_protocol::{
     start::PayloadRef,
 };
 use novarocks_control_runtime::{
-    actor_turn::{
-        ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket,
-        TimerSourceState,
-    },
+    actor_turn::{ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket},
     causal_input::CausalInputObligation,
     exit_custody::ExitCustody,
     obligation::WorkRetirementObserver,
@@ -455,13 +452,12 @@ impl AttemptTransportSource {
                     .snapshot(actor)
                     .expect("original attempt")
                     .failed
-                    || !matches!(
-                        self.runtime.timer_source_state(actor),
-                        Ok(TimerSourceState::ClosedDrained)
-                    )
                 {
                     return false;
                 }
+                // The last convergence report can race replies from already
+                // issued Native work. Keep the original Timer available to
+                // drain those inputs before sealing both under one gate.
                 match turn.seal_drained() {
                     Ok(()) => {}
                     Err(
@@ -1347,6 +1343,10 @@ impl EffectSource for AttemptTransportSource {
 
     fn result_admission_closed(&self) -> bool {
         self.other.result_admission_closed()
+    }
+
+    fn seals_timer_with_drained_ingress(&self) -> bool {
+        true
     }
 
     fn transport_retirement_ready(&self) -> bool {

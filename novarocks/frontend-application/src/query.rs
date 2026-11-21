@@ -978,10 +978,6 @@ fn product_command_error(error: CommandError) -> RoutedExecutionError {
     }
 }
 
-fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
-    build_string_query_result("status", vec![format!("Added {file_count} file(s)")])
-}
-
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
@@ -1958,7 +1954,6 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use arrow::array::StringArray;
     use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
@@ -2000,18 +1995,6 @@ mod tests {
         assert!(proto.enable_parquet_reader_page_index);
         assert!(proto.enable_scan_datacache);
         assert!(proto.enable_populate_datacache);
-    }
-
-    #[test]
-    fn add_files_status_uses_query_application_immediate_result_contract() {
-        let result = add_files_status(2).expect("build ADD FILES status");
-        assert_eq!(result.columns[0].name(), "status");
-        let values = result.batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("status text column");
-        assert_eq!(values.value(0), "Added 2 file(s)");
     }
 
     struct ChangingTopology {

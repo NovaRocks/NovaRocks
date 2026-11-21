@@ -192,6 +192,7 @@ impl ParquetColumnStatistics {
 pub struct ParquetMetadataInspection {
     footer: Arc<ArrowReaderMetadata>,
     policy: ParquetInterpretationPolicy,
+    storage_bytes_read: u64,
     access_domain: StorageAccessDomainId,
     identity: FileIdentity,
     /// The footer with its page indexes, loaded once for every reader of this
@@ -214,6 +215,12 @@ impl ParquetMetadataInspection {
     /// key/value pairs. Arrow hints never rewrite these file facts.
     pub fn raw_metadata(&self) -> &Arc<ParquetMetaData> {
         self.footer.metadata()
+    }
+
+    /// Storage bytes fetched by this footer inspection, including a small-file
+    /// file buffer when the shared range reader used one.
+    pub fn storage_bytes_read(&self) -> u64 {
+        self.storage_bytes_read
     }
 
     pub fn access_domain(&self) -> StorageAccessDomainId {
@@ -1034,6 +1041,7 @@ fn finish_inspection(
     Ok(ParquetMetadataInspection {
         footer: Arc::new(metadata),
         policy,
+        storage_bytes_read: chunk_reader.storage_bytes_read(),
         access_domain,
         identity,
         indexed_footer: Arc::default(),

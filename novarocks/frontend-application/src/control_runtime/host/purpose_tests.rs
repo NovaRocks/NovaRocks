@@ -2174,6 +2174,32 @@ fn inactive_financial_author_without_core_failure_preserves_the_original_typed_e
     assert_eq!(dropped, 1);
 }
 
+pub(in crate::control_runtime) fn stopped_admission_fixture(
+    admission: Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+) -> Option<Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>> {
+    let f = Fixture::with_effects(vec![vec![(1, 1, vec![])]], &[], |_| {
+        FrontendEffect::Attempt(admission.clone())
+    });
+    f.send(0);
+    // The original Business batch is already committed. Stop closes its
+    // effect gate before the first Host turn can claim queued admission.
+    assert_eq!(
+        f.runtime.snapshot(f.registration.actor()).unwrap().batches,
+        1
+    );
+    f.scope.request_stop().unwrap();
+    let (_, idle) = f.to_idle();
+    let original = f.executor.jobs.lock().unwrap().first().map(|job| {
+        let FrontendEffect::Attempt(effect) = &job.effect else {
+            panic!("the original admission must reach its Source");
+        };
+        effect.clone()
+    });
+    assert_eq!(f.finish(original.is_none()), (1, true));
+    assert!(idle);
+    original
+}
+
 #[test]
 fn committed_withdrawal_reaches_a_full_send_before_it_can_bind() {
     assert_withdrawal_reaches_the_original_send(false);

@@ -46,13 +46,25 @@ pub(super) struct ProviderPredicateColumn {
 pub(super) fn lower_provider_predicates(
     scan: &PlanScanNode,
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+    row_mutation_match: bool,
 ) -> Box<[ProviderReadPredicateNeed]> {
+    let literal = if row_mutation_match {
+        lower_row_mutation_literal
+    } else {
+        lower_literal
+    };
     scan.predicates
         .iter()
         .enumerate()
         .filter_map(|(ordinal, predicate)| {
             let occurrence = u32::try_from(ordinal).ok()?;
-            let summary = lower_conjunct(scan, columns, predicate)?;
+            let (column, domain) = lower_atom_with_literal(
+                predicate,
+                |expression| lower_column(scan, columns, expression),
+                literal,
+            )?;
+            let summary =
+                TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])).ok()?;
             Some(ProviderReadPredicateNeed::new(
                 ProviderPredicateOccurrenceId::new(occurrence),
                 Constraint::of_summary(summary),
@@ -62,30 +74,19 @@ pub(super) fn lower_provider_predicates(
         .into_boxed_slice()
 }
 
-fn lower_conjunct(
-    scan: &PlanScanNode,
-    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
-    predicate: &TypedExpr,
-) -> Option<TupleDomain<u32>> {
-    let (column, domain) = lower_atom(scan, columns, predicate)?;
-    TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])).ok()
-}
-
-fn lower_atom(
-    scan: &PlanScanNode,
-    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
-    predicate: &TypedExpr,
-) -> Option<(u32, Domain)> {
-    lower_atom_with_column(predicate, |expression| {
-        lower_column(scan, columns, expression)
-    })
-}
-
 /// Shared exact atom author. Each caller supplies its original column identity
 /// and complete type checks; this function never resolves names or scans.
 pub(super) fn lower_atom_with_column(
     predicate: &TypedExpr,
     resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
+) -> Option<(u32, Domain)> {
+    lower_atom_with_literal(predicate, resolve_column, lower_literal)
+}
+
+fn lower_atom_with_literal(
+    predicate: &TypedExpr,
+    resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
+    lower_literal: fn(&TypedExpr, ConnectorValueType) -> Option<ConnectorValue>,
 ) -> Option<(u32, Domain)> {
     match &unnest(predicate).kind {
         ExprKind::BinaryOp {
@@ -212,6 +213,36 @@ fn single_range(value_type: ConnectorValueType, low: Bound, high: Bound) -> Opti
     .ok()
 }
 
+fn lower_row_mutation_literal(
+    expression: &TypedExpr,
+    expected: ConnectorValueType,
+) -> Option<ConnectorValue> {
+    let expression = unnest(expression);
+    let ExprKind::Constant(value) = &expression.kind else {
+        return lower_literal(expression, expected);
+    };
+    // Folded values carry their original exact SQL declaration. Read only the
+    // selected physical signed value, preserving NULL and carrier checks.
+    if expression.value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        || value.value_type() != &expression.value_type
+        || exact_predicate_value_type(expression.value_type.data_type())? != expected
+    {
+        return None;
+    }
+    let integer = value.try_i64().ok().flatten()?;
+    signed_integer_value(integer, expected)
+}
+
+fn signed_integer_value(value: i64, expected: ConnectorValueType) -> Option<ConnectorValue> {
+    match expected {
+        ConnectorValueType::TinyInt => Some(ConnectorValue::TinyInt(i8::try_from(value).ok()?)),
+        ConnectorValueType::SmallInt => Some(ConnectorValue::SmallInt(i16::try_from(value).ok()?)),
+        ConnectorValueType::Integer => Some(ConnectorValue::Integer(i32::try_from(value).ok()?)),
+        ConnectorValueType::BigInt => Some(ConnectorValue::BigInt(value)),
+        _ => None,
+    }
+}
+
 fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option<ConnectorValue> {
     let expression = unnest(expression);
     if (expression.value_type.nullable() && !matches!(expression.kind, ExprKind::Cast { .. }))
@@ -244,19 +275,7 @@ fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option
         ) {
             return None;
         }
-        return match expected {
-            ConnectorValueType::TinyInt => {
-                Some(ConnectorValue::TinyInt(i8::try_from(*value).ok()?))
-            }
-            ConnectorValueType::SmallInt => {
-                Some(ConnectorValue::SmallInt(i16::try_from(*value).ok()?))
-            }
-            ConnectorValueType::Integer => {
-                Some(ConnectorValue::Integer(i32::try_from(*value).ok()?))
-            }
-            ConnectorValueType::BigInt => Some(ConnectorValue::BigInt(*value)),
-            _ => None,
-        };
+        return signed_integer_value(*value, expected);
     }
     let ExprKind::Literal(literal) = &expression.kind else {
         return None;
@@ -494,7 +513,7 @@ mod tests {
             comparison(BinOp::Lt, integer(10), column_ref()),
         ]);
 
-        let offered = lower_provider_predicates(&scan, &columns());
+        let offered = lower_provider_predicates(&scan, &columns(), false);
 
         assert_eq!(offered.len(), 2);
         assert_eq!(offered[0].occurrence().get(), 0);
@@ -515,7 +534,7 @@ mod tests {
         };
         let scan = scan(vec![comparison(BinOp::Eq, expression, integer(1))]);
 
-        assert!(lower_provider_predicates(&scan, &columns()).is_empty());
+        assert!(lower_provider_predicates(&scan, &columns(), false).is_empty());
     }
 
     #[test]
@@ -578,7 +597,7 @@ mod tests {
                         value_type: ConnectorValueType::NonComparable,
                     },
                 )]);
-                assert!(lower_provider_predicates(&scan, &columns).is_empty());
+                assert!(lower_provider_predicates(&scan, &columns, false).is_empty());
                 assert_eq!(scan.predicates.len(), 1, "SQL residual is retained");
             }
         }
@@ -595,6 +614,6 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
 
-        assert!(lower_provider_predicates(&scan(vec![predicate]), &columns()).is_empty());
+        assert!(lower_provider_predicates(&scan(vec![predicate]), &columns(), false).is_empty());
     }
 }

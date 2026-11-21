@@ -461,53 +461,72 @@ impl ManagedProcess {
         let mut cursor = 0;
         let mut suffix = Vec::new();
         let result = (|| -> Result<()> {
-            loop {
-                ensure!(
-                    Instant::now() < deadline,
-                    "{} original readiness deadline expired; diagnostics={}",
-                    process.label,
-                    process.diagnostic_root().display()
-                );
-                let found = match &marker {
-                    ReadyMarker::StdoutContains(needle) => {
-                        ensure!(
-                            !needle.is_empty(),
-                            "stdout readiness marker must not be empty"
-                        );
-                        let bytes = process.stdout.0.delta(&mut cursor)?;
-                        suffix.extend_from_slice(&bytes);
-                        let found = bytes_contain(&suffix, needle.as_bytes());
-                        let keep = needle.len().saturating_sub(1).min(suffix.len());
-                        suffix.drain(..suffix.len() - keep);
-                        found
-                    }
-                    ReadyMarker::FileContains { path, needle } => {
-                        FileReadinessSnapshot::read(path)?.is_some_and(|snapshot| {
-                            baseline.file_contains_fresh_marker(&snapshot, needle)
-                        })
-                    }
-                };
-                ensure!(
-                    Instant::now() < deadline,
-                    "original readiness deadline expired during observation"
-                );
-                if found {
+            let mut observe_marker = |drain_stdout: bool| -> Result<bool> {
+                loop {
                     ensure!(
-                        one_shot || process.owner.is_running_until(deadline)?,
+                        Instant::now() < deadline,
+                        "{} original readiness deadline expired; diagnostics={}",
+                        process.label,
+                        process.diagnostic_root().display()
+                    );
+                    let (found, more_stdout) = match &marker {
+                        ReadyMarker::StdoutContains(needle) => {
+                            ensure!(
+                                !needle.is_empty(),
+                                "stdout readiness marker must not be empty"
+                            );
+                            let bytes = process.stdout.0.delta(&mut cursor)?;
+                            suffix.extend_from_slice(&bytes);
+                            let found = bytes_contain(&suffix, needle.as_bytes());
+                            let keep = needle.len().saturating_sub(1).min(suffix.len());
+                            suffix.drain(..suffix.len() - keep);
+                            (found, bytes.len() == TURN_BYTES)
+                        }
+                        ReadyMarker::FileContains { path, needle } => {
+                            let found =
+                                FileReadinessSnapshot::read(path)?.is_some_and(|snapshot| {
+                                    baseline.file_contains_fresh_marker(&snapshot, needle)
+                                });
+                            (found, false)
+                        }
+                    };
+                    ensure!(
+                        Instant::now() < deadline,
+                        "original readiness deadline expired during observation"
+                    );
+                    if found || !drain_stdout || !more_stdout {
+                        return Ok(found);
+                    }
+                }
+            };
+            loop {
+                let found = observe_marker(false)?;
+                if one_shot && found {
+                    return Ok(());
+                }
+                // A one-shot child can finish before the monitor can answer a
+                // liveness query. The recorded Final proves it has exited.
+                let exited = if one_shot {
+                    process.owner.final_record()?.is_some()
+                } else {
+                    !process.owner.is_running_until(deadline)?
+                };
+                if exited {
+                    // The child may have published its marker after the
+                    // initial read, including beyond its first log chunk.
+                    if one_shot && observe_marker(true)? {
+                        return Ok(());
+                    }
+                    bail!(
                         "{} exited before readiness; stdout_tail={:?} stderr_tail={:?}",
                         process.label,
                         process.stdout_tail(),
                         process.stderr_tail()
                     );
+                }
+                if found {
                     return Ok(());
                 }
-                ensure!(
-                    process.owner.is_running_until(deadline)?,
-                    "{} exited before readiness; stdout_tail={:?} stderr_tail={:?}",
-                    process.label,
-                    process.stdout_tail(),
-                    process.stderr_tail()
-                );
                 thread::sleep(unix::POLL.min(deadline.saturating_duration_since(Instant::now())));
             }
         })();

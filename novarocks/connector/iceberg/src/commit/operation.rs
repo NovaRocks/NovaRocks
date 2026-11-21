@@ -35,11 +35,13 @@ use novarocks_fs::FileCancellation;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::RegisteredNewFiles;
 use super::model::{
     ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactWriter, AttemptArtifacts, AttemptToken,
-    CleanupRemainingReason, CleanupScope, IcebergCleanupReport, ObjectIdentity, OperationToken,
-    ReceivedPublication, RemainingArtifact,
+    CleanupRemainingReason, CleanupScope, IcebergCleanupReport, ObjectIdentity, OperationAuthority,
+    OperationToken, ReceivedPublication, RegisteredManifestObservation, RemainingArtifact,
 };
+use super::new_manifests::{RegisteredPaths, StageNewFiles, WrittenNewManifests};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CleanupBudget {
@@ -80,6 +82,7 @@ struct OperationState {
     permits: Arc<Semaphore>,
     limits: OperationLimits,
     artifacts: Mutex<OperationArtifacts>,
+    row_delta: OnceLock<RowDeltaValidation>,
     exit_failures: Mutex<BTreeMap<ObjectIdentity, StreamExitFailure>>,
     attempt_ordinal: AtomicU32,
     object_ordinal: AtomicU64,
@@ -88,12 +91,18 @@ struct OperationState {
     _payload: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 
+struct RowDeltaValidation {
+    check: super::dependency::RowDeltaWindowCheck,
+    source: Option<std::sync::Weak<dyn super::dependency::RemovedDataFiles>>,
+    _facts: super::row_delta_facts::RetainedRowDeltaFacts,
+}
+
 struct OperationArtifacts {
     ledger: ArtifactLedger,
     reuse: super::model::ManifestReuseIndex,
     loop_entered: bool,
     stage_ids: BTreeMap<usize, i64>,
-    new_files: BTreeMap<usize, super::new_manifests::StageNewFiles>,
+    new_files: BTreeMap<usize, StageNewFiles>,
     cleanup_withheld: Option<String>,
 }
 
@@ -168,12 +177,36 @@ impl IcebergCommitOperation {
                     new_files: BTreeMap::new(),
                     cleanup_withheld: None,
                 }),
+                row_delta: OnceLock::new(),
                 exit_failures: Mutex::new(BTreeMap::new()),
                 attempt_ordinal: AtomicU32::new(0),
                 object_ordinal: AtomicU64::new(0),
                 _payload: payload,
             }),
         })
+    }
+
+    pub(crate) fn hold_row_delta_validation(
+        &self,
+        check: super::dependency::RowDeltaWindowCheck,
+        facts: super::row_delta_facts::RetainedRowDeltaFacts,
+        source: Option<std::sync::Weak<dyn super::dependency::RemovedDataFiles>>,
+    ) -> Result<()> {
+        self.inner
+            .row_delta
+            .set(RowDeltaValidation {
+                check,
+                source,
+                _facts: facts,
+            })
+            .map_err(|_| internal("Iceberg operation received its row-delta validation twice"))
+    }
+
+    pub(crate) fn row_delta_check(&self) -> Option<&super::dependency::RowDeltaWindowCheck> {
+        self.inner
+            .row_delta
+            .get()
+            .map(|validation| &validation.check)
     }
 
     pub(crate) fn request_context(&self) -> &ConnectorRequestContext {
@@ -237,16 +270,61 @@ impl IcebergCommitOperation {
             .artifacts
             .lock()
             .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
-        if artifacts.loop_entered || artifacts.new_files.contains_key(&stage) {
+        if artifacts.loop_entered
+            || artifacts.ledger.registered_stage().is_some()
+            || artifacts.new_files.contains_key(&stage)
+        {
             return Err(internal(
                 "Iceberg compact files can only be installed once before preparation",
             ));
         }
-        artifacts.new_files.insert(
-            stage,
-            super::new_manifests::StageNewFiles::Pending(Arc::new(files)),
-        );
+        artifacts
+            .new_files
+            .insert(stage, StageNewFiles::Pending(Arc::new(files)));
         Ok(())
+    }
+
+    pub(crate) fn install_registered_new_files(
+        &self,
+        stage: usize,
+        files: RegisteredNewFiles,
+    ) -> Result<Arc<RegisteredPaths>> {
+        let mut artifacts = self
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
+        if self.token().authority() != OperationAuthority::Mutation
+            || artifacts.loop_entered
+            || artifacts.ledger.registered_stage().is_some()
+            || !artifacts.new_files.is_empty()
+            || !artifacts.stage_ids.is_empty()
+        {
+            return Err(internal(
+                "Iceberg registration requires one new mutation append stage",
+            ));
+        }
+        let paths = files.retain_paths()?;
+        artifacts
+            .ledger
+            .install_registered_paths(stage, Arc::clone(&paths))?;
+        artifacts
+            .new_files
+            .insert(stage, StageNewFiles::Registered(files));
+        Ok(paths)
+    }
+
+    /// The caller has driven its original preparation loop to actual exit.
+    /// Unknown publication can outlive this source without retaining its paths.
+    pub(crate) fn release_registered_paths(&self) {
+        let paths = self
+            .inner
+            .artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ledger
+            .take_registered_paths();
+        drop(paths);
     }
 
     pub(crate) fn pending_stage_new_files(
@@ -259,17 +337,14 @@ impl IcebergCommitOperation {
             .lock()
             .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
         match artifacts.new_files.get(&stage) {
-            Some(super::new_manifests::StageNewFiles::Pending(files)) => Ok(Arc::clone(files)),
+            Some(StageNewFiles::Pending(files)) => Ok(Arc::clone(files)),
             _ => Err(internal(
                 "Iceberg materialized stage has no pending source files",
             )),
         }
     }
 
-    pub(crate) fn take_stage_new_files(
-        &self,
-        stage: usize,
-    ) -> Result<super::new_manifests::StageNewFiles> {
+    pub(crate) fn take_stage_new_files(&self, stage: usize) -> Result<StageNewFiles> {
         let mut artifacts = self
             .inner
             .artifacts
@@ -279,17 +354,14 @@ impl IcebergCommitOperation {
             .new_files
             .get_mut(&stage)
             .ok_or_else(|| internal("Iceberg operation does not own this compact stage"))?;
-        Ok(std::mem::replace(
-            state,
-            super::new_manifests::StageNewFiles::Writing,
-        ))
+        Ok(std::mem::replace(state, StageNewFiles::Writing))
     }
 
     pub(crate) fn finish_stage_new_files(
         &self,
         stage: usize,
         snapshot: i64,
-        written: super::new_manifests::WrittenNewManifests,
+        written: WrittenNewManifests,
         verify_coverage: bool,
     ) -> Result<()> {
         let mut artifacts = self
@@ -299,19 +371,31 @@ impl IcebergCommitOperation {
             .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
         if !matches!(
             artifacts.new_files.get(&stage),
-            Some(super::new_manifests::StageNewFiles::Writing)
+            Some(StageNewFiles::Writing)
         ) {
             return Err(internal("Iceberg compact manifest stage was not claimed"));
         }
+        if artifacts.stage_ids.get(&stage) != Some(&snapshot)
+            || written.is_registered() != (artifacts.ledger.registered_stage() == Some(stage))
+        {
+            return Err(internal(
+                "Iceberg manifest stage changed its admitted source or snapshot",
+            ));
+        }
         if verify_coverage {
-            artifacts.ledger.seal_compact_stage(snapshot, &written.manifests, written.entries)
-                .inspect_err(|error| {
-                    tracing::error!(operation = ?self.token(), stage, snapshot, %error, "Compact manifest coverage check failed");
-                })?;
+            let ledger = &mut artifacts.ledger;
+            let coverage = if written.is_registered() {
+                ledger.seal_registered_stage(stage, snapshot, &written.manifests, written.entries)
+            } else {
+                ledger.seal_compact_stage(snapshot, &written.manifests, written.entries)
+            };
+            coverage.inspect_err(|error| {
+                tracing::error!(operation = ?self.token(), stage, snapshot, %error, "New Iceberg manifest coverage check failed");
+            })?;
         }
         artifacts
             .new_files
-            .insert(stage, super::new_manifests::StageNewFiles::Written(written));
+            .insert(stage, StageNewFiles::Written(written));
         Ok(())
     }
 
@@ -490,12 +574,12 @@ impl IcebergCommitOperation {
         _scope: CleanupScope,
         current: &ConnectorRequestContext,
     ) -> IcebergCleanupReport {
-        let pending = self
-            .inner
-            .artifacts
-            .lock()
-            .ok()
-            .map(|mut artifacts| std::mem::take(&mut artifacts.new_files));
+        let pending = self.inner.artifacts.lock().ok().map(|mut artifacts| {
+            (
+                std::mem::take(&mut artifacts.new_files),
+                artifacts.ledger.take_registered_paths(),
+            )
+        });
         drop(pending);
         match self.select_cleanup(None) {
             Ok(records) => self.cleanup_records(records, current).await,
@@ -691,6 +775,22 @@ pub(crate) struct IcebergCommitAttempt {
 }
 
 impl IcebergCommitAttempt {
+    pub(crate) fn row_delta_removed_data(
+        &self,
+    ) -> Result<Option<Arc<dyn super::dependency::RemovedDataFiles>>> {
+        self.operation
+            .inner
+            .row_delta
+            .get()
+            .and_then(|validation| validation.source.as_ref())
+            .map(|source| {
+                source
+                    .upgrade()
+                    .ok_or_else(|| internal("Iceberg operation lost the original row-delta source"))
+            })
+            .transpose()
+    }
+
     pub(crate) fn io_window_width(&self) -> usize {
         self.operation.inner.limits.io_requests as usize
     }
@@ -825,6 +925,62 @@ impl ArtifactWriter for IcebergCommitAttempt {
             .ledger
             .record_manifest(object, added_paths, existing_paths, replaces)
     }
+    fn registered_manifest_paths(&self, snapshot_id: i64) -> Result<Option<Arc<RegisteredPaths>>> {
+        let artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
+        let Some(stage) = artifacts.ledger.registered_stage() else {
+            return Ok(None);
+        };
+        if artifacts.stage_ids.get(&stage) != Some(&snapshot_id) {
+            return Ok(None);
+        }
+        Ok(artifacts
+            .ledger
+            .registered_manifest_paths(stage, snapshot_id)?
+            .cloned())
+    }
+
+    fn observe_registered_manifest(
+        &self,
+        snapshot_id: i64,
+        replaces: &[String],
+    ) -> Result<Option<RegisteredManifestObservation>> {
+        let artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
+        let Some(stage) = artifacts.ledger.registered_stage() else {
+            return Ok(None);
+        };
+        if artifacts.stage_ids.get(&stage) != Some(&snapshot_id) {
+            return Ok(None);
+        }
+        artifacts
+            .ledger
+            .observe_registered_manifest(stage, snapshot_id, replaces)
+    }
+
+    fn record_registered_manifest(
+        &self,
+        object: &ObjectIdentity,
+        observation: RegisteredManifestObservation,
+        replaces: &[String],
+    ) -> Result<()> {
+        self.operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg operation artifacts poisoned"))?
+            .ledger
+            .record_registered_manifest(object, observation, replaces)
+    }
+
     fn record_manifest_list(
         &self,
         object: &ObjectIdentity,

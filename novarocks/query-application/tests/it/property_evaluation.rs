@@ -1807,3 +1807,58 @@ fn iceberg_maintenance_rejects_the_retired_absolute_time_before_evaluation() {
         port.exhausted();
     }
 }
+
+#[test]
+fn add_files_enum_binding_preserves_trino_property_messages() {
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
+    use novarocks_query_application::sql::trino_table_command::bind_trino_table_execute;
+    use novarocks_spi::connector::ConnectorProviderId;
+
+    let provider = ConnectorProviderId::parse("iceberg").unwrap();
+    for (name, value, cause) in [
+        (
+            "format",
+            "textfile",
+            "The procedure does not support storage format: TEXTFILE",
+        ),
+        (
+            "format",
+            "foo",
+            "Invalid value [foo]. Valid values: [ORC, PARQUET, AVRO, RCBINARY, RCTEXT, SEQUENCEFILE, SEQUENCEFILE_PROTOBUF, JSON, OPENX_JSON, TEXTFILE, CSV, REGEX, ESRI, ESRI_GEO_JSON]",
+        ),
+        (
+            "recursive_directory",
+            "x",
+            "Invalid value [x]. Valid values: [TRUE, FALSE, FAIL]",
+        ),
+    ] {
+        let sql = format!("ALTER TABLE ice.ns.t EXECUTE add_files({name} => '{value}')");
+        let TrinoStatement::TableExecute(statement) = parse_statement(&sql).unwrap() else {
+            panic!("expected ALTER TABLE EXECUTE");
+        };
+        let error = bind_trino_table_execute(
+            &sql,
+            &statement,
+            &provider,
+            &mut Port::new(vec![Call {
+                expression: &statement.arguments[0].value,
+                target: Target::Varchar,
+                result: Ok(text(Some(value))),
+            }]),
+            "ice",
+            &Control::default(),
+        )
+        .unwrap_err();
+        let error = error.user_error().expect("typed procedure argument error");
+        assert_eq!(
+            error.code().as_str(),
+            "sql.admit.invalid_table_procedure_argument"
+        );
+        assert_eq!(
+            error.message(),
+            format!(
+                "Unable to set catalog 'ice' table procedure 'ADD_FILES' property '{name}' to ['{value}']: {cause}"
+            )
+        );
+    }
+}

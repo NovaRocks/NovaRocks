@@ -19,16 +19,21 @@
 //! owns its paid CPU work. The empty Provider does not model a BE split ACK.
 use crate::control_runtime::{FrontendAttemptRuntime, actor::FrontendEffect};
 use crate::fixtures::{
-    history::CapturedHistory,
+    history::{CapturedHistory, InputDisposition, WorkExpectation},
     native_recipe::{OriginalFixture, install_original_fixture, split::OriginalSplitObservation},
 };
 use crate::native::{data_runtime::FrontendDataRuntime, task_transport::tests::Loopback};
 use crate::task_execution::clock::ManualClock;
+use crate::task_execution::host::transport::OriginalSendRelease;
 use novarocks_attempt_protocol::{
     effect::EffectBody,
     port_output::{AttemptTerminal, AttemptToLogicalBody},
 };
-use novarocks_control_runtime_core::{history::HistoryFact, identity::ActorId};
+use novarocks_control_runtime::exit_work::HandoffState;
+use novarocks_control_runtime_core::{
+    history::HistoryFact,
+    identity::{ActorId, InputId},
+};
 use novarocks_coordination_contract::QueryExecutionErrorKind;
 use novarocks_types::BackendProcessId;
 use novarocks_workload_control::joint_admission::JointProgressDriver;
@@ -40,7 +45,7 @@ use std::{
 };
 
 type Terminal = AttemptTerminal<novarocks_attempt_protocol::failure::AttemptFailure>;
-struct OriginalTerminals {
+struct OriginalObservations {
     values: Vec<Terminal>,
     workloads: Vec<(
         novarocks_attempt_protocol::failure::HostFailureRef,
@@ -54,8 +59,32 @@ struct OriginalTerminals {
             >,
         >,
     >,
+    withdrawal: Option<(InputId, Arc<OnceLock<InputId>>)>,
 }
-impl OriginalTerminals {
+impl OriginalObservations {
+    fn observe_withdrawal(&self, process: &FrontendAttemptRuntime, actor: ActorId) {
+        let Some((position, occurrence)) = &self.withdrawal else {
+            return;
+        };
+        if occurrence.get().is_some() {
+            return;
+        }
+        // The admitted reservation becomes this standing position. Each fill
+        // gets a fresh occurrence, which the next original AP poll may consume.
+        if let Some(input) = process
+            .actor_runtime()
+            .standing_input_inventory(actor, None, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.standing_input_id.get() == position.get())
+            .and_then(|row| row.in_flight)
+        {
+            occurrence
+                .set(input)
+                .expect("one original withdrawal occurrence");
+        }
+    }
+
     fn observe(&mut self, terminal: &Terminal) {
         if self.values.contains(terminal) {
             return;
@@ -176,7 +205,7 @@ async fn drive<F: Future>(
     clock: &ManualClock,
     joint: &mut JointProgressDriver,
     actor: ActorId,
-    terminals: &mut OriginalTerminals,
+    terminals: &mut OriginalObservations,
     advance: bool,
     future: F,
 ) -> F::Output {
@@ -190,6 +219,7 @@ async fn drive<F: Future>(
                 .unwrap();
             let mut runnable = false;
             for _ in 0..64 {
+                terminals.observe_withdrawal(process, actor);
                 let polled = process
                     .actor_runtime()
                     .poll_one_with_clock(process.clock.as_ref())
@@ -301,12 +331,13 @@ async fn actual_split_call_cancellation_stops_its_own_ap_and_waits_for_the_origi
         .close_original_stopped_roster_on_abort()
         .unwrap();
     original.logical.probe.release_activation();
-    let mut terminals = OriginalTerminals {
+    let mut terminals = OriginalObservations {
         values: Vec::new(),
         workloads: Vec::new(),
         source: installed.fixture_admission_failures.clone(),
+        withdrawal: None,
     };
-    drive(
+    let (admission, held) = drive(
         &original.process,
         &original.clock,
         &mut original.joint,
@@ -314,12 +345,26 @@ async fn actual_split_call_cancellation_stops_its_own_ap_and_waits_for_the_origi
         &mut terminals,
         false,
         async {
-            while !observed.call.entered() {
+            loop {
+                let gate = observed.admission_handoff.lock().unwrap().upgrade();
+                if observed.call.entered()
+                    && let Some(gate) = gate
+                    && let Some(held) = gate.held()
+                {
+                    break (gate, held);
+                }
                 tokio::task::yield_now().await;
             }
         },
     )
     .await;
+    assert_eq!(
+        held.participation,
+        original.logical.probe.participations.lock().unwrap()[0]
+    );
+    assert_eq!(held.result_actor, actor);
+    assert_eq!(held.result_work.scope, child);
+    assert_eq!(admission.held_handoff_state(), Some(HandoffState::Pending));
     assert_eq!(observed.call.calls(), 1);
     assert_eq!(observed.closes.load(Ordering::Acquire), 0);
     assert_eq!(observed.drops.load(Ordering::Acquire), 0);
@@ -345,6 +390,9 @@ async fn actual_split_call_cancellation_stops_its_own_ap_and_waits_for_the_origi
             .all(|label| matches!(label.get_name(), "class" | "resource"))
     }));
     let mut captured = CapturedHistory::drain(&history, usize::MAX);
+    captured
+        .check_work(held.result_work, WorkExpectation::Unknown)
+        .unwrap();
     original
         .requester
         .request(novarocks_workload_control::CancellationReason::Requested)
@@ -352,7 +400,11 @@ async fn actual_split_call_cancellation_stops_its_own_ap_and_waits_for_the_origi
     drive(&original.process, &original.clock, &mut original.joint, installed.fixture_sources.0, &mut terminals, false, async {
         loop {
             captured.append_from(&history, usize::MAX);
-            if captured.entries().iter().any(|entry| matches!(entry.fact, HistoryFact::ScopeStopped { scope } if scope == child)) { break; }
+            if admission.held_handoff_state() == Some(HandoffState::Withdrawn)
+                && captured.entries().iter().any(|entry| matches!(entry.fact, HistoryFact::ScopeStopped { scope } if scope == child))
+            {
+                break;
+            }
             tokio::task::yield_now().await;
         }
     }).await;
@@ -378,20 +430,54 @@ async fn actual_split_call_cancellation_stops_its_own_ap_and_waits_for_the_origi
     assert_eq!(observed.drops.load(Ordering::Acquire), 0);
     // Stop has reached the actual AP, but this SAME Provider F and its
     // responsibility remain live. Releasing a caller borrow proves no exit.
+    assert_eq!(admission.held(), Some(held));
+    assert_eq!(admission.additional_matches(), 0);
+    assert_eq!(admission.accepted(), None);
+    let withdrawal = Arc::new(OnceLock::new());
+    terminals.withdrawal = Some((held.result_position, withdrawal.clone()));
+    assert_eq!(admission.release(), OriginalSendRelease::Accepted(held));
+    assert_eq!(admission.accepted(), Some(held));
     observed.call.release();
     let ready = original.logical.ready.take().unwrap();
-    let error = drive(
+    let (ready, (withdrawal_target, withdrawal_input)) = drive(
         &original.process,
         &original.clock,
         &mut original.joint,
         installed.fixture_sources.0,
         &mut terminals,
-        true,
-        ready,
+        false,
+        async {
+            let original_withdrawal = async {
+                // The original Join publishes DefinitelyUnsent on this input
+                // after actual transport exit. Keep the fixture clock fixed
+                // until AP consumes it, before evaluating a remote deadline.
+                loop {
+                    captured.append_from(&history, usize::MAX);
+                    if let Some(occurrence) = withdrawal.get().copied()
+                        && let Some(target) =
+                            captured
+                                .entries()
+                                .iter()
+                                .find_map(|entry| match entry.fact {
+                                    HistoryFact::InputConsumed { target, input }
+                                        if target.actor == held.result_actor
+                                            && input == occurrence =>
+                                    {
+                                        Some(target)
+                                    }
+                                    _ => None,
+                                })
+                    {
+                        break (target, occurrence);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::join!(ready, original_withdrawal)
+        },
     )
-    .await
-    .err()
-    .expect("cancelled computation has no Ready");
+    .await;
+    let error = ready.err().expect("cancelled computation has no Ready");
     assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
     let mut exit = original.logical.exit.take().unwrap();
     let receipt = drive(
@@ -568,6 +654,14 @@ async fn actual_split_call_cancellation_stops_its_own_ap_and_waits_for_the_origi
     assert_eq!(observed.drops.load(Ordering::Acquire), 1);
     captured.append_from(&history, usize::MAX);
     captured.check_capture().unwrap();
+    captured
+        .check_input(
+            withdrawal_target,
+            withdrawal_input,
+            InputDisposition::Consumed,
+        )
+        .unwrap();
+    assert_eq!(admission.additional_matches(), 0);
     assert!(!captured.entries().iter().any(|entry| matches!(entry.fact,
         HistoryFact::FailurePublication { target, .. }
             if target.actor == actor || target.actor == bound.registration.actor()

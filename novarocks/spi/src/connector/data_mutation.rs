@@ -27,19 +27,14 @@ use sha2::{Digest, Sha256};
 use super::{
     ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorMetadata, ConnectorMutationOperationId,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableHandle,
-    ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorPayloadRetentionGuard, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableHandle, ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
-pub const CONNECTOR_DATA_MUTATION_CONTRACT_VERSION: u16 = 3;
-pub const CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION: u16 = 2;
-pub const MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES: usize = 8 * 1024;
+pub const CONNECTOR_DATA_MUTATION_CONTRACT_VERSION: u16 = 4;
+pub const CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION: u16 = 3;
 pub const MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES: usize = 256;
 pub const MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
-pub const MAX_CONNECTOR_DATA_MUTATION_FILES: u32 = 4096;
-pub const MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES: usize = 16 * 1024;
-pub const MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES: usize = 64 * 1024 * 1024;
 
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"novarocks.connector-data-mutation.request.v1\0";
 const PLAN_DIGEST_DOMAIN: &[u8] = b"novarocks.connector-data-mutation.plan.v1\0";
@@ -49,166 +44,40 @@ pub const TRUNCATE_KIND: &str = "truncate";
 const RECEIPT_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"novarocks.connector-data-mutation.receipt-payload.v1\0";
 
-// Design: ADR-0046 (docs/adr/ADR-0046-frontend-add-files-source-ownership.md)
-/// Provider-calculated, secret-free physical ownership scope for a bounded
-/// existing-files plan.  It deliberately contains no operation, target, or
-/// connector-instance identity, so the frontend can protect one physical
-/// source location across retries and catalog instances without retaining the
-/// provider-private manifest.
+/// Storage format requested by ALTER TABLE EXECUTE add_files.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorDataMutationSourceScopeKind {
-    Directory,
+pub enum ConnectorAddFilesFormat {
+    Orc,
+    Parquet,
+    Avro,
 }
 
-impl ConnectorDataMutationSourceScopeKind {
-    const DIRECTORY_TAG: u8 = 1;
-
-    const fn to_wire_tag(self) -> u8 {
+impl ConnectorAddFilesFormat {
+    const fn digest_tag(self) -> u8 {
         match self {
-            Self::Directory => Self::DIRECTORY_TAG,
-        }
-    }
-
-    fn try_from_wire_tag(tag: u8) -> Result<Self, ConnectorError> {
-        match tag {
-            Self::DIRECTORY_TAG => Ok(Self::Directory),
-            _ => Err(corrupt(
-                "unsupported connector data mutation source scope kind",
-            )),
+            Self::Orc => 1,
+            Self::Parquet => 2,
+            Self::Avro => 3,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConnectorDataMutationSourceScope {
-    version: u16,
-    kind: ConnectorDataMutationSourceScopeKind,
-    digest: [u8; 32],
+/// The declared directory traversal policy for ADD FILES.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConnectorAddFilesRecursion {
+    Include,
+    Skip,
+    #[default]
+    Fail,
 }
 
-impl ConnectorDataMutationSourceScope {
-    pub const VERSION: u16 = 1;
-
-    pub fn try_new_directory(digest: [u8; 32]) -> Result<Self, ConnectorError> {
-        let scope = Self {
-            version: Self::VERSION,
-            kind: ConnectorDataMutationSourceScopeKind::Directory,
-            digest,
-        };
-        scope.validate()?;
-        Ok(scope)
-    }
-
-    pub const fn version(self) -> u16 {
-        self.version
-    }
-
-    pub const fn kind(self) -> ConnectorDataMutationSourceScopeKind {
-        self.kind
-    }
-
-    pub const fn digest(self) -> [u8; 32] {
-        self.digest
-    }
-
-    pub fn validate(self) -> Result<(), ConnectorError> {
-        if self.version != Self::VERSION || self.digest == [0; 32] {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector data mutation source scope is invalid",
-            ));
-        }
-        Ok(())
-    }
-
-    fn digest_into(self, hasher: &mut Sha256) {
-        hasher.update(self.version.to_be_bytes());
-        hasher.update([self.kind.to_wire_tag()]);
-        hasher.update(self.digest);
-    }
-}
-
-/// The source-side ownership contract for `register-existing-files`.
-///
-/// This is deliberately distinct from the source-scope digest. The digest is
-/// only a stable identity useful for best-effort de-duplication of concurrent
-/// work; this value records the provider's proof that source cleanup stays
-/// outside NovaRocks' authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorDataMutationSourceDomain {
-    CallerManagedStable,
-}
-
-impl ConnectorDataMutationSourceDomain {
-    const CALLER_MANAGED_STABLE_TAG: u8 = 1;
-
-    const fn to_wire_tag(self) -> u8 {
+impl ConnectorAddFilesRecursion {
+    const fn digest_tag(self) -> u8 {
         match self {
-            Self::CallerManagedStable => Self::CALLER_MANAGED_STABLE_TAG,
+            Self::Include => 1,
+            Self::Skip => 2,
+            Self::Fail => 3,
         }
-    }
-
-    fn try_from_wire_tag(tag: u8) -> Result<Self, ConnectorError> {
-        match tag {
-            Self::CALLER_MANAGED_STABLE_TAG => Ok(Self::CallerManagedStable),
-            _ => Err(corrupt("unsupported connector data mutation source domain")),
-        }
-    }
-}
-
-/// Provider-attested ADD FILES domain facts.
-///
-/// `target_cleanup_root_digest` identifies the exact target cleanup root whose
-/// disjointness was proved during planning. It is not a source lease and never
-/// authorizes NovaRocks to mutate the source root.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConnectorDataMutationAddFilesDomain {
-    version: u16,
-    source_domain: ConnectorDataMutationSourceDomain,
-    target_cleanup_root_digest: [u8; 32],
-}
-
-impl ConnectorDataMutationAddFilesDomain {
-    pub const VERSION: u16 = 1;
-
-    pub fn try_new_caller_managed_stable(
-        target_cleanup_root_digest: [u8; 32],
-    ) -> Result<Self, ConnectorError> {
-        let domain = Self {
-            version: Self::VERSION,
-            source_domain: ConnectorDataMutationSourceDomain::CallerManagedStable,
-            target_cleanup_root_digest,
-        };
-        domain.validate()?;
-        Ok(domain)
-    }
-
-    pub const fn version(self) -> u16 {
-        self.version
-    }
-
-    pub const fn source_domain(self) -> ConnectorDataMutationSourceDomain {
-        self.source_domain
-    }
-
-    pub const fn target_cleanup_root_digest(self) -> [u8; 32] {
-        self.target_cleanup_root_digest
-    }
-
-    pub fn validate(self) -> Result<(), ConnectorError> {
-        if self.version != Self::VERSION || self.target_cleanup_root_digest == [0; 32] {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector data mutation ADD FILES source domain is invalid",
-            ));
-        }
-        Ok(())
-    }
-
-    fn digest_into(self, hasher: &mut Sha256) {
-        hasher.update(self.version.to_be_bytes());
-        hasher.update([self.source_domain.to_wire_tag()]);
-        hasher.update(self.target_cleanup_root_digest);
     }
 }
 
@@ -216,7 +85,9 @@ impl ConnectorDataMutationAddFilesDomain {
 pub enum ConnectorDataMutationOperation {
     RegisterExistingFiles {
         table: ConnectorTableHandle,
-        source_location: Arc<str>,
+        location: Option<Arc<str>>,
+        format: Option<ConnectorAddFilesFormat>,
+        recursion: ConnectorAddFilesRecursion,
     },
     Truncate {
         table: ConnectorTableHandle,
@@ -227,14 +98,16 @@ pub enum ConnectorDataMutationOperation {
 impl ConnectorDataMutationOperation {
     pub fn register_existing_files(
         table: ConnectorTableHandle,
-        source_location: impl Into<Arc<str>>,
-    ) -> Result<Self, ConnectorError> {
-        let operation = Self::RegisterExistingFiles {
+        location: Option<Arc<str>>,
+        format: Option<ConnectorAddFilesFormat>,
+        recursion: ConnectorAddFilesRecursion,
+    ) -> Self {
+        Self::RegisterExistingFiles {
             table,
-            source_location: source_location.into(),
-        };
-        operation.validate()?;
-        Ok(operation)
+            location,
+            format,
+            recursion,
+        }
     }
 
     pub fn truncate(
@@ -264,13 +137,7 @@ impl ConnectorDataMutationOperation {
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
         match self {
-            Self::RegisterExistingFiles {
-                source_location, ..
-            } => validate_bounded_text(
-                source_location,
-                MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES,
-                "connector data mutation source location",
-            ),
+            Self::RegisterExistingFiles { .. } => Ok(()),
             Self::Truncate { target_ref, .. } => validate_bounded_text(
                 target_ref,
                 MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES,
@@ -285,8 +152,18 @@ impl ConnectorDataMutationOperation {
         digest_bytes(hasher, self.table().payload());
         match self {
             Self::RegisterExistingFiles {
-                source_location, ..
-            } => digest_bytes(hasher, source_location.as_bytes()),
+                location,
+                format,
+                recursion,
+                ..
+            } => {
+                hasher.update([u8::from(location.is_some())]);
+                if let Some(location) = location {
+                    digest_bytes(hasher, location.as_bytes());
+                }
+                hasher.update([format.map_or(0, ConnectorAddFilesFormat::digest_tag)]);
+                hasher.update([recursion.digest_tag()]);
+            }
             Self::Truncate { target_ref, .. } => digest_bytes(hasher, target_ref.as_bytes()),
         }
     }
@@ -377,22 +254,12 @@ pub struct ConnectorDataMutationPlanSummary {
 }
 
 impl ConnectorDataMutationPlanSummary {
-    pub fn try_new(
-        file_count: u32,
-        row_count: u64,
-        total_bytes: u64,
-    ) -> Result<Self, ConnectorError> {
-        if file_count > MAX_CONNECTOR_DATA_MUTATION_FILES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector data mutation file count exceeds the hard limit",
-            ));
-        }
-        Ok(Self {
+    pub const fn new(file_count: u32, row_count: u64, total_bytes: u64) -> Self {
+        Self {
             file_count,
             row_count,
             total_bytes,
-        })
+        }
     }
 
     pub const fn file_count(self) -> u32 {
@@ -423,8 +290,7 @@ pub struct ConnectorDataMutationPlan {
     request_digest: [u8; 32],
     state_digest: [u8; 32],
     summary: ConnectorDataMutationPlanSummary,
-    source_scope: Option<ConnectorDataMutationSourceScope>,
-    add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
+
     provider_payload: Bytes,
     plan_digest: [u8; 32],
 }
@@ -434,20 +300,16 @@ impl ConnectorDataMutationPlan {
         request: &ConnectorDataMutationPlanningRequest,
         state_digest: [u8; 32],
         summary: ConnectorDataMutationPlanSummary,
-        source_scope: Option<ConnectorDataMutationSourceScope>,
-        add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
+
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         request.validate()?;
         validate_provider_payload(&provider_payload, "plan")?;
-        validate_add_files_facts(request.operation().kind(), source_scope, add_files_domain)?;
         let operation_kind: Arc<str> = request.operation.kind().into();
         let plan_digest = plan_digest(
             request.request_digest,
             state_digest,
             summary,
-            source_scope,
-            add_files_domain,
             &provider_payload,
         );
         Ok(Self {
@@ -458,8 +320,7 @@ impl ConnectorDataMutationPlan {
             request_digest: request.request_digest,
             state_digest,
             summary,
-            source_scope,
-            add_files_domain,
+
             provider_payload,
             plan_digest,
         })
@@ -493,14 +354,6 @@ impl ConnectorDataMutationPlan {
         self.summary
     }
 
-    pub const fn source_scope(&self) -> Option<ConnectorDataMutationSourceScope> {
-        self.source_scope
-    }
-
-    pub const fn add_files_domain(&self) -> Option<ConnectorDataMutationAddFilesDomain> {
-        self.add_files_domain
-    }
-
     pub fn provider_payload(&self) -> &Bytes {
         &self.provider_payload
     }
@@ -512,18 +365,11 @@ impl ConnectorDataMutationPlan {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_operation_kind(&self.operation_kind)?;
         validate_provider_payload(&self.provider_payload, "plan")?;
-        validate_add_files_facts(
-            &self.operation_kind,
-            self.source_scope,
-            self.add_files_domain,
-        )?;
         if self.schema_version != CONNECTOR_DATA_MUTATION_CONTRACT_VERSION
             || plan_digest(
                 self.request_digest,
                 self.state_digest,
                 self.summary,
-                self.source_scope,
-                self.add_files_domain,
                 &self.provider_payload,
             ) != self.plan_digest
         {
@@ -557,24 +403,6 @@ impl ConnectorDataMutationPlan {
         encoded.extend_from_slice(&self.summary.file_count.to_be_bytes());
         encoded.extend_from_slice(&self.summary.row_count.to_be_bytes());
         encoded.extend_from_slice(&self.summary.total_bytes.to_be_bytes());
-        match self.source_scope {
-            None => encoded.push(0),
-            Some(scope) => {
-                encoded.push(1);
-                encoded.extend_from_slice(&scope.version.to_be_bytes());
-                encoded.push(scope.kind.to_wire_tag());
-                encoded.extend_from_slice(&scope.digest);
-            }
-        }
-        match self.add_files_domain {
-            None => encoded.push(0),
-            Some(domain) => {
-                encoded.push(1);
-                encoded.extend_from_slice(&domain.version.to_be_bytes());
-                encoded.push(domain.source_domain.to_wire_tag());
-                encoded.extend_from_slice(&domain.target_cleanup_root_digest);
-            }
-        }
         write_u32_bytes(&mut encoded, payload, "plan provider payload")?;
         encoded.extend_from_slice(&self.plan_digest);
         Ok(Bytes::from(encoded))
@@ -596,39 +424,11 @@ impl ConnectorDataMutationPlan {
         let operation_kind: Arc<str> = Arc::from(reader.read_utf8_u16("operation kind")?);
         let request_digest = reader.read_array()?;
         let state_digest = reader.read_array()?;
-        let summary = ConnectorDataMutationPlanSummary::try_new(
+        let summary = ConnectorDataMutationPlanSummary::new(
             reader.read_u32()?,
             reader.read_u64()?,
             reader.read_u64()?,
-        )?;
-        let source_scope = match reader.read_u8()? {
-            0 => None,
-            1 => Some(ConnectorDataMutationSourceScope {
-                version: reader.read_u16()?,
-                kind: ConnectorDataMutationSourceScopeKind::try_from_wire_tag(reader.read_u8()?)?,
-                digest: reader.read_array()?,
-            }),
-            _ => {
-                return Err(corrupt(
-                    "invalid connector data mutation plan source scope tag",
-                ));
-            }
-        };
-        let add_files_domain = match reader.read_u8()? {
-            0 => None,
-            1 => Some(ConnectorDataMutationAddFilesDomain {
-                version: reader.read_u16()?,
-                source_domain: ConnectorDataMutationSourceDomain::try_from_wire_tag(
-                    reader.read_u8()?,
-                )?,
-                target_cleanup_root_digest: reader.read_array()?,
-            }),
-            _ => {
-                return Err(corrupt(
-                    "invalid connector data mutation plan ADD FILES source domain tag",
-                ));
-            }
-        };
+        );
         let provider_payload = Bytes::copy_from_slice(reader.read_bytes_u32("provider payload")?);
         let plan_digest = reader.read_array()?;
         reader.finish()?;
@@ -643,8 +443,7 @@ impl ConnectorDataMutationPlan {
             request_digest,
             state_digest,
             summary,
-            source_scope,
-            add_files_domain,
+
             provider_payload,
             plan_digest,
         };
@@ -664,8 +463,6 @@ impl fmt::Debug for ConnectorDataMutationPlan {
             .field("request_digest", &self.request_digest)
             .field("state_digest", &self.state_digest)
             .field("summary", &self.summary)
-            .field("source_scope", &self.source_scope)
-            .field("add_files_domain", &self.add_files_domain)
             .field("provider_payload_len", &self.provider_payload.len())
             .field("plan_digest", &self.plan_digest)
             .finish()
@@ -676,6 +473,7 @@ impl fmt::Debug for ConnectorDataMutationPlan {
 pub struct ConnectorDataMutationExecuteRequest {
     pub plan: ConnectorDataMutationPlan,
     pub context: ConnectorRequestContext,
+    payload_byte_author: Option<ConnectorPayloadRetentionGuard>,
 }
 
 impl ConnectorDataMutationExecuteRequest {
@@ -684,7 +482,39 @@ impl ConnectorDataMutationExecuteRequest {
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         plan.validate()?;
-        Ok(Self { plan, context })
+        Ok(Self {
+            plan,
+            context,
+            payload_byte_author: None,
+        })
+    }
+
+    /// Bind the original statement's byte author to registration execution.
+    pub fn with_registration_byte_author(
+        mut self,
+        byte_author: ConnectorPayloadRetentionGuard,
+    ) -> Result<Self, ConnectorError> {
+        if self.plan.operation_kind() != REGISTER_EXISTING_FILES_KIND
+            || !byte_author.is_byte_budget()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "registration requires the original statement's payload byte author",
+            ));
+        }
+        self.payload_byte_author = Some(byte_author);
+        Ok(self)
+    }
+
+    pub fn registration_byte_author(
+        &self,
+    ) -> Result<&ConnectorPayloadRetentionGuard, ConnectorError> {
+        self.payload_byte_author.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "registration is missing its payload byte author",
+            )
+        })
     }
 }
 
@@ -849,11 +679,11 @@ impl ConnectorDataMutationReceipt {
         let request_digest = reader.read_array()?;
         let plan_digest = reader.read_array()?;
         let state_digest = reader.read_array()?;
-        let summary = ConnectorDataMutationPlanSummary::try_new(
+        let summary = ConnectorDataMutationPlanSummary::new(
             reader.read_u32()?,
             reader.read_u64()?,
             reader.read_u64()?,
-        )?;
+        );
         let provider_payload = Bytes::copy_from_slice(reader.read_bytes_u32("provider payload")?);
         let provider_payload_digest = reader.read_array()?;
         reader.finish()?;
@@ -1274,8 +1104,7 @@ fn plan_digest(
     request_digest: [u8; 32],
     state_digest: [u8; 32],
     summary: ConnectorDataMutationPlanSummary,
-    source_scope: Option<ConnectorDataMutationSourceScope>,
-    add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
+
     provider_payload: &Bytes,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1284,52 +1113,8 @@ fn plan_digest(
     hasher.update(request_digest);
     hasher.update(state_digest);
     summary.digest_into(&mut hasher);
-    match source_scope {
-        Some(scope) => {
-            hasher.update([1]);
-            scope.digest_into(&mut hasher);
-        }
-        None => hasher.update([0]),
-    }
-    match add_files_domain {
-        Some(domain) => {
-            hasher.update([1]);
-            domain.digest_into(&mut hasher);
-        }
-        None => hasher.update([0]),
-    }
     digest_bytes(&mut hasher, provider_payload);
     hasher.finalize().into()
-}
-
-fn validate_add_files_facts(
-    operation_kind: &str,
-    source_scope: Option<ConnectorDataMutationSourceScope>,
-    add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
-) -> Result<(), ConnectorError> {
-    match (operation_kind, source_scope, add_files_domain) {
-        (REGISTER_EXISTING_FILES_KIND, Some(scope), Some(domain)) => {
-            scope.validate()?;
-            domain.validate()
-        }
-        (REGISTER_EXISTING_FILES_KIND, None, _) => Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "register-existing-files plan requires a source ownership scope",
-        )),
-        (REGISTER_EXISTING_FILES_KIND, Some(_), None) => Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "register-existing-files plan requires caller-managed source domain proof",
-        )),
-        (TRUNCATE_KIND, None, None) => Ok(()),
-        (TRUNCATE_KIND, _, _) => Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "truncate plan must not carry ADD FILES source facts",
-        )),
-        _ => Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "unsupported connector data mutation operation kind",
-        )),
-    }
 }
 
 fn write_u16_bytes(encoded: &mut Vec<u8>, value: &[u8], field: &str) -> Result<(), ConnectorError> {
@@ -1393,10 +1178,6 @@ impl<'a> WireReader<'a> {
             return Err(corrupt(format!("invalid {} wire {field}", self.subject)));
         }
         Ok(())
-    }
-
-    fn read_u8(&mut self) -> Result<u8, ConnectorError> {
-        Ok(self.take(1)?[0])
     }
 
     fn read_u16(&mut self) -> Result<u16, ConnectorError> {
@@ -1488,105 +1269,5 @@ fn validate_operation_kind(kind: &str) -> Result<(), ConnectorError> {
             ConnectorErrorKind::InvalidRequest,
             "unsupported connector data mutation operation kind",
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use bytes::Bytes;
-
-    use super::{
-        ConnectorDataMutationAddFilesDomain, ConnectorDataMutationOperation,
-        ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
-        ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
-        ConnectorDataMutationSourceScope,
-    };
-    use crate::connector::{
-        ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorProviderId,
-        ConnectorRequestContext, ConnectorTableHandle, ProviderBindingEpoch,
-    };
-
-    fn plan() -> ConnectorDataMutationPlan {
-        let instance_id = ConnectorInstanceId::parse("analytics").expect("instance ID");
-        let request = ConnectorDataMutationPlanningRequest::try_new(
-            ConnectorMutationOperationId::from_bytes([3; 16]),
-            ConnectorProviderBindingKey {
-                instance_id: instance_id.clone(),
-                incarnation: ProviderBindingEpoch::from_bytes([4; 16]),
-            },
-            ConnectorDataMutationOperation::register_existing_files(
-                ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
-                    .expect("table"),
-                "s3://bucket/source",
-            )
-            .expect("operation"),
-            ConnectorRequestContext::try_new(
-                Instant::now() + Duration::from_secs(1),
-                crate::connector::ConnectorStopOwner::new().view(),
-                1024,
-                2048,
-            )
-            .expect("context"),
-        )
-        .expect("request");
-        ConnectorDataMutationPlan::try_new(
-            &request,
-            [5; 32],
-            ConnectorDataMutationPlanSummary::try_new(1, 2, 3).expect("summary"),
-            Some(
-                ConnectorDataMutationSourceScope::try_new_directory([6; 32]).expect("source scope"),
-            ),
-            Some(
-                ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable([7; 32])
-                    .expect("source domain"),
-            ),
-            Bytes::from_static(b"opaque-plan"),
-        )
-        .expect("plan")
-    }
-
-    #[test]
-    fn data_mutation_plan_wire_round_trips_and_binds_source_scope() {
-        let plan = plan();
-        let wire = plan.try_to_wire_v1().expect("encode plan");
-        let decoded = ConnectorDataMutationPlan::try_from_wire_v1(&wire).expect("decode plan");
-        assert_eq!(decoded, plan);
-        assert_eq!(decoded.source_scope(), plan.source_scope());
-
-        let mut tampered = wire.to_vec();
-        let last = tampered.last_mut().expect("plan digest");
-        *last ^= 1;
-        assert!(ConnectorDataMutationPlan::try_from_wire_v1(&tampered).is_err());
-    }
-
-    #[test]
-    fn data_mutation_receipt_wire_rejects_trailing_data() {
-        let plan = plan();
-        let receipt = ConnectorDataMutationReceipt::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
-                instance_id: plan.owner().instance_id.clone(),
-            },
-            plan.owner().incarnation,
-            plan.operation_id(),
-            plan.operation_kind(),
-            plan.request_digest(),
-            plan.plan_digest(),
-            plan.state_digest(),
-            plan.summary(),
-            Bytes::from_static(b"opaque-receipt"),
-        )
-        .expect("receipt");
-        let mut wire = receipt.try_to_wire_v1().expect("encode receipt").to_vec();
-        wire.push(0);
-        assert_eq!(
-            ConnectorDataMutationReceipt::try_from_wire_v1(&wire)
-                .expect_err("trailing receipt bytes must fail")
-                .kind(),
-            ConnectorErrorKind::CorruptData
-        );
     }
 }

@@ -238,7 +238,7 @@ pub(super) async fn prepare_equality_delete_statement_async(
         connector_context.clone(),
     ).await?;
     let target_binding =
-        super::load_delete_target_async(target, planning_pin, connector_context).await?;
+        super::load_equality_delete_target_async(target, planning_pin, connector_context).await?;
     let preparation = EqualityDeletePreparation {
         state,
         target,

@@ -20,6 +20,8 @@ use super::{
     normalize::{self, Selections},
     requirements,
 };
+use std::sync::Arc;
+
 use crate::commit::model::{
     ArtifactWriter, AttemptArtifacts, AttemptToken, BaseIdentity, FileChanges, FrozenRequest,
     FrozenRequestParts, IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts,
@@ -68,7 +70,7 @@ struct StagingState {
     base: TableMetadata,
     identity: BaseIdentity,
     location: Option<String>,
-    metadata: TableMetadata,
+    metadata: Arc<TableMetadata>,
     selections: Selections,
     updates: Vec<TableUpdate>,
     initialization_len: usize,
@@ -166,7 +168,7 @@ impl StagingState {
         }
         let initialization_len = updates.len();
         Ok(Self {
-            metadata: base.clone(),
+            metadata: Arc::new(base.clone()),
             base,
             identity,
             location,
@@ -197,7 +199,7 @@ impl StagingState {
         }
         let mut selections = self.selections.clone();
         let mut updates = self.updates.clone();
-        let mut metadata = self.metadata.clone();
+        let mut metadata = Arc::clone(&self.metadata);
         for update in change.updates {
             if intent.shape() == RequestShape::DocumentExpiry {
                 crate::commit::model::validate_document_expiry_update(&update)?;
@@ -215,11 +217,11 @@ impl StagingState {
             }
             if let Some(update) = normalize::normalize(&metadata, update, &mut selections)? {
                 updates.push(update);
-                metadata = normalize::replay(
+                metadata = Arc::new(normalize::replay(
                     &self.base,
                     self.location.as_deref(),
                     &updates[self.initialization_len..],
-                )?;
+                )?);
             }
         }
         requirements::implicit(&self.base, intent.shape(), &updates, &mut requirements);

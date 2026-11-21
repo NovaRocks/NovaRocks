@@ -370,6 +370,16 @@ struct AdditionMetadata {
     encoded_lower_bound: usize,
 }
 
+pub(crate) fn manifest_entry_encoded_lower_bound(
+    path: &str,
+    format_bytes: usize,
+) -> Result<usize, ConnectorError> {
+    // Both manifest encodings write a status, a file path and format with
+    // length prefixes, a record count and a file size. Each scalar/prefix
+    // consumes at least one byte. Optional/format-specific fields add no bound.
+    sum_bytes([path.len(), format_bytes, 5])
+}
+
 fn addition_metadata(
     fragment: &IcebergCommitFragment,
     path: &str,
@@ -392,10 +402,7 @@ fn addition_metadata(
     } else {
         "PARQUET".len()
     };
-    // Both manifest encodings write a status, a file path and format with
-    // length prefixes, a record count and a file size. Each scalar/prefix
-    // consumes at least one byte. Optional/format-specific fields add no bound.
-    let encoded_lower_bound = sum_bytes([path.len(), format_bytes, 5])?;
+    let encoded_lower_bound = manifest_entry_encoded_lower_bound(path, format_bytes)?;
     Ok(AdditionMetadata {
         object_path: path.into(),
         writer: fragment.creation().map(|receipt| *receipt.physical()),

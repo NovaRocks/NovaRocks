@@ -48,6 +48,10 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 这是验收命令入口，文档更新本身不是套件通过证据。
 
+## ADD FILES 准入
+
+`iceberg.add-files-procedure.enabled` 是 Iceberg catalog 的字符串布尔属性，默认 `false`。在支持登记的 catalog 中可以显式设置为 `"true"`。标准 REST 仅登记带嵌入式 field ID 的文件。无 ID 文件依赖支持整版 metadata 条件安装的 Hadoop catalog。用法与清理边界见 [ADD FILES](dml.md#登记已有-parquet-文件)。
+
 ## REST 认证
 
 REST catalog 的认证只有一个入口：catalog 定义中的凭证绑定。材料保存在各角色本地的启动配置里，不写进 catalog 定义，也不随 native fragment 或 FE/BE 传输。每个角色的 `Authorization` 只由该角色的认证 owner 设置：

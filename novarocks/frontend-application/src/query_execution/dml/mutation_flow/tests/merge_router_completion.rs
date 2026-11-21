@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::*;
+
 // This witness keeps the production MERGE producer and completion/encoding
 // path. Literal relations replace external reads; scripted sealed recipes
 // exercise package/manifest structure, not Iceberg execution or publication.

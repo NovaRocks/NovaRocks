@@ -189,6 +189,17 @@ impl MutationAffectedRows {
     }
 }
 
+fn poll_mutation_publication(
+    publication: &mut StatementPublication,
+    session: Option<&Arc<ConnectorWriteSession>>,
+    context: &ConnectorRequestContext,
+    selected: &Option<Result<(), QueryServiceError>>,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    let abort = selected.is_some();
+    publication.poll_settle(session, context, abort, cx)
+}
+
 struct MutationAction {
     original: Arc<OriginalInput>,
     root: WorkScope,
@@ -210,7 +221,6 @@ struct MutationAction {
     affected_rows: MutationAffectedRows,
     publication: Option<StatementPublication>,
     phase: Phase,
-    no_op: bool,
     busy: bool,
     health: StatementNativeHealthFailure,
 }
@@ -460,7 +470,6 @@ impl MutationAction {
                         )));
                     }
                     self.affected_rows.receive_write(&session)?;
-                    self.no_op = ready.accepted.is_empty();
                     self.phase = Phase::Publication;
                 }
 
@@ -496,13 +505,14 @@ impl MutationAction {
                         }
                     }
                     let session = self.session();
-                    let abort = self.selected.is_some() || self.no_op;
-                    if self
-                        .publication
-                        .as_mut()
-                        .unwrap()
-                        .poll_settle(session.as_ref(), &self.context, abort, cx)
-                        .is_pending()
+                    if poll_mutation_publication(
+                        self.publication.as_mut().unwrap(),
+                        session.as_ref(),
+                        &self.context,
+                        &self.selected,
+                        cx,
+                    )
+                    .is_pending()
                     {
                         return Poll::Pending;
                     }
@@ -888,128 +898,13 @@ pub(crate) fn prepare(
         affected_rows: MutationAffectedRows::default(),
         publication: Some(StatementPublication::new(attempt)),
         phase: Phase::Admit,
-        no_op: false,
         busy: false,
         health: health(),
     }))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[derive(Debug)]
-    struct SourceExitProbe(Arc<AtomicBool>);
-    impl novarocks_failure_contract::SourceRetentionCapability for SourceExitProbe {}
-    impl Drop for SourceExitProbe {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-    fn retained_compile_failure(
-        message: &str,
-        probe: Arc<AtomicBool>,
-    ) -> novarocks_failure_contract::SharedFailureCause {
-        let source = novarocks_failure_contract::SharedFailureCause::new(
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message.into()),
-        );
-        source.retain_source_lifetime(Box::new(SourceExitProbe(probe)));
-        source
-    }
-
-    struct ReadyErrorThenPanicDrop(Option<DmlExecutionError>);
-    impl Future for ReadyErrorThenPanicDrop {
-        type Output = Result<PhaseValue, DmlExecutionError>;
-        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-            Poll::Ready(Err(self.0.take().unwrap()))
-        }
-    }
-    impl Drop for ReadyErrorThenPanicDrop {
-        fn drop(&mut self) {
-            panic!("scripted original preparation Future Drop");
-        }
-    }
-    #[test]
-    fn actual_preparation_stores_typed_return_before_hostile_future_drop() {
-        let exited = Arc::new(AtomicBool::new(false));
-        let probe = Arc::clone(&exited);
-        let failure = retained_compile_failure("original preparation refused", probe);
-        let mut preparation = PhasePreparation {
-            future: Some(Box::pin(ReadyErrorThenPanicDrop(Some(
-                DmlExecutionError::Compilation(failure),
-            )))),
-            result: None,
-            busy: false,
-        };
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || preparation.poll_returned(&mut cx)
-            ))
-            .is_err()
-        );
-        assert!(
-            preparation.busy,
-            "the actual preparation owner is poisoned by child Drop"
-        );
-        let Some(Err(DmlExecutionError::Compilation(original))) = preparation.result.as_ref()
-        else {
-            panic!("original typed return must be stable");
-        };
-        assert!(original.detail().contains("original preparation refused"));
-        assert!(
-            !exited.load(Ordering::SeqCst),
-            "client projection must not retire the original cause"
-        );
-        assert!(
-            preparation.poll_returned(&mut cx).is_pending(),
-            "a poisoned original F is never repolled"
-        );
-        drop(preparation);
-        assert!(exited.load(Ordering::SeqCst));
-    }
-    #[test]
-    fn actual_preparation_refusal_keeps_original_source_through_client_projection() {
-        let exited = Arc::new(AtomicBool::new(false));
-        let probe = Arc::clone(&exited);
-        let failure = retained_compile_failure("same preparation failure", probe);
-        let mut preparation = PhasePreparation {
-            future: Some(Box::pin(async move {
-                Err(DmlExecutionError::Compilation(failure))
-            })),
-            result: None,
-            busy: false,
-        };
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(preparation.poll_returned(&mut cx).is_ready());
-        let original = preparation.result.as_ref().unwrap().as_ref().err().unwrap();
-        let client = project_failure(original, "UPDATE exact_admitted_source SET x = 1");
-        assert_eq!(
-            client.message(),
-            "[UnsupportedCompiledShape] pure compilation failed in its source domain"
-        );
-        let Some(novarocks_type_contract::CompileControlError::Source(projected)) =
-            client.compile_control_error()
-        else {
-            panic!("client diagnostic must retain the same original source");
-        };
-        let DmlExecutionError::Compilation(retained) = original else {
-            panic!("preparation must retain its original compilation cause");
-        };
-        assert_eq!(&projected, retained);
-        assert!(projected.detail().contains("same preparation failure"));
-        drop(projected);
-        assert!(!exited.load(Ordering::SeqCst));
-        drop(preparation);
-        assert!(
-            !exited.load(Ordering::SeqCst),
-            "the client still retains the original compile cause"
-        );
-        drop(client);
-        assert!(exited.load(Ordering::SeqCst));
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod affected_count_tests {

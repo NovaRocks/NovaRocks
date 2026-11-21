@@ -250,6 +250,7 @@ pub(crate) struct AcceptedWriteSegment {
     origin: Arc<()>,
     row_count: u64,
     delete_verification: Option<DeleteVerificationCounts>,
+    #[cfg(test)]
     empty: bool,
 }
 impl AcceptedWriteSegment {
@@ -267,6 +268,7 @@ impl AcceptedWriteSegment {
     pub(crate) fn row_count(&self) -> u64 {
         self.row_count
     }
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.empty
     }
@@ -390,6 +392,7 @@ impl ConnectorWriteSession {
             self.plan.commit_session(),
             &query,
             targets,
+            None,
             None,
         )?;
         Ok(query)
@@ -622,6 +625,7 @@ impl ConnectorWriteSession {
                 origin: Arc::clone(&self.decode_origin),
                 row_count,
                 delete_verification,
+                #[cfg(test)]
                 empty,
             },
             notification,

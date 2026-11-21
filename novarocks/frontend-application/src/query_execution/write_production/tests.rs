@@ -121,6 +121,7 @@ fn register_original(
     session: &ConnectorWriteSession,
     scope: &WorkScope,
     driver: &mut JointProgressDriver,
+    rewritten_target: Option<&ConnectorRewrittenTargetFact>,
 ) -> (
     QueryExecutionId,
     PlanSeal,
@@ -136,6 +137,7 @@ fn register_original(
             &[WriteTargetOrdinal::try_new(0).unwrap()],
             &mut ready,
             &mut facts,
+            rewritten_target,
         )
         .unwrap();
     drop((ready, facts));
@@ -174,7 +176,27 @@ fn original_writer_index_is_available_before_first_record_and_without_frontend_l
     bind(&scope, &mut driver);
     let fixture = fixture_with_outcome(2, 1, known_committed());
     let session = &fixture.session;
-    let (execution, plan, owner, facts) = register_original(session, &scope, &mut driver);
+    let instance_id = session.catalog_properties().handle().catalog_name().clone();
+    let supplied = Arc::new([19_u8; 32]);
+    let fact = ConnectorRewrittenTargetFact::new(
+        novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: novarocks_spi::connector::ProviderBindingEpoch::new(),
+        },
+        Arc::clone(&supplied),
+    );
+    let (execution, plan, owner, facts) =
+        register_original(session, &scope, &mut driver, Some(&fact));
+    {
+        let recorded = fixture.recorded.lock().unwrap();
+        let [Some(received)] = recorded.received_rewritten_targets.as_slice() else {
+            panic!("provider registration lost the rewritten target fact");
+        };
+        assert!(Arc::ptr_eq(
+            received.value(instance_id.as_str()).unwrap(),
+            &supplied
+        ));
+    }
     let target = WriteTargetOrdinal::try_new(0).unwrap();
     let proof = {
         let recorded = fixture.recorded.lock().unwrap();
@@ -291,6 +313,7 @@ fn provider_registration_refusal_withdraws_only_its_undispatched_production() {
             &[WriteTargetOrdinal::try_new(0).unwrap()],
             &mut ready,
             &mut facts,
+            None,
         )
         .unwrap();
     assert!(
@@ -344,6 +367,7 @@ fn provider_registration_panic_preserves_unproven_production_and_abort_access() 
             &[WriteTargetOrdinal::try_new(0).unwrap()],
             &mut ready,
             &mut facts,
+            None,
         )
     }));
     assert!(unwound.is_err());
@@ -386,7 +410,8 @@ fn checked_writer_prefix_without_end_keeps_actual_record_and_refuses_cleanup_com
         bind(&scope, &mut driver);
         let fixture = fixture_with_outcome(targets, 1, known_committed());
         let session = fixture.session;
-        let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
+        let (execution, plan, owner, facts) =
+            register_original(&session, &scope, &mut driver, None);
         let mut decoder = decoder(&session, execution, plan);
         decoder
             .apply_relay_body(
@@ -455,7 +480,16 @@ fn complete_actual_end_moves_same_set_then_requires_explicit_publication_disposi
     bind(&scope, &mut driver);
     let fixture = fixture_with_outcome(1, 1, known_committed());
     let session = fixture.session;
-    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
+    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver, None);
+    assert!(matches!(
+        fixture
+            .recorded
+            .lock()
+            .unwrap()
+            .received_rewritten_targets
+            .as_slice(),
+        [None]
+    ));
     let mut decoder = decoder(&session, execution, plan);
     decoder
         .apply_relay_body(
@@ -532,6 +566,7 @@ fn terminal_decision_during_paid_registration_keeps_both_original_sources() {
                 &[WriteTargetOrdinal::try_new(0).unwrap()],
                 &mut ready,
                 &mut facts,
+                None,
             )
             .is_err()
     );
@@ -556,7 +591,7 @@ fn complete_original_end_transfers_same_union_to_abort_call_and_retires_canonica
     bind(&scope, &mut driver);
     let fixture = fixture_with_outcome(1, 1, known_committed());
     let session = fixture.session;
-    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
+    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver, None);
     let mut decoder = decoder(&session, execution, plan);
     decoder
         .apply_relay_body(
@@ -622,7 +657,7 @@ fn cancel_between_precheck_and_claim_hands_same_complete_end_to_original_abort()
     bind(&scope, &mut driver);
     let fixture = fixture_with_outcome(1, 1, known_committed());
     let session = fixture.session;
-    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
+    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver, None);
     let mut decoder = decoder(&session, execution, plan);
     decoder
         .apply_relay_body(

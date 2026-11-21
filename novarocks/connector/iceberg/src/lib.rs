@@ -79,6 +79,7 @@ pub mod metadata_context;
 pub mod metadata_factory;
 mod metadata_json;
 pub mod metadata_read;
+mod parquet_metrics;
 mod partition_row;
 pub mod planning_facts;
 pub mod position_delete;

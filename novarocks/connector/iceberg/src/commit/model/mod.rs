@@ -32,7 +32,7 @@ pub use reuse::{
 
 pub use artifacts::{
     ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactReferences, ArtifactWriter,
-    AttemptArtifacts, CleanupScope, ReceivedPublication,
+    AttemptArtifacts, CleanupScope, ReceivedPublication, RegisteredManifestObservation,
 };
 #[cfg(test)]
 pub use artifacts::{ArtifactOrigin, ArtifactWriteState};

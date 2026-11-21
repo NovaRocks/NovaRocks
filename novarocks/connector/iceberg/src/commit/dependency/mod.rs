@@ -18,22 +18,26 @@
 //! Dependency validation reads only the input class that the dependency requires.
 
 mod builtin;
-#[allow(
-    dead_code,
-    reason = "RWM-12 and RWM-17 consume the history facts after switching their policies."
-)]
 pub(crate) mod history;
 mod inputs;
+mod row_delta;
 
 pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;
+pub(crate) use builtin::validate_with_removed_data;
+pub use history::HistoryGap;
 #[cfg(test)]
-pub use history::{HistoryGap, HistoryWindow, history_window};
+pub use history::{HistoryWindow, history_window};
 #[cfg(test)]
 pub use inputs::LiveSet;
 pub use inputs::ValidationInputs;
+pub(crate) use row_delta::{RemovedDataFiles, RowDeltaWindowCheck};
 
-use super::model::{Dependency, EntryIdentity};
+use novarocks_spi::connector::ConnectorMutationFailure;
+
+use crate::iceberg::spec::TableMetadata;
+
+use super::model::Dependency;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Culprit {
@@ -42,22 +46,30 @@ pub enum Culprit {
         actual: Option<i64>,
     },
     Snapshot(i64),
-    Entry {
-        snapshot: i64,
-        identity: EntryIdentity,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verdict<D = Dependency> {
     Holds,
-    Broken {
-        dependency: D,
-        culprit: Culprit,
-    },
-    #[cfg(test)]
-    Unprovable {
-        dependency: D,
-        reason: HistoryGap,
-    },
+    Broken { dependency: D, culprit: Culprit },
+    ValidationConflict(ConnectorMutationFailure),
+    Unprovable { dependency: D, reason: HistoryGap },
+}
+
+impl Verdict {
+    pub(crate) fn row_delta_conflict(
+        &self,
+        metadata: &TableMetadata,
+        start: Option<i64>,
+        parent: Option<i64>,
+    ) -> Option<ConnectorMutationFailure> {
+        match self {
+            Self::ValidationConflict(failure) => Some(failure.clone()),
+            Self::Unprovable {
+                dependency: Dependency::RowDeltaWindow(_),
+                reason,
+            } => Some(row_delta::history_conflict(reason, metadata, start, parent)),
+            _ => None,
+        }
+    }
 }

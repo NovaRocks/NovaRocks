@@ -1,0 +1,37 @@
+[ {
+  "field-id" : 1,
+  "names" : [ "id" ]
+}, {
+  "field-id" : 2,
+  "names" : [ "amount" ]
+}, {
+  "field-id" : 3,
+  "names" : [ "label" ]
+}, {
+  "field-id" : 4,
+  "names" : [ "payload" ]
+}, {
+  "field-id" : 5,
+  "names" : [ "details" ],
+  "fields" : [ {
+    "field-id" : 7,
+    "names" : [ "flag" ]
+  }, {
+    "field-id" : 8,
+    "names" : [ "comment" ]
+  } ]
+}, {
+  "field-id" : 6,
+  "names" : [ "items" ],
+  "fields" : [ {
+    "field-id" : 9,
+    "names" : [ "element" ],
+    "fields" : [ {
+      "field-id" : 10,
+      "names" : [ "code" ]
+    }, {
+      "field-id" : 11,
+      "names" : [ "note" ]
+    } ]
+  } ]
+} ]

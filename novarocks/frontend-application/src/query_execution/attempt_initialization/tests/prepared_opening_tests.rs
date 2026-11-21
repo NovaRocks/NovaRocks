@@ -392,6 +392,20 @@ impl read::ConnectorReadAttemptAccessSealer for Sealer {
     ) -> Result<read::ConnectorReadAttemptAccessSource, spi::ConnectorError> {
         Ok(mint.seal(Arc::new(Reacquirer(self.0.clone(), self.1.clone()))))
     }
+
+    fn rewritten_target_fact(
+        &self,
+        frozen: &read::ConnectorReadTableHandle,
+    ) -> Result<read::runtime::ConnectorRewrittenTargetFact, spi::ConnectorError> {
+        self.0.table(frozen)?;
+        Ok(spi::ConnectorProcessLocalPayload::new(
+            spi::ConnectorProviderBindingKey {
+                instance_id: self.1.descriptor.instance_id.clone(),
+                incarnation: self.1.epoch,
+            },
+            Arc::new([17_u8; 32]),
+        ))
+    }
 }
 struct Reacquirer(
     Arc<read::adapter::ReadRuntimeAdapter<Provider>>,
@@ -611,6 +625,18 @@ async fn internal_production_opening_cancellation_preserves_original_mio_child_a
         spi::ConnectorControlReadBinding::new(metadata, splits, None, Arc::new(Encoder));
     let frozen = adapter.wrap_table(Table);
     let access = read_group.seal_attempt_access(&request, &frozen).unwrap();
+    assert!(access.rewritten_target_fact().is_none());
+    let target = read_group
+        .seal_row_mutation_attempt_access(&request, &frozen)
+        .unwrap();
+    let rewritten = target.rewritten_target_fact().unwrap();
+    assert_eq!(
+        **rewritten
+            .value::<[u8; 32]>(provider.descriptor.instance_id.as_str())
+            .unwrap(),
+        [17; 32],
+    );
+    drop(target);
     assert!(access.requires_metadata_split_preparation());
     let entry =
         crate::query_execution::preparation::ConnectorAttemptAccessEntry::for_initializer_test(

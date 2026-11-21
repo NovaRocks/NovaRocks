@@ -17,7 +17,7 @@
 
 //! Only this adapter knows Actor routing and its original paid causal result.
 //! Replacement qualification supplies its QA leg directly to the same kernel.
-//! Unmounted P14 test fixture: retain one actual Establish launch job.
+//! Test fixture custody for one actual admission or Establish launch job.
 //!
 //! Mount only beneath the cfg(test) transport module. The caller must retain
 //! this decorator together with its SAME original Source/Host tracker in the
@@ -32,31 +32,31 @@ use novarocks_attempt_protocol::effect::{EffectBody, OperationIntent};
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use std::{
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     task::Waker,
 };
 
 /// Passive keys read from the actual bound job, never an issue authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OriginalHeldEstablish {
+pub(crate) struct OriginalHeldSend {
     pub(crate) participation: ParticipationRef,
     pub(crate) operation: TaskOperationId,
     pub(crate) action: AttemptActionId,
     pub(crate) result_actor: novarocks_control_runtime_core::identity::ActorId,
-    pub(crate) result_input: novarocks_control_runtime_core::identity::InputId,
+    pub(crate) result_position: novarocks_control_runtime_core::identity::InputId,
     pub(crate) result_work: novarocks_control_runtime_core::identity::ScopedWorkRef,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OriginalEstablishRelease {
+pub(crate) enum OriginalSendRelease {
     NotHeld,
     Busy,
-    Accepted(OriginalHeldEstablish),
-    Refused(OriginalHeldEstablish),
+    Accepted(OriginalHeldSend),
+    Refused(OriginalHeldSend),
 }
 
 struct HeldOriginal {
-    metadata: OriginalHeldEstablish,
+    metadata: OriginalHeldSend,
     job: PreparedEffectJob,
 }
 
@@ -66,34 +66,75 @@ struct OriginalHandoffState {
     releasing: bool,
     captured: bool,
     additional_matches: usize,
-    accepted: Option<OriginalHeldEstablish>,
+    accepted: Option<OriginalHeldSend>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OriginalSendTarget {
+    AdmissionTicket(ParticipationRef),
+    #[cfg(novarocks_dev_controls)]
+    Establish(ParticipationRef),
+}
+
+impl OriginalSendTarget {
+    fn matched_participation(self, operation: &OperationIntent) -> Option<ParticipationRef> {
+        match (self, operation) {
+            (
+                Self::AdmissionTicket(expected),
+                OperationIntent::AcquireParticipationAdmissionTicket(request),
+            ) if request.participation() == expected => Some(expected),
+            #[cfg(novarocks_dev_controls)]
+            (
+                Self::Establish(expected),
+                OperationIntent::EstablishParticipation { participation, .. },
+            ) if *participation == expected => Some(expected),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) struct OriginalSendHandoffFixture<'a> {
+    pub(crate) target: OriginalSendTarget,
+    pub(crate) observation: &'a Mutex<Weak<OriginalSendHandoff>>,
+}
+
+impl OriginalSendHandoffFixture<'_> {
+    pub(crate) fn decorate(
+        self,
+        original: Arc<dyn EffectExecutor>,
+        wake: Waker,
+    ) -> Arc<dyn EffectExecutor> {
+        let decorator = OriginalSendHandoff::new(original, self.target, wake);
+        *self.observation.lock().unwrap() = Arc::downgrade(&decorator);
+        decorator
+    }
 }
 
 /// One bounded slot for the SAME paid job. Ordinary jobs use the original
 /// executor unchanged; this fixture cannot create or poll a transport body.
-pub(crate) struct OriginalEstablishHandoff {
+pub(crate) struct OriginalSendHandoff {
     original: Arc<dyn EffectExecutor>,
-    participation: ParticipationRef,
+    target: OriginalSendTarget,
     /// Issued by the same registered Host, not a synthetic test wake.
     wake: Waker,
     state: Mutex<OriginalHandoffState>,
 }
 
-impl OriginalEstablishHandoff {
-    pub(crate) fn new(
+impl OriginalSendHandoff {
+    fn new(
         original: Arc<dyn EffectExecutor>,
-        participation: ParticipationRef,
+        target: OriginalSendTarget,
         wake: Waker,
     ) -> Arc<Self> {
         Arc::new(Self {
             original,
-            participation,
+            target,
             wake,
             state: Mutex::new(OriginalHandoffState::default()),
         })
     }
 
-    pub(crate) fn held(&self) -> Option<OriginalHeldEstablish> {
+    pub(crate) fn held(&self) -> Option<OriginalHeldSend> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -114,7 +155,7 @@ impl OriginalEstablishHandoff {
 
     /// Successful return observes only the original executor's acceptance.
     /// The Source still owes its actual result, body/captures, Join and header.
-    pub(crate) fn accepted(&self) -> Option<OriginalHeldEstablish> {
+    pub(crate) fn accepted(&self) -> Option<OriginalHeldSend> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -123,14 +164,14 @@ impl OriginalEstablishHandoff {
 
     /// The complete job stays in this slot if the original executor refuses.
     /// No rich callback or original-job destructor runs under the slot lock.
-    pub(crate) fn release(&self) -> OriginalEstablishRelease {
+    pub(crate) fn release(&self) -> OriginalSendRelease {
         let held = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.releasing {
-                return OriginalEstablishRelease::Busy;
+                return OriginalSendRelease::Busy;
             }
             let Some(held) = state.held.take() else {
-                return OriginalEstablishRelease::NotHeld;
+                return OriginalSendRelease::NotHeld;
             };
             state.releasing = true;
             held
@@ -146,7 +187,7 @@ impl OriginalEstablishHandoff {
                 // One real original-job handoff, never an empty scan or Full,
                 // notifies only the same registered Host.
                 self.wake.wake_by_ref();
-                OriginalEstablishRelease::Accepted(metadata)
+                OriginalSendRelease::Accepted(metadata)
             }
             Err(job) => {
                 let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -154,7 +195,7 @@ impl OriginalEstablishHandoff {
                 state.held = Some(HeldOriginal { metadata, job });
                 // The original executor owns its availability subscription.
                 // Refusal alone never creates a self-wake or new Work.
-                OriginalEstablishRelease::Refused(metadata)
+                OriginalSendRelease::Refused(metadata)
             }
         }
     }
@@ -168,7 +209,7 @@ impl OriginalEstablishHandoff {
             .additional_matches
     }
 
-    fn original_establish(&self, job: &PreparedEffectJob) -> Option<OriginalHeldEstablish> {
+    fn original_send(&self, job: &PreparedEffectJob) -> Option<OriginalHeldSend> {
         let FrontendEffect::Attempt(effect) = &job.effect else {
             return None;
         };
@@ -176,24 +217,17 @@ impl OriginalEstablishHandoff {
             return None;
         };
         let result_author = job.result.event_author().ok()?;
-        let mut original = batch
-            .operations
-            .iter()
-            .filter_map(|operation| match operation {
-                OperationIntent::EstablishParticipation {
-                    envelope,
-                    participation,
-                    ..
-                } if *participation == self.participation => Some(OriginalHeldEstablish {
-                    participation: *participation,
-                    operation: envelope.operation_id(),
-                    action: effect.protocol.id,
-                    result_actor: result_author.actor(),
-                    result_input: result_author.input(),
-                    result_work: result_author.work(),
-                }),
-                _ => None,
-            });
+        let mut original = batch.operations.iter().filter_map(|operation| {
+            let participation = self.target.matched_participation(operation)?;
+            Some(OriginalHeldSend {
+                participation,
+                operation: operation.operation_id(),
+                action: effect.protocol.id,
+                result_actor: result_author.actor(),
+                result_position: result_author.input(),
+                result_work: result_author.work(),
+            })
+        });
         let metadata = original.next()?;
         // A batch with two matching operations is not the one-operation cut.
         if original.next().is_some() || job.transport.is_some() {
@@ -219,9 +253,9 @@ impl OriginalEstablishHandoff {
     }
 }
 
-impl EffectExecutor for OriginalEstablishHandoff {
+impl EffectExecutor for OriginalSendHandoff {
     fn handoff(&self, job: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
-        let Some(metadata) = self.original_establish(&job) else {
+        let Some(metadata) = self.original_send(&job) else {
             return self.original.handoff(job);
         };
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -239,24 +273,24 @@ impl EffectExecutor for OriginalEstablishHandoff {
 /// Last-resort original custody only. It makes no successful-cleanup claim:
 /// the caller's whole-run guard must also retain the original Source/Host
 /// tracker because that separate owner still holds TransportRetirement.
-struct UnresolvedOriginalEstablish {
+struct UnresolvedOriginalSend {
     _executor: Arc<dyn EffectExecutor>,
     _held: HeldOriginal,
 }
 
-impl Drop for OriginalEstablishHandoff {
+impl Drop for OriginalSendHandoff {
     fn drop(&mut self) {
         let state = self
             .state
             .get_mut()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(held) = state.held.take() {
-            static UNRESOLVED: OnceLock<Mutex<Vec<UnresolvedOriginalEstablish>>> = OnceLock::new();
+            static UNRESOLVED: OnceLock<Mutex<Vec<UnresolvedOriginalSend>>> = OnceLock::new();
             UNRESOLVED
                 .get_or_init(|| Mutex::new(Vec::new()))
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push(UnresolvedOriginalEstablish {
+                .push(UnresolvedOriginalSend {
                     _executor: Arc::clone(&self.original),
                     _held: held,
                 });

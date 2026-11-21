@@ -183,6 +183,8 @@ pub(crate) struct Recorded {
         Option<novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction>,
     pub(crate) abort_received_fragments: Option<usize>,
     pub(crate) received_query_registrations: Vec<RecordedQueryRegistration>,
+    pub(crate) received_rewritten_targets:
+        Vec<Option<novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact>>,
     pub(crate) query_registration_failure: Option<ConnectorError>,
     pub(crate) panic_query_registration: bool,
     pub(crate) fragment_arrivals: usize,
@@ -573,6 +575,9 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         query: &ConnectorWriteQueryIdentity,
         targets: &[WriteTargetOrdinal],
         production: Option<Arc<dyn ConnectorWriteProductionProof>>,
+        rewritten_target: Option<
+            &novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
+        >,
     ) -> Result<(), ConnectorError> {
         let panic = self.recorded.lock().unwrap().panic_query_registration;
         assert!(!panic, "scripted Provider query registration panic");
@@ -591,6 +596,9 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         recorded
             .received_query_registrations
             .push((*query, targets.to_vec(), production));
+        recorded
+            .received_rewritten_targets
+            .push(rewritten_target.cloned());
         Ok(())
     }
 
@@ -1802,7 +1810,7 @@ fn received_input_validation_refusal_moves_no_original_inventory() {
     let control = fixture.session.write_stack_pin.session();
     let commit = fixture.session.plan.commit_session();
     control
-        .begin_write_query(commit, &query, &[target], None)
+        .begin_write_query(commit, &query, &[target], None, None)
         .unwrap();
     let fragment = fixture
         .fake_adapter()

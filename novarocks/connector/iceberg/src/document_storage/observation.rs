@@ -122,6 +122,52 @@ impl ConnectorDocumentStorageObservation for super::create::IcebergDocumentStora
         })
     }
 
+    fn project_keyed_documents_from_observed(
+        &self,
+        request: &KeyedDocumentDefinitionRequest,
+        table: &novarocks_spi::connector::ConnectorTableMetadata,
+    ) -> Result<novarocks_spi::connector::KeyedDocumentView, KeyedDocumentReadError> {
+        use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts;
+
+        request.validate()?;
+        if request.owner.instance_id != self.descriptor().instance_id
+            || request.owner.incarnation != self.incarnation()
+            || request.target != table.identity
+            || table.table.owner() != &request.owner.instance_id
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "keyed document projection differs from its admitted table or generation",
+            )
+            .into());
+        }
+        super::context::check_context(&request.context)?;
+        let source = table.source_read_facts().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "keyed document projection requires the original table observation",
+            )
+        })?;
+        let observed = IcebergObservedSourceReadFacts::current_all(
+            source,
+            &request.owner,
+            &request.target.namespace,
+            &request.target.table,
+        )?;
+        let metadata = observed.access.metadata();
+        super::keyed::project_view(
+            metadata,
+            &KeyedDocumentObservationRequest {
+                owner: request.owner.clone(),
+                catalog_handle: request.catalog_handle.clone(),
+                target: request.target.clone(),
+                object_id: table_object_id(metadata)?,
+                context: request.context.clone(),
+            },
+            committed_version_from_metadata(metadata, observed.access.metadata_location())?,
+        )
+    }
+
     fn observe_keyed_document_definition<'a>(
         &'a self,
         request: &'a KeyedDocumentDefinitionRequest,

@@ -26,7 +26,7 @@ under the License.
 新 attempt 会重新验证同一操作意图，不会把旧请求直接重发。
 
 纯追加可在新的目标 head 上重新准备，起始快照已过期或目标 ref 曾回滚也不要求遍历历史。
-ADD FILES 每轮检查源路径不在目标 ref 当前存活文件集中。DELETE、UPDATE、MERGE、动态分区覆盖、
+[ADD FILES](dml.md#登记已有-parquet-文件) 在输入校验后核对候选路径是否在 `main` 存活。提交重试时同一快照可复用该证据，换快照须复核本批候选。依赖名称映射时还须同轮核对整版 metadata。DELETE、UPDATE、MERGE、动态分区覆盖、
 OPTIMIZE 和 TRUNCATE 当前要求目标 ref 自读取基线起未变；冲突后重新加载若发现 head 已变，就以
 确定未提交的冲突结束。需要重新执行语句来读取新事实，不能复用旧输出绕过检查。静态全表
 INSERT OVERWRITE 按提交时的目标状态覆盖。带基线绑定文档或分区演进的操作也要求 ref 未变。
