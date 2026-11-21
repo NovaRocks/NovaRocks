@@ -17,13 +17,15 @@
 
 //! Iceberg's sole author of operation-specific public commit failure detail.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use novarocks_failure_contract::connector_reason::{
     COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_ERROR, ICEBERG_COMMIT_STATE_UNKNOWN,
     ICEBERG_COMMIT_VALIDATION_CONFLICT,
 };
-use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection, FailureReason};
+use novarocks_failure_contract::{
+    BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause,
+};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
 };
@@ -43,13 +45,12 @@ pub(crate) enum CommitFailureKind {
 #[derive(Debug)]
 struct PublicCommitFailure {
     reason: FailureReason,
-    message: String,
     original: ConnectorMutationFailure,
 }
 
 impl fmt::Display for PublicCommitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        f.write_str("Iceberg commit failed")
     }
 }
 
@@ -81,11 +82,15 @@ pub(crate) fn commit_failure(
         CommitOperation::OptimizeManifests => "Failed to commit during optimize_manifests: ",
         CommitOperation::ExpireSnapshots => "Failed to commit during expire_snapshots: ",
     };
-    let (reason, disposition, message) = match kind {
+    let metadata_maintenance = matches!(
+        operation,
+        CommitOperation::OptimizeManifests | CommitOperation::ExpireSnapshots
+    );
+    let (reason, disposition, body) = match kind {
         CommitFailureKind::Validation => (
             ICEBERG_COMMIT_VALIDATION_CONFLICT,
             ConnectorMutationFailureKind::Conflict,
-            format!("{prefix}{detail}"),
+            Cow::Borrowed(detail),
         ),
         CommitFailureKind::Contention { attempts } => (
             match operation.style() {
@@ -94,32 +99,56 @@ pub(crate) fn commit_failure(
                 CommitStyle::Legacy => unreachable!("legacy failure kept its original projection"),
             },
             ConnectorMutationFailureKind::Conflict,
-            format!("{prefix}{detail} (after {attempts} commit attempts)"),
+            Cow::Owned(format!("{detail} (after {attempts} commit attempts)")),
         ),
-        CommitFailureKind::Rejected => (
-            ICEBERG_COMMIT_ERROR,
-            original.kind(),
-            format!("{prefix}{detail}"),
-        ),
+        CommitFailureKind::Rejected => {
+            (ICEBERG_COMMIT_ERROR, original.kind(), Cow::Borrowed(detail))
+        }
         CommitFailureKind::Unknown => (
-            ICEBERG_COMMIT_STATE_UNKNOWN,
+            // Preserve the metadata procedures' existing Trino diagnostic path.
+            if metadata_maintenance {
+                ICEBERG_COMMIT_ERROR
+            } else {
+                ICEBERG_COMMIT_STATE_UNKNOWN
+            },
             original.kind(),
-            format!(
-                "{prefix}{UNKNOWN_MARKER}{}",
-                detail.trim_start_matches(UNKNOWN_MARKER)
-            ),
+            Cow::Borrowed(detail),
         ),
     };
-    let source = ConnectorError::from_domain(
-        ConnectorErrorKind::Unavailable,
-        PublicCommitFailure {
-            reason,
-            message: message.clone(),
-            original,
-        },
-    )
-    .with_public_failure_detail();
-    ConnectorMutationFailure::new(disposition, message).with_connector_source(source)
+    let marker =
+        if matches!(kind, CommitFailureKind::Unknown) && !body.starts_with("[CommitUnknown]") {
+            UNKNOWN_MARKER
+        } else {
+            ""
+        };
+    let cause = PublicCommitFailure { reason, original };
+    let cause = if metadata_maintenance {
+        // These procedures previously bounded the already prefixed detail.
+        SharedFailureCause::from_bounded_detail(
+            cause,
+            BoundedDetail::truncating_display(format_args!("{prefix}{marker}{body}")),
+        )
+    } else {
+        SharedFailureCause::from_prefixed_public_detail(
+            cause,
+            prefix,
+            marker,
+            BoundedDetail::truncating(&body),
+        )
+    };
+    let source = ConnectorError::from_domain(ConnectorErrorKind::Unavailable, cause)
+        .with_public_failure_detail();
+    if metadata_maintenance {
+        return ConnectorMutationFailure::from_connector(source);
+    }
+    // Preserve the row-delta kernel's original diagnostic. Its public
+    // projection is the Provider-authored cause, carried beside this message.
+    let mutation_detail = if operation == CommitOperation::Write {
+        body.into_owned()
+    } else {
+        source.message().to_owned()
+    };
+    ConnectorMutationFailure::new(disposition, mutation_detail).with_connector_source(source)
 }
 
 #[cfg(test)]

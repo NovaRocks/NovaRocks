@@ -22,7 +22,7 @@
     reason = "RWM-6 consumes this scoped facts interface after switching the writer inputs."
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map::Entry};
 use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,7 @@ use novarocks_spi::connector::{
 use crate::access_binding::IcebergReadBinding;
 
 use crate::commit::manifest_sources::{LocatedEntry, SnapshotSources, duplicate_identity};
+use crate::commit::model::{EntryIdentity, FrozenEntry};
 use crate::commit::write_stack::domain::IcebergDeleteTargetLocator;
 use crate::delete_semantics::{
     ConstructionFailure, DataFileFact, DataSequenceNumber, DeleteCandidateIndex, DeleteFact,
@@ -43,7 +44,8 @@ use crate::delete_semantics::{
 };
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{
-    DataContentType, Manifest, ManifestContentType, ManifestFile, Schema, TableMetadata,
+    DataContentType, DataFileFormat, Manifest, ManifestContentType, ManifestFile, Schema,
+    StructType, TableMetadata,
 };
 use crate::iceberg::{Error, ErrorKind, Result};
 use crate::read_snapshot::{
@@ -508,10 +510,186 @@ impl ManifestReadScope {
 
     /// A commit removes live physical entries even when a deletion vector
     /// supersedes their row-read effect. This borrows only already bound sources.
+    #[cfg(test)]
     pub(crate) fn live_position_entries(&self) -> impl Iterator<Item = &LocatedEntry> {
         self.bound
             .values()
             .flat_map(|source| source.position_entries.values())
+    }
+
+    /// Locate exact live entries for deletion using their own frozen partition
+    /// facts. This physical lookup neither changes nor consults position read
+    /// precedence, so it can locate an equality delete or a shadowed position
+    /// delete by its own identity.
+    pub(crate) async fn locate_live_removals(
+        &mut self,
+        required: &BTreeMap<&EntryIdentity, &FrozenEntry>,
+        io: &FileIO,
+        active: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<BTreeMap<EntryIdentity, LocatedEntry>> {
+        active()?;
+        let domain = self.domain.clone();
+        let endpoint = domain.endpoint();
+        let metadata = self.metadata.clone();
+        let list_path = self.manifest_list.clone();
+        let mut by_spec = BTreeMap::<i32, (StructType, HashSet<(TypedPartition, bool)>)>::new();
+        let mut required_paths = BTreeSet::new();
+        let mut dangling_data_paths = BTreeSet::new();
+        for (&identity, entry) in required {
+            active()?;
+            let facts = entry.facts();
+            let Some(spec) = metadata.partition_spec_by_id(facts.partition_spec_id) else {
+                // A required entry cannot be present under a retired spec.
+                // The commit owner will project it as a missing entry.
+                continue;
+            };
+            let data = matches!(identity, EntryIdentity::DataFile { .. });
+            let (partition_type, partitions) = match by_spec.entry(facts.partition_spec_id) {
+                Entry::Occupied(slot) => slot.into_mut(),
+                Entry::Vacant(slot) => slot.insert((
+                    endpoint
+                        .partition_type(facts.partition_spec_id)
+                        .map_err(delete_error)?,
+                    HashSet::new(),
+                )),
+            };
+            let partition = TypedPartition::bind_type(spec, partition_type, &facts.partition)
+                .map_err(delete_error)?;
+            partitions.insert((partition, data));
+            required_paths.insert(identity.path());
+            if data {
+                dangling_data_paths.insert(identity.path());
+            }
+        }
+        let mut selected = Vec::new();
+        for (&ordinal, descriptor) in self.load_descriptors(io, active).await? {
+            active()?;
+            let spec_id = descriptor.partition_spec_id;
+            let Some((_, partitions)) = by_spec.get(&spec_id) else {
+                continue;
+            };
+            let spec = metadata
+                .partition_spec_by_id(spec_id)
+                .ok_or_else(|| invalid(format!("Unknown target partition spec {spec_id}")))?;
+            let data = descriptor.content == ManifestContentType::Data;
+            if partitions.iter().any(|(partition, data_requested)| {
+                (!data || *data_requested) && may_contain(descriptor, spec, partition)
+            }) {
+                selected.push((ordinal, descriptor.clone()));
+            }
+        }
+        let mut located = BTreeMap::new();
+        for (source_index, descriptor) in &selected {
+            active()?;
+            let source = ManifestSource::committed(endpoint.snapshot_id(), &list_path, descriptor);
+            let index = self.bound_source(*source_index, source, io, active).await?;
+            for entry in index.entries(source) {
+                active()?;
+                if !entry.raw.is_alive() {
+                    continue;
+                }
+                let file = entry.raw.data_file();
+                let may_dangle = file.content_type() == DataContentType::PositionDeletes
+                    && file.file_format() == DataFileFormat::Puffin
+                    && file
+                        .referenced_data_file()
+                        .is_some_and(|target| dangling_data_paths.contains(target.as_str()));
+                if !required_paths.contains(file.file_path()) && !may_dangle {
+                    continue;
+                }
+                let entry = LocatedEntry::from_bound(*source_index, &entry)?;
+                let identity = entry.frozen.identity();
+                if required.contains_key(identity) || may_dangle {
+                    match located.entry(identity.clone()) {
+                        Entry::Vacant(slot) => {
+                            slot.insert(entry);
+                        }
+                        Entry::Occupied(slot) => {
+                            return Err(duplicate_identity(slot.key()));
+                        }
+                    }
+                }
+            }
+        }
+        active()?;
+        Ok(located)
+    }
+
+    async fn load_descriptors(
+        &mut self,
+        io: &FileIO,
+        active: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<&BTreeMap<usize, ManifestFile>> {
+        self.authorize(&self.manifest_list).await?;
+        if self.descriptors.is_none() {
+            let encoded_size = if self.owned_request.is_some() {
+                let bytes = io.new_input(&self.manifest_list)?.metadata().await?.size;
+                self.reserve_owned(bytes).await?;
+                bytes
+            } else {
+                0
+            };
+            let snapshot = self
+                .metadata
+                .snapshot_by_id(self.domain.endpoint().snapshot_id())
+                .ok_or_else(|| invalid("Fixed target snapshot disappeared from pinned metadata"))?;
+            let sources = SnapshotSources::load(&self.metadata, snapshot, io, active).await?;
+            let descriptors = sources.into_indexed_descriptors();
+            if self.owned_request.is_some() {
+                let bytes = descriptor_bytes(descriptors.values())?;
+                self.reserve_owned(bytes.saturating_sub(encoded_size))
+                    .await?;
+            }
+            self.descriptors = Some(descriptors);
+        }
+        self.descriptors
+            .as_ref()
+            .ok_or_else(|| invalid("Manifest list not loaded"))
+    }
+
+    async fn bound_source(
+        &mut self,
+        source_index: usize,
+        source: ManifestSource<'_>,
+        io: &FileIO,
+        active: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<Arc<BoundLookup>> {
+        self.authorize(&source.descriptor.manifest_path).await?;
+        if let Some(index) = self.bound.get(&source_index) {
+            return Ok(index.clone());
+        }
+        let spec_id = source.descriptor.partition_spec_id;
+        let metadata = self.metadata.clone();
+        let spec = metadata
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| invalid(format!("Unknown target partition spec {spec_id}")))?;
+        let partition_type = self
+            .domain
+            .endpoint()
+            .partition_type(spec_id)
+            .map_err(delete_error)?;
+        let raw = self.read_raw(source, io, active).await?;
+        let minimum = (std::mem::size_of::<BoundLookup>() as u64).saturating_add(
+            raw.manifest.entries().len() as u64 * std::mem::size_of::<ResolvedEntry>() as u64,
+        );
+        self.reserve_owned(minimum).await?;
+        let mut receipt = self.reserve_cache(minimum)?;
+        let mut index = bind_source(
+            source_index,
+            source,
+            &self.schema,
+            spec,
+            &partition_type,
+            raw,
+            active,
+        )?;
+        let actual = bound_lookup_bytes(&index);
+        self.reserve_owned(actual.saturating_sub(minimum)).await?;
+        self.grow_cache(&mut receipt, actual)?;
+        index._receipt = receipt;
+        let index = Arc::new(index);
+        self.bound.insert(source_index, index.clone());
+        Ok(index)
     }
 
     async fn observe_inner(
@@ -540,37 +718,9 @@ impl ManifestReadScope {
         let mut data = BTreeMap::new();
         let mut selected_bound = BTreeMap::new();
         if !targets.is_empty() {
-            self.authorize(&self.manifest_list).await?;
-            if self.descriptors.is_none() {
-                let encoded_size = if self.owned_request.is_some() {
-                    let bytes = io.new_input(&self.manifest_list)?.metadata().await?.size;
-                    self.reserve_owned(bytes).await?;
-                    bytes
-                } else {
-                    0
-                };
-                let snapshot = self
-                    .metadata
-                    .snapshot_by_id(endpoint.snapshot_id())
-                    .ok_or_else(|| {
-                        invalid("Fixed target snapshot disappeared from pinned metadata")
-                    })?;
-                let sources = SnapshotSources::load(&self.metadata, snapshot, io, &active).await?;
-                let descriptors = sources.into_indexed_descriptors();
-                if self.owned_request.is_some() {
-                    let bytes = descriptor_bytes(descriptors.values())?;
-                    self.reserve_owned(bytes.saturating_sub(encoded_size))
-                        .await?;
-                }
-                self.descriptors = Some(descriptors);
-            }
-            let descriptors = self
-                .descriptors
-                .as_ref()
-                .ok_or_else(|| invalid("Manifest list not loaded"))?;
             let metadata = self.metadata.clone();
-            let schema = self.schema.clone();
             let manifest_list = self.manifest_list.clone();
+            let descriptors = self.load_descriptors(io, &active).await?;
             for (&ordinal, descriptor) in descriptors {
                 active()?;
                 let spec_id = descriptor.partition_spec_id;
@@ -589,7 +739,6 @@ impl ManifestReadScope {
             }
             for (&source_index, descriptor) in &processed {
                 active()?;
-                self.authorize(&descriptor.manifest_path).await?;
                 let spec_id = descriptor.partition_spec_id;
                 let spec = metadata
                     .partition_spec_by_id(spec_id)
@@ -597,34 +746,7 @@ impl ManifestReadScope {
                 let source =
                     ManifestSource::committed(endpoint.snapshot_id(), &manifest_list, descriptor);
                 let partition_type = endpoint.partition_type(spec_id).map_err(delete_error)?;
-                let index = match self.bound.get(&source_index).cloned() {
-                    Some(index) => index,
-                    None => {
-                        let raw = self.read_raw(source, io, &active).await?;
-                        let minimum = (std::mem::size_of::<BoundLookup>() as u64).saturating_add(
-                            raw.manifest.entries().len() as u64
-                                * std::mem::size_of::<ResolvedEntry>() as u64,
-                        );
-                        self.reserve_owned(minimum).await?;
-                        let mut receipt = self.reserve_cache(minimum)?;
-                        let mut index = bind_source(
-                            source_index,
-                            source,
-                            &schema,
-                            spec,
-                            &partition_type,
-                            raw,
-                            &active,
-                        )?;
-                        let actual = bound_lookup_bytes(&index);
-                        self.reserve_owned(actual.saturating_sub(minimum)).await?;
-                        self.grow_cache(&mut receipt, actual)?;
-                        index._receipt = receipt;
-                        let index = Arc::new(index);
-                        self.bound.insert(source_index, index.clone());
-                        index
-                    }
-                };
+                let index = self.bound_source(source_index, source, io, &active).await?;
                 match descriptor.content {
                     ManifestContentType::Data => {
                         for (path, expected) in &targets {
@@ -991,472 +1113,4 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::iceberg::spec::{
-        DataFile, DataFileBuilder, DataFileFormat, Datum, FieldSummary, FormatVersion, Literal,
-        ManifestListWriter, ManifestWriterBuilder, NestedField, Operation, PartitionSpec,
-        PrimitiveType, Schema, Snapshot, SortOrder, Struct, Summary, TableMetadataBuilder,
-        Transform, Type,
-    };
-
-    const SNAPSHOT_ID: i64 = 21;
-    const LIST_PATH: &str = "memory:///list.avro";
-    const DATA_PATH: &str = "memory:///data.avro";
-    const DELETE_PATH: &str = "memory:///delete.avro";
-    const TARGET: &str = "memory:///target.parquet";
-
-    #[derive(Clone, Copy)]
-    enum Positions {
-        Matching,
-        WrongPartition,
-        DuplicateDv,
-        DuplicateDvAcrossSources,
-        DvOverParquet,
-    }
-
-    fn partition(value: i32) -> Struct {
-        Struct::from_iter([Some(Literal::int(value))])
-    }
-
-    fn data(path: &str, partition_value: i32) -> DataFile {
-        DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path(path.into())
-            .file_format(DataFileFormat::Parquet)
-            .partition(partition(partition_value))
-            .record_count(5)
-            .file_size_in_bytes(123)
-            .build()
-            .unwrap()
-    }
-
-    fn position(path: &str, target: &str, value: i32, dv_offset: Option<i64>) -> DataFile {
-        let mut builder = DataFileBuilder::default();
-        builder
-            .content(DataContentType::PositionDeletes)
-            .file_path(path.into())
-            .partition(partition(value))
-            .record_count(2)
-            .file_size_in_bytes(111)
-            .referenced_data_file(Some(target.into()));
-        match dv_offset {
-            Some(offset) => {
-                builder
-                    .file_format(DataFileFormat::Puffin)
-                    .content_offset(Some(offset))
-                    .content_size_in_bytes(Some(9));
-            }
-            None => {
-                builder.file_format(DataFileFormat::Parquet);
-            }
-        }
-        builder.build().unwrap()
-    }
-
-    async fn fixture(positions: Positions, unknown_summary: bool) -> (TableMetadata, FileIO) {
-        let io = FileIO::new_with_memory();
-        let schema = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "p",
-                Type::Primitive(PrimitiveType::Int),
-            ))])
-            .build()
-            .unwrap();
-        let spec = PartitionSpec::builder(Arc::new(schema.clone()))
-            .with_spec_id(0)
-            .add_partition_field("p", "p_key", Transform::Identity)
-            .unwrap()
-            .build()
-            .unwrap();
-        let metadata = TableMetadataBuilder::new(
-            schema,
-            spec.into_unbound(),
-            SortOrder::unsorted_order(),
-            "memory:///table".into(),
-            FormatVersion::V3,
-            Default::default(),
-        )
-        .unwrap()
-        .build()
-        .unwrap()
-        .metadata;
-        let spec = metadata.default_partition_spec().as_ref().clone();
-        let other_spec = PartitionSpec::builder(metadata.current_schema().clone())
-            .with_spec_id(1)
-            .add_partition_field("p", "p_bucket", Transform::Bucket(8))
-            .unwrap()
-            .build()
-            .unwrap();
-        let metadata = metadata
-            .into_builder(None)
-            .add_partition_spec(other_spec.into_unbound())
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-        let writer = |path| {
-            ManifestWriterBuilder::new(
-                io.new_output(path).unwrap(),
-                Some(SNAPSHOT_ID),
-                metadata.current_schema().clone(),
-                spec.clone(),
-            )
-        };
-
-        let mut data_writer = writer(DATA_PATH).build_v3_data();
-        data_writer
-            .add_file(data("memory:///unrequested.parquet", 10), 3)
-            .unwrap();
-        data_writer.add_file(data(TARGET, 10), 3).unwrap();
-        let data = data_writer.write_manifest_file().await.unwrap();
-
-        let mut delete_writer = writer(DELETE_PATH).build_v3_deletes();
-        delete_writer
-            .add_file(position("memory:///other.pos", "other", 10, None), 4)
-            .unwrap();
-        match positions {
-            Positions::Matching | Positions::DvOverParquet => delete_writer
-                .add_file(position("memory:///target.pos", TARGET, 10, None), 4)
-                .unwrap(),
-            Positions::WrongPartition => delete_writer
-                .add_file(position("memory:///target.pos", TARGET, 11, None), 4)
-                .unwrap(),
-            Positions::DuplicateDvAcrossSources => delete_writer
-                .add_file(position("memory:///dv.puffin", TARGET, 10, Some(4)), 4)
-                .unwrap(),
-            Positions::DuplicateDv => {
-                delete_writer
-                    .add_file(position("memory:///dv.puffin", TARGET, 10, Some(4)), 4)
-                    .unwrap();
-                delete_writer
-                    .add_file(position("memory:///dv.puffin", TARGET, 10, Some(40)), 4)
-                    .unwrap();
-            }
-        }
-        let delete = delete_writer.write_manifest_file().await.unwrap();
-        let extra_delete = match positions {
-            Positions::DuplicateDvAcrossSources | Positions::DvOverParquet => {
-                let mut writer = writer("memory:///extra-delete.avro").build_v3_deletes();
-                writer
-                    .add_file(position("memory:///dv.puffin", TARGET, 10, Some(40)), 4)
-                    .unwrap();
-                Some(writer.write_manifest_file().await.unwrap())
-            }
-            _ => None,
-        };
-
-        // These paths are absent in FileIO. Successful target observation
-        // therefore proves the exact spec and inclusive summary eliminated them.
-        let bound = Datum::int(99).to_bytes().unwrap();
-        let missing_partition = ManifestFile {
-            manifest_path: "memory:///summary-pruned.avro".into(),
-            partitions: (!unknown_summary).then(|| {
-                vec![FieldSummary {
-                    contains_null: false,
-                    contains_nan: Some(false),
-                    lower_bound: Some(bound.clone()),
-                    upper_bound: Some(bound),
-                }]
-            }),
-            ..data.clone()
-        };
-        let missing_spec = ManifestFile {
-            manifest_path: "memory:///spec-pruned.avro".into(),
-            partition_spec_id: 1,
-            ..delete.clone()
-        };
-        let mut list = ManifestListWriter::v3(
-            io.new_output(LIST_PATH).unwrap().writer().await.unwrap(),
-            SNAPSHOT_ID,
-            None,
-            4,
-            Some(0),
-        );
-        list.add_manifests(
-            [data, missing_partition, missing_spec, delete]
-                .into_iter()
-                .chain(extra_delete),
-        )
-        .unwrap();
-        let added = list.next_row_id().unwrap();
-        list.close().await.unwrap();
-        let snapshot = Snapshot::builder()
-            .with_snapshot_id(SNAPSHOT_ID)
-            .with_sequence_number(4)
-            .with_timestamp_ms(metadata.last_updated_ms() + 1)
-            .with_manifest_list(LIST_PATH)
-            .with_summary(Summary {
-                operation: Operation::Overwrite,
-                additional_properties: Default::default(),
-            })
-            .with_schema_id(metadata.current_schema_id())
-            .with_row_range(0, added)
-            .build();
-        (
-            metadata
-                .into_builder(None)
-                .add_snapshot(snapshot)
-                .unwrap()
-                .build()
-                .unwrap()
-                .metadata,
-            io,
-        )
-    }
-
-    async fn query(metadata: &TableMetadata, io: &FileIO) -> Result<TargetObservation> {
-        let partition = TypedPartition::bind(
-            metadata.partition_spec_by_id(0).unwrap(),
-            metadata.current_schema(),
-            &partition(10),
-        )
-        .unwrap();
-        observe_targets(
-            metadata,
-            SNAPSHOT_ID,
-            BTreeMap::from([(TARGET.to_owned(), partition)]),
-            io,
-            || Ok(()),
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn completion_only_covers_processed_sources_and_keeps_original_ordinals() {
-        let (metadata, io) = fixture(Positions::Matching, false).await;
-        let result = query(&metadata, &io).await.unwrap();
-        assert_eq!(
-            result.completion.domain.endpoint().snapshot_id(),
-            SNAPSHOT_ID
-        );
-        assert_eq!(result.completion.manifest_list, LIST_PATH);
-        assert_eq!(
-            result
-                .completion
-                .targets
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [TARGET]
-        );
-        assert_eq!(
-            result
-                .completion
-                .processed
-                .values()
-                .map(|m| m.manifest_path.as_str())
-                .collect::<Vec<_>>(),
-            [DATA_PATH, DELETE_PATH],
-        );
-        let target = &result.files[TARGET];
-        assert_eq!(target.data.ordinal, 1);
-        assert_eq!(target.data.source_index, 0);
-        assert_eq!(target.data.frozen.identity().path(), TARGET);
-        assert_eq!(target.data.frozen.facts().record_count, 5);
-        assert_eq!(target.data.frozen.facts().data_sequence, Some(3));
-        assert_eq!(target.data.frozen.facts().first_row_id, Some(5));
-        assert_eq!(
-            target
-                .positions
-                .iter()
-                .map(|f| (f.source_index, f.ordinal, f.frozen.identity().path()))
-                .collect::<Vec<_>>(),
-            [(3, 1, "memory:///target.pos")],
-        );
-    }
-
-    struct AccountedBytes(Arc<std::sync::atomic::AtomicU64>);
-
-    struct Receipt {
-        used: Arc<std::sync::atomic::AtomicU64>,
-        bytes: u64,
-    }
-
-    impl novarocks_spi::connector::ConnectorResourceLedger for AccountedBytes {
-        fn checkpoint(
-            &self,
-        ) -> std::result::Result<
-            novarocks_spi::connector::ConnectorResourceCheckpoint,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Ok(novarocks_spi::connector::ConnectorResourceCheckpoint::new(
-                0,
-            ))
-        }
-
-        fn try_reserve(
-            &self,
-            class: ConnectorResourceClass,
-            bytes: u64,
-        ) -> std::result::Result<
-            Box<dyn novarocks_spi::connector::ConnectorReservationBackend>,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            assert_eq!(class, ConnectorResourceClass::WriterState);
-            self.0
-                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-            Ok(Box::new(Receipt {
-                used: self.0.clone(),
-                bytes,
-            }))
-        }
-    }
-
-    impl novarocks_spi::connector::ConnectorReservationBackend for Receipt {
-        fn bytes(&self) -> u64 {
-            self.bytes
-        }
-
-        fn try_grow(
-            &mut self,
-            additional: u64,
-        ) -> std::result::Result<(), novarocks_spi::connector::ConnectorError> {
-            self.used
-                .fetch_add(additional, std::sync::atomic::Ordering::Relaxed);
-            self.bytes += additional;
-            Ok(())
-        }
-
-        fn shrink_to(
-            &mut self,
-            bytes: u64,
-        ) -> std::result::Result<(), novarocks_spi::connector::ConnectorError> {
-            self.used
-                .fetch_sub(self.bytes - bytes, std::sync::atomic::Ordering::Relaxed);
-            self.bytes = bytes;
-            Ok(())
-        }
-    }
-
-    impl Drop for Receipt {
-        fn drop(&mut self) {
-            self.used
-                .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    #[tokio::test]
-    async fn position_composite_prefers_dv_from_an_independent_source() {
-        let (metadata, io) = fixture(Positions::DvOverParquet, false).await;
-        let metadata = Arc::new(metadata);
-        let typed = TypedPartition::bind(
-            metadata.partition_spec_by_id(0).unwrap(),
-            metadata.current_schema(),
-            &partition(10),
-        )
-        .unwrap();
-        let mut scope = ManifestReadScope::new(metadata, SNAPSHOT_ID).unwrap();
-        let observation = scope
-            .observe(BTreeMap::from([(TARGET.to_owned(), typed)]), &io, || Ok(()))
-            .await
-            .unwrap();
-        let physical = scope
-            .live_position_entries()
-            .map(|entry| entry.frozen.identity())
-            .collect::<Vec<_>>();
-        assert!(physical.iter().any(|identity| matches!(
-            identity,
-            crate::commit::model::EntryIdentity::DeleteFile { .. }
-        )));
-        assert!(physical.iter().any(|identity| matches!(
-            identity,
-            crate::commit::model::EntryIdentity::DeletionVector { .. }
-        )));
-        let [position] = observation.files[TARGET].positions.as_slice() else {
-            panic!("DV must suppress the independent positional source");
-        };
-        assert_eq!(position.entry.source_index, 4);
-        assert!(matches!(
-            position.delete().address(),
-            crate::delete_semantics::DeleteContentAddress::PuffinBlob { offset: 40, .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn warm_scope_reuses_bound_and_composite_facts_but_rebind_keeps_only_raw() {
-        let (metadata, io) = fixture(Positions::Matching, false).await;
-        let metadata = Arc::new(metadata);
-        let typed = TypedPartition::bind(
-            metadata.partition_spec_by_id(0).unwrap(),
-            metadata.current_schema(),
-            &partition(10),
-        )
-        .unwrap();
-        let targets = || BTreeMap::from([(TARGET.to_owned(), typed.clone())]);
-        let mut scope = ManifestReadScope::new(metadata.clone(), SNAPSHOT_ID).unwrap();
-        let used = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        scope.resources = Some(ConnectorExecutionResources::from_admitted_ledger(Arc::new(
-            AccountedBytes(used.clone()),
-        )));
-        let first = scope.observe(targets(), &io, || Ok(())).await.unwrap();
-        let warm = scope.observe(targets(), &io, || Ok(())).await.unwrap();
-        assert!(Arc::ptr_eq(
-            &first.completion.domain,
-            &warm.completion.domain
-        ));
-        assert_eq!(scope.composites.len(), 1);
-        let first_source = &first.files[TARGET].positions[0]._source;
-        let warm_source = &warm.files[TARGET].positions[0]._source;
-        assert!(Arc::ptr_eq(first_source, warm_source));
-
-        let mut rebound_scope = scope.rebind(metadata, SNAPSHOT_ID).unwrap();
-        let rebound = rebound_scope
-            .observe(targets(), &io, || Ok(()))
-            .await
-            .unwrap();
-        let rebound_source = &rebound.files[TARGET].positions[0]._source;
-        assert!(!Arc::ptr_eq(
-            &first.completion.domain,
-            &rebound.completion.domain
-        ));
-        assert!(!Arc::ptr_eq(first_source, rebound_source));
-        assert!(Arc::ptr_eq(&first_source.raw, &rebound_source.raw));
-
-        let locator = first.files[TARGET].data_locator(&first.completion).unwrap();
-        let previous = Arc::downgrade(&first_source.raw);
-        let previous_domain = first.completion.domain.clone();
-        scope.evict();
-        assert!(previous.upgrade().is_some());
-        assert!(used.load(std::sync::atomic::Ordering::Relaxed) > 0);
-        drop(first);
-        drop(warm);
-        drop(rebound);
-        drop(rebound_scope);
-        scope.evict();
-        assert!(previous.upgrade().is_none());
-        assert_eq!(used.load(std::sync::atomic::Ordering::Relaxed), 0);
-        let cold = scope.observe(targets(), &io, || Ok(())).await.unwrap();
-        assert!(Arc::ptr_eq(&previous_domain, &cold.completion.domain));
-        assert_eq!(
-            cold.files[TARGET].data_locator(&cold.completion).unwrap(),
-            locator
-        );
-        let sources = scope.snapshot_sources().unwrap();
-        assert_eq!(sources.source_index_for_list_ordinal(3), Some(3));
-    }
-
-    #[tokio::test]
-    async fn unknown_summary_does_not_hide_an_unreadable_candidate() {
-        let (metadata, io) = fixture(Positions::Matching, true).await;
-        assert!(query(&metadata, &io).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn observed_exact_partition_contradiction_and_duplicate_dv_fail_the_scope() {
-        for (positions, expected) in [
-            (Positions::WrongPartition, "partition differs from target"),
-            (Positions::DuplicateDv, "multiple live deletion vector"),
-            (
-                Positions::DuplicateDvAcrossSources,
-                "multiple DVs for one target",
-            ),
-        ] {
-            let (metadata, io) = fixture(positions, false).await;
-            let error = query(&metadata, &io).await.unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::DataInvalid);
-            assert!(error.to_string().contains(expected), "{error}");
-        }
-    }
-}
+mod tests;

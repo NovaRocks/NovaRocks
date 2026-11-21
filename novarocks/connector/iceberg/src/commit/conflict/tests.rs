@@ -16,6 +16,10 @@
 // under the License.
 
 use super::*;
+use novarocks_failure_contract::{
+    FailureClass, FailureFact,
+    connector_reason::{COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_VALIDATION_CONFLICT},
+};
 
 #[test]
 fn commit_failure_projects_the_original_typed_category_and_message() {
@@ -57,9 +61,14 @@ fn commit_failure_projects_the_original_typed_category_and_message() {
             failure.failure_fact(),
             FailureFact::new(FailureClass::Dependency, reason)
         );
-        assert_eq!(
-            failure.connector_source().unwrap().failure_fact().reason(),
-            reason
-        );
+        let source = failure.connector_source().unwrap();
+        assert_eq!(source.failure_fact().reason(), reason);
+        let marker = if reason == ICEBERG_COMMIT_STATE_UNKNOWN {
+            "[CommitUnknown] "
+        } else {
+            ""
+        };
+        let expected = format!("Failed to commit the transaction during write: {marker}{message}");
+        assert_eq!(source.public_failure_detail(), Some(expected.as_str()));
     }
 }

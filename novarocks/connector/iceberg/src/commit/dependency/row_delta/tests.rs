@@ -23,6 +23,8 @@ use novarocks_failure_contract::connector_reason::ICEBERG_COMMIT_VALIDATION_CONF
 use novarocks_spi::connector::{ConnectorMutationFailureKind, ConnectorWriteOperationId};
 use tempfile::TempDir;
 
+use iceberg::spec::DataFile;
+
 use super::*;
 use crate::commit::dependency::validate_with_removed_data;
 use crate::commit::model::{

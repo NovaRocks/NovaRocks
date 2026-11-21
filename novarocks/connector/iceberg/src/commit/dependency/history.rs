@@ -64,22 +64,51 @@ pub fn history_window(
     {
         return Err(HistoryGap::StartExpired(start));
     }
+    walk_history(metadata, start, parent).map_err(|failure| failure.reason)
+}
+
+#[derive(Debug)]
+struct HistoryWalkFailure {
+    reason: HistoryGap,
+    last_known: Option<i64>,
+}
+
+pub(super) fn rewrite_files_history_window(
+    metadata: &TableMetadata,
+    start: Option<i64>,
+    parent: Option<i64>,
+) -> Result<HistoryWindow, Option<i64>> {
+    // The pointer to E proves the endpoint, even if E itself has expired.
+    walk_history(metadata, start, parent).map_err(|failure| failure.last_known)
+}
+
+fn walk_history(
+    metadata: &TableMetadata,
+    start: Option<i64>,
+    parent: Option<i64>,
+) -> Result<HistoryWindow, HistoryWalkFailure> {
     let mut next = parent;
     let mut visited = BTreeSet::new();
     let mut snapshots = Vec::new();
     while next != start {
+        let failure = |reason| HistoryWalkFailure {
+            reason,
+            last_known: snapshots
+                .last()
+                .map(|snapshot: &SnapshotRef| snapshot.snapshot_id()),
+        };
         let Some(id) = next else {
-            return Err(HistoryGap::StartNotAncestor {
+            return Err(failure(HistoryGap::StartNotAncestor {
                 start: start.expect("unequal absent endpoints"),
                 parent,
-            });
+            }));
         };
         if !visited.insert(id) {
-            return Err(HistoryGap::Cycle(id));
+            return Err(failure(HistoryGap::Cycle(id)));
         }
         let snapshot = metadata
             .snapshot_by_id(id)
-            .ok_or(HistoryGap::SnapshotMissing(id))?;
+            .ok_or_else(|| failure(HistoryGap::SnapshotMissing(id)))?;
         snapshots.push(snapshot.clone());
         next = snapshot.parent_snapshot_id();
     }
@@ -89,3 +118,6 @@ pub fn history_window(
         snapshots,
     })
 }
+
+#[cfg(test)]
+mod tests;

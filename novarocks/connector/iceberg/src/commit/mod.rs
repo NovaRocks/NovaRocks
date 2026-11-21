@@ -22,8 +22,8 @@
 
 mod action;
 pub(crate) mod attempt;
-#[cfg(test)]
-mod commit_failure;
+pub(crate) mod base_removal;
+pub(crate) mod commit_failure;
 pub(crate) mod conflict;
 pub(crate) mod conflict_scope;
 mod data_file;

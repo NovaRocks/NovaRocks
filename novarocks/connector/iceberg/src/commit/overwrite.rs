@@ -505,9 +505,9 @@ mod tests {
     use super::*;
     use crate::commit::attempt::{self, RetryPolicy};
     use crate::commit::model::{
-        AddedContent, Dependency, FileChanges, IcebergCleanupReport, IsolationLevel,
-        OperationIntent, OperationIntentParts, OperationToken, PublicationOutcome, RequestShape,
-        StartSnapshot, TableTarget,
+        AddedContent, Dependency, FileChanges, IcebergCleanupReport, OperationIntent,
+        OperationIntentParts, OperationToken, PublicationOutcome, RequestShape, StartSnapshot,
+        TableTarget,
     };
     use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
     use crate::commit::staging::PreparedChange;
@@ -966,7 +966,7 @@ mod tests {
 pub(crate) mod preparer_tests {
     use super::*;
     use crate::commit::model::{
-        AddedContent, Dependency, FileChanges, FrozenRequest, IsolationLevel, OperationIntent,
+        AddedContent, Dependency, FileChanges, FrozenRequest, OperationIntent,
         OperationIntentParts, OperationToken, RequestShape, TableTarget,
     };
     use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};

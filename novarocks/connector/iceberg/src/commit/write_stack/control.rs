@@ -4798,8 +4798,8 @@ mod eager_attempt_io_tests {
         dispatch: Arc<CountingDispatch>,
     ) -> StagedAttempt {
         use crate::commit::model::{
-            AddedContent, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
-            RequestShape, TableTarget,
+            AddedContent, FileChanges, OperationIntent, OperationIntentParts, RequestShape,
+            TableTarget,
         };
         use crate::commit::staging::{StagingBase, StagingEngine};
         let table = fixture.table.clone();

@@ -25,8 +25,8 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::CatalogPublisher;
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    AttemptToken, BaseIdentity, Dependency, FileChanges, FrozenRequest, OperationIntent,
-    OperationIntentParts, OperationToken, RequestShape, TableTarget,
+    AttemptToken, BaseIdentity, CommitOperation, Dependency, FileChanges, FrozenRequest,
+    OperationIntent, OperationIntentParts, OperationToken, RequestShape, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::snapshot_lifecycle_helpers::reclamation::ReclamationReport;
@@ -59,9 +59,7 @@ use novarocks_spi::connector::{
 };
 
 use super::maintenance_admission::{RetentionProcedure, validate_retention_procedure};
-use super::maintenance_error::{
-    CommitFailureDisposition, MaintenanceCommitProcedure, commit_failure,
-};
+use super::maintenance_error::{CommitFailureDisposition, project_maintenance_commit_failure};
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
 use crate::catalog::{CatalogTableName, SnapshotLoading};
 use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::{
@@ -603,7 +601,7 @@ impl MaintenanceEngine {
         .await;
         let outcome = public_outcome(journal.project(report));
         let outcome = if sql_execute {
-            project_commit_failure(outcome, MaintenanceCommitProcedure::OptimizeManifests)
+            project_commit_failure(outcome, CommitOperation::OptimizeManifests)
         } else {
             outcome
         };
@@ -783,7 +781,7 @@ impl MaintenanceEngine {
                 let wait = policy.backoff(ordinal);
                 if wait >= policy.total_timeout().saturating_sub(started.elapsed()) {
                     return Ok(if payload.sql_execute {
-                        project_commit_failure(outcome, MaintenanceCommitProcedure::ExpireSnapshots)
+                        project_commit_failure(outcome, CommitOperation::ExpireSnapshots)
                     } else {
                         outcome
                     });
@@ -838,7 +836,7 @@ impl MaintenanceEngine {
                 return Ok(public_outcome(journal.catalog_entry_outcome(entry)));
             }
             return Ok(if payload.sql_execute {
-                project_commit_failure(outcome, MaintenanceCommitProcedure::ExpireSnapshots)
+                project_commit_failure(outcome, CommitOperation::ExpireSnapshots)
             } else {
                 outcome
             });
@@ -1125,13 +1123,13 @@ pub(crate) struct MaintenancePublication {
 }
 fn project_commit_failure(
     outcome: ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>,
-    procedure: MaintenanceCommitProcedure,
+    operation: CommitOperation,
 ) -> ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt> {
     match outcome {
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ExternalMutationOutcome::KnownUncommitted {
-                failure: commit_failure(
-                    procedure,
+                failure: project_maintenance_commit_failure(
+                    operation,
                     CommitFailureDisposition::KnownUncommitted,
                     failure,
                 ),
@@ -1140,7 +1138,11 @@ fn project_commit_failure(
         }
         ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
             ExternalMutationOutcome::CommitUnknown {
-                failure: commit_failure(procedure, CommitFailureDisposition::Unknown, failure),
+                failure: project_maintenance_commit_failure(
+                    operation,
+                    CommitFailureDisposition::Unknown,
+                    failure,
+                ),
                 evidence,
             }
         }

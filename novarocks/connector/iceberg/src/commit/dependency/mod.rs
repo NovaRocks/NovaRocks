@@ -20,7 +20,9 @@
 mod builtin;
 pub(crate) mod history;
 mod inputs;
+mod rewrite_files;
 mod row_delta;
+mod window;
 
 pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;

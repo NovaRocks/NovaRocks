@@ -19,15 +19,15 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_failure_contract::connector_reason::{
-    COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_STATE_UNKNOWN, ICEBERG_COMMIT_VALIDATION_CONFLICT,
+use novarocks_failure_contract::{
+    FailureProjection, connector_reason::ICEBERG_COMMIT_STATE_UNKNOWN,
 };
-use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection, FailureReason};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorError, ConnectorMutationFailure, ConnectorMutationFailureKind,
 };
 
-use super::model::EntryIdentity;
+use super::commit_failure::{CommitFailureKind, commit_failure};
+use super::model::{CommitOperation, EntryIdentity};
 use crate::iceberg::spec::{DataFile, TableMetadata};
 
 /// Paths and identities needed by every prepare attempt, including after the
@@ -54,56 +54,15 @@ pub(crate) trait MayMatch: fmt::Display + Send + Sync {
     fn may_match(&self, file: &CandidateFile<'_>) -> Result<bool, ConnectorError>;
 }
 
-#[derive(Debug)]
-struct CommitFailureCause {
-    reason: FailureReason,
-    message: Arc<str>,
-    original: Option<ConnectorMutationFailure>,
-}
-
-impl fmt::Display for CommitFailureCause {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for CommitFailureCause {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.original
-            .as_ref()
-            .map(|cause| cause as &dyn std::error::Error)
-    }
-}
-
-impl FailureProjection for CommitFailureCause {
-    fn failure_fact(&self) -> FailureFact {
-        FailureFact::new(FailureClass::Dependency, self.reason)
-    }
-}
-
-fn commit_failure(
-    kind: ConnectorMutationFailureKind,
-    reason: FailureReason,
-    message: Arc<str>,
-    original: Option<ConnectorMutationFailure>,
-) -> ConnectorMutationFailure {
-    let source = ConnectorError::from_domain(
-        ConnectorErrorKind::Unavailable,
-        CommitFailureCause {
-            reason,
-            message: message.clone(),
-            original,
-        },
-    );
-    ConnectorMutationFailure::new(kind, message).with_connector_source(source)
-}
-
 pub(crate) fn validation_conflict(message: impl Into<Arc<str>>) -> ConnectorMutationFailure {
+    let message = message.into();
+    let original =
+        ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message.clone());
     commit_failure(
-        ConnectorMutationFailureKind::Conflict,
-        ICEBERG_COMMIT_VALIDATION_CONFLICT,
-        message.into(),
-        None,
+        CommitOperation::Write,
+        CommitFailureKind::Validation,
+        original,
+        &message,
     )
 }
 
@@ -111,12 +70,12 @@ pub(crate) fn transaction_conflict(
     original: ConnectorMutationFailure,
     attempts: u32,
 ) -> ConnectorMutationFailure {
-    let message = format!("{} (after {attempts} commit attempts)", original.message()).into();
+    let detail = original.message().to_owned();
     commit_failure(
-        ConnectorMutationFailureKind::Conflict,
-        COMMIT_TRANSACTION_CONFLICT,
-        message,
-        Some(original),
+        CommitOperation::Write,
+        CommitFailureKind::Contention { attempts },
+        original,
+        &detail,
     )
 }
 
@@ -124,11 +83,12 @@ pub(crate) fn commit_state_unknown(original: ConnectorMutationFailure) -> Connec
     if original.failure_fact().reason() == ICEBERG_COMMIT_STATE_UNKNOWN {
         return original;
     }
+    let detail = original.message().to_owned();
     commit_failure(
-        original.kind(),
-        ICEBERG_COMMIT_STATE_UNKNOWN,
-        original.message().into(),
-        Some(original),
+        CommitOperation::Write,
+        CommitFailureKind::Unknown,
+        original,
+        &detail,
     )
 }
 

@@ -267,14 +267,7 @@ enum PublicMessage<'a> {
     AddFilesUnknown(&'a str),
     Session(&'a StatementSessionError),
     Execution(&'a ExecutionFailureInput),
-    CommitFailure {
-        input: &'a ExecutionFailureInput,
-        unknown: bool,
-    },
-    OpenPartitionLimit {
-        limit: u64,
-        opening: u64,
-    },
+    OpenPartitionLimit { limit: u64, opening: u64 },
 }
 impl fmt::Display for PublicMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -282,13 +275,6 @@ impl fmt::Display for PublicMessage<'_> {
             Self::Borrowed(message) => formatter.write_str(message),
             Self::AddFilesUnknown(message) => write!(formatter, "Failed to add files: {message}"),
             Self::Session(error) => fmt::Display::fmt(error, formatter),
-            Self::CommitFailure { input, unknown } => {
-                formatter.write_str("Failed to commit the transaction during write: ")?;
-                if *unknown && !input.detail().as_str().starts_with("[CommitUnknown]") {
-                    formatter.write_str("[CommitUnknown] ")?;
-                }
-                fmt::Display::fmt(input.detail(), formatter)
-            }
             Self::OpenPartitionLimit { limit, opening } => write!(
                 formatter,
                 "Exceeded limit of {limit} open writers for partitions: {opening}"
@@ -517,9 +503,30 @@ fn service_error(
             .expect("declared row match SQL identity has a standard message");
         return project(code, diagnostics::bound_display(message), None);
     }
+    if let Some(user) = error.user_error()
+        && user.code().as_str() == "sql.admit.procedure_not_found"
+    {
+        return project_message(
+            query_id,
+            code,
+            PublicMessage::Borrowed(user.message()),
+            user_location(user, sql),
+            StatementExternalEffectDisposition::combine(
+                error.external_effect_disposition(),
+                effect,
+            ),
+        );
+    }
     if let Some(input) = error.execution_failure() {
-        let message = execution_message(input, code);
-        if matches!(message, PublicMessage::CommitFailure { .. }) {
+        let has_publication_suffix = commit_failure_code(input).is_some();
+        let message = if has_publication_suffix || code == Code::IcebergCommitError {
+            novarocks_query_application::execution_error::prefixed_connector_failure_detail(error)
+                .map(PublicMessage::Borrowed)
+                .unwrap_or_else(|| execution_message(input, code))
+        } else {
+            execution_message(input, code)
+        };
+        if has_publication_suffix {
             let public = error.diagnostic_with_execution_detail(&message, effect);
             return project_public_diagnostic(query_id, code, &public, None);
         }
@@ -602,7 +609,7 @@ fn add_files_execution_code(input: &ExecutionFailureInput, registration: bool) -
     })
 }
 
-fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
+fn commit_failure_code(input: &ExecutionFailureInput) -> Option<Code> {
     use novarocks_execution_contract::failure::{
         FailureEvidence,
         connector_reason::{
@@ -620,18 +627,16 @@ fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
         return None;
     }
     match fact.reason() {
-        COMMIT_TRANSACTION_CONFLICT => Some((Code::TransactionConflict, false)),
-        ICEBERG_COMMIT_VALIDATION_CONFLICT => Some((Code::IcebergCommitError, false)),
-        ICEBERG_COMMIT_STATE_UNKNOWN => Some((Code::IcebergCommitError, true)),
+        COMMIT_TRANSACTION_CONFLICT => Some(Code::TransactionConflict),
+        ICEBERG_COMMIT_VALIDATION_CONFLICT | ICEBERG_COMMIT_STATE_UNKNOWN => {
+            Some(Code::IcebergCommitError)
+        }
         _ => None,
     }
 }
 
 fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage<'_> {
-    if let Some((_, unknown)) = commit_failure(input) {
-        return PublicMessage::CommitFailure { input, unknown };
-    }
-    if code.uses_iceberg_maintenance_detail() {
+    if commit_failure_code(input).is_some() || code.uses_iceberg_maintenance_detail() {
         return PublicMessage::Borrowed(input.detail().as_str());
     }
     match open_partition_limit(input) {
@@ -641,7 +646,7 @@ fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage
 }
 
 fn execution_code(input: &ExecutionFailureInput) -> Code {
-    if let Some((code, _)) = commit_failure(input) {
+    if let Some(code) = commit_failure_code(input) {
         return code;
     }
     if open_partition_limit(input).is_some() {
@@ -735,7 +740,9 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.invalid_argument" => InvalidArguments,
         "sql.admit.invalid_table_procedure_arguments" => InvalidArguments,
-        "sql.admit.table_procedure_not_found" => ProcedureNotFound,
+        "sql.admit.table_procedure_not_found" | "sql.admit.procedure_not_found" => {
+            ProcedureNotFound
+        }
         "sql.admit.invalid_table_procedure_argument" => InvalidProcedureArgument,
         "sql.admit.duplicate_table_procedure_argument" => DuplicateProperty,
         "sql.analyze.invalid_analyze_property" => InvalidAnalyzeProperty,

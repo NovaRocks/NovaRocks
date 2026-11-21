@@ -18,6 +18,7 @@
 //! Current admission policies decide which source scope to observe.
 
 use super::super::model::{ArtifactWriter, Dependency, OperationIntent, WindowValidation};
+use super::rewrite_files::{RewriteFilesWindowCheck, validate_rewrite_files};
 use super::row_delta::validate_row_delta;
 use super::{Culprit, RemovedDataFiles, ValidationInputs, Verdict};
 use crate::iceberg::Result;
@@ -52,13 +53,14 @@ pub(crate) async fn validate_with_removed_data(
         WindowValidation::RowDelta(check) => {
             validate_row_delta(check, &inputs, start, io, removed_data).await
         }
-        WindowValidation::RewriteFiles(replaced) => Err(crate::iceberg::Error::new(
-            crate::iceberg::ErrorKind::Unexpected,
-            format!(
-                "RewriteFiles validation is unavailable for {} frozen removals",
-                replaced.len()
-            ),
-        )),
+        WindowValidation::RewriteFiles(replaced) => {
+            validate_rewrite_files(
+                RewriteFilesWindowCheck::new(replaced, intent.start()),
+                &inputs,
+                io,
+            )
+            .await
+        }
     }
 }
 
@@ -116,7 +118,7 @@ fn validate_dependency_checks(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::super::model::{
         ArtifactKind, AttemptToken, EntryIdentity, ObjectIdentity, OperationToken,
     };
@@ -129,11 +131,11 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    struct TestIo {
+    pub(in crate::commit::dependency) struct TestIo {
         io: FileIO,
     }
     impl TestIo {
-        fn new() -> Self {
+        pub(in crate::commit::dependency) fn new() -> Self {
             Self {
                 io: FileIO::new_with_fs(),
             }
@@ -184,7 +186,7 @@ mod tests {
             panic!("Validation must not record a manifest list")
         }
     }
-    fn metadata() -> TableMetadata {
+    pub(in crate::commit::dependency) fn metadata() -> TableMetadata {
         TableMetadataBuilder::new(
             Schema::builder().build().unwrap(),
             PartitionSpec::unpartition_spec(),
@@ -198,7 +200,7 @@ mod tests {
         .unwrap()
         .metadata
     }
-    fn append_snapshot(
+    pub(in crate::commit::dependency) fn append_snapshot(
         metadata: TableMetadata,
         id: i64,
         parent: Option<i64>,
@@ -215,8 +217,12 @@ mod tests {
                 operation,
                 additional_properties: HashMap::new(),
             })
-            .with_schema_id(metadata.current_schema_id())
-            .build();
+            .with_schema_id(metadata.current_schema_id());
+        let snapshot = if metadata.format_version() == FormatVersion::V3 {
+            snapshot.with_row_range(metadata.next_row_id(), 0).build()
+        } else {
+            snapshot.build()
+        };
         metadata
             .into_builder(None)
             .add_snapshot(snapshot)

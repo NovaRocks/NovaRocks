@@ -97,3 +97,28 @@ fn validation_conflict_preserves_its_typed_reason() {
         )
     );
 }
+
+#[test]
+fn row_delta_commit_retains_public_affixes_outside_the_original_body_bound() {
+    let detail = format!("{}é discarded tail", "x".repeat(510));
+    let failure = commit_failure(
+        CommitOperation::Write,
+        CommitFailureKind::Unknown,
+        original(ConnectorMutationFailureKind::Unavailable),
+        &detail,
+    );
+    let source = failure.connector_source().unwrap();
+    let cause = std::error::Error::source(source)
+        .unwrap()
+        .downcast_ref::<SharedFailureCause>()
+        .unwrap();
+    let expected = format!(
+        "Failed to commit the transaction during write: [CommitUnknown] {}é",
+        "x".repeat(510)
+    );
+
+    assert_eq!(failure.message(), detail);
+    assert_eq!(cause.prefixed_public_detail(), Some(expected.as_str()));
+    assert_eq!(expected.len(), 575);
+    assert!(cause.detail().len() <= 512);
+}
