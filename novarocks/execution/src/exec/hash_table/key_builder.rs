@@ -466,12 +466,13 @@ pub(crate) fn canonical_nullable_equals_observed(
     expected: &[u8],
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<bool> {
-    canonical_nullable_equals_with_policy_observed::<false>(array, row, expected, checkpoint)
+    canonical_nullable_equals_with_policy_observed::<false>(array, row, None, expected, checkpoint)
 }
 
 pub(crate) fn canonical_nullable_equals_with_policy_observed<const CONTENT: bool>(
     array: &ArrayRef,
     row: usize,
+    declaration: Option<&novarocks_type_contract::ValueTypeRef>,
     expected: &[u8],
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<bool> {
@@ -485,12 +486,49 @@ pub(crate) fn canonical_nullable_equals_with_policy_observed<const CONTENT: bool
     encode_nullable_nested_with_policy::<CONTENT, false, false, _, _>(
         array,
         row,
+        declaration,
         &mut sink,
         "tuple component",
         &mut work,
     )?;
     checkpoint()?;
     Ok(sink.equal && sink.offset == expected.len())
+}
+
+/// Encode a nested SQL key or its observable representative with the original
+/// nullable-component framing. The declaration supplies all temporal leaves.
+pub(crate) fn append_temporal_nullable_tracked_observed<
+    const CONTENT: bool,
+    const REPRESENTATIVE: bool,
+>(
+    array: &ArrayRef,
+    row: usize,
+    declaration: &novarocks_type_contract::ValueTypeRef,
+    out: &mut AggregateVec<u8>,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    let mut work = ObservedCanonicalKeyWork::new(checkpoint);
+    let count = if array.is_null(row) {
+        1
+    } else {
+        5usize
+            .checked_add(encoded_group_key_non_null_len_with(array, row, &mut work)?)
+            .ok_or_else(group_key_request_arithmetic)?
+    };
+    out.try_reserve_exact(count).map_err(|source| {
+        out.allocator()
+            .allocation_error("reserve temporal tuple component", source)
+    })?;
+    encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, false, _, _>(
+        array,
+        row,
+        Some(declaration),
+        out,
+        "tuple component",
+        &mut work,
+    )?;
+    checkpoint()
 }
 
 struct HashingKeyByteSink {
@@ -697,6 +735,46 @@ pub(crate) fn canonical_group_key_fnv_hash_observed(
     Ok(Some(sink.finish()))
 }
 
+pub(crate) fn canonical_temporal_group_key_hash_observed(
+    array: &ArrayRef,
+    row: usize,
+    declaration: &novarocks_type_contract::ValueTypeRef,
+    crc: bool,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<Option<u64>> {
+    checkpoint()?;
+    if array.is_null(row) {
+        if !declaration.nullable() {
+            return Err(group_key_encoding_contract("required temporal key is NULL"));
+        }
+        return Ok(None);
+    }
+    let mut work = ObservedCanonicalKeyWork::new(checkpoint);
+    let hash = if crc {
+        let mut sink = Crc32KeyByteSink::new();
+        encode_group_key_non_null_value_with_policy::<false, false, false, _, _>(
+            array,
+            row,
+            Some(declaration),
+            &mut sink,
+            &mut work,
+        )?;
+        u64::from(sink.finish())
+    } else {
+        let mut sink = HashingKeyByteSink::new(0);
+        encode_group_key_non_null_value_with_policy::<false, false, false, _, _>(
+            array,
+            row,
+            Some(declaration),
+            &mut sink,
+            &mut work,
+        )?;
+        sink.finish()
+    };
+    checkpoint()?;
+    Ok(Some(hash))
+}
+
 /// Exact old tuple bytes, with bounded sizing and writing work. Bounded fixed
 /// scalar leaves keep the original fast path; byte/nested values use the same
 /// canonical walker with actual caller control, never a replacement codec.
@@ -779,6 +857,7 @@ pub(crate) fn append_content_nullable_tracked_observed<
     encode_nullable_nested_with_policy::<true, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
         array,
         row,
+        None,
         out,
         "tuple component",
         &mut work,
@@ -828,7 +907,9 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
     out: &mut S,
     work: &mut W,
 ) -> ExecutionResult<()> {
-    encode_group_key_non_null_value_with_policy::<false, false, false, _, _>(array, row, out, work)
+    encode_group_key_non_null_value_with_policy::<false, false, false, _, _>(
+        array, row, None, out, work,
+    )
 }
 // Extra fixed K carriers need fingerprint bytes but do not alter the old
 // grouping codec or the encoded complex storage representation.
@@ -910,10 +991,49 @@ fn encode_group_key_non_null_value_with_policy<
 >(
     array: &ArrayRef,
     row: usize,
+    declaration: Option<&novarocks_type_contract::ValueTypeRef>,
     out: &mut S,
     work: &mut W,
 ) -> ExecutionResult<()> {
     work.step()?;
+    if let Some(ty) = declaration.and_then(novarocks_type_contract::ValueTypeRef::temporal) {
+        use novarocks_type_contract::TemporalCarrier;
+        let nullable = declaration.expect("temporal declaration").nullable();
+        let values = novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+            ty,
+            array.as_ref(),
+            nullable,
+        )
+        .map_err(ExecutionFailure::from_domain)?;
+        let value = values
+            .value(row)
+            .map_err(ExecutionFailure::from_domain)?
+            .ok_or_else(|| group_key_encoding_contract("temporal value unexpectedly NULL"))?;
+        if matches!(array.data_type(), DataType::FixedSizeBinary(..)) {
+            let form = if CONTENT || REPRESENTATIVE {
+                value.to_carrier(ty)
+            } else {
+                value.relation_carrier(ty)
+            }
+            .map_err(group_key_encoding_contract)?;
+            let bytes: &[u8] = match &form {
+                TemporalCarrier::ZonedTime(bytes) => bytes,
+                TemporalCarrier::Wide(bytes) => bytes,
+                TemporalCarrier::ZonedTimestamp(bytes) => bytes,
+                _ => {
+                    return Err(group_key_encoding_contract(
+                        "unexpected temporal fixed carrier",
+                    ));
+                }
+            };
+            work.push(out, 35)?;
+            work.extend(
+                out,
+                &group_key_component_len(bytes.len(), "temporal carrier")?.to_le_bytes(),
+            )?;
+            return work.extend(out, bytes);
+        }
+    }
     if NEUTRAL_BYTES && encode_fingerprint_fixed(array, row, out, work)? {
         return Ok(());
     }
@@ -1179,6 +1299,7 @@ fn encode_group_key_non_null_value_with_policy<
                 encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
                     values,
                     idx,
+                    declaration.and_then(|ty| ty.child_type_at(0)),
                     out,
                     "group key list item",
                     work,
@@ -1198,10 +1319,11 @@ fn encode_group_key_non_null_value_with_policy<
             work.push(out, 17)?;
             let field_count = group_key_component_len(struct_arr.num_columns(), "Struct")?;
             work.extend(out, &field_count.to_le_bytes())?;
-            for column in struct_arr.columns() {
+            for (index, column) in struct_arr.columns().iter().enumerate() {
                 encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
                     column,
                     row,
+                    declaration.and_then(|ty| ty.child_type_at(index)),
                     out,
                     "group key struct field",
                     work,
@@ -1226,6 +1348,7 @@ fn encode_group_key_non_null_value_with_policy<
                 encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
                     &keys,
                     idx,
+                    declaration.and_then(|ty| ty.child_type_at(0)),
                     out,
                     "group key map key",
                     work,
@@ -1233,6 +1356,7 @@ fn encode_group_key_non_null_value_with_policy<
                 encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
                     &values,
                     idx,
+                    declaration.and_then(|ty| ty.child_type_at(1)),
                     out,
                     "group key map value",
                     work,
@@ -1254,7 +1378,9 @@ fn encode_nullable_nested_with<S: KeyByteSink, W: CanonicalKeyWork>(
     context: &'static str,
     work: &mut W,
 ) -> ExecutionResult<()> {
-    encode_nullable_nested_with_policy::<false, false, false, _, _>(array, row, out, context, work)
+    encode_nullable_nested_with_policy::<false, false, false, _, _>(
+        array, row, None, out, context, work,
+    )
 }
 fn encode_nullable_nested_with_policy<
     const CONTENT: bool,
@@ -1265,12 +1391,16 @@ fn encode_nullable_nested_with_policy<
 >(
     array: &ArrayRef,
     row: usize,
+    declaration: Option<&novarocks_type_contract::ValueTypeRef>,
     out: &mut S,
     context: &'static str,
     work: &mut W,
 ) -> ExecutionResult<()> {
     work.step()?;
     if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
+        if declaration.is_some_and(|ty| ty.temporal().is_some() && !ty.nullable()) {
+            return Err(group_key_encoding_contract("required temporal key is NULL"));
+        }
         work.push(out, 0)?;
         return Ok(());
     }
@@ -1285,7 +1415,11 @@ fn encode_nullable_nested_with_policy<
     let len = group_key_component_len(len, context)?;
     work.extend(out, &len.to_le_bytes())?;
     encode_group_key_non_null_value_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
-        array, row, out, work,
+        array,
+        row,
+        declaration,
+        out,
+        work,
     )
 }
 
@@ -1303,6 +1437,9 @@ fn encoded_group_key_non_null_len_with<W: CanonicalKeyWork>(
         DataType::Decimal128(_, _) => Some(17),
         DataType::Decimal256(_, _) => Some(33),
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => Some(17),
+        DataType::FixedSizeBinary(width) if matches!(*width, 10 | 12 | 14) => {
+            fingerprint_fixed_len(array.data_type())
+        }
         _ => None,
     };
     if let Some(fixed) = fixed {
@@ -1413,10 +1550,33 @@ struct EncodedCursor<'a> {
 /// tuple parser in a key store. The payload remains the canonical author's
 /// non-NULL group-key encoding, not an Arrow value or a physical value layout.
 pub(crate) fn canonical_component_payload(bytes: &[u8]) -> ExecutionResult<Option<&[u8]>> {
-    let mut cursor = EncodedCursor::new(bytes);
+    let (_, representative) = canonical_component_forms(bytes)?;
+    let mut cursor = EncodedCursor::new(representative);
     let payload = cursor.read_nested()?;
     cursor.finish()?;
     Ok(payload)
+}
+
+pub(super) fn canonical_component_forms(bytes: &[u8]) -> ExecutionResult<(&[u8], &[u8])> {
+    if bytes.first() != Some(&2) {
+        return Ok((bytes, bytes));
+    }
+    let mut cursor = EncodedCursor::new(bytes);
+    cursor.expect_marker(2)?;
+    let key_len = cursor.read_u32()? as usize;
+    let end = cursor
+        .offset
+        .checked_add(key_len)
+        .ok_or_else(group_key_request_arithmetic)?;
+    let key = bytes
+        .get(cursor.offset..end)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| group_key_decoding_contract("truncated temporal comparison key"))?;
+    let representative = bytes
+        .get(end..)
+        .filter(|representative| !representative.is_empty())
+        .ok_or_else(|| group_key_decoding_contract("missing temporal key representative"))?;
+    Ok((key, representative))
 }
 
 impl<'a> EncodedCursor<'a> {

@@ -228,7 +228,7 @@ pub fn connector_partition_transform(
 }
 
 fn lower_sql_type(type_name: &novarocks_parser::ast::TypeName) -> Result<SqlType, String> {
-    use novarocks_parser::ast::{DataTypeParameter, DateTimeType, TypeKind};
+    use novarocks_parser::ast::{DataTypeParameter, TypeKind};
 
     let generic = match &type_name.kind {
         TypeKind::Generic(generic) => generic,
@@ -246,19 +246,12 @@ fn lower_sql_type(type_name: &novarocks_parser::ast::TypeName) -> Result<SqlType
                     .collect::<Result<_, String>>()?,
             ));
         }
-        TypeKind::DateTime(value) => {
-            let supported_precision = value.precision.as_ref().is_none_or(|parameter| {
-                matches!(parameter.as_ref(), DataTypeParameter::Numeric(number) if number.parsed_value == 6)
-            });
-            if value.with_time_zone || !supported_precision {
-                return Err("Iceberg schema supports only TIME/TIMESTAMP without time zone at microsecond precision".into());
-            }
-            return Ok(match value.kind {
-                DateTimeType::Time => SqlType::Time,
-                DateTimeType::Timestamp => SqlType::DateTime,
-            });
+        TypeKind::DateTime(_) | TypeKind::Interval(_) => {
+            return novarocks_sql::declared_temporal_type(type_name)
+                .map_err(|error| error.to_string())?
+                .map(SqlType::Temporal)
+                .ok_or_else(|| "temporal syntax lost its type declaration".into());
         }
-        TypeKind::Interval(_) => return Err("INTERVAL schema types are not supported".into()),
         TypeKind::ExplicitArray(_) => {
             return Err("explicit ARRAY schema lengths are not supported".into());
         }
@@ -425,23 +418,38 @@ mod tests {
     }
 
     #[test]
-    fn schema_types_refuse_unrepresentable_temporal_and_explicit_array_facts() {
+    fn schema_types_keep_exact_temporal_and_refuse_explicit_array_facts() {
         use novarocks_parser::{SYNTHETIC, ast, build};
+        use novarocks_type_contract::{TemporalPrecision, TemporalType};
         for kind in [ast::DateTimeType::Time, ast::DateTimeType::Timestamp] {
-            for precision in [None, Some(6), Some(3)] {
+            for digits in [None, Some(0), Some(6), Some(9), Some(12), Some(13)] {
                 for with_time_zone in [false, true] {
                     let ty = ast::TypeName {
                         kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
                             kind,
                             with_time_zone,
-                            precision: precision
-                                .map(|value| build::numeric_parameter(value).into()),
+                            precision: digits.map(|value| build::numeric_parameter(value).into()),
                         }),
                         span: SYNTHETIC,
                     };
+                    let actual = super::lower_sql_type(&ty);
+                    let Ok(precision) = TemporalPrecision::new(digits.unwrap_or(3) as u8) else {
+                        assert!(actual.is_err());
+                        continue;
+                    };
+                    let declaration = match (kind, with_time_zone) {
+                        (ast::DateTimeType::Time, false) => TemporalType::Time(precision),
+                        (ast::DateTimeType::Time, true) => {
+                            TemporalType::TimeWithTimeZone(precision)
+                        }
+                        (ast::DateTimeType::Timestamp, false) => TemporalType::Timestamp(precision),
+                        (ast::DateTimeType::Timestamp, true) => {
+                            TemporalType::TimestampWithTimeZone(precision)
+                        }
+                    };
                     assert_eq!(
-                        super::lower_sql_type(&ty).is_ok(),
-                        !with_time_zone && precision.is_none_or(|value| value == 6)
+                        actual.unwrap(),
+                        novarocks_types::schema::SqlType::Temporal(declaration)
                     );
                 }
             }

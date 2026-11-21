@@ -71,6 +71,9 @@ pub(super) fn validate_definition<H>(
         Kind::Nominal(value) => {
             scalars::nominal::<H>(*value)?;
         }
+        Kind::Temporal(value) => {
+            super::temporal::decode::<H>(value)?;
+        }
         Kind::ListItemTypeId(_) => {}
         Kind::FixedSizeList(value) => {
             required::<H>(value.item_type_id)?;

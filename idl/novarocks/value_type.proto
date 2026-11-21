@@ -33,7 +33,35 @@ message LogicalTypeDefinition {
     StructValue struct_value = 7;
     MapValue map_value = 8;
     UnionValue union_value = 9;
+    TemporalType temporal = 10;
   }
+}
+
+message TemporalType {
+  oneof kind {
+    uint32 time_precision = 1;
+    uint32 time_with_time_zone_precision = 2;
+    uint32 timestamp_precision = 3;
+    uint32 timestamp_with_time_zone_precision = 4;
+    IntervalQualifier interval = 5;
+  }
+}
+
+message IntervalQualifier {
+  IntervalField start_field = 1;
+  IntervalField end_field = 2;
+  optional uint32 leading_precision = 3;
+  optional uint32 fractional_precision = 4;
+}
+
+enum IntervalField {
+  INTERVAL_FIELD_UNSPECIFIED = 0;
+  INTERVAL_FIELD_YEAR = 1;
+  INTERVAL_FIELD_MONTH = 2;
+  INTERVAL_FIELD_DAY = 3;
+  INTERVAL_FIELD_HOUR = 4;
+  INTERVAL_FIELD_MINUTE = 5;
+  INTERVAL_FIELD_SECOND = 6;
 }
 
 // Parameters are authored, never inferred from actual data. Codecs validate

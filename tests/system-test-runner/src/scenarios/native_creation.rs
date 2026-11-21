@@ -932,6 +932,7 @@ pub(super) fn compiled_fragment(
                 novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                     novarocks_result_contract::TrinoJsonFacts {
                         parametric_datetime: true,
+                        parametric_interval: false,
                         variant: true,
                         variant_binary: true,
                     },

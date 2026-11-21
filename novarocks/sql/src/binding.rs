@@ -104,6 +104,9 @@ pub enum SqlResultConstraintOrigin {
     Unconstrained,
     /// A common target authored from the original ARRAY element declarations.
     ArrayCommonCoercion,
+    TemporalSelected {
+        own_nullable: bool,
+    },
     ValueDomainConversion {
         /// The original full final assignment/CAST target, before the one
         /// conversion owner chose its explicit intermediate contract.
@@ -113,7 +116,7 @@ pub enum SqlResultConstraintOrigin {
 
 /// One call's exact selection and authored semantic policy. The selected
 /// overload remains catalog-owned; a SQL scope does not redefine its identity.
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SqlFunctionCallFacts {
     resolved: novarocks_functions::ResolvedFunctionBinding,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
@@ -121,6 +124,8 @@ struct SqlFunctionCallFacts {
     result_constraint: Option<novarocks_functions::FunctionValueType>,
     result_constraint_origin: SqlResultConstraintOrigin,
     group_concat: Option<GroupConcatSourceFacts>,
+    statement_start: Option<novarocks_type_contract::StatementStartUtc>,
+    time_zone: Option<novarocks_type_contract::TimeZoneKey>,
     aggregate_state_source: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
 }
 
@@ -135,6 +140,8 @@ impl SqlFunctionBinding {
             result_constraint: None,
             result_constraint_origin: SqlResultConstraintOrigin::Unconstrained,
             group_concat: None,
+            statement_start: None,
+            time_zone: None,
             aggregate_state_source: None,
         }))
     }
@@ -156,8 +163,24 @@ impl SqlFunctionBinding {
                 final_target,
             },
             group_concat: None,
+            statement_start: None,
+            time_zone: None,
             aggregate_state_source: None,
         }))
+    }
+
+    pub(crate) fn new_with_temporal_constraint(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint: novarocks_functions::FunctionValueType,
+        own_nullable: bool,
+    ) -> Self {
+        let mut binding = Self::new(resolved, decimal_overflow_policy);
+        let facts = Arc::make_mut(&mut binding.0);
+        facts.result_constraint = Some(result_constraint);
+        facts.result_constraint_origin =
+            SqlResultConstraintOrigin::TemporalSelected { own_nullable };
+        binding
     }
 
     pub(crate) fn new_with_array_common_constraint(
@@ -171,6 +194,8 @@ impl SqlFunctionBinding {
             result_constraint: Some(result_constraint),
             result_constraint_origin: SqlResultConstraintOrigin::ArrayCommonCoercion,
             group_concat: None,
+            statement_start: None,
+            time_zone: None,
             aggregate_state_source: None,
         }))
     }
@@ -183,6 +208,8 @@ impl SqlFunctionBinding {
             result_constraint: old.result_constraint.clone(),
             result_constraint_origin: old.result_constraint_origin.clone(),
             group_concat: Some(facts),
+            statement_start: old.statement_start,
+            time_zone: old.time_zone,
             aggregate_state_source: old.aggregate_state_source.clone(),
         });
         self
@@ -200,6 +227,8 @@ impl SqlFunctionBinding {
             result_constraint: old.result_constraint.clone(),
             result_constraint_origin: old.result_constraint_origin.clone(),
             group_concat: old.group_concat.clone(),
+            statement_start: old.statement_start,
+            time_zone: old.time_zone,
             aggregate_state_source: Some(Arc::new(facts)),
         });
         self
@@ -212,6 +241,62 @@ impl SqlFunctionBinding {
 
     pub(crate) fn group_concat_source(&self) -> Option<&GroupConcatSourceFacts> {
         self.0.group_concat.as_ref()
+    }
+
+    /// Attach only the time facts declared by the actual selected overload.
+    /// Other semantic keys remain with their original binding authors.
+    pub(crate) fn with_statement_time(
+        mut self,
+        environment: Option<novarocks_type_contract::StatementTimeEnvironment>,
+        dependencies: &[novarocks_type_contract::SemanticParameterKey],
+    ) -> Result<Self, novarocks_functions::FunctionBindingError> {
+        use novarocks_type_contract::SemanticParameterKey as K;
+        let start = dependencies.contains(&K::StatementStartUtc);
+        let zone = dependencies.contains(&K::TimeZone);
+        if start || zone {
+            let environment = environment.ok_or_else(|| {
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(
+                    self.selected.overload.clone(),
+                )
+            })?;
+            let facts = Arc::make_mut(&mut self.0);
+            facts.statement_start = start.then_some(environment.start);
+            facts.time_zone = zone.then_some(environment.zone);
+        }
+        Ok(self)
+    }
+
+    /// IDs 0–3 belong to AllowThrowException and GROUP_CONCAT. A statement
+    /// body has one original instant and one effective time zone; required
+    /// property constants use their own environment and parameter table.
+    pub(crate) fn statement_time_parameters(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            novarocks_type_contract::SemanticParameterRef,
+            novarocks_type_contract::SemanticParameterValue,
+        ),
+    > {
+        use novarocks_type_contract::{
+            SemanticParameterId as I, SemanticParameterRef as R, SemanticParameterValue as V,
+        };
+        [
+            self.0
+                .statement_start
+                .map(|start| (4, V::StatementStartUtc(start))),
+            self.0.time_zone.map(|zone| (5, V::TimeZone(zone))),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(id, value)| {
+            (
+                R {
+                    id: I::new(id),
+                    expected_key: value.key(),
+                },
+                value,
+            )
+        })
     }
 
     pub fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {

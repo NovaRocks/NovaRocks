@@ -173,11 +173,14 @@ struct PreparedStagedTable {
     partition_spec: Option<UnboundPartitionSpec>,
 }
 
-fn build_staged_schema(columns: &[ConnectorColumnDefinition]) -> Result<Schema, String> {
+fn build_staged_schema(
+    columns: &[ConnectorColumnDefinition],
+    format_version: FormatVersion,
+) -> Result<Schema, ConnectorError> {
     Schema::builder()
-        .with_fields(super::type_mapping::schema_fields(columns)?)
+        .with_fields(super::type_mapping::schema_fields(columns, format_version)?)
         .build()
-        .map_err(|error| format!("build staged Iceberg schema: {error}"))
+        .map_err(|error| invalid(format!("build staged Iceberg schema: {error}")))
 }
 
 fn prepare_typed_staged_table(
@@ -291,7 +294,10 @@ fn bind_typed_staged_table(
     final_metadata_path: Option<StagedMetadataPath>,
 ) -> Result<PreparedStagedTable, ConnectorError> {
     let control = &request.context;
-    let schema = Arc::new(build_staged_schema(&request.columns).map_err(invalid)?);
+    let schema = Arc::new(build_staged_schema(
+        &request.columns,
+        storage_facts.format_version,
+    )?);
     crate::schema_capability::admit_schema(&schema)?;
     let spec = if let Some(visible_sources) = visible_sources {
         crate::table_properties::bind_mv_create_table_partitioning(

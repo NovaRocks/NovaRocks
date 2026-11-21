@@ -359,6 +359,45 @@ fn metadata_relation_row(schema: &SchemaRef) -> Result<Type, ConnectorError> {
     Ok(Type::Struct(StructType::new(fields)))
 }
 
+/// The explicit storage mirror of one column from the frozen metadata
+/// schema author. Other Arrow schemas do not authorize this projection.
+pub(crate) fn metadata_temporal_declaration(
+    layout: &DataType,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<Option<Type>, PureProviderCompileError<ConnectorError>> {
+    if !metadata_has_temporal_storage(layout, creation)? {
+        return Ok(None);
+    }
+    let declared =
+        metadata_relation_type_observed(layout, &mut MetadataRelationFieldIds::new(), &mut || {
+            creation.work(1)
+        })?;
+    Ok(Some(declared))
+}
+
+fn metadata_has_temporal_storage(
+    layout: &DataType,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<bool, PureProviderCompileError<ConnectorError>> {
+    creation.work(1)?;
+    match layout {
+        DataType::Time64(TimeUnit::Microsecond)
+        | DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _) => Ok(true),
+        DataType::List(child) | DataType::Map(child, _) => {
+            metadata_has_temporal_storage(child.data_type(), creation)
+        }
+        DataType::Struct(fields) => {
+            for field in fields {
+                if metadata_has_temporal_storage(field.data_type(), creation)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
 #[derive(Debug)]
 enum SystemMirrorError {
     Control(CompileControlError),
@@ -2204,6 +2243,15 @@ impl IcebergSystemPageSource {
             .ok()
             .and_then(std::num::NonZeroU32::new)
             .ok_or_else(|| internal("Iceberg metadata output page size exceeds its row domain"))?;
+        let Type::Struct(declaration) = metadata_relation_row(schema)? else {
+            return Err(internal("Iceberg metadata output has no row declaration"));
+        };
+        let temporal = projection
+            .iter()
+            .map(|index| {
+                super::output::TemporalOutputColumn::from_declaration(&declaration.fields()[*index])
+            })
+            .collect::<Arc<[_]>>();
         let output = super::output::OutputCursor::with_policy(
             &specs,
             OutputRows::Contiguous(0..row_count),
@@ -2212,7 +2260,8 @@ impl IcebergSystemPageSource {
                 max_rows,
                 ..novarocks_spi::connector::ENGINE_OUTPUT_POLICY
             },
-        )?;
+        )?
+        .with_temporal(&temporal, &specs)?;
         Ok(Self {
             context: context.clone(),
             output,
@@ -2831,12 +2880,32 @@ fn manifest_spec(
 /// field attributes never establish a scalar or nested value domain.
 pub(crate) fn validate_system_column_value(
     kind: IcebergSystemTableType,
+    declaration: &NestedField,
+    source: &Field,
     field: &Field,
     binding: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), PureProviderCompileError<ConnectorError>> {
     if field.is_nullable() != binding.nullable() {
         return Err(invalid("system root NULL declaration differs").into());
+    }
+    if crate::temporal::contains_temporal(&declaration.field_type) {
+        let matches = crate::temporal::matches_projection(
+            &declaration.field_type,
+            source.data_type(),
+            field.data_type(),
+            binding.value_type(),
+            &mut |_| work.step().map_err(SystemMirrorError::Control),
+        )
+        .map_err(|error| match error {
+            SystemMirrorError::Control(cause) => PureProviderCompileError::Control(cause),
+            SystemMirrorError::Source(cause) => PureProviderCompileError::Provider(cause),
+        })?;
+        return if matches {
+            Ok(())
+        } else {
+            Err(invalid("system temporal projection differs from its frozen source").into())
+        };
     }
     system_value(
         field.data_type(),

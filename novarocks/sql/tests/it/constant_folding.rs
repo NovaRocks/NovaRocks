@@ -380,3 +380,89 @@ fn e08s1_fold_environment_exact_original_concat_raw_limits_keep_child_fold() {
         );
     }
 }
+
+#[test]
+fn temporal_fold_reads_the_selected_statement_time_facts() {
+    use novarocks_type_contract::{
+        StatementStartUtc, StatementTimeEnvironment, TemporalMicros, TemporalValue, TimeZoneKey,
+    };
+    let probe = Arc::new(FoldProbe::default());
+    let zone = TimeZoneKey::parse("America/New_York").unwrap();
+    let start = StatementStartUtc::try_new(1_704_067_200, 123_456_789).unwrap();
+    let semantics = SqlSemanticSettings::default()
+        .with_statement_time(StatementTimeEnvironment { start, zone });
+    let physical = compile_table_free(
+        "SELECT CURRENT_TIMESTAMP(12)",
+        session(semantics, true),
+        &probe.control(),
+    )
+    .unwrap();
+    let receipts = probe.receipts.lock().unwrap();
+    let receipt = receipts.iter().find(|receipt| {
+        matches!(&receipt.root().kind, ExprKind::FunctionCall { function, .. }
+            if function.overload.as_str() == "builtin.scalar/temporal_statement_syntax/current_timestamp/v1")
+    }).expect("the original SQL fold observes the selected clock overload");
+    assert_eq!(
+        receipt.parameters.entries().values().collect::<Vec<_>>(),
+        [
+            &novarocks_type_contract::SemanticParameterValue::StatementStartUtc(start),
+            &novarocks_type_contract::SemanticParameterValue::TimeZone(zone),
+        ],
+    );
+    assert_eq!(
+        receipt
+            .result
+            .as_ref()
+            .unwrap()
+            .temporal_observed(CompilePhase::Validate, &SqlCompileControl::unbounded(),)
+            .unwrap(),
+        Some(TemporalValue::TimestampWithTimeZone {
+            instant: TemporalMicros::new(1_704_067_200_123_456, 789_000).unwrap(),
+            zone,
+        }),
+    );
+    assert!(!expression_sources(&physical).any(|(_, _, node)| {
+        matches!(&node.kind, ExprKind::FunctionCall { function, .. }
+            if function.overload.as_str() == "builtin.scalar/temporal_statement_syntax/current_timestamp/v1")
+    }));
+}
+
+#[test]
+fn temporal_at_local_fold_keeps_the_original_zone_during_source_admission() {
+    use novarocks_type_contract::{
+        SemanticParameterValue, StatementStartUtc, StatementTimeEnvironment, TemporalMicros,
+        TemporalValue, TimeZoneKey,
+    };
+    let probe = Arc::new(FoldProbe::default());
+    let zone = TimeZoneKey::parse("America/New_York").unwrap();
+    let start = StatementStartUtc::try_new(1_704_067_200, 123_456_789).unwrap();
+    let semantics = SqlSemanticSettings::default()
+        .with_statement_time(StatementTimeEnvironment { start, zone });
+    compile_table_free(
+        "SELECT TIMESTAMP '2024-01-01 00:00:00.000000000001' AT LOCAL",
+        session(semantics, true),
+        &probe.control(),
+    )
+    .unwrap();
+    let receipts = probe.receipts.lock().unwrap();
+    let receipt = receipts.iter().find(|receipt| {
+        matches!(&receipt.root().kind, ExprKind::FunctionCall { function, .. }
+            if function.overload.as_str() == "builtin.scalar/value_domain_conversion/temporal_zone/v1")
+    }).expect("the original SQL fold observes the selected local timestamp conversion");
+    assert_eq!(
+        receipt.parameters.entries().values().collect::<Vec<_>>(),
+        [&SemanticParameterValue::TimeZone(zone)]
+    );
+    assert_eq!(
+        receipt
+            .result
+            .as_ref()
+            .unwrap()
+            .temporal_observed(CompilePhase::Validate, &SqlCompileControl::unbounded())
+            .unwrap(),
+        Some(TemporalValue::TimestampWithTimeZone {
+            instant: TemporalMicros::new(1_704_085_200_000_000, 1).unwrap(),
+            zone,
+        })
+    );
+}

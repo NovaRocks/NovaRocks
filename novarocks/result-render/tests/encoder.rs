@@ -59,6 +59,7 @@ fn encoder(batch: RecordBatch, fields: Vec<RenderField>) -> ArrowTrinoJsonEncode
                 novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                     novarocks_result_contract::TrinoJsonFacts {
                         parametric_datetime: true,
+                        parametric_interval: false,
                         variant: true,
                         variant_binary: false,
                     },
@@ -218,6 +219,7 @@ fn repeated_occurrences_and_dictionary() {
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: false,
                 },
@@ -404,6 +406,7 @@ fn native_and_dynamic_depth_boundaries() {
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true
                 }
@@ -530,6 +533,7 @@ fn elements_reset_between_passes_and_sum_occurrences() {
                 novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                     novarocks_result_contract::TrinoJsonFacts {
                         parametric_datetime: true,
+                        parametric_interval: false,
                         variant: true,
                         variant_binary: false,
                     },
@@ -562,6 +566,7 @@ fn wide_columns_and_many_small_rows() {
                 novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                     novarocks_result_contract::TrinoJsonFacts {
                         parametric_datetime: true,
+                        parametric_interval: false,
                         variant: true,
                         variant_binary: false,
                     },

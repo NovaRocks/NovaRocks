@@ -541,6 +541,10 @@ enum BindingResolverOwnerKind {
     Unnest(Arc<crate::builtin::UnnestOwner>),
     BorrowedAggregate(Arc<crate::builtin::catalogue::BuiltinAggregateResolver>),
     BorrowedConversion(Arc<crate::builtin::value_conversion::ValueConversionResolver>),
+    BorrowedTemporalArithmetic(
+        Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
+    ),
+    BorrowedTemporalContext(Arc<crate::builtin::temporal_context::TemporalContextResolver>),
     ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
     Original(Arc<dyn FunctionBindingResolver>),
 }
@@ -571,6 +575,16 @@ impl FunctionBindingResolverOwner {
         owner: Arc<crate::builtin::value_conversion::ValueConversionResolver>,
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedConversion(owner))
+    }
+    pub(crate) fn borrowed_temporal_arithmetic(
+        owner: Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner))
+    }
+    pub(crate) fn borrowed_temporal_context(
+        owner: Arc<crate::builtin::temporal_context::TemporalContextResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedTemporalContext(owner))
     }
     pub(crate) fn parametric_aggregate(owner: Arc<ParametricAggregateBindingResolver>) -> Self {
         Self(BindingResolverOwnerKind::ParametricAggregate(owner))
@@ -603,6 +617,12 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedConversion(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::ParametricAggregate(owner) => owner
                         .validate_selected_with_creator_in(selected, request, creation, control),
                     BindingResolverOwnerKind::Original(_) => {
@@ -619,6 +639,8 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::Unnest(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Original(owner) => owner.as_ref(),
         }

@@ -183,7 +183,7 @@ fn run(
             } else {
                 Arc::new(Int32Array::from(vec![2, 1, 1, 0]))
             };
-            let result = stages::regroup(&source, &[keys], work)?;
+            let result = stages::regroup(&source, &[keys], None, work)?;
             assert_eq!(result.stage, stage);
             drop(result);
         }
@@ -434,7 +434,7 @@ fn analytic_input_stage_many_null_keys_bounded_owned_work_observation() {
     let mut work = Work::new(&observed, Arc::new(AtomicUsize::new(0)));
     let source = ints(vec![Some(1), Some(2)]);
     let keys = vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef; 600];
-    assert!(stages::regroup(&source, &keys, &mut work).is_ok());
+    assert!(stages::regroup(&source, &keys, None, &mut work).is_ok());
     assert!(control.trace().contains(&MAX_UNOBSERVED_KERNEL_WORK));
     assert!(
         control

@@ -1,0 +1,14 @@
+-- query 1
+-- types	bigint
+grouped_rows
+2
+
+-- query 2
+-- types	bigint
+distinct_keys
+1
+
+-- query 3
+-- types	varchar
+representative
+2024-01-01 08:00:00.000000000001 Asia/Shanghai

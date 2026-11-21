@@ -103,13 +103,13 @@ pub fn grouped_state_topn_key_supported(
     ty: &FunctionValueType,
 ) -> bool {
     comparator.supports_value_type(ty)
-        && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(ty.data_type())
+        && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_value_type(ty)
 }
 
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 33;
+pub const PLAN_CONTRACT_REVISION: u32 = 34;
 
 #[cfg(test)]
 mod tests;

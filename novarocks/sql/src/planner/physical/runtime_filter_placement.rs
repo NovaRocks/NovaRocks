@@ -307,7 +307,8 @@ fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> 
 
 fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
     eq.left.value_type.data_type() == eq.right.value_type.data_type()
-        && novarocks_local_program::is_filter_key_type(eq.left.value_type.data_type())
+        && eq.left.value_type.same_value_domain(&eq.right.value_type)
+        && novarocks_local_program::is_semantic_filter_key_type(&eq.left.value_type)
 }
 
 #[derive(Clone, Debug)]

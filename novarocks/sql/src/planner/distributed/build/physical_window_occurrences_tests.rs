@@ -1306,9 +1306,13 @@ fn window_occurrences_foreign_source_missing_ordered_effects_environment_and_pro
         id: SemanticParameterId::new(7),
         expected_key: SemanticParameterKey::TimeZone,
     }];
-    let params =
-        SemanticParameters::try_new([(refs[0].id, SemanticParameterValue::TimeZone("UTC".into()))])
-            .unwrap();
+    let params = SemanticParameters::try_new([(
+        refs[0].id,
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
+    )])
+    .unwrap();
     let mut call = input(source, &req, &occurrences, site, &children, &params);
     call.environment = &refs;
     assert!(matches!(

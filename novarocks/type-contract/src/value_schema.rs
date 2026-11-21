@@ -506,6 +506,13 @@ fn check_layout_observed<E: From<ExecutionValueTypeError>>(
         (ValueKind::Binary, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) => {
             Ok(())
         }
+        (ValueKind::Temporal(declaration), actual) => {
+            if *actual == declaration.carrier() {
+                Ok(())
+            } else {
+                Err(mismatch())
+            }
+        }
         (ValueKind::Nominal(logical), actual) => logical
             .validate_carrier(actual)
             .map_err(|e| E::from(ExecutionValueTypeError::Logical(e))),

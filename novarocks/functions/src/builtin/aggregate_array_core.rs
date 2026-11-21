@@ -296,7 +296,9 @@ fn array_value_from_common(
                 })
                 .collect::<Result<Vec<_>, KernelFailure>>()?,
         ),
-        AggScalarValue::Decimal256(_) | AggScalarValue::Binary(_) => {
+        AggScalarValue::Decimal256(_)
+        | AggScalarValue::Binary(_)
+        | AggScalarValue::Temporal(..) => {
             return Err(failure::contract(
                 "array_agg tracked scalar type is not supported by its output ABI",
             ));

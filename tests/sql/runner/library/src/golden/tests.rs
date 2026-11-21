@@ -338,3 +338,82 @@ fn file_parser_rejects_noncanonical_or_ambiguous_structure() {
     };
     assert!(invalid.render().is_err());
 }
+
+#[test]
+fn interval_qualifiers_preserve_wire_arguments_and_golden_values() {
+    use novarocks_test_trino_client::TypeSignature;
+
+    for (text, raw, arguments) in [
+        ("interval year to month", "interval year to month", vec![]),
+        ("interval day to second", "interval day to second", vec![]),
+        (
+            "INTERVAL YEAR(2) TO MONTH",
+            "interval year to month",
+            vec![0, 1, 2],
+        ),
+        (
+            "INTERVAL MONTH(10)",
+            "interval year to month",
+            vec![1, 1, 10],
+        ),
+        (
+            "INTERVAL HOUR(2) TO MINUTE",
+            "interval day to second",
+            vec![3, 4, 2, 0],
+        ),
+        (
+            "INTERVAL DAY(2) TO SECOND(12)",
+            "interval day to second",
+            vec![2, 5, 2, 12],
+        ),
+        (
+            "INTERVAL SECOND(2, 0)",
+            "interval day to second",
+            vec![5, 5, 2, 0],
+        ),
+    ] {
+        assert_eq!(
+            parse_type(text).unwrap(),
+            TypeSignature {
+                raw_type: raw.into(),
+                arguments: arguments.into_iter().map(TypeArgument::Long).collect(),
+            },
+            "{text}"
+        );
+    }
+    for invalid in [
+        "INTERVAL YEAR(2) TO DAY",
+        "INTERVAL MONTH(11)",
+        "INTERVAL HOUR(0)",
+        "INTERVAL HOUR(3, 2)",
+        "INTERVAL SECOND(1, 13)",
+        "INTERVAL DAY(1) TO SECOND",
+        "INTERVAL SECOND(1)",
+        "INTERVAL DAY(1) TO DAY",
+        "interval day to minute",
+    ] {
+        assert!(parse_type(invalid).is_err(), "{invalid}");
+    }
+    check("INTERVAL YEAR(2) TO MONTH", V::Text("-0-5".into()), "-0-5");
+    check(
+        "interval day to second",
+        V::Text("0 12:34:56.070".into()),
+        "0 12:34:56.070",
+    );
+    check(
+        "INTERVAL SECOND(1, 3)",
+        V::Text("0 00:00:09.123".into()),
+        "0 00:00:09.123",
+    );
+    check(
+        "map(array(INTERVAL SECOND(2, 12)), row(z time(12) with time zone, y INTERVAL MONTH(2)))",
+        V::Map(vec![(
+            V::Text("[0 00:00:00.000000000001]".into()),
+            V::Row(vec![
+                V::Text("23:59:59.999999999999+05:30".into()),
+                V::Text("0-7".into()),
+            ]),
+        )]),
+        r#"{"[0 00:00:00.000000000001]":["23:59:59.999999999999+05:30","0-7"]}"#,
+    );
+}

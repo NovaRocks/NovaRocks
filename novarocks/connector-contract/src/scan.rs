@@ -521,7 +521,10 @@ fn validate_scan<R: AsRef<ConnectorReadRelationRecipeDraft>, S: ScanOperations>(
             return Err(E::DuplicateVariable.into());
         }
     }
-    for predicate in [&input.enforced_predicate, &input.unenforced_predicate] {
+    for (predicate, enforced) in [
+        (&input.enforced_predicate, true),
+        (&input.unenforced_predicate, false),
+    ] {
         for column in predicate.columns() {
             ops.boundary().map_err(ScanValidationError::Observer)?;
             if column.index() >= assignments.len() {
@@ -531,7 +534,16 @@ fn validate_scan<R: AsRef<ConnectorReadRelationRecipeDraft>, S: ScanOperations>(
         if let Some(domains) = predicate.domains() {
             for (column, domain) in domains {
                 ops.boundary().map_err(ScanValidationError::Observer)?;
-                if domain.value_type() != assignments[column.index()].value_type {
+                let source = assignments[column.index()].value_type;
+                let target = domain.value_type();
+                let compatible = source == target
+                    || (!enforced
+                        && matches!(
+                            (source, target),
+                            (ConnectorValueType::Temporal(source), ConnectorValueType::Temporal(target))
+                                if source.is_lossless_widening_to(target)
+                        ));
+                if !compatible {
                     return Err(E::PredicateTypeMismatch.into());
                 }
             }

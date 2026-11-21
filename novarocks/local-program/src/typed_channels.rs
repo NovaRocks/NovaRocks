@@ -531,7 +531,7 @@ impl ChannelValidation<'_> {
                             }
                             let ty = self.definition(id)?;
                             if !comparator.supports_value_type(ty)
-                                || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(ty.data_type())
+                                || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1.supports_partition_value_type(ty)
                             { return Err(ProgramChannelTypeError::TypeMismatch); }
                             same_value(ty, self.definition(key.expr)?, false, work)?;
                         }

@@ -56,6 +56,7 @@ pub struct FrontendMvProductAdapter {
     /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
     /// carries the value that statement admission would otherwise have to guess.
     optimizer_query_mem_limit_bytes: u64,
+    statement_clock: crate::application::StatementClock,
     attempt_timeout: Duration,
     root_admission: RootAdmissionHandle,
     /// The deployment's statement that a previous incarnation is isolated,
@@ -75,6 +76,7 @@ impl FrontendMvProductAdapter {
         product_service: Arc<MvKeyedProductService>,
         maintenance_config: MaintenanceCoordinatorConfig,
         optimizer_query_mem_limit_bytes: u64,
+        statement_clock: crate::application::StatementClock,
         attempt_timeout: Duration,
         root_admission: RootAdmissionHandle,
         startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
@@ -87,6 +89,7 @@ impl FrontendMvProductAdapter {
             execution_role,
             topology,
             optimizer_query_mem_limit_bytes,
+            statement_clock,
             attempt_timeout,
             root_admission,
             startup_isolation,
@@ -147,6 +150,7 @@ impl FrontendMvProductAdapter {
             product_service: Arc::clone(&self.product_service),
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
+            statement_clock: self.statement_clock.clone(),
             attempt_timeout: self.attempt_timeout,
             runtime: tokio::runtime::Handle::current(),
             startup_isolation: self.startup_isolation.clone(),
@@ -168,6 +172,7 @@ struct RefreshWorkerDependencies {
     product_service: Arc<MvKeyedProductService>,
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
+    statement_clock: crate::application::StatementClock,
     attempt_timeout: Duration,
     /// The existing FE runtime hosts the two original serial asynchronous
     /// tasks and the shared warehouse queue; no worker or local queue is added.

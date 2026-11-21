@@ -29,41 +29,19 @@
 //! unrecognized `$suffix` is refused by
 //! [`SqlMetadataTableKind::parse`](crate::planner::table::SqlMetadataTableKind).
 
-use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields};
+use novarocks_type_contract::{TemporalPrecision, TemporalType};
 use novarocks_types::schema::SqlType;
 use std::sync::Arc;
 
 use crate::planner::table::SqlMetadataTableKind;
-
-/// Time zone stamped on every `TIMESTAMP WITH TIME ZONE` metadata column.
-///
-/// Iceberg `timestamptz` is UTC by definition, so the instant is unambiguous;
-/// what matters is the *spelling*. Frontend predicate lowering only recognizes
-/// a tz-aware timestamp whose zone matches `"UTC"` case-insensitively
-/// (`query_execution/preparation/typed_predicate.rs::is_utc`), so any other
-/// spelling — `"+00:00"` included — would silently make
-/// `committed_at`/`made_current_at` predicates non-pushable.
-///
-/// Note the honest limit of this declaration: NovaRocks has no SQL-visible
-/// `TIMESTAMP WITH TIME ZONE`. The parser has no syntax for it, the native
-/// fragment wire drops the zone entirely
-/// (`native/fragment_encoder/plan/type_mapping.rs` emits `PrimitiveType::
-/// Datetime` plus a time unit and has no zone field), and MySQL result
-/// encoding renders the value as UTC wall-clock without reporting a zone.
-/// Tagging the Arrow type is still the most faithful thing available: it is
-/// what distinguishes an instant from a naive local timestamp for predicate
-/// lowering, and `exec/chunk/type_compatibility.rs` treats a zone difference
-/// at the same time unit as a metadata-only retag rather than an error.
-const UTC_TIME_ZONE: &str = "UTC";
 
 #[derive(Clone, Debug)]
 pub struct MetadataColumn {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
-    /// SQL logical type for the columns whose Arrow carrier is ambiguous on
-    /// its own. Today that is exactly the JSON columns: `readable_metrics` is
-    /// carried as `Utf8`, and only this field distinguishes it from a VARCHAR.
+    /// Complete SQL declaration when the Arrow carrier alone is ambiguous.
     pub logical_type: Option<SqlType>,
 }
 
@@ -74,6 +52,16 @@ impl MetadataColumn {
             data_type,
             nullable,
             logical_type: None,
+        }
+    }
+
+    fn timestamp_with_time_zone(name: &str) -> Self {
+        let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::MICROSECONDS);
+        Self {
+            name: name.to_string(),
+            data_type: declaration.carrier(),
+            nullable: false,
+            logical_type: Some(SqlType::Temporal(declaration)),
         }
     }
 
@@ -122,12 +110,6 @@ fn varbinary() -> DataType {
 /// Trino `BOOLEAN`.
 fn boolean() -> DataType {
     DataType::Boolean
-}
-
-/// Trino `TIMESTAMP WITH TIME ZONE`, microsecond precision (Iceberg's own
-/// `timestamptz` precision).
-fn timestamp_with_time_zone() -> DataType {
-    DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into()))
 }
 
 /// Trino `MAP(key, value)`.
@@ -362,7 +344,7 @@ fn entries_data_file_row(derived: &IcebergMetadataDerivedTypes) -> DataType {
 /// Trino `$snapshots`.
 fn snapshots_columns() -> Vec<MetadataColumn> {
     vec![
-        MetadataColumn::new("committed_at", timestamp_with_time_zone(), false),
+        MetadataColumn::timestamp_with_time_zone("committed_at"),
         MetadataColumn::new("snapshot_id", bigint(), false),
         MetadataColumn::new("parent_id", bigint(), true),
         MetadataColumn::new("operation", varchar(), true),
@@ -378,7 +360,7 @@ fn snapshots_columns() -> Vec<MetadataColumn> {
 /// Trino `$history`.
 fn history_columns() -> Vec<MetadataColumn> {
     vec![
-        MetadataColumn::new("made_current_at", timestamp_with_time_zone(), false),
+        MetadataColumn::timestamp_with_time_zone("made_current_at"),
         MetadataColumn::new("snapshot_id", bigint(), false),
         MetadataColumn::new("parent_id", bigint(), true),
         MetadataColumn::new("is_current_ancestor", boolean(), false),
@@ -782,9 +764,14 @@ mod tests {
                 "summary",
             ]
         );
+        let instant = TemporalType::TimestampWithTimeZone(TemporalPrecision::MICROSECONDS);
         assert_eq!(
             column(&columns, "committed_at").data_type,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            instant.carrier()
+        );
+        assert_eq!(
+            column(&columns, "committed_at").logical_type,
+            Some(SqlType::Temporal(instant))
         );
         assert_eq!(column(&columns, "snapshot_id").data_type, bigint());
         assert_eq!(column(&columns, "parent_id").data_type, bigint());
@@ -814,9 +801,14 @@ mod tests {
                 "is_current_ancestor",
             ]
         );
+        let instant = TemporalType::TimestampWithTimeZone(TemporalPrecision::MICROSECONDS);
         assert_eq!(
             column(&columns, "made_current_at").data_type,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            instant.carrier()
+        );
+        assert_eq!(
+            column(&columns, "made_current_at").logical_type,
+            Some(SqlType::Temporal(instant))
         );
         assert_eq!(column(&columns, "snapshot_id").data_type, bigint());
         assert_eq!(column(&columns, "parent_id").data_type, bigint());

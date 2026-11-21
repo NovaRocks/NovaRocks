@@ -55,6 +55,7 @@ pub(crate) fn semantic_comparison_node_work(
         match kind {
             ValueKind::Scalar(ty) => crate::schema::type_comparison_node_work(ty)?,
             ValueKind::Nominal(_)
+            | ValueKind::Temporal(_)
             | ValueKind::FixedSizeList { .. }
             | ValueKind::Struct(_)
             | ValueKind::Union(_) => COMPARISON_HEADER_WORK,
@@ -86,6 +87,10 @@ fn equal<E: From<ValueTypeError>>(
         }
         (ValueKind::String, ValueKind::String) | (ValueKind::Binary, ValueKind::Binary) => true,
         (ValueKind::Nominal(left), ValueKind::Nominal(right)) => {
+            observe(TypeComparisonStep::Header)?;
+            left == right
+        }
+        (ValueKind::Temporal(left), ValueKind::Temporal(right)) => {
             observe(TypeComparisonStep::Header)?;
             left == right
         }
@@ -209,7 +214,11 @@ fn visit<'a, E>(
                 visit(field.field.value_type(), observe)?;
             }
         }
-        ValueKind::Scalar(_) | ValueKind::String | ValueKind::Binary | ValueKind::Nominal(_) => {}
+        ValueKind::Scalar(_)
+        | ValueKind::String
+        | ValueKind::Binary
+        | ValueKind::Nominal(_)
+        | ValueKind::Temporal(_) => {}
     }
     Ok(())
 }

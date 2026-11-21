@@ -29,6 +29,7 @@ pub(crate) enum SortKeyFailure {
     PhysicalWrapper(&'static str),
     LargeIntWidth { actual: i32 },
     Type(ExecutionValueTypeError),
+    Value(novarocks_value_arrays::ValueError),
     Arrow(arrow::error::ArrowError),
 }
 impl fmt::Display for SortKeyFailure {
@@ -59,7 +60,8 @@ impl fmt::Display for SortKeyFailure {
                 "LARGEINT sort key width mismatch: expected 16, got {actual}"
             ),
             Self::Type(source) => source.fmt(f),
-            Self::Arrow(source) => write!(f, "normalize LARGEINT sort key failed: {source}"),
+            Self::Value(source) => source.fmt(f),
+            Self::Arrow(source) => write!(f, "normalizing sort key failed: {source}"),
         }
     }
 }
@@ -67,6 +69,7 @@ impl Error for SortKeyFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Type(source) => Some(source),
+            Self::Value(source) => Some(source),
             Self::Arrow(source) => Some(source),
             _ => None,
         }
@@ -83,6 +86,7 @@ impl FailureProjection for SortKeyFailure {
             Self::PhysicalWrapper(_) => ExecutionReason::SortKeyPhysicalWrapper,
             Self::LargeIntWidth { .. } => ExecutionReason::SortKeyLargeIntWidth,
             Self::Type(source) => return source.failure_fact(),
+            Self::Value(source) => return source.failure_fact(),
             Self::Arrow(arrow::error::ArrowError::MemoryError(_)) => {
                 return FailureFact::new(
                     FailureClass::Resource,

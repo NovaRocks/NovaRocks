@@ -35,7 +35,9 @@ use novarocks_sql::compiler::{
     SqlCompileError, SqlConstantEvaluationError, SqlFunctionCatalog, SqlPlannerTableSnapshot,
     prepare_required_constant,
 };
-use novarocks_type_contract::{CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompilePhase, PureCompileControl, TemporalValue, TimeZoneKey, ValueKind,
+};
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 use std::sync::{Arc, RwLock};
 
@@ -50,6 +52,7 @@ pub(crate) enum ScopedSessionMutation {
         name: ast::ObjectName,
         span: Span,
     },
+    SetTimeZone(ast::TrinoSetTimeZone),
 }
 
 pub(crate) struct SessionPropertyMutation {
@@ -61,6 +64,7 @@ pub(crate) struct SessionPropertyCpuInput {
     pub(crate) source: Arc<str>,
     pub(crate) mutation: SessionPropertyMutation,
     pub(crate) staged: SessionSqlState,
+    pub(crate) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     pub(crate) registry: Arc<SessionPropertyRegistry>,
     pub(crate) interpreter: Arc<crate::RequiredConstantInterpreter>,
     pub(crate) control: SqlCompileControl,
@@ -78,6 +82,11 @@ impl SessionPropertyCpuInput {
     pub(crate) fn run(mut self) -> Result<PreparedSessionProperties, QueryServiceError> {
         let evaluator = SessionPropertyEvaluation {
             interpreter: &self.interpreter,
+            sql_semantics: self
+                .staged
+                .sql_semantics()
+                .clone()
+                .with_statement_time(self.staged.statement_time(self.statement_time)),
             control: &self.control,
             scope: &self.scope,
             window: &self.window,
@@ -125,6 +134,21 @@ impl SessionPropertyCpuInput {
                     .map_err(|error| sql_session_property_error_at(error, &self.source, span))?;
                 Ok(SessionEffects::property(validated))
             }
+            ScopedSessionMutation::SetTimeZone(node) => {
+                let zone = node
+                    .time_zone
+                    .as_ref()
+                    .map(|expression| {
+                        evaluator.evaluate_time_zone(&self.staged, expression, &self.source)
+                    })
+                    .transpose()?;
+                self.control
+                    .checkpoint(CompilePhase::Validate, 0)
+                    .map_err(QueryServiceError::from_compile_control)?;
+                self.registry
+                    .prepare_trino_time_zone(zone)
+                    .map_err(|error| super::internal_error(error.to_string()))
+            }
             ScopedSessionMutation::Reset { name, span } => {
                 let property = self
                     .registry
@@ -157,6 +181,7 @@ impl QuerySessionPropertyCpuInput {
         let query = self.statement.query();
         let evaluator = SessionPropertyEvaluation {
             interpreter: &self.context.interpreter,
+            sql_semantics: self.context.sql_semantics.clone(),
             control: &self.context.control,
             scope: &self.context.scope,
             window: &self.context.window,
@@ -202,6 +227,7 @@ pub(super) struct QuerySessionPreparationInput {
     pub(super) source: Arc<str>,
     pub(super) statement: super::query_session_action::QueryFamily,
     pub(super) original: SessionSqlState,
+    pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     pub(super) compiler: super::compiler::FrontendQueryCompiler,
     pub(super) registry: Arc<SessionPropertyRegistry>,
     pub(super) catalogs: novarocks_query_application::sql::catalog::SessionCatalogService,
@@ -278,7 +304,11 @@ impl QuerySessionPreparation {
             );
             let context = input.compiler.property_cpu_context(
                 input.original.current_database().to_owned(),
-                input.original.sql_semantics().clone(),
+                input
+                    .original
+                    .sql_semantics()
+                    .clone()
+                    .with_statement_time(input.original.statement_time(input.statement_time)),
                 input.interpreter,
                 control,
                 owner.scope().clone(),
@@ -368,6 +398,7 @@ fn session_query_work_error(
 
 struct SessionPropertyEvaluation<'a> {
     interpreter: &'a crate::RequiredConstantInterpreter,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     control: &'a SqlCompileControl,
     scope: &'a WorkScope,
     window: &'a ResultWindowAlias,
@@ -391,6 +422,85 @@ impl SessionPropertyEvaluation<'_> {
             SessionPropertyType::Double => RequiredConstantTarget::Double,
             SessionPropertyType::Varchar => RequiredConstantTarget::Varchar,
         };
+        self.evaluate_target(original, expression, target, name, None)
+    }
+
+    fn evaluate_time_zone(
+        &self,
+        original: &SessionSqlState,
+        expression: &ast::Expr,
+        source: &str,
+    ) -> Result<TimeZoneKey, QueryServiceError> {
+        let value = self.evaluate_target(
+            original,
+            expression,
+            RequiredConstantTarget::TimeZone,
+            "time_zone_id",
+            Some(source),
+        )?;
+        let constant_failure =
+            |error| QueryServiceError::from_failure_cause(SharedFailureCause::new(error));
+        let missing = || super::internal_error("SET TIME ZONE expression returned NULL");
+        if matches!(value.value_type().value_type().kind(), ValueKind::String) {
+            let name = value
+                .utf8_observed(CompilePhase::Validate, self.control)
+                .map_err(constant_failure)?
+                .ok_or_else(missing)?;
+            if name.is_empty() {
+                return Err(super::internal_error("Zone id is an empty string"));
+            }
+            return TimeZoneKey::parse(name).ok_or_else(|| {
+                QueryServiceError::new(
+                    novarocks_query_application::session_error::QueryServiceErrorKind::Unsupported,
+                    format!("Time zone not supported: {name}"),
+                )
+            });
+        }
+        let Some(TemporalValue::IntervalDayTime(offset)) = value
+            .temporal_observed(CompilePhase::Validate, self.control)
+            .map_err(constant_failure)?
+        else {
+            return Err(missing());
+        };
+        const MICROS_PER_MINUTE: i64 = 60_000_000;
+        if offset.picoseconds_of_microsecond() != 0 || offset.micros() % MICROS_PER_MINUTE != 0 {
+            return Err(QueryServiceError::from_user_error(
+                novarocks_sql::analyze_error::AnalyzeError::invalid_literal(
+                    "Invalid TIME ZONE offset interval: interval contains seconds",
+                    expression.span(),
+                )
+                .to_user_error(None),
+            ));
+        }
+        let minutes = offset.micros() / MICROS_PER_MINUTE;
+        i16::try_from(minutes)
+            .ok()
+            .and_then(TimeZoneKey::from_offset_minutes)
+            .ok_or_else(|| {
+                use novarocks_query_application::execution_error::{
+                    SqlExecutionErrorDescriptor, SqlExecutionErrorKind,
+                };
+                use novarocks_user_error::{RetryClass, UserError};
+                QueryServiceError::from_user_error(UserError::from_descriptor(
+                    SqlExecutionErrorDescriptor::for_kind(
+                        SqlExecutionErrorKind::InvalidFunctionArgument,
+                    )
+                    .descriptor,
+                    format!("Invalid offset minutes {minutes}"),
+                    None,
+                    RetryClass::Never,
+                ))
+            })
+    }
+
+    fn evaluate_target(
+        &self,
+        original: &SessionSqlState,
+        expression: &ast::Expr,
+        target: RequiredConstantTarget,
+        name: &str,
+        time_zone_source: Option<&str>,
+    ) -> Result<novarocks_functions::ConstantValue, QueryServiceError> {
         let prepared = {
             let catalog = self.catalog.read().map_err(super::poisoned_state)?;
             prepare_required_constant(RequiredConstantRequest {
@@ -400,19 +510,29 @@ impl SessionPropertyEvaluation<'_> {
                 current_database: original.current_database(),
                 functions: Arc::clone(self.functions),
                 sealed_functions: self.interpreter.sealed_functions(),
-                sql_semantics: original.sql_semantics(),
+                sql_semantics: &self.sql_semantics,
                 constant_policy: self.policy,
                 control: self.control,
             })
         }
-        .map_err(compile_error)?;
+        .map_err(|error| compile_error_for_target(error, time_zone_source))?;
         self.interpreter
             .evaluate(prepared, self.scope, self.window)
-            .map_err(|error| evaluation_error(error, name))
+            .map_err(|error| {
+                if let (Some(_), SqlConstantEvaluationError::Source(cause)) =
+                    (time_zone_source, &error)
+                {
+                    return QueryServiceError::from_failure_cause(cause.clone());
+                }
+                evaluation_error(error, name)
+            })
     }
 }
 
-fn compile_error(error: SqlCompileError) -> QueryServiceError {
+fn compile_error_for_target(
+    error: SqlCompileError,
+    time_zone_source: Option<&str>,
+) -> QueryServiceError {
     use novarocks_type_contract::CompileControlError as C;
     match error {
         SqlCompileError::Cancelled => QueryServiceError::from_compile_control(C::Cancelled),
@@ -437,6 +557,12 @@ fn compile_error(error: SqlCompileError) -> QueryServiceError {
                 == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
             {
                 return QueryServiceError::from_user_error(error.to_user_error(None));
+            }
+            if let Some(source) = time_zone_source {
+                let source = (error.kind()
+                    != novarocks_sql::analyze_error::AnalyzeErrorKind::TypeMismatch)
+                    .then_some(source);
+                return QueryServiceError::from_user_error(error.to_user_error(source));
             }
             QueryServiceError::from_user_error(
                 SessionAdmitError::InvalidSessionProperty.without_location(error.to_string()),
@@ -543,6 +669,7 @@ mod tests {
                     catalogs: Arc::new(SystemOnly),
                 },
                 staged,
+                statement_time: crate::application::test_statement_time(),
                 registry: Arc::new(SessionPropertyRegistry::new().unwrap()),
                 interpreter: Arc::new(crate::query_execution::required_constant_eval::test_required_constant_interpreter()),
                 control: SqlCompileControl::unbounded(), scope: self.root.owner.scope(), window: self.window.clone(),
@@ -761,7 +888,8 @@ mod tests {
                 .user_error()
                 .is_none_or(|error| error.code().as_str() != "sql.admit.invalid_session_property")
         );
-        let compile = compile_error(SqlCompileError::CompilationSource(source.clone()));
+        let compile =
+            compile_error_for_target(SqlCompileError::CompilationSource(source.clone()), None);
         assert_eq!(compile.failure_cause(), Some(&source));
         assert!(
             compile

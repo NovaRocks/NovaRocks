@@ -127,6 +127,10 @@ fn empty_membership_values(data_type: &DataType) -> Option<MembershipValues> {
         DataType::Int32 => MembershipValues::int32([]),
         DataType::Int64 => MembershipValues::int64([]),
         DataType::FixedSizeBinary(16) => MembershipValues::large_int([]),
+        DataType::FixedSizeBinary(width @ (10 | 12 | 14)) => MembershipValues::Temporal {
+            carrier_width: *width,
+            values: Default::default(),
+        },
         DataType::Float32 => MembershipValues::float32([]),
         DataType::Float64 => MembershipValues::float64([]),
         DataType::Utf8 => MembershipValues::utf8(std::iter::empty::<String>()),
@@ -160,6 +164,16 @@ fn union_membership_values(
         (MembershipValues::LargeInt(left), MembershipValues::LargeInt(right)) => {
             union!(left, right)
         }
+        (
+            MembershipValues::Temporal {
+                carrier_width: left_width,
+                values: left,
+            },
+            MembershipValues::Temporal {
+                carrier_width: right_width,
+                values: right,
+            },
+        ) if left_width == right_width => union!(left, right),
         (MembershipValues::Float32(left), MembershipValues::Float32(right)) => union!(left, right),
         (MembershipValues::Float64(left), MembershipValues::Float64(right)) => union!(left, right),
         (MembershipValues::Utf8(left), MembershipValues::Utf8(right)) => {
@@ -232,6 +246,16 @@ fn projected_value_growth(
         (MembershipValues::LargeInt(left), MembershipValues::LargeInt(right)) => {
             missing_fixed_bytes(left, right, size_of::<i128>())
         }
+        (
+            MembershipValues::Temporal {
+                carrier_width: left_width,
+                values: left,
+            },
+            MembershipValues::Temporal {
+                carrier_width: right_width,
+                values: right,
+            },
+        ) if left_width == right_width => missing_fixed_bytes(left, right, 12),
         (MembershipValues::Float32(left), MembershipValues::Float32(right)) => {
             missing_fixed_bytes(left, right, size_of::<u32>())
         }

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::commit::write_adaptation::adapt_batch;
 use crate::iceberg::arrow::RecordBatchPartitionSplitter;
 use crate::iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
 use arrow::array::{
@@ -207,14 +208,28 @@ fn provider_partition_keys_match_the_sdk_data_splitter_across_supported_sources(
                 .build()
                 .unwrap(),
         );
-        let input_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        let physical_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "source",
             sample.array.data_type().clone(),
             true,
         )]));
-        let input = RecordBatch::try_new(input_schema.clone(), vec![sample.array]).unwrap();
-        let adapted =
-            adapt_batch(&input, &Arc::new(schema_to_arrow_schema(&schema).unwrap())).unwrap();
+        let physical = RecordBatch::try_new(physical_schema, vec![sample.array]).unwrap();
+        let adapted = adapt_batch(
+            &physical,
+            &Arc::new(schema_to_arrow_schema(&schema).unwrap()),
+        )
+        .unwrap();
+        let canonical = crate::temporal::TemporalReadProjection::from_type(&Type::Primitive(
+            sample.kind.clone(),
+        ))
+        .materialize(physical.column(0).clone(), "source", &mut || Ok(()))
+        .unwrap();
+        let input_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "source",
+            canonical.data_type().clone(),
+            true,
+        )]));
+        let input = RecordBatch::try_new(input_schema.clone(), vec![canonical]).unwrap();
         for transform in sample.transforms {
             // Include a void field in the tuple, alongside a real partition field.
             let spec = Arc::new(

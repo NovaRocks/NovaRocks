@@ -1416,7 +1416,7 @@ fn grouped_topn_rejects_a_key_outside_the_partition_domain() {
     let comparator = novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1;
     assert!(
         !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-            .supports_partition_key(definition.ty.data_type())
+            .supports_partition_value_type(&definition.ty)
     );
     assert!(!novarocks_physical_plan::grouped_state_topn_key_supported(
         comparator,

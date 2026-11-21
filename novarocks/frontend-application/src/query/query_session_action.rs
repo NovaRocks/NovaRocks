@@ -93,6 +93,7 @@ pub(super) struct QueryActionInputs {
     pub(super) cancellation: QueryCancellationView,
     pub(super) window: ResultWindowAlias,
     pub(super) planning_cpu: Option<Arc<FrontendPlanningCpuSource>>,
+    pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     #[cfg(novarocks_dev_controls)]
     pub(super) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
     #[cfg(novarocks_dev_controls)]
@@ -115,6 +116,7 @@ struct ScopedQueryAction {
     source: Arc<str>,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
     action: Option<Box<dyn GovernedStatementAction>>,
+    statement_time: novarocks_type_contract::StatementTimeEnvironment,
     #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
     #[cfg(novarocks_dev_controls)]
@@ -186,6 +188,7 @@ impl GovernedStatementAction for ScopedQueryAction {
                 ),
                 window,
                 planning_cpu: Some(Arc::clone(&self.planning_cpu)),
+                statement_time: self.statement_time,
                 #[cfg(novarocks_dev_controls)]
                 observation: self.observation.clone(),
                 #[cfg(novarocks_dev_controls)]
@@ -226,6 +229,7 @@ impl FrontendQuerySession {
         &self,
         source: Arc<str>,
         action: novarocks_query_application::sql::trino_admission::TrinoQueryAction,
+        statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<StatementResult, QueryServiceError> {
         let family = QueryFamily::from_trino(action);
         use novarocks_query_application::{
@@ -240,7 +244,8 @@ impl FrontendQuerySession {
             kind,
             shape: StatementOutputShape::ResultSet,
         };
-        self.execute_query_family(source, family, admitted).await
+        self.execute_query_family(source, family, admitted, statement_time)
+            .await
     }
 
     async fn execute_query_family(
@@ -248,6 +253,7 @@ impl FrontendQuerySession {
         source: Arc<str>,
         family: QueryFamily,
         admitted: novarocks_query_application::session::StatementAdmission,
+        statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<StatementResult, QueryServiceError> {
         self.admission.publish(admitted);
         *self.output_shape.lock().map_err(poisoned_state)? = Some(admitted.shape);
@@ -331,6 +337,7 @@ impl FrontendQuerySession {
                     source: Arc::clone(&source),
                     statement: family,
                     original,
+                    statement_time,
                     compiler: self.service.query_compiler.clone(),
                     registry: Arc::clone(&self.service.session_properties),
                     catalogs: Arc::clone(&self.service.session_catalog_resolver),
@@ -350,6 +357,7 @@ impl FrontendQuerySession {
             source,
             planning_cpu,
             action: None,
+            statement_time,
             #[cfg(novarocks_dev_controls)]
             observation,
             #[cfg(novarocks_dev_controls)]

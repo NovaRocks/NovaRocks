@@ -210,6 +210,10 @@ fn node<E>(value: &ValueTypeRef, write: &mut impl FnMut(&[u8]) -> Result<(), E>)
                 ValueLogicalType::Physical => unreachable!("checked nominal excludes Physical"),
             },
         ])?,
+        ValueKind::Temporal(declaration) => {
+            write(&[9])?;
+            write(&declaration.identity_bytes())?;
+        }
         ValueKind::List(item) => {
             write(&[4])?;
             node(item, write)?;

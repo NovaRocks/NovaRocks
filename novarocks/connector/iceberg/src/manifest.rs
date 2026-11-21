@@ -214,6 +214,7 @@ fn partition_field_values_checked(
             .and_then(|literal| literal.as_ref())
             .and_then(partition_value_from_literal);
         values.push(IcebergPartitionFieldValue {
+            source_field_id: Some(field.source_id),
             source_column,
             field_name: field.name.clone(),
             transform: partition_transform_name(&field.transform),

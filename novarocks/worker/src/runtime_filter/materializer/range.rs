@@ -7,6 +7,7 @@ use novarocks_execution::runtime_filter::{
         OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderNullOrder,
         RuntimeOrderSortDirection,
     },
+    temporal_order_key_type_bytes,
 };
 
 use crate::runtime_filter::artifact as worker_artifact;
@@ -56,7 +57,7 @@ pub fn decode_range_leaf(
     if !r.empty() {
         return Err(ArtifactCodecError::TrailingBytes);
     }
-    let (keys, comparator_digest, timezone_bytes) = decode_contract(contract)?;
+    let (keys, comparator_digest, timezone_bytes) = decode_contract(contract, expected)?;
     if comparator_digest != expected.comparator_digest()
         || keys.len() != expected.keys().len()
         || !keys
@@ -107,6 +108,7 @@ pub fn decode_range_leaf(
 
 fn decode_contract(
     bytes: &[u8],
+    expected: &RuntimeOrderContract,
 ) -> Result<
     (
         Vec<novarocks_execution::runtime_filter::contribution::RuntimeOrderKey>,
@@ -120,10 +122,20 @@ fn decode_contract(
     if count == 0 {
         return Err(ArtifactCodecError::NonCanonicalPayload);
     }
+    if count != expected.keys().len() {
+        return Err(ArtifactCodecError::ContractViolation);
+    }
     let mut keys = Vec::with_capacity(count);
     let mut timezone_bytes = 0;
-    for _ in 0..count {
-        let (data_type, bytes) = decode_type(&mut r)?;
+    for key in expected.keys() {
+        let (data_type, bytes) = if let Some(declaration) = key.temporal_type() {
+            if r.array::<5>()? != temporal_order_key_type_bytes(declaration) {
+                return Err(ArtifactCodecError::ContractViolation);
+            }
+            (key.data_type().clone(), 0)
+        } else {
+            decode_type(&mut r)?
+        };
         timezone_bytes += bytes;
         let direction = match r.u8()? {
             1 => RuntimeOrderSortDirection::Ascending,
@@ -194,7 +206,14 @@ fn decode_tuple(
     for key in contract.keys() {
         values.push(match r.u8()? {
             0 => None,
-            1 => Some(decode_scalar(&mut r, key.data_type())?),
+            1 => Some(if let Some(declaration) = key.temporal_type() {
+                let value = r.array()?;
+                novarocks_type_contract::TemporalRelationKey::from_order_bytes(declaration, value)
+                    .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?;
+                OrderedScalar::Temporal(value)
+            } else {
+                decode_scalar(&mut r, key.data_type())?
+            }),
             _ => return Err(ArtifactCodecError::NonCanonicalPayload),
         });
     }
@@ -285,7 +304,14 @@ pub fn encode_range_leaf(
             .to_be_bytes(),
     );
     for key in contract.keys() {
-        encode_type(key.data_type(), &mut contract_bytes)?;
+        if let Some(declaration) = key.temporal_type() {
+            if key.data_type() != &declaration.carrier() {
+                return Err(ArtifactCodecError::ContractViolation);
+            }
+            contract_bytes.extend_from_slice(&temporal_order_key_type_bytes(declaration));
+        } else {
+            encode_type(key.data_type(), &mut contract_bytes)?;
+        }
         contract_bytes.push(match key.direction() {
             RuntimeOrderSortDirection::Ascending => 1,
             RuntimeOrderSortDirection::Descending => 2,
@@ -410,6 +436,7 @@ fn encode_type(data_type: &DataType, output: &mut Vec<u8>) -> Result<(), Artifac
 }
 fn encode_scalar(value: &OrderedScalar, output: &mut Vec<u8>) -> Result<(), ArtifactCodecError> {
     match value {
+        OrderedScalar::Temporal(value) => output.extend_from_slice(value),
         OrderedScalar::Boolean(value) => output.push(u8::from(*value)),
         OrderedScalar::Int8(value) => output.push(*value as u8),
         OrderedScalar::Int16(value) => output.extend_from_slice(&value.to_be_bytes()),

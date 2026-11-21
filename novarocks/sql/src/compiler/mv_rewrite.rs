@@ -3644,7 +3644,7 @@ fn build_candidate(
         inner: analyzer_catalog,
         default_catalog: &definition.resolution.default_catalog,
     };
-    let (resolved, ctes, returned) = crate::analyzer::analyze_with_factory_and_function_catalog(
+    let (resolved, ctes, returned) = crate::analyzer::analyze_mv_definition_with_factory(
         &definition.select_query,
         &catalog,
         &definition.resolution.default_namespace,

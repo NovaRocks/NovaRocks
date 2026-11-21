@@ -287,21 +287,13 @@ struct FunctionMetadata<'a> {
 fn unsupported_remaining_root(expr: &ast::Expr) -> bool {
     matches!(
         expr,
-        ast::Expr::AtLocal(_)
-            | ast::Expr::AtTimeZone(_)
-            | ast::Expr::Overlay(_)
-            | ast::Expr::IntervalValueExpression(_)
+        ast::Expr::Overlay(_)
             | ast::Expr::MethodCall(_)
             | ast::Expr::StaticMethodCall(_)
             | ast::Expr::CurrentCatalog(_)
-            | ast::Expr::CurrentDate(_)
             | ast::Expr::CurrentPath(_)
             | ast::Expr::CurrentSchema(_)
             | ast::Expr::CurrentUser(_)
-            | ast::Expr::CurrentTime(_)
-            | ast::Expr::CurrentTimestamp(_)
-            | ast::Expr::LocalTime(_)
-            | ast::Expr::LocalTimestamp(_)
     ) || matches!(expr, ast::Expr::Trim(node) if node.trim_character.is_some())
 }
 
@@ -436,21 +428,48 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::GroupingOperation(node) => {
                 self.analyze_grouping_input(super::GroupingSyntaxRef::Operation(node), scope)
             }
-            ast::Expr::AtLocal(_)
-            | ast::Expr::AtTimeZone(_)
-            | ast::Expr::Overlay(_)
-            | ast::Expr::IntervalValueExpression(_)
-            | ast::Expr::MethodCall(_)
-            | ast::Expr::StaticMethodCall(_)
-            | ast::Expr::CurrentCatalog(_)
-            | ast::Expr::CurrentDate(_)
-            | ast::Expr::CurrentPath(_)
-            | ast::Expr::CurrentSchema(_)
-            | ast::Expr::CurrentUser(_)
+            ast::Expr::IntervalValueExpression(node) => {
+                let left = self.analyze_expr(&node.left, scope)?;
+                let right = self.analyze_expr(&node.right, scope)?;
+                let [left_type, right_type, target] =
+                    novarocks_expression::typing::qualified_datetime_difference(
+                        &left.value_type,
+                        &right.value_type,
+                        &node.data_type,
+                    )
+                    .map_err(|error| {
+                        super::expression_typing::analyze_typing_error(error, node.span)
+                    })?;
+                let left = self.cast_to_value_type(left, left_type, node.left.span())?;
+                let right = self.cast_to_value_type(right, right_type, node.right.span())?;
+                let difference = self.analyze_temporal_operator(
+                    novarocks_type_contract::OperatorFunction::TemporalSubtract,
+                    vec![left, right],
+                    node.span,
+                )?;
+                self.cast_to_value_type(difference, target, node.span)
+            }
+            ast::Expr::AtLocal(node) => {
+                let source = self.analyze_expr(&node.value, scope)?;
+                self.type_at_zone(source, None, node.span)
+            }
+            ast::Expr::AtTimeZone(node) => {
+                let source = self.analyze_expr(&node.value, scope)?;
+                let zone = self.analyze_expr(&node.time_zone, scope)?;
+                self.type_at_zone(source, Some(zone), node.span)
+            }
+            ast::Expr::CurrentDate(_)
             | ast::Expr::CurrentTime(_)
             | ast::Expr::CurrentTimestamp(_)
             | ast::Expr::LocalTime(_)
-            | ast::Expr::LocalTimestamp(_) => Err(AnalyzeError::unsupported_expression(
+            | ast::Expr::LocalTimestamp(_) => self.type_clock(expr),
+            ast::Expr::Overlay(_)
+            | ast::Expr::MethodCall(_)
+            | ast::Expr::StaticMethodCall(_)
+            | ast::Expr::CurrentCatalog(_)
+            | ast::Expr::CurrentPath(_)
+            | ast::Expr::CurrentSchema(_)
+            | ast::Expr::CurrentUser(_) => Err(AnalyzeError::unsupported_expression(
                 "expression profile is not supported",
                 expr.span(),
             )),
@@ -492,14 +511,19 @@ impl<'a> super::AnalyzerContext<'a> {
             // producer, full binding and failure effects of the operand.
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Plus) => {
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
+                novarocks_expression::typing::validate_temporal_unary_plus(&inner_typed.value_type)
+                    .map_err(|error| {
+                        super::expression_typing::analyze_typing_error(error, unary.span)
+                    })?;
                 signed_unary_plus_identity(inner_typed, expr)
             }
 
             // Unary minus
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
                 let operand = self.analyze_expr(&unary.expression, scope)?;
+                let operator = novarocks_expression::typing::negation_operator(&operand.value_type);
                 let mut bound = self.type_scalar_call(
-                    NodeShape::Operator(novarocks_type_contract::OperatorFunction::Negation),
+                    NodeShape::Operator(operator),
                     vec![operand],
                     unary.span,
                 )?;
@@ -520,6 +544,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 let inner_typed = self.analyze_expr(&cast.expression, scope)?;
                 let declared =
                     super::helpers::sql_type_to_value_type(&cast.data_type, true, self.control)?;
+                if inner_typed.value_type.value_type().temporal().is_some()
+                    || declared.value_type().temporal().is_some()
+                {
+                    return self.type_temporal_cast(inner_typed, declared, cast.safe, cast.span);
+                }
                 if matches!(
                     inner_typed.value_type.data_type(),
                     DataType::List(_) | DataType::Null
@@ -1670,6 +1699,20 @@ impl<'a> super::AnalyzerContext<'a> {
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
+        if let Some(operator) = novarocks_expression::typing::temporal_binary_operator(
+            arithmetic_operator_of(op),
+            &left_typed.value_type,
+            &right_typed.value_type,
+        )
+        .map_err(|error| super::expression_typing::analyze_typing_error(error, binary.span))?
+        {
+            return self.analyze_temporal_operator(
+                operator,
+                vec![left_typed, right_typed],
+                binary.span,
+            );
+        }
+
         // A boolean is a one-bit number once it reaches arithmetic: TRUE is 1
         // and FALSE is 0, and `x + any_match(...)` is how a lambda counts the
         // elements that matched. Spelling that as a cast to the width a
@@ -1682,19 +1725,6 @@ impl<'a> super::AnalyzerContext<'a> {
             arithmetic_operator_of(op),
             binary.left_operand_span,
         )?;
-
-        if let Some(date_shift) = date_day_arithmetic_expr(
-            self.function_catalog,
-            &left_typed,
-            op,
-            &right_typed,
-            binary.left_operand_span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )? {
-            return Ok(date_shift);
-        }
 
         // The SQL owner freezes promotion from declared metadata before any
         // values are evaluated. Both operands must carry the float cast.
@@ -1807,6 +1837,30 @@ impl<'a> super::AnalyzerContext<'a> {
                 },
             },
             value_type: super::helpers::with_nullability(result_type, nullable),
+        })
+    }
+
+    fn analyze_temporal_operator(
+        &self,
+        operator: novarocks_type_contract::OperatorFunction,
+        args: Vec<TypedExpr>,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let bound = self.type_scalar_call(NodeShape::Operator(operator), args, span)?;
+        let novarocks_functions::FunctionResultType::Scalar(result) =
+            &bound.binding.selected.result_type
+        else {
+            unreachable!("temporal operators have scalar results");
+        };
+        Ok(TypedExpr {
+            value_type: result.clone(),
+            kind: ExprKind::FunctionCall {
+                name: operator.catalog_name().to_owned(),
+                args: bound.args.into(),
+                distinct: false,
+                volatility: bound.binding.semantics.volatility,
+                binding: bound.binding,
+            },
         })
     }
 
@@ -4402,102 +4456,6 @@ pub(super) fn cast_null_preserving_target_type(
         },
         value_type: novarocks_type_contract::FunctionValueType::new(target.clone(), nullable),
     }
-}
-
-fn date_day_arithmetic_expr(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    left: &TypedExpr,
-    op: &ast::BinaryOperator,
-    right: &TypedExpr,
-    span: Span,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<Option<TypedExpr>, AnalyzeError> {
-    match op {
-        ast::BinaryOperator::Add if is_temporal_day_base(left.value_type.data_type()) => {
-            date_day_shift_expr(
-                function_catalog,
-                "days_add",
-                left.clone(),
-                right.clone(),
-                span,
-                decimal_overflow_policy,
-                constant_policy,
-                control,
-            )
-        }
-        ast::BinaryOperator::Add if is_temporal_day_base(right.value_type.data_type()) => {
-            date_day_shift_expr(
-                function_catalog,
-                "days_add",
-                right.clone(),
-                left.clone(),
-                span,
-                decimal_overflow_policy,
-                constant_policy,
-                control,
-            )
-        }
-        ast::BinaryOperator::Subtract if is_temporal_day_base(left.value_type.data_type()) => {
-            date_day_shift_expr(
-                function_catalog,
-                "days_sub",
-                left.clone(),
-                right.clone(),
-                span,
-                decimal_overflow_policy,
-                constant_policy,
-                control,
-            )
-        }
-        _ => Ok(None),
-    }
-}
-
-fn date_day_shift_expr(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    function_name: &str,
-    date_expr: TypedExpr,
-    offset_expr: TypedExpr,
-    span: Span,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<Option<TypedExpr>, AnalyzeError> {
-    if !is_integer_day_offset(offset_expr.value_type.data_type()) {
-        return Ok(None);
-    }
-    if !matches!(
-        &date_expr.value_type.data_type(),
-        DataType::Date32 | DataType::Timestamp(_, _)
-    ) {
-        return Ok(None);
-    }
-    let offset_expr =
-        cast_null_preserving_target_type(offset_expr, &DataType::Int64, decimal_overflow_policy);
-    let args = vec![date_expr, offset_expr];
-    resolved_scalar_call_at(
-        function_catalog,
-        function_name,
-        args,
-        span,
-        decimal_overflow_policy,
-        constant_policy,
-        control,
-    )
-    .map(Some)
-}
-
-fn is_temporal_day_base(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Date32 | DataType::Timestamp(_, _))
-}
-
-fn is_integer_day_offset(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
 }
 
 fn cast_to_utf8_if_needed(expr: &mut TypedExpr) -> bool {

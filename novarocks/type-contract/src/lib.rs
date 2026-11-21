@@ -168,9 +168,18 @@ pub use semantics::{
     AggregateStateInterpretation, AggregateStateOrderKey, BooleanValue, EvaluationDemand,
     MAX_SEMANTIC_PARAMETERS, SemanticParameterError, SemanticParameterId, SemanticParameterKey,
     SemanticParameterProjectionError, SemanticParameterProjectionVisit, SemanticParameterRef,
-    SemanticParameterValue, SemanticParameters,
+    SemanticParameterValue, SemanticParameters, StatementStartUtc, StatementTimeEnvironment,
 };
 pub use temporal_source::*;
+mod temporal_type;
+pub use temporal_type::{
+    IntervalField, IntervalQualifier, TemporalPrecision, TemporalType, TemporalTypeError,
+};
+mod temporal_value;
+pub use temporal_value::*;
+mod time_zone_key;
+pub use time_zone_key::TimeZoneKey;
+
 pub use value_arithmetic::{
     arithmetic_result_value_shape_with_op, arithmetic_result_value_type_with_op,
     is_integer_value_type, is_numeric_value_type,

@@ -519,7 +519,19 @@ fn equality_delete_input_fields(
                 .ok_or_else(|| {
                     "equality-delete key lacks its complete provider declaration".to_string()
                 })?;
-            ConnectorWriteFieldRequest::try_new_typed(column.clone(), value.clone())
+            // The provider's canonical carrier may differ from its format
+            // field, for example for a zoned instant. Keep the original
+            // equality domain and exclude any data-writer storage override.
+            let input = metadata
+                .planning_facts
+                .column_facts()
+                .get(ordinal)
+                .and_then(|facts| facts.write_input())
+                .filter(|input| {
+                    input.storage_type().is_none() && input.execution_type() == Some(value)
+                })
+                .map_or(column, |input| input.field());
+            ConnectorWriteFieldRequest::try_new_typed(input.clone(), value.clone())
                 .map_err(|error| error.to_string())
         })
         .collect()

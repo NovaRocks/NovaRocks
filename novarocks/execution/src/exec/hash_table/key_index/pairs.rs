@@ -30,7 +30,7 @@ use crate::{
         },
         pipeline::operator::InputConstructionOwner,
     },
-    runtime::task::ExecutionResult,
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::{
     array::*,
@@ -109,6 +109,7 @@ pub(super) fn compare_prepared_pairs(
                         right_rows,
                         nulls,
                         left.spec.equalities()[column],
+                        &left.spec.types()[column],
                         output,
                         checkpoint,
                     )?;
@@ -138,7 +139,11 @@ pub(super) fn compare_prepared_pairs(
                                         u8::from(canonical_nullable_equals_with_policy_observed::<
                                             $content,
                                         >(
-                                            b, bp, &expected, checkpoint
+                                            b,
+                                            bp,
+                                            Some(right.component_binding(column)?.value_type()),
+                                            &expected,
+                                            checkpoint,
                                         )?);
                                 }
                             }
@@ -241,6 +246,7 @@ pub(super) fn compare_value_pairs(
                         right_rows,
                         NullPolicy::Equal,
                         left.spec.equalities()[column],
+                        &left.spec.types()[column],
                         &mut fixed,
                         checkpoint,
                     )?;
@@ -289,7 +295,11 @@ pub(super) fn compare_value_pairs(
                                     )?;
                                     Some(
                                         canonical_nullable_equals_with_policy_observed::<$content>(
-                                            b, bp, &expected, checkpoint,
+                                            b,
+                                            bp,
+                                            Some(right.component_binding(column)?.value_type()),
+                                            &expected,
+                                            checkpoint,
                                         )?,
                                     )
                                 };
@@ -340,11 +350,44 @@ pub(super) fn compare_fixed_pairs(
     right_rows: &[usize],
     nulls: NullPolicy,
     equality: KeyEquality,
+    binding: &novarocks_type_contract::FunctionValueType,
     output: &mut [u8],
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<()> {
     if a.data_type() != b.data_type() {
         return Err(invariant(ValueViolation::Layout));
+    }
+    if let (Some(declaration), KeyEquality::SqlGrouping(_)) =
+        (binding.value_type().temporal(), equality)
+    {
+        use novarocks_value_arrays::decode::PreparedTemporalArray;
+        let a = PreparedTemporalArray::bind(declaration, a.as_ref(), binding.nullable())
+            .map_err(ExecutionFailure::from_domain)?;
+        let b = PreparedTemporalArray::bind(declaration, b.as_ref(), binding.nullable())
+            .map_err(ExecutionFailure::from_domain)?;
+        for (i, ((&ar, &br), result)) in left_rows
+            .iter()
+            .zip(right_rows)
+            .zip(output.iter_mut())
+            .enumerate()
+        {
+            checkpoint_at(i, checkpoint)?;
+            if *result == 0 {
+                continue;
+            }
+            let left = a
+                .relation_key(physical_row(am, ar)?)
+                .map_err(ExecutionFailure::from_domain)?;
+            let right = b
+                .relation_key(physical_row(bm, br)?)
+                .map_err(ExecutionFailure::from_domain)?;
+            *result = u8::from(match (left, right) {
+                (Some(left), Some(right)) => left == right,
+                (None, None) => nulls == NullPolicy::Equal,
+                _ => false,
+            });
+        }
+        return Ok(());
     }
     macro_rules! primitive {
         ($ty:ty, $canonical:expr) => {{

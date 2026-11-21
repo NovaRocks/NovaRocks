@@ -96,7 +96,7 @@ impl AnalyzerContext<'_> {
         args: Vec<TypedExpr>,
         span: Span,
     ) -> Result<BoundScalarCall, AnalyzeError> {
-        type_scalar_call_with_catalog(
+        type_scalar_call_with_environment(
             self.function_catalog,
             shape,
             args,
@@ -104,6 +104,8 @@ impl AnalyzerContext<'_> {
             self.constant_policy,
             self.control,
             span,
+            self.sql_semantics.statement_time(),
+            self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
         )
     }
 
@@ -123,8 +125,68 @@ impl AnalyzerContext<'_> {
             else {
                 return Err(TypingError::InvalidShape("expected a typed value node"));
             };
-            Ok((result, apply_conversions(context, args, conversions, work)?))
+            Ok((
+                result,
+                apply_conversions(
+                    context,
+                    args,
+                    conversions,
+                    self.sql_semantics.statement_time(),
+                    self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
+                    work,
+                )?,
+            ))
         })
+    }
+
+    pub(super) fn type_clock(&self, expression: &ast::Expr) -> Result<TypedExpr, AnalyzeError> {
+        let span = expression.span();
+        self.with_typing(span, |context, work| {
+            let (syntax, target) = typing::clock_syntax(expression)?
+                .ok_or(TypingError::InvalidShape("expected temporal clock syntax"))?;
+            bind_temporal_syntax(self, context, syntax, target, Vec::new(), work)
+        })
+    }
+
+    pub(super) fn type_at_zone(
+        &self,
+        mut source: TypedExpr,
+        zone: Option<TypedExpr>,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let (syntax, zoned_source, target) = typing::at_zone_syntax(
+            &source.value_type,
+            zone.as_ref().map(|expression| &expression.value_type),
+        )
+        .map_err(|cause| analyze_typing_error(cause, span))?;
+        if source.value_type != zoned_source {
+            source = self.type_temporal_cast(source, zoned_source, false, span)?;
+        }
+        let mut arguments = vec![source];
+        arguments.extend(zone);
+        self.with_typing(span, |context, work| {
+            bind_temporal_syntax(self, context, syntax, target, arguments, work)
+        })
+    }
+
+    pub(super) fn type_temporal_cast(
+        &self,
+        source: TypedExpr,
+        target: FunctionValueType,
+        safe: bool,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        authored_temporal_cast(
+            self.function_catalog,
+            &self.sql_semantics,
+            self.constant_policy,
+            self.control,
+            source,
+            target,
+            safe,
+            span,
+            self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
+        )
     }
 
     pub(super) fn type_literal(&self, literal: &ast::Literal) -> Result<TypedExpr, AnalyzeError> {
@@ -140,7 +202,7 @@ impl AnalyzerContext<'_> {
                 name: &value.type_name,
                 value: &value.value,
             },
-            ast::LiteralKind::Interval(_) => LiteralSyntax::Interval,
+            ast::LiteralKind::Interval(value) => LiteralSyntax::Interval(value),
         };
         self.with_typing(literal.span, |context, work| {
             let NodeTyping::Literal(emission) =
@@ -150,6 +212,10 @@ impl AnalyzerContext<'_> {
             };
             Ok(match emission {
                 LiteralEmission::Direct(value) => literal_expression(value, false),
+                LiteralEmission::Constant { value_type, value } => TypedExpr {
+                    kind: ExprKind::Constant(value),
+                    value_type,
+                },
                 LiteralEmission::Cast {
                     input,
                     declared_result,
@@ -180,6 +246,118 @@ impl AnalyzerContext<'_> {
     }
 }
 
+fn bind_temporal_syntax(
+    analyzer: &AnalyzerContext<'_>,
+    context: &TypingContext<'_>,
+    syntax: typing::TemporalSyntax,
+    target: FunctionValueType,
+    arguments: Vec<TypedExpr>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<TypedExpr, TypingError> {
+    let request_arguments = arguments
+        .iter()
+        .map(|argument| {
+            work.step()?;
+            work.flush()?;
+            Ok(function_argument(
+                argument,
+                context.constant_policy,
+                work.control(),
+            )?)
+        })
+        .collect::<Result<Vec<_>, TypingError>>()?;
+    let selected = typing::bind_temporal_syntax(
+        context.catalog,
+        syntax,
+        &request_arguments,
+        &target,
+        work.control(),
+    )?;
+    let volatility = selected.semantics.volatility;
+    enforce_mv_time_independence(
+        analyzer.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
+        syntax.dependencies(),
+    )?;
+    let binding = SqlFunctionBinding::new_with_temporal_constraint(
+        selected,
+        context.decimal_overflow_policy,
+        target.clone(),
+        false,
+    )
+    .with_statement_time(
+        analyzer.sql_semantics.statement_time(),
+        syntax.dependencies(),
+    )?;
+    Ok(TypedExpr {
+        value_type: target,
+        kind: ExprKind::FunctionCall {
+            name: novarocks_functions::builtin::temporal_context::FUNCTION_NAME.into(),
+            volatility,
+            binding,
+            args: arguments.into(),
+            distinct: false,
+        },
+    })
+}
+
+pub(super) fn authored_temporal_cast(
+    catalog: &dyn SqlFunctionCatalog,
+    settings: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: ConstantPolicy,
+    control: &dyn PureCompileControl,
+    source: TypedExpr,
+    target: FunctionValueType,
+    safe: bool,
+    span: Span,
+    forbid_time_dependencies: bool,
+) -> Result<TypedExpr, AnalyzeError> {
+    with_typing(
+        catalog,
+        settings.sql_mode().decimal_overflow_policy(),
+        constant_policy,
+        control,
+        span,
+        |context, work| {
+            use novarocks_functions::builtin::value_conversion as owner;
+            let nullable = safe || source.value_type.nullable();
+            let target = target.with_nullable(nullable)?;
+            let argument = function_argument(&source, constant_policy, work.control())?;
+            work.flush()?;
+            let binding = typing::select_temporal_cast(
+                context.catalog,
+                &argument,
+                &target,
+                safe,
+                work.control(),
+            )?
+            .ok_or(TypingError::InvalidShape(
+                "temporal CAST has no temporal type",
+            ))?;
+            let dependencies =
+                owner::temporal_cast_dependencies(binding.selected.overload.as_str());
+            enforce_mv_time_independence(forbid_time_dependencies, dependencies)?;
+            let volatility = binding.semantics.volatility;
+            let binding = SqlFunctionBinding::new_with_temporal_constraint(
+                binding,
+                context.decimal_overflow_policy,
+                target.clone(),
+                safe,
+            )
+            .with_statement_time(settings.statement_time(), dependencies)?;
+            Ok(TypedExpr {
+                value_type: target,
+                kind: ExprKind::FunctionCall {
+                    name: owner::VALUE_CONVERSION_NAME.into(),
+                    volatility,
+                    binding,
+                    args: vec![source].into(),
+                    distinct: false,
+                },
+            })
+        },
+    )
+}
+
 pub(super) fn type_scalar_call_with_catalog(
     catalog: &dyn SqlFunctionCatalog,
     shape: NodeShape<'_>,
@@ -188,6 +366,30 @@ pub(super) fn type_scalar_call_with_catalog(
     constant_policy: ConstantPolicy,
     control: &dyn PureCompileControl,
     span: Span,
+) -> Result<BoundScalarCall, AnalyzeError> {
+    type_scalar_call_with_environment(
+        catalog,
+        shape,
+        args,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+        span,
+        None,
+        false,
+    )
+}
+
+fn type_scalar_call_with_environment(
+    catalog: &dyn SqlFunctionCatalog,
+    shape: NodeShape<'_>,
+    args: Vec<TypedExpr>,
+    decimal_overflow_policy: DecimalOverflowPolicy,
+    constant_policy: ConstantPolicy,
+    control: &dyn PureCompileControl,
+    span: Span,
+    statement_time: Option<novarocks_type_contract::StatementTimeEnvironment>,
+    forbid_time_dependencies: bool,
 ) -> Result<BoundScalarCall, AnalyzeError> {
     with_typing(
         catalog,
@@ -205,12 +407,22 @@ pub(super) fn type_scalar_call_with_catalog(
             else {
                 return Err(TypingError::InvalidShape("expected a bound scalar call"));
             };
-            let args = apply_conversions(context, args, conversions, work)?;
+            let args = apply_conversions(
+                context,
+                args,
+                conversions,
+                statement_time,
+                forbid_time_dependencies,
+                work,
+            )?;
             let converted = typed_children(context, &args, true, work)?;
             let binding = typing::finish_call(context, &selected, &converted, work)?;
+            let dependencies = catalog.scalar_time_dependencies(&binding);
+            enforce_mv_time_independence(forbid_time_dependencies, dependencies)?;
             Ok(BoundScalarCall {
                 args,
-                binding: SqlFunctionBinding::new(binding, context.decimal_overflow_policy),
+                binding: SqlFunctionBinding::new(binding, context.decimal_overflow_policy)
+                    .with_statement_time(statement_time, dependencies)?,
             })
         },
     )
@@ -259,7 +471,7 @@ fn with_typing<T>(
         .map_err(|error| analyze_typing_error(error, span))
 }
 
-fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeError {
+pub(super) fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeError {
     match error {
         TypingError::TypeMismatch(message) => AnalyzeError::type_mismatch(message, span),
         TypingError::InvalidLiteral(message) => AnalyzeError::invalid_literal(message, span),
@@ -311,10 +523,29 @@ fn typed_children(
         .collect()
 }
 
+fn enforce_mv_time_independence(
+    forbid: bool,
+    dependencies: &[novarocks_type_contract::SemanticParameterKey],
+) -> Result<(), TypingError> {
+    use novarocks_type_contract::SemanticParameterKey as Key;
+    if forbid
+        && dependencies
+            .iter()
+            .any(|key| matches!(key, Key::StatementStartUtc | Key::TimeZone))
+    {
+        return Err(TypingError::Unsupported(
+            "Materialized view expressions cannot depend on the statement instant or session time zone".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_conversions(
     context: &TypingContext<'_>,
     args: Vec<TypedExpr>,
     conversions: Vec<Conversion>,
+    statement_time: Option<novarocks_type_contract::StatementTimeEnvironment>,
+    forbid_time_dependencies: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<TypedExpr>, TypingError> {
     if args.len() != conversions.len() {
@@ -337,12 +568,16 @@ fn apply_conversions(
                 };
                 let result = result.clone();
                 let volatility = conversion.binding.semantics.volatility;
+                let dependencies = novarocks_functions::builtin::value_conversion::temporal_cast_dependencies(
+                    conversion.binding.selected.overload.as_str(),
+                );
+                enforce_mv_time_independence(forbid_time_dependencies, dependencies)?;
                 let binding = SqlFunctionBinding::new_with_conversion_constraint(
                     conversion.binding,
                     context.decimal_overflow_policy,
                     conversion.expected_result,
                     conversion.target,
-                );
+                ).with_statement_time(statement_time, dependencies)?;
                 let expression = TypedExpr {
                     kind: ExprKind::FunctionCall {
                         name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.into(),

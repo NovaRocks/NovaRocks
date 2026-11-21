@@ -400,6 +400,7 @@ async fn build_frontend_role_products(
             Arc::clone(&mv_product_service),
             host.mv_maintenance_config(),
             host.optimizer_query_mem_limit_bytes(),
+            host.statement_clock(),
             host.lake_publication_runtime_policy()
                 .max_attempt_duration(),
             host.workload_root_admission(),
@@ -737,6 +738,7 @@ fn build_frontend_query_session_factory_from_role_products(
         dml_engines.truncate,
         host.query_blocking_executor(),
         host.optimizer_query_mem_limit_bytes(),
+        host.statement_clock(),
         host.lake_publication_runtime_policy(),
         host.serving_lifecycle().admission(),
     )

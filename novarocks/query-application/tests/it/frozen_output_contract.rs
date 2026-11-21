@@ -97,6 +97,7 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
             novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(
                 &novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 },
@@ -110,6 +111,7 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 },

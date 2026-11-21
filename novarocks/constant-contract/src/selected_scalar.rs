@@ -22,9 +22,35 @@ use super::{
     ConstantError, ConstantValue, Row, logical_null, primitive_bytes, resolve_row, variable_bytes,
 };
 use arrow_schema::DataType;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompilePhase, PureCompileControl, TemporalType, TemporalValue,
+};
 
 impl ConstantValue {
+    /// Decode the selected temporal value using the exact bound SQL declaration.
+    pub fn temporal_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<TemporalValue>, ConstantError> {
+        let declaration =
+            self.value_type()
+                .value_type()
+                .temporal()
+                .ok_or(ConstantError::Invalid(
+                    "constant does not have a temporal declaration",
+                ))?;
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let value = if let Some(row) = selected_row(self, &mut work)? {
+            work.step()?;
+            Some(read_temporal(row, declaration)?)
+        } else {
+            None
+        };
+        work.finish()?;
+        Ok(value)
+    }
+
     /// Borrow actual selected UTF8 text, resolving dictionary/run encoding.
     /// NULL and other terminal carriers return None. The caller must validate
     /// the complete logical FVT separately; this never infers Physical/JSON.
@@ -113,6 +139,44 @@ impl ConstantValue {
         work.finish()?;
         Ok(value)
     }
+}
+
+pub(super) fn read_temporal(
+    row: Row<'_>,
+    declaration: TemporalType,
+) -> Result<TemporalValue, ConstantError> {
+    let wrong_carrier =
+        || ConstantError::Invalid("constant temporal carrier does not match declaration");
+    if *row.data.data_type() != declaration.carrier() {
+        return Err(wrong_carrier());
+    }
+    match row.data.data_type() {
+        DataType::Int32 => TemporalValue::from_i32_carrier(
+            declaration,
+            i32::from_ne_bytes(
+                primitive_bytes(row, 4)?
+                    .try_into()
+                    .map_err(|_| wrong_carrier())?,
+            ),
+        ),
+        DataType::Timestamp(..) | DataType::Int64 => TemporalValue::from_i64_carrier(
+            declaration,
+            i64::from_ne_bytes(
+                primitive_bytes(row, 8)?
+                    .try_into()
+                    .map_err(|_| wrong_carrier())?,
+            ),
+        ),
+        DataType::FixedSizeBinary(width) => {
+            TemporalValue::from_fixed_carrier(declaration, primitive_bytes(row, *width as usize)?)
+        }
+        _ => return Err(wrong_carrier()),
+    }
+    .map_err(|_| {
+        ConstantError::Invalid(
+            "constant temporal value lies outside the declared range or precision",
+        )
+    })
 }
 
 pub(super) fn selected_row<'a>(

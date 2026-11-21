@@ -72,7 +72,11 @@ pub fn assignment_common_value_type(
             .map_err(AssignmentCommonTypeError::ValueType);
     }
     work.flush()?;
-    let carrier = crate::wider_type(left.data_type(), right.data_type());
+    let carrier = if let Some(common) = temporal_common(left.value_type(), right.value_type())? {
+        common.carrier()
+    } else {
+        crate::wider_type(left.data_type(), right.data_type())
+    };
     work.flush()?;
     let layout = ValueLayout::try_new(&carrier, ValueTypeStorageLifetime::pure())
         .map_err(AssignmentCommonTypeError::Construction)?;
@@ -84,6 +88,31 @@ pub fn assignment_common_value_type(
         work,
     )?;
     FunctionValueType::try_from_value(value, layout).map_err(AssignmentCommonTypeError::ValueType)
+}
+
+fn temporal_common(
+    left: &crate::ValueTypeRef,
+    right: &crate::ValueTypeRef,
+) -> Result<Option<crate::TemporalType>, AssignmentCommonTypeError> {
+    use crate::{TemporalType, ValueKind};
+    let common = match (left.temporal(), right.temporal()) {
+        (None, None) => return Ok(None),
+        (Some(a), Some(b)) => a.common_type(b),
+        (
+            Some(ty @ (TemporalType::Timestamp(_) | TemporalType::TimestampWithTimeZone(_))),
+            None,
+        ) if matches!(right.kind(), ValueKind::Scalar(DataType::Date32)) => Some(ty),
+        (
+            None,
+            Some(ty @ (TemporalType::Timestamp(_) | TemporalType::TimestampWithTimeZone(_))),
+        ) if matches!(left.kind(), ValueKind::Scalar(DataType::Date32)) => Some(ty),
+        _ => None,
+    };
+    common
+        .map(Some)
+        .ok_or(AssignmentCommonTypeError::IncompatibleShape(
+            "assignment lacks a declared temporal common type",
+        ))
 }
 
 fn common_domain(
@@ -235,7 +264,14 @@ fn common_semantics(
         common_semantics(field.data_type(), left, right, field.is_nullable(), work)
     };
     let domain = common_domain(left, right, target);
-    let kind = if domain != ValueLogicalType::Physical {
+    let kind = if let Some(temporal) = temporal_common(left, right)? {
+        if temporal.carrier() != *target {
+            return Err(AssignmentCommonTypeError::IncompatibleShape(
+                "assignment lacks a compatible temporal carrier",
+            ));
+        }
+        ValueKind::Temporal(temporal)
+    } else if domain != ValueLogicalType::Physical {
         ValueKind::Nominal(domain)
     } else {
         match target {

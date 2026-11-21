@@ -88,6 +88,7 @@ fn field_with_marker(name: &str, data_type: DataType, nullable: bool) -> Field {
 async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_other_domains() {
     let dir = tempfile::tempdir().unwrap();
     let location = format!("file://{}", dir.path().display());
+    let temporal = crate::temporal::declaration(&PrimitiveType::Timestamptz).unwrap();
     let list_child = Arc::new(field_with_marker("element", DataType::Int32, true));
     let struct_child = Arc::new(field_with_marker("child", DataType::Int32, true));
     let map_key = Arc::new(field_with_marker("key", DataType::Int32, false));
@@ -108,11 +109,7 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
         ),
         field_with_marker("mapping", DataType::Map(entries_field.clone(), false), true),
         field_with_marker("raw", DataType::Binary, true),
-        field_with_marker(
-            "zoned",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
-        ),
+        field_with_marker("zoned", temporal.carrier(), true),
     ];
     let input_schema = Arc::new(Schema::new_with_metadata(
         fields,
@@ -214,11 +211,19 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
                 None,
                 Some(&[][..]),
             ])),
-            Arc::new(TimestampMicrosecondArray::from(vec![
-                Some(0),
-                None,
-                Some(123456789),
-            ])),
+            crate::temporal::TemporalReadProjection::from_type(&Type::Primitive(
+                PrimitiveType::Timestamptz,
+            ))
+            .materialize(
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(0),
+                    None,
+                    Some(123456789),
+                ])),
+                "zoned",
+                &mut || Ok(()),
+            )
+            .unwrap(),
         ],
     )
     .unwrap();

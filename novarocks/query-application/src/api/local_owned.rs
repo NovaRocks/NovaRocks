@@ -222,7 +222,9 @@ impl OwnedLocalResult {
         );
         let retained_backing_bytes = buffers
             .checked_add(schema.backing_bytes())
-            .and_then(|bytes| bytes.checked_add(ClientRowEncoder::scratch_capacity_bound_bytes()))
+            .and_then(|bytes| {
+                bytes.checked_add(ClientRowEncoder::scratch_capacity_bound_for_schema(&schema))
+            })
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or("Local delivery backing size overflows")?;
         let LocalSourceInput { result, window } = input;
@@ -398,6 +400,7 @@ mod tests {
             text,
             ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true,
             }),
@@ -455,17 +458,16 @@ mod tests {
             let result = produce_text_for_family(&host, &"x".repeat(128 * 1024), family);
             let mut cursor = result.into_cursor();
             let retained = cursor.retained_backing_bytes();
-            assert!(retained >= ClientRowEncoder::scratch_capacity_bound_bytes() as u64);
+            let scratch =
+                ClientRowEncoder::scratch_capacity_bound_for_schema(cursor.client_render());
+            assert!(retained >= scratch as u64);
             assert_eq!(cursor.scratch_capacity_bytes(), 0);
             let mut output = [0xab; 128];
             if after_count {
                 let turn = cursor.step(&mut output).unwrap();
                 assert!(turn.examined_bytes <= RootProfileV1::EMIT_BYTES_PER_TURN);
                 assert_eq!(turn.emitted_bytes, 0);
-                assert_eq!(
-                    cursor.scratch_capacity_bytes(),
-                    ClientRowEncoder::scratch_capacity_bound_bytes()
-                );
+                assert_eq!(cursor.scratch_capacity_bytes(), scratch);
                 assert_eq!(cursor.retained_backing_bytes(), retained);
             }
             cursor.cancel();
@@ -528,7 +530,7 @@ mod tests {
                 assert!(measured.get() > LocalResultBound::V1.bytes - 8192);
                 let expected = measured.get()
                     + result.client_render().backing_bytes()
-                    + ClientRowEncoder::scratch_capacity_bound_bytes();
+                    + ClientRowEncoder::scratch_capacity_bound_for_schema(result.client_render());
                 root.owner.complete();
                 root.business.release();
                 drop(window);
@@ -586,7 +588,7 @@ mod tests {
         })
         .unwrap();
         let expected = result.client_render().backing_bytes()
-            + ClientRowEncoder::scratch_capacity_bound_bytes();
+            + ClientRowEncoder::scratch_capacity_bound_for_schema(result.client_render());
         root.owner.complete();
         root.business.release();
         drop(window);
@@ -625,6 +627,7 @@ mod tests {
                 window.retain_alias(),
                 ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true
                 })
@@ -644,6 +647,7 @@ mod tests {
                 client_window.retain_alias(),
                 ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true
                 })
@@ -676,6 +680,7 @@ mod tests {
             window.retain_alias(),
             ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true,
             }),
@@ -751,6 +756,7 @@ mod tests {
             .unwrap();
         let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
             parametric_datetime: true,
+            parametric_interval: false,
             variant: false,
             variant_binary: false,
         });
@@ -876,6 +882,7 @@ mod tests {
             window.retain_alias(),
             ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true,
             }),
@@ -896,7 +903,7 @@ mod tests {
             .map(|array| array.get_buffer_memory_size())
             .sum::<usize>()
             + result.client_render().backing_bytes()
-            + ClientRowEncoder::scratch_capacity_bound_bytes();
+            + ClientRowEncoder::scratch_capacity_bound_for_schema(result.client_render());
         root.owner.complete();
         root.business.release();
         drop(window);
@@ -934,6 +941,7 @@ mod tests {
                 window.retain_alias(),
                 ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 }),

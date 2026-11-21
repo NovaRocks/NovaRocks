@@ -116,6 +116,20 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         Arc::new(self.clone())
     }
 
+    fn scalar_time_dependencies(
+        &self,
+        binding: &ResolvedFunctionBinding,
+    ) -> &[novarocks_type_contract::SemanticParameterKey] {
+        self.definition_by_id(&binding.function_id)
+            .and_then(|definition| definition.binding_declaration())
+            .and_then(|declaration| {
+                declaration
+                    .effect_declaration(&binding.selected.overload)
+                    .ok()
+            })
+            .map_or(&[], |effects| effects.environment_dependencies.as_ref())
+    }
+
     fn select_exact_overload_observed(
         &self,
         function: &novarocks_functions::FunctionId,

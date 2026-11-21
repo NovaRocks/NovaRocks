@@ -94,13 +94,28 @@ pub(super) type IcebergDynamicFilter = dyn DynamicFilter<IcebergColumnHandle>;
 /// particular, nullable domains and nested columns stay residual: pruning
 /// either with a physical min/max statistic could discard a matching NULL or
 /// bind an incomplete Parquet path.
-fn static_file_predicates(predicate: &TupleDomain<IcebergColumnHandle>) -> Vec<ScanPredicate> {
+fn static_file_predicates(
+    predicate: &TupleDomain<IcebergColumnHandle>,
+    file_schema: Option<&ArrowSchema>,
+) -> Vec<ScanPredicate> {
     let Some(domains) = predicate.domains() else {
         return Vec::new();
     };
     let mut predicates = Vec::new();
     for (column, domain) in domains {
         if domain.null_allowed() || !column.is_base_column() {
+            continue;
+        }
+        if matches!(
+            domain.value_type(),
+            ConnectorValueType::TimeMicros
+                | ConnectorValueType::TimestampMicros
+                | ConnectorValueType::TimestampTzMicros
+                | ConnectorValueType::TimestampNanos
+                | ConnectorValueType::TimestampTzNanos
+        ) && !file_schema.is_some_and(|schema| {
+            file_has_temporal_unit(schema, column.base_field_id(), domain.value_type())
+        }) {
             continue;
         }
         let values = domain.values();
@@ -154,6 +169,40 @@ fn static_file_predicates(predicate: &TupleDomain<IcebergColumnHandle>) -> Vec<S
         }
     }
     predicates
+}
+
+fn file_has_temporal_unit(
+    schema: &ArrowSchema,
+    source_id: i32,
+    value_type: ConnectorValueType,
+) -> bool {
+    use arrow::datatypes::{DataType, TimeUnit};
+    schema.fields().iter().any(|field| {
+        let field_id = field
+            .metadata()
+            .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse::<i32>().ok());
+        field_id == Some(source_id)
+            && matches!(
+                (field.data_type(), value_type),
+                (
+                    DataType::Time64(TimeUnit::Microsecond),
+                    ConnectorValueType::TimeMicros
+                ) | (
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    ConnectorValueType::TimestampMicros
+                ) | (
+                    DataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+                    ConnectorValueType::TimestampTzMicros
+                ) | (
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    ConnectorValueType::TimestampNanos
+                ) | (
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some(_)),
+                    ConnectorValueType::TimestampTzNanos
+                )
+            )
+    })
 }
 
 fn file_predicate(column: &IcebergColumnHandle, domain: ScanPredicateDomain) -> ScanPredicate {
@@ -213,7 +262,8 @@ fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> 
         | ConnectorValue::Varchar(_)
         | ConnectorValue::Varbinary(_)
         | ConnectorValue::Uuid(_)
-        | ConnectorValue::Fixed(_) => None,
+        | ConnectorValue::Fixed(_)
+        | ConnectorValue::Temporal { .. } => None,
     }
 }
 
@@ -1353,6 +1403,10 @@ fn try_partition_only_page_source(
         total_rows,
         emitted_rows: 0,
         context,
+        temporal_output: super::output::temporal_output(
+            binding.columns(),
+            output_projection.as_ref(),
+        )?,
         output_projection,
         retained_bytes: split.retained_size_in_bytes(),
     }))
@@ -1364,6 +1418,7 @@ pub struct IcebergPartitionOnlyPageSource {
     total_rows: u64,
     emitted_rows: u64,
     context: FileReadContext,
+    temporal_output: Arc<[Option<super::output::TemporalOutputColumn>]>,
     output_projection: Option<super::output::OutputProjection>,
     retained_bytes: u64,
 }
@@ -1387,11 +1442,13 @@ impl IcebergPartitionOnlyPageSource {
             .as_ref()
             .map(|projection| projection.project(&columns))
             .transpose()?;
+        let projected = projected.as_deref().unwrap_or(&columns);
         let mut pending = super::output::OutputCursor::new(
-            projected.as_deref().unwrap_or(&columns),
+            projected,
             OutputRows::Contiguous(0..rows),
             &self.context,
-        )?;
+        )?
+        .with_temporal(&self.temporal_output, projected)?;
         let page = pending.next_page(&self.context)?;
         if let Some(page) = &page {
             self.emitted_rows += page.position_count() as u64;
@@ -1474,6 +1531,7 @@ enum ReaderState {
         binding: Box<IcebergSchemaBinding>,
         page_schema: Arc<ArrowSchema>,
         output_targets: Vec<arrow::datatypes::DataType>,
+        temporal_output: Arc<[Option<super::output::TemporalOutputColumn>]>,
         checks: Vec<PredicateCheck>,
         positions_required: bool,
     },
@@ -1661,6 +1719,10 @@ impl IcebergParquetPageSource {
             .map(|field| output_carrier(field, self.output_layout, &self.nominals))
             .collect::<Result<Vec<_>, _>>()?;
         let checks = self.build_predicate_checks()?;
+        let temporal_output = super::output::temporal_output(
+            &binding.columns()[..self.prefix_len],
+            self.output_projection.as_ref(),
+        )?;
 
         // A whole-file split owns every footer row group by ordinal, so it can
         // re-ask the filter before each one it has not read. A byte-bounded
@@ -1693,6 +1755,7 @@ impl IcebergParquetPageSource {
             binding: Box::new(binding),
             page_schema,
             output_targets,
+            temporal_output,
             checks,
             positions_required,
         };
@@ -1936,7 +1999,10 @@ impl IcebergParquetPageSource {
             range,
             projection,
             sizing: self.budget,
-            predicates: static_file_predicates(&self.effective_predicate),
+            predicates: static_file_predicates(
+                &self.effective_predicate,
+                self.footer.as_ref().map(|footer| footer.schema().as_ref()),
+            ),
             pruning: PhysicalPruning {
                 row_groups: row_groups.map(|ordinals| {
                     ordinals
@@ -2270,6 +2336,7 @@ impl IcebergParquetPageSource {
             binding,
             page_schema,
             output_targets,
+            temporal_output,
             checks,
             positions_required,
             ..
@@ -2392,11 +2459,11 @@ impl IcebergParquetPageSource {
             .as_ref()
             .map(|projection| projection.project(&output))
             .transpose()?;
-        self.pending_output = Some(super::output::OutputCursor::new(
-            projected.as_deref().unwrap_or(&output),
-            row_domain,
-            &self.context,
-        )?);
+        let projected = projected.as_deref().unwrap_or(&output);
+        self.pending_output = Some(
+            super::output::OutputCursor::new(projected, row_domain, &self.context)?
+                .with_temporal(temporal_output, projected)?,
+        );
         Ok(())
     }
 }
@@ -2579,6 +2646,11 @@ fn connector_value_at(
         ConnectorValueType::NonComparable => {
             return Err(corrupt(format!(
                 "iceberg predicate column of {path} is typed non-comparable, which has no value"
+            )));
+        }
+        ConnectorValueType::Temporal(_) => {
+            return Err(corrupt(format!(
+                "iceberg predicate for {path} was not projected to its physical temporal unit"
             )));
         }
         ConnectorValueType::Boolean => {

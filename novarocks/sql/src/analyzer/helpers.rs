@@ -319,12 +319,8 @@ fn validate_ast_type(
                 validate_ast_type(&field.data_type, depth + 1, nodes, work)?;
             }
         }
-        ast::TypeKind::DateTime(_) => {}
-        ast::TypeKind::Interval(_) => {
-            return Err(AnalyzeError::unsupported_expression(
-                "INTERVAL data types are not supported",
-                sql_type.span,
-            ));
+        ast::TypeKind::DateTime(_) | ast::TypeKind::Interval(_) => {
+            work.step().map_err(AnalyzeError::control)?;
         }
         ast::TypeKind::ExplicitArray(_) => {
             return Err(AnalyzeError::unsupported_expression(
@@ -347,7 +343,9 @@ fn author_ast_type(
     work.step().map_err(AnalyzeError::control)?;
     let storage = ValueTypeStorageLifetime::pure();
     let domain = declared_root(sql_type);
-    let kind = if domain != ValueLogicalType::Physical {
+    let kind = if let Some(declaration) = temporal_declaration(sql_type)? {
+        ValueKind::Temporal(declaration)
+    } else if domain != ValueLogicalType::Physical {
         ValueKind::Nominal(domain)
     } else {
         match layout {
@@ -429,6 +427,13 @@ fn nested_field_with_logical_type(
     Ok(Field::new(name, sql_type_to_arrow(sql_type)?, nullable))
 }
 
+fn temporal_declaration(
+    syntax: &ast::TypeName,
+) -> Result<Option<novarocks_type_contract::TemporalType>, AnalyzeError> {
+    novarocks_expression::typing::declared_temporal_type(syntax)
+        .map_err(|error| AnalyzeError::type_mismatch(error.to_string(), syntax.span))
+}
+
 pub(super) fn sql_type_to_arrow(
     sql_type: &novarocks_parser::ast::TypeName,
 ) -> Result<DataType, AnalyzeError> {
@@ -450,24 +455,12 @@ pub(super) fn sql_type_to_arrow(
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(DataType::Struct(Fields::from(fields)));
         }
-        ast::TypeKind::DateTime(datetime) => {
-            if datetime.with_time_zone || datetime.precision.as_deref().is_some_and(|parameter| !matches!(parameter, ast::DataTypeParameter::Numeric(value) if value.parsed_value == 6)) {
-                return Err(AnalyzeError::unsupported_expression("TIME/TIMESTAMP only support microsecond precision without time zone", sql_type.span));
-            }
-            return Ok(match datetime.kind {
-                ast::DateTimeType::Time => {
-                    DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
-                }
-                ast::DateTimeType::Timestamp => {
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-                }
-            });
-        }
-        ast::TypeKind::Interval(_) => {
-            return Err(AnalyzeError::unsupported_expression(
-                "INTERVAL data types are not supported",
-                sql_type.span,
-            ));
+        ast::TypeKind::DateTime(_) | ast::TypeKind::Interval(_) => {
+            return temporal_declaration(sql_type)?
+                .map(novarocks_type_contract::TemporalType::carrier)
+                .ok_or_else(|| {
+                    AnalyzeError::internal("temporal syntax lost its type declaration")
+                });
         }
         ast::TypeKind::ExplicitArray(_) => {
             return Err(AnalyzeError::unsupported_expression(

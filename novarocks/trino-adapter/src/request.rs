@@ -245,6 +245,7 @@ impl ParsedStatementRequest {
         {
             match capability {
                 "PARAMETRIC_DATETIME" => facts.parametric_datetime = true,
+                "PARAMETRIC_INTERVAL" => facts.parametric_interval = true,
                 "VARIANT" => facts.variant = true,
                 "VARIANT_BINARY" => facts.variant_binary = true,
                 _ => {} // Other advertised capabilities do not change this presentation contract.
@@ -696,6 +697,33 @@ mod tests {
         assert!(parse(&input).unwrap().session_value().is_ok());
     }
     #[test]
+    fn session_time_zone_header_survives_property_override_and_validates_independently() {
+        let mut input = headers();
+        input.insert("x-trino-time-zone", HeaderValue::from_static("+14:00"));
+        input.insert(
+            "x-trino-session",
+            HeaderValue::from_static("time_zone_id=Asia%2FShanghai"),
+        );
+        let registry = SessionPropertyRegistry::new().unwrap();
+        let state = SessionSqlState::from_session_value(
+            parse(&input).unwrap().session_value().unwrap(),
+            &registry,
+            &NoCatalogAccess,
+        )
+        .unwrap();
+        let header = *state.time_zone().unwrap();
+        assert_eq!(header.name(), "+14:00");
+        assert_eq!(state.effective_time_zone(header).name(), "Asia/Shanghai");
+
+        input.insert("x-trino-time-zone", HeaderValue::from_static("+14:01"));
+        assert!(matches!(
+            parse(&input).unwrap().session_value(),
+            Err(RequestSessionError::Session(
+                StatementSessionError::TimeZoneNotSupported { .. }
+            ))
+        ));
+    }
+    #[test]
     fn session_properties_reach_original_semantic_owner_without_remote_lookup() {
         let mut input = headers();
         input.insert("x-trino-catalog", HeaderValue::from_static("unknown_lake"));
@@ -728,7 +756,7 @@ mod tests {
         input.insert(
             "x-trino-client-capabilities",
             HeaderValue::from_static(
-                "PARAMETRIC_DATETIME,VARIANT_BINARY,OTHER,VARIANT, parametric_datetime",
+                "PARAMETRIC_DATETIME,PARAMETRIC_INTERVAL,VARIANT_BINARY,OTHER,VARIANT, parametric_datetime",
             ),
         );
         input.insert("x-trino-source", HeaderValue::from_static("cli"));
@@ -743,6 +771,7 @@ mod tests {
             request.session_value().unwrap().presentation(),
             &ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: true,
                 variant: true,
                 variant_binary: true
             })

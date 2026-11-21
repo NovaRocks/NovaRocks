@@ -18,7 +18,9 @@
 //! Scope ownership is supplied by the caller. Observing a source or a Layout
 //! grants no capacity; the legacy adapter supplies only its original lifetime.
 use super::analytic_failure;
-use super::{ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, take};
+use super::{
+    AnalyticKeyType, ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, take,
+};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow::compute::concat;
@@ -319,12 +321,24 @@ pub(crate) fn gather<W: AnalyticInputWork>(
 // The original comparator, NULL order and key order are unchanged.
 pub(crate) fn compare_keys<W: AnalyticInputWork>(
     keys: &[ArrayRef],
+    key_types: Option<&[AnalyticKeyType]>,
     left: usize,
     right: usize,
     work: &mut W,
 ) -> Result<Ordering, Result<ExecutionFailure, W::Failure>> {
-    for array in keys {
+    for (index, array) in keys.iter().enumerate() {
         work.step().map_err(Err)?;
+        if let Some(key_types) = key_types {
+            if let Some(order) = key_types[index]
+                .temporal_order(array.as_ref(), left, right)
+                .map_err(Ok)?
+            {
+                if !order.is_eq() {
+                    return Ok(order);
+                }
+                continue;
+            }
+        }
         match (array.is_null(left), array.is_null(right)) {
             (true, true) => continue,
             (true, false) => return Ok(Ordering::Less),
@@ -347,7 +361,7 @@ pub(crate) fn unscoped_compare(
     left: usize,
     right: usize,
 ) -> ExecutionResult<Ordering> {
-    match compare_keys(keys, left, right, &mut UnscopedWork) {
+    match compare_keys(keys, None, left, right, &mut UnscopedWork) {
         Ok(order) => Ok(order),
         Err(Ok(message)) => Err(message),
         Err(Err(cause)) => match cause {},
@@ -357,6 +371,7 @@ pub(crate) fn unscoped_compare(
 pub(crate) fn regroup<W: AnalyticInputWork>(
     chunk: &Chunk,
     keys: &[ArrayRef],
+    key_types: Option<&[AnalyticKeyType]>,
     work: &mut W,
 ) -> AnalyticStageOperationResult<W> {
     let stage = AnalyticInputStage::Regroup;
@@ -390,7 +405,7 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
         if sort_error.is_some() {
             return Ordering::Equal;
         }
-        match compare_keys(keys, *left, *right, work) {
+        match compare_keys(keys, key_types, *left, *right, work) {
             Ok(order) => {
                 if order.is_eq() {
                     left.cmp(right)

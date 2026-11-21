@@ -696,7 +696,7 @@ fn prepare_table_creation(
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
     let schema = Schema::builder()
-        .with_fields(super::type_mapping::schema_fields(columns).map_err(invalid)?)
+        .with_fields(super::type_mapping::schema_fields(columns, format_version)?)
         .build()
         .map_err(|error| invalid(format!("build Iceberg schema: {error}")))?;
     crate::schema_capability::admit_schema(&schema)?;
@@ -2107,6 +2107,7 @@ pub(crate) fn prepare_schema_updates(
     let fields = apply_schema_change(
         metadata.current_schema().as_struct().fields(),
         change,
+        metadata.format_version(),
         &mut next_id,
     )?;
     let new_schema = Schema::builder()
@@ -2297,6 +2298,7 @@ fn reject_reserved_schema_change(change: &ConnectorSchemaChange) -> Result<(), C
 fn apply_schema_change(
     fields: &[Arc<NestedField>],
     change: &ConnectorSchemaChange,
+    format_version: FormatVersion,
     next_id: &mut i32,
 ) -> Result<Vec<Arc<NestedField>>, ConnectorError> {
     match change {
@@ -2318,7 +2320,7 @@ fn apply_schema_change(
             *next_id = next_id
                 .checked_add(1)
                 .ok_or_else(|| invalid("Iceberg field ID space exhausted"))?;
-            let field = super::type_mapping::column_field(id, column, next_id).map_err(invalid)?;
+            let field = super::type_mapping::column_field(id, column, format_version, next_id)?;
             insert_at_position(siblings, Arc::new(field), position)
         }),
         ConnectorSchemaChange::DropColumn { path } => {
@@ -2355,8 +2357,8 @@ fn apply_schema_change(
                 let index = field_index(siblings, name)?;
                 let mut field = (*siblings[index]).clone();
                 let mut unused_id = *next_id;
-                let target = super::type_mapping::iceberg_type(data_type, &mut unused_id)
-                    .map_err(invalid)?;
+                let target =
+                    super::type_mapping::iceberg_type(data_type, format_version, &mut unused_id)?;
                 field.field_type = Box::new(widen_type(&field.field_type, target)?);
                 let mut updated = siblings.to_vec();
                 updated[index] = Arc::new(field);
@@ -7975,8 +7977,13 @@ mod tests {
             },
         };
         let mut next_id = 3;
-        let fields = apply_schema_change(schema().as_struct().fields(), &change, &mut next_id)
-            .expect("apply schema change");
+        let fields = apply_schema_change(
+            schema().as_struct().fields(),
+            &change,
+            FormatVersion::V2,
+            &mut next_id,
+        )
+        .expect("apply schema change");
         assert_eq!(
             fields
                 .iter()
@@ -8043,9 +8050,13 @@ mod tests {
             find_field_id(&fields, &path).expect("resolve list element"),
             2
         );
-        let error =
-            apply_schema_change(&fields, &ConnectorSchemaChange::DropColumn { path }, &mut 3)
-                .expect_err("dropping a list element must preserve the composite shape");
+        let error = apply_schema_change(
+            &fields,
+            &ConnectorSchemaChange::DropColumn { path },
+            FormatVersion::V2,
+            &mut 3,
+        )
+        .expect_err("dropping a list element must preserve the composite shape");
 
         assert_eq!(
             error.message(),
@@ -8674,6 +8685,7 @@ mod tests {
         let fields = apply_schema_change(
             metadata.current_schema().as_struct().fields(),
             change,
+            metadata.format_version(),
             &mut (metadata.last_column_id() + 1),
         )
         .unwrap();
@@ -9638,7 +9650,7 @@ mod tests {
             };
             ConnectorCatalogMutation::admit(&provider, &request)
                 .expect("existing Variant does not make metadata read-only");
-            apply_schema_change(&fields, &change, &mut 3)
+            apply_schema_change(&fields, &change, metadata.format_version(), &mut 3)
                 .expect("existing schema-change semantics remain legal");
             let commit = prepare_schema_updates(&metadata, &change)
                 .expect("existing schema change reaches its commit owner");

@@ -478,6 +478,33 @@ fn author_call(
             arguments: children,
         }
     };
+    let declared_dependencies = &declaration.effects().environment_dependencies;
+    let mut environment = Vec::new();
+    if !declared_dependencies.is_empty() {
+        let authored = function.require_legacy_metadata().map_err(|_| {
+            CallAuthorError::scalar_invalid("selected call has no authored environment references")
+        })?;
+        for &key in declared_dependencies {
+            work.step()?;
+            let mut matching = authored
+                .semantic_parameters
+                .iter()
+                .filter(|reference| reference.expected_key == key);
+            let reference = matching.next().copied().ok_or_else(|| {
+                CallAuthorError::scalar_invalid(
+                    "selected call is missing an authored semantic parameter",
+                )
+            })?;
+            if matching.next().is_some()
+                || inputs.environment.parameters.require(reference).is_err()
+            {
+                return Err(CallAuthorError::scalar_invalid(
+                    "selected call has a foreign or ambiguous semantic parameter",
+                ));
+            }
+            environment.push(reference);
+        }
+    }
     let prepared = inputs
         .functions
         .prepare_fresh(
@@ -488,7 +515,7 @@ fn author_call(
                 kind: function.kind,
                 selected: selection.as_ref(),
                 request: request.request(),
-                environment: &[],
+                environment: &environment,
                 parameters: inputs.environment.parameters,
                 decimal_overflow_policy: decimal,
                 proof_scope: CallProofScope::Region(invocation.context.region),

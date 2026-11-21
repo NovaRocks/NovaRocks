@@ -19,10 +19,16 @@
 //! Shared-buffer metadata reconstruction and Arrow copy remain opaque library
 //! work bracketed by the original control. No allocation grant is claimed.
 
+#[path = "value_conversion_temporal.rs"]
+mod temporal;
+#[path = "temporal_assignment.rs"]
+pub(super) mod temporal_assignment;
+
 use super::value_conversion::{
     ARRAY_COMMON_COERCION, BOOLEAN_LARGEINT, DECIMAL128_LARGEINT, DECIMAL256_LARGEINT,
     FLOAT32_LARGEINT, FLOAT64_LARGEINT, JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT,
-    LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, SIGNED_LARGEINT, UTF8_LARGEINT,
+    LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, SIGNED_LARGEINT,
+    TEMPORAL_WRITE_ASSIGNMENT, UTF8_LARGEINT,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
@@ -81,6 +87,8 @@ enum Operation {
     Utf8LargeInt,
     NullLift,
     ArrayCommon,
+    Temporal(temporal::PreparedTemporalCast),
+    TemporalWriteAssignment,
 }
 #[derive(Clone, Copy, Debug)]
 enum NumericLargeIntSource {
@@ -169,6 +177,7 @@ impl ConversionRecipe {
                 LARGEINT_TEXT => Operation::LargeIntText,
                 UTF8_LARGEINT => Operation::Utf8LargeInt,
                 NULL_LIFT => Operation::NullLift,
+                TEMPORAL_WRITE_ASSIGNMENT => Operation::TemporalWriteAssignment,
                 ARRAY_COMMON_COERCION => {
                     // Pure identity and NULL-promise widening reuse the original
                     // metadata reconstruction author, including UNKNOWN children.
@@ -183,6 +192,9 @@ impl ConversionRecipe {
                     } else {
                         Operation::ArrayCommon
                     }
+                }
+                id if super::value_conversion::temporal_overload(id).is_some() => {
+                    Operation::Temporal(temporal::PreparedTemporalCast::new(contract, source)?)
                 }
                 _ => return Err(invalid("conversion has an unknown canonical overload")),
             };
@@ -433,6 +445,23 @@ impl ConversionRecipe {
                     }
                     Operation::LargeIntText => largeint_text(*argument, selection, &mut work)?,
                     Operation::Utf8LargeInt => utf8_largeint(*argument, selection, &mut work)?,
+                    Operation::Temporal(recipe) => recipe.evaluate(
+                        *argument,
+                        selection,
+                        source.nullable(),
+                        &mut errors,
+                        &mut work,
+                    )?,
+                    Operation::TemporalWriteAssignment => {
+                        let compact = compact(*argument, selection, &mut work)?;
+                        temporal_assignment::convert(
+                            &compact,
+                            source,
+                            target,
+                            &mut errors,
+                            &mut work,
+                        )?
+                    }
                     Operation::NullLift => {
                         return Err(internal("NULL lift active domain was not excluded"));
                     }
@@ -607,7 +636,7 @@ fn downcast<T: 'static>(array: &ArrayRef) -> Result<&T, KernelFailure> {
         .downcast_ref()
         .ok_or_else(|| internal("conversion carrier has a foreign array implementation"))
 }
-fn extent(rows: usize, width: usize) -> Result<(), KernelFailure> {
+pub(super) fn extent(rows: usize, width: usize) -> Result<(), KernelFailure> {
     let bytes = rows
         .checked_mul(width)
         .ok_or(KernelFailure::ResourceExhausted)?;

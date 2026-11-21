@@ -174,7 +174,19 @@ pub(super) fn schema(
     let mut fields = creation.reserve(columns.len())?;
     let mut values = creation.reserve(columns.len())?;
     for column in columns {
-        let value = column.value_type().clone_observed(|| creation.work(1))?;
+        let value = match column.temporal_declaration() {
+            Some(source) => {
+                crate::schema_mapping::typed_value::from_declaration(
+                    source,
+                    column.nullable(),
+                    None,
+                    None,
+                    creation,
+                )?
+                .binding
+            }
+            None => column.value_type().clone_observed(|| creation.work(1))?,
+        };
         let name = creation.text(column.name())?;
         fields.push(creation.arc(Field::new(
             name,

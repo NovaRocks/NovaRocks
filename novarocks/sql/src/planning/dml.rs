@@ -1007,6 +1007,7 @@ fn complete_connector_write_plan(
 pub struct DmlCtasSourcePlan {
     constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
+    semantic_settings: crate::sql_mode::SqlSemanticSettings,
     private_output_domain: bool,
     output_domains: Box<[novarocks_physical_plan::ResultValueDomain]>,
     output_names: Box<[String]>,
@@ -1025,6 +1026,15 @@ pub struct DmlSourceColumn {
 }
 
 impl DmlSourceColumn {
+    pub fn has_temporal_type(&self) -> bool {
+        fn has_temporal(value: &novarocks_type_contract::ValueTypeRef) -> bool {
+            value.temporal().is_some()
+                || (0..value.child_count())
+                    .any(|index| value.child_type_at(index).is_some_and(has_temporal))
+        }
+        has_temporal(self.value_type.value_type())
+    }
+
     /// Persistence uses the complete SQL declaration, including every child domain.
     pub fn has_private_persistence_domain(&self) -> bool {
         crate::planning::mv::has_private_persistence_domain(self.value_type.value_type())
@@ -1084,6 +1094,7 @@ pub fn compile_ctas_source(
 ) -> Result<DmlCtasSourcePlan, crate::compiler::SqlCompileError> {
     let output_names = request.definition_column_names()?.into_boxed_slice();
     let constant_policy = request.constant_policy();
+    let semantic_settings = request.semantic_settings().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
@@ -1100,6 +1111,7 @@ pub fn compile_ctas_source(
     Ok(DmlCtasSourcePlan {
         constant_policy,
         root_allow_throw_exception: compiled.root_allow_throw_exception,
+        semantic_settings,
         private_output_domain,
         output_domains,
         output_names,
@@ -1114,7 +1126,7 @@ pub fn compile_ctas_source(
 /// the completed writer graph.
 pub fn begin_final_ctas_connector_write_plan(
     source: &DmlCtasSourcePlan,
-    sink: DmlWritePlanInput,
+    mut sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
@@ -1124,6 +1136,7 @@ pub fn begin_final_ctas_connector_write_plan(
     (DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>),
     crate::compiler::SqlCompileError,
 > {
+    bind_ctas_write_projection(source, &mut sink.0, control)?;
     let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
     let target_schema =
         crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
@@ -1170,6 +1183,58 @@ pub fn begin_final_ctas_connector_write_plan(
         },
         needs,
     ))
+}
+
+fn bind_ctas_write_projection(
+    source: &DmlCtasSourcePlan,
+    sink: &mut crate::planner::distributed::write::contract::SqlWritePlanInput,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<(), crate::compiler::SqlCompileError> {
+    use crate::analysis::{ExprKind, TypedExpr};
+    use crate::analyzer::write_assignment;
+    use crate::compiler::SqlCompileError;
+    let output = &source.optimized.output_columns;
+    let fields = &sink.contract.target.fields;
+    let inputs = &sink.contract.input_columns;
+    if !matches!(sink.input, ConnectorWriteInputBinding::RootOutputByOrdinal)
+        || output.len() != inputs.len()
+        || fields.len() != inputs.len()
+    {
+        return Err(SqlCompileError::InvalidRequest(
+            "CTAS source width or input order differs from the admitted writer".into(),
+        ));
+    }
+    let mut project = Vec::with_capacity(output.len());
+    let mut requires_conversion = false;
+    for (ordinal, ((column, input), field)) in output.iter().zip(inputs).zip(fields).enumerate() {
+        let site = write_assignment::write_assignment_site_for_column(
+            ordinal,
+            input,
+            field.storage_type.clone(),
+            control,
+        )?;
+        let expression = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: column.column_id,
+                qualifier: None,
+                column: column.name.clone(),
+            },
+            value_type: column.value_type.clone(),
+        };
+        let value = write_assignment::bind_write_assignment_value(
+            expression,
+            &site,
+            novarocks_parser::SYNTHETIC,
+            source.function_catalog.as_ref(),
+            &source.semantic_settings,
+            source.constant_policy,
+            control,
+        )?;
+        requires_conversion |= !matches!(value.kind, ExprKind::ColumnRef { .. });
+        project.push(value);
+    }
+    sink.root_output_exprs = requires_conversion.then_some(project);
+    Ok(())
 }
 
 /// Provider route facts that SQL binds to a change-stream producer. Exact

@@ -416,6 +416,47 @@ fn decode(
             resource.checkpoint()?;
             Ok(Arc::new(result))
         }
+        DataType::FixedSizeBinary(width @ (10 | 12 | 14)) => {
+            let len = *width as usize;
+            preflight_fixed_binary_constructor_extent(*width, rows.len())
+                .map_err(|error| ExecutionFailure::from(error.into_kernel()))?;
+            let mut values = vector::<u8>(
+                rows.len()
+                    .checked_mul(len)
+                    .ok_or_else(group_key_request_arithmetic)?,
+                resource,
+            )?;
+            for block in rows.chunks(256) {
+                resource.checkpoint()?;
+                for row in block {
+                    if let Some(row) = row {
+                        decode_fixed_value(row, 35, 4 + len, |bytes| {
+                            let stored_width =
+                                i32::from_le_bytes(bytes[..4].try_into().expect("fixed width"));
+                            if stored_width != *width {
+                                return Err(group_key_decoding_contract(
+                                    "temporal fixed carrier width differs from declaration",
+                                ));
+                            }
+                            values.extend_from_slice(&bytes[4..]);
+                            Ok(())
+                        })?;
+                    } else {
+                        values.resize(values.len() + len, 0);
+                    }
+                }
+            }
+            let nulls = validity(rows, resource)?;
+            node(ty, nulls.is_some(), resource)?;
+            let result = FixedSizeBinaryArray::try_new(
+                *width,
+                Buffer::from_vec(values),
+                publish_validity(nulls),
+            )
+            .map_err(group_key_decode_arrow)?;
+            resource.checkpoint()?;
+            Ok(Arc::new(result))
+        }
         DataType::Utf8
         | DataType::LargeUtf8
         | DataType::Utf8View

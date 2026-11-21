@@ -87,10 +87,45 @@ pub(crate) enum KeyStrategy {
     Canonical,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TemporalKeyMode {
+    Physical,
+    Temporal,
+    Zoned,
+}
+
+impl TemporalKeyMode {
+    fn from_declaration(
+        declaration: &novarocks_type_contract::ValueTypeRef,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
+        use novarocks_type_contract::{
+            TemporalType, ValueSemanticVisit, visit_value_type_observed,
+        };
+
+        let mut mode = Self::Physical;
+        visit_value_type_observed(declaration, |event| {
+            checkpoint()?;
+            if let ValueSemanticVisit::Node(value) = event {
+                mode = match value.temporal() {
+                    Some(
+                        TemporalType::TimeWithTimeZone(_) | TemporalType::TimestampWithTimeZone(_),
+                    ) => Self::Zoned,
+                    Some(_) if mode == Self::Physical => Self::Temporal,
+                    _ => mode,
+                };
+            }
+            Ok::<(), ExecutionFailure>(())
+        })?;
+        Ok(mode)
+    }
+}
+
 struct SpecData {
     types: Vec<FunctionValueType>,
     nulls: Vec<NullPolicy>,
     equalities: Vec<KeyEquality>,
+    temporal_modes: Vec<TemporalKeyMode>,
     #[cfg_attr(
         not(test),
         expect(
@@ -153,6 +188,7 @@ impl KeySpec {
         let mut copied_types = vector(owner, types.len())?;
         let mut copied_nulls = vector(owner, count)?;
         let mut equalities = vector(owner, count)?;
+        let mut temporal_modes = vector(owner, count)?;
         let mut canonical = false;
         for (i, ty) in types.iter().enumerate() {
             checkpoint_at(i, checkpoint)?;
@@ -160,6 +196,10 @@ impl KeySpec {
             let policy = equality(i);
             copied_nulls.push(policy.null_policy());
             equalities.push(policy);
+            temporal_modes.push(TemporalKeyMode::from_declaration(
+                ty.value_type(),
+                checkpoint,
+            )?);
             canonical |=
                 !is_fixed(ty.data_type()) && ByteLayout::from_data_type(ty.data_type()).is_none();
         }
@@ -178,6 +218,7 @@ impl KeySpec {
                 types: copied_types,
                 nulls: copied_nulls,
                 equalities,
+                temporal_modes,
                 strategy,
                 _storage: owner.storage_lifetime(),
             },
@@ -801,6 +842,53 @@ impl<'a> PreparedKeyBatch<'a> {
         row: usize,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<crate::exec::hash_table::allocation::AggregateVec<u8>> {
+        let temporal_mode = self
+            .spec
+            .0
+            .temporal_modes
+            .get(column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        if *temporal_mode != TemporalKeyMode::Physical {
+            use crate::exec::hash_table::key_builder::append_temporal_nullable_tracked_observed;
+            let declaration = self.component_binding(column)?.value_type();
+            let (array, mapping) = self.tuples().physical_component(column)?;
+            let physical = super::pairs::physical_row(mapping, row)?;
+            let mut out =
+                crate::exec::hash_table::allocation::AggregateVec::new_in(self.allocator.clone());
+            if REPRESENTATIVE
+                && !CONTENT
+                && *temporal_mode == TemporalKeyMode::Zoned
+                && !array.is_null(physical)
+            {
+                // Retain both the comparison bytes and the actually admitted
+                // value in the original byte page and its existing budget.
+                out.try_reserve_exact(5).map_err(|error| {
+                    self.allocator
+                        .allocation_error("reserve temporal representative frame", error)
+                })?;
+                out.extend_from_slice(&[2, 0, 0, 0, 0]);
+                append_temporal_nullable_tracked_observed::<false, false>(
+                    array,
+                    physical,
+                    declaration,
+                    &mut out,
+                    checkpoint,
+                )?;
+                let key_size = crate::exec::hash_table::key_builder::group_key_component_len(
+                    out.len() - 5,
+                    "temporal comparison key",
+                )?;
+                out[1..5].copy_from_slice(&key_size.to_le_bytes());
+            }
+            append_temporal_nullable_tracked_observed::<CONTENT, REPRESENTATIVE>(
+                array,
+                physical,
+                declaration,
+                &mut out,
+                checkpoint,
+            )?;
+            return Ok(out);
+        }
         if !CONTENT {
             return self.tuples().encode_component_row(
                 column,

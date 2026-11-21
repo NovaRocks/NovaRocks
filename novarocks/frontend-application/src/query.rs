@@ -1013,6 +1013,7 @@ pub struct FrontendQueryService {
     /// Cost budget frozen from `[runtime]` and handed to statement admission
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
+    statement_clock: crate::application::StatementClock,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     serving_admission: FrontendServingAdmission,
 }
@@ -1076,6 +1077,7 @@ impl FrontendQueryService {
         truncate_engine: Arc<dyn TruncateEngine>,
         query_blocking_executor: QueryBlockingExecutor,
         optimizer_query_mem_limit_bytes: u64,
+        statement_clock: crate::application::StatementClock,
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
         serving_admission: FrontendServingAdmission,
     ) -> Self {
@@ -1113,6 +1115,7 @@ impl FrontendQueryService {
             truncate_engine,
             query_blocking_executor,
             optimizer_query_mem_limit_bytes,
+            statement_clock,
             lake_publication_runtime_policy,
             serving_admission,
         }
@@ -1245,6 +1248,7 @@ impl FrontendQuerySession {
         &self,
         source: Arc<str>,
         action: TrinoSessionAction,
+        statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<QuerySessionStatement, QueryServiceError> {
         let (kind, work) = lower_trino_session_action(action);
         let shape = StatementOutputShape::Empty;
@@ -1266,8 +1270,14 @@ impl FrontendQuerySession {
                 .await
             }
             TrinoSessionWork::Mutation(mutation) => {
-                self.execute_observed_scoped_session_mutation(source, mutation, deadline, governed)
-                    .await?
+                self.execute_observed_scoped_session_mutation(
+                    source,
+                    mutation,
+                    deadline,
+                    governed,
+                    statement_time,
+                )
+                .await?
             }
         };
         Ok(QuerySessionStatement::output_owned(output, kind))
@@ -1598,6 +1608,10 @@ fn lower_trino_session_action(action: TrinoSessionAction) -> (StatementKind, Tri
         TrinoSessionAction::Reset { name, span } => (
             StatementKind::ResetSession,
             TrinoSessionWork::Mutation(ScopedSessionMutation::Reset { name, span }),
+        ),
+        TrinoSessionAction::SetTimeZone(node) => (
+            StatementKind::SetTimeZone,
+            TrinoSessionWork::Mutation(ScopedSessionMutation::SetTimeZone(node)),
         ),
     }
 }

@@ -152,6 +152,10 @@ pub enum MembershipValues {
         timezone: Option<String>,
         values: BTreeSet<i64>,
     },
+    Temporal {
+        carrier_width: i32,
+        values: BTreeSet<[u8; 12]>,
+    },
     Decimal128 {
         precision: u8,
         scale: i8,
@@ -225,6 +229,7 @@ impl MembershipValues {
             Self::Timestamp { unit, timezone, .. } => {
                 DataType::Timestamp(*unit, timezone.clone().map(Into::into))
             }
+            Self::Temporal { carrier_width, .. } => DataType::FixedSizeBinary(*carrier_width),
             Self::Decimal128 {
                 precision, scale, ..
             } => DataType::Decimal128(*precision, *scale),
@@ -243,6 +248,7 @@ impl MembershipValues {
             Self::Utf8(values) => values.is_empty(),
             Self::Date32(values) => values.is_empty(),
             Self::Timestamp { values, .. } => values.is_empty(),
+            Self::Temporal { values, .. } => values.is_empty(),
             Self::Decimal128 { values, .. } => values.is_empty(),
         }
     }
@@ -289,6 +295,16 @@ impl MembershipValues {
                 push_count(out, values.len())?;
                 for x in values {
                     out.extend_from_slice(&x.to_be_bytes());
+                }
+            }
+            Self::Temporal {
+                carrier_width,
+                values,
+            } => {
+                out.extend_from_slice(&[13, *carrier_width as u8]);
+                push_count(out, values.len())?;
+                for value in values {
+                    out.extend_from_slice(value);
                 }
             }
             Self::Decimal128 {
@@ -394,6 +410,7 @@ pub enum OrderedScalar {
     Date32(i32),
     Timestamp(i64),
     Decimal128(i128),
+    Temporal([u8; 12]),
 }
 
 /// Borrowed values use the same frozen scalar vocabulary as owned tuples.
@@ -410,6 +427,7 @@ pub enum OrderedScalarRef<'a> {
     Date32(i32),
     Timestamp(i64),
     Decimal128(i128),
+    Temporal([u8; 12]),
 }
 
 impl OrderedScalarRef<'_> {
@@ -427,6 +445,7 @@ impl OrderedScalarRef<'_> {
             Self::Date32(value) => OrderedScalar::Date32(value),
             Self::Timestamp(value) => OrderedScalar::Timestamp(value),
             Self::Decimal128(value) => OrderedScalar::Decimal128(value),
+            Self::Temporal(value) => OrderedScalar::Temporal(value),
         }
     }
 }
@@ -444,6 +463,7 @@ impl OrderedScalar {
             Self::Date32(value) => OrderedScalarRef::Date32(*value),
             Self::Timestamp(value) => OrderedScalarRef::Timestamp(*value),
             Self::Decimal128(value) => OrderedScalarRef::Decimal128(*value),
+            Self::Temporal(value) => OrderedScalarRef::Temporal(*value),
         }
     }
 }
@@ -769,6 +789,10 @@ impl RuntimeOrderKey {
     pub fn value_type(&self) -> Option<&novarocks_functions::FunctionValueType> {
         self.complete_type.as_ref()
     }
+    pub fn temporal_type(&self) -> Option<novarocks_type_contract::TemporalType> {
+        self.value_type()
+            .and_then(|value_type| value_type.value_type().temporal())
+    }
     /// A data frame carries physical key encoding, not a new semantic author.
     /// Its channel retains and validates the complete execution binding.
     pub fn same_physical_key(&self, other: &Self) -> bool {
@@ -948,12 +972,16 @@ impl RuntimeOrderContract {
         };
         emit(&count.to_be_bytes())?;
         for key in keys {
-            if !ordered_key_type_supported(key.data_type()) {
+            if key.temporal_type().is_none() && !ordered_key_type_supported(key.data_type()) {
                 return Err(Contract(fragment_contract_error(
                     "ordered contract has unsupported key type",
                 )));
             }
-            novarocks_local_program::visit_filter_key_type(key.data_type(), &mut emit)?;
+            novarocks_local_program::visit_ordered_filter_key_type(
+                key.data_type(),
+                key.temporal_type(),
+                &mut emit,
+            )?;
             emit(&[match key.direction() {
                 RuntimeOrderSortDirection::Ascending => 1,
                 RuntimeOrderSortDirection::Descending => 2,
@@ -1007,7 +1035,7 @@ impl RuntimeOrderContract {
             observe()?;
             if tuple
                 .value(ordinal)
-                .is_some_and(|value| !scalar_ref_matches(value, key.data_type()))
+                .is_some_and(|value| !scalar_ref_matches(value, key))
             {
                 return Err(OrderedTupleError::TypeMismatch.into());
             }
@@ -1508,6 +1536,15 @@ fn decode_membership(
         DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => {
             MembershipValues::LargeInt(read_set(&mut r, tag, 6, |r| r.i128())?)
         }
+        DataType::FixedSizeBinary(width @ (10 | 12 | 14)) => {
+            if tag != 13 || r.u8()? != *width as u8 {
+                return Err(ContributionCodecError::SchemaMismatch);
+            }
+            MembershipValues::Temporal {
+                carrier_width: *width,
+                values: read_set(&mut r, tag, 13, |reader| reader.array::<12>())?,
+            }
+        }
         DataType::Float32 => MembershipValues::Float32(read_set(&mut r, tag, 7, |r| {
             let bits = r.u32()?;
             let x = f32::from_bits(bits);
@@ -1787,7 +1824,44 @@ pub fn encode_membership_contributions(
             actual: type_description(array.data_type()),
         });
     }
-    let domain = value_domain_from_array(array.as_ref(), &expected)?;
+    let domain = if let DataType::FixedSizeBinary(width @ (10 | 12 | 14)) = expected {
+        let ty = schema
+            .value_type()
+            .filter(|value_type| value_type.data_type() == &expected)
+            .ok_or_else(|| invalid_array(&expected, "temporal filter has no complete key type"))?;
+        let temporal = ty
+            .value_type()
+            .temporal()
+            .ok_or_else(|| invalid_array(&expected, "temporal filter has a foreign key type"))?;
+        let view = novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+            temporal,
+            array.as_ref(),
+            ty.nullable(),
+        )
+        .map_err(|_| invalid_array(&expected, "invalid temporal filter key array"))?;
+        let mut contains_null = false;
+        let mut values = BTreeSet::new();
+        for row in 0..array.len() {
+            match view
+                .relation_key(row)
+                .map_err(|_| invalid_array(&expected, "invalid temporal filter key"))?
+            {
+                Some(key) => {
+                    values.insert(key.order_bytes());
+                }
+                None => contains_null = true,
+            }
+        }
+        ValueDomainDelta::new(
+            MembershipValues::Temporal {
+                carrier_width: width,
+                values,
+            },
+            contains_null,
+        )
+    } else {
+        value_domain_from_array(array.as_ref(), &expected)?
+    };
     if domain.values().is_empty() && !domain.contains_null() {
         return Ok(MembershipContributionEncodingOutcome::Contributions(
             Vec::new(),
@@ -2030,7 +2104,7 @@ fn decode_tuple_reader(
     for key in contract.keys() {
         values.push(match reader.u8()? {
             0 => None,
-            1 => Some(decode_scalar(reader, key.data_type())?),
+            1 => Some(decode_scalar(reader, key)?),
             _ => return Err(ContributionCodecError::NonCanonicalPayload),
         });
     }
@@ -2038,9 +2112,15 @@ fn decode_tuple_reader(
 }
 fn decode_scalar(
     r: &mut Reader<'_>,
-    data_type: &DataType,
+    key: &RuntimeOrderKey,
 ) -> Result<OrderedScalar, ContributionCodecError> {
-    Ok(match data_type {
+    if let Some(declaration) = key.temporal_type() {
+        let bytes = r.array()?;
+        novarocks_type_contract::TemporalRelationKey::from_order_bytes(declaration, bytes)
+            .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
+        return Ok(OrderedScalar::Temporal(bytes));
+    }
+    Ok(match key.data_type() {
         DataType::Boolean => OrderedScalar::Boolean(match r.u8()? {
             0 => false,
             1 => true,
@@ -2068,8 +2148,12 @@ fn decode_scalar(
         _ => return Err(ContributionCodecError::SchemaMismatch),
     })
 }
-fn scalar_ref_matches(value: OrderedScalarRef<'_>, data_type: &DataType) -> bool {
-    match (value, data_type) {
+fn scalar_ref_matches(value: OrderedScalarRef<'_>, key: &RuntimeOrderKey) -> bool {
+    if let Some(declaration) = key.temporal_type() {
+        return matches!(value, OrderedScalarRef::Temporal(bytes)
+            if novarocks_type_contract::TemporalRelationKey::from_order_bytes(declaration, bytes).is_ok());
+    }
+    match (value, key.data_type()) {
         (OrderedScalarRef::Boolean(_), DataType::Boolean)
         | (OrderedScalarRef::Int8(_), DataType::Int8)
         | (OrderedScalarRef::Int16(_), DataType::Int16)
@@ -2209,9 +2293,9 @@ fn visit_ordered_tuple(
         match tuple.value(ordinal) {
             None => visit(&[0])?,
             Some(value) => {
-                if contract.is_some_and(|contract| {
-                    !scalar_ref_matches(value, contract.keys()[ordinal].data_type())
-                }) {
+                if contract
+                    .is_some_and(|contract| !scalar_ref_matches(value, &contract.keys()[ordinal]))
+                {
                     return Err(ContributionCodecError::SchemaMismatch.into());
                 }
                 visit(&[1])?;
@@ -2230,6 +2314,7 @@ fn visit_scalar_ref(
     visit: &mut impl FnMut(&[u8]) -> Result<(), ControlledContributionCodecError>,
 ) -> Result<(), ControlledContributionCodecError> {
     match value {
+        OrderedScalarRef::Temporal(value) => visit(&value)?,
         OrderedScalarRef::Boolean(value) => visit(&[u8::from(value)])?,
         OrderedScalarRef::Int8(value) => visit(&value.to_be_bytes())?,
         OrderedScalarRef::Int16(value) => visit(&value.to_be_bytes())?,
@@ -2291,6 +2376,7 @@ fn compare_scalar_ref(
     work: &mut novarocks_functions::EvaluationCheckpoints<'_>,
 ) -> Result<Ordering, ControlledOrderedTupleError> {
     Ok(match (left, right) {
+        (OrderedScalarRef::Temporal(a), OrderedScalarRef::Temporal(b)) => a.cmp(&b),
         (OrderedScalarRef::Boolean(a), OrderedScalarRef::Boolean(b)) => a.cmp(&b),
         (OrderedScalarRef::Int8(a), OrderedScalarRef::Int8(b)) => a.cmp(&b),
         (OrderedScalarRef::Int16(a), OrderedScalarRef::Int16(b)) => a.cmp(&b),

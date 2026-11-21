@@ -111,6 +111,21 @@ pub(super) fn cast_to_value_type(
     if source.value_type == target {
         return Ok(source);
     }
+    if source.value_type.value_type().temporal().is_some()
+        || target.value_type().temporal().is_some()
+    {
+        return super::expression_typing::authored_temporal_cast(
+            function_catalog,
+            sql_semantics,
+            constant_policy,
+            control,
+            source,
+            target,
+            false,
+            span,
+            false,
+        );
+    }
     // The semantic cast walk observes the actual caller's control; its
     // checked owner preserves nested nominal domains across carrier casts.
     if constant_is_null(&source, constant_policy, control)? {

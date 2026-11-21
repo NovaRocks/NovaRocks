@@ -28,7 +28,7 @@ pub(crate) use staged_paths::{
 mod streaming;
 pub(crate) use streaming::StreamingStagedDataFileWriter;
 
-use super::write_adaptation::{WriteAdaptationError, adapt_batch};
+use super::write_adaptation::{WriteAdaptationError, adapt_batch, adapt_temporal_batch};
 use crate as novarocks_connector_iceberg;
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
@@ -165,6 +165,7 @@ pub struct StagedWriteContext {
     file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     writer_schema: SchemaRef,
     annotated_schema: arrow::datatypes::SchemaRef,
+    temporal_storage: Option<Box<[crate::temporal::TemporalReadProjection]>>,
     /// Target table partition spec id reported in sink commit metadata. The
     /// staged writer may use synthetic metadata for schema/partition binding,
     /// but the coordinator must commit files under the real target spec id.
@@ -227,6 +228,7 @@ impl StagedWriteContext {
             file_io,
             writer_schema,
             annotated_schema,
+            temporal_storage: None,
             partition_spec_id,
             target_file_size_bytes:
                 crate::iceberg::spec::TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
@@ -246,6 +248,22 @@ impl StagedWriteContext {
         }
         self.max_partitions_per_writer = max_partitions_per_writer;
         Ok(self)
+    }
+
+    pub(super) fn with_temporal_storage(
+        mut self,
+        temporals: Box<[crate::temporal::TemporalReadProjection]>,
+    ) -> Self {
+        self.temporal_storage = Some(temporals);
+        self
+    }
+
+    fn adapt(&self, batch: &RecordBatch) -> Result<RecordBatch, WriteAdaptationError> {
+        if let Some(temporals) = &self.temporal_storage {
+            adapt_temporal_batch(batch, &self.annotated_schema, temporals)
+        } else {
+            adapt_batch(batch, &self.annotated_schema)
+        }
     }
 
     fn max_row_group_bytes(&self) -> Result<usize, String> {
@@ -380,7 +398,7 @@ async fn write_record_batches_with_journal(
             if batch.num_rows() == 0 {
                 continue;
             }
-            let annotated = adapt_batch(&batch, &ctx.annotated_schema)?;
+            let annotated = ctx.adapt(&batch)?;
             for offset in
                 (0..annotated.num_rows()).step_by(write_batch_rows.min(annotated.num_rows()))
             {
@@ -420,7 +438,7 @@ async fn write_record_batches_with_journal(
         if batch.num_rows() == 0 {
             continue;
         }
-        let annotated = adapt_batch(&batch, &ctx.annotated_schema)?;
+        let annotated = ctx.adapt(&batch)?;
         let partitioned = splitter
             .split(&annotated)
             .map_err(|e| format!("split iceberg batch by partition spec failed: {e}"))?;

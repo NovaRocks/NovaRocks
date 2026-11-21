@@ -1,0 +1,15 @@
+-- query 2
+-- types	timestamp(6)
+event
+1969-12-31 23:59:59.999999
+
+-- query 4
+-- types	timestamp(6)	time(6)	timestamp(6) with time zone
+event	clock	zoned
+2024-01-01 00:00:00.123457	12:34:56.123400	2024-01-01 00:00:00.123457 UTC
+
+-- query 10
+-- types	integer	timestamp(9) with time zone
+id	zoned
+1	2024-01-01 00:00:00.123456790 UTC
+2	2024-01-01 00:00:00.123456790 UTC

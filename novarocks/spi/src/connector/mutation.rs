@@ -384,6 +384,7 @@ pub enum ConnectorDataType {
     DateTime,
     DateTimeNs,
     Time,
+    Temporal(novarocks_type_contract::TemporalType),
     Array(Box<ConnectorDataType>),
     Map(Box<ConnectorDataType>, Box<ConnectorDataType>),
     Struct(Vec<ConnectorStructField>),
@@ -403,10 +404,17 @@ pub enum ConnectorDefaultValue {
     Bool(bool),
     Int(i64),
     Float(f64),
-    Decimal { unscaled: i128, scale: i8 },
+    Decimal {
+        unscaled: i128,
+        scale: i8,
+    },
     String(Arc<str>),
     Date(i32),
     DateTime(i64),
+    Temporal {
+        data_type: novarocks_type_contract::TemporalType,
+        value: novarocks_type_contract::TemporalValue,
+    },
     Binary(Bytes),
 }
 

@@ -40,6 +40,7 @@ pub struct SessionSqlState {
     property_inputs: SessionPropertyInputs,
     presentation: Option<ClientPresentationFamily>,
     time_zone: Option<SessionTimeZone>,
+    time_zone_override: Option<SessionTimeZone>,
 }
 impl Default for SessionSqlState {
     fn default() -> Self {
@@ -52,6 +53,7 @@ impl Default for SessionSqlState {
             property_inputs: SessionPropertyInputs::default(),
             presentation: None,
             time_zone: None,
+            time_zone_override: None,
         }
     }
 }
@@ -74,6 +76,23 @@ impl SessionSqlState {
     pub fn time_zone(&self) -> Option<&SessionTimeZone> {
         self.time_zone.as_ref()
     }
+    pub fn effective_time_zone(&self, default: SessionTimeZone) -> SessionTimeZone {
+        self.time_zone_override
+            .or(self.time_zone)
+            .unwrap_or(default)
+    }
+    /// Preserve the original statement instant while resolving the effective
+    /// zone of this session projection, including a statement-local override.
+    pub fn statement_time(
+        &self,
+        admitted: novarocks_type_contract::StatementTimeEnvironment,
+    ) -> novarocks_type_contract::StatementTimeEnvironment {
+        novarocks_type_contract::StatementTimeEnvironment {
+            start: admitted.start,
+            zone: self.effective_time_zone(admitted.zone),
+        }
+    }
+
     pub fn property_inputs(&self) -> &SessionPropertyInputs {
         &self.property_inputs
     }
@@ -156,6 +175,7 @@ impl SessionSqlState {
             staged.execution_settings = defaults.execution_settings;
             staged.optimizer_settings = defaults.optimizer_settings;
             staged.sql_semantics = defaults.sql_semantics;
+            staged.time_zone_override = None;
             let inputs = std::mem::take(&mut staged.property_inputs);
             inputs
                 .project_into(&mut staged)

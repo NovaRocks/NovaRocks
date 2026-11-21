@@ -44,6 +44,7 @@ pub enum NativeRenderType {
         unit: RenderTimeUnit,
         timezone: Option<String>,
     },
+    Temporal(RenderTemporalType),
     Json,
     Variant,
     Opaque(OpaqueRenderType),
@@ -54,6 +55,57 @@ pub enum NativeRenderType {
     },
     Struct(Vec<NamedRenderField>),
 }
+
+/// Exact SQL temporal declaration projected by the logical result author.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderTemporalType {
+    Time(u8),
+    TimeWithTimeZone(u8),
+    Timestamp(u8),
+    TimestampWithTimeZone(u8),
+    Interval {
+        start: RenderIntervalField,
+        end: RenderIntervalField,
+        leading_precision: u8,
+        fractional_precision: u8,
+    },
+}
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum RenderIntervalField {
+    Year = 0,
+    Month = 1,
+    Day = 2,
+    Hour = 3,
+    Minute = 4,
+    Second = 5,
+}
+
+impl RenderTemporalType {
+    fn is_valid(self) -> bool {
+        use RenderIntervalField as F;
+        match self {
+            Self::Time(p)
+            | Self::TimeWithTimeZone(p)
+            | Self::Timestamp(p)
+            | Self::TimestampWithTimeZone(p) => p <= 12,
+            Self::Interval {
+                start,
+                end,
+                leading_precision,
+                fractional_precision,
+            } => {
+                let leading_max = if start <= F::Month { 10 } else { 13 };
+                start <= end
+                    && (start <= F::Month) == (end <= F::Month)
+                    && (1..=leading_max).contains(&leading_precision)
+                    && fractional_precision <= 12
+                    && (end == F::Second || fractional_precision == 0)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderTimeUnit {
     Second,
@@ -77,6 +129,7 @@ pub enum ClientPresentationFamily {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TrinoJsonFacts {
     pub parametric_datetime: bool,
+    pub parametric_interval: bool,
     pub variant: bool,
     pub variant_binary: bool,
 }
@@ -268,6 +321,9 @@ impl SchemaBounds {
             }
         }
         match &field.native_type {
+            NativeRenderType::Temporal(ty) if !ty.is_valid() => {
+                Err(RootContractError::InvalidSchema)
+            }
             NativeRenderType::SignedInteger(bits) | NativeRenderType::UnsignedInteger(bits)
                 if !matches!(bits, 8 | 16 | 32 | 64) =>
             {
@@ -352,6 +408,7 @@ mod tests {
     fn trino_accepts_its_explicit_type_vocabulary() {
         let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
             parametric_datetime: true,
+            parametric_interval: false,
             variant: true,
             variant_binary: true,
         });

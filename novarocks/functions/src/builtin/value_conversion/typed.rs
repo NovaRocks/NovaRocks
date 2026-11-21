@@ -34,11 +34,14 @@ fn child_layout(layout: &DataType, index: usize) -> Option<&DataType> {
 }
 
 fn has_nominal(value: &ValueTypeRef) -> bool {
-    matches!(value.kind(), ValueKind::Nominal(_))
+    matches!(value.kind(), ValueKind::Nominal(_) | ValueKind::Temporal(_))
         || (0..value.child_count()).any(|i| value.child_type_at(i).is_some_and(has_nominal))
 }
 
 pub(super) fn domains_preserved(a: &ValueTypeRef, b: &ValueTypeRef) -> bool {
+    if a.temporal().is_some() || b.temporal().is_some() {
+        return a.temporal() == b.temporal();
+    }
     if !has_nominal(a) && !has_nominal(b) {
         return true;
     }

@@ -22,7 +22,7 @@ use novarocks_local_program::{
     AggregateTopNFilter, FilterLateApplyGranularity, FilterNullOrder, FilterOrderKey,
     FilterOrderKeys, FilterSortDirection, is_aggregate_topn_key_type,
     is_ordered_filter_flat_payload_type, single_key_ordered_filter_digests_observed,
-    visit_filter_key_type,
+    visit_ordered_filter_key_type,
 };
 use novarocks_physical_plan::{
     AggregateGrouping, LateApplyGranularity, NullOrdering, SortDirection,
@@ -87,7 +87,13 @@ fn contract<H, F: ValueSchemaCreationFactory<H>>(
     let (comparator_digest, contract_digest) = single_key_ordered_filter_digests_observed(
         direction,
         null_order,
-        |emit| visit_filter_key_type::<MembershipCreationFailure<H>>(key.ty.data_type(), emit),
+        |emit| {
+            visit_ordered_filter_key_type::<MembershipCreationFailure<H>>(
+                key.ty.data_type(),
+                key.ty.value_type().temporal(),
+                emit,
+            )
+        },
         || work.step().map_err(MembershipCreationFailure::Control),
     )
     .map_err(|cause| match cause {

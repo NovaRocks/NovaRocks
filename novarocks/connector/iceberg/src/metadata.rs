@@ -1498,38 +1498,38 @@ pub(crate) fn build_table_metadata(
     } else {
         None
     };
-    let (schema, execution_schema) = if let Some(metadata_table_type) = payload.metadata_table_type
-    {
-        let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
-        let schema = metadata_output_schema(&columns).map_err(corrupt)?;
-        let execution =
-            crate::metadata_batch_reader::metadata_output_execution_schema(&columns, creation)?;
-        (schema, execution)
-    } else {
-        // The table schema exposed to SQL carries the Iceberg metadata
-        // pseudo-columns after the storage fields, in exactly the order
-        // `projected_schema` uses for scans. Their planning facts are what
-        // marks them hidden and row-lineage-owned, so omitting them here
-        // would make `_file`, `_pos`, `_row_id` and
-        // `_last_updated_sequence_number` unresolvable.
-        let mut fields = base_schema.fields().to_vec();
-        fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
-        if let Some(mutation) = &mutation_metadata {
-            fields.extend(mutation.arrow_fields()?);
-        }
-        let schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            base_schema.metadata().clone(),
-        ));
-        let execution = crate::schema_mapping::catalog_value::table_with_document(
-            &nominal_document,
-            definition_schema.as_ref(),
-            &payload.metadata_columns,
-            mutation_metadata.as_ref(),
-            creation,
-        )?;
-        (schema, execution)
-    };
+    let (schema, execution_schema, metadata_columns) =
+        if let Some(metadata_table_type) = payload.metadata_table_type {
+            let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
+            let schema = metadata_output_schema(&columns).map_err(corrupt)?;
+            let execution =
+                crate::metadata_batch_reader::metadata_output_execution_schema(&columns, creation)?;
+            (schema, execution, Some(columns))
+        } else {
+            // The table schema exposed to SQL carries the Iceberg metadata
+            // pseudo-columns after the storage fields, in exactly the order
+            // `projected_schema` uses for scans. Their planning facts are what
+            // marks them hidden and row-lineage-owned, so omitting them here
+            // would make `_file`, `_pos`, `_row_id` and
+            // `_last_updated_sequence_number` unresolvable.
+            let mut fields = base_schema.fields().to_vec();
+            fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
+            if let Some(mutation) = &mutation_metadata {
+                fields.extend(mutation.arrow_fields()?);
+            }
+            let schema = Arc::new(Schema::new_with_metadata(
+                fields,
+                base_schema.metadata().clone(),
+            ));
+            let execution = crate::schema_mapping::catalog_value::table_with_document(
+                &nominal_document,
+                definition_schema.as_ref(),
+                &payload.metadata_columns,
+                mutation_metadata.as_ref(),
+                creation,
+            )?;
+            (schema, execution, None)
+        };
     let planning_facts = if payload.metadata_table_type.is_some() {
         ConnectorTablePlanningFacts::empty()
     } else {
@@ -1595,7 +1595,7 @@ pub(crate) fn build_table_metadata(
             observed_source,
             creation,
         )?;
-    ConnectorTableMetadata::try_new_typed(
+    ConnectorTableMetadata::try_new_typed_with_format_projection(
         novarocks_spi::connector::ConnectorTableMetadataHeader {
             identity: ConnectorTableIdentity {
                 instance_id: descriptor.instance_id.clone(),
@@ -1620,8 +1620,66 @@ pub(crate) fn build_table_metadata(
         schema,
         execution_schema,
         creation,
+        |ordinal, source, binding, creation| {
+            let declaration = if let Some(columns) = &metadata_columns {
+                columns
+                    .get(ordinal)
+                    .and_then(|column| column.temporal_declaration())
+            } else if let Some(field) = definition_schema.as_struct().fields().get(ordinal) {
+                Some(field.field_type.as_ref())
+            } else {
+                mutation_metadata
+                    .as_ref()
+                    .filter(|_| {
+                        ordinal + 1
+                            == definition_schema.as_struct().fields().len()
+                                + payload.metadata_columns.len()
+                                + 2
+                    })
+                    .map(|mutation| mutation.partition_field().field_type.as_ref())
+            };
+            match declaration {
+                Some(declaration) => crate::temporal::matches_projection(
+                    declaration,
+                    source,
+                    binding.data_type(),
+                    binding.value_type(),
+                    &mut |units| {
+                        creation
+                            .work(units)
+                            .map_err(CatalogTemporalLayoutError::Creation)
+                    },
+                )
+                .map_err(CatalogTemporalLayoutError::into_failure),
+                None => Ok(false),
+            }
+        },
     )
     .map(|metadata| metadata.with_source_read_facts(source_facts))
+}
+
+enum CatalogTemporalLayoutError {
+    Creation(novarocks_connector_contract::PureProviderCompileError<ConnectorError>),
+    Layout(novarocks_type_contract::ValueTypeError),
+}
+
+impl From<novarocks_type_contract::ValueTypeError> for CatalogTemporalLayoutError {
+    fn from(cause: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Layout(cause)
+    }
+}
+
+impl CatalogTemporalLayoutError {
+    fn into_failure(
+        self,
+    ) -> novarocks_connector_contract::PureProviderCompileError<ConnectorError> {
+        match self {
+            Self::Creation(cause) => cause,
+            Self::Layout(cause) => {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, cause.to_string()).into()
+            }
+        }
+    }
 }
 
 impl ConnectorScanPlanning for IcebergMetadata {

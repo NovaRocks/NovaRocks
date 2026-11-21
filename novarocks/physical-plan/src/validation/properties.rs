@@ -598,7 +598,7 @@ pub(crate) fn validate_distribution(
         for value in keys.iter() {
             require_value(fragment, *value, &path, errors);
             if let (Some(algorithm), Some(value)) = (algorithm, fragment.values().get(value))
-                && !algorithm.supports_partition_key(value.ty.data_type())
+                && !algorithm.supports_partition_value_type(&value.ty)
             {
                 errors.push(ValidationError::new(
                     &path,

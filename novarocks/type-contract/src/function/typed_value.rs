@@ -85,6 +85,10 @@ pub(crate) fn compatible_write_projection<E>(
             observe()?;
             a == b
         }
+        (ValueKind::Temporal(a), ValueKind::Temporal(b)) => {
+            observe()?;
+            a == b
+        }
         (ValueKind::List(a), ValueKind::List(b)) => {
             compatible_write_projection(a, b, children, allow_fixed_bytes, observe)?
         }

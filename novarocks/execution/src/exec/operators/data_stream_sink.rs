@@ -1220,33 +1220,67 @@ mod data_stream_sink_hash_partition {
         partitions: usize,
         crc: bool,
     ) -> ExecutionResult<Vec<Chunk>> {
-        partition_chunk_by_hash_arrays_with(chunk, keys, partitions, crc, |source, rows| {
-            take_partition_rows_with(source, rows, |source, columns, _| {
-                Chunk::try_new_with_columns(source.chunk_schema_ref(), columns).map_err(Into::into)
-            })
-        })
+        partition_chunk_by_hash_arrays_with(
+            chunk,
+            keys,
+            |_| Ok(None),
+            partitions,
+            crc,
+            &|| Ok(()),
+            |source, rows| {
+                take_partition_rows_with(source, rows, |source, columns, _| {
+                    Chunk::try_new_with_columns(source.chunk_schema_ref(), columns)
+                        .map_err(Into::into)
+                })
+            },
+        )
     }
-    pub(crate) fn partition_chunk_by_hash_arrays_created(
+    pub(crate) fn partition_chunk_by_hash_arrays_created<'a>(
         chunk: &Chunk,
         keys: &[ArrayRef],
+        key_type: impl Fn(usize) -> ExecutionResult<&'a novarocks_type_contract::ValueTypeRef>,
         partitions: usize,
         crc: bool,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Vec<Chunk>> {
         checkpoint()?;
-        let output =
-            partition_chunk_by_hash_arrays_with(chunk, keys, partitions, crc, |source, rows| {
-                take_partition_rows_created(source, rows, factory, checkpoint)
-            })?;
+        let output = partition_chunk_by_hash_arrays_with(
+            chunk,
+            keys,
+            |column| key_type(column).map(Some),
+            partitions,
+            crc,
+            checkpoint,
+            |source, rows| take_partition_rows_created(source, rows, factory, checkpoint),
+        )?;
         checkpoint()?;
         Ok(output)
     }
-    fn partition_chunk_by_hash_arrays_with(
+    fn temporal_values<'a>(
+        array: &'a ArrayRef,
+        ty: Option<&novarocks_type_contract::ValueTypeRef>,
+    ) -> ExecutionResult<Option<novarocks_value_arrays::decode::PreparedTemporalArray<'a>>> {
+        let Some(ty) = ty else { return Ok(None) };
+        ty.temporal()
+            .map(|declaration| {
+                novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+                    declaration,
+                    array.as_ref(),
+                    ty.nullable(),
+                )
+                .map_err(ExecutionFailure::from_domain)
+            })
+            .transpose()
+    }
+
+    fn partition_chunk_by_hash_arrays_with<'a>(
         chunk: &Chunk,
         partition_arrays: &[ArrayRef],
+        key_type: impl Fn(usize) -> ExecutionResult<Option<&'a novarocks_type_contract::ValueTypeRef>>,
         num_partitions: usize,
         use_crc32: bool,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
         mut take_rows: impl FnMut(&Chunk, &[u32]) -> ExecutionResult<Chunk>,
     ) -> ExecutionResult<Vec<Chunk>> {
         if chunk.is_empty() {
@@ -1275,12 +1309,35 @@ mod data_stream_sink_hash_partition {
             .collect::<Result<Vec<_>, _>>()?;
 
         let num_rows = chunk.len();
-
         // Compute hash values for each row
         let hash_values = if use_crc32 {
             // CRC32 hash for BUCKET_SHUFFLE_HASH_PARTITIONED
             let mut crc32_hashes = vec![0u32; num_rows];
-            for array in &partition_arrays {
+            for (column, array) in partition_arrays.iter().enumerate() {
+                let declaration = key_type(column)?;
+                if let Some(values) = temporal_values(array, declaration)? {
+                    for (row, total) in crc32_hashes.iter_mut().enumerate() {
+                        if row.is_multiple_of(256) {
+                            checkpoint()?;
+                        }
+                        if let Some(key) = values
+                            .relation_key(row)
+                            .map_err(ExecutionFailure::from_domain)?
+                        {
+                            *total = total.wrapping_add(crc32_hash_value(&key.order_bytes()));
+                        }
+                    }
+                    continue;
+                }
+                if let Some(ty) = declaration.filter(|ty| ty.contains_temporal()) {
+                    for (row, total) in crc32_hashes.iter_mut().enumerate() {
+                        let part = crate::exec::hash_table::key_builder::canonical_temporal_group_key_hash_observed(
+                            array, row, ty, true, checkpoint,
+                        )?;
+                        *total = total.wrapping_add(part.unwrap_or(0) as u32);
+                    }
+                    continue;
+                }
                 let arr_hashes = compute_crc32_hash_array(array)?;
                 for i in 0..num_rows {
                     crc32_hashes[i] = crc32_hashes[i].wrapping_add(arr_hashes[i]);
@@ -1290,7 +1347,33 @@ mod data_stream_sink_hash_partition {
         } else {
             // FNV hash for HASH_PARTITIONED
             let mut fnv_hashes = vec![FNV_SEED; num_rows];
-            for array in &partition_arrays {
+            for (column, array) in partition_arrays.iter().enumerate() {
+                let declaration = key_type(column)?;
+                if let Some(values) = temporal_values(array, declaration)? {
+                    for (row, total) in fnv_hashes.iter_mut().enumerate() {
+                        if row.is_multiple_of(256) {
+                            checkpoint()?;
+                        }
+                        let key = values
+                            .relation_key(row)
+                            .map_err(ExecutionFailure::from_domain)?;
+                        let part = key.map_or(FNV_SEED.wrapping_mul(FNV_PRIME), |key| {
+                            fnv_hash_value(&key.order_bytes())
+                        });
+                        *total = (*total ^ part).wrapping_mul(FNV_PRIME);
+                    }
+                    continue;
+                }
+                if let Some(ty) = declaration.filter(|ty| ty.contains_temporal()) {
+                    for (row, total) in fnv_hashes.iter_mut().enumerate() {
+                        let part = crate::exec::hash_table::key_builder::canonical_temporal_group_key_hash_observed(
+                            array, row, ty, false, checkpoint,
+                        )?;
+                        *total = (*total ^ part.unwrap_or(FNV_SEED.wrapping_mul(FNV_PRIME)))
+                            .wrapping_mul(FNV_PRIME);
+                    }
+                    continue;
+                }
                 let arr_hashes = compute_fnv_hash_array(array)?;
                 for i in 0..num_rows {
                     fnv_hashes[i] ^= arr_hashes[i];
@@ -2626,6 +2709,14 @@ impl DataStreamSinkOperator {
                 let partition_chunks = partition_chunk_by_hash_arrays_created(
                     chunk,
                     &keys.arrays,
+                    |column| {
+                        keys.types
+                            .get(column)
+                            .map(|ty| ty.value_type())
+                            .ok_or_else(|| {
+                                stream_contract("missing compiled partition key declaration")
+                            })
+                    },
                     n,
                     use_crc32,
                     factory,
@@ -3788,6 +3879,11 @@ mod created_partition_regressions {
             let actual = partition_chunk_by_hash_arrays_created(
                 &source,
                 &keys,
+                |column| {
+                    Ok(source.chunk_schema().slots()[column]
+                        .field_schema()
+                        .value_type())
+                },
                 3,
                 crc,
                 factory.as_ref(),

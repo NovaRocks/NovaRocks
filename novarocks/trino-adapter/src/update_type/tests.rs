@@ -70,6 +70,7 @@ fn task_names_match_trino_and_novarocks_extensions() {
         (Update, "UPDATE"),
         (Merge, "MERGE"),
         (SetSession, "SET SESSION"),
+        (SetTimeZone, "SET TIME ZONE"),
         (ResetSession, "RESET SESSION"),
         (Use, "USE"),
         (BeginTransaction, "START TRANSACTION"),

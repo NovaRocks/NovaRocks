@@ -170,6 +170,7 @@ pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) root_allow_throw_exception: bool,
     pub(super) constant_policy: novarocks_constant_contract::ConstantPolicy,
     pub(super) root_allow_throw_exception_used: &'emission mut bool,
+    pub(super) parameters: &'emission mut BTreeMap<SemanticParameterId, SemanticParameterValue>,
     pub(super) functions: &'emission Arc<dyn crate::compiler::SqlFunctionCatalog>,
     pub(super) control: &'control dyn PureCompileControl,
     pub(super) work: &'emission mut CompileCheckpoints<'control>,
@@ -746,12 +747,30 @@ impl ScalarEmission<'_, '_> {
                 self.work.flush()?;
                 ty = result_type.clone();
                 self.work.step()?;
+                let mut semantic_parameters = Vec::new();
+                for (reference, value) in binding.statement_time_parameters() {
+                    self.work.step()?;
+                    match self.parameters.entry(reference.id) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(value);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if *entry.get() == value => {}
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            return Err(ContractLoweringError::InvalidFunctionBinding {
+                                detail: "One statement body cannot freeze conflicting time facts"
+                                    .into(),
+                            });
+                        }
+                    }
+                    semantic_parameters.push(reference);
+                }
                 captured_call = Some((captured, channels, canonical));
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
                         legacy_metadata: Some(
                             novarocks_expression_contract::LegacyBindingMetadata {
-                                semantic_parameters: Box::default(),
+                                semantic_parameters: semantic_parameters.into_boxed_slice(),
                                 volatility: binding.semantics.volatility,
                                 argument_evaluation: binding.semantics.argument_evaluation,
                                 failure_behavior: binding.semantics.failure_behavior,

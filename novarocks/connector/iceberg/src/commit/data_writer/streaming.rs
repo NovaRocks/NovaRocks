@@ -20,8 +20,7 @@
 //! One driver's real partition writers, retained across input pages and close waits.
 use super::{
     IcebergDataFileWriterBuilder, StagedDataFile, StagedPathJournal, StagedWriteContext,
-    StagedWriteProgress, adapt_batch, retag_data_file_partition_spec_id,
-    row_group_write_batch_rows,
+    StagedWriteProgress, retag_data_file_partition_spec_id, row_group_write_batch_rows,
 };
 use crate::iceberg::{
     arrow::RecordBatchPartitionSplitter,
@@ -183,7 +182,9 @@ impl StreamingStagedDataFileWriter {
             return Ok(());
         }
         let before = self.journal.total_accepted_bytes();
-        let annotated = adapt_batch(&batch, &self.context.annotated_schema)
+        let annotated = self
+            .context
+            .adapt(&batch)
             .map_err(super::WriteAdaptationError::into_connector_error)?;
         if let Some(splitter) = &self.splitter {
             let partitioned = splitter

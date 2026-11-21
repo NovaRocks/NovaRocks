@@ -63,11 +63,13 @@ fn source() -> SemanticParameters {
     SemanticParameters::try_new([
         (
             SemanticParameterId::new(0),
-            SemanticParameterValue::StatementStartUtc(-17),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(-17, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(1),
-            SemanticParameterValue::TimeZone("Fixed/Long/Zone+05:30".repeat(8).into_boxed_str()),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("Asia/Kolkata").unwrap()),
         ),
         (
             SemanticParameterId::new(2),
@@ -121,7 +123,6 @@ fn run(
 #[test]
 fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_source_drop() {
     let c = Control::default();
-    let mut original_zone_address = 0;
     let output = {
         let input = source();
         let before = input.clone();
@@ -155,9 +156,6 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
                     } => {
                         assert!(std::ptr::eq(value, input.require(reference).unwrap()));
                         captured.push((reference.id.get(), is_new, output_definition_count));
-                        if let SemanticParameterValue::TimeZone(zone) = value {
-                            original_zone_address = zone.as_ptr() as usize;
-                        }
                     }
                 }
                 Ok::<(), SemanticParameterProjectionError>(())
@@ -186,7 +184,9 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
     };
     assert_eq!(
         output.get(SemanticParameterId::new(0)),
-        Some(&SemanticParameterValue::StatementStartUtc(-17))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            crate::StatementStartUtc::try_new(-17, 0).unwrap()
+        ))
     );
     assert_eq!(
         output.get(SemanticParameterId::new(2)),
@@ -204,8 +204,7 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
     else {
         panic!("expected actual timezone");
     };
-    assert_eq!(zone.as_ref(), "Fixed/Long/Zone+05:30".repeat(8));
-    assert_ne!(zone.as_ptr() as usize, original_zone_address);
+    assert_eq!(*zone, crate::TimeZoneKey::parse("Asia/Kolkata").unwrap());
     let trace = c.trace();
     assert_eq!(trace[0], (CompilePhase::LowerProgram, 0));
     assert!(

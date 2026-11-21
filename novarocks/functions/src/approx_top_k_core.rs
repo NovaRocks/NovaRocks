@@ -144,6 +144,9 @@ fn encode_optional_scalar(
                 buf.push(6);
                 buf.extend_from_slice(&v.to_le_bytes());
             }
+            AggScalarValue::Temporal(..) => {
+                return Err(crate::aggregate_scalar::temporal_scalar_contract());
+            }
             AggScalarValue::Decimal128(v) => {
                 buf.push(7);
                 buf.extend_from_slice(&v.to_le_bytes());

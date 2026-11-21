@@ -20,39 +20,11 @@ use crate::session_error::QueryServiceError;
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_types::naming::{DEFAULT_CATALOG, normalize_identifier};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SessionTimeZone {
-    Region(Box<str>),
-    FixedOffsetMinutes(i16),
-}
-impl SessionTimeZone {
-    pub fn parse(zone: &str) -> Result<Self, StatementSessionError> {
-        let unsupported = || StatementSessionError::TimeZoneNotSupported { zone: zone.into() };
-        if zone.starts_with(['+', '-']) {
-            let bytes = zone.as_bytes();
-            if bytes.len() != 6
-                || bytes[3] != b':'
-                || ![bytes[1], bytes[2], bytes[4], bytes[5]]
-                    .iter()
-                    .all(u8::is_ascii_digit)
-            {
-                return Err(unsupported());
-            }
-            let hours = i16::from(bytes[1] - b'0') * 10 + i16::from(bytes[2] - b'0');
-            let minutes = i16::from(bytes[4] - b'0') * 10 + i16::from(bytes[5] - b'0');
-            if hours > 18 || minutes >= 60 || (hours == 18 && minutes != 0) {
-                return Err(unsupported());
-            }
-            let offset = hours * 60 + minutes;
-            return Ok(Self::FixedOffsetMinutes(if bytes[0] == b'-' {
-                -offset
-            } else {
-                offset
-            }));
-        }
-        zone.parse::<chrono_tz::Tz>().map_err(|_| unsupported())?;
-        Ok(Self::Region(zone.into()))
-    }
+pub type SessionTimeZone = novarocks_type_contract::TimeZoneKey;
+
+fn parse_session_header_zone(zone: &str) -> Result<SessionTimeZone, StatementSessionError> {
+    SessionTimeZone::parse(zone)
+        .ok_or_else(|| StatementSessionError::TimeZoneNotSupported { zone: zone.into() })
 }
 
 #[derive(Clone, Debug)]
@@ -84,7 +56,7 @@ impl SessionValue {
             .transpose()?
             .filter(|name| name != DEFAULT_CATALOG);
         let schema = schema.map(normalize).transpose()?;
-        let time_zone = time_zone.map(SessionTimeZone::parse).transpose()?;
+        let time_zone = time_zone.map(parse_session_header_zone).transpose()?;
         Ok(Self {
             catalog,
             schema,
@@ -141,26 +113,85 @@ mod tests {
     }
     use super::*;
     #[test]
-    fn time_zone_inputs_are_validated_without_assigning_semantics() {
+    fn time_zone_headers_use_the_frozen_zone_index() {
         assert_eq!(
-            SessionTimeZone::parse("+18:00").unwrap(),
-            SessionTimeZone::FixedOffsetMinutes(1080)
+            parse_session_header_zone("+14:00")
+                .unwrap()
+                .fixed_offset_minutes(),
+            Some(840)
         );
         assert_eq!(
-            SessionTimeZone::parse("-05:30").unwrap(),
-            SessionTimeZone::FixedOffsetMinutes(-330)
+            parse_session_header_zone("-05:30")
+                .unwrap()
+                .fixed_offset_minutes(),
+            Some(-330)
         );
         assert_eq!(
-            SessionTimeZone::parse("Asia/Shanghai").unwrap(),
-            SessionTimeZone::Region("Asia/Shanghai".into())
+            parse_session_header_zone("Asia/Shanghai").unwrap().name(),
+            "Asia/Shanghai"
         );
-        for zone in ["+18:01", "+19:00", "+01:60", "+8:00", "invalid-zone"] {
+        for zone in ["+14:01", "+18:00", "+01:60", "invalid-zone"] {
             assert!(matches!(
-                SessionTimeZone::parse(zone),
+                parse_session_header_zone(zone),
                 Err(StatementSessionError::TimeZoneNotSupported { .. })
             ));
         }
     }
+    #[test]
+    fn effective_zone_prefers_the_typed_override_then_the_header_then_the_config() {
+        use crate::session_effects::SessionEffects;
+        use crate::sql::session::{SessionSqlState, registry::SessionPropertyRegistry};
+        use novarocks_type_contract::{StatementStartUtc, StatementTimeEnvironment};
+
+        let registry = SessionPropertyRegistry::new().unwrap();
+        let admitted = StatementTimeEnvironment {
+            start: StatementStartUtc::try_new(-1, 987_654_321).unwrap(),
+            zone: SessionTimeZone::parse("America/New_York").unwrap(),
+        };
+        assert_eq!(
+            SessionSqlState::default().statement_time(admitted),
+            admitted
+        );
+
+        let header = SessionTimeZone::parse("Europe/Warsaw").unwrap();
+        let value = SessionValue::try_new(
+            None,
+            None,
+            vec![("time_zone_id".into(), "Asia/Shanghai".into())],
+            Some(header.name()),
+            ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                parametric_interval: false,
+                variant: true,
+                variant_binary: true,
+            }),
+        )
+        .unwrap();
+        let mut state =
+            SessionSqlState::from_session_value(value, &registry, &NoCatalogAccess).unwrap();
+        let projected = state.statement_time(admitted);
+        assert_eq!(projected.start, admitted.start);
+        assert_eq!(projected.zone.name(), "Asia/Shanghai");
+        assert_eq!(state.time_zone(), Some(&header));
+
+        let query =
+            novarocks_parser::parser::parse_query("WITH SESSION time_zone_id = 'UTC' SELECT 1")
+                .unwrap();
+        let property = registry
+            .resolve_sql_property(&query.session_properties[0].name, &NoCatalogAccess)
+            .unwrap();
+        let clear = SessionEffects::reset_property(property);
+        assert_eq!(
+            clear.reset_properties().collect::<Vec<_>>(),
+            ["time_zone_id"]
+        );
+        state.apply_effects(&clear).unwrap();
+        let projected = state.statement_time(admitted);
+        assert_eq!(projected.start, admitted.start);
+        assert_eq!(projected.zone, header);
+        assert_eq!(state.render_session_property("time_zone_id"), None);
+    }
+
     #[test]
     fn names_are_normalized_without_requiring_remote_existence() {
         let value = SessionValue::try_new(
@@ -170,6 +201,7 @@ mod tests {
             None,
             ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true,
             }),
@@ -185,6 +217,7 @@ mod tests {
                 None,
                 ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true
                 })
@@ -202,6 +235,7 @@ mod tests {
 
         let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
             parametric_datetime: true,
+            parametric_interval: false,
             variant: true,
             variant_binary: false,
         });
@@ -227,7 +261,7 @@ mod tests {
         assert_eq!(state.presentation(), Some(&family));
         assert_eq!(
             state.time_zone(),
-            Some(&SessionTimeZone::Region("Europe/Warsaw".into()))
+            SessionTimeZone::parse("Europe/Warsaw").as_ref()
         );
         assert_eq!(state.execution_settings().query_timeout_secs(), Some(41));
         assert_eq!(
@@ -253,6 +287,7 @@ mod tests {
                 None,
                 ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 }),
@@ -262,7 +297,7 @@ mod tests {
                 matches!(error, StatementSessionError::Service(error) if error.kind() == QueryServiceErrorKind::InvalidValue)
             );
         }
-        for zone in ["+18:59", "-18:01", "+00:99", "UTC+08:00", ""] {
+        for zone in ["+18:59", "-18:01", "+00:99", "+02:00:01", ""] {
             let error = SessionValue::try_new(
                 None,
                 None,
@@ -270,6 +305,7 @@ mod tests {
                 Some(zone),
                 ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 }),
@@ -293,6 +329,7 @@ mod tests {
             None,
             ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true,
             }),
@@ -311,16 +348,19 @@ mod tests {
             Some(&ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true
                 }
             ))
         );
         assert_eq!(state.time_zone(), None);
-        for (zone, minutes) in [("+00:00", 0), ("-00:00", 0), ("-18:00", -1080)] {
+        for (zone, minutes) in [("+00:00", 0), ("-00:00", 0), ("-14:00", -840)] {
             assert_eq!(
-                SessionTimeZone::parse(zone).unwrap(),
-                SessionTimeZone::FixedOffsetMinutes(minutes)
+                parse_session_header_zone(zone)
+                    .unwrap()
+                    .fixed_offset_minutes(),
+                Some(minutes)
             );
         }
     }

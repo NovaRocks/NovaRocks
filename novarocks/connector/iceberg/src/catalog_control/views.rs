@@ -1513,6 +1513,22 @@ mod declaration_tests {
 
     #[test]
     fn standard_view_types_do_not_require_an_engine_or_private_type_summary() {
+        use novarocks_type_contract::{
+            TemporalPrecision, TemporalType, ValueKind, ValueLayout, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+        let temporal = |ty: TemporalType| {
+            FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(
+                    ValueKind::Temporal(ty),
+                    false,
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+                ValueLayout::try_new(&ty.carrier(), ValueTypeStorageLifetime::pure()).unwrap(),
+            )
+            .unwrap()
+        };
         for value in [
             FunctionValueType::new(DataType::Boolean, false),
             FunctionValueType::new(DataType::Int32, false),
@@ -1531,17 +1547,15 @@ mod declaration_tests {
                 true,
             ),
             FunctionValueType::new(DataType::Date32, false),
-            FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
-            FunctionValueType::new(DataType::Timestamp(TimeUnit::Microsecond, None), false),
-            FunctionValueType::new(DataType::Timestamp(TimeUnit::Nanosecond, None), false),
-            FunctionValueType::new(
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-            FunctionValueType::new(
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                false,
-            ),
+            temporal(TemporalType::Time(TemporalPrecision::MICROSECONDS)),
+            temporal(TemporalType::Timestamp(TemporalPrecision::MICROSECONDS)),
+            temporal(TemporalType::Timestamp(TemporalPrecision::NANOSECONDS)),
+            temporal(TemporalType::TimestampWithTimeZone(
+                TemporalPrecision::MICROSECONDS,
+            )),
+            temporal(TemporalType::TimestampWithTimeZone(
+                TemporalPrecision::NANOSECONDS,
+            )),
             FunctionValueType::try_with_logical_type(
                 DataType::FixedSizeBinary(16),
                 false,

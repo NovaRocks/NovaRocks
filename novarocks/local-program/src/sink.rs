@@ -617,7 +617,7 @@ fn validate_branch_core<E: From<StaticSinkError>>(
         ) && crate::unit_refs::root_type(units, *id).is_some_and(|node| {
             matches!(branch.contract.routing, StaticStreamRouting::Ordinary)
                 || novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
-                    .supports_partition_key(node.data_type())
+                    .supports_partition_value_type(node)
         });
         observe()?;
         if !valid {

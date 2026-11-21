@@ -93,8 +93,22 @@ pub(super) fn validate_program_columns(
                         .get(ordinal)
                         .ok_or_else(|| invalid("missing system source occurrence"))?;
                     let field = &public.schema().fields()[ordinal];
+                    if !equal_text(field.name(), shape.name(), work)?
+                        || field.is_nullable() != shape.is_nullable()
+                    {
+                        return Err(invalid("system source occurrence name/NULL differs"));
+                    }
+                    let declaration = check_system_column(
+                        reference.system_table_type(),
+                        column,
+                        shape,
+                        public.logical_types()[ordinal],
+                        work,
+                    )?;
                     crate::typed_read::system_page_source::validate_system_column_value(
                         reference.system_table_type(),
+                        &declaration,
+                        shape,
                         field,
                         binding,
                         work,
@@ -103,19 +117,9 @@ pub(super) fn validate_program_columns(
                         PureProviderCompileError::Control(cause) => Failure::Control(cause),
                         PureProviderCompileError::Provider(cause) => source_error(cause),
                     })?;
-                    if !equal_text(field.name(), shape.name(), work)?
-                        || field.is_nullable() != shape.is_nullable()
-                    {
-                        return Err(invalid("system source occurrence name/NULL differs"));
+                    if !crate::temporal::contains_temporal(&declaration.field_type) {
+                        typed_compare::shape(field.data_type(), shape.data_type(), work)?;
                     }
-                    typed_compare::shape(field.data_type(), shape.data_type(), work)?;
-                    check_system_column(
-                        reference.system_table_type(),
-                        column,
-                        &public.schema().fields()[ordinal],
-                        public.logical_types()[ordinal],
-                        work,
-                    )?;
                     work.step()?;
                 }
                 for fact in public
@@ -317,7 +321,7 @@ fn check_system_column(
     field: &Field,
     logical: ValueLogicalType,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), Failure> {
+) -> Result<NestedField, Failure> {
     let mirrored = crate::typed_read::system_page_source::system_column_field_for_compile(
         kind, column, field, logical, work,
     )
@@ -326,7 +330,8 @@ fn check_system_column(
         PureProviderCompileError::Provider(error) => source_error(error),
     })?;
     let expected = opaque_source(work, || IcebergColumnHandle::base_column(&mirrored))?;
-    compare_handle(column, &expected, work)
+    compare_handle(column, &expected, work)?;
+    Ok(mirrored)
 }
 
 fn visit_table(
@@ -847,6 +852,29 @@ mod tests {
             .iter()
             .zip(logical)
             .map(|(field, domain)| {
+                if system {
+                    use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
+                    let mut request = |_| Ok(());
+                    let mut work = |_| Ok(());
+                    let mut creation =
+                        ConnectorReadSchemaCreation::new(storage.clone(), &mut request, &mut work);
+                    if let Some(declaration) = crate::typed_read::metadata_temporal_declaration(
+                        field.data_type(),
+                        &mut creation,
+                    )
+                    .unwrap()
+                    {
+                        return crate::schema_mapping::typed_value::from_declaration(
+                            &declaration,
+                            field.is_nullable(),
+                            None,
+                            None,
+                            &mut creation,
+                        )
+                        .unwrap()
+                        .binding;
+                    }
+                }
                 FunctionValueType::try_with_logical_type(
                     field.data_type().clone(),
                     field.is_nullable(),

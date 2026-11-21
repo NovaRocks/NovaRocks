@@ -50,10 +50,12 @@ pub enum BackendRuntimeFilterArtifactQuery {
         artifact: Arc<PhysicalArtifact>,
         data_type: DataType,
         null_semantics: RuntimeFilterNullSemantics,
+        temporal: Option<novarocks_type_contract::TemporalType>,
     },
     Ordered {
         artifact: Arc<PhysicalArtifact>,
         data_type: DataType,
+        temporal: Option<novarocks_type_contract::TemporalType>,
     },
 }
 
@@ -77,6 +79,23 @@ impl BackendRuntimeFilterArtifactQuery {
         data_type: DataType,
         null_semantics: RuntimeFilterNullSemantics,
     ) -> Result<Self, RuntimeFilterArtifactQueryError> {
+        let schema = RuntimeFilterMembershipSchema::new(&data_type, null_semantics)
+            .map_err(|_| RuntimeFilterArtifactQueryError::ContractViolation)?;
+        Self::membership_typed(bundle, &schema)
+    }
+
+    pub fn membership_typed(
+        bundle: &ArtifactBundle,
+        schema: &RuntimeFilterMembershipSchema,
+    ) -> Result<Self, RuntimeFilterArtifactQueryError> {
+        let data_type = schema.data_type();
+        let null_semantics = schema.null_semantics();
+        let temporal = schema
+            .value_type()
+            .and_then(|value_type| value_type.value_type().temporal());
+        if matches!(data_type, DataType::FixedSizeBinary(10 | 12 | 14)) && temporal.is_none() {
+            return Err(RuntimeFilterArtifactQueryError::ContractViolation);
+        }
         let profile = ConsumerArtifactProfile::new(
             BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
             None,
@@ -88,8 +107,6 @@ impl BackendRuntimeFilterArtifactQuery {
         let [(kind, artifact)] = bundle.artifacts() else {
             return Err(RuntimeFilterArtifactQueryError::ContractViolation);
         };
-        let schema = RuntimeFilterMembershipSchema::new(&data_type, null_semantics)
-            .map_err(|_| RuntimeFilterArtifactQueryError::ContractViolation)?;
         let Some(index) = artifact.membership_index() else {
             return Err(RuntimeFilterArtifactQueryError::ContractViolation);
         };
@@ -106,8 +123,9 @@ impl BackendRuntimeFilterArtifactQuery {
         }
         Ok(Self::Membership {
             artifact: Arc::clone(artifact),
-            data_type,
+            data_type: data_type.clone(),
             null_semantics,
+            temporal,
         })
     }
 
@@ -141,6 +159,7 @@ impl BackendRuntimeFilterArtifactQuery {
         Ok(Self::Ordered {
             artifact: Arc::clone(artifact),
             data_type: contract.keys()[0].data_type().clone(),
+            temporal: contract.keys()[0].temporal_type(),
         })
     }
 
@@ -231,6 +250,24 @@ impl BackendRuntimeFilterArtifactQuery {
 }
 
 impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
+    fn temporal_type(&self) -> Option<novarocks_type_contract::TemporalType> {
+        match self {
+            Self::Membership { temporal, .. } | Self::Ordered { temporal, .. } => *temporal,
+        }
+    }
+
+    fn temporal_relation_key_type(&self) -> Option<novarocks_type_contract::TemporalType> {
+        match self {
+            Self::Ordered { temporal, .. } => *temporal,
+            Self::Membership {
+                data_type,
+                temporal,
+                ..
+            } if matches!(data_type, DataType::FixedSizeBinary(10 | 12 | 14)) => *temporal,
+            Self::Membership { .. } => None,
+        }
+    }
+
     fn data_type(&self) -> &DataType {
         match self {
             Self::Membership { data_type, .. } | Self::Ordered { data_type, .. } => data_type,
@@ -240,9 +277,11 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
     fn controlled_scalar_query(&self) -> Option<&dyn RuntimeFilterControlledScalarQuery> {
         match self {
             Self::Membership { .. } => Some(self),
-            Self::Ordered { data_type, .. } if is_aggregate_topn_key_carrier(data_type) => {
-                Some(self)
-            }
+            Self::Ordered {
+                data_type,
+                temporal,
+                ..
+            } if temporal.is_some() || is_aggregate_topn_key_carrier(data_type) => Some(self),
             _ => None,
         }
     }
@@ -283,9 +322,13 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
                 Self::membership_matches_scalar(artifact, data_type, value, ScalarQueryMode::Legacy)
                     .map_err(legacy_query_error)
             }
-            Self::Ordered { data_type, .. } => {
+            Self::Ordered {
+                data_type,
+                temporal,
+                ..
+            } => {
                 self.ordered_range()?;
-                let scalar = ordered_scalar_ref(value, data_type)?;
+                let scalar = ordered_scalar_ref(value, data_type, *temporal)?;
                 self.ordered_matches_scalar(Some(scalar), ScalarQueryMode::Legacy)
                     .map_err(legacy_query_error)
             }
@@ -311,6 +354,9 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
                 connector_membership_probe(inclusive_max, data_type)?,
             )
             .map_err(map_query_error),
+            Self::Ordered {
+                temporal: Some(_), ..
+            } => Err(RuntimeFilterArtifactQueryError::Unsupported),
             Self::Ordered { data_type, .. } => {
                 let range = self.ordered_range()?;
                 let min = OrderedTuple::try_new(
@@ -341,7 +387,11 @@ impl RuntimeFilterControlledScalarQuery for BackendRuntimeFilterArtifactQuery {
                 null_semantics,
                 ..
             } => Ok(membership_matches_null(artifact, *null_semantics)),
-            Self::Ordered { data_type, .. } if is_aggregate_topn_key_carrier(data_type) => {
+            Self::Ordered {
+                data_type,
+                temporal,
+                ..
+            } if temporal.is_some() || is_aggregate_topn_key_carrier(data_type) => {
                 self.ordered_matches_scalar(None, ScalarQueryMode::Controlled(control))
             }
             _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
@@ -365,9 +415,13 @@ impl RuntimeFilterControlledScalarQuery for BackendRuntimeFilterArtifactQuery {
                 value,
                 ScalarQueryMode::Controlled(control),
             ),
-            Self::Ordered { data_type, .. } if is_aggregate_topn_key_carrier(data_type) => {
+            Self::Ordered {
+                data_type,
+                temporal,
+                ..
+            } if temporal.is_some() || is_aggregate_topn_key_carrier(data_type) => {
                 self.ordered_range()?;
-                let scalar = ordered_scalar_ref(value, data_type)?;
+                let scalar = ordered_scalar_ref(value, data_type, *temporal)?;
                 self.ordered_matches_scalar(Some(scalar), ScalarQueryMode::Controlled(control))
             }
             _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
@@ -411,6 +465,9 @@ fn membership_probe<'a>(
     expected: &DataType,
 ) -> Result<MembershipProbe<'a>, RuntimeFilterArtifactQueryError> {
     match (value, expected) {
+        (RuntimeFilterScalarRef::Temporal(value), DataType::FixedSizeBinary(10 | 12 | 14)) => {
+            Ok(MembershipProbe::Temporal(value))
+        }
         (RuntimeFilterScalarRef::Boolean(value), DataType::Boolean) => {
             Ok(MembershipProbe::Boolean(value))
         }
@@ -495,7 +552,16 @@ fn connector_membership_probe<'a>(
 fn ordered_scalar_ref<'a>(
     value: RuntimeFilterScalarRef<'a>,
     expected: &DataType,
+    temporal: Option<novarocks_type_contract::TemporalType>,
 ) -> Result<OrderedScalarRef<'a>, RuntimeFilterArtifactQueryError> {
+    if let Some(temporal) = temporal {
+        let RuntimeFilterScalarRef::Temporal(bytes) = value else {
+            return Err(RuntimeFilterArtifactQueryError::ContractViolation);
+        };
+        novarocks_type_contract::TemporalRelationKey::from_order_bytes(temporal, bytes)
+            .map_err(|_| RuntimeFilterArtifactQueryError::ContractViolation)?;
+        return Ok(OrderedScalarRef::Temporal(bytes));
+    }
     Ok(match (value, expected) {
         (RuntimeFilterScalarRef::Boolean(value), DataType::Boolean) => {
             OrderedScalarRef::Boolean(value)
@@ -619,7 +685,162 @@ mod tests {
         BackendRuntimeFilterArtifactQuery::Ordered {
             artifact,
             data_type,
+            temporal: None,
         }
+    }
+
+    #[test]
+    fn temporal_ordered_artifact_probes_exact_instants_under_control() {
+        use arrow::array::{ArrayRef, FixedSizeBinaryBuilder};
+        use novarocks_execution::runtime_filter::{
+            KernelFailure, RuntimeFilterBindingId, RuntimeFilterRowEvaluation,
+            evaluator::evaluate_rows,
+        };
+        use novarocks_local_program::{
+            FilterMembershipSchemaError, FilterNullOrder, FilterSortDirection,
+            single_key_ordered_filter_digests_observed, visit_ordered_filter_key_type,
+        };
+        use novarocks_type_contract::{
+            FunctionValueType, TemporalCarrier, TemporalMicros, TemporalPrecision, TemporalType,
+            TemporalValue, TimeZoneKey, ValueKind, ValueLayout, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+
+        let ty = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+        let binding = |ty: TemporalType| {
+            let storage = ValueTypeStorageLifetime::pure();
+            FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(ValueKind::Temporal(ty), true, storage.clone()).unwrap(),
+                ValueLayout::try_new(&ty.carrier(), storage).unwrap(),
+            )
+            .unwrap()
+        };
+        let digests = |ty: TemporalType| {
+            single_key_ordered_filter_digests_observed::<FilterMembershipSchemaError>(
+                FilterSortDirection::Ascending,
+                FilterNullOrder::Last,
+                |emit| visit_ordered_filter_key_type(&ty.carrier(), Some(ty), emit),
+                || Ok(()),
+            )
+            .unwrap()
+        };
+        let (comparator, digest) = digests(ty);
+        let wrong = TemporalType::TimestampWithTimeZone(TemporalPrecision::NANOSECONDS);
+        assert_eq!(wrong.carrier(), ty.carrier());
+        assert_ne!(digests(wrong), (comparator, digest));
+        let key = |ty| {
+            RuntimeOrderKey::with_value_type(
+                binding(ty),
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderNullOrder::Last,
+            )
+        };
+        let contract =
+            RuntimeOrderContract::from_fragment_contract([key(ty)], comparator, digest).unwrap();
+        assert!(
+            RuntimeOrderContract::from_fragment_contract([key(wrong)], comparator, digest).is_err()
+        );
+
+        let value = |fraction, zone| TemporalValue::TimestampWithTimeZone {
+            instant: TemporalMicros::new(-1, fraction).unwrap(),
+            zone,
+        };
+        let utc = TimeZoneKey::UTC;
+        let same = TimeZoneKey::parse("Asia/Shanghai").unwrap();
+        let boundary = value(1, utc).relation_key(ty).unwrap().order_bytes();
+        let bound = OrderedTuple::new([Some(OrderedScalar::Temporal(boundary))]);
+        let encoded = encode_range_leaf(&contract, &bound, LogicalVersion::FIRST).unwrap();
+        let (artifact, _) =
+            decode_range_leaf(&encoded, &contract, LogicalVersion::FIRST, encoded.len()).unwrap();
+        let foreign = RuntimeOrderContract::from_frozen([key(wrong)], comparator, digest);
+        assert!(matches!(
+            decode_range_leaf(&encoded, &foreign, LogicalVersion::FIRST, encoded.len()),
+            Err(ArtifactCodecError::ContractViolation)
+        ));
+        let query = BackendRuntimeFilterArtifactQuery::Ordered {
+            artifact,
+            data_type: ty.carrier(),
+            temporal: Some(ty),
+        };
+        assert_eq!(query.temporal_type(), Some(ty));
+        let controlled = query.controlled_scalar_query().unwrap();
+        assert_eq!(
+            controlled.non_null_value_may_match_controlled(
+                RuntimeFilterScalarRef::Temporal(
+                    value(1, same).relation_key(ty).unwrap().order_bytes()
+                ),
+                &NoControl,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            controlled.non_null_value_may_match_controlled(
+                RuntimeFilterScalarRef::Temporal(
+                    value(2, same).relation_key(ty).unwrap().order_bytes()
+                ),
+                &NoControl,
+            ),
+            Ok(false)
+        );
+        let mut corrupt = boundary;
+        corrupt[8..].fill(255);
+        assert_eq!(
+            controlled.non_null_value_may_match_controlled(
+                RuntimeFilterScalarRef::Temporal(corrupt),
+                &NoControl
+            ),
+            Err(RuntimeFilterControlledQueryError::Artifact(
+                RuntimeFilterArtifactQueryError::ContractViolation
+            ))
+        );
+
+        struct Cancelled;
+        impl KernelEvaluationControl for Cancelled {
+            fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+                Err(KernelFailure::Cancelled)
+            }
+            fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+                panic!("ordered artifact query never waits")
+            }
+        }
+        assert_eq!(
+            controlled.non_null_value_may_match_controlled(
+                RuntimeFilterScalarRef::Temporal(boundary),
+                &Cancelled,
+            ),
+            Err(RuntimeFilterControlledQueryError::Kernel(
+                KernelFailure::Cancelled
+            ))
+        );
+
+        let DataType::FixedSizeBinary(width) = ty.carrier() else {
+            panic!("zoned timestamp carrier")
+        };
+        let mut rows = FixedSizeBinaryBuilder::with_capacity(4, width);
+        for (fraction, zone) in [(1, same), (2, utc), (0, same)] {
+            let TemporalCarrier::ZonedTimestamp(bytes) =
+                value(fraction, zone).to_carrier(ty).unwrap()
+            else {
+                panic!("zoned timestamp value")
+            };
+            rows.append_value(bytes).unwrap();
+        }
+        rows.append_null();
+        let rows: ArrayRef = Arc::new(rows.finish());
+        let outcome = evaluate_rows(
+            RuntimeFilterBindingId::new(1),
+            LogicalVersion::FIRST,
+            &query,
+            &rows,
+        )
+        .unwrap();
+        let RuntimeFilterRowEvaluation::Evaluated { mask, .. } = outcome.evaluation() else {
+            panic!("typed temporal filter must evaluate");
+        };
+        assert_eq!(
+            mask.iter().collect::<Vec<_>>(),
+            [Some(true), Some(false), Some(true), Some(false)]
+        );
     }
 
     /// Frozen row-query oracle before extraction: actual range codec input,

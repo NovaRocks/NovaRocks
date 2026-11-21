@@ -50,10 +50,17 @@ pub enum DefaultLiteral {
     Bool(bool),
     Int(i64),
     Float(f64),
-    Decimal { unscaled: i128, scale: i8 },
+    Decimal {
+        unscaled: i128,
+        scale: i8,
+    },
     String(String),
     Date(i32),
     DateTime(i64),
+    Temporal {
+        data_type: novarocks_type_contract::TemporalType,
+        value: novarocks_type_contract::TemporalValue,
+    },
     Binary(Vec<u8>),
 }
 

@@ -111,7 +111,17 @@ pub(crate) fn encode_logical_domain(
             value_type,
             null_semantics,
         } => {
-            validate_native_type(value_type.data_type())?;
+            if let Some(temporal) = value_type.value_type().temporal() {
+                if value_type.data_type() != &temporal.carrier()
+                    || !novarocks_local_program::is_semantic_filter_key_type(&value_type)
+                {
+                    return Err(contract_error(
+                        "runtime filter membership key has an unsupported temporal declaration",
+                    ));
+                }
+            } else {
+                validate_native_type(value_type.data_type())?;
+            }
             let execution_null_semantics = match null_semantics {
                 RuntimeFilterNullSemantics::NeverMatches => {
                     ExecutionRuntimeFilterNullSemantics::NeverMatches
@@ -177,13 +187,25 @@ pub(crate) fn encode_logical_domain(
                     .to_be_bytes(),
             );
             for key in &keys {
-                if !ordered_key_type_supported(key.value_type.data_type()) {
-                    return Err(contract_error(
-                        "runtime filter ordered contract has unsupported key type",
-                    ));
+                let data_type = key.value_type.data_type();
+                if let Some(temporal) = key.value_type.value_type().temporal() {
+                    if data_type != &temporal.carrier() {
+                        return Err(contract_error(
+                            "runtime filter ordered key has a foreign temporal carrier",
+                        ));
+                    }
+                    canonical_keys.extend_from_slice(
+                        &novarocks_local_program::temporal_order_key_type_bytes(temporal),
+                    );
+                } else {
+                    if !ordered_key_type_supported(data_type) {
+                        return Err(contract_error(
+                            "runtime filter ordered contract has unsupported key type",
+                        ));
+                    }
+                    encode_membership_schema_type(data_type, &mut canonical_keys)?;
+                    validate_native_type(data_type)?;
                 }
-                encode_membership_schema_type(key.value_type.data_type(), &mut canonical_keys)?;
-                validate_native_type(key.value_type.data_type())?;
                 canonical_keys.push(match key.direction {
                     RuntimeFilterSortDirection::Ascending => 1,
                     RuntimeFilterSortDirection::Descending => 2,
@@ -521,6 +543,47 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn membership_encodes_the_complete_zoned_timestamp_declaration() {
+        use novarocks_type_contract::{
+            TemporalPrecision, TemporalType, ValueKind, ValueLayout, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+
+        let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+        let carrier = declaration.carrier();
+        let storage = ValueTypeStorageLifetime::pure();
+        let source = novarocks_physical_plan::ValueType::try_from_value(
+            ValueTypeRef::try_new(ValueKind::Temporal(declaration), true, storage.clone()).unwrap(),
+            ValueLayout::try_new(&carrier, storage).unwrap(),
+        )
+        .unwrap();
+        let encoded = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+            value_type: source.clone(),
+            null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+        })
+        .unwrap();
+        assert_complete_domain(&encoded, &[source]);
+        assert_eq!(
+            encoded.membership_schema_digest(),
+            Some(
+                RuntimeFilterMembershipSchema::new(
+                    &carrier,
+                    ExecutionRuntimeFilterNullSemantics::NeverMatches,
+                )
+                .unwrap()
+                .digest()
+            )
+        );
+        assert!(
+            encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+                value_type: novarocks_physical_plan::ValueType::new(carrier, true),
+                null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+            })
+            .is_err()
+        );
     }
 
     #[test]

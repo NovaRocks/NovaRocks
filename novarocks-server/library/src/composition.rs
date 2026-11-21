@@ -560,6 +560,12 @@ pub fn compose_frontend_role_config(
         novarocks_failpoint::liveness::PreparedRoleSession,
     >,
 ) -> anyhow::Result<FrontendRoleConfig> {
+    let trino_settings = config
+        .standalone_server
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    let default_time_zone = trino_settings.validated_trino_time_zone()?;
     let runtime_config = &config.runtime;
     let constant_policy = crate::compiled_composition::frontend_constant_policy(
         runtime_config
@@ -610,6 +616,7 @@ pub fn compose_frontend_role_config(
         std::sync::Arc::new(static_plan.frontend_required_constant_interpreter()),
         std::sync::Arc::new(provider_manifest.compose_session_property_registry()?),
     )
+    .with_default_statement_time_zone(default_time_zone)
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(
         Duration::from_millis(runtime_config.catalog_prune_interval_ms),
@@ -705,11 +712,6 @@ pub fn compose_frontend_role_config(
         Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
-    let trino_settings = config
-        .standalone_server
-        .as_ref()
-        .cloned()
-        .unwrap_or_default();
     let trino_listener = novarocks_trino_adapter::TrinoListenerSettings {
         port: trino_settings.trino_port,
         user: trino_settings.user,

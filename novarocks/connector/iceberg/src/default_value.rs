@@ -26,8 +26,49 @@ use crate::iceberg::spec::{
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_spi::connector::ConnectorColumnDefault;
+use novarocks_spi::connector::{ConnectorColumnDefault, ConnectorError, ConnectorErrorKind};
+use novarocks_type_contract::{TemporalType, TemporalValue};
 use novarocks_types::schema::{ColumnDefault, validate_column_default};
+
+/// A stored default uses the provider's actual target precision, just as a
+/// value assigned by an ordinary write does.
+pub(crate) fn temporal_default_literal(
+    source: TemporalType,
+    value: TemporalValue,
+    requested: TemporalType,
+    storage: &Type,
+) -> Result<IcebergLiteral, ConnectorError> {
+    use novarocks_functions::temporal_value::{ParsedTemporal, cast_precision};
+    let invalid = |detail| ConnectorError::new(ConnectorErrorKind::InvalidRequest, detail);
+    let storage = match storage {
+        Type::Primitive(primitive) => crate::temporal::declaration(primitive),
+        _ => None,
+    }
+    .filter(|storage| crate::temporal::compatible(*storage, requested))
+    .ok_or_else(|| invalid("Iceberg default differs from its temporal storage type".to_owned()))?;
+    let value = cast_precision(ParsedTemporal { ty: source, value }, storage)
+        .map_err(|error| invalid(error.to_string()))?;
+    let storage_value = crate::temporal::to_storage(storage, value.value)
+        .map_err(|error| invalid(error.to_string()))?;
+    // The pinned SDK's JSON codec panics on a negative fractional zoned
+    // instant. Remove this refusal when the Iceberg baseline includes #2892.
+    if matches!(storage, TemporalType::TimestampWithTimeZone(_)) && storage_value < 0 {
+        let units_per_second = if storage.precision().fits_microseconds() {
+            1_000_000
+        } else {
+            1_000_000_000
+        };
+        if storage_value % units_per_second != 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg column defaults cannot encode a pre-epoch fractional TIMESTAMP WITH TIME ZONE with this catalog codec",
+            ));
+        }
+    }
+    Ok(IcebergLiteral::Primitive(PrimitiveLiteral::Long(
+        storage_value,
+    )))
+}
 
 pub fn iceberg_literal_to_column_default(
     literal: &IcebergLiteral,
@@ -755,6 +796,43 @@ mod tests {
             column_default_to_iceberg_literal(&expected, &iceberg_type).unwrap(),
             literal
         );
+    }
+
+    #[test]
+    fn zoned_default_refuses_only_the_pinned_codec_panic_after_rounding() {
+        use novarocks_type_contract::{TemporalMicros, TemporalPrecision, TimeZoneKey};
+
+        let source = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+        let value = |picos| TemporalValue::TimestampWithTimeZone {
+            instant: TemporalMicros::from_picos(picos).unwrap(),
+            zone: TimeZoneKey::UTC,
+        };
+        for (primitive, precision, storage_step, second) in [
+            (
+                PrimitiveType::Timestamptz,
+                TemporalPrecision::MICROSECONDS,
+                1_000_000,
+                1_000_000,
+            ),
+            (
+                PrimitiveType::TimestamptzNs,
+                TemporalPrecision::NANOSECONDS,
+                1_000,
+                1_000_000_000,
+            ),
+        ] {
+            let storage = Type::Primitive(primitive);
+            let target = TemporalType::TimestampWithTimeZone(precision);
+            let rejected = temporal_default_literal(source, value(-storage_step), target, &storage)
+                .unwrap_err();
+            assert_eq!(rejected.kind(), ConnectorErrorKind::Unsupported);
+            for (picos, expected) in [(-1_000_000_000_000, -second), (-1, 0), (storage_step, 1)] {
+                assert_eq!(
+                    temporal_default_literal(source, value(picos), target, &storage).unwrap(),
+                    IcebergLiteral::Primitive(PrimitiveLiteral::Long(expected)),
+                );
+            }
+        }
     }
 
     #[test]

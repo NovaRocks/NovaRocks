@@ -194,6 +194,7 @@ fn synthetic_options_preserve_admitted_root_hints_and_absent_options_defaults() 
                 novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                     novarocks_result_contract::TrinoJsonFacts {
                         parametric_datetime: true,
+                        parametric_interval: false,
                         variant: true,
                         variant_binary: true,
                     },

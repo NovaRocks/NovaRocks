@@ -43,6 +43,7 @@ pub mod semantic;
 pub mod sql_mode;
 pub mod system_table;
 mod type_syntax;
+pub use novarocks_expression::typing::declared_temporal_type;
 pub use type_syntax::{TypeSyntaxError, sql_type_syntax};
 
 pub(crate) mod optimizer;

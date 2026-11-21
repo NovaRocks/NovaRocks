@@ -1677,3 +1677,6 @@ mod tests {
         }
     }
 }
+
+mod temporal;
+pub use temporal::PreparedTemporalArray;

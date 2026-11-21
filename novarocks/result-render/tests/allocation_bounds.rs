@@ -101,6 +101,7 @@ fn prepare(array: ArrayRef, render: RenderField) -> (Arc<ClientRenderSchema>, Re
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: false,
                 },
@@ -133,6 +134,7 @@ fn root_contract_schema_is_borrowed_through_actual_encoder_exit() {
         f(N::String, P::TrinoValue),
     );
     let schema = Arc::try_unwrap(schema).unwrap();
+    let scratch = ArrowTrinoJsonEncoder::scratch_capacity_bound_for_schema(&schema);
     let contract = Arc::new(RootOutputContract::new(
         RootProfileId::V1,
         FrozenRootOutput::ClientRows(schema),
@@ -148,6 +150,8 @@ fn root_contract_schema_is_borrowed_through_actual_encoder_exit() {
         "starting a BE cursor must not clone schema Vec/String backings"
     );
     assert!(allocated <= encoder.scratch_capacity_bytes());
+    assert_eq!(encoder.scratch_capacity_bytes(), scratch);
+    assert!(scratch < ArrowTrinoJsonEncoder::scratch_capacity_bound_bytes());
     drop(contract);
     assert!(weak.upgrade().is_some());
     loop {
@@ -379,4 +383,81 @@ fn trino_large_strings_temporal_and_variant_turns_allocate_nothing() {
             }
         }
     }
+}
+
+#[test]
+fn legacy_interval_map_validation_reuses_admitted_scratch_across_turns() {
+    use novarocks_result_contract::{RenderIntervalField as F, RenderTemporalType as T};
+
+    let values = 1025;
+    let key: ArrayRef = Arc::new(Int64Array::from_iter_values((0..values).map(|m| m * 1000)));
+    let value: ArrayRef = Arc::new(Int32Array::from(vec![1; values as usize]));
+    let entries = StructArray::new(
+        vec![
+            Arc::new(Field::new("key", key.data_type().clone(), false)),
+            Arc::new(Field::new("value", value.data_type().clone(), true)),
+        ]
+        .into(),
+        vec![key, value],
+        None,
+    );
+    let array = Arc::new(MapArray::new(
+        Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, values as i32])),
+        entries,
+        None,
+        false,
+    ));
+    let (schema, batch) = prepare(
+        array,
+        f(
+            N::Map {
+                key: Box::new(RenderField {
+                    native_type: N::Temporal(T::Interval {
+                        start: F::Day,
+                        end: F::Second,
+                        leading_precision: 2,
+                        fractional_precision: 6,
+                    }),
+                    nullable: false,
+                    presentation: P::TrinoValue,
+                }),
+                value: Box::new(f(N::SignedInteger(32), P::TrinoValue)),
+            },
+            P::TrinoValue,
+        ),
+    );
+    let scratch = ArrowTrinoJsonEncoder::scratch_capacity_bound_for_schema(&schema);
+    start();
+    let encoder = ArrowTrinoJsonEncoder::try_new(schema, batch);
+    let (allocated, _, _) = stop();
+    let mut encoder = encoder.unwrap();
+    assert!(allocated <= encoder.scratch_capacity_bytes());
+    assert_eq!(encoder.scratch_capacity_bytes(), scratch);
+    assert_eq!(
+        scratch,
+        ArrowTrinoJsonEncoder::scratch_capacity_bound_bytes()
+    );
+    assert!(
+        encoder.scratch_capacity_bytes() <= ArrowTrinoJsonEncoder::scratch_capacity_bound_bytes()
+    );
+    let mut out = [0; 32 * 1024];
+    let mut turns = 0;
+    let mut rows = 0;
+    loop {
+        start();
+        let turn = encoder.step(&mut out);
+        assert_eq!(stop(), (0, 0, 0));
+        let turn = turn.unwrap();
+        assert!(turn.emitted_bytes + turn.examined_bytes <= V::EMIT_BYTES_PER_TURN);
+        assert!(turn.visited_cells <= V::CELLS_PER_TURN);
+        rows += turn.completed_rows;
+        turns += 1;
+        assert!(turns < 256);
+        if turn.status == RenderTurnStatus::InputComplete {
+            break;
+        }
+    }
+    assert!(turns > 1);
+    assert_eq!(rows, 1);
 }

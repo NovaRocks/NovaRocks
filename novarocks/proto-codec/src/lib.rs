@@ -17,6 +17,9 @@ pub mod connector_common;
 /// Structural validation and canonical encoding for the typed connector read wire.
 pub mod connector_read;
 
+/// Shared projection of the exact SQL temporal type on the native wire.
+pub mod temporal_type;
+
 /// Structural validation and canonical encoding for the connector write
 /// carriers.
 pub mod connector_write;

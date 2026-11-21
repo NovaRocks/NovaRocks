@@ -791,6 +791,7 @@ impl ConstantPool {
         let validated = canonical_pool_data(
             data,
             field.is_nullable(),
+            value_type.value_type(),
             &mut PoolObserver::plain(),
             &mut work,
         );
@@ -1013,7 +1014,13 @@ impl ConstantPool {
         validated?;
         observer.step(work)?;
         work.flush()?;
-        let (canonical, data) = canonical_pool_data(data, field.is_nullable(), observer, work)?;
+        let (canonical, data) = canonical_pool_data(
+            data,
+            field.is_nullable(),
+            value_type.value_type(),
+            observer,
+            work,
+        )?;
         observer.gate()?;
         work.flush()?;
         let pool = Self(Arc::new(PoolBacking {
@@ -1718,6 +1725,7 @@ fn validate_arrow_data(data: &ArrayData) -> Result<(), ConstantError> {
 fn canonical_pool_data<E: PoolFailure>(
     data: ArrayData,
     nullable: bool,
+    semantic: &novarocks_type_contract::ValueTypeRef,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ArrayRef, ArrayData), E> {
@@ -1736,7 +1744,7 @@ fn canonical_pool_data<E: PoolFailure>(
         observer.step(work)?;
         work.flush()?;
     }
-    validate_values_owned(&data, nullable, observer, work)?;
+    validate_values_owned(&data, nullable, Some(semantic), observer, work)?;
     Ok((canonical, data))
 }
 
@@ -2284,16 +2292,19 @@ pub fn validate_array_values_with_creator<H>(
     let mut creator = PoolCreator(creation);
     let mut observer = PoolObserver::plain();
     observer.creator = Some(&mut creator);
-    validate_values_owned(data, nullable, &mut observer, work)
+    validate_values_owned(data, nullable, None, &mut observer, work)
 }
 
+type ConstantValueType<'a> = Option<&'a novarocks_type_contract::ValueTypeRef>;
+
 enum RequiredFrame<'a> {
-    Row(Row<'a>, bool),
-    Range(&'a ArrayData, usize, usize, bool),
+    Row(Row<'a>, bool, ConstantValueType<'a>),
+    Range(&'a ArrayData, usize, usize, bool, ConstantValueType<'a>),
 }
 fn validate_values_owned<E: PoolFailure>(
     data: &ArrayData,
     nullable: bool,
+    semantic: ConstantValueType<'_>,
     observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), E> {
@@ -2316,10 +2327,22 @@ fn validate_values_owned<E: PoolFailure>(
             .map_err(ConstantError::allocation)?;
         observer.step(work)?;
         work.flush()?;
-        values.push(RequiredFrame::Range(data, 0, data.len(), !nullable));
+        values.push(RequiredFrame::Range(
+            data,
+            0,
+            data.len(),
+            !nullable,
+            semantic,
+        ));
         values
     } else {
-        vec![RequiredFrame::Range(data, 0, data.len(), !nullable)]
+        vec![RequiredFrame::Range(
+            data,
+            0,
+            data.len(),
+            !nullable,
+            semantic,
+        )]
     };
     while let Some(frame) = pending.pop() {
         if observer.is_parent() {
@@ -2327,7 +2350,7 @@ fn validate_values_owned<E: PoolFailure>(
             // push fanout. Admit/reserve that actual Vec growth before the
             // pop's completed observation, rather than after a late callback.
             let (row, continuation) = match &frame {
-                RequiredFrame::Range(data, start, end, _)
+                RequiredFrame::Range(data, start, end, _, _)
                     if start != end && !matches!(data.data_type(), DataType::Null) =>
                 {
                     (
@@ -2338,7 +2361,7 @@ fn validate_values_owned<E: PoolFailure>(
                         1,
                     )
                 }
-                RequiredFrame::Row(row, _) => (Some(*row), 0),
+                RequiredFrame::Row(row, _, _) => (Some(*row), 0),
                 _ => (None, 0),
             };
             let children = row
@@ -2365,8 +2388,8 @@ fn validate_values_owned<E: PoolFailure>(
             )?;
         }
         observer.step(work)?;
-        let (row, required) = match frame {
-            RequiredFrame::Range(data, start, end, required) => {
+        let (row, required, semantic) = match frame {
+            RequiredFrame::Range(data, start, end, required, semantic) => {
                 if start == end {
                     continue;
                 }
@@ -2379,10 +2402,16 @@ fn validate_values_owned<E: PoolFailure>(
                     continue;
                 }
                 observer.reserve(&mut pending, 1, work)?;
-                pending.push(RequiredFrame::Range(data, start + 1, end, required));
-                (Row { data, index: start }, required)
+                pending.push(RequiredFrame::Range(
+                    data,
+                    start + 1,
+                    end,
+                    required,
+                    semantic,
+                ));
+                (Row { data, index: start }, required, semantic)
             }
-            RequiredFrame::Row(row, required) => (row, required),
+            RequiredFrame::Row(row, required, semantic) => (row, required, semantic),
         };
         if matches!(row.data.data_type(), DataType::Null) || row.data.is_null(row.index) {
             if required {
@@ -2401,6 +2430,7 @@ fn validate_values_owned<E: PoolFailure>(
                         index: dictionary_index(row.data, row.index)?,
                     },
                     required,
+                    semantic,
                 ));
                 continue;
             }
@@ -2412,16 +2442,22 @@ fn validate_values_owned<E: PoolFailure>(
                         index: run_index_owned(row.data, row.index, observer, work)?,
                     },
                     required || !values.is_nullable(),
+                    semantic,
                 ));
                 continue;
             }
             _ => {}
         }
+        if let Some(temporal) = semantic.and_then(novarocks_type_contract::ValueTypeRef::temporal) {
+            crate::selected_scalar::read_temporal(row, temporal)?;
+        }
         validate_decimal_value(row)?;
         match row.data.data_type() {
             DataType::Struct(fields) => {
                 observer.reserve(&mut pending, fields.len(), work)?;
-                for (field, child) in fields.iter().zip(row.data.child_data()).rev() {
+                for (index, (field, child)) in
+                    fields.iter().zip(row.data.child_data()).enumerate().rev()
+                {
                     observer.step(work)?;
                     observer.reserve(&mut pending, 1, work)?;
                     pending.push(RequiredFrame::Row(
@@ -2430,6 +2466,7 @@ fn validate_values_owned<E: PoolFailure>(
                             index: row.index,
                         },
                         !field.is_nullable(),
+                        semantic.and_then(|ty| ty.child_type_at(index)),
                     ));
                 }
             }
@@ -2446,12 +2483,35 @@ fn validate_values_owned<E: PoolFailure>(
                     start,
                     end,
                     !field.is_nullable(),
+                    if matches!(row.data.data_type(), DataType::Map(..)) {
+                        // A Map's physical entries struct directly contains
+                        // the semantic key and value children.
+                        semantic
+                    } else {
+                        semantic.and_then(|ty| ty.child_type_at(0))
+                    },
                 ));
             }
             DataType::Union(_, _) => {
-                let (_, child, nullable) = union_row_owned(row.data, row.index, observer, work)?;
+                let (tag, child, nullable) = union_row_owned(row.data, row.index, observer, work)?;
                 observer.reserve(&mut pending, 1, work)?;
-                pending.push(RequiredFrame::Row(child, required || !nullable));
+                let mut child_semantic = None;
+                if let Some(novarocks_type_contract::ValueKind::Union(fields)) =
+                    semantic.map(|ty| ty.kind())
+                {
+                    for field in fields {
+                        observer.step(work)?;
+                        if field.type_id == tag {
+                            child_semantic = Some(field.field.value_type());
+                            break;
+                        }
+                    }
+                }
+                pending.push(RequiredFrame::Row(
+                    child,
+                    required || !nullable,
+                    child_semantic,
+                ));
             }
             _ => {}
         }
@@ -3197,6 +3257,41 @@ impl ConstantValue {
                     "timestamp factory requires exact Timestamp type",
                 ));
             }
+        };
+        Self::from_scalar_array(field, ty, array, policy, phase, control)
+    }
+
+    pub fn from_temporal(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        value: novarocks_type_contract::TemporalValue,
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        use novarocks_type_contract::TemporalCarrier;
+        let declaration = ty.value_type().temporal().ok_or(ConstantError::Invalid(
+            "temporal constant factory requires a declared temporal type",
+        ))?;
+        factory_preflight(&field, &ty, 0, false, policy, phase, control)?;
+        let fixed = |bytes: &[u8]| {
+            Ok::<_, ConstantError>(
+                arrow_array::FixedSizeBinaryArray::try_from_iter([bytes].into_iter())
+                    .map_err(ConstantError::arrow_validation)?
+                    .to_data(),
+            )
+        };
+        let array = match value.to_carrier(declaration).map_err(|_| {
+            ConstantError::Invalid("temporal constant lies outside the declared range or precision")
+        })? {
+            TemporalCarrier::I32(value) => arrow_array::Int32Array::from(vec![value]).to_data(),
+            TemporalCarrier::I64(value) => arrow_array::Int64Array::from(vec![value]).to_data(),
+            TemporalCarrier::TimestampMicros(value) => {
+                arrow_array::TimestampMicrosecondArray::from(vec![value]).to_data()
+            }
+            TemporalCarrier::ZonedTime(bytes) => fixed(&bytes)?,
+            TemporalCarrier::Wide(bytes) => fixed(&bytes)?,
+            TemporalCarrier::ZonedTimestamp(bytes) => fixed(&bytes)?,
         };
         Self::from_scalar_array(field, ty, array, policy, phase, control)
     }

@@ -179,6 +179,7 @@ pub fn sql_type_from_execution_value_observed<E: From<ExecutionColumnTypeError>>
         Ok(match value.kind() {
             ValueKind::String => SqlType::String,
             ValueKind::Binary => SqlType::Binary,
+            ValueKind::Temporal(ty) => SqlType::Temporal(*ty),
             ValueKind::Nominal(domain) => match domain {
                 ValueLogicalType::Json => SqlType::Json,
                 ValueLogicalType::Variant => SqlType::Variant,
@@ -300,6 +301,7 @@ fn author(
         author(declaration, field.data_type(), field.is_nullable(), storage)
     };
     let kind = match (declaration, layout) {
+        (SqlType::Temporal(ty), layout) if ty.carrier() == *layout => ValueKind::Temporal(*ty),
         (
             SqlType::Array(declaration),
             DataType::List(item)

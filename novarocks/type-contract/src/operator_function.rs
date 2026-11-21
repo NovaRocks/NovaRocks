@@ -21,20 +21,42 @@ use crate::FunctionId;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum OperatorFunction {
     Negation,
+    TemporalAdd,
+    TemporalSubtract,
+    TemporalMultiply,
+    TemporalDivide,
+    TemporalNegation,
 }
 
 impl OperatorFunction {
-    pub const ALL: [Self; 1] = [Self::Negation];
+    pub const ALL: [Self; 6] = [
+        Self::Negation,
+        Self::TemporalAdd,
+        Self::TemporalSubtract,
+        Self::TemporalMultiply,
+        Self::TemporalDivide,
+        Self::TemporalNegation,
+    ];
 
     pub const fn catalog_name(self) -> &'static str {
         match self {
             Self::Negation => "__negate",
+            Self::TemporalAdd => "__temporal_add",
+            Self::TemporalSubtract => "__temporal_subtract",
+            Self::TemporalMultiply => "__temporal_multiply",
+            Self::TemporalDivide => "__temporal_divide",
+            Self::TemporalNegation => "__temporal_negate",
         }
     }
 
     pub const fn function_id_text(self) -> &'static str {
         match self {
             Self::Negation => "builtin.scalar/__negate/v1",
+            Self::TemporalAdd => "builtin.scalar/__temporal_add/v1",
+            Self::TemporalSubtract => "builtin.scalar/__temporal_subtract/v1",
+            Self::TemporalMultiply => "builtin.scalar/__temporal_multiply/v1",
+            Self::TemporalDivide => "builtin.scalar/__temporal_divide/v1",
+            Self::TemporalNegation => "builtin.scalar/__temporal_negate/v1",
         }
     }
 

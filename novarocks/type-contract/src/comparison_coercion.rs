@@ -434,6 +434,10 @@ pub fn comparison_common_value_type(
         let value = null_common_value(left, right);
         return Ok((value != *left || value != *right).then_some(value));
     }
+    if left.value_type().temporal().is_some() || right.value_type().temporal().is_some() {
+        let value = value_type_for_common_layout(left.data_type().clone(), left, right)?;
+        return Ok((value != *left || value != *right).then_some(value));
+    }
     let carrier = comparison_common_type(left.data_type(), right.data_type())?;
     let common_exists = carrier.is_some()
         || crate::arrow_type_equals_ignoring_metadata(left.data_type(), right.data_type());
@@ -541,6 +545,41 @@ fn common_value_core<E>(
             storage,
             creation.observer(),
         );
+    }
+    let temporal_pair = (left.value_type().temporal(), right.value_type().temporal());
+    if temporal_pair.0.is_some() || temporal_pair.1.is_some() {
+        use crate::TemporalType::{Timestamp, TimestampWithTimeZone};
+        let common = match temporal_pair {
+            (Some(a), Some(b)) => a.common_type(b),
+            (Some(ty @ (Timestamp(_) | TimestampWithTimeZone(_))), None)
+                if right.data_type() == &DataType::Date32 =>
+            {
+                Some(ty)
+            }
+            (None, Some(ty @ (Timestamp(_) | TimestampWithTimeZone(_))))
+                if left.data_type() == &DataType::Date32 =>
+            {
+                Some(ty)
+            }
+            _ => None,
+        }
+        .ok_or_else(|| {
+            crate::ValueConstructionFailure::Rule(
+                "comparison has no declared common temporal type".into(),
+            )
+        })?;
+        let layout = crate::ValueLayout::try_new_with_construction(
+            &common.carrier(),
+            storage.clone(),
+            creation.observer(),
+        )?;
+        let value = crate::ValueTypeRef::try_new_with_construction(
+            crate::ValueKind::Temporal(common),
+            left.nullable() || right.nullable(),
+            storage,
+            creation.observer(),
+        )?;
+        return FunctionValueType::try_from_value(value, layout).map_err(Into::into);
     }
     let logical_type = if left.logical_type() == right.logical_type() {
         if left.logical_type() == ValueLogicalType::Physical
@@ -793,7 +832,10 @@ fn restore_typed_value<E>(
 }
 
 fn has_nominal_child(value: &crate::ValueTypeRef) -> bool {
-    if matches!(value.kind(), crate::ValueKind::Nominal(_)) {
+    if matches!(
+        value.kind(),
+        crate::ValueKind::Nominal(_) | crate::ValueKind::Temporal(_)
+    ) {
         return true;
     }
     (0..value.child_count()).any(|index| value.child_type_at(index).is_some_and(has_nominal_child))

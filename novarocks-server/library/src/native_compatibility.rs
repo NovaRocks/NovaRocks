@@ -23,7 +23,7 @@ use novarocks_physical_plan::PLAN_CONTRACT_REVISION;
 use novarocks_spi::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
 use novarocks_version::{
     NativeCarrierDeclaration, NativeCompatibilityMaterial, StaticPlanInterpreter,
-    derive_repository_native_compatibility_material,
+    digest_temporal_plan_rules,
 };
 
 /// Builds the one closed carrier manifest for this server binary.
@@ -67,6 +67,30 @@ fn native_carrier_from_contract(
         first.descriptor(),
     )
     .with_context(|| "validate server native carrier declaration")
+}
+
+fn derive_repository_native_compatibility_material(
+    declarations: impl IntoIterator<Item = NativeCarrierDeclaration>,
+    function_catalog_digest: [u8; 32],
+    plan_contract_revision: u32,
+    static_plan_interpreter: StaticPlanInterpreter,
+) -> Result<NativeCompatibilityMaterial, novarocks_version::NativeCompatibilityError> {
+    use novarocks_functions::temporal_zone_rules::{
+        TEMPORAL_ZONE_RULE_INTERPRETATION, temporal_zone_rule_material,
+    };
+    use novarocks_type_contract::TimeZoneKey;
+    let temporal_rules = digest_temporal_plan_rules(
+        TimeZoneKey::index_material(),
+        temporal_zone_rule_material(),
+        TEMPORAL_ZONE_RULE_INTERPRETATION,
+    );
+    novarocks_version::derive_repository_native_compatibility_material(
+        declarations,
+        function_catalog_digest,
+        plan_contract_revision,
+        static_plan_interpreter,
+        temporal_rules,
+    )
 }
 
 /// Resolves the immutable compatibility material for this binary before role
@@ -119,7 +143,7 @@ mod tests {
                 .unwrap();
         // Catalog declarations and the composed pure interpreter are identical here.
         // Revision 1 admitted raw UTF8 bounds; the normalized contract must not.
-        let legacy = novarocks_version::derive_repository_native_compatibility_material(
+        let legacy = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             1,
@@ -144,7 +168,7 @@ mod tests {
         let current =
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
                 .unwrap();
-        let prior = novarocks_version::derive_repository_native_compatibility_material(
+        let prior = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             25,
@@ -166,7 +190,7 @@ mod tests {
         let current =
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
                 .unwrap();
-        let prior = novarocks_version::derive_repository_native_compatibility_material(
+        let prior = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             26,
@@ -189,7 +213,7 @@ mod tests {
         let current =
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
                 .unwrap();
-        let prior = novarocks_version::derive_repository_native_compatibility_material(
+        let prior = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             27,
@@ -213,7 +237,7 @@ mod tests {
         let current =
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
                 .unwrap();
-        let prior = novarocks_version::derive_repository_native_compatibility_material(
+        let prior = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             14,
@@ -295,7 +319,7 @@ mod tests {
             }
         }
         let derive = |carriers| {
-            novarocks_version::derive_repository_native_compatibility_material(
+            super::derive_repository_native_compatibility_material(
                 carriers,
                 [0x31; 32],
                 novarocks_physical_plan::PLAN_CONTRACT_REVISION,
@@ -338,7 +362,7 @@ mod tests {
             .checked_sub(1)
             .filter(|revision| *revision != 0)
             .expect("test requires a prior plan contract revision");
-        let plan_only_change = novarocks_version::derive_repository_native_compatibility_material(
+        let plan_only_change = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             prior_plan_revision,
@@ -445,7 +469,7 @@ mod tests {
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
                 .unwrap();
         // Revision 2 has normalized temporal casts but lacks this exact pair.
-        let legacy = novarocks_version::derive_repository_native_compatibility_material(
+        let legacy = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             2,
@@ -473,7 +497,7 @@ mod tests {
         // independent Add/Sub semantic root. Both peers lack this closed fact.
         // Equal catalogue and pure-interpreter digests isolate the plan revision.
         for revision in [2, 3] {
-            let prior = novarocks_version::derive_repository_native_compatibility_material(
+            let prior = super::derive_repository_native_compatibility_material(
                 native_carrier_declarations(manifest.contracts()).unwrap(),
                 [0x31; 32],
                 revision,
@@ -498,7 +522,7 @@ mod tests {
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
                 .unwrap();
         for prior_revision in [4, 5] {
-            let prior = novarocks_version::derive_repository_native_compatibility_material(
+            let prior = super::derive_repository_native_compatibility_material(
                 native_carrier_declarations(manifest.contracts()).unwrap(),
                 [0x31; 32],
                 prior_revision,
@@ -578,7 +602,7 @@ mod tests {
         let current =
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
                 .unwrap();
-        let prior = novarocks_version::derive_repository_native_compatibility_material(
+        let prior = super::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             11,

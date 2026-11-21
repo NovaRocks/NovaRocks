@@ -729,6 +729,27 @@ pub(crate) fn visit_key_read_page<'a>(
         )
         .into());
     }
+    if let Some(declaration) = key.temporal_type() {
+        use crate::runtime::task::ExecutionFailure;
+        let values = novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+            declaration,
+            array.as_ref(),
+            binding.nullable(),
+        )
+        .map_err(ExecutionFailure::from_domain)?;
+        for selected in rows {
+            control.checkpoint(1)?;
+            let key = values
+                .relation_key(selected.row)
+                .map_err(ExecutionFailure::from_domain)?;
+            visitor(
+                selected.ordinal,
+                key.map(|key| OrderedScalarRef::Temporal(key.order_bytes())),
+            )?;
+        }
+        control.checkpoint(0)?;
+        return Ok(());
+    }
     let expected = key.data_type();
     macro_rules! visit {
         ($array:ty, $convert:expr) => {{

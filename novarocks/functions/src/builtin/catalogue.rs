@@ -3197,6 +3197,10 @@ pub fn contribute_builtin_functions(
     builder: &mut EngineFunctionCatalogBuilder,
 ) -> Result<(), FunctionCatalogError> {
     builder.register(super::value_conversion::value_conversion_definition()?)?;
+    builder.register(super::temporal_context::definition()?)?;
+    for operator in super::temporal_arithmetic_owner::OPERATORS {
+        builder.register(super::temporal_arithmetic_owner::definition(operator)?)?;
+    }
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {

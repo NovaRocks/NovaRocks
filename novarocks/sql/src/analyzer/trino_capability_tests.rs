@@ -84,13 +84,10 @@ fn reason(gate: &str) -> &str {
         "array_wildcard" => "array wildcard subscripts",
         "explicit_array_type" => "explicit ARRAY lengths",
         "function_processing_mode" => "function processing modes",
-        "interval_literal" => "INTERVAL literals",
-        "interval_type" => "INTERVAL data types",
         "json_constructor" => "SQL/JSON constructor",
         "json_exists" => "JSON_EXISTS is not supported",
         "json_value" => "JSON_VALUE is not supported",
         "json_serialize" => "JSON_SERIALIZE is not supported",
-        "interval_value_expression" => "INTERVAL value expressions are not supported",
         "json_query_profile" => "JSON_QUERY only supports its plain two-argument profile",
         "json_table" => "JSON_TABLE is not supported",
         "match" => "MATCH predicates",
@@ -131,6 +128,44 @@ fn assert_row_field_dereference(source: &str) {
 }
 
 #[test]
+fn temporal_sql_reaches_its_selected_types_after_query_preanalysis() {
+    use novarocks_type_contract::{
+        IntervalField, IntervalQualifier, TemporalPrecision, TemporalType,
+    };
+
+    let p12 = TemporalPrecision::PICOSECONDS;
+    let interval =
+        IntervalQualifier::new(IntervalField::Second, IntervalField::Second, 4, p12).unwrap();
+    let cases = [
+        (
+            "SELECT CAST(TIMESTAMP '2024-01-01 00:00:00 UTC' AS TIMESTAMP(12) WITH TIME ZONE)",
+            TemporalType::TimestampWithTimeZone(p12),
+        ),
+        (
+            "SELECT CAST(TIME '12:00:00 +05:30' AS TIME(12) WITH TIME ZONE)",
+            TemporalType::TimeWithTimeZone(p12),
+        ),
+        (
+            "SELECT CAST(INTERVAL '1.123456789012' SECOND(2, 12) AS INTERVAL SECOND(4, 12))",
+            TemporalType::Interval(interval),
+        ),
+    ];
+    for (source, expected) in cases {
+        let query = super::query_prepass::preanalyze(parse_query(source).unwrap()).unwrap();
+        let (resolved, _, _) = analyze(&query, &NoCatalog, "default")
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+        let [column] = resolved.output_columns.as_slice() else {
+            panic!("expected one temporal column for {source}");
+        };
+        assert_eq!(
+            column.value_type.value_type().temporal(),
+            Some(expected),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn parsed_trino_queries_reach_their_declared_analyzer_capability_gate() {
     let parser_ledger: Vec<_> = include_str!("../../../parser/tests/it/grammar-coverage.tsv")
         .lines()
@@ -148,17 +183,52 @@ fn parsed_trino_queries_reach_their_declared_analyzer_capability_gate() {
             &fields[1..6],
             [*rule, *alternative, *label, *clause, *source]
         );
-        if *gate == "row_field_dereference" {
-            assert_row_field_dereference(source);
-        } else {
-            assert_analyzer_capability(
-                source,
-                &format!("grammar row {row} ({rule})"),
-                reason(gate),
-            );
+        let owner = format!("grammar row {row} ({rule})");
+        match *gate {
+            "row_field_dereference" => assert_row_field_dereference(source),
+            "interval_literal" => {
+                let query = parse_query(source).unwrap();
+                assert_analyzer_rejection(
+                    &query,
+                    source,
+                    &owner,
+                    AnalyzeErrorKind::InvalidLiteral,
+                    "sql.analyze.invalid_literal",
+                );
+            }
+            "interval_type" => assert_interval_type(source),
+            "interval_value_expression" => {
+                let typed = source.replacen('?', "DATE '2000-01-02'", 1).replacen(
+                    '?',
+                    "DATE '2000-01-01'",
+                    1,
+                );
+                if source.contains("YEAR") || source.contains("MONTH") {
+                    assert_analyzer_capability(&typed, &owner, "year-month interval difference");
+                } else {
+                    assert_interval_type(&typed);
+                }
+            }
+            _ => assert_analyzer_capability(source, &owner, reason(gate)),
         }
     }
     assert_eq!(covered.len(), 186);
+}
+
+fn assert_interval_type(source: &str) {
+    let query = parse_query(source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    let (resolved, _, _) =
+        analyze(&query, &NoCatalog, "default").unwrap_or_else(|error| panic!("{source}: {error}"));
+    let [field] = resolved.output_columns.as_slice() else {
+        panic!("{source}: expected one interval output");
+    };
+    assert!(
+        matches!(
+            field.value_type.value_type().temporal(),
+            Some(novarocks_type_contract::TemporalType::Interval(qualifier)) if !qualifier.is_year_month()
+        ),
+        "{source}"
+    );
 }
 
 fn unaliased_select_relation(query: &Query) -> &Relation {

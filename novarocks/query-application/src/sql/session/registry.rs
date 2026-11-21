@@ -27,6 +27,8 @@ use novarocks_spi::connector::ConnectorProviderId;
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 mod catalog;
+const TIME_ZONE_ID: &str = "time_zone_id";
+
 mod constant;
 mod declarations;
 mod inputs;

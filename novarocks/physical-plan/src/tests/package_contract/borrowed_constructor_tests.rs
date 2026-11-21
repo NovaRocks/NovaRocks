@@ -114,7 +114,9 @@ fn parameter_input(
     );
     input.parameters = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+        ),
     )])
     .unwrap();
     input
@@ -213,11 +215,15 @@ fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse
     unused.parameters = SemanticParameters::try_new([
         (
             r.id,
-            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(0),
-            SemanticParameterValue::TimeZone("UTC".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
         ),
     ])
     .unwrap();

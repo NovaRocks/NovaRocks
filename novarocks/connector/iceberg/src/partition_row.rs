@@ -86,8 +86,22 @@ impl UnifiedPartitionRow {
                             part.field_id
                         )))
                     })?;
-                let data_type = crate::metadata_batch_reader::iceberg_type_to_arrow_type(&result)
-                    .map_err(|message| PartitionRowError::Semantic(corrupt(message)))?;
+                let data_type = match &result {
+                    crate::iceberg::spec::Type::Primitive(
+                        crate::iceberg::spec::PrimitiveType::Timestamptz,
+                    ) => DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        Some("UTC".into()),
+                    ),
+                    crate::iceberg::spec::Type::Primitive(
+                        crate::iceberg::spec::PrimitiveType::TimestamptzNs,
+                    ) => DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Nanosecond,
+                        Some("UTC".into()),
+                    ),
+                    _ => crate::metadata_batch_reader::iceberg_type_to_arrow_type(&result)
+                        .map_err(|message| PartitionRowError::Semantic(corrupt(message)))?,
+                };
                 match by_id.entry(part.field_id) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(UnifiedPartitionField {

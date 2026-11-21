@@ -1313,6 +1313,33 @@ impl ConnectorTableMetadata {
         execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
         creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
     ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
+        Self::try_new_typed_with_format_projection(
+            header,
+            format_schema,
+            execution_schema,
+            creation,
+            |_, _, _, _| Ok(false),
+        )
+    }
+
+    /// Publish a catalog schema with an explicitly authored format conversion.
+    /// The provider must prove each changed layout from its format declaration.
+    /// The existing normalized equality is sufficient for unchanged layouts.
+    pub fn try_new_typed_with_format_projection(
+        header: ConnectorTableMetadataHeader,
+        format_schema: SchemaRef,
+        execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+        mut matches_projection: impl FnMut(
+            usize,
+            &arrow::datatypes::DataType,
+            &novarocks_type_contract::FunctionValueType,
+            &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            bool,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        >,
+    ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
         creation.work(1)?;
         if format_schema.fields().len() != execution_schema.bindings().len() {
             return Err(ConnectorError::new(
@@ -1363,7 +1390,7 @@ impl ConnectorTableMetadata {
                 |units| creation.work(units).map_err(CatalogLayoutError::Caller),
             )
             .map_err(CatalogLayoutError::into_failure)?;
-            if !same {
+            if !same && !matches_projection(ordinal, source.data_type(), binding, creation)? {
                 return Err(ConnectorError::new(
                     super::ConnectorErrorKind::InvalidRequest,
                     "catalog source/execution normalized layouts differ",

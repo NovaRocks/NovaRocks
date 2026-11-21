@@ -52,7 +52,8 @@ fn resource() -> Failure {
 
 /// Source offset choices remain the existing SQL-read mapping: LIST uses
 /// 32-bit offsets, ordinary BINARY is Binary, VARIANT is LargeBinary, and UTC
-/// storage timestamps use the existing timezone-free SQL execution carrier.
+/// storage timestamps retain their source units. The SQL binding describes
+/// the canonical temporal carrier independently.
 pub(crate) fn from_declaration(
     declaration: &Type,
     nullable: bool,
@@ -167,6 +168,19 @@ fn author(
     }
     let storage = creation.storage();
     let (source, layout, kind) = match declaration {
+        Type::Primitive(primitive) if crate::temporal::declaration(primitive).is_some() => {
+            if nominal.is_some() || integer.is_some() {
+                return Err(invalid(
+                    "Iceberg temporal field carries an unrelated domain",
+                ));
+            }
+            let declaration = crate::temporal::declaration(primitive).unwrap();
+            (
+                primitive_layout(primitive, None)?,
+                declaration.carrier(),
+                ValueKind::Temporal(declaration),
+            )
+        }
         Type::Primitive(_) | Type::Variant(_) => {
             let (mut data_type, domain) = match declaration {
                 Type::Primitive(primitive) => (

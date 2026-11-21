@@ -56,6 +56,19 @@ pub const VALUE_CONVERSION_FUNCTION_ID: &str = "builtin.scalar/value_domain_conv
 /// Automatic domain resolution deliberately never proposes it.
 pub const ARRAY_COMMON_COERCION: &str =
     "builtin.scalar/value_domain_conversion/array_common_coercion/v1";
+pub const TEMPORAL_WRITE_ASSIGNMENT: &str =
+    "builtin.scalar/value_domain_conversion/nested_temporal_write_assignment/v1";
+
+/// Only a checked writer assignment can request this shape-preserving path.
+pub fn temporal_write_assignment_matches(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<bool, FunctionBindingError> {
+    binding_control::scope(control, |work| {
+        pair_matches_observed(TEMPORAL_WRITE_ASSIGNMENT, source, target, work)
+    })
+}
 
 pub(super) const JSON_TEXT: &str =
     "builtin.scalar/value_domain_conversion/json_text_same_structure/v1";
@@ -86,6 +99,67 @@ pub(super) const UTF8_LARGEINT: &str =
 pub(super) const NULL_LIFT: &str =
     "builtin.scalar/value_domain_conversion/null_to_typed_nullable/v1";
 
+pub(super) const TEMPORAL: &str = "builtin.scalar/value_domain_conversion/temporal/v1";
+pub(super) const TEMPORAL_WIDEN: &str = "builtin.scalar/value_domain_conversion/temporal_widen/v1";
+pub(super) const TEMPORAL_ZONE: &str = "builtin.scalar/value_domain_conversion/temporal_zone/v1";
+pub(super) const TEMPORAL_CLOCK: &str = "builtin.scalar/value_domain_conversion/temporal_clock/v1";
+pub(super) const TRY_TEMPORAL: &str = "builtin.scalar/value_domain_conversion/try_temporal/v1";
+pub(super) const TRY_TEMPORAL_ZONE: &str =
+    "builtin.scalar/value_domain_conversion/try_temporal_zone/v1";
+pub(super) const TRY_TEMPORAL_CLOCK: &str =
+    "builtin.scalar/value_domain_conversion/try_temporal_clock/v1";
+
+pub(super) fn temporal_overload(id: &str) -> Option<(crate::temporal_cast::Dependencies, bool)> {
+    use crate::temporal_cast::Dependencies as D;
+    Some(match id {
+        TEMPORAL | TEMPORAL_WIDEN => (D::None, false),
+        TEMPORAL_ZONE => (D::Zone, false),
+        TEMPORAL_CLOCK => (D::Clock, false),
+        TRY_TEMPORAL => (D::None, true),
+        TRY_TEMPORAL_ZONE => (D::Zone, true),
+        TRY_TEMPORAL_CLOCK => (D::Clock, true),
+        _ => return None,
+    })
+}
+
+pub fn temporal_cast_overload(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+    safe: bool,
+) -> Option<&'static str> {
+    if !safe
+        && let (Some(source), Some(target)) = (
+            source.value_type().temporal(),
+            target.value_type().temporal(),
+        )
+        && source.is_lossless_widening_to(target)
+    {
+        return Some(TEMPORAL_WIDEN);
+    }
+    use crate::temporal_cast::Dependencies as D;
+    Some(
+        match (
+            crate::temporal_cast::Pair::bind(source, target)?.dependencies,
+            safe,
+        ) {
+            (D::None, false) => TEMPORAL,
+            (D::Zone, false) => TEMPORAL_ZONE,
+            (D::Clock, false) => TEMPORAL_CLOCK,
+            (D::None, true) => TRY_TEMPORAL,
+            (D::Zone, true) => TRY_TEMPORAL_ZONE,
+            (D::Clock, true) => TRY_TEMPORAL_CLOCK,
+        },
+    )
+}
+
+/// Selected temporal dependencies are also consumed by SQL and EXL binding
+/// authors before the unit projects the original parameter IDs.
+pub fn temporal_cast_dependencies(
+    id: &str,
+) -> &'static [novarocks_type_contract::SemanticParameterKey] {
+    temporal_overload(id).map_or(&[], |(dependencies, _)| dependencies.keys())
+}
+
 const AUTOMATIC_OVERLOADS: &[&str] = &[
     JSON_TEXT,
     OPAQUE_BINARY,
@@ -101,6 +175,10 @@ const AUTOMATIC_OVERLOADS: &[&str] = &[
     LARGEINT_TEXT,
     UTF8_LARGEINT,
     NULL_LIFT,
+    TEMPORAL,
+    TEMPORAL_WIDEN,
+    TEMPORAL_ZONE,
+    TEMPORAL_CLOCK,
 ];
 
 /// Base effects of the hidden value conversions. Overflow NULL is a
@@ -125,10 +203,25 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
 /// Strict ARRAY common coercion owns conversion Data under every scalar policy;
 /// its dedicated preparation never accepts that policy as a semantic switch.
 pub(super) fn overload_effects(id: &str) -> FunctionEffectDeclaration {
+    if let Some((dependencies, safe)) = temporal_overload(id) {
+        let mut base = effects();
+        base.environment_dependencies = dependencies.keys().into();
+        if safe {
+            base.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+        } else if id != TEMPORAL_WIDEN {
+            base.own_row_error = FunctionIntrinsicRowError::MayRaise;
+        }
+        return base;
+    }
+
     let mut effects = effects();
     if matches!(
         id,
-        LARGEINT_DECIMAL | DECIMAL128_LARGEINT | DECIMAL256_LARGEINT | ARRAY_COMMON_COERCION
+        LARGEINT_DECIMAL
+            | DECIMAL128_LARGEINT
+            | DECIMAL256_LARGEINT
+            | ARRAY_COMMON_COERCION
+            | TEMPORAL_WRITE_ASSIGNMENT
     ) {
         effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
     }
@@ -164,7 +257,15 @@ pub(super) fn definition_parts()
         (LARGEINT_TEXT, "LargeInt(FixedSizeBinary16)->Physical(Utf8)", "explicit exact target; original signed big-endian i128 text; NULL preserved"),
         (UTF8_LARGEINT, "Physical Utf8->LargeInt(FixedSizeBinary16)", "explicit nullable exact LargeInt target; trim then signed i128 parse; invalid or out-of-range text returns NULL; NULL preserved"),
         (NULL_LIFT, "Physical Null(nullable=true)->explicit complete nullable target", "evaluate child eagerly; strict NULL protocol produces typed NULL without row implementation"),
+        (TEMPORAL, "exact temporal source and target; strict, independent of statement time", "checked selected temporal conversion, no statement dependencies"),
+        (TEMPORAL_WIDEN, "same datetime family and unchanged or wider fractional precision", "exact datetime value unchanged; no statement dependencies or row errors"),
+        (TEMPORAL_ZONE, "exact temporal source and target; strict, depends on the effective time zone", "checked selected temporal conversion with captured time zone"),
+        (TEMPORAL_CLOCK, "exact temporal source and target; strict, depends on effective zone and start", "checked selected temporal conversion with captured start and zone"),
+        (TRY_TEMPORAL, "exact temporal source and nullable target; own row capture, independent of statement time", "capture only own temporal row Data"),
+        (TRY_TEMPORAL_ZONE, "exact temporal source and nullable target; own row capture with effective time zone", "capture only own temporal row Data with captured time zone"),
+        (TRY_TEMPORAL_CLOCK, "exact temporal source and nullable target; own row capture with effective zone and start", "capture only own temporal row Data with captured start and zone"),
         (ARRAY_COMMON_COERCION, "original complete source->independently inferred ARRAY common element target; exact selection only", "strict Trino common coercion; preserve source NULL/domain/layout obligations; conversion Data propagates; never an automatic domain candidate"),
+        (TEMPORAL_WRITE_ASSIGNMENT, "exact same-shape Iceberg Array/Map/Row with temporal precision changes; exact selection only", "round reachable temporal leaves once; retain target geometry; conversion Data propagates"),
     ]
     .into_iter()
     .map(|(id, argument_pattern, result_pattern)| {
@@ -469,6 +570,11 @@ pub(super) fn decimal_to_largeint_can_overflow(data_type: &DataType) -> bool {
 /// Match the exact selected family directly. No resolution replay is used by
 /// frozen validation. In particular FixedSizeBinary16 is not a numeric source.
 fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType) -> bool {
+    if let Some((_, safe)) = temporal_overload(id) {
+        return (!safe || target.nullable())
+            && (!source.nullable() || target.nullable())
+            && temporal_cast_overload(source, target, safe) == Some(id);
+    }
     match id {
         JSON_TEXT | OPAQUE_BINARY => typed::same_shape_pair(
             source,
@@ -648,6 +754,13 @@ fn pair_matches_observed(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, FunctionBindingError> {
     work.step()?;
+    if id == TEMPORAL_WRITE_ASSIGNMENT {
+        return super::value_conversion_kernel::temporal_assignment::matches(
+            source,
+            target,
+            &mut || work.step().map_err(FunctionBindingError::from),
+        );
+    }
     if id == ARRAY_COMMON_COERCION {
         return novarocks_type_contract::array_common_coercion_types_valid_observed(
             source,

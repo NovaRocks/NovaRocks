@@ -858,9 +858,13 @@ fn table_occurrences_missing_or_foreign_child_scope_environment_and_proof_refuse
         expected_key: SemanticParameterKey::TimeZone,
     };
     let environment = [bad_ref];
-    let env_params =
-        SemanticParameters::try_new([(bad_ref.id, SemanticParameterValue::TimeZone("UTC".into()))])
-            .unwrap();
+    let env_params = SemanticParameters::try_new([(
+        bad_ref.id,
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
+    )])
+    .unwrap();
     prefixes(
         |c| {
             let mut call = input(&f, &req, &occ, &effects, &env_params);

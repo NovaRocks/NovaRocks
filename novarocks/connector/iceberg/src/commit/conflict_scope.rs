@@ -588,6 +588,7 @@ fn connector_datum(value: &ConnectorValue, primitive: &PrimitiveType) -> Option<
         ConnectorValue::TimestampTzMicros(v) => Datum::timestamptz_micros(*v),
         ConnectorValue::TimestampNanos(v) => Datum::timestamp_nanos(*v),
         ConnectorValue::TimestampTzNanos(v) => Datum::timestamptz_nanos(*v),
+        ConnectorValue::Temporal { .. } => return None,
         ConnectorValue::Varchar(v) => Datum::string(v),
         ConnectorValue::Varbinary(v) => Datum::binary(v.iter().copied()),
         ConnectorValue::Uuid(v) => Datum::uuid(Uuid::from_bytes(*v)),

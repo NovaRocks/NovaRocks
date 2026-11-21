@@ -339,6 +339,18 @@ fn validate_implicit_target(
     span: Span,
 ) -> Result<(), AnalyzeError> {
     use DataType::*;
+    if target == RequiredConstantTarget::TimeZone {
+        let ty = source.value_type();
+        if matches!(ty.kind(), ValueKind::String)
+            || matches!(ty.temporal(), Some(novarocks_type_contract::TemporalType::Interval(qualifier)) if !qualifier.is_year_month())
+        {
+            return Ok(());
+        }
+        return Err(AnalyzeError::type_mismatch(
+            "Expected an expression of varchar or interval day-time type",
+            span,
+        ));
+    }
     // The semantic value kind owns this decision. A dictionary layout, a
     // nominal Utf8 value, and a physical SQL string are not interchangeable.
     let allowed = if target == RequiredConstantTarget::Timestamp {
@@ -420,7 +432,7 @@ fn required_target_value_type(
                     ),
             ))
         }
-        RequiredConstantTarget::Timestamp => source
+        RequiredConstantTarget::Timestamp | RequiredConstantTarget::TimeZone => source
             .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
             .map_err(AnalyzeError::control),
         RequiredConstantTarget::ArrayVarchar => {

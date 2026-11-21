@@ -880,6 +880,7 @@ pub struct FrontendApplicationHost {
     control_membership_failure: Option<Arc<MembershipShutdownError>>,
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
+    statement_clock: StatementClock,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     mv_scheduler_config: MvSchedulerConfig,
     mv_maintenance_config: MaintenanceCoordinatorConfig,
@@ -971,6 +972,115 @@ impl FrontendLogicalExecutionRuntimeConfig {
     }
 }
 
+/// FE-local source for statement wall time. Deadlines keep their own
+/// monotonic clock; packages receive only the frozen statement facts.
+#[derive(Clone)]
+pub(crate) struct StatementClock {
+    default_zone: novarocks_type_contract::TimeZoneKey,
+    sample: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+}
+
+impl Default for StatementClock {
+    fn default() -> Self {
+        Self {
+            default_zone: novarocks_type_contract::TimeZoneKey::UTC,
+            sample: Arc::new(std::time::SystemTime::now),
+        }
+    }
+}
+
+impl StatementClock {
+    #[cfg(test)]
+    pub(crate) fn with_test_sample(
+        default_zone: novarocks_type_contract::TimeZoneKey,
+        sample: impl Fn() -> std::time::SystemTime + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            default_zone,
+            sample: Arc::new(sample),
+        }
+    }
+
+    pub(crate) fn capture(
+        &self,
+    ) -> Result<
+        (
+            std::time::SystemTime,
+            novarocks_type_contract::StatementTimeEnvironment,
+        ),
+        &'static str,
+    > {
+        use std::time::UNIX_EPOCH;
+        let time = (self.sample)();
+        let nanos = match time.duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos() as i128,
+            Err(error) => -(error.duration().as_nanos() as i128),
+        };
+        let seconds = i64::try_from(nanos.div_euclid(1_000_000_000))
+            .map_err(|_| "Statement start exceeds the signed UTC second range")?;
+        let nanos = nanos.rem_euclid(1_000_000_000) as u32;
+        let start = novarocks_type_contract::StatementStartUtc::try_new(seconds, nanos)
+            .ok_or("Statement start is not normalized")?;
+        Ok((
+            time,
+            novarocks_type_contract::StatementTimeEnvironment {
+                start,
+                zone: self.default_zone,
+            },
+        ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_statement_time() -> novarocks_type_contract::StatementTimeEnvironment {
+    novarocks_type_contract::StatementTimeEnvironment {
+        start: novarocks_type_contract::StatementStartUtc::try_new(1, 234_567_890).unwrap(),
+        zone: novarocks_type_contract::TimeZoneKey::UTC,
+    }
+}
+
+#[cfg(test)]
+mod statement_clock_tests {
+    use super::StatementClock;
+    use novarocks_type_contract::TimeZoneKey;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn statement_clock_samples_once_and_normalizes_a_negative_instant() {
+        let samples = Arc::new(AtomicUsize::new(0));
+        let clock = StatementClock {
+            default_zone: TimeZoneKey::parse("America/New_York").unwrap(),
+            sample: Arc::new({
+                let samples = Arc::clone(&samples);
+                move || {
+                    let nth = samples.fetch_add(1, Ordering::Relaxed);
+                    if nth == 0 {
+                        UNIX_EPOCH - Duration::from_nanos(123)
+                    } else {
+                        UNIX_EPOCH + Duration::from_nanos(3)
+                    }
+                }
+            }),
+        };
+        let (raw, first) = clock.capture().unwrap();
+        assert_eq!(raw, UNIX_EPOCH - Duration::from_nanos(123));
+        assert_eq!(
+            (first.start.seconds(), first.start.nanos()),
+            (-1, 999_999_877)
+        );
+        assert_eq!(first.zone, clock.default_zone);
+        assert_eq!(samples.load(Ordering::Relaxed), 1);
+
+        let (_, second) = clock.capture().unwrap();
+        assert_eq!((second.start.seconds(), second.start.nanos()), (0, 3));
+        assert_eq!(second.zone, first.zone);
+    }
+}
+
 #[derive(Clone)]
 pub struct FrontendExecutionConfig {
     native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
@@ -997,6 +1107,7 @@ pub struct FrontendExecutionConfig {
     /// SQL costing only ever sees the value admission froze; it never consults
     /// a process-global configuration.
     optimizer_query_mem_limit_bytes: u64,
+    statement_clock: StatementClock,
     /// Query-control timeouts frozen from `[runtime]` and handed to the
     /// coordinator, which validates them once at startup instead of per query.
     query_control_timeouts: FrontendQueryControlTimeouts,
@@ -1073,6 +1184,7 @@ impl FrontendExecutionConfig {
             mv_management_audit: None,
             mv_startup_isolation: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
+            statement_clock: StatementClock::default(),
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
             coordination_budgets: CoordinationBudgets::DEFAULT,
@@ -1242,6 +1354,14 @@ impl FrontendExecutionConfig {
 
     pub(crate) const fn lake_publication_runtime_policy(&self) -> LakePublicationRuntimePolicy {
         self.lake_publication_runtime_policy
+    }
+
+    pub fn with_default_statement_time_zone(
+        mut self,
+        zone: novarocks_type_contract::TimeZoneKey,
+    ) -> Self {
+        self.statement_clock.default_zone = zone;
+        self
     }
 
     pub fn with_optimizer_query_mem_limit_bytes(mut self, bytes: u64) -> Self {
@@ -1545,6 +1665,7 @@ impl FrontendApplicationHost {
             control_membership_failure: None,
             topology: None,
             optimizer_query_mem_limit_bytes: execution.optimizer_query_mem_limit_bytes(),
+            statement_clock: execution.statement_clock.clone(),
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
             mv_scheduler_config: execution.mv_scheduler.clone(),
             mv_maintenance_config: execution.mv_maintenance.clone(),
@@ -2169,6 +2290,10 @@ impl FrontendApplicationHost {
     }
 
     /// Cost budget frozen from `[runtime]`, handed to statement admission.
+    pub(crate) fn statement_clock(&self) -> StatementClock {
+        self.statement_clock.clone()
+    }
+
     pub fn optimizer_query_mem_limit_bytes(&self) -> u64 {
         self.optimizer_query_mem_limit_bytes
     }

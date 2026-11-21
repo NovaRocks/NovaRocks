@@ -73,7 +73,12 @@ fn effects(scope: v2::proof_scope::Kind) -> v2::CallEffects {
 fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
     use v2::semantic_parameter::Value;
     let values = [
-        Value::StatementStartUtcMicros(i64::MIN),
+        Value::StatementStartUtc(
+            novarocks_proto_models::physical_semantics_v2::StatementStartUtc {
+                seconds: Some(i64::MIN),
+                nanos: Some(7),
+            },
+        ),
         Value::TimeZone("+08:00".into()),
         Value::AllowThrowException(false),
         Value::DecimalOverflowToDouble(true),

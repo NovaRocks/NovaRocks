@@ -147,7 +147,7 @@ fn analytic_copy_operation_port_default_original_batches_and_original_boundaries
         }]
     );
     let key: ArrayRef = Arc::new(Int32Array::from(vec![2, 0, 1, 0]));
-    let ordered = stages::regroup(&result.value, &[key], &mut work).unwrap();
+    let ordered = stages::regroup(&result.value, &[key], None, &mut work).unwrap();
     assert_eq!(
         work.occurrences[1],
         Occurrence::Take {
@@ -212,7 +212,7 @@ fn analytic_copy_operation_port_zero_columns_single_source_and_identity_skip_cop
         single.record_batch().column(0)
     ));
     let key = Arc::clone(single.record_batch().column(0));
-    let identity = stages::regroup(&single, &[key], &mut work).unwrap();
+    let identity = stages::regroup(&single, &[key], None, &mut work).unwrap();
     assert!(Arc::ptr_eq(
         identity.value.record_batch().column(0),
         single.record_batch().column(0)
@@ -233,7 +233,7 @@ fn analytic_copy_operation_port_same_default_control_trace_and_data_formatter() 
                 AnalyticInputStage::Gather => { drop(stages::gather(&[source.clone(), chunk(Arc::new(Int64Array::from(vec![1, 2])))], work)?); }
                 AnalyticInputStage::Regroup => {
                     let key: ArrayRef = Arc::new(BinaryArray::from(vec![b"x".as_slice(), b"z".as_slice(), b"y".as_slice(), b"w".as_slice()]));
-                    drop(stages::regroup(&source, &[key], work)?);
+                    drop(stages::regroup(&source, &[key], None, work)?);
                 }
                 AnalyticInputStage::OutputSplit => { drop(stages::split(schema(DataType::Int64), source.columns(), std::slice::from_ref(&source), work)?); }
             }

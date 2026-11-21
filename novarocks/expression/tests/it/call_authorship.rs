@@ -325,7 +325,9 @@ fn shared_if_authors_exact_guarded_claims_for_value_and_truth_demands() {
     let sealed = fixture.seal();
     let parameters = SemanticParameters::try_new([(
         novarocks_type_contract::SemanticParameterId::new(91),
-        novarocks_type_contract::SemanticParameterValue::TimeZone("UTC".into()),
+        novarocks_type_contract::SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
     )])
     .unwrap();
     let authored = fixture
@@ -667,8 +669,13 @@ fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals
 
     for invalid in [
         SemanticParameters::default(),
-        SemanticParameters::try_new([(allow.id, SemanticParameterValue::TimeZone("UTC".into()))])
-            .unwrap(),
+        SemanticParameters::try_new([(
+            allow.id,
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
+        )])
+        .unwrap(),
     ] {
         let Err(error @ CallAuthorError::Capability(CapabilityRefusal::Effects(_))) =
             fixture.author(&sealed, &invalid, &HarnessControl)

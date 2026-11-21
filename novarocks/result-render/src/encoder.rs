@@ -35,6 +35,9 @@ use std::ops::Range;
 use std::sync::Arc;
 #[path = "json_cursor.rs"]
 mod json_cursor;
+#[path = "legacy_map_key.rs"]
+mod legacy_map_key;
+use legacy_map_key::LegacyMapKeys;
 #[path = "variant_cursor.rs"]
 mod variant_cursor;
 use json_cursor::{JsonCursor, Utf8};
@@ -166,6 +169,7 @@ impl Source {
 #[derive(Clone, Copy)]
 enum Mode {
     Json,
+    RawUtf8,
     Base64,
 }
 struct Stream {
@@ -232,12 +236,25 @@ struct Variant {
     range: Range<usize>,
     depth: usize,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueText {
+    Json,
+    MapKey,
+    MapKeyMember,
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "Inline formatting atoms share the fixed, accounted cursor stack and must not allocate per cell"
 )]
 enum EncodeStep {
     JsonEscape(bool),
+    RawKey {
+        array: ArrayRef,
+        row: usize,
+        path: Path,
+        mode: ValueText,
+    },
     TrinoKey {
         array: ArrayRef,
         row: usize,
@@ -254,6 +271,7 @@ enum EncodeStep {
         end: usize,
         path: Path,
         first: bool,
+        object_text: bool,
     },
     Map {
         array: ArrayRef,
@@ -268,6 +286,7 @@ enum EncodeStep {
         row: usize,
         path: Path,
         next: usize,
+        object_text: bool,
     },
     Stream(Stream),
     Atom(Atom),
@@ -338,7 +357,7 @@ fn stream_next(
                 stream.at += n;
                 b.scan(n);
             }
-            Mode::Json => {
+            Mode::Json | Mode::RawUtf8 => {
                 b.scan(1);
                 stream.at += 1;
                 if let Some(j) = &mut stream.json
@@ -358,6 +377,9 @@ fn stream_next(
                 }
                 if let Some(u) = &mut stream.utf8 {
                     u.feed(c)?;
+                }
+                if matches!(stream.mode, Mode::RawUtf8) {
+                    return Ok(Poll::Byte(c));
                 }
                 let mut escaped = [0; 6];
                 let count = trino_json::escape_byte(c, &mut escaped);
@@ -443,6 +465,12 @@ enum Poll {
     Byte(u8),
     Done,
     Yield,
+    CheckLegacyKeys {
+        array: ArrayRef,
+        start: usize,
+        end: usize,
+        path: Path,
+    },
 }
 const CELL_TASK_CAPACITY: usize = 196;
 
@@ -453,6 +481,7 @@ struct CellCursor {
     escaped_len: usize,
     stack: Vec<EncodeStep>,
     elements: usize,
+    legacy_keys: Option<(ArrayRef, usize, usize, Path)>,
 }
 impl CellCursor {
     fn new() -> Self {
@@ -463,6 +492,7 @@ impl CellCursor {
             escaped_len: 0,
             stack: Vec::with_capacity(CELL_TASK_CAPACITY),
             elements: 0,
+            legacy_keys: None,
         }
     }
     fn reset(&mut self, array: ArrayRef, row: usize, path: Path, base: usize) {
@@ -471,7 +501,18 @@ impl CellCursor {
         self.escaped_at = 0;
         self.escaped_len = 0;
         self.elements = base;
+        self.legacy_keys = None;
         self.stack.push(EncodeStep::Value { array, row, path });
+    }
+    fn reset_key(&mut self, array: ArrayRef, row: usize, path: Path) {
+        self.stack.clear();
+        self.elements = 0;
+        self.stack.push(EncodeStep::RawKey {
+            array,
+            row,
+            path,
+            mode: ValueText::MapKey,
+        });
     }
     fn push(&mut self, t: EncodeStep) -> Result<(), RenderError> {
         if self.stack.len() >= CELL_TASK_CAPACITY {
@@ -553,6 +594,7 @@ impl CellCursor {
                             charge(b, 1);
                         }
                         Poll::Done | Poll::Yield => break,
+                        Poll::CheckLegacyKeys { .. } => unreachable!("streams contain no maps"),
                     }
                 }
                 Ok(n)
@@ -560,7 +602,12 @@ impl CellCursor {
             _ => Ok(0),
         }
     }
-    fn next(&mut self, s: &ClientRenderSchema, b: &mut Budget) -> Result<Poll, RenderError> {
+    fn next(
+        &mut self,
+        s: &ClientRenderSchema,
+        b: &mut Budget,
+        legacy_key_fields: &[usize],
+    ) -> Result<Poll, RenderError> {
         if !b.room(4096) {
             return Ok(Poll::Yield);
         }
@@ -570,7 +617,7 @@ impl CellCursor {
             b.scan(1);
             return Ok(Poll::Byte(byte));
         }
-        let poll = self.next_raw(s, b)?;
+        let poll = self.next_raw(s, b, legacy_key_fields)?;
         if let Poll::Byte(byte) = poll
             && self.json_escape
         {
@@ -581,12 +628,25 @@ impl CellCursor {
         }
         Ok(poll)
     }
-    fn next_raw(&mut self, s: &ClientRenderSchema, b: &mut Budget) -> Result<Poll, RenderError> {
+    fn next_raw(
+        &mut self,
+        s: &ClientRenderSchema,
+        b: &mut Budget,
+        legacy_key_fields: &[usize],
+    ) -> Result<Poll, RenderError> {
         loop {
             // Leave capacity for both a maximum fixed descriptor/atom operation
             // and the caller's destination byte. No uncharged scans occur here.
             if !b.room(4096) {
                 return Ok(Poll::Yield);
+            }
+            if let Some((array, start, end, path)) = self.legacy_keys.take() {
+                return Ok(Poll::CheckLegacyKeys {
+                    array,
+                    start,
+                    end,
+                    path,
+                });
             }
             if let Some(EncodeStep::Atom(a)) = self.stack.last_mut() {
                 if a.at < a.len {
@@ -647,13 +707,35 @@ impl CellCursor {
             match task {
                 EncodeStep::JsonEscape(enabled) => self.json_escape = enabled,
                 EncodeStep::TrinoKey { array, row, path } => {
+                    self.literal(b"\"")?;
+                    self.push(EncodeStep::JsonEscape(false))?;
+                    self.push(EncodeStep::RawKey {
+                        array,
+                        row,
+                        path,
+                        mode: ValueText::MapKey,
+                    })?;
+                    self.push(EncodeStep::JsonEscape(true))?;
+                    self.literal(b"\"")?;
+                }
+                EncodeStep::RawKey {
+                    array,
+                    row,
+                    path,
+                    mode,
+                } => {
                     if !b.cell() {
-                        self.push(EncodeStep::TrinoKey { array, row, path })?;
+                        self.push(EncodeStep::RawKey {
+                            array,
+                            row,
+                            path,
+                            mode,
+                        })?;
                         return Ok(Poll::Yield);
                     }
                     self.element()?;
                     b.scan(32 + usize::from(path.depth) * 2);
-                    self.trino_value(array, row, path, s, true, b)?;
+                    self.trino_value(array, row, path, s, mode, b, legacy_key_fields)?;
                 }
                 EncodeStep::Stream(_) | EncodeStep::Atom(_) => {
                     unreachable!("byte tasks are advanced in place")
@@ -677,7 +759,7 @@ impl CellCursor {
                         self.literal(b"null")?;
                         continue;
                     }
-                    self.trino_value(array, row, path, s, false, b)?;
+                    self.trino_value(array, row, path, s, ValueText::Json, b, legacy_key_fields)?;
                 }
                 EncodeStep::List {
                     array,
@@ -685,6 +767,7 @@ impl CellCursor {
                     end,
                     path,
                     first,
+                    object_text,
                 } => {
                     if next < end {
                         let child = path.child(0)?;
@@ -694,14 +777,24 @@ impl CellCursor {
                             end,
                             path,
                             first: false,
+                            object_text,
                         })?;
-                        self.push(EncodeStep::Value {
-                            array,
-                            row: next,
-                            path: child,
+                        self.push(if object_text {
+                            EncodeStep::RawKey {
+                                array,
+                                row: next,
+                                path: child,
+                                mode: ValueText::MapKeyMember,
+                            }
+                        } else {
+                            EncodeStep::Value {
+                                array,
+                                row: next,
+                                path: child,
+                            }
                         })?;
                         if !first {
-                            self.literal(b",")?;
+                            self.literal(if object_text { b", " } else { b"," })?;
                         }
                     }
                 }
@@ -754,6 +847,7 @@ impl CellCursor {
                     row,
                     path,
                     next,
+                    object_text,
                 } => {
                     let fields = if let N::Struct(fields) = &path.field(s)?.native_type {
                         fields
@@ -767,14 +861,25 @@ impl CellCursor {
                             row,
                             path,
                             next: next + 1,
+                            object_text,
                         })?;
-                        self.push(EncodeStep::Value {
-                            array: child,
-                            row,
-                            path: path.child(next)?,
+                        let path = path.child(next)?;
+                        self.push(if object_text {
+                            EncodeStep::RawKey {
+                                array: child,
+                                row,
+                                path,
+                                mode: ValueText::MapKeyMember,
+                            }
+                        } else {
+                            EncodeStep::Value {
+                                array: child,
+                                row,
+                                path,
+                            }
                         })?;
                         if next != 0 {
-                            self.literal(b",")?;
+                            self.literal(if object_text { b", " } else { b"," })?;
                         }
                     }
                 }
@@ -1223,6 +1328,9 @@ fn validate_field(f: &RenderField, d: &DataType, nested: bool) -> Result<(), Ren
         (N::Timestamp { unit, timezone }, DataType::Timestamp(u, tz)) => {
             unit_matches(*unit, u) && timezone.as_deref() == tz.as_deref()
         }
+        (N::Temporal(ty), _) => {
+            novarocks_type_contract::TemporalType::try_from(*ty).is_ok_and(|ty| ty.carrier() == *d)
+        }
         (N::List(child), DataType::List(field) | DataType::LargeList(field)) => {
             if child.nullable != field.is_nullable() {
                 return Err(error(E::SchemaMismatch));
@@ -1314,6 +1422,7 @@ struct ArrowClientRowEncoder {
     stage: Box<[u8; V::SMALL_ROW_BYTES]>,
     lengths: Box<[u32; V::MAX_COLUMNS]>,
     cursor: CellCursor,
+    legacy_keys: Option<Box<LegacyMapKeys>>,
     phase: Phase,
     row: usize,
     column: usize,
@@ -1438,8 +1547,10 @@ impl ArrowClientRowEncoder {
                 })?;
             }
         }
+        let legacy_keys = LegacyMapKeys::for_schema(&schema)?;
         Ok(Self {
             schema,
+            legacy_keys,
             batch,
             stage: Box::new([0; V::SMALL_ROW_BYTES]),
             lengths: Box::new([0; V::MAX_COLUMNS]),
@@ -1468,6 +1579,9 @@ impl ArrowClientRowEncoder {
         self.stage_at = 0;
         self.prefix_at = 0;
         self.cursor.stack.clear();
+        if let Some(keys) = &mut self.legacy_keys {
+            keys.clear();
+        }
     }
     fn start_cell(&mut self, budget: &mut Budget) -> Result<bool, RenderError> {
         if !budget.room(4096) || !budget.cell() {
@@ -1647,15 +1761,35 @@ impl ArrowClientRowEncoder {
                 b.emit(1);
                 continue;
             }
+            if let Some(keys) = &mut self.legacy_keys
+                && !keys.advance(&self.schema, &mut b)?
+            {
+                break;
+            }
+            let legacy_key_fields = match (&self.legacy_keys, &self.phase) {
+                (Some(keys), Phase::Small | Phase::Count) => keys.field_ids(),
+                _ => &[],
+            };
             if self.phase == Phase::Small && self.stage_len == V::SMALL_ROW_BYTES {
                 // Ask the cursor before classifying a row that ends exactly
                 // at the staging boundary as a larger counted row.
-                match self.cursor.next(&self.schema, &mut b)? {
+                match self.cursor.next(&self.schema, &mut b, legacy_key_fields)? {
                     Poll::Done => {
                         self.complete_cell()?;
                     }
                     Poll::Yield => break,
                     Poll::Byte(_) => self.reset_row(Phase::Count),
+                    Poll::CheckLegacyKeys {
+                        array,
+                        start,
+                        end,
+                        path,
+                    } => {
+                        self.legacy_keys
+                            .as_mut()
+                            .ok_or_else(invalid)?
+                            .begin(array, start, end, path)?;
+                    }
                 }
                 continue;
             }
@@ -1694,8 +1828,19 @@ impl ArrowClientRowEncoder {
                 }
                 continue;
             }
-            match self.cursor.next(&self.schema, &mut b)? {
+            match self.cursor.next(&self.schema, &mut b, legacy_key_fields)? {
                 Poll::Yield => break,
+                Poll::CheckLegacyKeys {
+                    array,
+                    start,
+                    end,
+                    path,
+                } => {
+                    self.legacy_keys
+                        .as_mut()
+                        .ok_or_else(invalid)?
+                        .begin(array, start, end, path)?;
+                }
                 Poll::Done => {
                     self.complete_cell()?;
                 }
@@ -1749,18 +1894,37 @@ impl BoundedClientRowEncoder for ArrowClientRowEncoder {
     fn cancel(&mut self) {
         self.phase = Phase::Cancelled;
         self.cursor.stack.clear();
+        if let Some(keys) = &mut self.legacy_keys {
+            keys.clear();
+        }
     }
     fn scratch_capacity_bytes(&self) -> usize {
         size_of::<Self>()
             + size_of::<[u8; V::SMALL_ROW_BYTES]>()
             + size_of::<[u32; V::MAX_COLUMNS]>()
             + self.cursor.stack.capacity() * size_of::<EncodeStep>()
+            + self
+                .legacy_keys
+                .as_ref()
+                .map_or(0, |keys| keys.scratch_capacity())
     }
 }
 
 /// All encoder allocations are fixed before the first turn. The stack refuses
 /// an additional task before its original allocation could grow.
 pub(super) const fn scratch_capacity_bound_bytes() -> usize {
+    basic_scratch_capacity_bound_bytes() + LegacyMapKeys::scratch_capacity_bound()
+}
+
+pub(super) fn scratch_capacity_bound_for_schema(schema: &ClientRenderSchema) -> usize {
+    if LegacyMapKeys::required_for(schema) {
+        scratch_capacity_bound_bytes()
+    } else {
+        basic_scratch_capacity_bound_bytes()
+    }
+}
+
+const fn basic_scratch_capacity_bound_bytes() -> usize {
     size_of::<ArrowClientRowEncoder>()
         + size_of::<[u8; V::SMALL_ROW_BYTES]>()
         + size_of::<[u32; V::MAX_COLUMNS]>()

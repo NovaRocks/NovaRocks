@@ -24,6 +24,7 @@ use novarocks_proto_models::physical_semantics_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, MAX_SEMANTIC_PARAMETERS, SemanticParameterError, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    StatementStartUtc, TimeZoneKey,
 };
 
 pub(super) fn encode_key(key: SemanticParameterKey) -> i32 {
@@ -144,26 +145,21 @@ fn emit_parameter_entries(
         work.step()?;
         let value = match value {
             SemanticParameterValue::StatementStartUtc(value) => {
-                wire::semantic_parameter::Value::StatementStartUtcMicros(*value)
+                wire::semantic_parameter::Value::StatementStartUtc(wire::StatementStartUtc {
+                    seconds: Some(value.seconds()),
+                    nanos: Some(value.nanos()),
+                })
             }
             SemanticParameterValue::TimeZone(value) => {
-                if value.len() > 255 {
-                    return Err(SemanticsCodecError::from(
-                        SemanticParameterError::InvalidTimeZone,
-                    ));
-                }
                 if observed {
                     work.flush()?;
                 }
-                // Borrow the actual str specialization: formatting Box<str>
-                // through Display would grow short Strings to at least eight
-                // bytes, invalidating the exact source-length request bound.
-                let copied = value.as_ref().to_string();
+                let name = value.name().to_owned();
                 if observed {
                     work.step()?;
                     work.flush()?;
                 }
-                wire::semantic_parameter::Value::TimeZone(copied)
+                wire::semantic_parameter::Value::TimeZone(name)
             }
             SemanticParameterValue::AllowThrowException(value) => {
                 wire::semantic_parameter::Value::AllowThrowException(*value)
@@ -191,18 +187,24 @@ fn decode_value(
 ) -> Result<SemanticParameterValue, SemanticsCodecError> {
     use wire::semantic_parameter::Value;
     match value {
-        Some(Value::StatementStartUtcMicros(value)) => {
-            Ok(SemanticParameterValue::StatementStartUtc(*value))
+        Some(Value::StatementStartUtc(value)) => {
+            let start = value
+                .seconds
+                .zip(value.nanos)
+                .and_then(|(seconds, nanos)| StatementStartUtc::try_new(seconds, nanos))
+                .ok_or(SemanticsCodecError::InvalidShape(
+                    "statement start must contain UTC seconds and normalized nanoseconds",
+                ))?;
+            Ok(SemanticParameterValue::StatementStartUtc(start))
         }
         Some(Value::TimeZone(value)) => {
-            // Check before cloning. The public owner performs the remaining
-            // empty/control-character validation on this bounded spelling.
             if value.len() > 255 {
-                return Err(SemanticsCodecError::from(
-                    SemanticParameterError::InvalidTimeZone,
-                ));
+                return Err(SemanticParameterError::InvalidTimeZone.into());
             }
-            Ok(SemanticParameterValue::TimeZone(value.as_str().into()))
+            let key = TimeZoneKey::parse(value)
+                .filter(|key| key.name() == value)
+                .ok_or(SemanticParameterError::InvalidTimeZone)?;
+            Ok(SemanticParameterValue::TimeZone(key))
         }
         Some(Value::AllowThrowException(value)) => {
             Ok(SemanticParameterValue::AllowThrowException(*value))
@@ -358,16 +360,6 @@ pub fn decode_writer_semantic_parameters_with_creator_in<H>(
                     SemanticsCodecError::from(SemanticParameterError::InvalidTimeZone).into(),
                 );
             }
-            work.flush().map_err(SemanticsCodecError::from)?;
-            if !value.is_empty() {
-                creation
-                    .request_layout(Layout::array::<u8>(value.len()).map_err(|_| {
-                        SemanticsCodecError::SourceModel(
-                            "writer timezone layout is unrepresentable",
-                        )
-                    })?)
-                    .map_err(ProjectionFailure::Host)?;
-            }
         }
     }
     let parameters = decode_parameters_observed(source, work)?;
@@ -474,7 +466,13 @@ mod tests {
         use wire::semantic_parameter::Value;
         let dto = wire::SemanticParameters {
             entries: vec![
-                entry(0, Value::StatementStartUtcMicros(i64::MIN)),
+                entry(
+                    0,
+                    wire::semantic_parameter::Value::StatementStartUtc(wire::StatementStartUtc {
+                        seconds: Some(i64::MIN),
+                        nanos: Some(0),
+                    }),
+                ),
                 entry(9, Value::TimeZone("-07:30".into())),
                 entry(11, Value::AllowThrowException(false)),
                 entry(13, Value::DecimalOverflowToDouble(true)),
@@ -486,11 +484,15 @@ mod tests {
         let expected = SemanticParameters::try_new([
             (
                 SemanticParameterId::new(0),
-                SemanticParameterValue::StatementStartUtc(i64::MIN),
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(i64::MIN, 0).unwrap(),
+                ),
             ),
             (
                 SemanticParameterId::new(9),
-                SemanticParameterValue::TimeZone("-07:30".into()),
+                SemanticParameterValue::TimeZone(
+                    novarocks_type_contract::TimeZoneKey::parse("-07:30").unwrap(),
+                ),
             ),
             (
                 SemanticParameterId::new(11),
@@ -629,7 +631,7 @@ mod tests {
             assert_eq!(decoded, reference);
             assert_eq!(
                 table.require(decoded).unwrap(),
-                &SemanticParameterValue::TimeZone(zone.into())
+                &SemanticParameterValue::TimeZone(TimeZoneKey::parse(zone).unwrap())
             );
         }
         assert!(matches!(
@@ -712,8 +714,20 @@ mod tests {
         );
         let clocks = wire::SemanticParameters {
             entries: vec![
-                entry(0, Value::StatementStartUtcMicros(-1)),
-                entry(u32::MAX, Value::StatementStartUtcMicros(-1)),
+                entry(
+                    0,
+                    wire::semantic_parameter::Value::StatementStartUtc(wire::StatementStartUtc {
+                        seconds: Some(-1),
+                        nanos: Some(0),
+                    }),
+                ),
+                entry(
+                    u32::MAX,
+                    wire::semantic_parameter::Value::StatementStartUtc(wire::StatementStartUtc {
+                        seconds: Some(-1),
+                        nanos: Some(0),
+                    }),
+                ),
             ],
         };
         assert!(matches!(
@@ -736,7 +750,15 @@ mod tests {
 
     #[test]
     fn parameter_time_zone_bound_and_public_spelling_validation_are_preserved() {
-        for spelling in ["", "UTC\n", "\0", &"a".repeat(256), &"é".repeat(128)] {
+        for spelling in [
+            "",
+            "UTC\n",
+            "Z",
+            "+00:00",
+            "\0",
+            &"a".repeat(256),
+            &"é".repeat(128),
+        ] {
             let dto = wire::SemanticParameters {
                 entries: vec![entry(
                     0,
@@ -750,7 +772,7 @@ mod tests {
                 ))
             ));
         }
-        let spelling = "a".repeat(255);
+        let spelling = "America/Argentina/Buenos_Aires".to_owned();
         let dto = wire::SemanticParameters {
             entries: vec![entry(
                 u32::MAX,
@@ -760,8 +782,42 @@ mod tests {
         let table = decode(&dto, &Control::default()).unwrap();
         assert_eq!(
             table.get(SemanticParameterId::new(u32::MAX)),
-            Some(&SemanticParameterValue::TimeZone(spelling.into_boxed_str()))
+            Some(&SemanticParameterValue::TimeZone(
+                TimeZoneKey::parse(&spelling).unwrap()
+            ))
         );
+        assert_eq!(encode(&table, &Control::default()).unwrap(), dto);
+    }
+
+    #[test]
+    fn statement_start_requires_presence_and_normalized_nanoseconds() {
+        use wire::semantic_parameter::Value;
+        for (seconds, nanos) in [
+            (None, Some(0)),
+            (Some(0), None),
+            (Some(0), Some(1_000_000_000)),
+        ] {
+            let dto = wire::SemanticParameters {
+                entries: vec![entry(
+                    0,
+                    Value::StatementStartUtc(wire::StatementStartUtc { seconds, nanos }),
+                )],
+            };
+            assert!(matches!(
+                decode(&dto, &Control::default()),
+                Err(SemanticsCodecError::InvalidShape(_))
+            ));
+        }
+        let dto = wire::SemanticParameters {
+            entries: vec![entry(
+                0,
+                Value::StatementStartUtc(wire::StatementStartUtc {
+                    seconds: Some(-1),
+                    nanos: Some(987_654_321),
+                }),
+            )],
+        };
+        let table = decode(&dto, &Control::default()).unwrap();
         assert_eq!(encode(&table, &Control::default()).unwrap(), dto);
     }
 

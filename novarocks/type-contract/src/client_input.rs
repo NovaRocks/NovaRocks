@@ -135,6 +135,7 @@ fn matches_field(
     }
     *nodes -= 1;
     match (&field.native_type, value.kind()) {
+        (N::Temporal(expected), ValueKind::Temporal(actual)) => *expected == (*actual).into(),
         (N::String, ValueKind::String) | (N::Binary, ValueKind::Binary) => true,
         (N::Json, ValueKind::Nominal(V::Json))
         | (N::Variant, ValueKind::Nominal(V::Variant))
@@ -263,6 +264,7 @@ mod tests {
                     novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                         novarocks_result_contract::TrinoJsonFacts {
                             parametric_datetime: true,
+                            parametric_interval: false,
                             variant: true,
                             variant_binary: true,
                         },
@@ -339,6 +341,7 @@ mod tests {
                 novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                     novarocks_result_contract::TrinoJsonFacts {
                         parametric_datetime: true,
+                        parametric_interval: false,
                         variant: true,
                         variant_binary: true
                     }

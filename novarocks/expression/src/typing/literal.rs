@@ -15,9 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::{DataType, TimeUnit};
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
-use novarocks_type_contract::{CompileCheckpoints, FunctionValueType, ValueLogicalType};
+use novarocks_functions::temporal_value::{
+    ParsedTemporal, parse_time_literal, parse_timestamp_literal,
+};
+use novarocks_parser::ast;
+use novarocks_type_contract::{
+    CompileCheckpoints, CompilePhase, FunctionValueType, ValueLogicalType,
+};
 
 use super::{CarrierConversion, LiteralValue, TypingError, admit_syntax_constant};
 
@@ -32,7 +40,7 @@ pub enum LiteralSyntax<'a> {
     String(&'a str),
     Binary(&'a [u8]),
     TypedString { name: &'a str, value: &'a str },
-    Interval,
+    Interval(&'a ast::IntervalLiteral),
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +70,10 @@ impl TypedLiteral {
 #[derive(Debug)]
 pub enum LiteralEmission {
     Direct(TypedLiteral),
+    Constant {
+        value_type: FunctionValueType,
+        value: ConstantValue,
+    },
     Cast {
         input: TypedLiteral,
         declared_result: FunctionValueType,
@@ -126,6 +138,31 @@ pub(super) fn type_literal(
             false,
         ),
         LiteralSyntax::TypedString { name, value } => {
+            let parser: Option<
+                fn(
+                    &str,
+                )
+                    -> Result<ParsedTemporal, novarocks_functions::temporal_value::LiteralError>,
+            > = if name.eq_ignore_ascii_case("time") {
+                Some(parse_time_literal)
+            } else if name.eq_ignore_ascii_case("timestamp") {
+                Some(parse_timestamp_literal)
+            } else {
+                None
+            };
+            if let Some(parse) = parser {
+                for _ in value.bytes() {
+                    work.step()?;
+                }
+                let parsed = parse(value).map_err(
+                    |error: novarocks_functions::temporal_value::LiteralError| {
+                        TypingError::InvalidLiteral(format!(
+                            "invalid {name} literal '{value}': {error}"
+                        ))
+                    },
+                )?;
+                return temporal_constant(context, parsed, work);
+            }
             let target = typed_string(name).ok_or_else(|| {
                 TypingError::Unsupported(format!("generic literal type {name} is not supported"))
             })?;
@@ -144,18 +181,14 @@ pub(super) fn type_literal(
                 .map(LiteralEmission::Direct);
             }
             if target == DataType::Date32 {
-                let date = value.trim_matches(['\'', '"']);
-                let days = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                    .map_err(|error| {
-                        TypingError::InvalidLiteral(format!(
-                            "invalid date literal '{date}': {error}"
-                        ))
-                    })?
-                    .signed_duration_since(
-                        chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch"),
-                    )
-                    .num_days();
-                (LiteralValue::Int(days), target, false)
+                let days = novarocks_functions::temporal_value::parse_date_literal_observed(
+                    value,
+                    || work.step(),
+                )?
+                .ok_or_else(|| {
+                    TypingError::InvalidLiteral(format!("invalid DATE literal '{value}'"))
+                })?;
+                (LiteralValue::Int(i64::from(days)), target, false)
             } else {
                 // SQL has a non-null temporal literal declaration. The checked
                 // physical text cast can produce NULL and must retain that fact.
@@ -180,10 +213,15 @@ pub(super) fn type_literal(
                 });
             }
         }
-        LiteralSyntax::Interval => {
-            return Err(TypingError::Unsupported(
-                "INTERVAL literals are not supported".into(),
-            ));
+        LiteralSyntax::Interval(interval) => {
+            for _ in interval.value.bytes() {
+                work.step()?;
+            }
+            return temporal_constant(
+                context,
+                super::temporal::parse_interval_literal(interval)?,
+                work,
+            );
         }
     };
     TypedLiteral::checked(
@@ -193,6 +231,24 @@ pub(super) fn type_literal(
         work,
     )
     .map(LiteralEmission::Direct)
+}
+
+fn temporal_constant(
+    context: &super::TypingContext<'_>,
+    parsed: ParsedTemporal,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<LiteralEmission, TypingError> {
+    work.flush()?;
+    let value_type = super::temporal_function_value_type(parsed.ty, false)?;
+    let value = ConstantValue::from_temporal(
+        Arc::new(Field::new("value", parsed.ty.carrier(), false)),
+        value_type.clone(),
+        parsed.value,
+        context.constant_policy,
+        CompilePhase::FunctionSpecialization,
+        work.control(),
+    )?;
+    Ok(LiteralEmission::Constant { value_type, value })
 }
 
 fn infer_decimal_literal_type(s: &str) -> Result<DataType, TypingError> {

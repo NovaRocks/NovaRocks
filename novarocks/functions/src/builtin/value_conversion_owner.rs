@@ -37,8 +37,8 @@ use crate::{
     ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-fn implementation_pairs() -> [(&'static str, &'static str); 15] {
-    [
+fn implementation_pairs() -> &'static [(&'static str, &'static str)] {
+    &[
         (
             value_conversion::JSON_TEXT,
             "builtin.scalar/value_domain_conversion/json_text_same_structure/selected-v1",
@@ -96,8 +96,40 @@ fn implementation_pairs() -> [(&'static str, &'static str); 15] {
             "builtin.scalar/value_domain_conversion/null_to_typed_nullable/selected-v1",
         ),
         (
+            value_conversion::TEMPORAL,
+            "builtin.scalar/value_domain_conversion/temporal/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_WIDEN,
+            "builtin.scalar/value_domain_conversion/temporal_widen/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_ZONE,
+            "builtin.scalar/value_domain_conversion/temporal_zone/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_CLOCK,
+            "builtin.scalar/value_domain_conversion/temporal_clock/selected-v1",
+        ),
+        (
+            value_conversion::TRY_TEMPORAL,
+            "builtin.scalar/value_domain_conversion/try_temporal/selected-v1",
+        ),
+        (
+            value_conversion::TRY_TEMPORAL_ZONE,
+            "builtin.scalar/value_domain_conversion/try_temporal_zone/selected-v1",
+        ),
+        (
+            value_conversion::TRY_TEMPORAL_CLOCK,
+            "builtin.scalar/value_domain_conversion/try_temporal_clock/selected-v1",
+        ),
+        (
             value_conversion::ARRAY_COMMON_COERCION,
             "builtin.scalar/value_domain_conversion/array_common_coercion/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_WRITE_ASSIGNMENT,
+            "builtin.scalar/value_domain_conversion/nested_temporal_write_assignment/selected-v1",
         ),
     ]
 }
@@ -211,7 +243,7 @@ impl ValueConversionOwner {
             argument_control: base.argument_control,
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
-            environment: Box::default(),
+            environment: input.environment.into(),
             proof_scope: input.proof_scope,
         }
     }
@@ -255,6 +287,22 @@ impl PureFunctionMetadataOwner for ValueConversionOwner {
     }
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
+    }
+    fn admit_frozen_environment_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        environment: &[novarocks_type_contract::SemanticParameterRef],
+        parameters: &novarocks_type_contract::SemanticParameters,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        if conversion_environment_valid(selected, environment, parameters) {
+            Ok(())
+        } else {
+            Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ))
+        }
     }
 }
 
@@ -383,6 +431,20 @@ pub(super) fn prepared_for_test_with_policy(
     tests::prepare(source, target, policy)
 }
 
+fn conversion_environment_valid(
+    selected: &FunctionBindingSelection,
+    environment: &[novarocks_type_contract::SemanticParameterRef],
+    parameters: &novarocks_type_contract::SemanticParameters,
+) -> bool {
+    let keys = value_conversion::temporal_cast_dependencies(selected.overload.as_str());
+    environment.len() == keys.len()
+        && keys.iter().all(|key| {
+            environment.iter().any(|reference| {
+                reference.expected_key == *key && parameters.require(*reference).is_ok()
+            })
+        })
+}
+
 impl ValueConversionOwner {
     fn refine_selected_core(
         &self,
@@ -401,11 +463,13 @@ impl ValueConversionOwner {
             }
             let scope = matches!(input.proof_scope, CallProofScope::Unconditional)
                 || input.proof_scope == input.context.proof_scope();
-            let environment = input.environment.is_empty();
+            let environment =
+                conversion_environment_valid(input.selected, input.environment, input.parameters);
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !scope || !environment {
                 return Err(FunctionBindingError::InvalidBinding(
-                    "value conversion requires its exact proof scope and no environment".into(),
+                    "value conversion requires its exact proof scope and declared environment"
+                        .into(),
                 )
                 .into());
             }
@@ -436,7 +500,11 @@ impl ValueConversionOwner {
                     == input.context
                 && contract.decimal_overflow_policy() == input.decimal_overflow_policy
                 && contract.effects() == &self.call_effects(input)
-                && input.environment.is_empty();
+                && conversion_environment_valid(
+                    input.selected,
+                    input.environment,
+                    input.parameters,
+                );
             work.step().map_err(compile_failure)?;
             if !exact {
                 return Err(invalid(

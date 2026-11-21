@@ -882,6 +882,13 @@ fn domain_error(path: &'static str, error: impl std::fmt::Display) -> ConnectorC
 }
 
 fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
+    if let ConnectorValueType::Temporal(declaration) = value_type {
+        return dto::ValueType {
+            kind: dto::ValueTypeKind::Temporal as i32,
+            temporal: Some(novarocks_proto_codec::temporal_type::encode(declaration)),
+            ..Default::default()
+        };
+    }
     let (kind, decimal_precision, decimal_scale, fixed_length) = match value_type {
         ConnectorValueType::Boolean => (dto::ValueTypeKind::Boolean, None, None, None),
         ConnectorValueType::TinyInt => (dto::ValueTypeKind::TinyInt, None, None, None),
@@ -919,6 +926,7 @@ fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
         ConnectorValueType::Fixed { length } => {
             (dto::ValueTypeKind::Fixed, None, None, Some(length))
         }
+        ConnectorValueType::Temporal(_) => unreachable!("handled above"),
         ConnectorValueType::NonComparable => (dto::ValueTypeKind::NonComparable, None, None, None),
     };
     dto::ValueType {
@@ -926,6 +934,7 @@ fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
         decimal_precision,
         decimal_scale,
         fixed_length,
+        temporal: None,
     }
 }
 
@@ -943,6 +952,13 @@ fn decode_value_type(
                 "unknown Iceberg predicate value type",
             )
         })?;
+        if kind != dto::ValueTypeKind::Temporal && raw.temporal.is_some() {
+            return Err(codec_error(
+                "value_type.temporal",
+                ConnectorCodecErrorKind::InconsistentFields,
+                "unexpected Iceberg temporal declaration",
+            ));
+        }
         let value_type = match kind {
             dto::ValueTypeKind::Unspecified => {
                 return Err(codec_error(
@@ -1009,6 +1025,29 @@ fn decode_value_type(
                 }
                 ConnectorValueType::Fixed { length }
             }
+            dto::ValueTypeKind::Temporal => {
+                if raw.decimal_precision.is_some()
+                    || raw.decimal_scale.is_some()
+                    || raw.fixed_length.is_some()
+                {
+                    return Err(codec_error(
+                        "value_type.temporal",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "Iceberg temporal type carries unrelated parameters",
+                    ));
+                }
+                let temporal = raw.temporal.as_ref().ok_or_else(|| {
+                    codec_error(
+                        "value_type.temporal",
+                        ConnectorCodecErrorKind::MissingField,
+                        "missing Iceberg temporal declaration",
+                    )
+                })?;
+                ConnectorValueType::Temporal(
+                    novarocks_proto_codec::temporal_type::decode(temporal)
+                        .map_err(|error| domain_error("value_type.temporal", error))?,
+                )
+            }
             simple => {
                 if raw.decimal_precision.is_some()
                     || raw.decimal_scale.is_some()
@@ -1041,7 +1080,8 @@ fn decode_value_type(
                     dto::ValueTypeKind::NonComparable => ConnectorValueType::NonComparable,
                     dto::ValueTypeKind::Unspecified
                     | dto::ValueTypeKind::Decimal
-                    | dto::ValueTypeKind::Fixed => unreachable!("handled above"),
+                    | dto::ValueTypeKind::Fixed
+                    | dto::ValueTypeKind::Temporal => unreachable!("handled above"),
                 }
             }
         };
@@ -1076,6 +1116,9 @@ fn encode_value(value: &ConnectorValue) -> dto::Value {
         ConnectorValue::TimestampTzMicros(value) => dto::value::Value::TimestampTzMicros(*value),
         ConnectorValue::TimestampNanos(value) => dto::value::Value::TimestampNanos(*value),
         ConnectorValue::TimestampTzNanos(value) => dto::value::Value::TimestampTzNanos(*value),
+        ConnectorValue::Temporal { data_type, value } => dto::value::Value::Temporal(
+            novarocks_proto_codec::connector_read::encode_temporal_value(*data_type, *value),
+        ),
         ConnectorValue::Varchar(value) => dto::value::Value::Varchar(value.to_string()),
         ConnectorValue::Varbinary(value) => dto::value::Value::Varbinary(value.to_vec()),
         ConnectorValue::Uuid(value) => dto::value::Value::Uuid(value.to_vec()),
@@ -1161,6 +1204,12 @@ fn decode_value(
             }
             dto::value::Value::TimestampNanos(value) => ConnectorValue::TimestampNanos(*value),
             dto::value::Value::TimestampTzNanos(value) => ConnectorValue::TimestampTzNanos(*value),
+            dto::value::Value::Temporal(value) => {
+                let (data_type, value) =
+                    novarocks_proto_codec::connector_read::decode_temporal_value(value)
+                        .map_err(|error| domain_error("value.temporal", error))?;
+                ConnectorValue::Temporal { data_type, value }
+            }
             dto::value::Value::Varchar(value) => {
                 ConnectorValue::Varchar(Arc::from(copy_string(value, context)?))
             }

@@ -348,3 +348,76 @@ fn membership_controlled_query_long_validation_comparison_and_null_preserve_firs
     drop(query);
     assert_eq!(budget.retained_bytes(), 0);
 }
+
+#[test]
+fn temporal_membership_preserves_instant_equality_and_picosecond_boundaries() {
+    use novarocks_type_contract::{
+        FunctionValueType, TemporalMicros, TemporalPrecision, TemporalType, TemporalValue,
+        TimeZoneKey, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let ty = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+    let storage = ValueTypeStorageLifetime::pure();
+    let value_type = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(ValueKind::Temporal(ty), false, storage.clone()).unwrap(),
+        ValueLayout::try_new(&ty.carrier(), storage).unwrap(),
+    )
+    .unwrap();
+    let schema =
+        RuntimeFilterMembershipSchema::new(&ty.carrier(), RuntimeFilterNullSemantics::NeverMatches)
+            .unwrap();
+    let schema = RuntimeFilterMembershipSchema::from_canonical_value_type(
+        schema.canonical_schema().clone(),
+        value_type,
+    )
+    .unwrap();
+    let instant = TemporalMicros::new(-1, 999_998).unwrap();
+    let encode = |instant, zone| {
+        TemporalValue::TimestampWithTimeZone { instant, zone }
+            .relation_key(ty)
+            .unwrap()
+            .order_bytes()
+    };
+    let utc = encode(instant, TimeZoneKey::UTC);
+    let shanghai = TimeZoneKey::parse("Asia/Shanghai").unwrap();
+    let domain = ValueDomainDelta::new(
+        MembershipValues::Temporal {
+            carrier_width: 14,
+            values: BTreeSet::from([utc]),
+        },
+        false,
+    );
+    let profile = ConsumerArtifactProfile::new(
+        BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+        None,
+    )
+    .unwrap();
+    let MaterializationOutcome::Published(bundle) = materialize_membership(
+        7,
+        &domain,
+        &schema,
+        LogicalVersion::FIRST,
+        &profile,
+        MaterializationAdmission::new(1 << 20),
+    ) else {
+        panic!("the exact temporal membership domain must materialize");
+    };
+    let query = BackendRuntimeFilterArtifactQuery::membership_typed(&bundle, &schema).unwrap();
+    let control = Control::running();
+    assert_eq!(
+        query.non_null_value_may_match_controlled(
+            RuntimeFilterScalarRef::Temporal(encode(instant, shanghai)),
+            &control
+        ),
+        Ok(true),
+    );
+    assert_eq!(
+        query.non_null_value_may_match_controlled(
+            RuntimeFilterScalarRef::Temporal(encode(
+                TemporalMicros::new(-1, 999_999).unwrap(),
+                shanghai
+            )),
+            &control,
+        ),
+        Ok(false),
+    );
+}

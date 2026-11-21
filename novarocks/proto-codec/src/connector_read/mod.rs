@@ -39,7 +39,10 @@ pub use runtime_codec::{
 pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment};
 pub use split::{SplitCategory, ValidatedConnectorSplit};
 pub use task_update::{ScheduledSplit, SplitAssignment, parse_task_update_assignments};
-pub use value::{decode_value, decode_value_type, encode_value, encode_value_type};
+pub use value::{
+    decode_temporal_value, decode_value, decode_value_type, encode_temporal_value, encode_value,
+    encode_value_type,
+};
 
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 

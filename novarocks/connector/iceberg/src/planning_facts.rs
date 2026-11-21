@@ -250,7 +250,13 @@ fn table_planning_columns<'a>(
                     (
                         iceberg_write_default(current_schema, field.name())?,
                         declaration
-                            .filter(|declaration| declaration.storage_type().is_some())
+                            .filter(|declaration| {
+                                declaration.storage_type().is_some()
+                                    || (declaration.field().data_type() != field.data_type()
+                                        && declaration.execution_type().is_some_and(|value| {
+                                            value.value_type().contains_temporal()
+                                        }))
+                            })
                             .cloned(),
                     )
                 }
@@ -780,6 +786,46 @@ mod tests {
             Some(&ConnectorColumnDefault::String(Arc::from("fallback")))
         );
         assert_eq!(facts.column_facts()[1].write_default(), None);
+    }
+
+    #[test]
+    fn current_temporal_write_input_keeps_the_provider_authored_carrier() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
+        use arrow::datatypes::TimeUnit;
+        use novarocks_type_contract::{TemporalPrecision, TemporalType};
+
+        let iceberg_schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "clock",
+                    Type::Primitive(PrimitiveType::Time),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "instant",
+                    Type::Primitive(PrimitiveType::Timestamp),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("clock", DataType::Time64(TimeUnit::Microsecond), true),
+            Field::new(
+                "instant",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        let facts = write_default_facts(Some(&iceberg_schema), &arrow_schema).unwrap();
+        let input = facts.column_facts()[0].write_input().unwrap();
+        assert_eq!(input.field().data_type(), &DataType::Int64);
+        assert_eq!(
+            input.execution_type().unwrap().value_type().temporal(),
+            Some(TemporalType::Time(TemporalPrecision::MICROSECONDS))
+        );
+        assert!(input.storage_type().is_none());
+        assert!(facts.column_facts()[1].write_input().is_none());
     }
 
     #[test]

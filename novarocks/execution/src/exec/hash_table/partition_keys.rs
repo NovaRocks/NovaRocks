@@ -33,7 +33,7 @@ use novarocks_value_arrays::{
     ByteLayout, ValueError, ValueFailure, ValueViolation,
     access::ByteSource,
     control::ValueStructure,
-    decode::{DecodedBytes, ValueConversionContext},
+    decode::{DecodedBytes, PreparedTemporalArray, ValueConversionContext},
     hash_eq::{ByteHashAlgorithm, NullHash, hash_row_observed},
     reachability::ReachableRows,
 };
@@ -240,7 +240,22 @@ fn append_native_column(
     if dictionary && !byte_layout.is_some_and(ByteLayout::is_utf8) {
         return Err(invariant(ValueViolation::Dictionary));
     }
-    if let Some(layout) = byte_layout {
+    if let Some(declaration) = ty.value_type().temporal() {
+        let values = PreparedTemporalArray::bind(declaration, array.as_ref(), ty.nullable())
+            .map_err(ExecutionFailure::from_domain)?;
+        for (row, hash) in hashes.iter_mut().enumerate() {
+            if row.is_multiple_of(256) {
+                checkpoint()?;
+            }
+            if let Some(accumulator) = hash {
+                let key = values
+                    .relation_key(row)
+                    .map_err(ExecutionFailure::from_domain)?;
+                let leaf = key.map_or(0, |key| BYTE_HASH.hash_bytes(&key.order_bytes()));
+                *accumulator = combine(*accumulator, combine(FNV_SEED, leaf));
+            }
+        }
+    } else if let Some(layout) = byte_layout {
         let source = ByteSource::parse(array, layout, None)
             .map_err(ExecutionFailure::from_domain)?
             .with_storage(&storage);
@@ -297,6 +312,8 @@ fn append_native_column(
         }
         hash_native_list(array, selected, hashes, conversions, owner, checkpoint)?;
     } else {
+        let semantic = ty.value_type();
+        let temporal_children = semantic.contains_temporal();
         for (row, hash) in hashes.iter_mut().enumerate() {
             if row.is_multiple_of(256) {
                 checkpoint()?;
@@ -307,7 +324,13 @@ fn append_native_column(
             if normalized_root_is_null(array.as_ref(), row) && !ty.nullable() {
                 return Err(invariant(ValueViolation::RequiredNull));
             }
-            let leaf = primitive_hash(array, row, checkpoint)?;
+            let leaf = if temporal_children {
+                super::key_builder::canonical_temporal_group_key_hash_observed(
+                    array, row, semantic, false, checkpoint,
+                )?
+            } else {
+                primitive_hash(array, row, checkpoint)?
+            };
             *accumulator = combine(*accumulator, combine(FNV_SEED, leaf.unwrap_or(0)));
         }
     }

@@ -59,6 +59,8 @@ fn decode(signature: &TypeSignature, raw: &RawValue) -> Result<TrinoValue, State
         | "time with time zone"
         | "timestamp"
         | "timestamp with time zone"
+        | "interval year to month"
+        | "interval day to second"
         | "json" => TrinoValue::Text(serde_json::from_str(raw.get())?),
         "varbinary" => {
             let text: String = serde_json::from_str(raw.get())?;
@@ -162,6 +164,8 @@ pub fn decode_map_key(
         | "time with time zone"
         | "timestamp"
         | "timestamp with time zone"
+        | "interval year to month"
+        | "interval day to second"
         | "json" => Ok(TrinoValue::Text(text.to_owned())),
         "varbinary" => Ok(TrinoValue::Binary(STANDARD.decode(text).map_err(|e| {
             StatementFailure::protocol(format!("invalid base64 map key: {e}"))
@@ -181,6 +185,9 @@ pub fn decode_map_key(
             .parse::<f64>()
             .map(TrinoValue::Double)
             .map_err(|e| StatementFailure::protocol(format!("invalid double map key: {e}"))),
+        // Trino serializes container keys with Java object text. Delimiters
+        // also occur in string members, so this wire spelling is opaque.
+        "array" | "row" | "map" => Ok(TrinoValue::Text(text.to_owned())),
         "variant" => Ok(TrinoValue::Variant(serde_json::to_string(text)?)),
         _ => Err(StatementFailure::protocol(format!(
             "unsupported map key type: {}",

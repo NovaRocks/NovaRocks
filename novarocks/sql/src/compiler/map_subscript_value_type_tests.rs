@@ -91,6 +91,7 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
             crate::compiler::RenderFamilyRequest::TrinoJson(
                 &novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 },
