@@ -20,7 +20,8 @@ use crate::testkit::claim_author::{legacy_scalar_function, physical_call_request
 use crate::typing::{
     CarrierConversion, ChildForm, ChildTyping, Conversion, LiteralEmission, LiteralSyntax,
     LiteralValue, NodeShape, NodeTyping, ScalarTypingRoute, TypedLiteral, TypingContext,
-    TypingError, finish_call, scalar_typing_route, type_node,
+    TypingError, finish_call, scalar_typing_route, syntax_arithmetic, syntax_comparison,
+    syntax_distinct_from, type_node,
 };
 use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantPools;
@@ -150,6 +151,22 @@ impl<'a> TextTyping<'a> {
                 node.typing.form = form;
                 Ok(node)
             }
+            ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
+                let child = self.lower(&unary.expression, work, next)?;
+                let (_, mut children) =
+                    self.type_value(NodeShape::UnaryPlus, vec![child], span, work)?;
+                Ok(children.pop().expect("one unary plus operand"))
+            }
+            ast::Expr::Binary(binary) => {
+                let left = self.lower(&binary.left, work, next)?;
+                let right = self.lower(&binary.right, work, next)?;
+                self.type_call(
+                    NodeShape::Operator(syntax_arithmetic(binary.operator)),
+                    vec![left, right],
+                    span,
+                    work,
+                )
+            }
             ast::Expr::Logical(logical) => {
                 let operator = logical.operator;
                 let mut pending: Vec<_> = logical.terms.iter().rev().collect();
@@ -172,6 +189,26 @@ impl<'a> TextTyping<'a> {
                 Ok(TextNode::new(ty, TextKind::Logical(operator, children)))
             }
             ast::Expr::Predicated(node) => match &node.predicate {
+                ast::Predicate::Comparison(predicate) => {
+                    let left = self.lower(&node.value, work, next)?;
+                    let right = self.lower(&predicate.right, work, next)?;
+                    self.type_call(
+                        NodeShape::Operator(syntax_comparison(predicate.operator)),
+                        vec![left, right],
+                        span,
+                        work,
+                    )
+                }
+                ast::Predicate::DistinctFrom(predicate) => {
+                    let left = self.lower(&node.value, work, next)?;
+                    let right = self.lower(&predicate.right, work, next)?;
+                    self.type_call(
+                        NodeShape::Operator(syntax_distinct_from(predicate.negated)),
+                        vec![left, right],
+                        span,
+                        work,
+                    )
+                }
                 ast::Predicate::IsNull(predicate) => {
                     let child = self.lower(&node.value, work, next)?;
                     let (ty, mut children) =

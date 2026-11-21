@@ -398,8 +398,31 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
         type_text("TRIM('a' FROM x)"),
         Err(TextError::UnsupportedSyntax(cause)) if cause.message == "explicit TRIM characters are not supported"
     ));
+    for source in [
+        "-NULL",
+        "NULL + NULL",
+        "NULL - NULL",
+        "NULL * NULL",
+        "NULL / NULL",
+        "NULL / 2e0",
+    ] {
+        assert!(
+            matches!(
+                type_text(source),
+                Err(TextError::Typing {
+                    cause: TypingError::Binding(
+                        novarocks_functions::FunctionBindingError::AmbiguousOverload
+                    ),
+                    ..
+                })
+            ),
+            "{source}"
+        );
+    }
     for (text, prefix) in [
-        ("-NULL", "unary minus requires"),
+        ("+NULL", "unary plus requires"),
+        ("+DECIMAL '1.25'", "unary plus requires"),
+        ("TRUE + 1", "operator + does not accept"),
         ("1 AND TRUE", "AND requires"),
         ("CASE WHEN 3 THEN 4 END", "CASE WHEN requires"),
     ] {
@@ -654,4 +677,138 @@ fn input_constant_policy_reports_the_original_row_and_column() {
         Consistency::NotApplicable(Inapplicability::InputConstant { row: 1, column, cause: novarocks_constant_contract::ConstantError::Limit(_) })
         if column == "x"
     ));
+}
+
+#[test]
+fn standard_arithmetic_selects_the_exact_decimal_declarations() {
+    use arrow::array::Decimal128Array;
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+
+    let ratio = constant("DECIMAL '1.00' / DECIMAL '3.00'", &context);
+    assert_eq!(ratio.batch.values.data_type(), &DataType::Decimal128(9, 6));
+    assert_eq!(
+        ratio
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap()
+            .value(0),
+        333_333,
+    );
+    let ratio_with_null = constant("NULL / DECIMAL '3.00'", &context);
+    assert_eq!(
+        ratio_with_null.batch.values.data_type(),
+        &DataType::Decimal128(9, 6)
+    );
+    assert!(ratio_with_null.batch.values.is_null(0));
+    let null_modulo = constant("NULL % NULL", &context);
+    assert_eq!(null_modulo.batch.values.data_type(), &DataType::Int8);
+    assert!(null_modulo.batch.values.is_null(0));
+}
+
+#[test]
+fn standard_arithmetic_uses_the_original_real_width_and_selected_rows() {
+    use arrow::array::Float32Array;
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [
+        column("x", 5, DataType::Float32, true),
+        column("y", 9, DataType::Float32, false),
+    ];
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(Float32Array::from(vec![
+                Some(16_777_216.0),
+                Some(0.0),
+                None,
+            ])),
+            Arc::new(Float32Array::from(vec![1.0, 0.0, 1.0])),
+        ],
+    );
+    let checked = evaluate(&compile("(+x + y) - x", &columns, &context), &input);
+    assert_compared(&checked, 2, 3);
+    assert_eq!(
+        checked.batch.values.to_data(),
+        Float32Array::from(vec![Some(0.0), Some(0.0), None]).to_data(),
+    );
+    let checked = evaluate(&compile("x / y", &columns, &context), &input);
+    let values = checked
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 16_777_216.0);
+    assert!(values.value(1).is_nan());
+    assert!(values.is_null(2));
+    assert!(checked.batch.errors.is_empty());
+}
+
+#[test]
+fn ordinary_and_null_safe_float_comparisons_preserve_distinct_relations() {
+    use arrow::array::{BooleanArray, Float64Array};
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [
+        column("x", 5, DataType::Float64, true),
+        column("y", 9, DataType::Float64, true),
+    ];
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(f64::NAN),
+                Some(-0.0),
+                None,
+                None,
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(1.0),
+                Some(0.0),
+                None,
+                Some(0.0),
+            ])),
+        ],
+    );
+    for (operator, expected) in [
+        (
+            "x = y",
+            vec![Some(false), Some(false), Some(true), None, None],
+        ),
+        (
+            "x < y",
+            vec![Some(false), Some(false), Some(false), None, None],
+        ),
+        (
+            "x IS NOT DISTINCT FROM y",
+            vec![Some(true), Some(false), Some(true), Some(true), Some(false)],
+        ),
+        (
+            "x IS DISTINCT FROM y",
+            vec![
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+            ],
+        ),
+    ] {
+        let checked = evaluate(&compile(operator, &columns, &context), &input);
+        assert_eq!(
+            checked.batch.values.to_data(),
+            BooleanArray::from(expected).to_data(),
+            "{operator}"
+        );
+    }
 }

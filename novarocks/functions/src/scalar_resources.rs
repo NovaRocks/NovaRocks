@@ -81,7 +81,43 @@ enum Source {
         operation: crate::bit_numeric::BitwiseOp,
         width: BitwiseWidth,
     },
+    BinaryPrimitive {
+        output: BinaryPrimitiveOutput,
+        row_errors: bool,
+    },
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BinaryPrimitiveOutput {
+    Boolean,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Real,
+    Double,
+    Decimal128,
+}
+
+impl BinaryPrimitiveOutput {
+    fn layout(self) -> Result<(Option<usize>, usize), ScalarResourceError> {
+        use arrow_array::{
+            BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
+            Int32Array,
+        };
+
+        Ok(match self {
+            Self::Boolean => (None, array_arc_bytes_for::<BooleanArray>()?),
+            Self::Int8 => (Some(1), array_arc_bytes_for::<Int8Array>()?),
+            Self::Int16 => (Some(2), array_arc_bytes_for::<Int16Array>()?),
+            Self::Int32 => (Some(4), array_arc_bytes_for::<Int32Array>()?),
+            Self::Int64 => (Some(8), array_arc_bytes_for::<Int64Array>()?),
+            Self::Real => (Some(4), array_arc_bytes_for::<Float32Array>()?),
+            Self::Double => (Some(8), array_arc_bytes_for::<Float64Array>()?),
+            Self::Decimal128 => (Some(16), array_arc_bytes_for::<Decimal128Array>()?),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BitwiseWidth {
     Int8,
@@ -156,6 +192,12 @@ impl ScalarInvocationResourceProfile {
         }
     }
 
+    pub(crate) const fn binary_primitive(output: BinaryPrimitiveOutput, row_errors: bool) -> Self {
+        Self {
+            source: Source::BinaryPrimitive { output, row_errors },
+        }
+    }
+
     /// No arrays, diagnostics, formatting or other heap objects are created.
     /// All valid constant/column mappings, sparse selections, NULLs and count
     /// values have this same envelope. Preexisting input storage is excluded.
@@ -164,6 +206,9 @@ impl ScalarInvocationResourceProfile {
         selected_rows: usize,
     ) -> Result<ScalarInvocationRequestFacts, ScalarResourceError> {
         match self.source {
+            Source::BinaryPrimitive { output, row_errors } => {
+                binary_primitive_requests(selected_rows, output, row_errors)
+            }
             Source::Int64Shift => int64_shift_requests(selected_rows),
             Source::NarrowShift(width) => narrow_shift_requests(selected_rows, width),
             // The original shared integer finish has the same requests.
@@ -185,6 +230,9 @@ impl ScalarInvocationResourceProfile {
         arguments: &[crate::EvaluatedArgument<'_>],
     ) -> Result<ScalarInvocationRequestFacts, ScalarResourceError> {
         match self.source {
+            // The whole wrapper validates both actual input carriers before
+            // the kernel. Every admitted input is a flat Arrow scalar.
+            Source::BinaryPrimitive { .. } => {}
             Source::Int64Shift => {
                 // Original wrong arity exits before reading any argument.
                 // Do not inspect unrelated carriers or reorder that failure.
@@ -270,6 +318,64 @@ fn empty_shift_requests(
             size_of::<arrow_data::BufferSpec>(),
         )?,
         requests: 6,
+    })
+}
+
+fn binary_primitive_requests(
+    rows: usize,
+    output: BinaryPrimitiveOutput,
+    row_errors: bool,
+) -> Result<ScalarInvocationRequestFacts, ScalarResourceError> {
+    require_arrow_model()?;
+    let (width, array_arc) = output.layout()?;
+    if rows == 0 {
+        return empty_shift_requests(array_arc);
+    }
+    let bitmap = rounded_buffer_bytes(checked_add(rows, 7)? / 8)?;
+    let values = match width {
+        Some(width) => rounded_buffer_bytes(
+            rows.checked_mul(width)
+                .ok_or(ScalarResourceError::Arithmetic)?,
+        )?,
+        None => bitmap,
+    };
+    // The builders adopt a fixed values buffer and at most one validity
+    // buffer. Finishing adds their Bytes Arcs, a Buffer Vec and the array Arc.
+    let buffer_vec = Layout::array::<Buffer>(4)
+        .map_err(|_| ScalarResourceError::Arithmetic)?
+        .size();
+    let metadata = checked_add(
+        checked_add(128, array_arc)?,
+        checked_add(buffer_vec, size_of::<arrow_data::BufferSpec>())?,
+    )?;
+    let diagnostics = if row_errors {
+        // At most one original row journal entry per selected row. A partial
+        // journal can be shrunk to its final size when published as a Box.
+        let entry = checked_add(
+            checked_add(
+                size_of::<crate::RowDataError>(),
+                size_of::<crate::RowDataError>(),
+            )?,
+            crate::MAX_ROW_ERROR_MESSAGE_BYTES,
+        )?;
+        rows.checked_mul(entry)
+            .ok_or(ScalarResourceError::Arithmetic)?
+    } else {
+        0
+    };
+    Ok(ScalarInvocationRequestFacts {
+        bytes: checked_add(
+            checked_add(
+                checked_add(values, bitmap)?,
+                checked_add(metadata, diagnostics)?,
+            )?,
+            crate::MAX_ROW_ERROR_MESSAGE_BYTES,
+        )?,
+        requests: if row_errors {
+            checked_add(10, rows)?
+        } else {
+            8
+        },
     })
 }
 
