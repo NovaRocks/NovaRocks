@@ -1,4 +1,4 @@
 -- query 1
--- types	decimal(38, 10)
+-- types	decimal(35, 20)
 am_pm_ratio
-0.6124401914
+0.61244019138755980861
