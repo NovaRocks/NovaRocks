@@ -667,14 +667,19 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
     let Some(statement) = statements.last() else {
         return false;
     };
-    // Procedures with metric rows require typed goldens. Other known commands
-    // retain their implicit skip even if comments precede the statement.
+    // These table procedures return metric rows. Preserve the implicit
+    // completion handling for the other table procedures.
     use novarocks_parser::ast::TrinoStatement::*;
     match novarocks_parser::parser::parse_statement(statement) {
-        Ok(TableExecute(value)) => {
-            let name = &value.procedure_name.value;
-            !name.eq_ignore_ascii_case("optimize") && !name.eq_ignore_ascii_case("add_files")
-        }
+        Ok(TableExecute(value)) => ![
+            "add_files",
+            "optimize",
+            "optimize_manifests",
+            "expire_snapshots",
+            "remove_orphan_files",
+        ]
+        .iter()
+        .any(|name| value.procedure_name.value.eq_ignore_ascii_case(name)),
         Ok(
             CreateCatalog(_)
             | DropCatalog(_)
@@ -900,6 +905,9 @@ mod implicit_skip_result_tests {
             "USE x; WITH t AS (SELECT 1) SELECT * FROM t;",
             "USE x; SHOW TABLES;",
             "ALTER TABLE t EXECUTE optimize;",
+            "ALTER TABLE t EXECUTE OPTIMIZE_MANIFESTS;",
+            "SET SESSION iceberg.expire_snapshots_min_retention = '0s'; ALTER TABLE t EXECUTE expire_snapshots(retention_threshold => '0s');",
+            "ALTER TABLE iceberg.db.t EXECUTE remove_orphan_files;",
             "ALTER TABLE t EXECUTE ADD_FILES(location => 's3://bucket/source', format => 'PARQUET');",
             "USE x; ALTER TABLE \"qualified\".\"table\" EXECUTE optimize;",
         ] {
@@ -918,6 +926,7 @@ mod implicit_skip_result_tests {
             "USE x; INSERT INTO t VALUES (1);",
             "USE x; DROP TABLE t; -- trailing comment;",
             "USE x; REFRESH MATERIALIZED VIEW mv;",
+            "ALTER TABLE t EXECUTE create_tag(name => 'tag');",
         ] {
             let step = step(sql);
             assert!(step_has_implicit_skip_result(&step), "{sql}");

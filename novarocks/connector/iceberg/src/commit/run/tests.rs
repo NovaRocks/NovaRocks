@@ -458,6 +458,7 @@ async fn keyed_data_finish_observed<'a>(
             &query,
             &[target.ordinal()],
             Some(received_write_proof(target.ordinal(), physical)),
+            None,
         )
         .unwrap();
     let mut writer = execution

@@ -62,17 +62,7 @@ pub enum WindowBound {
     UnboundedFollowing,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum LiteralValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    LargeInt(i128),
-    Float(f64),
-    Decimal(String),
-    String(String),
-    Binary(Vec<u8>),
-}
+pub use novarocks_expression::typing::LiteralValue;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
@@ -95,8 +85,6 @@ pub enum BinOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnOp {
     Not,
-    Negate,
-    BitwiseNot,
 }
 
 impl JoinKind {

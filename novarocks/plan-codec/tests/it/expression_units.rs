@@ -100,15 +100,20 @@ fn pair_with_unary(unary: bool) -> p::FragmentPackage {
         .unwrap()
         .add(None, ty.clone(), ExprKind::Value(value))
         .unwrap();
+    let projected_type = if unary {
+        p::ValueType::new(arrow::datatypes::DataType::Boolean, false)
+    } else {
+        ty
+    };
     let definition = if unary {
         builder
             .unit(project)
             .unwrap()
             .add(
                 None,
-                ty.clone(),
+                projected_type.clone(),
                 ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::Plus,
+                    op: novarocks_expression_contract::UnaryOperator::Not,
                     expr: definition,
                 },
             )
@@ -128,7 +133,7 @@ fn pair_with_unary(unary: bool) -> p::FragmentPackage {
         .unwrap();
     let projected = builder
         .add_value(
-            ty,
+            projected_type,
             p::ValueOrigin::Expr {
                 node: project,
                 root,

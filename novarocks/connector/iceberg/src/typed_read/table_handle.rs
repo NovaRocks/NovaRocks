@@ -202,6 +202,7 @@ pub struct IcebergTableHandle {
     storage_properties: BTreeMap<String, String>,
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
     mutation_partition_type_json: Option<Arc<str>>,
+    rewritten_target: Option<crate::commit::conflict_scope::RewrittenTargetBinding>,
 }
 
 impl IcebergTableHandle {
@@ -342,6 +343,7 @@ impl IcebergTableHandle {
             storage_properties,
             pinned_data_files,
             mutation_partition_type_json: None,
+            rewritten_target: None,
         })
     }
 
@@ -533,6 +535,20 @@ impl IcebergTableHandle {
 
     pub const fn format_version(&self) -> i32 {
         self.format_version
+    }
+
+    pub(crate) fn with_rewritten_target(
+        mut self,
+        binding: crate::commit::conflict_scope::RewrittenTargetBinding,
+    ) -> Self {
+        self.rewritten_target = Some(binding);
+        self
+    }
+
+    pub(crate) const fn rewritten_target(
+        &self,
+    ) -> Option<crate::commit::conflict_scope::RewrittenTargetBinding> {
+        self.rewritten_target
     }
 
     pub const fn unenforced_predicate(&self) -> &TupleDomain<IcebergColumnHandle> {

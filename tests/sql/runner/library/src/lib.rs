@@ -307,7 +307,16 @@ fn evaluate_expected_error_outcome(
             Some(error)
                 if error.error_name == expected.name && error.error_type == expected.error_type =>
             {
-                Ok(())
+                if let Some(prefix) = &meta.expect_error
+                    && !error.message.starts_with(prefix)
+                {
+                    Err(format!(
+                        "expected Trino error message starting with {prefix:?} at statement {count}, got {:?}",
+                        error.message
+                    ))
+                } else {
+                    Ok(())
+                }
             }
             Some(error) => Err(format!(
                 "expected Trino error {},{} at statement {count}, got {},{}: {}",
@@ -3669,7 +3678,11 @@ fn run_case_observed(
             }
         }
         let orphan_fixture = match step.meta.iceberg_orphan_fixture.as_deref() {
-            Some(table) => match iceberg_orphan_fixture::install(table) {
+            Some(table) => match iceberg_orphan_fixture::install(
+                table,
+                &ctx.namespace_guard(&case_target_conn, step.meta.cleanup),
+                step_deadline,
+            ) {
                 Ok(fixture) => {
                     let _ = writeln!(
                         log,

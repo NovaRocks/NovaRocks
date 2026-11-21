@@ -1304,26 +1304,6 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
             },
         )
         .unwrap();
-    let negate = b
-        .add(
-            None,
-            int(true),
-            ExprKind::Unary {
-                op: UnaryOperator::Minus,
-                expr: a,
-            },
-        )
-        .unwrap();
-    let bitnot = b
-        .add(
-            None,
-            int(true),
-            ExprKind::Unary {
-                op: UnaryOperator::BitwiseNot,
-                expr: z,
-            },
-        )
-        .unwrap();
     let inlist = b
         .add(
             None,
@@ -1384,7 +1364,7 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
             },
         )
         .unwrap();
-    for id in [arithmetic, cast, negate, bitnot, inlist, like, case] {
+    for id in [arithmetic, cast, inlist, like, case] {
         b.root(id, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
     }
@@ -1404,17 +1384,15 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
     let recipes = compiled.recipes();
     assert!(recipes.arithmetic(uses[0]).is_some());
     assert!(recipes.cast(uses[1]).is_some());
-    assert!(recipes.native_negate(uses[2]).is_some());
-    assert!(recipes.native_bitnot(uses[3]).is_some());
-    assert!(recipes.native_inlist(uses[4]).is_some());
-    let like = recipes.native_like(uses[5]).unwrap();
+    assert!(recipes.native_inlist(uses[2]).is_some());
+    let like = recipes.native_like(uses[3]).unwrap();
     assert!(like.negated());
     assert_eq!(like.text_type(), &ValueType::new(DataType::Utf8, false));
     assert_eq!(like.pattern_type(), &ValueType::new(DataType::Utf8, false));
     assert!(
         recipes
             .comparison(ComparisonSite::CaseWhen {
-                occurrence: uses[6],
+                occurrence: uses[4],
                 arm: 0
             })
             .is_some()

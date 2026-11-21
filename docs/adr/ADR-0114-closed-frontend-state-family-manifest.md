@@ -5,6 +5,10 @@ domain: [frontend-state-families]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0243
+    scope: "GC first-observation as a registered Accelerator family. The closed manifest and prefix ownership for remaining frontend state families remain active."
+    link: "ADR-0243-statement-authorized-iceberg-metadata-maintenance.md"
 date: 2026-08-26
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/984"

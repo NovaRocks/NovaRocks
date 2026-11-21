@@ -36,11 +36,13 @@ use crate::commit::publication_descriptor::{
 use crate::commit::staging::StagingBase;
 use crate::iceberg::{Error, ErrorKind, Result};
 use async_trait::async_trait;
+#[cfg(test)]
+use novarocks_spi::connector::LakePublicationDisposition;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorOperationControl, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
     ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationDisposition,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -181,30 +183,6 @@ struct JournalState<R> {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JournalEntryRef(Uuid);
-
-/// Exact original failure dimension, independent of the recorded commit fact.
-/// Cloning preserves the original typed cause; no Checked graph is projected.
-#[derive(Clone)]
-pub(crate) enum CatalogPublicationFailure {
-    Dispatch(ConnectorMutationFailure),
-    RequiredFinalization(ConnectorMutationFailure),
-}
-impl CatalogPublicationFailure {
-    pub(crate) fn connector_error(&self) -> ConnectorError {
-        let (failure, detail) = match self {
-            Self::Dispatch(failure) => (failure, "original catalog publication failed"),
-            Self::RequiredFinalization(failure) => {
-                (failure, "original catalog required finalization failed")
-            }
-        };
-        if let Some(original) = failure.connector_source() {
-            return original.clone();
-        }
-        // This is the publication boundary's descriptive kind. The original
-        // producer's typed failure remains authoritative for classification.
-        ConnectorError::from_domain_static(ConnectorErrorKind::Unavailable, failure.clone(), detail)
-    }
-}
 
 pub(crate) enum RetainedPublicationProjection<R> {
     Committed {
@@ -635,6 +613,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .is_some_and(|entry| entry.checked.descriptor.first_dispatch_ms.is_some())
     }
     /// Copy-only conclusion; an in-flight actual dispatch remains None.
+    #[cfg(test)]
     pub(crate) fn catalog_dispatch_fact(&self) -> Option<(LakePublicationDisposition, bool)> {
         let state = self
             .state
@@ -664,37 +643,33 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             EntryPhase::Prepared | EntryPhase::Claimed | EntryPhase::Dispatching => None,
         }
     }
-    /// Copy only the exact original failure needed by a stable receiver before
-    /// a later receipt/CPU action can refuse. Commit, Unknown, finalization and
-    /// independent object cleanup remain separate dimensions.
-    pub(crate) fn catalog_publication_failure(&self) -> Option<CatalogPublicationFailure> {
+    /// Whether the current journal entry supplies the original failure.
+    /// The complete outcome projection still owns the typed failure itself.
+    pub(crate) fn has_catalog_publication_failure(&self) -> bool {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = state
+        let Some(entry) = state
             .current
             .get(&self.frontier)
-            .and_then(|id| state.entries.get(id))?;
+            .and_then(|id| state.entries.get(id))
+        else {
+            return false;
+        };
         match &entry.phase {
             EntryPhase::Concluded(
-                DispatchEvidence::NotDispatched { failure }
-                | DispatchEvidence::Rejected { failure, .. },
-            ) => Some(CatalogPublicationFailure::Dispatch(failure.clone())),
-            EntryPhase::Concluded(DispatchEvidence::Unknown { failure, .. })
+                DispatchEvidence::NotDispatched { .. } | DispatchEvidence::Rejected { .. },
+            ) => true,
+            EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
                 if entry.positive_proof.is_none() =>
             {
-                Some(CatalogPublicationFailure::Dispatch(failure.clone()))
+                true
             }
             EntryPhase::Concluded(
                 DispatchEvidence::Applied { .. } | DispatchEvidence::Unknown { .. },
-            ) => match &entry.finalization {
-                ExternalMutationFinalization::Complete => None,
-                ExternalMutationFinalization::Failed(failure) => Some(
-                    CatalogPublicationFailure::RequiredFinalization(failure.clone()),
-                ),
-            },
-            EntryPhase::Prepared | EntryPhase::Claimed | EntryPhase::Dispatching => None,
+            ) => matches!(entry.finalization, ExternalMutationFinalization::Failed(_)),
+            EntryPhase::Prepared | EntryPhase::Claimed | EntryPhase::Dispatching => false,
         }
     }
     pub(crate) fn current_entry(&self) -> Option<JournalEntryRef> {

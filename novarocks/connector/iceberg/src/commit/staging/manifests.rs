@@ -24,8 +24,8 @@ use crate::commit::model::{
 };
 use crate::commit::new_manifests::decoded_file_clone_bytes;
 use crate::iceberg::spec::{
-    DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder, PartitionSpec, SchemaRef, TableMetadata,
+    DataFile, FormatVersion, Literal, ManifestContentType, ManifestFile, ManifestListWriter,
+    ManifestWriterBuilder, PartitionSpec, PrimitiveLiteral, SchemaRef, TableMetadata,
 };
 use crate::iceberg::{Error, ErrorKind, Result};
 use novarocks_spi::connector::{
@@ -157,6 +157,95 @@ fn retain_registered_normalization(
     source
         .reserve(bytes, "Iceberg registered bounds normalization")
         .map(Some)
+}
+
+/// Buffer one data-manifest lane until its estimated Avro length reaches the
+/// table's target. Source encoding remains the original sourced writer's job.
+#[derive(Default)]
+pub(crate) struct RollingDataManifest {
+    entries: Vec<SourcedManifestEntry>,
+    pub(crate) replaces: Vec<String>,
+    pub(crate) owned_bytes: u64,
+    encoded_bytes: u64,
+}
+
+impl RollingDataManifest {
+    pub(crate) fn entry_sizes(file: &DataFile) -> Result<(u64, u64)> {
+        let variable_size = |value: &PrimitiveLiteral| match value {
+            PrimitiveLiteral::String(value) => value.len(),
+            PrimitiveLiteral::Binary(value) => value.len(),
+            _ => 0,
+        };
+        let mut payload = file.file_path().len();
+        let mut add = |bytes: usize| -> Result<()> {
+            payload = payload
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("Manifest entry backing overflow"))?;
+            Ok(())
+        };
+        add(file.key_metadata().map_or(0, <[u8]>::len))?;
+        add(std::mem::size_of_val(
+            file.split_offsets().unwrap_or_default(),
+        ))?;
+        for partition in file.partition().fields() {
+            add(20)?;
+            if let Some(Literal::Primitive(value)) = partition {
+                add(variable_size(value))?;
+            }
+        }
+        for counts in [
+            file.column_sizes(),
+            file.value_counts(),
+            file.null_value_counts(),
+            file.nan_value_counts(),
+        ] {
+            add(counts.len().saturating_mul(20))?;
+        }
+        for value in file
+            .lower_bounds()
+            .values()
+            .chain(file.upper_bounds().values())
+        {
+            add(20)?;
+            add(variable_size(value.literal()))?;
+        }
+        let encoded = 48 + payload as u64;
+        // Includes vector spare capacity, heap payloads and the temporary
+        // copies held by the sourced encoder, SDK writer and artifact author.
+        let owned = encoded
+            .checked_add(std::mem::size_of::<SourcedManifestEntry>() as u64)
+            .and_then(|bytes| bytes.checked_mul(8))
+            .ok_or_else(|| invalid("Manifest entry backing overflow"))?;
+        Ok((encoded, owned))
+    }
+
+    pub(crate) fn push(&mut self, entry: SourcedManifestEntry, encoded_bytes: u64) {
+        self.encoded_bytes += encoded_bytes;
+        self.entries.push(entry);
+    }
+
+    pub(crate) fn reaches(&self, target: u64) -> bool {
+        self.encoded_bytes >= target
+    }
+
+    pub(crate) async fn write(
+        self,
+        artifacts: &dyn ArtifactWriter,
+        metadata: &TableMetadata,
+        snapshot_id: i64,
+        spec: &PartitionSpec,
+    ) -> Result<ManifestFile> {
+        write_sourced_manifest(
+            artifacts,
+            metadata,
+            snapshot_id,
+            spec,
+            ManifestContentType::Data,
+            self.entries,
+            &self.replaces,
+        )
+        .await
+    }
 }
 
 pub(super) async fn write_encoded_manifest(

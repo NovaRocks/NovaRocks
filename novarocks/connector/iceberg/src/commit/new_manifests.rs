@@ -82,6 +82,22 @@ fn invariant(message: impl Into<String>) -> Error {
         .with_source(ConnectorError::new(ConnectorErrorKind::Internal, message))
 }
 
+pub(crate) fn row_delta_validation_error(message: impl Into<String>) -> Error {
+    let message = message.into();
+    let failure = super::conflict::validation_conflict(message.clone());
+    Error::new(ErrorKind::DataInvalid, message).with_source(failure)
+}
+
+pub(crate) fn validate_position_format(source: FormatVersion, base: FormatVersion) -> Result<()> {
+    if source == FormatVersion::V2 && base >= FormatVersion::V3 {
+        return Err(row_delta_validation_error(format!(
+            "Must use DVs for position deletes in V{}: writer used V2 position deletes",
+            base as u8,
+        )));
+    }
+    Ok(())
+}
+
 /// Keep the soft rolling estimate separate from a proven encoded minimum.
 #[derive(Clone, Copy, Default)]
 struct EntrySize {
@@ -181,6 +197,13 @@ pub(crate) async fn prepare_added_manifests(
             (upgrade_v1(view, snapshot_id, written).await?, true)
         }
         StageNewFiles::Written(written) => {
+            if written
+                .manifests
+                .iter()
+                .any(|manifest| manifest.content == ManifestContentType::Deletes)
+            {
+                validate_position_format(written.version, version)?;
+            }
             tracing::debug!(operation = ?operation.token(), stage, snapshot_id,
                 manifests = written.manifests.len(), "Reusing new Iceberg manifests");
             (written, false)
@@ -212,6 +235,9 @@ async fn write_pending(
         v2_targets,
     } = pending.received;
     drop(v2_targets);
+    if counts.position_deletes.files != 0 {
+        validate_position_format(pending.source.format_version(), version)?;
+    }
     let total = counts
         .data
         .files
@@ -231,12 +257,6 @@ async fn write_pending(
             continue;
         };
         let partition_type = if deletes {
-            if version == FormatVersion::V3 && pending.source.format_version() == FormatVersion::V2
-            {
-                return Err(invariant(
-                    "A new V3 delete manifest cannot add V2 position-delete files",
-                ));
-            }
             Some(
                 historical
                     .and_then(|partitions| partitions.get(&spec_id))

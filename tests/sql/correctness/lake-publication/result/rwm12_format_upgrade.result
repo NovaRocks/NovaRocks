@@ -1,0 +1,7 @@
+-- query 4
+-- types	bigint	bigint	varchar
+id	value	part
+1	10	inside
+2	20	inside
+3	30	inside
+4	40	outside

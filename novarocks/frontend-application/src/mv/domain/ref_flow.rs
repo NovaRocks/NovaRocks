@@ -542,20 +542,6 @@ mod tests {
         }
     }
 
-    struct NoTimestampArguments;
-
-    impl novarocks_query_application::sql::table_procedure::TableProcedureAbsoluteTimePort
-        for NoTimestampArguments
-    {
-        fn legacy_timestamp_literal_millis(
-            &mut self,
-            _text: &str,
-            _span: Span,
-        ) -> Result<i64, QueryServiceError> {
-            panic!("tag procedures do not accept timestamps");
-        }
-    }
-
     fn project_sql(source: &str) -> Result<ConnectorRefAction, QueryServiceError> {
         use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
         use novarocks_query_application::sql::trino_table_command::bind_trino_table_execute;
@@ -567,9 +553,8 @@ mod tests {
             source,
             &statement,
             &ConnectorProviderId::parse("iceberg").unwrap(),
-            "ice",
             &mut LiteralConstants,
-            &mut NoTimestampArguments,
+            "iceberg",
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )?;
         project_trino_tag(source, statement.span, bound).map(|action| action.0)

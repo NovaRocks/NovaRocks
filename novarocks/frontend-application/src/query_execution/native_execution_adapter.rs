@@ -1791,7 +1791,11 @@ impl ProjectedManifestAttempt {
             #[cfg(test)]
             fixture_observation_budget: None,
             #[cfg(all(test, novarocks_dev_controls))]
-            fixture_establish_handoff: fixture_row.as_deref(),
+            fixture_send_handoff: fixture_row.as_deref().and_then(
+                original_install_fixture::OriginalInstallRow::original_send_handoff_fixture,
+            ),
+            #[cfg(all(test, not(novarocks_dev_controls)))]
+            fixture_send_handoff: None,
             initial_now,
             process: &process,
             data: &host.runtime.data_runtime,
@@ -2283,7 +2287,13 @@ impl ProductionManifestAttemptProjection {
             // Original complete control D must already be bound. Registration
             // precedes initializer effects, round stage and every Create RPC.
             session
-                .register_manifest_productions(manifest, &self.work_scope)
+                .register_manifest_productions(
+                    manifest,
+                    &self.work_scope,
+                    prepared
+                        .rewritten_target_fact()
+                        .map_err(projection_message)?,
+                )
                 .await
                 .map_err(write_production_failure)?;
             Some(session)

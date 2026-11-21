@@ -109,11 +109,13 @@ pub mod largeint_text;
 mod logical_null;
 pub mod math_numeric;
 pub mod opaque_memory;
+mod operator_functions;
 pub mod parse_json_core;
 mod parse_json_resources;
 pub mod pattern_memo;
 pub mod percentile_hash_core;
 pub mod percentile_input;
+pub use operator_functions::{OperatorFunctionCatalogError, validate_installed_operator_functions};
 mod pure_catalogue;
 mod scalar_copy_geometry;
 #[cfg(test)]
@@ -2755,8 +2757,6 @@ pub mod string_reverse_shared;
 pub mod legacy_arithmetic;
 pub mod legacy_decimal;
 pub mod legacy_literal;
-mod native_negate;
-pub use native_negate::*;
 
 pub mod binary_text;
 
@@ -2768,9 +2768,6 @@ pub mod time_text_cast;
 pub mod time_calendar_cast;
 
 pub mod field_shared;
-
-mod native_bitnot;
-pub use native_bitnot::*;
 
 /// Original Decimal128 CAST computation shared by legacy and selected shells.
 pub mod decimal128_rescale;

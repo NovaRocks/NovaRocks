@@ -628,6 +628,15 @@ impl PreparedDistributedQuery {
         self.plan_facts.scan(fragment_id, node_id)
     }
 
+    pub(crate) fn rewritten_target_fact(
+        &self,
+    ) -> Result<
+        Option<&novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact>,
+        String,
+    > {
+        self.attempt_access.rewritten_target_fact()
+    }
+
     pub(crate) fn share_connector_attempt_access(
         &self,
         fragment_id: FragmentId,

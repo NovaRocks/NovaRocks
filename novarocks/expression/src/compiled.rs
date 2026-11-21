@@ -63,10 +63,6 @@ pub struct UnitRecipes {
         CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeLikeRecipe>,
     native_inlist:
         CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeInListRecipe>,
-    native_negate:
-        CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeNegateRecipe>,
-    native_bitnot:
-        CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeBitNotRecipe>,
     arithmetic: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedArithmeticRecipe>,
     casts: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedCastRecipe>,
     comparisons: CreatedPrimitiveMap<ComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
@@ -392,12 +388,6 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         control,
     )
     .map_err(publication)?;
-    let native_negate =
-        crate::primitives::compile_native_negate_with_factory(&parts, None, factory, control)
-            .map_err(publication)?;
-    let native_bitnot =
-        crate::primitives::compile_native_bitnot_with_factory(&parts, None, factory, control)
-            .map_err(publication)?;
     let arithmetic =
         crate::primitives::compile_arithmetic_with_factory(&parts, None, factory, control)
             .map_err(publication)?;
@@ -432,8 +422,6 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         recipes: UnitRecipes {
             native_like,
             native_inlist,
-            native_negate,
-            native_bitnot,
             arithmetic,
             casts,
             comparisons,

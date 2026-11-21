@@ -118,6 +118,23 @@ impl StatisticsReader for IcebergMetadata {
         ))
     }
 
+    fn row_mutation_statistics_version(
+        &self,
+        source: &novarocks_spi::connector::ConnectorRowMutationCurrent,
+    ) -> Result<StatisticsDataVersion, ConnectorError> {
+        let original = scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts::for_row_mutation_current(
+            source,
+            &novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.descriptor().instance_id.clone(),
+                incarnation: self.incarnation(),
+            },
+        )?;
+        statistics_data_version(
+            &original.access.metadata().uuid().to_string(),
+            source.snapshot_id(),
+        )
+    }
+
     fn read_statistics_async(
         &self,
         request: StatisticsReadRequest,
@@ -144,11 +161,46 @@ impl StatisticsReader for IcebergMetadata {
                     "Iceberg table has no current snapshot for statistics",
                 )
             })?;
-            let physical = self
-                .runtime()
-                .load_table_for_request_async(&table.namespace, &table.table, &request.context)
-                .await
-                .map_err(unavailable)?;
+            let physical = if let Some(source) = &request.row_mutation_current {
+                if source.identity().namespace.as_ref() != table.namespace
+                    || source.identity().table.as_ref() != table.table
+                    || source.snapshot_id() != Some(snapshot_id)
+                {
+                    return Err(invalid(
+                        "Iceberg statistics differ from the original row mutation source",
+                    ));
+                }
+                let original = scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts::for_row_mutation_current(
+                    source,
+                    &novarocks_spi::connector::ConnectorProviderBindingKey {
+                        instance_id: self.descriptor().instance_id.clone(),
+                        incarnation: self.incarnation(),
+                    },
+                )?;
+                if table_info.table_uuid.as_deref()
+                    != Some(original.access.metadata().uuid().to_string().as_str())
+                {
+                    return Err(invalid(
+                        "Iceberg statistics differ from the original table UUID",
+                    ));
+                }
+                original.access.reacquired_request_scoped(
+                    self.runtime()
+                        .resources()
+                        .planning_binding()
+                        .for_request(request.context.clone()),
+                    self.runtime()
+                        .resources()
+                        .catalog_runtime()
+                        .iceberg_runtime()
+                        .clone(),
+                )?
+            } else {
+                self.runtime()
+                    .load_table_for_request_async(&table.namespace, &table.table, &request.context)
+                    .await
+                    .map_err(unavailable)?
+            };
             let metadata = physical.table.metadata();
             // Deliberately no currentness check. The query was planned on this
             // snapshot; the table moving on afterwards does not make that snapshot's

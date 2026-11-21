@@ -21,26 +21,21 @@ mod retention;
 
 pub use retention::ProcedureRetentionDuration;
 
-use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_parser::{
     Span,
-    ast::{CallArgument, Expr, Ident, LiteralKind},
+    ast::{CallArgument, Expr, Ident},
 };
 use novarocks_spi::connector::{
     ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorProviderId, DdlPropertyType,
     DdlPropertyValue,
 };
-use novarocks_sql::compiler::RequiredConstantTarget;
-use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueKind, ValueLogicalType};
+use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
 };
 
-use super::property_evaluation::{
-    DdlPropertyConstantPort, constant_failure, evaluate_required_constant,
-    evaluate_required_property_value,
-};
+use super::property_evaluation::{DdlPropertyConstantPort, evaluate_required_property_value};
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
 const NOT_FOUND: ErrorCodeDescriptor = admit("sql.admit.table_procedure_not_found");
@@ -84,7 +79,6 @@ pub enum TableProcedureKind {
 pub enum ProcedureArgumentType {
     Value(DdlPropertyType),
     Enum(ProcedureArgumentEnum),
-    AbsoluteTime,
     EqualityRows,
 }
 
@@ -180,9 +174,6 @@ const RETENTION: TableProcedureArgument = with_default(
     Value(Type::Varchar),
     DefaultValue::Varchar("7d"),
 );
-const OLDER_THAN: TableProcedureArgument =
-    argument("older_than", ProcedureArgumentType::AbsoluteTime);
-
 const ICEBERG: &[TableProcedure] = &[
     procedure(
         TableProcedureKind::Optimize,
@@ -207,18 +198,17 @@ const ICEBERG: &[TableProcedure] = &[
         &[
             RETENTION,
             argument("retain_last", Value(Type::Integer)),
-            unsupported(with_default(
+            with_default(
                 "clean_expired_metadata",
                 Value(Type::Boolean),
                 DefaultValue::Boolean(false),
-            )),
-            OLDER_THAN,
+            ),
         ],
     ),
     procedure(
         TableProcedureKind::RemoveOrphanFiles,
         "REMOVE_ORPHAN_FILES",
-        &[RETENTION, OLDER_THAN],
+        &[RETENTION],
     ),
     procedure(
         TableProcedureKind::AddFiles,
@@ -377,16 +367,6 @@ pub enum ProcedureInput<'a> {
     ExplicitDefault,
 }
 
-/// The original maintenance timestamp parser owns the compatibility spelling
-/// of a direct TIMESTAMP literal. Other expressions use required constants.
-pub trait TableProcedureAbsoluteTimePort {
-    fn legacy_timestamp_literal_millis(
-        &mut self,
-        text: &str,
-        span: Span,
-    ) -> Result<i64, QueryServiceError>;
-}
-
 #[derive(Debug, PartialEq)]
 pub enum BoundProcedureValue<'a> {
     Value(DdlPropertyValue),
@@ -443,7 +423,6 @@ pub fn bind_arguments<'a>(
     arguments: &[TableProcedureInputArgument<'a>],
     source: TableProcedureBindingSource<'_>,
     constants: &mut dyn DdlPropertyConstantPort,
-    absolute_time: &mut dyn TableProcedureAbsoluteTimePort,
     control: &dyn PureCompileControl,
 ) -> Result<BoundTableProcedure<'a>, QueryServiceError> {
     let arguments = arguments
@@ -459,6 +438,7 @@ pub fn bind_arguments<'a>(
         &arguments,
         Some(source.sql),
         Some((source.sql, source.statement_span)),
+        source.catalog,
         control,
         |slot, argument| {
             let span = argument.span.expect("original SQL argument span");
@@ -477,7 +457,6 @@ pub fn bind_arguments<'a>(
                             span,
                         },
                         constants,
-                        absolute_time,
                         control,
                     )?,
                     span: Some(span),
@@ -499,6 +478,7 @@ fn bind_slots<'a, A: Copy>(
     arguments: &[BindingInput<'_, A>],
     source: Option<&str>,
     statement_location: Option<(&str, Span)>,
+    catalog: &str,
     control: &dyn PureCompileControl,
     mut evaluate: impl FnMut(
         &TableProcedureArgument,
@@ -545,8 +525,6 @@ fn bind_slots<'a, A: Copy>(
         .iter()
         .map(|_| BoundProcedureArgument::Omitted)
         .collect::<Vec<_>>();
-    let mut retention_seen = false;
-    let mut older_seen = false;
     for (position, argument) in arguments.iter().enumerate() {
         checkpoint(control, 1)?;
         let index = if let Some(name) = argument.name {
@@ -559,10 +537,18 @@ fn bind_slots<'a, A: Copy>(
                     error(
                         INVALID_ARGUMENT,
                         source.zip(argument.span),
-                        format!(
-                            "Table procedure {} argument '{}' does not exist",
-                            procedure.name, folded
-                        ),
+                        match procedure.kind {
+                            TableProcedureKind::OptimizeManifests
+                            | TableProcedureKind::ExpireSnapshots
+                            | TableProcedureKind::RemoveOrphanFiles => format!(
+                                "Catalog '{catalog}' table procedure '{}' property '{folded}' does not exist",
+                                procedure.name
+                            ),
+                            _ => format!(
+                                "Table procedure {} argument '{}' does not exist",
+                                procedure.name, folded
+                            ),
+                        },
                         None,
                     )
                 })?
@@ -577,18 +563,6 @@ fn bind_slots<'a, A: Copy>(
             )));
         }
         let value = evaluate(slot, *argument)?;
-        if (slot.name == "older_than" && retention_seen)
-            || (slot.name == "retention_threshold" && older_seen)
-        {
-            return Err(error(
-                INVALID_ARGUMENT,
-                source.zip(argument.span),
-                "Table procedure arguments older_than and retention_threshold cannot both be supplied",
-                None,
-            ));
-        }
-        retention_seen |= slot.name == "retention_threshold";
-        older_seen |= slot.name == "older_than";
         // The reference checks duplicates on canonical Ident values above,
         // then the property author uses a lowercase key for value assignment.
         bound[index] = value;
@@ -613,7 +587,6 @@ fn bind_value<'a>(
     input: ProcedureInput<'a>,
     binding: EnumArgumentContext<'_>,
     constants: &mut dyn DdlPropertyConstantPort,
-    absolute_time: &mut dyn TableProcedureAbsoluteTimePort,
     control: &dyn PureCompileControl,
 ) -> Result<BoundProcedureValue<'a>, QueryServiceError> {
     if let (ProcedureArgumentType::EqualityRows, ProcedureInput::Expression(expression)) =
@@ -622,7 +595,10 @@ fn bind_value<'a>(
         return Ok(BoundProcedureValue::EqualityRows(expression));
     }
     let EnumArgumentContext {
-        sql: source, span, ..
+        sql: source,
+        catalog,
+        span,
+        ..
     } = binding;
     let location = Some((source, span));
     let evaluate = |expression, ty, constants: &mut dyn DdlPropertyConstantPort| {
@@ -634,7 +610,7 @@ fn bind_value<'a>(
         (Value(ty), ProcedureInput::Expression(expression)) => evaluate(expression, ty, constants)?,
         (ProcedureArgumentType::Enum(values), ProcedureInput::Expression(expression)) => {
             let value = evaluate(expression, Type::Varchar, constants)?;
-            validate_supplied_value(slot, &value, location)?;
+            validate_supplied_value(slot, &value, location, catalog)?;
             let DdlPropertyValue::Varchar(value) = value else {
                 return Err(invariant(
                     "Table procedure enum received a different declared type",
@@ -643,42 +619,13 @@ fn bind_value<'a>(
             return bind_procedure_enum(values, slot.name, expression, &value, binding);
         }
 
-        (ProcedureArgumentType::AbsoluteTime, ProcedureInput::Expression(expression)) => {
-            let literal = match expression {
-                Expr::Literal(literal) => match &literal.kind {
-                    LiteralKind::String(_) => Some(Type::Varchar),
-                    LiteralKind::Long { .. } => Some(Type::Bigint),
-                    LiteralKind::Generic(literal)
-                        if literal.type_name.eq_ignore_ascii_case("timestamp") =>
-                    {
-                        return absolute_time
-                            .legacy_timestamp_literal_millis(&literal.value, expression.span())
-                            .map(DdlPropertyValue::Bigint)
-                            .map(BoundProcedureValue::Value);
-                    }
-                    LiteralKind::Null => {
-                        return Err(invalid_procedure_argument(
-                            source,
-                            span,
-                            "Table procedure argument 'older_than' cannot be NULL",
-                        ));
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-            match literal {
-                Some(ty) => evaluate(expression, ty, constants)?,
-                None => evaluate_timestamp(expression, source, span, constants, control)?,
-            }
-        }
         _ => {
             return Err(invariant(
                 "Table procedure input differs from its original argument author",
             ));
         }
     };
-    validate_supplied_value(slot, &value, location)?;
+    validate_supplied_value(slot, &value, location, catalog)?;
     if let DdlPropertyValue::Varchar(text) = &value
         && slot.name == RETENTION.name
     {
@@ -772,69 +719,11 @@ fn bind_procedure_enum<'a>(
     ))
 }
 
-fn evaluate_timestamp(
-    expression: &Expr,
-    source: &str,
-    span: Span,
-    constants: &mut dyn DdlPropertyConstantPort,
-    control: &dyn PureCompileControl,
-) -> Result<DdlPropertyValue, QueryServiceError> {
-    let constant = evaluate_required_constant(
-        expression,
-        RequiredConstantTarget::Timestamp,
-        constants,
-        control,
-        |message, cause| error(INVALID_ARGUMENT, Some((source, span)), message, cause),
-    )?;
-
-    let binding = constant.value_type();
-    let ValueKind::Scalar(ty) = binding.value_type().kind() else {
-        return Err(invariant(
-            "Required timestamp constant has a different complete target type",
-        ));
-    };
-    if binding.logical_type() != ValueLogicalType::Physical || binding.data_type() != ty {
-        return Err(invariant(
-            "Required timestamp constant has a different complete target type",
-        ));
-    }
-    let unit = match ty {
-        DataType::Timestamp(unit, _) => unit,
-        DataType::Null if binding.nullable() => return Ok(DdlPropertyValue::Null),
-        _ => {
-            return Err(invariant(
-                "Required timestamp constant has a different complete target type",
-            ));
-        }
-    };
-    let ticks = constant.try_timestamp().map_err(constant_failure)?;
-    checkpoint(control, 1)?;
-    let Some(ticks) = ticks else {
-        return Ok(DdlPropertyValue::Null);
-    };
-    // The physical timestamp payload already measures from the epoch. An
-    // authored zone describes that instant; an unzoned input uses the same
-    // UTC interpretation as the compatibility literal path.
-    let millis = match unit {
-        TimeUnit::Second => ticks.checked_mul(1_000),
-        TimeUnit::Millisecond => Some(ticks),
-        TimeUnit::Microsecond => Some(ticks.div_euclid(1_000)),
-        TimeUnit::Nanosecond => Some(ticks.div_euclid(1_000_000)),
-    }
-    .ok_or_else(|| {
-        invalid_procedure_argument(
-            source,
-            span,
-            "Table procedure timestamp is outside the epoch-millisecond range",
-        )
-    })?;
-    Ok(DdlPropertyValue::Bigint(millis))
-}
-
 fn validate_supplied_value(
     slot: &TableProcedureArgument,
     value: &DdlPropertyValue,
     location: Option<(&str, Span)>,
+    catalog: &str,
 ) -> Result<(), QueryServiceError> {
     if matches!(value, DdlPropertyValue::Null) {
         return Err(error(
@@ -849,12 +738,16 @@ fn validate_supplied_value(
             "Table procedure argument author produced a different declared type",
         ));
     }
-    if slot.name == "retain_last" && matches!(value, DdlPropertyValue::Integer(count) if *count < 1)
+    if slot.name == "retain_last"
+        && let DdlPropertyValue::Integer(count) = value
+        && *count < 1
     {
         return Err(error(
             INVALID_ARGUMENT,
             location,
-            "Number of snapshots to retain must be at least 1",
+            format!(
+                "Unable to set catalog '{catalog}' table procedure 'EXPIRE_SNAPSHOTS' property 'retain_last' to [{count}]: Number of snapshots to retain must be at least 1"
+            ),
             None,
         ));
     }
@@ -865,10 +758,6 @@ fn matches_type(expected: ProcedureArgumentType, value: &DdlPropertyValue) -> bo
     match expected {
         Value(ty) => value.value_type() == Some(ty),
         ProcedureArgumentType::Enum(_) => value.value_type() == Some(Type::Varchar),
-        ProcedureArgumentType::AbsoluteTime => matches!(
-            value,
-            DdlPropertyValue::Varchar(_) | DdlPropertyValue::Bigint(_)
-        ),
         ProcedureArgumentType::EqualityRows => false,
     }
 }
@@ -894,6 +783,14 @@ pub fn invalid_procedure_argument(
     message: impl Into<String>,
 ) -> QueryServiceError {
     error(INVALID_ARGUMENT, Some((source, span)), message, None)
+}
+
+/// Project an argument rejected by the selected provider after binding.
+pub fn invalid_procedure_request(
+    cause: SharedFailureCause,
+    message: impl Into<String>,
+) -> QueryServiceError {
+    error(INVALID_ARGUMENT, None, message, Some(cause))
 }
 
 fn error(
@@ -940,16 +837,6 @@ mod tests {
             panic!("argument shape must be refused before evaluating its value")
         }
     }
-    impl TableProcedureAbsoluteTimePort for UnreachedEvaluation {
-        fn legacy_timestamp_literal_millis(
-            &mut self,
-            _: &str,
-            _: Span,
-        ) -> Result<i64, QueryServiceError> {
-            panic!("argument shape must be refused before parsing a timestamp literal")
-        }
-    }
-
     #[test]
     fn table_procedure_argument_shape_preserves_pin_error_identities() {
         let provider = ConnectorProviderId::parse("iceberg").unwrap();
@@ -988,10 +875,9 @@ mod tests {
                 &args,
                 TableProcedureBindingSource {
                     sql,
-                    catalog: "ice",
+                    catalog: "iceberg",
                     statement_span: call.span,
                 },
-                &mut UnreachedEvaluation,
                 &mut UnreachedEvaluation,
                 &SqlCompileControl::unbounded(),
             )

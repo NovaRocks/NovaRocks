@@ -178,7 +178,60 @@ pub(crate) async fn execute_action_with_ports(
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     request: MaintenanceActionRequest,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MaintenanceActionOutcome, String> {
+) -> Result<MaintenanceActionOutcome, TerminalError> {
+    if let Some(call) = pending.as_mut()
+        && let Some(intent) = call.trino_execute()
+    {
+        let matches = match (&request, intent) {
+            (
+                MaintenanceActionRequest::RewriteManifests {
+                    use_caching: None,
+                    spec_id: None,
+                    target,
+                },
+                MetadataMaintenanceIntent::TrinoOptimizeManifests,
+            )
+            | (
+                MaintenanceActionRequest::ExpireSnapshots { target, .. },
+                MetadataMaintenanceIntent::TrinoExpireSnapshots { .. },
+            ) => {
+                let instance =
+                    novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+                        .map_err(TerminalError::from_original_cause)?;
+                let table = novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance.clone(),
+                    namespace: target.namespace.clone().into(),
+                    table: target.table.clone().into(),
+                };
+                match (&request, intent) {
+                    (
+                        MaintenanceActionRequest::ExpireSnapshots {
+                            older_than_ms,
+                            retain_last,
+                            ..
+                        },
+                        MetadataMaintenanceIntent::TrinoExpireSnapshots {
+                            older_than_ms: frozen_cutoff,
+                            retain_last: frozen_retain_last,
+                            ..
+                        },
+                    ) if *older_than_ms != Some(*frozen_cutoff)
+                        || retain_last != frozen_retain_last =>
+                    {
+                        false
+                    }
+                    _ => call.matches(&instance, call.operation_id(), &table, intent),
+                }
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(TerminalError::pre_dispatch_failed(
+                "EXECUTE differs from its retained metadata call",
+            ));
+        }
+        return run_trino_metadata_procedure(call, cache_finalizer).await;
+    }
     match request {
         MaintenanceActionRequest::RewriteDataFiles { .. }
         | MaintenanceActionRequest::RewritePositionDeleteFiles { .. } => Err(
@@ -222,6 +275,192 @@ pub(crate) async fn execute_action_with_ports(
                 .to_string(),
         ),
     }
+    .map_err(TerminalError::from)
+}
+
+async fn run_trino_metadata_procedure(
+    call: &mut MetadataMaintenanceCall,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+) -> Result<MaintenanceActionOutcome, TerminalError> {
+    use crate::connector::metadata_maintenance::{
+        KnownUncommittedMetadataMaintenance, MetadataMaintenanceDispatchState,
+        ResolvedMetadataMaintenance,
+    };
+    use novarocks_spi::connector::ExternalMutationFinalization;
+    use novarocks_table_maintenance::ProcedureMetrics;
+
+    let completion =
+        crate::connector::metadata_maintenance::resolve_metadata_maintenance(call, cache_finalizer)
+            .await;
+    let completed = match completion {
+        ResolvedMetadataMaintenance::KnownCommitted(completed) => completed,
+        ResolvedMetadataMaintenance::KnownUncommitted {
+            failure: KnownUncommittedMetadataMaintenance::Planning(error),
+            ..
+        } => {
+            return Err(procedure_connector_terminal(
+                error,
+                TerminalError::pre_dispatch_failed,
+            ));
+        }
+        ResolvedMetadataMaintenance::KnownUncommitted {
+            failure: KnownUncommittedMetadataMaintenance::Provider(failure),
+            cleanup,
+        } => {
+            let detail = crate::connector::mutation::known_uncommitted_message(&failure, &cleanup);
+            return Err(procedure_mutation_terminal(
+                failure,
+                detail,
+                TerminalError::known_uncommitted,
+            ));
+        }
+        ResolvedMetadataMaintenance::CommitUnknown { failure } => {
+            let detail = failure.to_string();
+            return Err(procedure_mutation_terminal(
+                failure,
+                detail,
+                TerminalError::commit_unknown,
+            ));
+        }
+        ResolvedMetadataMaintenance::ContractFailure {
+            error,
+            dispatch: MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+        } => {
+            return Err(procedure_connector_terminal(
+                error,
+                TerminalError::pre_dispatch_failed,
+            ));
+        }
+        ResolvedMetadataMaintenance::ContractFailure {
+            error,
+            dispatch: MetadataMaintenanceDispatchState::PossiblyDispatched,
+        } => {
+            return Err(procedure_connector_terminal(
+                error,
+                TerminalError::commit_unknown,
+            ));
+        }
+    };
+    if let ExternalMutationFinalization::Failed(failure) = completed.finalization {
+        let detail = failure.to_string();
+        return Err(procedure_mutation_terminal(
+            failure,
+            detail,
+            TerminalError::known_committed_finalization_failed,
+        ));
+    }
+    let metrics = completed
+        .receipt
+        .summary()
+        .manifest_rewrite_metrics
+        .map(|metrics| {
+            ProcedureMetrics::from_counts([
+                ("rewritten_manifests_count", metrics.rewritten),
+                ("added_manifests_count", metrics.added),
+                ("kept_manifests_count", metrics.kept),
+                (
+                    "processed_manifest_entries_count",
+                    metrics.processed_entries,
+                ),
+            ])
+        })
+        .transpose()
+        .map_err(TerminalError::known_committed_finalization_failed)?;
+    Ok(MaintenanceActionOutcome::Procedure { metrics })
+}
+
+pub(crate) fn retention_format_error(
+    terminal: TerminalError,
+    procedure: &'static str,
+    target: &MaintenanceTarget,
+) -> TerminalError {
+    use novarocks_failure_contract::{BoundedDetail, SharedFailureCause};
+    use novarocks_spi::connector::{ConnectorError, ConnectorTableFormatVersionUnsupported};
+    use std::error::Error as _;
+
+    if terminal.state
+        != novarocks_table_maintenance::runtime::MaintenanceJobState::PreDispatchFailed
+    {
+        return terminal;
+    }
+    let Some(cause) = terminal.failure_cause.as_ref() else {
+        return terminal;
+    };
+    let typed = cause
+        .downcast_ref::<ConnectorTableFormatVersionUnsupported>()
+        .or_else(|| {
+            cause
+                .downcast_ref::<ConnectorError>()?
+                .source()?
+                .downcast_ref::<SharedFailureCause>()?
+                .downcast_ref::<ConnectorTableFormatVersionUnsupported>()
+        });
+    let Some(&ConnectorTableFormatVersionUnsupported(version)) = typed else {
+        return terminal;
+    };
+    let detail = format!(
+        "{procedure} is not supported for Iceberg table format version > 3. Table {}.{} format version is {version}.",
+        target.namespace, target.table,
+    );
+    TerminalError::pre_dispatch_failed(detail.clone()).with_failure_cause(Some(
+        SharedFailureCause::from_bounded_detail(
+            ConnectorTableFormatVersionUnsupported(version),
+            BoundedDetail::truncating(&detail),
+        ),
+    ))
+}
+
+pub(crate) fn invalid_procedure_error(
+    terminal: &TerminalError,
+) -> Option<novarocks_query_application::session_error::QueryServiceError> {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    use novarocks_table_maintenance::runtime::MaintenanceJobState;
+    if terminal.state != MaintenanceJobState::PreDispatchFailed {
+        return None;
+    }
+    let cause = terminal.failure_cause.as_ref()?;
+    let error = cause.downcast_ref::<ConnectorError>()?;
+    if error.kind() != ConnectorErrorKind::InvalidRequest {
+        return None;
+    }
+    let message = error.public_failure_detail()?;
+    Some(
+        novarocks_query_application::sql::table_procedure::invalid_procedure_request(
+            cause.clone(),
+            message,
+        ),
+    )
+}
+
+fn procedure_mutation_terminal(
+    failure: novarocks_spi::connector::ConnectorMutationFailure,
+    detail: String,
+    terminal: impl FnOnce(String) -> TerminalError,
+) -> TerminalError {
+    match failure.connector_source().cloned() {
+        Some(error) => procedure_connector_terminal(error, terminal),
+        None => terminal(detail).with_failure_cause(Some(
+            novarocks_failure_contract::SharedFailureCause::from_static_detail(
+                failure,
+                "Iceberg table procedure failed",
+            ),
+        )),
+    }
+}
+
+pub(super) fn procedure_connector_terminal(
+    error: novarocks_spi::connector::ConnectorError,
+    terminal: impl FnOnce(String) -> TerminalError,
+) -> TerminalError {
+    use novarocks_failure_contract::{BoundedDetail, SharedFailureCause};
+    let detail = error
+        .public_failure_detail()
+        .unwrap_or("Iceberg table procedure failed")
+        .to_owned();
+    terminal(detail.clone()).with_failure_cause(Some(SharedFailureCause::from_bounded_detail(
+        error,
+        BoundedDetail::truncating(&detail),
+    )))
 }
 
 /// Read the current snapshot on a caller-supplied exact request context.

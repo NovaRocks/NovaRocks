@@ -20,29 +20,34 @@
 //! work bracketed by the original control. No allocation grant is claimed.
 
 use super::value_conversion::{
-    ARRAY_COMMON_COERCION, JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT, LARGEINT_SIGNED,
-    LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, SIGNED_LARGEINT, UTF8_LARGEINT,
+    ARRAY_COMMON_COERCION, BOOLEAN_LARGEINT, DECIMAL128_LARGEINT, DECIMAL256_LARGEINT,
+    FLOAT32_LARGEINT, FLOAT64_LARGEINT, JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT,
+    LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, SIGNED_LARGEINT, UTF8_LARGEINT,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
     KernelFailure, ScalarCallContract, ScalarCallInput, SelectedValues, Selection,
+    cast::{decimal_integral_coefficient, decimal_overflow_error},
     kernel_control::{compile_failure, internal, invalid},
     kernel_input::{EvaluationCheckpoints, validate_argument_observed, validate_type_observed},
+    largeint::{LARGEINT_BYTE_WIDTH, i128_to_be_bytes},
     selected_copy::{self, CopyError},
 };
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray, ListArray, MapArray,
-    PrimitiveArray, StructArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray,
+    ListArray, MapArray, PrimitiveArray, StructArray, UInt64Array,
     builder::{FixedSizeBinaryBuilder, PrimitiveBuilder},
     new_empty_array,
     types::*,
 };
+use arrow_buffer::i256;
 use arrow_schema::DataType;
 use arrow_select::take::{TakeOptions, take};
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, ExpressionEffectContext,
     PureCompileControl, arrow_data_types_exact_observed,
 };
+use num_traits::ToPrimitive;
 use std::{ops::Range, sync::Arc};
 
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +72,7 @@ impl Signed {
 enum Operation {
     SameShape,
     SignedLargeInt(Signed),
+    NumericLargeInt(NumericLargeIntSource),
     LargeIntSigned(Signed),
     LargeIntDecimal(super::value_conversion::largeint_decimal::DecimalRecipe),
     LargeIntF32,
@@ -75,6 +81,14 @@ enum Operation {
     Utf8LargeInt,
     NullLift,
     ArrayCommon,
+}
+#[derive(Clone, Copy, Debug)]
+enum NumericLargeIntSource {
+    Decimal128(i8),
+    Decimal256(i8),
+    Float32,
+    Float64,
+    Boolean,
 }
 #[derive(Clone, Copy, Debug)]
 enum JsonKind {
@@ -126,6 +140,18 @@ impl ConversionRecipe {
                 SIGNED_LARGEINT => {
                     Operation::SignedLargeInt(Signed::from_type(source.data_type())?)
                 }
+                DECIMAL128_LARGEINT | DECIMAL256_LARGEINT => match source.data_type() {
+                    DataType::Decimal128(_, scale) => {
+                        Operation::NumericLargeInt(NumericLargeIntSource::Decimal128(*scale))
+                    }
+                    DataType::Decimal256(_, scale) => {
+                        Operation::NumericLargeInt(NumericLargeIntSource::Decimal256(*scale))
+                    }
+                    _ => return Err(invalid("conversion has a foreign frozen Decimal source")),
+                },
+                FLOAT32_LARGEINT => Operation::NumericLargeInt(NumericLargeIntSource::Float32),
+                FLOAT64_LARGEINT => Operation::NumericLargeInt(NumericLargeIntSource::Float64),
+                BOOLEAN_LARGEINT => Operation::NumericLargeInt(NumericLargeIntSource::Boolean),
                 LARGEINT_SIGNED => {
                     Operation::LargeIntSigned(Signed::from_type(target.data_type())?)
                 }
@@ -376,6 +402,14 @@ impl ConversionRecipe {
                     Operation::SignedLargeInt(width) => {
                         signed_largeint(width, *argument, selection, &mut work)?
                     }
+                    Operation::NumericLargeInt(source) => numeric_largeint(
+                        source,
+                        self.policy,
+                        *argument,
+                        selection,
+                        &mut errors,
+                        &mut work,
+                    )?,
                     Operation::LargeIntSigned(width) => {
                         largeint_signed(width, *argument, selection, &mut work)?
                     }
@@ -674,6 +708,104 @@ fn signed_largeint(
         Signed::I64 => run!(Int64Type),
     }
 }
+fn numeric_largeint(
+    source: NumericLargeIntSource,
+    policy: DecimalOverflowPolicy,
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    errors: &mut Vec<crate::RowDataError>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let report_decimal_overflow = matches!(
+        source,
+        NumericLargeIntSource::Decimal128(_) | NumericLargeIntSource::Decimal256(_)
+    ) && policy == DecimalOverflowPolicy::ReportError;
+    macro_rules! convert {
+        ($value:expr) => {
+            convert_numeric_largeint(
+                argument,
+                selection,
+                report_decimal_overflow,
+                errors,
+                work,
+                $value,
+            )
+        };
+    }
+    // Only decimal conversions consult the frozen SQL decimal overflow policy.
+    match source {
+        NumericLargeIntSource::Decimal128(scale) => {
+            convert!(|array: &arrow_array::Decimal128Array, row, work| {
+                decimal_largeint(i256::from_i128(array.value(row)), scale, work)
+            })
+        }
+        NumericLargeIntSource::Decimal256(scale) => {
+            convert!(|array: &arrow_array::Decimal256Array, row, work| {
+                decimal_largeint(array.value(row), scale, work)
+            })
+        }
+        NumericLargeIntSource::Float32 => {
+            convert!(|array: &arrow_array::Float32Array, row, _| Ok(array.value(row).to_i128()))
+        }
+        NumericLargeIntSource::Float64 => {
+            convert!(|array: &arrow_array::Float64Array, row, _| Ok(array.value(row).to_i128()))
+        }
+        NumericLargeIntSource::Boolean => {
+            convert!(|array: &BooleanArray, row, _| Ok(Some(i128::from(array.value(row)))))
+        }
+    }
+}
+
+fn decimal_largeint(
+    value: i256,
+    scale: i8,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<i128>, KernelFailure> {
+    if value == i256::ZERO {
+        // Zero fits at every scale, even when the scale factor does not fit i256.
+        return Ok(Some(0));
+    }
+    decimal_integral_coefficient(value, scale, work)
+}
+
+fn convert_numeric_largeint<A: Array + 'static>(
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    report_decimal_overflow: bool,
+    errors: &mut Vec<crate::RowDataError>,
+    work: &mut EvaluationCheckpoints<'_>,
+    value: impl Fn(&A, usize, &mut EvaluationCheckpoints<'_>) -> Result<Option<i128>, KernelFailure>,
+) -> Result<ArrayRef, KernelFailure> {
+    let source: &A = downcast(argument.array())?;
+    extent(selection.len(), LARGEINT_BYTE_WIDTH as usize)?;
+    work.flush()?;
+    let mut output = FixedSizeBinaryBuilder::with_capacity(selection.len(), LARGEINT_BYTE_WIDTH);
+    work.flush()?;
+    for (ordinal, logical_row) in selection.iter().enumerate() {
+        let row = argument.value_row(ordinal, logical_row);
+        work.step()?;
+        if source.is_null(row) {
+            output.append_null();
+            continue;
+        }
+        if let Some(value) = value(source, row, work)? {
+            output
+                .append_value(i128_to_be_bytes(value))
+                .map_err(|_| internal("conversion LargeInt append violated its fixed width"))?;
+        } else {
+            output.append_null();
+            if report_decimal_overflow {
+                errors.push(decimal_overflow_error(ordinal, work)?);
+                work.flush()?;
+            }
+        }
+    }
+    work.flush()?;
+    let output = Arc::new(output.finish()) as ArrayRef;
+    work.flush()?;
+    Ok(output)
+}
+
 fn largeint_decimal(
     recipe: super::value_conversion::largeint_decimal::DecimalRecipe,
     policy: DecimalOverflowPolicy,

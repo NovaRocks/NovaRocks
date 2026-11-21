@@ -269,6 +269,32 @@ enum RowDiagnostic {
     Bounded(Box<str>),
     Host(crate::aggregate_invocation_backing::HostDiagnostic),
     Domain(novarocks_failure_contract::SharedFailureCause),
+    NegationOverflow(NegationOverflow),
+}
+
+/// Integer negation can overflow only for the minimum of the exact SQL type.
+/// This closed fact produces a diagnostic without copying an input or source message.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NegationOverflow {
+    TinyInt,
+    SmallInt,
+    Integer,
+    BigInt,
+    LargeInt,
+}
+
+impl NegationOverflow {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::TinyInt => "tinyint negation overflow: -128",
+            Self::SmallInt => "smallint negation overflow: -32768",
+            Self::Integer => "integer negation overflow: -2147483648",
+            Self::BigInt => "bigint negation overflow: -9223372036854775808",
+            Self::LargeInt => {
+                "largeint negation overflow: -170141183460469231731687303715884105728"
+            }
+        }
+    }
 }
 /// Semantic data failure retained independently of its diagnostic and row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,6 +318,7 @@ impl PartialEq for RowDataError {
         self.selected_ordinal == other.selected_ordinal
             && self.reason == other.reason
             && self.message() == other.message()
+            && self.public_diagnostic() == other.public_diagnostic()
     }
 }
 impl Eq for RowDataError {}
@@ -361,6 +388,14 @@ impl RowDataError {
         }
     }
 
+    pub(crate) fn negation_overflow(selected_ordinal: usize, overflow: NegationOverflow) -> Self {
+        Self {
+            selected_ordinal,
+            reason: DataFailureReason::NumericOutOfRange,
+            message: RowDiagnostic::NegationOverflow(overflow),
+        }
+    }
+
     pub const fn reason(&self) -> DataFailureReason {
         self.reason
     }
@@ -373,6 +408,15 @@ impl RowDataError {
             RowDiagnostic::Bounded(message) => message,
             RowDiagnostic::Host(message) => message.message(),
             RowDiagnostic::Domain(source) => source.detail(),
+            RowDiagnostic::NegationOverflow(overflow) => overflow.message(),
+        }
+    }
+
+    /// Public wording is authored only by a closed, input-independent row diagnostic.
+    pub fn public_diagnostic(&self) -> Option<&'static str> {
+        match self.message {
+            RowDiagnostic::NegationOverflow(overflow) => Some(overflow.message()),
+            _ => None,
         }
     }
     /// Remap the true selected ordinal without clipping or reformatting the

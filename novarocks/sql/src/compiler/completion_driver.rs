@@ -939,6 +939,7 @@ fn provider_or_ready_step(
         physical,
         next_need_ordinal,
         offer_predicates,
+        None,
         !matches!(
             common.display_intent,
             SqlDisplayIntent::Explain { analyze: false, .. }
@@ -1006,11 +1007,17 @@ pub(crate) fn collect_provider_inputs(
     plan: PhysicalPlanNode,
     next_need_ordinal: u32,
     offer_predicates: bool,
+    row_mutation_match: Option<crate::binding::SqlTableBindingId>,
     materialize_system_tables: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<CollectedProviderInputs, SqlCompileError> {
-    let (physical, reads, mut next_need) =
-        collect_provider_needs_with_next(plan, next_need_ordinal, offer_predicates, control)?;
+    let (physical, reads, mut next_need) = collect_provider_needs_with_next(
+        plan,
+        next_need_ordinal,
+        offer_predicates,
+        row_mutation_match,
+        control,
+    )?;
     let (physical, system_tables) = super::system_table_completion::collect(
         physical,
         &mut next_need,
@@ -1024,10 +1031,16 @@ pub(crate) fn collect_provider_needs(
     plan: PhysicalPlanNode,
     next_need_ordinal: u32,
     offer_predicates: bool,
+    row_mutation_match: Option<crate::binding::SqlTableBindingId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>), SqlCompileError> {
-    let (plan, needs, _) =
-        collect_provider_needs_with_next(plan, next_need_ordinal, offer_predicates, control)?;
+    let (plan, needs, _) = collect_provider_needs_with_next(
+        plan,
+        next_need_ordinal,
+        offer_predicates,
+        row_mutation_match,
+        control,
+    )?;
     Ok((plan, needs))
 }
 
@@ -1035,6 +1048,7 @@ fn collect_provider_needs_with_next(
     plan: PhysicalPlanNode,
     mut next_need_ordinal: u32,
     offer_predicates: bool,
+    row_mutation_match: Option<crate::binding::SqlTableBindingId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>, u32), SqlCompileError> {
     #[derive(Default)]
@@ -1058,6 +1072,7 @@ fn collect_provider_needs_with_next(
         occurrence_allocator: &mut ProviderReadOccurrenceAllocator,
         needs: &mut Vec<ProviderReadNeed>,
         offer_predicates: bool,
+        row_mutation_match: Option<crate::binding::SqlTableBindingId>,
         work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
     ) -> Result<PhysicalPlanNode, SqlCompileError> {
         work.step()?;
@@ -1077,6 +1092,7 @@ fn collect_provider_needs_with_next(
                     occurrence_allocator,
                     needs,
                     offer_predicates,
+                    row_mutation_match,
                     work,
                 )
             })
@@ -1103,7 +1119,11 @@ fn collect_provider_needs_with_next(
                 .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
                 let (columns, predicate_columns) = provider_columns(&output_columns, &scan, work)?;
                 let predicates = if offer_predicates {
-                    lower_provider_predicates(&scan, &predicate_columns)
+                    lower_provider_predicates(
+                        &scan,
+                        &predicate_columns,
+                        row_mutation_match == Some(source.binding),
+                    )
                 } else {
                     Box::default()
                 };
@@ -1146,6 +1166,7 @@ fn collect_provider_needs_with_next(
         &mut occurrence_allocator,
         &mut needs,
         offer_predicates,
+        row_mutation_match,
         &mut work,
     )?;
     work.finish()?;
@@ -1600,9 +1621,14 @@ mod tests {
                 ValueType::try_with_logical_type(DataType::FixedSizeBinary(16), true, logical)
                     .unwrap();
             let plan = provider_type_scan(value_type.clone(), 1);
-            let (_, needs) =
-                collect_provider_needs(plan.clone(), 7, false, &SqlCompileControl::unbounded())
-                    .unwrap();
+            let (_, needs) = collect_provider_needs(
+                plan.clone(),
+                7,
+                false,
+                None,
+                &SqlCompileControl::unbounded(),
+            )
+            .unwrap();
             assert_eq!(needs[0].columns()[0].engine_type(), &value_type);
             let mut forged = plan;
             forged.output_columns[0].value_type =
@@ -1617,7 +1643,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(matches!(
-                collect_provider_needs(forged, 7, false, &SqlCompileControl::unbounded()),
+                collect_provider_needs(forged, 7, false, None, &SqlCompileControl::unbounded()),
                 Err(SqlCompileError::Compilation(_))
             ));
         }
@@ -1654,7 +1680,7 @@ mod tests {
             failure: None,
             fail_at: usize::MAX,
         };
-        let (_, needs) = collect_provider_needs(plan.clone(), 0, false, &owner).unwrap();
+        let (_, needs) = collect_provider_needs(plan.clone(), 0, false, None, &owner).unwrap();
         assert_eq!(needs[0].columns().len(), 320);
         let observations = owner.observations.lock().unwrap().clone();
         assert_eq!(observations[0], 0);
@@ -1673,7 +1699,7 @@ mod tests {
                     failure: Some(error.clone()),
                     fail_at,
                 };
-                let result = collect_provider_needs(plan.clone(), 0, false, &owner);
+                let result = collect_provider_needs(plan.clone(), 0, false, None, &owner);
                 assert!(
                     matches!(result, Err(actual) if actual == SqlCompileError::from(error.clone()))
                 );
@@ -1767,7 +1793,7 @@ mod tests {
                 observations: Default::default(),
             };
             assert!(
-                matches!(collect_provider_needs(plan.clone(), 0, false, &owner),
+                matches!(collect_provider_needs(plan.clone(), 0, false, None, &owner),
                 Err(actual) if actual == SqlCompileError::from(failure))
             );
             let observations = owner.observations.lock().unwrap();
@@ -1776,7 +1802,7 @@ mod tests {
             assert!(observations[1..].iter().all(|units| *units == 256));
         }
         let (_, needs) =
-            collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()).unwrap();
+            collect_provider_needs(plan, 0, false, None, &SqlCompileControl::unbounded()).unwrap();
         assert_eq!(needs.len(), 1);
         assert_eq!(needs[0].columns().len(), 1);
     }
@@ -1810,6 +1836,7 @@ mod tests {
                 provider_type_scan(same, 1),
                 0,
                 false,
+                None,
                 &SqlCompileControl::unbounded(),
             )
             .unwrap();
@@ -1838,7 +1865,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(matches!(
-                collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()),
+                collect_provider_needs(plan, 0, false, None, &SqlCompileControl::unbounded()),
                 Err(SqlCompileError::Compilation(_))
             ));
         }

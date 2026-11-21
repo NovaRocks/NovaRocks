@@ -206,7 +206,7 @@ SELECT
     CAST(decimal256_50_15 AS smallint) as decimal256_to_smallint,
     CAST(decimal256_50_15 AS int) as decimal256_to_int,
     CAST(decimal256_50_15 AS bigint) as decimal256_to_bigint,
-    CAST(decimal256_50_15 AS largeint) as decimal256_to_largeint
+    CAST(CAST(decimal256_50_15 AS LARGEINT) AS VARCHAR) AS decimal256_to_largeint
 FROM ${case_db}.cast_test_source
 WHERE decimal256_50_15 IS NOT NULL
 ORDER BY id;

@@ -196,17 +196,17 @@ fn semantic_depth_keeps_resource_class_and_truth_only_keeps_boolean_contract() {
     let mut builder = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: 3,
     });
-    let (pools, reference) = i64_source(1);
+    let (pools, reference) = null_source(&boolean(true));
     let mut id = builder
-        .add(None, integer(false), ExprKind::Constant(reference))
+        .add(None, boolean(true), ExprKind::Constant(reference))
         .unwrap();
     for _ in 0..3 {
         id = builder
             .add(
                 None,
-                integer(false),
+                boolean(true),
                 ExprKind::Unary {
-                    op: UnaryOperator::Plus,
+                    op: UnaryOperator::Not,
                     expr: id,
                 },
             )
@@ -226,17 +226,17 @@ fn semantic_depth_keeps_resource_class_and_truth_only_keeps_boolean_contract() {
     // A previously sealed unit must still obey the enclosing deployment's
     // stricter semantic limit through the same unit validation author.
     let mut fresh = BoundExprSetBuilder::new(limits());
-    let (source, reference) = i64_source(7);
+    let (source, reference) = null_source(&boolean(true));
     let mut id = fresh
-        .add(None, integer(false), ExprKind::Constant(reference))
+        .add(None, boolean(true), ExprKind::Constant(reference))
         .unwrap();
     for _ in 0..2 {
         id = fresh
             .add(
                 None,
-                integer(false),
+                boolean(true),
                 ExprKind::Unary {
-                    op: UnaryOperator::Plus,
+                    op: UnaryOperator::Not,
                     expr: id,
                 },
             )
@@ -435,7 +435,7 @@ fn arithmetic_gate_preserves_exact_domain_and_only_root_nullable_widening() {
 }
 
 #[test]
-fn binary_numeric_gates_reject_opaque_fixed16_and_preserve_unsigned_bitwise() {
+fn arithmetic_rejects_opaque_fixed16_and_uuid() {
     for opaque in [
         ValueType::new(DataType::FixedSizeBinary(16), false),
         ValueType::try_with_logical_type(
@@ -446,120 +446,36 @@ fn binary_numeric_gates_reject_opaque_fixed16_and_preserve_unsigned_bitwise() {
         .unwrap(),
     ] {
         assert!(!binary_valid(
-            opaque.clone(),
+            opaque,
             BinaryOperator::Add,
             largeint(false),
             largeint(true)
         ));
-        assert!(!binary_valid(
-            opaque.clone(),
-            BinaryOperator::BitAnd,
-            opaque.clone(),
-            opaque
-        ));
-    }
-    for dtype in [
-        DataType::UInt8,
-        DataType::UInt16,
-        DataType::UInt32,
-        DataType::UInt64,
-    ] {
-        assert!(binary_valid(
-            ValueType::new(dtype.clone(), false),
-            BinaryOperator::BitXor,
-            ValueType::new(dtype.clone(), true),
-            ValueType::new(dtype, true)
-        ));
     }
 }
 
-fn unary_unit(
+fn not_unit(
     input: ValueType,
     output: ValueType,
-    op: UnaryOperator,
-    nonliteral_null_child: bool,
 ) -> Result<(BoundExprSet, novarocks_constant_contract::ConstantPools), UnitError> {
     let (pools, reference) = null_source(&input);
     let mut b = BoundExprSetBuilder::new(limits());
-    let mut child = b
-        .add(None, input.clone(), ExprKind::Constant(reference))
-        .unwrap();
-    if nonliteral_null_child {
-        child = b
-            .add(
-                None,
-                input,
-                ExprKind::Unary {
-                    op: UnaryOperator::Plus,
-                    expr: child,
-                },
-            )
-            .unwrap();
-    }
+    let child = b.add(None, input, ExprKind::Constant(reference)).unwrap();
     let id = b
-        .add(None, output, ExprKind::Unary { op, expr: child })
+        .add(
+            None,
+            output,
+            ExprKind::Unary {
+                op: UnaryOperator::Not,
+                expr: child,
+            },
+        )
         .unwrap();
     b.root(id, EvaluationDemand::Value, RootScope::AllPorts)
         .unwrap();
     Ok((no_calls(b, vec![], &Control::good())?, pools))
 }
 
-#[test]
-fn checked_unary_units_preserve_decimal_uint_largeint_and_strict_null() {
-    for dtype in [
-        DataType::Float16,
-        DataType::Decimal32(7, 2),
-        DataType::Decimal64(10, 2),
-        DataType::Decimal128(38, 2),
-        DataType::Decimal256(76, 2),
-        DataType::UInt64,
-    ] {
-        let ty = ValueType::new(dtype, true);
-        unary_unit(ty.clone(), ty, UnaryOperator::Minus, false).unwrap();
-    }
-    unary_unit(
-        largeint(true),
-        largeint(true),
-        UnaryOperator::BitwiseNot,
-        false,
-    )
-    .unwrap();
-    for op in [
-        UnaryOperator::Plus,
-        UnaryOperator::Minus,
-        UnaryOperator::BitwiseNot,
-    ] {
-        let ty = ValueType::new(DataType::Null, true);
-        let (fragment, _constants) = unary_unit(ty.clone(), ty.clone(), op, true).unwrap();
-        assert_eq!(fragment.definitions().len(), 3);
-        assert!(fragment.definitions().iter().all(|expr| expr.ty == ty));
-    }
-    for opaque in [
-        ValueType::new(DataType::FixedSizeBinary(16), true),
-        ValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(16),
-            true,
-            ValueLogicalType::Uuid,
-        )
-        .unwrap(),
-    ] {
-        for op in [UnaryOperator::Minus, UnaryOperator::BitwiseNot] {
-            let errors = unary_unit(opaque.clone(), opaque.clone(), op, false).unwrap_err();
-            assert!(
-                matches!(errors,UnitError::Invalid {message,..} if message.contains("unary expression types are inconsistent with its operator"))
-            );
-        }
-    }
-    assert!(
-        unary_unit(
-            ValueType::new(DataType::Null, true),
-            ValueType::new(DataType::Int64, true),
-            UnaryOperator::Minus,
-            false
-        )
-        .is_err()
-    );
-}
 #[test]
 fn numeric_not_keeps_the_original_successful_domain_and_nullability() {
     for carrier in [
@@ -572,27 +488,8 @@ fn numeric_not_keeps_the_original_successful_domain_and_nullability() {
         DataType::Float64,
         DataType::Decimal128(18, 4),
     ] {
-        {
-            let nullable = true;
-            assert!(
-                unary_unit(
-                    ValueType::new(carrier.clone(), nullable),
-                    ValueType::new(DataType::Boolean, nullable),
-                    UnaryOperator::Not,
-                    false
-                )
-                .is_ok()
-            );
-        }
-        assert!(
-            unary_unit(
-                ValueType::new(carrier, true),
-                ValueType::new(DataType::Boolean, false),
-                UnaryOperator::Not,
-                false
-            )
-            .is_err()
-        );
+        assert!(not_unit(ValueType::new(carrier.clone(), true), boolean(true)).is_ok());
+        assert!(not_unit(ValueType::new(carrier, true), boolean(false)).is_err());
     }
     for carrier in [
         DataType::UInt64,
@@ -601,15 +498,7 @@ fn numeric_not_keeps_the_original_successful_domain_and_nullability() {
         DataType::Null,
         DataType::FixedSizeBinary(16),
     ] {
-        assert!(
-            unary_unit(
-                ValueType::new(carrier, true),
-                ValueType::new(DataType::Boolean, true),
-                UnaryOperator::Not,
-                false
-            )
-            .is_err()
-        );
+        assert!(not_unit(ValueType::new(carrier, true), boolean(true)).is_err());
     }
 }
 
@@ -621,9 +510,12 @@ fn uuid_is_not_a_numeric_largeint_domain() {
         ValueLogicalType::Uuid,
     )
     .unwrap();
-    for op in [BinaryOperator::Add, BinaryOperator::BitAnd] {
-        assert!(!binary_valid(uuid.clone(), op, uuid.clone(), uuid.clone()));
-    }
+    assert!(!binary_valid(
+        uuid.clone(),
+        BinaryOperator::Add,
+        uuid.clone(),
+        uuid
+    ));
     let integer = largeint(false);
     let plain = ValueType::new(DataType::FixedSizeBinary(16), false);
     for (input, output, valid) in [

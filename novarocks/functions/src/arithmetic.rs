@@ -186,14 +186,6 @@ impl SignedWidth {
             Self::I64 => array.as_any().is::<Int64Array>(),
         }
     }
-    pub(crate) fn minimum(self) -> i64 {
-        match self {
-            Self::I8 => i64::from(i8::MIN),
-            Self::I16 => i64::from(i16::MIN),
-            Self::I32 => i64::from(i32::MIN),
-            Self::I64 => i64::MIN,
-        }
-    }
     fn contains(self, value: i64) -> bool {
         match self {
             Self::I8 => i8::try_from(value).is_ok(),

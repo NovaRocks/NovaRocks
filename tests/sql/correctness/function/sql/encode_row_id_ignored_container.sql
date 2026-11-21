@@ -51,7 +51,7 @@ SELECT encode_sort_key(v1,v2,v3) FROM encode_ignored;
 
 -- query 8
 -- The ignored array carrier does not suppress evaluation of its child.
--- @expect_error=assert_true failed
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:422)
 SELECT encode_row_id([assert_true(FALSE)]);
 
 -- query 9

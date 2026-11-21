@@ -104,8 +104,8 @@ SELECT ROW(1, 2) OVERLAPS ROW(3, 4);
 SELECT 1 = ALL (SELECT 1);
 
 -- query 25
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT TRUE IS UNKNOWN;
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT 'text' IS UNKNOWN;
 
 -- query 26
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR

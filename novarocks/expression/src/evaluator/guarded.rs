@@ -687,7 +687,7 @@ impl<K> Frame<K> {
         work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
-        use novarocks_functions::native_inlist::{InRows, signed_equality_observed};
+        use novarocks_functions::native_inlist::InRows;
         let ordinal = self
             .next
             .checked_sub(1)
@@ -768,38 +768,22 @@ impl<K> Frame<K> {
             &parents,
             &mut |event| in_event(event, work),
         ))?;
-        let equalities = if expected.data_type() == &DataType::Utf8 {
-            if work.scalar_host.is_some() && allocator.is_none() {
-                return Err(invalid(
-                    "Task IN comparison has no original allocation owner",
-                ));
-            }
-            work.flush()?;
-            let control = work.control;
-            in_observed(super::utf8_inlist::utf8_equality_observed(
-                left.values(),
-                right.values(),
-                recipe.source_type().logical_type()
-                    == novarocks_type_contract::ValueLogicalType::Json,
-                allocator.cloned(),
-                control,
-                &mut |event| in_event(event, work),
-            ))?
-        } else {
-            super::utf8_inlist::Utf8Equalities::without_reservation(
-                in_observed(signed_equality_observed(
-                    left.values(),
-                    right.values(),
-                    &mut |event| in_event(event, work),
-                ))?
-                .ok_or_else(|| invalid("checked signed IN comparison lost its domain"))?,
-            )
-        };
-        in_observed(state.equalities_selected_observed(
-            equalities.array(),
-            &parents,
+        work.flush()?;
+        if let Some(host) = work.scalar_host.as_deref() {
+            host.validate_frame_allocator(allocator)?;
+        }
+        let control = work.control;
+        let equalities = in_observed(recipe.membership_equalities_observed(
+            left.values(),
+            right.values(),
+            allocator.cloned(),
+            control,
             &mut |event| in_event(event, work),
         ))?;
+        in_observed(
+            equalities
+                .apply_to_selected_observed(state, &parents, &mut |event| in_event(event, work)),
+        )?;
         // A match never suppresses the next original candidate invocation.
         work.flush()?;
         drop(equalities);
@@ -1098,8 +1082,6 @@ pub(super) enum CompletionKind {
     },
     Boolean,
     Cast,
-    Negate,
-    BitNot,
     Arithmetic,
     Comparison {
         null_safe: bool,
@@ -1118,8 +1100,6 @@ impl CompletionKind {
             StaticExprKind::PreparedBetween { plan, .. } => Self::Between { plan: *plan },
             StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => Self::Boolean,
             StaticExprKind::PreparedCast { .. } => Self::Cast,
-            StaticExprKind::PreparedNativeNegate(_) => Self::Negate,
-            StaticExprKind::PreparedNativeBitNot(_) => Self::BitNot,
             StaticExprKind::PreparedArithmetic { .. } => Self::Arithmetic,
             StaticExprKind::PreparedNullSafeComparison { .. } => {
                 Self::Comparison { null_safe: true }
@@ -1289,44 +1269,6 @@ fn complete_node<'a, R, K: Ord + Clone>(
             } else {
                 OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
             }
-        }
-        CompletionKind::Negate => {
-            if frame.children.len() != 1 {
-                return Err(invalid("native negate requires its exact ordered operand").into());
-            }
-            let child = frame
-                .children
-                .pop()
-                .ok_or_else(|| internal("missing native negate operand"))?
-                .value
-                .into_value(local_selection, work)?;
-            let recipe = recipes
-                .native_negate_recipe()
-                .ok_or_else(|| invalid("missing exact native negate recipe"))?;
-            work.flush()?;
-            let output =
-                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
-            work.flush()?;
-            OwnedValue::from_selected(output)
-        }
-        CompletionKind::BitNot => {
-            if frame.children.len() != 1 {
-                return Err(invalid("native BitwiseNot requires its exact ordered operand").into());
-            }
-            let child = frame
-                .children
-                .pop()
-                .ok_or_else(|| internal("missing native BitwiseNot operand"))?
-                .value
-                .into_value(local_selection, work)?;
-            let recipe = recipes
-                .native_bitnot_recipe()
-                .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
-            work.flush()?;
-            let output =
-                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
-            work.flush()?;
-            OwnedValue::from_selected(output)
         }
         CompletionKind::Arithmetic => {
             if frame.children.len() != 2 {
@@ -2718,9 +2660,8 @@ fn in_observed<T>(
     match result {
         Ok(value) => Ok(value),
         Err(novarocks_functions::native_inlist::InError::Host(error)) => Err(error),
-        // Exact signed recipes and actual carrier validation establish matching
-        // concrete types/lengths before Arrow equality. An error here violates
-        // that checked invariant; it is not a maskable SQL row-data result.
+        // Comparison and JSON normalization report invocation failures here.
+        // Candidate row errors have already been inherited by the frame.
         Err(novarocks_functions::native_inlist::InError::Operation(cause)) => Err(cause),
     }
 }

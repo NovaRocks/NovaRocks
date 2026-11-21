@@ -20,6 +20,7 @@
 //! The three original Statistics CPU phases. Every input and partial output
 //! resides in this same Provider Source; the worker only borrows a loan.
 use super::*;
+use crate::catalog_control::orphan_files::{DecodeWork, Decoded};
 use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::model::FrozenRequest;
 use crate::commit::operation::IcebergCommitOperation;
@@ -41,12 +42,15 @@ mod scoped_read;
 #[path = "scoped_snapshot.rs"]
 pub(crate) mod scoped_snapshot;
 enum CpuBody {
+    OrphanDecode(Box<DecodeWork>),
     CatalogCreate(Box<crate::catalog_control::catalog_mutation::create_cpu::Work>),
     ViewListing(Box<crate::catalog_control::views::async_listing::Work>),
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
+    RetainedPartitionSpecs(
+        Box<crate::catalog_control::metadata_maintenance::expiry_metadata::Work>,
+    ),
     PreparedSource(Box<scoped_prepared_source::Work>),
     PreparedSplit(Box<scoped_prepared_split::Work>),
-    Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
     Read(Box<scoped_read::ReadBody>),
     MetadataBinding {
@@ -125,6 +129,28 @@ impl Drop for BodyLoan<'_> {
     }
 }
 impl IcebergMetadataCpuOriginal {
+    pub(in crate::catalog_control) fn orphan_decode(
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+        work: DecodeWork,
+    ) -> Arc<Self> {
+        Self::new(
+            descriptor,
+            incarnation,
+            CpuBody::OrphanDecode(Box::new(work)),
+        )
+    }
+
+    pub(in crate::catalog_control) fn take_orphan_decode(&self) -> crate::iceberg::Result<Decoded> {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::OrphanDecode(work) = &mut loan.body.as_mut().unwrap().body else {
+            panic!("same orphan scan CPU source");
+        };
+        work.output
+            .take()
+            .expect("orphan scan CPU result was produced")
+    }
+
     pub(in crate::catalog_control) fn catalog_create(
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
         incarnation: novarocks_spi::connector::ProviderBindingEpoch,
@@ -229,22 +255,25 @@ impl IcebergMetadataCpuOriginal {
         };
         work.next()
     }
-    pub(crate) fn cleanup_source(
+
+    pub(in crate::catalog_control) fn retained_partition_specs(
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
         incarnation: novarocks_spi::connector::ProviderBindingEpoch,
-        work: crate::catalog_control::cleanup_maintenance::async_original::CpuWork,
+        work: crate::catalog_control::metadata_maintenance::expiry_metadata::Work,
     ) -> Arc<Self> {
-        Self::new(descriptor, incarnation, CpuBody::Cleanup(Box::new(work)))
+        Self::new(
+            descriptor,
+            incarnation,
+            CpuBody::RetainedPartitionSpecs(Box::new(work)),
+        )
     }
-    pub(in crate::catalog_control) fn take_cleanup_output(
+
+    pub(crate) fn take_retained_partition_specs(
         &self,
-    ) -> Result<
-        crate::catalog_control::cleanup_maintenance::async_original::CpuOutput,
-        ConnectorError,
-    > {
+    ) -> Result<std::collections::BTreeSet<i32>, ConnectorError> {
         let mut loan = BodyLoan::take(self);
-        let CpuBody::Cleanup(work) = &mut loan.body.as_mut().unwrap().body else {
-            return Err(invalid("cleanup CPU source differs"));
+        let CpuBody::RetainedPartitionSpecs(work) = &mut loan.body.as_mut().unwrap().body else {
+            return Err(internal("Retained partition specs CPU source differs"));
         };
         work.take_output()
     }
@@ -380,12 +409,13 @@ impl IcebergMetadataCpuOriginal {
         assert!(!original.started, "one original Statistics CPU execution");
         original.started = true;
         match &mut original.body {
+            CpuBody::OrphanDecode(work) => work.run(),
             CpuBody::CatalogCreate(work) => work.run(),
             CpuBody::ViewListing(work) => work.run(),
             CpuBody::Compaction(work) => work.run(),
+            CpuBody::RetainedPartitionSpecs(work) => work.run(),
             CpuBody::PreparedSource(body) => body.run(),
             CpuBody::PreparedSplit(body) => body.run(),
-            CpuBody::Cleanup(work) => work.run(),
             CpuBody::Read(body) => body.run(),
             CpuBody::ReadSnapshot(body) => body.run(),
             CpuBody::MetadataBinding {
@@ -728,8 +758,9 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                         | CpuBody::PreparedSource(_)
                         | CpuBody::PreparedSplit(_)
                         | CpuBody::ReadSnapshot(_)
-                        | CpuBody::Cleanup(_)
                         | CpuBody::Compaction(_)
+                        | CpuBody::OrphanDecode(_)
+                        | CpuBody::RetainedPartitionSpecs(_)
                 ) || matches!(&body.as_ref().unwrap().body,CpuBody::Read(read) if read.phase<=1
                 ),
                 "metadata source cannot dispatch a Statistics product phase"
@@ -759,6 +790,9 @@ pub(crate) fn metadata_cpu_source_bytes() -> Result<usize, ConnectorError> {
         >())
         .max(std::mem::size_of::<scoped_prepared_source::Work>())
         .max(std::mem::size_of::<scoped_prepared_split::Work>())
+        .max(std::mem::size_of::<
+            crate::catalog_control::metadata_maintenance::expiry_metadata::Work,
+        >())
         .max(std::mem::size_of::<
             crate::catalog_control::views::async_listing::Work,
         >());

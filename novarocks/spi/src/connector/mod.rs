@@ -35,6 +35,7 @@ mod handle;
 mod identity;
 mod io_admission;
 mod listing;
+mod maintenance_duration;
 mod metadata;
 mod metadata_maintenance;
 mod mutation;
@@ -81,19 +82,10 @@ pub use catalog::{
 };
 pub use catalog_runtime::{CatalogRuntime, CatalogRuntimeMaterializer};
 pub use cleanup_maintenance::{
-    BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
-    CandidatePage, ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation,
-    ConnectorCleanupAsyncOutput, ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart,
-    ConnectorCleanupAsyncStep, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
-    ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
+    ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation, ConnectorCleanupAsyncOutput,
+    ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorCleanupMaintenanceSession,
-    ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefIdentity,
-    ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
-    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest, ConnectorCleanupScanSafety,
-    MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
-    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
-    MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
-    PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+    ConnectorCleanupOperationId, ConnectorOrphanCleanupMetrics,
 };
 pub use codec::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorCodecError,
@@ -169,7 +161,10 @@ pub use distributed_rewrite::{
 };
 pub use distribution::ProviderBindingEpoch;
 pub use document_storage::*;
-pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
+pub use error::{
+    ConnectorError, ConnectorErrorKind, ConnectorTableFormatVersionUnsupported,
+    ConnectorTableObjectBindingFailure,
+};
 pub use execution::{ConnectorPrepareSplitRequest, MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT};
 pub use handle::{
     ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
@@ -186,6 +181,11 @@ pub use io_admission::{
     SelectedThriftServiceOrigin, SharedDependency, ThriftServiceOrigin,
 };
 pub use listing::{ConnectorListingCollector, ConnectorListingPageSize};
+pub use maintenance_duration::{
+    ConnectorMaintenanceDuration, ConnectorMaintenanceRetention,
+    EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,
+    REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
+};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorListNamespacesRequest,
@@ -210,7 +210,8 @@ pub use metadata::{
     MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
 };
 pub use metadata_maintenance::{
-    CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMaxCompactableDataFiles,
+    CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorExpireSnapshotsExecute,
+    ConnectorManifestRewriteMetrics, ConnectorMaxCompactableDataFiles,
     ConnectorMaxCompactableDataFilesExecution, ConnectorMaxCompactableDataFilesRequest,
     ConnectorMaxCompactableDataFilesSource, ConnectorMetadataCleanupResponsibility,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
@@ -304,9 +305,10 @@ pub use resources::{
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
     ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
-    ConnectorMutationTargetField, ConnectorRowMutationEffect, ConnectorRowMutationIntent,
-    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
-    ConnectorRowMutationPreparationRequest, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
+    ConnectorMutationTargetField, ConnectorRowMutationCurrent, ConnectorRowMutationEffect,
+    ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorRowMutationStrategy, ConnectorWriteRouteId,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use scoped_begin::ConnectorScopedBeginCause;

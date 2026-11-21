@@ -2666,12 +2666,14 @@ impl NativeExecutor {
     pub(crate) async fn streamed_computation_cut_handle(
         &self,
     ) -> Option<crate::admitted_query_context::StreamedComputationCutHandle> {
+        // Business Ready can retire preparation before Relay completes. The
+        // original Native producer still owns the same activity source.
         self.body
             .lock()
             .await
-            .session
+            .streamed_computation
             .as_ref()
-            .and_then(|session| session.streamed_computation_cut_handle())
+            .map(|producer| producer.cut_handle())
     }
     /// The caller installs the original exit receiver before acknowledging source
     /// registration. Refusal preserves the activation and reporter in `incoming`.

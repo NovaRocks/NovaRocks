@@ -27,7 +27,7 @@ use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
 use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionDefinition,
-    InstalledPureKernel, PureEngineFunctionCatalog,
+    InstalledPureKernel, PureEngineFunctionCatalog, validate_installed_operator_functions,
 };
 use novarocks_native_adapter::backend_application::CompiledStaticPlan;
 use novarocks_plan_codec::physical_package_v2::{
@@ -182,6 +182,7 @@ pub(crate) fn seal_pure_catalog(
     let catalog = builder
         .seal_pure(installed)
         .map_err(|error| anyhow::anyhow!("seal the production pure function catalogue: {error}"))?;
+    validate_installed_operator_functions(&catalog, &CompositionControl)?;
     Ok(PureCatalogSeal {
         catalog,
         installed_definitions,

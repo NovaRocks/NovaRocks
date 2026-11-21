@@ -22,7 +22,7 @@ use super::*;
 use crate::query_execution::completion_facts::FrontendCompletionCustody;
 use crate::query_execution::dml::mutation::OwnedMutationStatement;
 use crate::query_execution::dml::mutation_match_read::{
-    bind_mutation_match_read, mutation_match_select,
+    bind_mutation_match_read, load_row_mutation_target, mutation_match_select,
 };
 use crate::query_execution::write_session::WriteBeginReceiving;
 use novarocks_proto_codec::lifecycle::QueryOptions;
@@ -60,28 +60,15 @@ pub(crate) async fn prepare_mutation_facts_async(
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge
         }
     };
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
-        state.mv_storage_observation().as_ref(), &planning_pin,
-        state.mv_readiness().as_ref(), target, mutation, connector_context.clone(),
-    ).await?;
-    let context =
-        crate::connector::context_for_planning_pin(&planning_pin, connector_context.clone())?;
-    let metadata = crate::connector::schema_creation::load_frontend_table_async(
-        planning_pin.binding().metadata().as_ref(),
-        novarocks_spi::connector::ConnectorTableRequest {
-            table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: planning_pin.binding().descriptor().instance_id.clone(),
-                namespace: Arc::from(target.namespace.as_str()),
-                table: Arc::from(target.table.as_str()),
-            },
-            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-            context,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let binding =
-        crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_pin);
+    let binding = load_row_mutation_target(target, planning_pin, connector_context).await?;
+    crate::mv::domain::iceberg_guard::reject_from_admitted_iceberg_table(
+        binding.planning_pin(),
+        state.mv_readiness().as_ref(),
+        target,
+        mutation,
+        binding.metadata(),
+        connector_context.clone(),
+    )?;
     // The same pure signers own strategy, base, complete target types and
     // assignment/partition admission. No second preparation or lease is minted.
     match statement {
@@ -197,7 +184,9 @@ impl PreparedMutationFacts {
                 mor_change_stream_input_request(self.columns(), self.signed()?.match_contract())?,
                 novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 Some(self.signed()?.base_version().clone()),
-                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation {
+                    admission: self.signed()?.admission(),
+                },
                 self.context().clone(),
             )?,
             receiving.as_ref(),
@@ -251,6 +240,12 @@ impl PreparedMutationFacts {
             original,
             self.planning_pin(),
         )?;
+        let bindings = Arc::new(QueryTableBindingStore::try_new()?);
+        bindings.register_row_mutation_current(
+            original,
+            self.planning_pin(),
+            &preparations.preparation,
+        )?;
         Ok(PreparedMorMutationWrite {
             state: state.clone(),
             facts: Arc::clone(self),
@@ -258,7 +253,7 @@ impl PreparedMutationFacts {
             query,
             kind,
             assertion,
-            bindings: Arc::new(QueryTableBindingStore::try_new()?),
+            bindings,
             match_read,
         })
     }
@@ -415,8 +410,12 @@ pub(crate) async fn compile_routed_mutation_write(
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
         state, Arc::clone(bindings), context,
     ).await?;
+    let match_binding = bindings
+        .row_mutation_match_binding()?
+        .ok_or("row mutation lost its original target binding")?;
     let optimize_request =
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone());
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone())
+            .with_row_mutation_match(Some(match_binding));
     let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
         DmlChangeStreamCompileRequest {

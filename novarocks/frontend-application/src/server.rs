@@ -310,16 +310,7 @@ async fn build_frontend_role_products(
     let view_service: Arc<dyn novarocks_query_application::view::ViewService> =
         Arc::new(novarocks_query_application::view::QueryViewService::new());
     let dml_service = Arc::new(crate::dml::DmlService::new());
-    let maintenance_service =
-        crate::table_maintenance::FrontendTableMaintenanceService::open(host.durable())
-            .await
-            .map_err(|error| {
-                FrontendApplicationError::new(
-                    crate::application::FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
-                    error,
-                )
-            })?
-            .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy());
+    let maintenance_service = crate::table_maintenance::FrontendTableMaintenanceService::default();
     #[cfg(novarocks_dev_controls)]
     let maintenance_service = maintenance_service.with_test_controls(
         host.test_session
@@ -455,7 +446,6 @@ async fn build_frontend_role_products(
         host.static_plan_carrier(),
         host.required_constant_interpreter().sealed_functions(),
     )
-    .with_state_store_original(host.state_store_original_binding())
     .with_rewrite_runtime(crate::query_execution::kernels::MaintenanceRewriteRuntime {
         launcher: logical_execution_launcher.clone(),
         completion: crate::query_execution::completion_facts::CompletionFactOwners::new(

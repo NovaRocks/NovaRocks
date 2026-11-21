@@ -186,6 +186,18 @@ impl FunctionBindingResolver for Resolver {
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.selection(request, control)
     }
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        let selected = self.selection(request, control)?;
+        if &selected.overload != overload {
+            return Err(FunctionBindingError::UnknownOverload(overload.clone()));
+        }
+        Ok(selected)
+    }
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -240,6 +252,7 @@ fn catalog(behavior: Behavior) -> Arc<dyn SqlFunctionCatalog> {
 enum Path {
     Ordinary,
     Resolved,
+    Shared,
 }
 fn bind(
     path: Path,
@@ -268,6 +281,22 @@ fn bind(
             let result = bound.value_type().clone();
             Ok((bound.args, bound.binding, result))
         }
+        Path::Shared => {
+            let bound = super::expression_typing::type_scalar_call_with_catalog(
+                catalog,
+                novarocks_expression::typing::NodeShape::CatalogCall {
+                    name: "rebind_probe",
+                    expected_result: None,
+                },
+                args,
+                policy,
+                crate::constant::test_constant_policy(),
+                control,
+                SPAN,
+            )?;
+            let result = bound.value_type().clone();
+            Ok((bound.args, bound.binding, result))
+        }
         Path::Resolved => {
             let expr = super::resolve_expr::resolved_scalar_call_at(
                 catalog,
@@ -292,7 +321,7 @@ fn assert_ordinary(path: Path, error: &AnalyzeError) {
             assert_eq!(error.kind(), AnalyzeErrorKind::Internal);
             assert_eq!(error.span(), None);
         }
-        Path::Resolved => {
+        Path::Resolved | Path::Shared => {
             assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
             assert_eq!(error.span(), Some(SPAN));
         }
@@ -334,7 +363,7 @@ fn scalar_rebind_immutable_engine_resolver_cannot_publish_non_fixed_point_argume
         second.selected.argument_types[0],
         FunctionArgumentType::Value(FunctionValueType::new(DataType::Int16, false))
     );
-    for path in [Path::Ordinary, Path::Resolved] {
+    for path in [Path::Ordinary, Path::Resolved, Path::Shared] {
         let error = bind(
             path,
             catalog.as_ref(),
@@ -351,7 +380,7 @@ fn scalar_rebind_immutable_engine_resolver_cannot_publish_non_fixed_point_argume
 fn scalar_rebind_lawful_canonical_source_keeps_policy_and_catalog_owned_changed_result() {
     let catalog = catalog(Behavior::Widen);
     let original = source(FunctionValueType::new(DataType::Int32, false));
-    for path in [Path::Ordinary, Path::Resolved] {
+    for path in [Path::Ordinary, Path::Resolved, Path::Shared] {
         for policy in [
             DecimalOverflowPolicy::OutputNull,
             DecimalOverflowPolicy::ReportError,
@@ -394,6 +423,42 @@ fn scalar_rebind_lawful_canonical_source_keeps_policy_and_catalog_owned_changed_
     }
 }
 
+#[test]
+fn shared_scalar_typing_retains_statement_abi_and_missing_installation() {
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    let control = Trace::default();
+    let actual = crate::functions::builtin_sql_function_catalog().snapshot_for_scalar_presence();
+    let bound = super::expression_typing::type_scalar_call_with_catalog(
+        actual.as_ref(),
+        novarocks_expression::typing::NodeShape::CatalogCall {
+            name: "abs",
+            expected_result: None,
+        },
+        vec![source(ty.clone())],
+        DecimalOverflowPolicy::OutputNull,
+        crate::constant::test_constant_policy(),
+        &control,
+        SPAN,
+    )
+    .unwrap();
+    assert_eq!(
+        bound.binding.admitted_execution_abi,
+        Some(novarocks_functions::PureKernelAbi::ScalarV1)
+    );
+
+    let unavailable = catalog(Behavior::Echo).snapshot_for_scalar_presence();
+    let error = bind(
+        Path::Shared,
+        unavailable.as_ref(),
+        vec![source(ty)],
+        DecimalOverflowPolicy::OutputNull,
+        &control,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+    assert!(error.to_string().contains("test.scalar/rebind/0/v1"));
+}
+
 #[derive(Clone, Debug)]
 enum Fault {
     Short,
@@ -426,24 +491,10 @@ impl FaultCatalog {
             calls: Arc::new(AtomicUsize::new(0)),
         }
     }
-}
-impl SqlFunctionCatalog for FaultCatalog {
-    fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
-        Arc::new(self.clone())
-    }
-    fn resolve_scalar_signature(
+
+    fn observe_selection(
         &self,
-        name: &str,
-        args: &[DataType],
-        control: &dyn PureCompileControl,
-    ) -> Result<ResolvedFunctionSignature, FunctionResolutionError> {
-        self.base.resolve_scalar_signature(name, args, control)
-    }
-    fn resolve_scalar_binding(
-        &self,
-        name: &str,
-        args: &[FunctionArgument],
-        control: &dyn PureCompileControl,
+        select: impl FnOnce() -> Result<ResolvedFunctionBinding, FunctionBindingError>,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         let at = self.calls.fetch_add(1, Ordering::SeqCst);
         if at == self.at
@@ -451,7 +502,7 @@ impl SqlFunctionCatalog for FaultCatalog {
         {
             return Err(cause.into());
         }
-        let mut bound = self.base.resolve_scalar_binding(name, args, control)?;
+        let mut bound = select()?;
         if at != self.at {
             return Ok(bound);
         }
@@ -546,6 +597,39 @@ impl SqlFunctionCatalog for FaultCatalog {
             novarocks_type_contract::TypedFactSlice::from_pure_boxed(arguments.into_boxed_slice());
         Ok(bound)
     }
+}
+impl SqlFunctionCatalog for FaultCatalog {
+    fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
+        Arc::new(self.clone())
+    }
+    fn resolve_scalar_signature(
+        &self,
+        name: &str,
+        args: &[DataType],
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionSignature, FunctionResolutionError> {
+        self.base.resolve_scalar_signature(name, args, control)
+    }
+    fn resolve_scalar_binding(
+        &self,
+        name: &str,
+        args: &[FunctionArgument],
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.observe_selection(|| self.base.resolve_scalar_binding(name, args, control))
+    }
+    fn finish_scalar_binding(
+        &self,
+        function: &FunctionId,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.observe_selection(|| {
+            self.base
+                .finish_scalar_binding(function, overload, request, control)
+        })
+    }
     fn contains_aggregate(&self, name: &str) -> bool {
         self.base.contains_aggregate(name)
     }
@@ -572,7 +656,7 @@ impl SqlFunctionCatalog for FaultCatalog {
 
 #[test]
 fn scalar_rebind_catalog_shapes_never_truncate_arguments_or_publish_non_scalar_results() {
-    for path in [Path::Ordinary, Path::Resolved] {
+    for path in [Path::Ordinary, Path::Resolved, Path::Shared] {
         for at in [0, 1] {
             for fault in [
                 Fault::Short,
@@ -678,7 +762,7 @@ fn scalar_rebind_full_value_and_callable_targets_match_actual_coerced_ast() {
 
 #[test]
 fn scalar_rebind_catalog_first_and_second_control_causes_never_retry() {
-    for path in [Path::Ordinary, Path::Resolved] {
+    for path in [Path::Ordinary, Path::Resolved, Path::Shared] {
         for at in [0, 1] {
             for cause in CAUSES {
                 let catalog =

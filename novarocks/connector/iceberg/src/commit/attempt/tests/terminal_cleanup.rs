@@ -277,6 +277,7 @@ fn incomplete_v3_delete_cannot_grant_cleanup_or_prepare_a_manifest() {
             &query,
             &[ordinal],
             Some(received_write_proof(ordinal, physical)),
+            None,
         )
         .unwrap();
     let (mut incoming, author, live) = paid_fragments_counted(

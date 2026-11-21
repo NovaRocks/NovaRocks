@@ -4,7 +4,10 @@ explicit_only = true
 heavy = { reason = "fixture", detail = "Requires a controlled publication Catalog fault fixture, native 1FE+3BE and serial execution." }
 
 [impact]
-paths = ["novarocks/frontend-application/src/**"]
+paths = [
+    "novarocks/frontend-application/src/**",
+    "novarocks/connector/iceberg/src/commit/**",
+]
 
 [reuse]
 scope = "suite"

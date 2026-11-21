@@ -302,6 +302,239 @@ async fn installed_subscription_progress_and_actual_exit_survive_full_ordinary()
     run_installed_subscription(true).await;
 }
 
+#[tokio::test]
+async fn failed_subscription_generation_waits_for_its_original_result_position() {
+    use crate::task_execution::host::transport::handoff_actor_transport;
+    use novarocks_control_runtime::actor_turn::{FailureSourceState, InputPhase};
+    use novarocks_control_runtime_core::capacity::ResourceVector;
+
+    let generation = Generation::new(1).unwrap();
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let (mut parent, mut payer) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    parent.start().unwrap();
+    let action = AttemptActionId::new(NonZeroU64::MIN);
+    let backend = BackendProcessId::new_v7();
+    let execution = QueryExecutionId::new(QueryId::new(17, 2), AttemptId::new(1).unwrap()).unwrap();
+    let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
+    let request = Arc::new(SubscriptionRequest {
+        participation,
+        generation: NonZeroU64::MIN,
+        status_cursors: Box::new([]),
+        task_convergence_cursors: Box::new([]),
+        participation_cursor: None,
+        quiesce_cursor: None,
+        required_identities: Box::new([]),
+    });
+    let key = stream_key(&request);
+    let effect = AttemptEffectEnvelope::new(AttemptEffect {
+        id: action,
+        class: EffectClass::Settlement,
+        body: EffectBody::OpenSubscription(request),
+    });
+    let inbox = WithdrawalInbox::with_commands(&scope, [(effect.clone(), None)], [8; 4]);
+    let runtime = inbox.runtime();
+    let registration = inbox.registration();
+    let actor = registration.actor();
+    let ticket = inbox.command(&parent, action);
+    let command_input = ticket.input;
+    let handle = tokio::runtime::Handle::current();
+    let mut peer = Loopback::start().await;
+    let client = Client::for_backend_in(
+        Arc::from([peer.descriptor(backend)]),
+        0,
+        FrontendDataRuntime::new(handle.clone()),
+    );
+    let observer = ConsumerId::new(1).unwrap();
+    let position = inbox.reserve_result(&parent);
+    let standing = || runtime.standing_input_inventory(actor, None, 8).unwrap();
+    let original_roles = standing();
+    assert_eq!(original_roles.len(), 2);
+    let mut source = AttemptCallSource::new(
+        &parent,
+        &payer,
+        generation,
+        observer,
+        AttemptCallOwner::SubscriptionOpen,
+        position,
+    );
+    let result = source.prepay(&effect).unwrap().unwrap();
+    let header = source.pending_work().retirement_observer();
+    let phase = SubscriptionPhasePublisher::new(
+        inbox.reserve_standing(source.pending_work()),
+        key,
+        |input| FrontendInput::Attempt(Box::new(input)),
+    );
+    let phase_role = phase.role_id();
+    let failure = SubscriptionFailureRecord::new(action, key);
+    // The production registration can lose its ingress fence. Even for that
+    // case the host tracks the actual open job until its original exit retires.
+    let mut job = source.bind_subscription(&ticket, result, || {
+        ActorTransportWork::Subscription(Box::new(BoundSubscription {
+            effect: action,
+            key,
+            original: None,
+            client,
+            failure: failure.clone(),
+        }))
+    });
+    let mut subscriptions = AttemptSubscriptions {
+        runtime: runtime.clone(),
+        registration: registration.clone(),
+        source: inbox.source(),
+        generation_limit: 1,
+        endpoints: None,
+        calls: BTreeMap::from([(
+            participation,
+            SubscriptionCall {
+                source,
+                exited: None,
+                refused: None,
+            },
+        )]),
+        publication_refusal: None,
+        pending: None,
+        active: BTreeMap::from([(
+            action,
+            Active {
+                key,
+                phase,
+                indexed: None,
+                failure,
+                body_exited: false,
+                call_retired: false,
+                phase_closed: false,
+                registered: false,
+                stop_requested: false,
+            },
+        )]),
+        phase_roles: BTreeMap::from([(phase_role, action)]),
+        active_order: VecDeque::from([action]),
+        active_scan: RetirementScan::default(),
+        close_order: VecDeque::new(),
+        closing: false,
+        terminal_failures: BTreeMap::new(),
+    };
+    let mut retirements =
+        TransportRetirements::new(runtime.clone(), registration.clone(), handle.clone(), 1);
+    retirements
+        .track(effect, job.transport.take().unwrap())
+        .unwrap_or_else(|_| panic!("same original subscription Join"));
+    assert_eq!(
+        subscriptions.advance_active(action, false, &mut |_| panic!("before actual exit")),
+        (false, false)
+    );
+    assert!(!header.is_retired());
+    // Place the panic before the exit fact in the same Source FIFO. Only
+    // drive the original transport until both inputs are in the inbox.
+    let panic_input = inbox
+        .reserve_command(&parent)
+        .fill(FrontendInput::Test(u64::MAX))
+        .unwrap();
+    handoff_actor_transport(&handle, job)
+        .unwrap_or_else(|_| panic!("same original subscription handoff"));
+    runtime.effect_completed(ticket).unwrap();
+    runtime.retire_input(actor, command_input).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !retirements.is_empty() {
+            while let Some(turn) = runtime.claim_host_actor() {
+                let progress = retirements.progress(&turn, 8, |id, event| match event {
+                    TransportSourceEvent::Result(original) => subscriptions
+                        .accept(id, original)
+                        .unwrap_or_else(|original| std::panic::resume_unwind(original)),
+                    TransportSourceEvent::Retired => subscriptions.transport_retired(id),
+                    _ => panic!("the original subscription exits normally"),
+                });
+                let (_, reaped) = subscriptions.advance_active(action, false, &mut |_| {
+                    panic!("the original result is still queued")
+                });
+                assert!(!reaped);
+                turn.release(progress.more).unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let queued = runtime.input_inventory(actor, None, 8).unwrap();
+    let exit = queued
+        .iter()
+        .find(|row| row.phase == InputPhase::Filled && row.standing_input_id.is_some())
+        .expect("the actual subscription exit is queued behind its owner failure")
+        .input;
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    let FailureSourceState::ClosedPending(supervisor) =
+        runtime.failure_source_state(actor).unwrap()
+    else {
+        panic!("original actor failed before it could consume the subscription exit");
+    };
+    runtime.retire_input(actor, supervisor).unwrap();
+    runtime.retire_input(actor, panic_input).unwrap();
+    assert!(runtime.take_failure_payload(actor).unwrap().is_some());
+
+    let mut releases = Vec::new();
+    let first = subscriptions.advance_active(action, true, &mut |capture| releases.push(capture));
+    let retained = subscriptions.owns(action) && releases.is_empty();
+    let disposed = runtime.input_custody(actor, exit).unwrap().unwrap().phase
+        == InputPhase::AbandonedByOwnerFailure;
+    if subscriptions.owns(action) {
+        assert_eq!(
+            subscriptions.advance_active(action, true, &mut |capture| releases.push(capture)),
+            (true, true)
+        );
+    } else {
+        // Settle the paid result even if the old implementation reaped early.
+        assert!(
+            subscriptions
+                .calls
+                .get_mut(&participation)
+                .unwrap()
+                .source
+                .retire_result()
+                .unwrap()
+        );
+    }
+    assert!(header.is_retired());
+    assert!(runtime.input_custody(actor, exit).unwrap().is_none());
+    assert_eq!(standing(), original_roles);
+    let mut call = subscriptions.calls.remove(&participation).unwrap();
+    assert!(call.source.close_idle().unwrap());
+    assert!(call.source.take_drained_owner().is_none() && call.source.is_drained());
+    assert_eq!(releases.len(), 1);
+    for capture in releases {
+        capture.dispose();
+    }
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
+    assert!(
+        scope
+            .reap_observed_header(&parent.retirement_observer())
+            .unwrap()
+    );
+    scope.close_external().unwrap();
+    inbox.finish();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(ledger.is_empty());
+    assert!(peer.settle().await);
+
+    assert!(disposed);
+    assert_eq!(first, (true, false));
+    assert!(
+        retained,
+        "the generation outlives disposal until the original lane is idle"
+    );
+}
+
 async fn run_installed_subscription(saturate_ordinary: bool) {
     use crate::{
         control_runtime::membership::{

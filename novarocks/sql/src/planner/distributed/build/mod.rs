@@ -20,6 +20,8 @@ mod contract_lowering;
 mod lowered_draft;
 mod unit_source;
 mod wait_graph;
+#[cfg(novarocks_dev_controls)]
+pub(crate) use contract_lowering::lower_standalone_scalar_unit;
 pub(crate) use contract_lowering::{StandaloneScalarEmission, lower_required_constant_unit};
 #[cfg(test)]
 pub(crate) use lowered_draft::CheckedAggregateLogicalSourceEntry;

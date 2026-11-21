@@ -23,12 +23,13 @@ use novarocks_query_application::api::{
 };
 use std::sync::Arc;
 
-use novarocks_table_maintenance::MaintenanceActionOutcome;
+use novarocks_table_maintenance::{MaintenanceActionOutcome, ProcedureMetrics};
 
 pub fn action_result(
     outcome: MaintenanceActionOutcome,
 ) -> Result<MaintenanceStatementResult, String> {
     let result = match outcome {
+        MaintenanceActionOutcome::Procedure { metrics } => procedure_metrics_result(metrics)?,
         MaintenanceActionOutcome::RewriteDataFiles {
             rewritten_data_files_count,
             added_data_files_count,
@@ -190,6 +191,27 @@ fn table_execute_metrics(
             Arc::new(Int64Array::from_iter(rows.iter().map(|(_, value)| *value))) as ArrayRef,
         ],
         context,
+    )
+}
+
+pub(crate) fn procedure_metrics_result(
+    metrics: Option<ProcedureMetrics>,
+) -> Result<QueryResult, String> {
+    let (names, values): (Vec<_>, Vec<_>) = metrics
+        .map(ProcedureMetrics::into_rows)
+        .unwrap_or_default()
+        .into_iter()
+        .unzip();
+    build_query_result(
+        vec![
+            column("metric_name", DataType::Utf8, false),
+            column("metric_value", DataType::Int64, false),
+        ],
+        vec![
+            Arc::new(StringArray::from(names)) as ArrayRef,
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+        ],
+        "build Iceberg procedure metrics",
     )
 }
 

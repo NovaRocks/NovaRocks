@@ -14,13 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! ONE original arena-free AES row computation, with explicit source semantics.
+//! AES row computation over normalized text and binary arguments.
 use super::{
     aes_primitive::{self, AesMode},
     md5_shared::{Observation, OwnedBytesArray},
     to_base64_shared::latin1_string_to_bytes_observed,
 };
-use novarocks_type_contract::ToBase64ByteSource;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Encrypt,
@@ -41,41 +40,23 @@ pub enum Row {
     Value(Option<Vec<u8>>),
     Failure(RowFailure),
 }
-fn decrypt_with_utf8_fallback<E>(
+fn decrypt_ciphertext<E>(
     mode: AesMode,
     src: &OwnedBytesArray,
     row: usize,
     key: &[u8],
     iv: Option<&[u8]>,
     aad: Option<&[u8]>,
-    source: ToBase64ByteSource,
     observe: &mut dyn FnMut(Observation) -> Result<(), E>,
 ) -> Result<Option<Vec<u8>>, E> {
-    let utf8_bytes = src.bytes(row);
-    let latin1 = match src.utf8(row) {
-        Some(text) => latin1_string_to_bytes_observed(text, observe)?,
-        None => None,
-    };
-    let primary = if source.prefers_latin1() {
-        latin1.as_deref().unwrap_or(utf8_bytes)
+    if let Some(text) = src.utf8(row) {
+        let Some(bytes) = latin1_string_to_bytes_observed(text, observe)? else {
+            return Ok(None);
+        };
+        aes_primitive::aes_decrypt_raw_observed(mode, &bytes, key, iv, aad, observe)
     } else {
-        utf8_bytes
-    };
-    let mut result = aes_primitive::aes_decrypt_raw_observed(mode, primary, key, iv, aad, observe)?;
-    if result.is_some() {
-        return Ok(result);
+        aes_primitive::aes_decrypt_raw_observed(mode, src.bytes(row), key, iv, aad, observe)
     }
-    let fallback = if source.prefers_latin1() {
-        Some(utf8_bytes)
-    } else {
-        latin1.as_deref()
-    };
-    if let Some(fallback) = fallback
-        && fallback != primary
-    {
-        result = aes_primitive::aes_decrypt_raw_observed(mode, fallback, key, iv, aad, observe)?;
-    }
-    Ok(result)
 }
 /// Addresses are supplied by the caller's exact evaluated-carrier projection.
 /// Eager child evaluation and normalization remain outside the pure row body.
@@ -83,7 +64,6 @@ pub fn evaluate_row_observed<E>(
     operation: Operation,
     inputs: &[OwnedBytesArray],
     rows: &[usize],
-    source: ToBase64ByteSource,
     observe: &mut dyn FnMut(Observation) -> Result<(), E>,
 ) -> Result<Row, E> {
     observe(Observation::Step)?;
@@ -124,14 +104,13 @@ pub fn evaluate_row_observed<E>(
                 None,
                 observe,
             )?,
-            Operation::Decrypt => decrypt_with_utf8_fallback(
+            Operation::Decrypt => decrypt_ciphertext(
                 AesMode::Aes128Ecb,
                 src,
                 src_row,
                 key_bytes,
                 None,
                 None,
-                source,
                 observe,
             )?,
         }));
@@ -167,20 +146,15 @@ pub fn evaluate_row_observed<E>(
         Operation::Encrypt => aes_primitive::aes_encrypt_raw_observed(
             mode, src_bytes, key_bytes, iv_bytes, aad_bytes, observe,
         )?,
-        Operation::Decrypt => decrypt_with_utf8_fallback(
-            mode, src, src_row, key_bytes, iv_bytes, aad_bytes, source, observe,
-        )?,
+        Operation::Decrypt => {
+            decrypt_ciphertext(mode, src, src_row, key_bytes, iv_bytes, aad_bytes, observe)?
+        }
     }))
 }
 
 /// Calculate one row with an explicit domain outcome and no external control.
-pub fn evaluate_row(
-    operation: Operation,
-    inputs: &[OwnedBytesArray],
-    rows: &[usize],
-    source: ToBase64ByteSource,
-) -> Row {
-    match evaluate_row_observed(operation, inputs, rows, source, &mut |_| {
+pub fn evaluate_row(operation: Operation, inputs: &[OwnedBytesArray], rows: &[usize]) -> Row {
+    match evaluate_row_observed(operation, inputs, rows, &mut |_| {
         Ok::<(), std::convert::Infallible>(())
     }) {
         Ok(value) => value,
@@ -246,15 +220,28 @@ impl novarocks_failure_contract::FailureProjection for RequiredAesFailure {
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for RequiredAesFailure {}
+
+pub(super) fn aad_error(
+    operation: Operation,
+    ordinal: usize,
+) -> Result<crate::RowDataError, crate::KernelFailure> {
+    crate::RowDataError::from_domain(
+        ordinal,
+        RequiredAesFailure {
+            operation,
+            _ordinal: ordinal,
+            cause: RowFailure::AadRequiresGcm,
+        },
+    )
+}
 /// Only this explicit required-row boundary promotes the row's domain result.
 pub fn evaluate_required_row(
     operation: Operation,
     inputs: &[OwnedBytesArray],
     rows: &[usize],
-    source: ToBase64ByteSource,
     ordinal: usize,
 ) -> Result<Option<Vec<u8>>, crate::KernelFailure> {
-    match evaluate_row(operation, inputs, rows, source) {
+    match evaluate_row(operation, inputs, rows) {
         Row::Value(value) => Ok(value),
         Row::Failure(cause) => Err(crate::KernelFailure::from_domain(RequiredAesFailure {
             operation,

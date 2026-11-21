@@ -22,6 +22,8 @@
 
 mod action;
 pub(crate) mod attempt;
+pub(crate) mod conflict;
+pub(crate) mod conflict_scope;
 mod data_file;
 pub mod data_writer;
 pub(crate) mod dependency;
@@ -34,7 +36,6 @@ pub(crate) mod manifest_merge;
 pub(crate) mod manifest_sources;
 mod manifest_transform;
 pub(crate) mod model;
-pub mod mv_provenance;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod new_manifests;
@@ -52,6 +53,8 @@ pub mod ref_action;
 pub mod report;
 mod rewrite_data_files;
 mod row_delta;
+pub(crate) mod row_delta_facts;
+
 pub mod row_delta_dv_metadata;
 mod row_mutation_preparation;
 #[cfg(test)]
@@ -72,10 +75,6 @@ mod write_preparation;
 pub(crate) mod write_shared;
 pub mod write_stack;
 
-pub use mv_provenance::{
-    MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MvPublicationProvenanceV2,
-    ProvenanceBase, RefreshTechnique,
-};
 pub use mv_refresh_ref::{
     MV_PUBLICATION_ID_PROP, MV_PUBLICATION_STAGING_REF_PREFIX, MvPublicationSnapshotMarker,
     MvRefreshPublishPlan, snapshot_matches_publication_marker,

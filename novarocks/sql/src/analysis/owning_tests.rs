@@ -90,7 +90,7 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             decimal_overflow_policy: policy,
         },
         2 => ExprKind::UnaryOp {
-            op: UnOp::Negate,
+            op: UnOp::Not,
             expr: boxed(child),
         },
         3 => ExprKind::LambdaFunction {
@@ -277,7 +277,7 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
         }
         (
             ExprKind::UnaryOp {
-                op: UnOp::Negate,
+                op: UnOp::Not,
                 expr,
             },
             2,

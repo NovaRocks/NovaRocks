@@ -30,9 +30,17 @@ pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] =
     &[UNSUPPORTED_STATEMENT, NOT_IN_TRANSACTION];
 
 pub fn unsupported_statement(source: &str, span: Span, subject: &str) -> QueryServiceError {
+    unsupported_statement_detail(source, span, format!("{subject} is not supported"))
+}
+
+pub(super) fn unsupported_statement_detail(
+    source: &str,
+    span: Span,
+    message: String,
+) -> QueryServiceError {
     QueryServiceError::from_user_error(UserError::from_descriptor(
         UNSUPPORTED_STATEMENT,
-        format!("{subject} is not supported"),
+        message,
         Some(span.to_user_error_location(source)),
         RetryClass::Never,
     ))

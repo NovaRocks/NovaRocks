@@ -84,9 +84,9 @@ fn task_names_match_trino_and_novarocks_extensions() {
         (DropTag, "DROP TAG"),
         (AddFiles, "ALTER TABLE EXECUTE"),
         (Optimize, "ALTER TABLE EXECUTE"),
-        (RewriteManifests, "REWRITE MANIFESTS"),
-        (ExpireSnapshots, "EXPIRE SNAPSHOTS"),
-        (RemoveOrphanFiles, "REMOVE ORPHAN FILES"),
+        (RewriteManifests, "ALTER TABLE EXECUTE"),
+        (ExpireSnapshots, "ALTER TABLE EXECUTE"),
+        (RemoveOrphanFiles, "ALTER TABLE EXECUTE"),
         (
             AlterMaterializedViewRefresh,
             "ALTER MATERIALIZED VIEW REFRESH",

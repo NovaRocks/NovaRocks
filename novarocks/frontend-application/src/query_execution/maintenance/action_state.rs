@@ -143,6 +143,15 @@ impl MaintenanceActionState {
         }
         Ok(())
     }
+    pub(crate) fn is_trino_expiry(&self) -> bool {
+        self.original
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|body| body.call.as_ref())
+            .is_some_and(MetadataMaintenanceCall::is_trino_expiry)
+    }
+
     pub(super) fn install_call(&self, call: MetadataMaintenanceCall) -> Result<(), String> {
         let mut loan = self.loan()?;
         let body = loan.body.as_mut().unwrap();
@@ -156,17 +165,17 @@ impl MaintenanceActionState {
     pub(super) async fn execute(
         &self,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         std::future::poll_fn(|cx| self.poll_execute(request.clone(), cx)).await
     }
     fn poll_execute(
         &self,
         request: MaintenanceActionRequest,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<MaintenanceActionOutcome, String>> {
+    ) -> Poll<Result<MaintenanceActionOutcome, TerminalError>> {
         let mut loan = match self.loan() {
             Ok(loan) => loan,
-            Err(error) => return Poll::Ready(Err(error)),
+            Err(error) => return Poll::Ready(Err(error.into())),
         };
         let body = loan.body.as_mut().unwrap();
         let engine = body

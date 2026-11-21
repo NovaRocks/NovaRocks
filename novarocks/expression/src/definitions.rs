@@ -56,9 +56,6 @@ pub enum StaticExprKind {
         array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     },
     /// Intrinsic arithmetic retaining its exact admitted semantic parameter.
-    PreparedNativeNegate(CompiledExprId),
-    /// Exact admitted native BitwiseNot recipe, never ordinary scalar dispatch.
-    PreparedNativeBitNot(CompiledExprId),
     PreparedArithmetic {
         operator: novarocks_type_contract::ArithmeticOperator,
         left: CompiledExprId,
@@ -178,8 +175,6 @@ impl StaticExprKind {
         match self {
             Self::Constant(_) | Self::Input => {}
             Self::PreparedCast { child, .. }
-            | Self::PreparedNativeNegate(child)
-            | Self::PreparedNativeBitNot(child)
             | Self::Not(child)
             | Self::IsNull(child)
             | Self::IsNotNull(child) => visit(*child)?,

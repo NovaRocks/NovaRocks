@@ -36,8 +36,8 @@ use novarocks_query_application::{
         property_evaluation::DdlPropertyConstantPort,
         table_procedure::{
             BoundProcedureArgument, BoundProcedureValue, BoundTableProcedure,
-            ProcedureArgumentDefault, ProcedureRetentionDuration, TableProcedureAbsoluteTimePort,
-            TableProcedureKind, invalid_procedure_argument,
+            ProcedureArgumentDefault, ProcedureRetentionDuration, TableProcedureKind,
+            invalid_procedure_argument,
         },
         trino_table_command::bind_trino_table_execute,
     },
@@ -45,8 +45,9 @@ use novarocks_query_application::{
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_spi::connector::{
     ConnectorColumnPosition, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceId, ConnectorPropertyChange, ConnectorRequestContext, ConnectorSchemaChange,
-    DdlPropertyValue,
+    ConnectorExpireSnapshotsExecute, ConnectorInstanceId, ConnectorMaintenanceDuration,
+    ConnectorMaintenanceRetention, ConnectorPropertyChange, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorSchemaChange, DdlPropertyValue,
 };
 use novarocks_table_maintenance::MaintenanceTarget;
 use novarocks_type_contract::PureCompileControl;
@@ -126,14 +127,12 @@ impl MaintenanceCommandExecutor {
         }
         let control =
             crate::query_execution::planning::sql_compile_control_from_execution(execution);
-        let mut absolute_time = OriginalTimestamp { source };
         let bound = bind_trino_table_execute(
             source,
             statement,
             provider,
-            &target.catalog,
             constants,
-            &mut absolute_time,
+            &target.catalog,
             &control,
         )
         .map_err(crate::query::procedure_command_error)?;
@@ -233,18 +232,30 @@ impl MaintenanceCommandExecutor {
             )
             .map(PreparedTableExecute::Action)
             .map_err(crate::query::maintenance_command_error),
-            Procedure::RemoveOrphanFiles(older_than_ms) => super::super::cleanup_action::prepare(
-                &self.kernel,
-                target,
+            Procedure::RemoveOrphanFiles {
                 older_than_ms,
-                Some(planning),
-                false,
-                execution,
-                connector,
-                family,
-            )
-            .map(PreparedTableExecute::Action)
-            .map_err(crate::query::maintenance_command_error),
+                duration,
+            } => {
+                use novarocks_spi::connector::REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY;
+                let retention = frozen_retention(
+                    execution,
+                    &planning,
+                    duration,
+                    REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
+                )?;
+                super::super::cleanup_action::prepare(
+                    &self.kernel,
+                    target,
+                    older_than_ms,
+                    super::super::cleanup_action::CleanupEntry::TableExecute(retention),
+                    planning,
+                    execution,
+                    connector,
+                    family,
+                )
+                .map(PreparedTableExecute::Action)
+                .map_err(crate::query::maintenance_command_error)
+            }
             Procedure::RewriteManifests => self.prepare_bound_metadata(
                 context,
                 execution,
@@ -255,21 +266,41 @@ impl MaintenanceCommandExecutor {
                     use_caching: None,
                     spec_id: None,
                 },
+                MetadataMaintenanceIntent::TrinoOptimizeManifests,
             ),
             Procedure::ExpireSnapshots {
                 older_than_ms,
                 retain_last,
-            } => self.prepare_bound_metadata(
-                context,
-                execution,
-                connector,
-                target,
-                planning,
-                ParsedMaintenanceAction::ExpireSnapshots {
-                    older_than_ms,
-                    retain_last,
-                },
-            ),
+                duration,
+                clean_expired_metadata,
+            } => {
+                use novarocks_spi::connector::EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY;
+                let retention = frozen_retention(
+                    execution,
+                    &planning,
+                    duration,
+                    EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,
+                )?;
+                self.prepare_bound_metadata(
+                    context,
+                    execution,
+                    connector,
+                    target,
+                    planning,
+                    ParsedMaintenanceAction::ExpireSnapshots {
+                        older_than_ms: Some(older_than_ms),
+                        retain_last,
+                    },
+                    MetadataMaintenanceIntent::TrinoExpireSnapshots {
+                        older_than_ms,
+                        retain_last,
+                        inputs: ConnectorExpireSnapshotsExecute {
+                            retention,
+                            clean_expired_metadata,
+                        },
+                    },
+                )
+            }
             Procedure::AddFiles(_) => unreachable!("ADD FILES has its original DML owner"),
             Procedure::CatalogMutation(_) => {
                 unreachable!("table mutations have their catalog owner")
@@ -286,18 +317,8 @@ impl MaintenanceCommandExecutor {
         target: MaintenanceTarget,
         planning: ConnectorControlPlanningPin,
         action: ParsedMaintenanceAction,
+        intent: MetadataMaintenanceIntent,
     ) -> Result<PreparedTableExecute, CommandError> {
-        let intent = match &action {
-            ParsedMaintenanceAction::RewriteManifests {
-                use_caching: None,
-                spec_id: None,
-            } => MetadataMaintenanceIntent::rewrite_metadata_layout(),
-            ParsedMaintenanceAction::ExpireSnapshots {
-                older_than_ms,
-                retain_last,
-            } => MetadataMaintenanceIntent::expire_table_versions(*older_than_ms, *retain_last),
-            _ => return Err(crate::query::procedure_command_error(invariant())),
-        };
         let lease = self
             .kernel
             .connector_control()
@@ -331,10 +352,15 @@ enum Procedure {
     Optimize,
     RewriteManifests,
     ExpireSnapshots {
-        older_than_ms: Option<i64>,
+        older_than_ms: i64,
         retain_last: Option<u32>,
+        duration: ConnectorMaintenanceDuration,
+        clean_expired_metadata: bool,
     },
-    RemoveOrphanFiles(i64),
+    RemoveOrphanFiles {
+        older_than_ms: i64,
+        duration: ConnectorMaintenanceDuration,
+    },
     AddFiles(crate::query_execution::dml::add_files::AddFilesArguments),
     CatalogMutation(IcebergTableMutation),
     Tag(TrinoTagAction),
@@ -546,58 +572,33 @@ fn project_bound(
         TableProcedureKind::AddEqualityDelete => return Err(invariant()),
     }
 
-    let mut older_than_ms = None;
+    let mut retention = None;
     let mut retain_last = None;
-    let mut retention_default = None;
+    let mut clean_expired_metadata = false;
     for (slot, argument) in bound.into_arguments() {
-        if slot.name == "retention_threshold" {
-            let Some(ProcedureArgumentDefault::Varchar(default)) = slot.default else {
-                return Err(invariant());
-            };
-            retention_default = Some(default);
-            let (duration, value_span) = match argument {
-                BoundProcedureArgument::Omitted => continue,
-                BoundProcedureArgument::ExplicitDefault(span) => (
-                    ProcedureRetentionDuration::parse(source, span, default, control)?,
-                    span,
-                ),
+        match (slot.name, argument) {
+            (
+                "retention_threshold",
                 BoundProcedureArgument::Present {
                     value: BoundProcedureValue::RetentionDuration(duration),
-                    span: Some(span),
-                } => (duration, span),
-                _ => return Err(invariant()),
-            };
-            older_than_ms = Some(relative_cutoff(
-                source,
-                value_span,
-                &duration,
-                statement_started_at,
-                kind,
-            )?);
-            continue;
-        }
-        match (slot.name, argument) {
-            (_, BoundProcedureArgument::Omitted) => {}
-            (
-                "older_than",
-                BoundProcedureArgument::Present {
-                    value: BoundProcedureValue::Value(DdlPropertyValue::Bigint(value)),
-                    ..
+                    span: Some(value_span),
                 },
-            ) => older_than_ms = Some(value),
-            (
-                "older_than",
-                BoundProcedureArgument::Present {
-                    value: BoundProcedureValue::Value(DdlPropertyValue::Varchar(value)),
-                    span: argument_span,
-                },
-            ) => {
-                older_than_ms = Some(original_timestamp(
-                    source,
-                    argument_span.ok_or_else(invariant)?,
-                    &value,
-                )?)
+            ) => retention = Some((duration, value_span)),
+            ("retention_threshold", default_argument) => {
+                let Some(ProcedureArgumentDefault::Varchar(default)) = slot.default else {
+                    return Err(invariant());
+                };
+                let value_span = match default_argument {
+                    BoundProcedureArgument::Omitted => span,
+                    BoundProcedureArgument::ExplicitDefault(value_span) => value_span,
+                    _ => return Err(invariant()),
+                };
+                retention = Some((
+                    ProcedureRetentionDuration::parse(source, value_span, default, control)?,
+                    value_span,
+                ));
             }
+            (_, BoundProcedureArgument::Omitted | BoundProcedureArgument::ExplicitDefault(_)) => {}
             (
                 "retain_last",
                 BoundProcedureArgument::Present {
@@ -605,35 +606,62 @@ fn project_bound(
                     ..
                 },
             ) => retain_last = Some(u32::try_from(value).map_err(|_| invariant())?),
+            (
+                "clean_expired_metadata",
+                BoundProcedureArgument::Present {
+                    value: BoundProcedureValue::Value(DdlPropertyValue::Boolean(value)),
+                    ..
+                },
+            ) => clean_expired_metadata = value,
             _ => return Err(invariant()),
         }
     }
-    // A retain-only expiration keeps the existing Provider's age policy.
-    if older_than_ms.is_none() && retain_last.is_none() {
-        let duration = ProcedureRetentionDuration::parse(
-            source,
-            span,
-            retention_default.ok_or_else(invariant)?,
-            control,
-        )?;
-        older_than_ms = Some(relative_cutoff(
-            source,
-            span,
-            &duration,
-            statement_started_at,
-            kind,
-        )?);
-    }
+    let (retention, value_span) = retention.ok_or_else(invariant)?;
+    let older_than_ms =
+        relative_cutoff(source, value_span, &retention, statement_started_at, kind)?;
+    let duration = retention.connector_duration();
     match kind {
         TableProcedureKind::ExpireSnapshots => Ok(Procedure::ExpireSnapshots {
             older_than_ms,
             retain_last,
+            duration,
+            clean_expired_metadata,
         }),
-        TableProcedureKind::RemoveOrphanFiles => Ok(Procedure::RemoveOrphanFiles(
-            older_than_ms.ok_or_else(invariant)?,
-        )),
+        TableProcedureKind::RemoveOrphanFiles => Ok(Procedure::RemoveOrphanFiles {
+            older_than_ms,
+            duration,
+        }),
         _ => Err(invariant()),
     }
+}
+
+fn frozen_retention(
+    execution: &QueryExecutionContext,
+    planning: &ConnectorControlPlanningPin,
+    requested: ConnectorMaintenanceDuration,
+    property: &str,
+) -> Result<ConnectorMaintenanceRetention, CommandError> {
+    use novarocks_query_application::sql::session::registry::SessionPropertyValue;
+    let binding = planning.binding();
+    let key = ConnectorProviderBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    let session_minimum = match execution
+        .session_property_inputs()
+        .read_catalog_override_for_binding(&key, property)
+    {
+        None => None,
+        Some(SessionPropertyValue::Varchar(value)) => Some(
+            ConnectorMaintenanceDuration::parse(value)
+                .ok_or_else(|| crate::query::procedure_command_error(invariant()))?,
+        ),
+        Some(_) => return Err(crate::query::procedure_command_error(invariant())),
+    };
+    Ok(ConnectorMaintenanceRetention {
+        requested,
+        session_minimum,
+    })
 }
 
 fn relative_cutoff(
@@ -674,25 +702,6 @@ fn relative_cutoff(
             "Table procedure retention_threshold produces a cutoff outside the supported timestamp range",
         )
     })
-}
-
-struct OriginalTimestamp<'a> {
-    source: &'a str,
-}
-
-impl TableProcedureAbsoluteTimePort for OriginalTimestamp<'_> {
-    fn legacy_timestamp_literal_millis(
-        &mut self,
-        text: &str,
-        span: Span,
-    ) -> Result<i64, QueryServiceError> {
-        original_timestamp(self.source, span, text)
-    }
-}
-
-fn original_timestamp(source: &str, span: Span, value: &str) -> Result<i64, QueryServiceError> {
-    crate::table_maintenance::admission::parse_timestamp_millis(value)
-        .map_err(|message| invalid_procedure_argument(source, span, message))
 }
 
 fn invariant() -> QueryServiceError {

@@ -243,8 +243,6 @@ fn normalize_inner(
         ScalarNode::UnaryOp { op, child } => {
             let name = match op {
                 UnOp::Not => "not",
-                UnOp::Negate => "neg",
-                UnOp::BitwiseNot => "bitnot",
             };
             call(
                 name,
@@ -262,7 +260,11 @@ fn normalize_inner(
         } => NormExpr::Call {
             value_type: value_type.clone(),
             argument_order: NormArgumentOrder::Ordered,
-            name: format!("fn:{}", name.to_ascii_lowercase()),
+            name: if crate::common::negation::is_negation(&binding.function_id) {
+                format!("fn:{}", binding.function_id.as_str())
+            } else {
+                format!("fn:{}", name.to_ascii_lowercase())
+            },
             distinct: *distinct || volatility.is_volatile(),
             binding: Some(binding.clone()),
             decimal_overflow_policy: None,

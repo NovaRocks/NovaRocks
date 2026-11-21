@@ -90,7 +90,7 @@ ALTER TABLE p14_source EXECUTE optimize(no_such => 1);
 ALTER TABLE p14_source EXECUTE optimize('10MB', no_such => 1);
 
 -- query 18
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=WHERE not supported for procedure OPTIMIZE_MANIFESTS
 ALTER TABLE p14_source EXECUTE optimize_manifests WHERE id > 0;
 
 -- query 19

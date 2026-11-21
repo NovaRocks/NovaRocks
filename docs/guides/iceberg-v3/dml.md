@@ -80,7 +80,7 @@ ALTER TABLE lake.sales.orders EXECUTE add_files(
 
 登记先共享实际读取绑定，能正常忽略未映射的额外列。文件的原始字段只有部分 ID、目标绑定使用当前未支持的载体（如 INT96），都会拒绝。必填列有 NULL 或无法从 footer 确认其 NULL 个数为零时返回 `CONSTRAINT_VIOLATION`。重复的存活路径返回 `ICEBERG_COMMIT_ERROR`。成功后可从 `"orders$files"` 检查登记路径、记录数和列指标，并从 `"orders$snapshots"` 核对追加快照。
 
-准备期间保持输入路径和字节稳定。登记失败时，只清理操作生成且获得删除权的元数据。登记后，文件按表的快照生命周期管理，源在表目录之外也可能在最后一份引用快照过期后被清理。源在表目录内时，应与能扫描同一前缀的外部孤儿文件清理错开。遇到结果未知，按[发布核对流程](lake-publication.md#不确定提交)只读核对原快照标记。结论仍未知时保留对象并禁止自动重试。设计与并发边界见 [ADR-0244](../../adr/ADR-0244-iceberg-add-files-uses-read-binding-and-atomic-registration.md).
+准备期间保持输入路径和字节稳定。登记失败时，只清理操作生成且获得删除权的元数据。登记后，文件按表的快照生命周期管理，源在表目录之外也可能在最后一份引用快照过期后被清理。源在表目录内时，应与能扫描同一前缀的外部孤儿文件清理错开。遇到结果未知，按[发布核对流程](lake-publication.md#不确定提交)只读核对原快照标记。结论仍未知时保留对象并禁止自动重试。设计与并发边界见 [ADR-0246](../../adr/ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md).
 
 ## ✅ INSERT INTO
 

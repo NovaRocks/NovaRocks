@@ -32,10 +32,7 @@ pub(super) fn decode_unary(
 ) -> Result<novarocks_expression_contract::UnaryOperator, ExpressionCodecError> {
     use wire::UnaryOperator as W;
     Ok(match W::try_from(op) {
-        Ok(W::Plus) => novarocks_expression_contract::UnaryOperator::Plus,
-        Ok(W::Minus) => novarocks_expression_contract::UnaryOperator::Minus,
         Ok(W::Not) => novarocks_expression_contract::UnaryOperator::Not,
-        Ok(W::BitwiseNot) => novarocks_expression_contract::UnaryOperator::BitwiseNot,
         Ok(W::Unspecified) | Err(_) => {
             return Err(shape("unary operator is unknown or unspecified"));
         }
@@ -61,9 +58,6 @@ pub(super) fn decode_binary(
             W::LtEq => novarocks_expression_contract::BinaryOperator::LtEq,
             W::Gt => novarocks_expression_contract::BinaryOperator::Gt,
             W::GtEq => novarocks_expression_contract::BinaryOperator::GtEq,
-            W::BitAnd => novarocks_expression_contract::BinaryOperator::BitAnd,
-            W::BitOr => novarocks_expression_contract::BinaryOperator::BitOr,
-            W::BitXor => novarocks_expression_contract::BinaryOperator::BitXor,
         },
     )
 }
@@ -174,14 +168,7 @@ mod tests {
     fn receiving_operators_cover_every_closed_variant_and_original_error_categories() {
         use novarocks_expression_contract::{BinaryOperator as B, UnaryOperator as P};
         use wire::{BinaryOperator as V, UnaryOperator as W};
-        for (wire, expected) in [
-            (W::Plus, P::Plus),
-            (W::Minus, P::Minus),
-            (W::Not, P::Not),
-            (W::BitwiseNot, P::BitwiseNot),
-        ] {
-            assert_eq!(decode_unary(wire as i32).unwrap(), expected);
-        }
+        assert_eq!(decode_unary(W::Not as i32).unwrap(), P::Not);
         for (wire, expected) in [
             (V::Add, B::Add),
             (V::Subtract, B::Subtract),
@@ -195,20 +182,18 @@ mod tests {
             (V::LtEq, B::LtEq),
             (V::Gt, B::Gt),
             (V::GtEq, B::GtEq),
-            (V::BitAnd, B::BitAnd),
-            (V::BitOr, B::BitOr),
-            (V::BitXor, B::BitXor),
         ] {
             assert_eq!(decode_binary(wire as i32).unwrap(), expected);
         }
-        for raw in [0, -1, i32::MAX] {
+        // Former operation numbers are reserved and follow the unknown-value path.
+        for raw in [0, 1, 2, 4, -1, i32::MAX] {
             error(
                 decode_unary(raw),
                 "unary operator is unknown or unspecified",
             );
         }
         error(decode_binary(0), "binary operator is unspecified");
-        for raw in [-1, i32::MAX] {
+        for raw in [13, 14, 15, -1, i32::MAX] {
             error(decode_binary(raw), "binary operator is unknown");
         }
     }

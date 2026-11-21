@@ -36,6 +36,8 @@ pub use array_common::{
     list_value_type_with_construction,
 };
 mod array_generate;
+mod assignment_common;
+pub use assignment_common::{AssignmentCommonTypeError, assignment_common_value_type};
 mod call_context;
 mod carrier_parameters;
 mod coercion;
@@ -89,6 +91,8 @@ pub use value_type::{
     ExecutionValueTypeError, ValueField, ValueKind, ValueTypeRef, ValueTypeStorageHold,
     ValueTypeStorageLifetime, ValueUnionField,
 };
+mod operator_function;
+pub use operator_function::OperatorFunction;
 mod value_arithmetic;
 mod value_projection;
 mod window;

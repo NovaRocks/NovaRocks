@@ -6,9 +6,12 @@ status: active
 supersedes: [ADR-0032, ADR-0035, ADR-0036, ADR-0037, ADR-0046, ADR-0054, ADR-0064, ADR-0068, ADR-0070]
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0244
+  - id: ADR-0246
     scope: "Repeating ADD FILES duplicate validation on every refreshed base"
-    link: "ADR-0244-iceberg-add-files-uses-read-binding-and-atomic-registration.md"
+    link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"
+  - id: ADR-0243
+    scope: "Scan GC admission for explicit remove_orphan_files and cleanup of NovaRocks-owned refs. Target OCC, autocommit and crash-only publication remain active."
+    link: "ADR-0243-statement-authorized-iceberg-metadata-maintenance.md"
   - id: ADR-0198
     scope: "Deriving an external-effect lifetime bound from a local statement deadline and unconditional age-gated orphan, owned-ref or unanchored CTAS collection; target OCC, autocommit and the absence of durable takeover remain active"
     link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
@@ -24,7 +27,7 @@ code-anchors:
   - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs (IcebergCleanupMaintenance)"
 ---
 
-> ADD FILES 每轮刷新后查重的条款由 [ADR-0244](ADR-0244-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 接替。候选以准确 main 快照为依据复用或重新匹配。target OCC、提交结论和失败后对象保护继续有效。
+> ADD FILES 每轮刷新后查重的条款由 [ADR-0246](ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 接替。候选以准确 main 快照为依据复用或重新匹配。target OCC、提交结论和失败后对象保护继续有效。
 
 ## 问题
 

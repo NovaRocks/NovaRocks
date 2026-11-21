@@ -383,7 +383,6 @@ pub fn iceberg_ref_command_executor(
 /// Leaf ports for foreground table-maintenance commands.
 #[derive(Clone)]
 pub struct MaintenanceCommandPorts {
-    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     rewrite_runtime: Option<domain::MaintenanceRewriteRuntime>,
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -419,7 +418,6 @@ impl MaintenanceCommandPorts {
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
-            state_store: None,
             rewrite_runtime: None,
             constant_policy,
             functions,
@@ -434,14 +432,6 @@ impl MaintenanceCommandPorts {
             service,
             runtime,
         }
-    }
-
-    pub(crate) fn with_state_store_original(
-        mut self,
-        binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,
-    ) -> Self {
-        self.state_store = binding;
-        self
     }
 
     pub(crate) fn with_rewrite_runtime(
@@ -465,8 +455,7 @@ impl MaintenanceCommandPorts {
             self.constant_policy,
             self.static_plan_carrier.clone(),
             Arc::clone(&self.sealed_functions),
-        )
-        .with_state_store_original(self.state_store.clone());
+        );
         match self.rewrite_runtime.as_ref() {
             Some(runtime) => kernel.with_rewrite_runtime(runtime.clone()),
             None => kernel,

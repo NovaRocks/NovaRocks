@@ -14,3 +14,11 @@ catalogs = []
 # Opt in to ALTER TABLE EXECUTE add_files on this Iceberg catalog.
 # The property is a string Boolean and defaults to "false".
 # "iceberg.add-files-procedure.enabled" = "true"
+
+# Optional Iceberg maintenance minimums, also under [catalogs.properties].
+# "iceberg.expire-snapshots.min-retention" = "7d"
+# "iceberg.remove-orphan-files.min-retention" = "7d"
+# Each EXECUTE defaults retention_threshold to '7d'. A catalog session can
+# override the corresponding minimum, for example when lake is the catalog:
+# SET SESSION lake.expire_snapshots_min_retention = '14d';
+# SET SESSION lake.remove_orphan_files_min_retention = '14d';

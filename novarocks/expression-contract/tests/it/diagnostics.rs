@@ -161,7 +161,7 @@ fn lazy_type_issues_keep_lambda_parent_and_function_argument_payload() {
     let parameter = builder
         .add(
             Some(lambda),
-            integer(false),
+            boolean(false),
             ExprKind::LambdaParameter { lambda, ordinal: 0 },
         )
         .unwrap();
@@ -169,9 +169,9 @@ fn lazy_type_issues_keep_lambda_parent_and_function_argument_payload() {
         .insert(
             lambda,
             None,
-            integer(false),
+            boolean(false),
             ExprKind::Lambda {
-                parameter_types: Box::new([integer(false)]),
+                parameter_types: Box::new([boolean(false)]),
                 body: parameter,
             },
         )
@@ -179,9 +179,9 @@ fn lazy_type_issues_keep_lambda_parent_and_function_argument_payload() {
     let wrong_parent = builder
         .add(
             None,
-            integer(false),
+            boolean(false),
             ExprKind::Unary {
-                op: UnaryOperator::Plus,
+                op: UnaryOperator::Not,
                 expr: lambda,
             },
         )

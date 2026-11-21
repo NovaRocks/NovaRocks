@@ -757,6 +757,8 @@ impl AttemptCallSource {
         );
     }
 
+    /// Reports progress, including disposal of a failed payload before the
+    /// original inputs and work header retire and the result returns to idle.
     pub(crate) fn retire_result(&mut self) -> Result<bool, ActorTurnError> {
         let Some(live) = self.live.as_mut() else {
             return Ok(false);

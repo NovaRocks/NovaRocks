@@ -30,6 +30,7 @@ struct Counts {
     acquired: AtomicUsize,
     table_load: AtomicUsize,
     table_prepare: AtomicUsize,
+    source_prepare: AtomicUsize,
     table_create: AtomicUsize,
     view_load: AtomicUsize,
     view_prepare: AtomicUsize,
@@ -41,6 +42,7 @@ struct Counts {
 }
 struct ObservedMetadata {
     owner: ConnectorInstanceId,
+    epoch: ProviderBindingEpoch,
     error: Option<ConnectorError>,
     counts: Arc<Counts>,
 }
@@ -48,13 +50,21 @@ impl ObservedMetadata {
     fn create(
         &self,
         request: ConnectorTableRequest,
+        full: bool,
         creation: &mut ConnectorReadSchemaCreation<'_>,
     ) -> Result<ConnectorTableMetadata, PureProviderCompileError<ConnectorError>> {
         let data_type = match request.resolution {
             ConnectorTableResolution::HistoricalSnapshot(10) => arrow::datatypes::DataType::Int32,
             _ => arrow::datatypes::DataType::Int64,
         };
-        crate::connector::schema_creation::declared_test_metadata_with_creation(
+        let mut fields = vec![arrow::datatypes::Field::new("x", data_type.clone(), false)];
+        let mut values = vec![FunctionValueType::new(data_type, false)];
+        if full {
+            let added = arrow::datatypes::DataType::Int64;
+            fields.push(arrow::datatypes::Field::new("added", added.clone(), true));
+            values.push(FunctionValueType::new(added, true));
+        }
+        let observation = crate::connector::schema_creation::declared_test_metadata_with_creation(
             ConnectorTableMetadataHeader {
                 identity: request.table,
                 planning_facts: ConnectorTablePlanningFacts::empty(),
@@ -66,12 +76,23 @@ impl ObservedMetadata {
                     bytes::Bytes::from_static(b"same observed table"),
                 )?,
             },
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("x", data_type.clone(), false),
-            ])),
-            vec![FunctionValueType::new(data_type, false)],
+            Arc::new(arrow::datatypes::Schema::new(fields)),
+            values,
             creation,
-        )
+        )?;
+        if full {
+            Ok(
+                observation.with_source_read_facts(ConnectorProcessLocalPayload::new(
+                    ConnectorProviderBindingKey {
+                        instance_id: self.owner.clone(),
+                        incarnation: self.epoch,
+                    },
+                    Arc::new(()),
+                )),
+            )
+        } else {
+            Ok(observation)
+        }
     }
     fn references(
         &self,
@@ -128,7 +149,7 @@ impl ConnectorMetadata for ObservedMetadata {
         if let Some(error) = &self.error {
             return Err(error.clone().into());
         }
-        self.create(request, creation)
+        self.create(request, false, creation)
     }
     fn prepare_table(&self, request: ConnectorTableRequest) -> ConnectorTablePreparationFuture<'_> {
         Box::pin(async move {
@@ -148,7 +169,30 @@ impl ConnectorMetadata for ObservedMetadata {
                 return Err(error.clone());
             }
             tokio::task::yield_now().await;
-            Ok(ConnectorTablePreparation::new(self.owner.clone(), request))
+            Ok(ConnectorTablePreparation::new(
+                self.owner.clone(),
+                (request, false),
+            ))
+        })
+    }
+    fn prepare_source_table(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> ConnectorTablePreparationFuture<'_> {
+        Box::pin(async move {
+            self.counts.source_prepare.fetch_add(1, Ordering::Relaxed);
+            self.counts
+                .resolutions
+                .lock()
+                .unwrap()
+                .push(request.resolution);
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            Ok(ConnectorTablePreparation::new(
+                self.owner.clone(),
+                (request, true),
+            ))
         })
     }
     fn create_prepared_table(
@@ -156,9 +200,9 @@ impl ConnectorMetadata for ObservedMetadata {
         prepared: ConnectorTablePreparation,
         creation: &mut ConnectorReadSchemaCreation<'_>,
     ) -> Result<ConnectorTableMetadata, PureProviderCompileError<ConnectorError>> {
-        let request = prepared.into_facts::<ConnectorTableRequest>(&self.owner)?;
+        let (request, full) = prepared.into_facts::<(ConnectorTableRequest, bool)>(&self.owner)?;
         self.counts.table_create.fetch_add(1, Ordering::Relaxed);
-        self.create(request, creation)
+        self.create(request, full, creation)
     }
     fn read_reference_facts(
         &self,
@@ -301,6 +345,7 @@ fn fixture(
     let counts = Arc::new(Counts::default());
     let metadata = Arc::new(ObservedMetadata {
         owner: base.descriptor().instance_id.clone(),
+        epoch: base.incarnation(),
         error: table_error,
         counts: counts.clone(),
     });
@@ -711,3 +756,5 @@ fn a_provider_table_from_another_relation_cannot_be_relabelled_as_the_requested_
         assert_eq!(resolver.counts.view_load.load(Ordering::Relaxed), 0);
     }
 }
+
+mod row_mutation_current;

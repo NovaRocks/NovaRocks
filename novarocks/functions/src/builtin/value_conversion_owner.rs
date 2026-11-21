@@ -28,16 +28,16 @@ use super::value_conversion::{self, ValueConversionResolver};
 use super::value_conversion_kernel::ConversionRecipe;
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
-    CallEffectInput, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
-    FunctionBindingResolver, FunctionBindingSelection, FunctionCatalogError, FunctionDefinition,
-    FunctionEffectOwner, FunctionEffectOwnerError, FunctionId, FunctionKind, FunctionOverloadId,
-    FunctionVisibility, KernelEvaluationControl, KernelFailure, PreparedScalarKernel,
-    PureFunctionMetadataOwner, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
-    PureScalarImplementation, ScalarCallContract, ScalarCallInput, ScalarKernelInstance,
-    SelectedValues,
+    CallEffectInput, FunctionArgumentType, FunctionBindingDeclaration, FunctionBindingError,
+    FunctionBindingRequest, FunctionBindingResolver, FunctionBindingSelection,
+    FunctionCatalogError, FunctionDefinition, FunctionEffectOwner, FunctionEffectOwnerError,
+    FunctionId, FunctionKind, FunctionOverloadId, FunctionVisibility, KernelEvaluationControl,
+    KernelFailure, PreparedScalarKernel, PureFunctionMetadataOwner, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi, PureScalarImplementation, ScalarCallContract,
+    ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-fn implementation_pairs() -> [(&'static str, &'static str); 10] {
+fn implementation_pairs() -> [(&'static str, &'static str); 15] {
     [
         (
             value_conversion::JSON_TEXT,
@@ -50,6 +50,26 @@ fn implementation_pairs() -> [(&'static str, &'static str); 10] {
         (
             value_conversion::SIGNED_LARGEINT,
             "builtin.scalar/value_domain_conversion/signed_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::BOOLEAN_LARGEINT,
+            "builtin.scalar/value_domain_conversion/boolean_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::DECIMAL128_LARGEINT,
+            "builtin.scalar/value_domain_conversion/decimal128_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::DECIMAL256_LARGEINT,
+            "builtin.scalar/value_domain_conversion/decimal256_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::FLOAT32_LARGEINT,
+            "builtin.scalar/value_domain_conversion/float32_to_largeint_null_invalid/selected-v1",
+        ),
+        (
+            value_conversion::FLOAT64_LARGEINT,
+            "builtin.scalar/value_domain_conversion/float64_to_largeint_null_invalid/selected-v1",
         ),
         (
             value_conversion::LARGEINT_SIGNED,
@@ -154,15 +174,27 @@ impl ValueConversionOwner {
     }
 
     fn call_effects(&self, input: CallEffectInput<'_>) -> CallEffects {
-        let mut base = value_conversion::overload_effects(input.selected.overload.as_str());
-        if input.selected.overload.as_str() == value_conversion::LARGEINT_DECIMAL {
-            let can_overflow = match &input.selected.result_type {
+        let overload = input.selected.overload.as_str();
+        let mut base = value_conversion::overload_effects(overload);
+        let can_decimal_overflow = match overload {
+            value_conversion::LARGEINT_DECIMAL => Some(match &input.selected.result_type {
                 crate::FunctionResultType::Scalar(target) => {
                     value_conversion::largeint_decimal::DecimalRecipe::try_new(target.data_type())
                         .is_none_or(|recipe| recipe.can_overflow())
                 }
                 _ => true,
-            };
+            }),
+            value_conversion::DECIMAL128_LARGEINT | value_conversion::DECIMAL256_LARGEINT => {
+                Some(match input.selected.argument_types.as_ref() {
+                    [FunctionArgumentType::Value(source)] => {
+                        value_conversion::decimal_to_largeint_can_overflow(source.data_type())
+                    }
+                    _ => true,
+                })
+            }
+            _ => None,
+        };
+        if let Some(can_overflow) = can_decimal_overflow {
             base.own_row_error = if can_overflow
                 && input.decimal_overflow_policy == DecimalOverflowPolicy::ReportError
             {

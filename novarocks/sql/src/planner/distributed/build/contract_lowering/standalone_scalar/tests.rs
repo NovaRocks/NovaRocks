@@ -233,24 +233,22 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
         },
         value_type: ValueType::new(DataType::Int64, false),
     };
-    let negate = TypedExpr {
-        kind: ExprKind::UnaryOp {
-            op: UnOp::Negate,
-            expr: AstBox::new(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Decimal("7".into())),
-                value_type: ValueType::new(DataType::Decimal128(2, 0), false),
-            }),
+    let negate = crate::analyzer::negation_for_test(
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Decimal("7".into())),
+            value_type: ValueType::new(DataType::Decimal128(2, 0), false),
         },
-        value_type: ValueType::new(DataType::Decimal128(2, 0), false),
-    };
-    for expression in [&cast, &negate] {
+        &Control::default(),
+    )
+    .unwrap();
+    for (expression, nullable) in [(&cast, true), (&negate, false)] {
         let baseline_control = Control::default();
         let source = emit(expression, &baseline_control).unwrap();
         assert_eq!(
             source.value_type().data_type(),
             expression.value_type.data_type()
         );
-        assert!(source.value_type().nullable());
+        assert_eq!(source.value_type().nullable(), nullable);
         assert!(source.unit.ports().is_empty());
     }
     let call = lower_call(text("ABC"), DecimalOverflowPolicy::ReportError);

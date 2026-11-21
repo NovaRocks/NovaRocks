@@ -30,16 +30,18 @@ use crate::manifest::DataFileWithStats;
 pub(crate) mod add_files;
 #[path = "catalog_control/catalog_mutation.rs"]
 pub mod catalog_mutation;
-#[path = "catalog_control/cleanup_candidates.rs"]
-mod cleanup_candidates;
 #[path = "catalog_control/cleanup_maintenance.rs"]
 pub mod cleanup_maintenance;
 pub mod data_mutation;
 pub mod drop_cleanup;
+#[path = "catalog_control/maintenance_admission.rs"]
+mod maintenance_admission;
+#[path = "catalog_control/maintenance_error.rs"]
+pub(crate) mod maintenance_error;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub(crate) mod metadata_maintenance;
-#[path = "catalog_control/owned_ref_cleanup.rs"]
-mod owned_ref_cleanup;
+
+mod orphan_files;
 #[path = "catalog_control/staged_create.rs"]
 pub mod staged_create;
 #[path = "catalog_control/statistics.rs"]
@@ -226,6 +228,7 @@ mod tests {
             warehouse_path: PathBuf::from("/tmp/warehouse"),
             write: Default::default(),
             add_files_enabled: false,
+            maintenance: Default::default(),
         });
 
         assert!(!state.is_s3());
@@ -251,6 +254,7 @@ mod tests {
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
                 write: Default::default(),
                 add_files_enabled: false,
+                maintenance: Default::default(),
             })
         };
         registry

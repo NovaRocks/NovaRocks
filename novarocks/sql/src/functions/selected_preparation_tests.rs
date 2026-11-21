@@ -408,13 +408,29 @@ struct DeclarationOnly;
 
 #[test]
 fn sql_missing_selected_implementation_keeps_ordinary_tail_and_every_control_prefix() {
-    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let builtin = build_builtin_engine_function_catalog().unwrap();
+    let original = builtin
+        .definition("cardinality", FunctionKind::Scalar)
+        .unwrap();
+    // Keep the actual binding author and declaration in a catalogue that
+    // deliberately has no prepared implementation for this definition.
+    let definition = FunctionDefinition::try_new_bound(
+        original.canonical_name(),
+        original.visibility(),
+        original.binding_declaration().unwrap().clone(),
+        Arc::new(original.binding_resolver().unwrap().clone()),
+    )
+    .unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder.register(definition).unwrap();
+    let catalog = builder.seal_bound().unwrap();
     let control = Control::default();
-    let arguments = [];
+    let arguments = arguments();
     let bound =
-        SqlFunctionCatalog::resolve_scalar_binding(&catalog, "uuid", &arguments, &control).unwrap();
+        SqlFunctionCatalog::resolve_scalar_binding(&catalog, "cardinality", &arguments, &control)
+            .unwrap();
     let selected = Arc::new(bound.selected.clone());
-    let uses = [];
+    let uses = [Some(ExpressionUseId::new(0))];
     let parameters = SemanticParameters::try_new([]).unwrap();
     let call = input(&bound, &selected, &arguments, &uses, &parameters);
     let options = || PureCallPreparation::Scalar {
@@ -433,7 +449,8 @@ fn sql_missing_selected_implementation_keeps_ordinary_tail_and_every_control_pre
     let trace = control.trace();
     assert!(matches!(
         direct,
-        FunctionSpecializationFailure::MissingPureImplementation(_)
+        FunctionSpecializationFailure::MissingPureImplementation(ref id)
+            if id == &selected.overload
     ));
     // Missing ownership is already an authored error. A later optional
     // checkpoint must not replace that exact selected-overload refusal.

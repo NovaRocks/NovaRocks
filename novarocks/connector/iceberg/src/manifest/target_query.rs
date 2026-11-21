@@ -218,6 +218,7 @@ pub(crate) struct ManifestReadScope {
     manifest_list: String,
     descriptors: Option<BTreeMap<usize, ManifestFile>>,
     raw: RawManifestCache,
+    original_raw: Option<RawManifestCache>,
     bound: BTreeMap<usize, Arc<BoundLookup>>,
     composites: BTreeMap<Vec<usize>, Composite>,
     resources: Option<ConnectorExecutionResources>,
@@ -243,6 +244,7 @@ impl ManifestReadScope {
             manifest_list,
             descriptors: None,
             raw: RawManifestCache::default(),
+            original_raw: None,
             bound: BTreeMap::new(),
             composites: BTreeMap::new(),
             resources: None,
@@ -293,7 +295,7 @@ impl ManifestReadScope {
     /// operation may still reuse raw objects through the same authorization.
     pub(crate) fn rebind(&self, metadata: Arc<TableMetadata>, snapshot_id: i64) -> Result<Self> {
         let mut scope = Self::new(metadata, snapshot_id)?;
-        scope.raw = self.raw.clone();
+        scope.original_raw = Some(self.raw.clone());
         scope.resources = self.resources.clone();
         scope.binding = self.binding.clone();
         scope.owned_request = self.owned_request.clone();
@@ -342,12 +344,20 @@ impl ManifestReadScope {
             source.descriptor.manifest_path.clone(),
             source.descriptor.manifest_length,
         );
-        Ok(self
-            .raw
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&key)
-            .cloned())
+        Ok(self.raw_entry(&key))
+    }
+
+    // An attempt can borrow immutable E objects. Objects first loaded in B
+    // stay in the round's own cache and release with that round's accounting.
+    fn raw_entry(&self, key: &(String, i64)) -> Option<Arc<RawManifest>> {
+        let lookup = |cache: &RawManifestCache| {
+            cache
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(key)
+                .cloned()
+        };
+        lookup(&self.raw).or_else(|| self.original_raw.as_ref().and_then(lookup))
     }
 
     async fn authorize(&self, path: &str) -> Result<()> {
@@ -370,13 +380,7 @@ impl ManifestReadScope {
             source.descriptor.manifest_path.clone(),
             source.descriptor.manifest_length,
         );
-        let cached = self
-            .raw
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&key)
-            .cloned();
-        if let Some(raw) = cached {
+        if let Some(raw) = self.raw_entry(&key) {
             return Ok(raw);
         }
         let encoded_bytes = u64::try_from(source.descriptor.manifest_length)
@@ -474,6 +478,48 @@ impl ManifestReadScope {
         targets: BTreeMap<String, TypedPartition>,
         io: &FileIO,
         active: impl Fn() -> Result<()> + Sync,
+    ) -> Result<TargetObservation> {
+        self.observe_inner(targets, io, active, true).await
+    }
+
+    /// A preparation round treats a disappeared target as a conflict only after
+    /// its bounded observation completed. Storage and malformed-data failures
+    /// still leave this method as their original errors.
+    pub(crate) async fn observe_present(
+        &mut self,
+        targets: BTreeMap<String, TypedPartition>,
+        io: &FileIO,
+        active: impl Fn() -> Result<()> + Sync,
+    ) -> Result<TargetObservation> {
+        self.observe_inner(targets, io, active, false).await
+    }
+
+    pub(crate) fn observed_data_file(
+        &self,
+        physical: &LocatedEntry,
+    ) -> Result<&crate::iceberg::spec::DataFile> {
+        let entry = self
+            .bound
+            .get(&physical.source_index)
+            .and_then(|bound| bound.raw().entries().get(physical.ordinal))
+            .ok_or_else(|| invalid("Completed target lost its original bound data entry"))?;
+        Ok(entry.data_file())
+    }
+
+    /// A commit removes live physical entries even when a deletion vector
+    /// supersedes their row-read effect. This borrows only already bound sources.
+    pub(crate) fn live_position_entries(&self) -> impl Iterator<Item = &LocatedEntry> {
+        self.bound
+            .values()
+            .flat_map(|source| source.position_entries.values())
+    }
+
+    async fn observe_inner(
+        &mut self,
+        targets: BTreeMap<String, TypedPartition>,
+        io: &FileIO,
+        active: impl Fn() -> Result<()> + Sync,
+        require_all: bool,
     ) -> Result<TargetObservation> {
         active()?;
         let domain = self.domain.clone();
@@ -656,11 +702,14 @@ impl ManifestReadScope {
         let mut files = BTreeMap::new();
         for path in targets.keys() {
             active()?;
-            let (fact, data) = data.remove(path).ok_or_else(|| {
-                invalid(format!(
-                    "Target data file {path} is absent from the declared snapshot range"
-                ))
-            })?;
+            let Some((fact, data)) = data.remove(path) else {
+                if require_all {
+                    return Err(invalid(format!(
+                        "Target data file {path} is absent from the declared snapshot range"
+                    )));
+                }
+                continue;
+            };
             let set = index.for_data(&fact).map_err(delete_error)?;
             let positions = set
                 .members()
@@ -824,7 +873,7 @@ fn descriptor_bytes<'a>(mut files: impl Iterator<Item = &'a ManifestFile>) -> Re
     })
 }
 
-fn raw_manifest_bytes(raw: &Manifest, descriptor: &ManifestFile) -> u64 {
+pub(crate) fn raw_manifest_bytes(raw: &Manifest, descriptor: &ManifestFile) -> u64 {
     use crate::iceberg::spec::ManifestEntry;
     let backing =
         raw.entries()
@@ -1291,7 +1340,30 @@ mod tests {
     #[tokio::test]
     async fn position_composite_prefers_dv_from_an_independent_source() {
         let (metadata, io) = fixture(Positions::DvOverParquet, false).await;
-        let observation = query(&metadata, &io).await.unwrap();
+        let metadata = Arc::new(metadata);
+        let typed = TypedPartition::bind(
+            metadata.partition_spec_by_id(0).unwrap(),
+            metadata.current_schema(),
+            &partition(10),
+        )
+        .unwrap();
+        let mut scope = ManifestReadScope::new(metadata, SNAPSHOT_ID).unwrap();
+        let observation = scope
+            .observe(BTreeMap::from([(TARGET.to_owned(), typed)]), &io, || Ok(()))
+            .await
+            .unwrap();
+        let physical = scope
+            .live_position_entries()
+            .map(|entry| entry.frozen.identity())
+            .collect::<Vec<_>>();
+        assert!(physical.iter().any(|identity| matches!(
+            identity,
+            crate::commit::model::EntryIdentity::DeleteFile { .. }
+        )));
+        assert!(physical.iter().any(|identity| matches!(
+            identity,
+            crate::commit::model::EntryIdentity::DeletionVector { .. }
+        )));
         let [position] = observation.files[TARGET].positions.as_slice() else {
             panic!("DV must suppress the independent positional source");
         };

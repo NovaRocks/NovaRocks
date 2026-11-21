@@ -48,7 +48,7 @@ impl HistoryWindow {
         &'a self,
         operations: &'a [Operation],
     ) -> impl Iterator<Item = &'a SnapshotRef> {
-        self.snapshots
+        self.snapshots()
             .iter()
             .filter(move |snapshot| operations.contains(&snapshot.summary().operation))
     }

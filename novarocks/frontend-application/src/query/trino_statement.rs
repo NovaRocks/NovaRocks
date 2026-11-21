@@ -343,9 +343,15 @@ fn preparation_plan(
                 publication_deadline: true,
                 waits_for_topology: false,
             },
-            Some(Procedure::OptimizeManifests) => management(RewriteManifests),
-            Some(Procedure::ExpireSnapshots) => management(ExpireSnapshots),
-            Some(Procedure::RemoveOrphanFiles) => management(RemoveOrphanFiles),
+            Some(Procedure::OptimizeManifests) => {
+                CommandPlan::management(RewriteManifests, ResultSet, true)
+            }
+            Some(Procedure::ExpireSnapshots) => {
+                CommandPlan::management(ExpireSnapshots, ResultSet, true)
+            }
+            Some(Procedure::RemoveOrphanFiles) => {
+                CommandPlan::management(RemoveOrphanFiles, ResultSet, true)
+            }
             Some(Procedure::AddFiles) => CommandPlan::management(AddFiles, ResultSet, true),
             Some(Procedure::MoveColumn) => management(ReorderColumn),
             Some(Procedure::SetColumnNotNull) => management(SetColumnNotNull),

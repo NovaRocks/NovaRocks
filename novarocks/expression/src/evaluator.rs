@@ -386,8 +386,6 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::IsNotNull(_)
                     | StaticExprKind::Case { .. }
                     | StaticExprKind::PreparedCast { .. }
-                    | StaticExprKind::PreparedNativeNegate(_)
-                    | StaticExprKind::PreparedNativeBitNot(_)
                     | StaticExprKind::PreparedBetween { .. }
                     | StaticExprKind::PreparedLike { .. }
                     | StaticExprKind::PreparedInList { .. }
@@ -406,24 +404,6 @@ impl CompiledExpressionInstance {
                                     .arithmetic(occurrence)
                                     .ok_or_else(|| {
                                         invalid("missing mandatory arithmetic effect recipe")
-                                    })?
-                                    .own_effects(invocation.context)
-                            } else if matches!(node.kind(), StaticExprKind::PreparedNativeNegate(_))
-                            {
-                                program
-                                    .recipes()
-                                    .native_negate(occurrence)
-                                    .ok_or_else(|| {
-                                        invalid("missing mandatory native negate effect recipe")
-                                    })?
-                                    .own_effects(invocation.context)
-                            } else if matches!(node.kind(), StaticExprKind::PreparedNativeBitNot(_))
-                            {
-                                program
-                                    .recipes()
-                                    .native_bitnot(occurrence)
-                                    .ok_or_else(|| {
-                                        invalid("missing mandatory native BitwiseNot effect recipe")
                                     })?
                                     .own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedLike { .. }) {
@@ -524,14 +504,6 @@ impl CompiledExpressionInstance {
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
                         && program.recipes().cast(occurrence).is_some() => {}
-                StaticExprKind::PreparedNativeNegate(_)
-                    if invocation.control == ControlShape::Eager
-                        && invocation.arguments.len() == 1
-                        && program.recipes().native_negate(occurrence).is_some() => {}
-                StaticExprKind::PreparedNativeBitNot(_)
-                    if invocation.control == ControlShape::Eager
-                        && invocation.arguments.len() == 1
-                        && program.recipes().native_bitnot(occurrence).is_some() => {}
                 StaticExprKind::PreparedInList {
                     values, is_not_in, ..
                 } if invocation.control
@@ -1132,7 +1104,6 @@ mod input_source;
 mod node_recipes;
 pub(crate) mod scalar_invocation;
 mod unary;
-mod utf8_inlist;
 
 pub use filter_conjunction::CompiledFilterConjunctionInstance;
 

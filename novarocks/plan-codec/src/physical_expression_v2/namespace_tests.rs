@@ -414,7 +414,7 @@ fn all_kinds() -> Fixture {
             ordinal: 2,
         }),
         ExprKind::Unary {
-            op: UnaryOperator::Minus,
+            op: UnaryOperator::Not,
             expr: z,
         },
         ExprKind::Binary {
@@ -481,7 +481,7 @@ fn all_kinds() -> Fixture {
         .enumerate()
         .map(|(i, kind)| {
             let id = i as u32;
-            let ty = if matches!(i, 5 | 6 | 10 | 11 | 12 | 13 | 15) {
+            let ty = if matches!(i, 3 | 5 | 6 | 10 | 11 | 12 | 13 | 15) {
                 boolean()
             } else {
                 int()
@@ -562,7 +562,7 @@ fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurre
     assert_eq!(
         out[3].kind,
         Some(Kind::Unary(wire::UnaryExpression {
-            op: wire::UnaryOperator::Minus as i32,
+            op: wire::UnaryOperator::Not as i32,
             expr_id: Some(15)
         }))
     );

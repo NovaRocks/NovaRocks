@@ -22,9 +22,9 @@ use novarocks_query_application::admitted_query_context::QueryResultCapacityBind
 use novarocks_table_maintenance::{
     activity::MaintenanceActivityFamily,
     product::{
-        CleanupSession, DistributedRewriteSession, MaintenanceFuture, RewriteAbort, RewriteCommit,
-        RewriteFailure, RewriteIntent, RewritePlanFacts, RewriteReceiptFacts,
-        TableMaintenanceEffectPort, TableMaintenanceProduct,
+        DistributedRewriteSession, MaintenanceFuture, RewriteAbort, RewriteCommit, RewriteFailure,
+        RewriteIntent, RewritePlanFacts, RewriteReceiptFacts, TableMaintenanceEffectPort,
+        TableMaintenanceProduct,
     },
     runtime::MaintenanceJobState,
 };
@@ -164,27 +164,6 @@ struct ProductExecution {
     finalizer: Arc<Finalizer>,
 }
 impl TableMaintenanceEffectPort for ProductExecution {
-    fn observe_cleanup_owned_ref<'a>(
-        &'a self,
-        _: &'a novarocks_table_maintenance::gc_observation::GcOwnedRefObservationAccelerator,
-        _: novarocks_table_maintenance::gc_observation::GcOwnedRefObservation,
-        _: i64,
-        _: i64,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<
-            novarocks_table_maintenance::gc_observation::GcOwnedRefObservationDecision,
-            novarocks_table_maintenance::runtime::TerminalError,
-        >,
-    > {
-        Box::pin(async {
-            Err(
-                novarocks_table_maintenance::runtime::TerminalError::pre_dispatch_failed(
-                    "this effect source cannot observe owned-ref cleanup",
-                ),
-            )
-        })
-    }
     fn reject_user_action_on_mv<'a>(
         &'a self,
         _: &'a MaintenanceTarget,
@@ -195,7 +174,7 @@ impl TableMaintenanceEffectPort for ProductExecution {
     fn execute_metadata<'a>(
         &'a self,
         _: MaintenanceActionRequest,
-    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>> {
+    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>> {
         Box::pin(async { panic!("the original worker dispatches Rewrite only") })
     }
     fn begin_rewrite<'a>(
@@ -209,16 +188,6 @@ impl TableMaintenanceEffectPort for ProductExecution {
                 finalizer: self.finalizer.clone(),
             }) as Box<dyn DistributedRewriteSession>)
         })
-    }
-    fn begin_cleanup<'a>(
-        &'a self,
-        _: &'a MaintenanceTarget,
-        _: i64,
-    ) -> MaintenanceFuture<
-        'a,
-        Result<Box<dyn CleanupSession + 'a>, novarocks_table_maintenance::runtime::TerminalError>,
-    > {
-        Box::pin(async { panic!("business terminal does not run unrelated GC") })
     }
 }
 #[tokio::test]
@@ -273,7 +242,7 @@ async fn exercise_original_terminal(effect: ExecutionEffect, outcome: ProviderOu
         .unwrap();
     let capacity = QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap();
     let execution = ProductExecution {
-        product: TableMaintenanceProduct::new(None),
+        product: TableMaintenanceProduct::default(),
         effect,
         finalizer: Arc::new(Finalizer {
             allow: AtomicBool::new(false),
@@ -500,7 +469,7 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_and_statem
             Some(&control)
         );
         let execution = ProductExecution {
-            product: TableMaintenanceProduct::new(None),
+            product: TableMaintenanceProduct::default(),
             effect,
             finalizer: Arc::new(Finalizer {
                 allow: AtomicBool::new(true),

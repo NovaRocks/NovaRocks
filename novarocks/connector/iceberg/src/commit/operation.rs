@@ -82,12 +82,19 @@ struct OperationState {
     permits: Arc<Semaphore>,
     limits: OperationLimits,
     artifacts: Mutex<OperationArtifacts>,
+    row_delta: OnceLock<RowDeltaValidation>,
     exit_failures: Mutex<BTreeMap<ObjectIdentity, StreamExitFailure>>,
     attempt_ordinal: AtomicU32,
     object_ordinal: AtomicU64,
     // The original payload pin follows retained journal/artifact backing; the
     // process cache keeps only a value pin, never an admission port/WorkOwner.
     _payload: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
+}
+
+struct RowDeltaValidation {
+    check: super::dependency::RowDeltaWindowCheck,
+    source: Option<std::sync::Weak<dyn super::dependency::RemovedDataFiles>>,
+    _facts: super::row_delta_facts::RetainedRowDeltaFacts,
 }
 
 struct OperationArtifacts {
@@ -170,12 +177,36 @@ impl IcebergCommitOperation {
                     new_files: BTreeMap::new(),
                     cleanup_withheld: None,
                 }),
+                row_delta: OnceLock::new(),
                 exit_failures: Mutex::new(BTreeMap::new()),
                 attempt_ordinal: AtomicU32::new(0),
                 object_ordinal: AtomicU64::new(0),
                 _payload: payload,
             }),
         })
+    }
+
+    pub(crate) fn hold_row_delta_validation(
+        &self,
+        check: super::dependency::RowDeltaWindowCheck,
+        facts: super::row_delta_facts::RetainedRowDeltaFacts,
+        source: Option<std::sync::Weak<dyn super::dependency::RemovedDataFiles>>,
+    ) -> Result<()> {
+        self.inner
+            .row_delta
+            .set(RowDeltaValidation {
+                check,
+                source,
+                _facts: facts,
+            })
+            .map_err(|_| internal("Iceberg operation received its row-delta validation twice"))
+    }
+
+    pub(crate) fn row_delta_check(&self) -> Option<&super::dependency::RowDeltaWindowCheck> {
+        self.inner
+            .row_delta
+            .get()
+            .map(|validation| &validation.check)
     }
 
     pub(crate) fn request_context(&self) -> &ConnectorRequestContext {
@@ -744,6 +775,22 @@ pub(crate) struct IcebergCommitAttempt {
 }
 
 impl IcebergCommitAttempt {
+    pub(crate) fn row_delta_removed_data(
+        &self,
+    ) -> Result<Option<Arc<dyn super::dependency::RemovedDataFiles>>> {
+        self.operation
+            .inner
+            .row_delta
+            .get()
+            .and_then(|validation| validation.source.as_ref())
+            .map(|source| {
+                source
+                    .upgrade()
+                    .ok_or_else(|| internal("Iceberg operation lost the original row-delta source"))
+            })
+            .transpose()
+    }
+
     pub(crate) fn io_window_width(&self) -> usize {
         self.operation.inner.limits.io_requests as usize
     }

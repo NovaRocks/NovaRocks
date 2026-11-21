@@ -546,7 +546,7 @@ fn local_view_service_does_not_restore_state_across_process_instances() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() {
+async fn legacy_maintenance_and_corrupt_mv_projection_records_do_not_block_host_open() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
     let mut host = open_host(Some(config.clone()))
@@ -572,16 +572,14 @@ async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() 
         .expect("stage corrupt maintenance record");
     transaction
         .put(
-            Key::try_from(Bytes::from_static(
-                b"novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/00000000-0000-0000-0000-0000000003c3/5f5f6e6f7661726f636b735f5f636f7272757074",
-            ))
-            .expect("GC observation key"),
+            novarocks_mv_application::state_store_repository::key::projection_by_id_key(963)
+                .expect("MV projection key"),
             Value::try_from(Bytes::from_static(b"not-canonical-json"))
-                .expect("corrupt GC observation value"),
+                .expect("corrupt MV projection value"),
             Precondition::Absent,
         )
         .await
-        .expect("stage corrupt GC observation record");
+        .expect("stage corrupt MV projection record");
     assert!(matches!(
         transaction.commit().await,
         CommitOutcome::Committed(_)
@@ -592,7 +590,7 @@ async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() 
     for _ in 0..2 {
         let mut reopened = open_host(Some(config.clone()))
             .await
-            .expect("legacy maintenance and corrupt GC observation data must not block host open");
+            .expect("legacy maintenance and corrupt MV projection data must not block host open");
         reopened.shutdown().await.expect("reopened host shutdown");
     }
 }
