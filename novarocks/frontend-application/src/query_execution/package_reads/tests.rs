@@ -35,7 +35,7 @@ use novarocks_physical_plan::{
     DataRelation, Distribution, FragmentBuilder, FragmentId, FragmentSink, NodeKind, PhysicalPlan,
     PhysicalProperties, PipelineDopDomain, PlanBuilder, PlanVersionId, ProviderColumnReference,
     ProviderReadOccurrenceId, ProviderReadReference, Relation, RelationField, RowMultiplicity,
-    ScanReadBudget, StagePlacementPolicy, ValueOrigin, ValueType,
+    StagePlacementPolicy, ValueOrigin, ValueType,
 };
 use novarocks_query_application::api::RuntimeSplitPlacement;
 use novarocks_spi::connector::read_stack::adapter::{ProviderReadRuntime, ReadRuntimeAdapter};
@@ -70,6 +70,7 @@ struct FixtureRuntime {
 
 impl ProviderReadRuntime for FixtureRuntime {
     type Table = ();
+    type Execution = ();
     type Column = FixtureColumn;
     type Transaction = ();
     type Split = FixtureSplit;
@@ -158,10 +159,6 @@ fn fixture() -> (
             NodeKind::Scan {
                 occurrence,
                 relation: Box::new(relation),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 4096,
-                    max_batch_bytes: 8 << 20,
-                },
                 provider_outputs: Box::from([(column.clone(), value)]),
                 residuals: Box::default(),
                 derived_values: Box::default(),

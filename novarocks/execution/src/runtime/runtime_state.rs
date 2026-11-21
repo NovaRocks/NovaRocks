@@ -41,7 +41,7 @@ pub(crate) struct PositionShardTestObservation {
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
-/// Today it mainly provides access to frequently used query options (e.g. `batch_size` / chunk size).
+/// It carries the options and capabilities admitted for this query.
 /// More execution-time parameters and state can be migrated here over time.
 pub struct RuntimeState {
     query_options: Option<QueryOptions>,
@@ -571,13 +571,6 @@ impl RuntimeState {
 
     pub fn error(&self) -> Option<ExecutionFailure> {
         self.error_state.error()
-    }
-
-    /// Return the maximum row count per in-memory chunk/RecordBatch.
-    ///
-    /// StarRocks BE uses query option `batch_size` (aka `RuntimeState::chunk_size()`).
-    pub fn chunk_size(&self) -> usize {
-        super::query_options::chunk_size(self.query_options.as_ref())
     }
 
     pub fn runtime_profile_report_interval_ns(&self) -> Option<i64> {

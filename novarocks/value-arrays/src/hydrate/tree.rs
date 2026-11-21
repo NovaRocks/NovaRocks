@@ -525,7 +525,7 @@ impl Node {
     }
 }
 /// Pure real-field arithmetic, also used by the no-multi-GiB boundary oracle.
-pub(super) fn check_extent(
+pub(crate) fn check_extent(
     layout: ByteLayout,
     committed: u128,
     row: u128,
@@ -594,7 +594,7 @@ pub fn visit_reachable_child_rows_observed<E>(
 }
 
 /// Actual source geometry; no metadata or projected child length authors rows.
-pub(super) fn child_rows<E>(
+pub(crate) fn child_rows<E>(
     source: &ArrayRef,
     row: usize,
     visit: &mut impl FnMut(usize, usize, usize) -> Result<(), ValueFailure<E>>,

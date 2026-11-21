@@ -421,12 +421,33 @@ impl IcebergSchemaBinding {
         absolute_positions: Option<&UInt64Array>,
         facts: &IcebergSplitFacts<'_>,
     ) -> Result<Vec<ArrayRef>, ConnectorError> {
-        let row_count = batch.num_rows();
+        self.materialize_columns(batch, absolute_positions, facts, None)
+            .map(|columns| columns.into_iter().map(|column| column.array).collect())
+    }
+
+    pub(super) fn materialize_for_scan(
+        &self,
+        batch: &RecordBatch,
+        absolute_positions: Option<&UInt64Array>,
+        facts: &IcebergSplitFacts<'_>,
+        output_columns: usize,
+    ) -> Result<Vec<MaterializedScanColumn>, ConnectorError> {
+        self.materialize_columns(batch, absolute_positions, facts, Some(output_columns))
+    }
+
+    fn materialize_columns(
+        &self,
+        batch: &RecordBatch,
+        absolute_positions: Option<&UInt64Array>,
+        facts: &IcebergSplitFacts<'_>,
+        output_columns: Option<usize>,
+    ) -> Result<Vec<MaterializedScanColumn>, ConnectorError> {
+        let source_rows = batch.num_rows();
         if let Some(positions) = absolute_positions
-            && positions.len() != row_count
+            && positions.len() != source_rows
         {
             return Err(corrupt(format!(
-                "iceberg data file {} produced {} absolute row positions for {row_count} rows",
+                "iceberg data file {} produced {} absolute row positions for {source_rows} rows",
                 facts.path,
                 positions.len()
             )));
@@ -440,8 +461,24 @@ impl IcebergSchemaBinding {
         let mut materialized_roots = vec![None; self.root_projection.len()];
 
         let mut columns = Vec::with_capacity(self.columns.len());
-        for (bound, dereference) in self.columns.iter().zip(&self.projected_dereferences) {
-            columns.push(match &bound.source {
+        for (ordinal, (bound, dereference)) in self
+            .columns
+            .iter()
+            .zip(&self.projected_dereferences)
+            .enumerate()
+        {
+            let constant = output_columns.is_some_and(|count| ordinal < count)
+                && matches!(
+                    &bound.source,
+                    IcebergColumnSource::IdentityPartitionConstant(_)
+                        | IcebergColumnSource::MutationSpecId(_)
+                        | IcebergColumnSource::MutationPartition(_)
+                        | IcebergColumnSource::InitialDefault
+                        | IcebergColumnSource::TypedNull
+                        | IcebergColumnSource::Metadata(IcebergMetadataColumn::Path)
+                );
+            let row_count = if constant { 1 } else { source_rows };
+            let array = match &bound.source {
                 IcebergColumnSource::Physical { base_field_id, .. } => {
                     let root = &self.physical[base_field_id];
                     let value = &mut materialized_roots[root.slot];
@@ -481,6 +518,9 @@ impl IcebergSchemaBinding {
                 IcebergColumnSource::TypedNull => {
                     arrow::array::new_null_array(bound.target.data_type(), row_count)
                 }
+                IcebergColumnSource::Metadata(IcebergMetadataColumn::Path) if constant => {
+                    Arc::new(arrow::array::StringArray::from(vec![facts.path]))
+                }
                 IcebergColumnSource::Metadata(metadata) => metadata_column(
                     *metadata,
                     bound.target.as_ref(),
@@ -499,10 +539,16 @@ impl IcebergSchemaBinding {
                     absolute_positions,
                     facts,
                 )?,
-            });
+            };
+            columns.push(MaterializedScanColumn { array, constant });
         }
         Ok(columns)
     }
+}
+
+pub(super) struct MaterializedScanColumn {
+    pub(super) array: ArrayRef,
+    pub(super) constant: bool,
 }
 
 /// Everything binding needs, and nothing a worker would have to resolve.
@@ -524,6 +570,20 @@ pub struct IcebergSchemaBindingRequest<'a> {
 /// Decide where every ordered output column comes from.
 pub fn bind_scan_columns(
     request: IcebergSchemaBindingRequest<'_>,
+) -> Result<IcebergSchemaBinding, ConnectorError> {
+    bind_columns(request, FieldAdaptation::bind)
+}
+
+/// Bind the layout negotiated by an opened data reader.
+pub(super) fn bind_decoder_columns(
+    request: IcebergSchemaBindingRequest<'_>,
+) -> Result<IcebergSchemaBinding, ConnectorError> {
+    bind_columns(request, FieldAdaptation::bind_for_scan)
+}
+
+fn bind_columns(
+    request: IcebergSchemaBindingRequest<'_>,
+    bind_field: fn(Option<&Field>, &FieldRef) -> Result<FieldAdaptation, AdaptationError>,
 ) -> Result<IcebergSchemaBinding, ConnectorError> {
     let coverage = file_field_id_coverage(request.file_schema)?;
     // Name mapping repairs a legacy file, so it is consulted only when the
@@ -628,7 +688,7 @@ pub fn bind_scan_columns(
             let slot = root_projection
                 .binary_search(&original_slot)
                 .expect("the projected physical root is present");
-            let adaptation = FieldAdaptation::bind(
+            let adaptation = bind_field(
                 Some(resolved_schema.field(original_slot)),
                 &bound.base_target,
             )

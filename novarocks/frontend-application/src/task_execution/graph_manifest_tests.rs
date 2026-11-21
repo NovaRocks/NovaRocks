@@ -983,7 +983,6 @@ fn original_manifest_and_passive_activation_form_one_attempt_host_projection() {
                 query_options: Arc::new(novarocks_task_codec::domain::WireContent::new(
                     b"test.options",
                     wire::QueryOptions {
-                        batch_size: 4096,
                         query_timeout: 30,
                         pipeline_dop: 1,
                         ..Default::default()

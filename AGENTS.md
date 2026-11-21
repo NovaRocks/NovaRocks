@@ -293,7 +293,7 @@ SQL client
 
 - `novarocks/expression-contract/src/{unit,builder}.rs`
   `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
-  codec 用受检的中立 parts 构造单元。修订号 32 的 package 在 PhysicalNode 信封承载单元，
+  codec 用受检的中立 parts 构造单元。修订号 33 的 package 在 PhysicalNode 信封承载单元，
   类型、常量和函数绑定由 package 共享。节点字段的根与端口由 `physical-plan/src/node_roots.rs` 核对。
   见 [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 

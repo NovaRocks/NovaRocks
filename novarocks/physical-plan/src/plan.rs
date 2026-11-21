@@ -907,7 +907,6 @@ pub enum NodeKind {
         /// capabilities distinct without changing provider relation identity.
         occurrence: crate::ProviderReadOccurrenceId,
         relation: Box<Relation>,
-        read_budget: ScanReadBudget,
         provider_outputs: Box<[(ProviderColumnReference, ValueId)]>,
         /// Predicates that the engine must evaluate at the scan. This may also
         /// contain an `Exact` provider guarantee when deliberate rechecking is
@@ -1026,16 +1025,6 @@ pub enum NodeKind {
         target: WriterTarget,
     },
     TableFinish(WriterFinishSpec),
-}
-
-/// Explicit per-reader output-batch budget for one scan.
-///
-/// These values are semantic resource limits in the final plan. They are
-/// supplied by planning and never reconstructed by a codec or runtime default.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScanReadBudget {
-    pub max_batch_rows: u64,
-    pub max_batch_bytes: u64,
 }
 
 /// Borrow of the common grouping and exact aggregate-call contract.

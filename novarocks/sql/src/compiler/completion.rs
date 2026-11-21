@@ -1666,6 +1666,7 @@ pub struct ProviderReadColumnFact {
     request_ordinal: u32,
     column: ProviderColumnReference,
     engine_type: ValueType,
+    execution_type: Option<ValueType>,
 }
 
 impl ProviderReadColumnFact {
@@ -1678,7 +1679,20 @@ impl ProviderReadColumnFact {
             request_ordinal,
             column,
             engine_type,
+            execution_type: None,
         }
+    }
+
+    /// Preserve a provider's exact byte-view declaration beside the SQL type.
+    pub fn with_execution_type(mut self, execution_type: &ValueType) -> Self {
+        if execution_type != &self.engine_type {
+            self.execution_type = Some(execution_type.clone());
+        }
+        self
+    }
+
+    pub fn execution_type(&self) -> &ValueType {
+        self.execution_type.as_ref().unwrap_or(&self.engine_type)
     }
 
     pub const fn request_ordinal(&self) -> u32 {
@@ -3374,6 +3388,15 @@ fn validate_provider_contract(
             .any(|(actual, requested)| {
                 actual.request_ordinal != requested.ordinal
                     || actual.engine_type != requested.engine_type
+                    || actual
+                        .execution_type
+                        .as_ref()
+                        .is_some_and(|execution_type| {
+                            !novarocks_type_contract::byte_view_to_offsets_projection(
+                                execution_type,
+                                &requested.engine_type,
+                            )
+                        })
             })
     {
         return Err(CompletionProtocolError::ProviderProjectionMismatch { id: need.id });
@@ -4040,6 +4063,10 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
                 checked_sum([
                     provider_column_bytes(&field.column),
                     data_type_dynamic_bytes(field.engine_type.data_type()),
+                    field
+                        .execution_type
+                        .as_ref()
+                        .map_or(Ok(0), |ty| data_type_dynamic_bytes(ty.data_type())),
                 ])
             })),
         ])?;

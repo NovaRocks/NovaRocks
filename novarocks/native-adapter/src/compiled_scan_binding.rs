@@ -426,8 +426,7 @@ pub(crate) fn bind_compiled_scan(
         .collect::<Result<Vec<ConnectorReadAssignment>, _>>()
         .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     let dynamic_filter = complete_all_dynamic_filter(scan, &assignments);
-    let descriptor =
-        TypedConnectorReadDescriptor::new(relation.table().clone(), assignments, dynamic_filter);
+    let descriptor = TypedConnectorReadDescriptor::new(relation, assignments, dynamic_filter);
 
     let (range_scope, operations) = task
         .scan_sources

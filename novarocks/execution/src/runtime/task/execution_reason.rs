@@ -196,8 +196,7 @@ pub(crate) enum ExecutionReason {
     ChunkInvalidColumnIndex = 184,
     OperatorMemoryTrackerMissing = 185,
     SeriesDuplicateBounds = 193,
-    SeriesMissingBatchRows = 194,
-    SeriesInvalidBatchRows = 195,
+    // 194 and 195 retired with runtime-configured series batch sizing.
     SeriesInputPort = 196,
     SeriesArrow = 197,
     SeriesAlreadyFailed = 198,
@@ -210,8 +209,7 @@ pub(crate) enum ExecutionReason {
     TableCursorOutputExtent = 205,
     TableCursorInputPort = 206,
     TableCursorAlreadyFailed = 207,
-    TableCursorMissingBatchRows = 208,
-    TableCursorInvalidBatchRows = 209,
+    // 208 and 209 retired with runtime-configured table function batch sizing.
     ChunkSplitExceedsCharge = 210,
     ChunkSplitExceedsReservation = 211,
     #[expect(

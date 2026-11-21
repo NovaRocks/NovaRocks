@@ -17,6 +17,7 @@
 //! Processor lifecycle probes, independent of compile/source transport tests.
 use super::*;
 use crate::exec::chunk::ChunkSchema;
+use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::task::ExecutionFailureCause;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -95,7 +96,7 @@ fn instance(values: [i64; 3], control: Arc<Control>) -> (CompiledGenerateSeriesP
         pending: None,
         offset: 0,
         accepted: false,
-        batch_rows: Some(std::num::NonZeroUsize::new(4096).unwrap()),
+        batch_rows: std::num::NonZeroU32::new(4096).unwrap(),
         failed: false,
     };
     (processor, chunk)

@@ -39,6 +39,7 @@ pub mod predicate;
 pub mod projection;
 pub mod public_schema;
 pub mod runtime;
+mod scan_policy;
 pub mod session;
 pub mod split;
 pub mod split_source;
@@ -61,13 +62,14 @@ pub use mv_target_selection::{
 pub use page_source::{
     ConnectorDataCacheOptions, ConnectorPageSourceProviderOptions, ConnectorPreparationControl,
     ConnectorPreparationExit, ConnectorPreparationProgress, ConnectorPreparationStart,
-    ConnectorPreparedPageSource, PageSourceFileMetrics, PageSourceMetrics, SourcePage,
+    ConnectorPreparedPageSource, PageOutputCustody, PageSourceFileMetrics, PageSourceMetrics,
+    SourcePage,
 };
 pub use page_stream::{
     BudgetConsume, ConnectorOperationExit, ConnectorOperationTicket, ConnectorPageStream,
     ConnectorPollBudget, ConnectorSourceExit, ConnectorSourceExitProof, ConnectorSourceFailure,
     ConnectorSourceFailureEvent, ConnectorSourceFailureReceiver, ConnectorSourceOperations,
-    OwnedConnectorPageStream,
+    FileReaderFirstBatch, OwnedConnectorPageStream,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,
@@ -99,6 +101,7 @@ pub use runtime::{
     ConnectorReadSplitPreparation, ConnectorReadSplitSource, ConnectorReadSystemTablePlan,
     ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
 };
+pub use scan_policy::{ENGINE_OUTPUT_POLICY, ScanOutputPolicy};
 pub use session::{
     ConnectorCatalogSession, ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue,
 };

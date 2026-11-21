@@ -53,6 +53,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-connector-iceberg = { workspace = true, features = ["reader-test-fixture"] }
 novarocks-test-compile-to-execute.workspace = true
 novarocks-sql-testkit.workspace = true
 chrono.workspace = true

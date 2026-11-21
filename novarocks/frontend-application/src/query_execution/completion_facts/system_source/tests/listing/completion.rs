@@ -79,10 +79,6 @@ pub(super) fn request(
             max: 8,
             requires_power_of_two: true,
         },
-        novarocks_physical_plan::ScanReadBudget {
-            max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-            max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-        },
         DEFAULT_COMPLETION_LIMITS,
     )
 }

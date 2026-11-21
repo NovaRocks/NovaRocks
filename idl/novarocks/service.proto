@@ -656,7 +656,8 @@ message DatacacheOptions {
 // Query options consumed by NovaRocks native runtime.
 // Design: docs/adr/ADR-0162-in-memory-query-execution-boundary.md
 message QueryOptions {
-  int32 batch_size = 1;
+  reserved 1;
+  reserved "batch_size";
   int32 query_timeout = 2;
   bool enable_profile = 3;
   int32 pipeline_dop = 4;

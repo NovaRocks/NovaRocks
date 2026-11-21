@@ -1376,6 +1376,7 @@ mod tests {
         }
         impl ProviderReadRuntime for Provider {
             type Table = ();
+            type Execution = ();
             type Column = Column;
             type Transaction = ();
             type Split = Unit;

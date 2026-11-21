@@ -78,10 +78,17 @@ pub async fn load_position_deletes_async(
     access: &FsAccessHandle,
     context: &FileReadContext,
 ) -> Result<RoaringTreemap, String> {
-    load_position_deletes_async_with_metrics(specs, data_file_path, access, context, |_| {})
-        .await
-        .map(|(positions, _)| positions)
-        .map_err(|error| error.to_string())
+    load_position_deletes_async_with_metrics(
+        specs,
+        data_file_path,
+        access,
+        context,
+        crate::file_reader::default_parquet_reader_sizing(),
+        |_| {},
+    )
+    .await
+    .map(|(positions, _)| positions)
+    .map_err(|error| error.to_string())
 }
 
 /// Physical decoded rows, including rows later rejected by the exact path check.
@@ -90,6 +97,7 @@ pub(crate) async fn load_position_deletes_async_with_metrics(
     data_file_path: &str,
     access: &FsAccessHandle,
     context: &FileReadContext,
+    sizing: novarocks_fs::ReaderSizing,
     mut on_decoded: impl FnMut(usize) + Send,
 ) -> Result<(RoaringTreemap, usize), novarocks_spi::connector::ConnectorError> {
     let mut deleted = RoaringTreemap::new();
@@ -135,6 +143,7 @@ pub(crate) async fn load_position_deletes_async_with_metrics(
                     position_delete_projection(),
                     position_delete_predicates(data_file_path),
                     context.clone(),
+                    sizing,
                     |batch| {
                         decoded_rows += batch.batch.num_rows();
                         on_decoded(batch.batch.num_rows());
@@ -349,6 +358,7 @@ pub(crate) async fn load_position_delete_index(
     spec: &IcebergDeleteFileSpec,
     access: &FsAccessHandle,
     context: &FileReadContext,
+    sizing: novarocks_fs::ReaderSizing,
 ) -> Result<PositionDeleteIndex, novarocks_spi::connector::ConnectorError> {
     let mut index = PositionDeleteIndex {
         rows: 0,
@@ -361,6 +371,7 @@ pub(crate) async fn load_position_delete_index(
         position_delete_projection(),
         Vec::new(),
         context.clone(),
+        sizing,
         |batch| {
             visit_position_delete_rows(&spec.path, None, batch, |path, position| {
                 index.rows += 1;
@@ -457,6 +468,7 @@ mod tests {
 
     fn dv_context(runtime: &tokio::runtime::Runtime) -> FileReadContext {
         FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -795,6 +807,7 @@ mod tests {
                 "/data/a.parquet",
                 &access,
                 &context,
+                crate::file_reader::default_parquet_reader_sizing(),
                 |decoded| progress.push(decoded),
             ))
             .unwrap();
@@ -937,6 +950,7 @@ mod tests {
             ))
             .expect("resolve local access");
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(1)),
             runtime: file_runtime,
@@ -967,7 +981,12 @@ mod tests {
         assert_eq!(deleted.iter().collect::<Vec<_>>(), vec![2, 5]);
 
         let whole = runtime
-            .block_on(load_position_delete_index(&spec, &access, &context))
+            .block_on(load_position_delete_index(
+                &spec,
+                &access,
+                &context,
+                crate::file_reader::default_parquet_reader_sizing(),
+            ))
             .expect("read the complete shared delete object");
         assert_eq!(whole.rows, 4);
         assert_eq!(

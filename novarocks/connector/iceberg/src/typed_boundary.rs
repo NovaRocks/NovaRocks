@@ -225,6 +225,29 @@ pub struct IcebergTypedBoundary {
 }
 
 impl IcebergTypedBoundary {
+    fn read_representation(
+        &self,
+        relation: &crate::typed_read::IcebergRuntimeRelation,
+    ) -> (crate::typed_read::runtime::IcebergReadLayout, bool) {
+        #[cfg(novarocks_dev_controls)]
+        if crate::typed_read::runtime::IcebergReadLayout::applies_to(relation)
+            && let Some(context) = self.request_context.as_ref()
+            && let Some(slot) = self
+                .runtime
+                .resources()
+                .planning_binding()
+                .test_observation()
+            && let Some(selection) = slot.read_representation(context)
+        {
+            return selection;
+        }
+        let _ = relation;
+        (
+            crate::typed_read::runtime::IcebergReadLayout::Offsets,
+            false,
+        )
+    }
+
     fn check_request_active(&self) -> Result<(), ConnectorError> {
         if let Some(request) = &self.request_context {
             ConnectorOperationControl::check_active(request)?;
@@ -1343,6 +1366,7 @@ fn iceberg_request_control(
 /// codec, rather than an FE or BE role, that can recover them again.
 impl ProviderReadRuntime for IcebergTypedBoundary {
     type Table = crate::typed_read::IcebergRuntimeRelation;
+    type Execution = crate::typed_read::runtime::IcebergReadExecution;
     type Column = IcebergColumnHandle;
     type Transaction = HiveTransactionHandle;
     type Split = crate::typed_read::IcebergReadSplit;
@@ -1357,6 +1381,20 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
 
     fn transaction(&self) -> Self::Transaction {
         self.transaction
+    }
+
+    fn freeze_read_execution(
+        &self,
+        session: &ConnectorSession,
+        table: &Self::Table,
+    ) -> Result<Option<Self::Execution>, ConnectorError> {
+        self.check_request_active()?;
+        let mut execution =
+            Self::Execution::from_catalog_session(self.runtime.parquet_read_defaults(), session)?;
+        (execution.layout, execution.preserve_top_level_dictionary) =
+            self.read_representation(table);
+        self.check_request_active()?;
+        Ok(Some(execution))
     }
 }
 
@@ -2179,7 +2217,12 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     creation,
                 )
             }
-            relation => public_read_schema(relation, columns, creation),
+            relation => public_read_schema(
+                relation,
+                columns,
+                self.read_representation(relation).0,
+                creation,
+            ),
         }
     }
 
@@ -5013,7 +5056,12 @@ mod public_read_schema_tests {
     > {
         let columns: Vec<_> = columns.iter().collect();
         with_creation(|creation| {
-            crate::typed_read::codec::public_read_schema(relation, &columns, creation)
+            crate::typed_read::codec::public_read_schema(
+                relation,
+                &columns,
+                crate::typed_read::runtime::IcebergReadLayout::Offsets,
+                creation,
+            )
         })
     }
     fn installed_adapter(

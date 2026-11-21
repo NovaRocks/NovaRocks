@@ -525,6 +525,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         None,
         1,
         0,
+        novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
     )
     .map(|(graph, _preparation)| graph)
 }
@@ -547,6 +548,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     ordered: Option<&CompiledOrderedFilterContext>,
     local_exchange_bytes_per_driver: usize,
     local_exchange_max_rows: i64,
+    output_batch_rows: std::num::NonZeroU32,
 ) -> ExecutionResult<(
     PipelineGraph,
     crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation,
@@ -582,6 +584,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
         operator_buffer_chunks: 1,
         local_exchange_buffer_mem_limit_per_driver: local_exchange_bytes_per_driver,
         local_exchange_max_buffered_rows: local_exchange_max_rows,
+        output_batch_rows,
     };
     let mut build = build_node(program, graph.root(), &mut ctx, &error, ordered)?;
     // Statistics owns its specific original bounded materializer. Other root
@@ -717,6 +720,7 @@ fn build_node(
                     Arc::clone(program),
                     id,
                     Arc::clone(error),
+                    ctx.output_batch_rows,
                 )?,
             ));
             Ok(build)
@@ -1311,6 +1315,7 @@ fn build_node(
                 Arc::clone(program),
                 id,
                 Arc::clone(error),
+                ctx.output_batch_rows,
             )?;
             let mut build = build_node(program, *input, ctx, error, ordered)?;
             build.pipeline.factories.push(Box::new(factory));
@@ -1657,7 +1662,6 @@ mod join_pipelines;
 mod set_op_pipelines;
 
 #[cfg(test)]
-#[path = "compiled_tests.rs"]
 mod tests;
 
 #[cfg(test)]
@@ -1719,10 +1723,6 @@ pub(crate) use runtime_filter_tests::ordered_scan_with_numeric_membership_fixtur
 #[cfg(test)]
 #[path = "compiled_runtime_filter_compile_tests.rs"]
 mod runtime_filter_compile_tests;
-
-#[cfg(test)]
-#[path = "compiled_table_function_tests.rs"]
-mod compiled_table_function_tests;
 
 #[cfg(test)]
 #[path = "compiled_window_fixture.rs"]

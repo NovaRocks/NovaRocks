@@ -113,6 +113,7 @@ impl LateProvider {
 }
 impl ProviderReadRuntime for LateProvider {
     type Table = Arc<ActualFrozenTable>;
+    type Execution = ConnectorCatalogSession;
     type Column = LateColumn;
     type Transaction = ();
     type Split = LateSplit;
@@ -123,6 +124,13 @@ impl ProviderReadRuntime for LateProvider {
         &self.catalog
     }
     fn transaction(&self) -> Self::Transaction {}
+    fn freeze_read_execution(
+        &self,
+        session: &ConnectorSession,
+        _: &Self::Table,
+    ) -> Result<Option<Self::Execution>, ConnectorError> {
+        Ok((!session.properties().is_empty()).then(|| session.properties().clone()))
+    }
 }
 impl ProviderReadMetadata for LateProvider {
     type PreparedSourceRead = (ConnectorReadSourceSelection, ConnectorTableObjectId);
@@ -813,6 +821,7 @@ fn original_provider_completion_fixture(
             bindings.clone(),
             ConnectorSession::try_new("actual-port", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
                 .unwrap(),
+            Arc::default(),
             context,
             blocking.clone(),
             capacity.clone(),
@@ -1802,4 +1811,40 @@ fn original_prepared_source_routing_uses_to_and_refuses_missing_or_foreign_facts
         "ordinary explicit Delta stopped using its original typed author"
     );
     assert_eq!(provider.source_prepares.load(Ordering::Acquire), 1);
+
+    let properties = ConnectorCatalogSession::from([
+        (
+            Arc::from("parquet_max_read_block_row_count"),
+            SessionPropertyValue::Integer(256),
+        ),
+        (
+            Arc::from("parquet_max_read_block_size"),
+            SessionPropertyValue::Varchar(Arc::from("0B")),
+        ),
+    ]);
+    let read_session = session
+        .clone()
+        .try_with_properties(properties.clone())
+        .unwrap();
+    *provider.table.lock().unwrap() = Some(table);
+    let ordinary_handle = ConnectorReadMetadata::get_table_handle(
+        adapter.as_ref(),
+        &read_session,
+        &SchemaTableName::try_new("db", "orders").unwrap(),
+        ConnectorReadRelationVersion::Current,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    for (kind, handle) in [
+        (ConnectorReadRelationKind::Table, ordinary_handle),
+        (ConnectorReadRelationKind::Table, handle),
+        (ConnectorReadRelationKind::ChangeWindow, delta_handle),
+    ] {
+        let relation = adapter.relation(&read_session, kind, handle).unwrap();
+        assert_eq!(
+            adapter.read_execution(&relation).unwrap(),
+            Some(&properties)
+        );
+    }
 }

@@ -131,7 +131,7 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
     use novarocks_local_program::KernelAbiVersion;
     use novarocks_physical_plan::{
         FragmentPackageAdmission, NodeKind, PipelineDopDomain, PlanLimits, PlanVersionId,
-        PropertyProofProjectionLimits, ScanReadBudget, extract_fragment_packages,
+        PropertyProofProjectionLimits, extract_fragment_packages,
     };
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
@@ -172,10 +172,6 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
             min: 1,
             max: 1,
             requires_power_of_two: false,
-        },
-        ScanReadBudget {
-            max_batch_rows: 4096,
-            max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
     )

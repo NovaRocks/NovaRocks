@@ -23,7 +23,6 @@ use super::super::instance;
 #[test]
 fn query_options_encoder_maps_every_query_wide_option() {
     let query_options = novarocks_execution::runtime::query_options::QueryOptions {
-        batch_size: Some(4096),
         query_timeout: Some(60),
         query_delivery_timeout: Some(30),
         enable_profile: true,
@@ -50,7 +49,6 @@ fn query_options_encoder_maps_every_query_wide_option() {
         ..Default::default()
     };
     let opts = instance::encode_query_options(&query_options);
-    assert_eq!(opts.batch_size, 4096);
     assert_eq!(opts.query_timeout, 60);
     assert_eq!(opts.query_delivery_timeout, 30);
     assert_eq!(opts.runtime_profile_report_interval, 7);

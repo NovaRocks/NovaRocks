@@ -85,6 +85,7 @@ where
     C: ColumnHandle,
 {
     type Table = T;
+    type Execution = ();
     type Column = C;
     type Transaction = ();
     type Split = FakeSplit;

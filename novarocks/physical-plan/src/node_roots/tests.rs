@@ -664,10 +664,6 @@ fn scan(origin: Option<ValueOrigin>) -> Fragment {
         NodeKind::Scan {
             occurrence: ProviderReadOccurrenceId::new(1),
             relation: Box::new(relation),
-            read_budget: ScanReadBudget {
-                max_batch_rows: 4096,
-                max_batch_bytes: 8388608,
-            },
             provider_outputs: Box::new([(column, v(0))]),
             residuals: Box::new([r(9)]),
             derived_values: Box::new([v(5)]),

@@ -206,6 +206,19 @@ cluster-harness 继续拥有 FE/BE 的应用生命周期、原生 1FE+NBE 拓扑
 
 容器运行状态根及正式证据根需 bind-mount 支持的本地文件系统；overlay 不作锁语义 fallback。详细 API、保留/释放责任、macOS 排查与 native Linux x86_64 尚未补齐的验证见 [test-support README](../test-support/README.md)。规范 Rust 的 nextest 与正式原始结果接口见 [CI README](../../tools/ci/README.md)；这些机械验证不替代本 suite 的真实 fixture 和 native 1FE+3BE 验收。
 
+### Iceberg 扫描载体观察
+
+SQL 步骤可独立使用 `-- @iceberg_scan_layout=offsets` 或 `view`，以及
+`-- @iceberg_dictionary_output=true` 或 `false`。默认是 offsets，顶层字典保持默认关闭。
+runner 为该步骤的每个计划提交 token 请求原生 FE 语句授权。选择从原语句冻结到同一份
+Iceberg 执行声明与载荷，作用于普通数据和 change-window 扫描。
+
+`-- @be_log_contains=NOVAROCKS_CONNECTOR_PARQUET_FIRST_BATCH` 可断言
+`max_read_rows`、`max_read_bytes`、`reader_batch_rows`、`decoded_rows`。
+`NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK` 统计首个实际发布 Chunk 的顶层 UTF8
+offsets、view 与字典列，以及 BINARY offsets 与 view 列。观察沿准确的语句、角色和
+split 绑定，适用于开发构建的 cross-process 1FE+3BE。
+
 ## SSB/TPC 数据正确性
 
 `ssb`、`tpc-h`、`tpc-ds` 与其他 suite 共用正常 case discovery、suite init/cleanup、结果比对和 server cleanup；分别消费 scale `1`、`1`、`1GB` 的共享 READY 数据。仅以完整 suite manifest 的 `prepared_dataset` 绑定输入，不读取旧测量 scenario/window 定义。

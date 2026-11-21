@@ -30,7 +30,7 @@
 //! that membership to the scan's subscription.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -197,10 +197,6 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
                     predicate_guarantees: Box::default(),
                     provided_properties: singleton(),
                 })),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 100,
-                    max_batch_bytes: 4096,
-                },
                 provider_outputs: columns.iter().cloned().zip(scan).collect(),
                 residuals: Box::default(),
                 derived_values: Box::default(),
@@ -420,8 +416,6 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         TupleDomain::all(),
         None,
         vec![StaticScanDynamicFilter::new(FILTER.get(), Arc::from("v0"))],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

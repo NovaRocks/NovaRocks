@@ -458,6 +458,7 @@ pub(crate) async fn prepare_original_cohort_in(
         completion,
         scope,
         crate::query_execution::compiler::typed_connector_session()?,
+        Arc::clone(engine.execution.session_property_inputs()),
     )?;
     custody.sink = Some(ReadAccessSink::new());
     let mut facts = provider

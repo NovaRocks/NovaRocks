@@ -134,7 +134,11 @@ pub fn normalize_data_size_property(
         DdlPropertyValue::Varchar(text) => text,
         _ => return Err(invalid(property, DataSizeFailureReason::ExpectedVarchar)),
     };
-    let bytes = parse(property, text, control)?;
+    let bytes = parse_airlift_data_size(
+        text,
+        || control.check_active(),
+        |reason, _| invalid(property, DataSizeFailureReason::Parse(reason)),
+    )?;
     if let Some(reason) = data_size_range_failure(property, bytes) {
         return Err(invalid(property, DataSizeFailureReason::Range(reason)));
     }
@@ -158,19 +162,18 @@ fn data_size_range_failure(property: DataSizeProperty, bytes: i64) -> Option<Dat
     }
 }
 
-fn parse(
-    property: DataSizeProperty,
+pub(crate) fn parse_airlift_data_size<E>(
     text: &str,
-    control: &dyn ConnectorOperationControl,
-) -> Result<i64, ConnectorError> {
-    use DataSizeFailureReason::Parse;
+    mut check_active: impl FnMut() -> Result<(), E>,
+    invalid: impl Fn(DataSizeParseFailure, &str) -> E,
+) -> Result<i64, E> {
     use DataSizeParseFailure as P;
     // The 1.13 fast path is selected by Java UTF-16 length and a final B.
     // Its Long.parseLong(char) behavior includes BMP decimal digits and -0.
     // Counting only through 21 decides this original fast-path condition.
     let mut units = 0;
     for ch in text.chars() {
-        control.check_active()?;
+        check_active()?;
         units += ch.len_utf16();
         if units > 20 {
             break;
@@ -179,7 +182,7 @@ fn parse(
     if (2..=20).contains(&units)
         && !text.starts_with('+')
         && let Some(number) = text.strip_suffix('B')
-        && let Some(bytes) = java_byte_integer(number, control)?
+        && let Some(bytes) = java_byte_integer(number, &mut check_active)?
     {
         return Ok(bytes);
     }
@@ -188,49 +191,50 @@ fn parse(
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() && regex_space(bytes[i]) {
-        control.check_active()?;
+        check_active()?;
         i += 1;
     }
     let start = i;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        control.check_active()?;
+        check_active()?;
         i += 1;
     }
     if start == i {
-        return Err(invalid(property, Parse(P::Syntax)));
+        return Err(invalid(P::Syntax, text));
     }
     let decimal = i < bytes.len() && bytes[i] == b'.';
     if decimal {
-        control.check_active()?;
+        check_active()?;
         i += 1;
         let fraction_start = i;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
-            control.check_active()?;
+            check_active()?;
             i += 1;
         }
         if i == fraction_start {
-            return Err(invalid(property, Parse(P::Syntax)));
+            return Err(invalid(P::Syntax, text));
         }
     }
     let number = &text[start..i];
     while i < bytes.len() && regex_space(bytes[i]) {
-        control.check_active()?;
+        check_active()?;
         i += 1;
     }
     let unit_start = i;
     while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-        control.check_active()?;
+        check_active()?;
         i += 1;
     }
     let unit_end = i;
     while i < bytes.len() && regex_space(bytes[i]) {
-        control.check_active()?;
+        check_active()?;
         i += 1;
     }
     if unit_start == unit_end || i != bytes.len() {
-        return Err(invalid(property, Parse(P::Syntax)));
+        return Err(invalid(P::Syntax, text));
     }
-    let factor: i64 = match &text[unit_start..unit_end] {
+    let unit = &text[unit_start..unit_end];
+    let factor: i64 = match unit {
         "B" => 1,
         "kB" => 1 << 10,
         "MB" => 1 << 20,
@@ -238,30 +242,30 @@ fn parse(
         "TB" => 1 << 40,
         "PB" => 1 << 50,
         "EB" => 1 << 60,
-        _ => return Err(invalid(property, Parse(P::Unit))),
+        _ => return Err(invalid(P::Unit, unit)),
     };
-    control.check_active()?;
+    check_active()?;
     if !decimal {
-        let number: i64 = number
+        let magnitude: i64 = number
             .parse()
-            .map_err(|_| invalid(property, Parse(P::IntegerOverflow)))?;
-        return number
+            .map_err(|_| invalid(P::IntegerOverflow, number))?;
+        return magnitude
             .checked_mul(factor)
-            .ok_or_else(|| invalid(property, Parse(P::IntegerOverflow)));
+            .ok_or_else(|| invalid(P::IntegerOverflow, number));
     }
     // Keep the actual 1.13 IEEE operation sequence. Long.MAX_VALUE compares as
     // 2^63 in this double comparison; Java's narrowing conversion saturates.
     // Rust's saturating float-to-integer conversion has that same boundary.
     let size: f64 = number
         .parse()
-        .map_err(|_| invalid(property, Parse(P::DecimalOverflow)))?;
-    control.check_active()?;
+        .map_err(|_| invalid(P::DecimalOverflow, text))?;
+    check_active()?;
     if !size.is_finite() {
-        return Err(invalid(property, Parse(P::DecimalOverflow)));
+        return Err(invalid(P::DecimalOverflow, text));
     }
     let rounded = (size / (1.0 / factor as f64) + 0.5).floor();
     if rounded > i64::MAX as f64 {
-        return Err(invalid(property, Parse(P::DecimalOverflow)));
+        return Err(invalid(P::DecimalOverflow, text));
     }
     Ok(rounded as i64)
 }
@@ -270,10 +274,10 @@ fn regex_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | b'\x0c' | b'\r')
 }
 
-fn java_byte_integer(
+fn java_byte_integer<E>(
     number: &str,
-    control: &dyn ConnectorOperationControl,
-) -> Result<Option<i64>, ConnectorError> {
+    check_active: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Option<i64>, E> {
     let (negative, digits) = match number.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, number),
@@ -283,7 +287,7 @@ fn java_byte_integer(
     }
     let mut result = 0_i64;
     for ch in digits.chars() {
-        control.check_active()?;
+        check_active()?;
         let Some(digit) = bmp_decimal_digit(ch) else {
             return Ok(None);
         };

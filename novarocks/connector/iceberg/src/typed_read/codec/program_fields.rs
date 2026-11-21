@@ -56,6 +56,7 @@ pub(super) fn validate_program_columns(
     relation: &IcebergRuntimeRelation,
     columns: &[IcebergColumnHandle],
     public: &ConnectorReadPublicFacts,
+    read_layout: crate::typed_read::runtime::IcebergReadLayout,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
     work.flush()?;
@@ -145,6 +146,7 @@ pub(super) fn validate_program_columns(
                         public,
                         declaration,
                         input_work,
+                        read_layout,
                         work,
                     )
                 },
@@ -173,9 +175,10 @@ pub(super) fn validate_program_columns(
 pub(crate) fn public_read_schema(
     relation: &IcebergRuntimeRelation,
     columns: &[&IcebergColumnHandle],
+    layout: crate::typed_read::runtime::IcebergReadLayout,
     creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadPublicSchema, PureProviderCompileError<ConnectorError>> {
-    typed_source::publish(relation, columns, creation)
+    typed_source::publish(relation, columns, layout, creation)
 }
 
 /// The public schema of a frozen read of `columns` from a metadata relation.
@@ -602,6 +605,7 @@ fn compare_public(
     public: &ConnectorReadPublicFacts,
     declaration: Option<&NestedField>,
     input_work: usize,
+    read_layout: crate::typed_read::runtime::IcebergReadLayout,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
     let execution = public
@@ -648,6 +652,7 @@ fn compare_public(
         nominals.get(&value_id).map(|domain| domain.logical_type()),
         column.scalar_integer_domain(),
         nominals,
+        read_layout,
         work,
     )?;
     if let Some(declaration) = declaration {
@@ -894,7 +899,13 @@ mod tests {
         control: &Control,
     ) -> Result<(), Failure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
-        validate_program_columns(relation, columns, public, &mut work)
+        validate_program_columns(
+            relation,
+            columns,
+            public,
+            crate::typed_read::runtime::IcebergReadLayout::Offsets,
+            &mut work,
+        )
     }
     fn rejected(
         relation: &IcebergRuntimeRelation,

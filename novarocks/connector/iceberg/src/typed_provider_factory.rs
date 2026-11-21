@@ -81,6 +81,7 @@ impl IcebergTypedProviderFactory {
     where
         P: ProviderReadRuntime<
                 Table = IcebergRuntimeRelation,
+                Execution = crate::typed_read::runtime::IcebergReadExecution,
                 Column = IcebergColumnHandle,
                 Transaction = HiveTransactionHandle,
                 Split = IcebergReadSplit,
@@ -140,6 +141,7 @@ impl IcebergTypedProviderFactory {
     where
         P: ProviderReadRuntime<
                 Table = IcebergRuntimeRelation,
+                Execution = crate::typed_read::runtime::IcebergReadExecution,
                 Column = IcebergColumnHandle,
                 Transaction = HiveTransactionHandle,
                 Split = IcebergReadSplit,
@@ -161,6 +163,7 @@ impl<P> ProviderAdmittedReadFactory<P> for IcebergTypedProviderFactory
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
+            Execution = crate::typed_read::runtime::IcebergReadExecution,
             Column = IcebergColumnHandle,
             Transaction = HiveTransactionHandle,
             Split = IcebergReadSplit,
@@ -337,7 +340,7 @@ mod tests {
                 &properties,
             )
             .expect("vended binding"),
-            IcebergPageSourceProviderOptions::with_default_budget(),
+            IcebergPageSourceProviderOptions::default(),
         )
     }
 
@@ -368,7 +371,7 @@ mod tests {
     #[test]
     fn query_reader_policy_overrides_the_generation_default() {
         let options = apply_reader_policy(
-            IcebergPageSourceProviderOptions::with_default_budget(),
+            IcebergPageSourceProviderOptions::default(),
             ConnectorPageSourceProviderOptions {
                 enable_parquet_reader_page_index: true,
                 data_cache: ConnectorDataCacheOptions {

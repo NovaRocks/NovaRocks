@@ -105,7 +105,7 @@ impl RecipeCompiler for IcebergReadRecipeCompiler {
             .expect("Iceberg read codec revision is non-zero");
         let codecs = IcebergReadTypes::wire_codecs();
         let relation = draft.relation();
-        let table = decode(
+        let (table, execution) = decode(
             draft,
             relation.table(),
             ConnectorCodecCategory::ReadTable,
@@ -127,7 +127,7 @@ impl RecipeCompiler for IcebergReadRecipeCompiler {
         }
         let relation = ConnectorReadRelationPayload::new(
             relation.kind(),
-            with_bytes(relation.table(), codecs.encode_table(&table)?),
+            with_bytes(relation.table(), codecs.encode_table(&table, execution)?),
             with_bytes(relation.view(), codecs.encode_read_view(&view)?),
         );
         let mut columns = Vec::with_capacity(draft.columns().len());
@@ -387,7 +387,7 @@ mod tests {
                 ConnectorReadRelationKind::SystemTable,
                 envelope(
                     ConnectorCodecCategory::ReadTable,
-                    codecs.encode_table(&table).unwrap(),
+                    codecs.encode_table(&table, Default::default()).unwrap(),
                 ),
                 envelope(
                     ConnectorCodecCategory::ReadView,

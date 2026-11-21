@@ -56,6 +56,7 @@ use crate::typed_read::{
 };
 
 use super::dto;
+use crate::typed_read::runtime::{IcebergReadExecution, IcebergReadLayout};
 use crate::typed_read::split::{decode_read_domain, encode_read_domain};
 
 const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
@@ -64,18 +65,31 @@ const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergReadWireCodec;
 
-impl ConnectorPrivateEncoder<IcebergRuntimeRelation> for IcebergReadWireCodec {
-    fn encode_private(&self, value: &IcebergRuntimeRelation) -> Result<Bytes, ConnectorCodecError> {
-        Ok(Bytes::from(encode_relation(value).encode_to_vec()))
+impl IcebergReadWireCodec {
+    pub(crate) fn encode_read_table(
+        &self,
+        value: &IcebergRuntimeRelation,
+        execution: IcebergReadExecution,
+    ) -> Result<Bytes, ConnectorCodecError> {
+        let mut raw = encode_relation(value);
+        raw.execution = Some(dto::IcebergReadExecution {
+            max_read_rows: Some(execution.sizing.max_read_rows),
+            max_read_bytes: Some(execution.sizing.max_read_bytes),
+            layout: Some(match execution.layout {
+                IcebergReadLayout::Offsets => dto::IcebergReadLayout::Offsets as i32,
+                IcebergReadLayout::View => dto::IcebergReadLayout::View as i32,
+            }),
+            preserve_top_level_dictionary: Some(execution.preserve_top_level_dictionary),
+        });
+        decode_execution(&raw)?;
+        Ok(Bytes::from(raw.encode_to_vec()))
     }
-}
 
-impl ConnectorPrivateDecoder<IcebergRuntimeRelation> for IcebergReadWireCodec {
-    fn decode_private(
+    pub(crate) fn decode_read_table(
         &self,
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
-    ) -> Result<IcebergRuntimeRelation, ConnectorCodecError> {
+    ) -> Result<(IcebergRuntimeRelation, IcebergReadExecution), ConnectorCodecError> {
         let result = (|| {
             let raw = decode_root::<dto::IcebergReadTablePayload>(
                 payload,
@@ -83,12 +97,36 @@ impl ConnectorPrivateDecoder<IcebergRuntimeRelation> for IcebergReadWireCodec {
                 ConnectorFieldPath::root("iceberg_read_table"),
                 Schema::ReadTable,
             )?;
-            let value = decode_relation(&raw, context)?;
-            charge_retained(context, payload.len(), size_of::<IcebergRuntimeRelation>())?;
-            Ok(value)
+            let execution = decode_execution(&raw)?;
+            let relation = decode_relation(&raw, context)?;
+            charge_retained(
+                context,
+                payload.len(),
+                size_of::<(IcebergRuntimeRelation, IcebergReadExecution)>(),
+            )?;
+            Ok((relation, execution))
         })();
         context.observe_compile_step()?;
         finish_decode(result, context)
+    }
+}
+
+#[cfg(test)]
+impl ConnectorPrivateEncoder<IcebergRuntimeRelation> for IcebergReadWireCodec {
+    fn encode_private(&self, value: &IcebergRuntimeRelation) -> Result<Bytes, ConnectorCodecError> {
+        self.encode_read_table(value, IcebergReadExecution::default())
+    }
+}
+
+#[cfg(test)]
+impl ConnectorPrivateDecoder<IcebergRuntimeRelation> for IcebergReadWireCodec {
+    fn decode_private(
+        &self,
+        payload: &[u8],
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergRuntimeRelation, ConnectorCodecError> {
+        self.decode_read_table(payload, context)
+            .map(|(relation, _)| relation)
     }
 }
 
@@ -274,6 +312,7 @@ enum Schema {
     Insert,
     Merge,
     ReadTable,
+    ReadExecution,
     Decryption,
     Delete,
     DataSplit,
@@ -487,12 +526,17 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         ReadTable => match field {
+            1 => singular(Message(ReadExecution)),
             10 => oneof(Message(Table)),
             11 => oneof(Message(TableFunction)),
             12 => oneof(Message(ChangeWindowHandle)),
             13 => oneof(Message(SystemTable)),
             14 => oneof(Message(TableExecute)),
             15 => oneof(Message(Merge)),
+            _ => return None,
+        },
+        ReadExecution => match field {
+            1..=4 => singular(Varint),
             _ => return None,
         },
         Decryption => match field {
@@ -2252,7 +2296,68 @@ fn encode_relation(value: &IcebergRuntimeRelation) -> dto::IcebergReadTablePaylo
     };
     dto::IcebergReadTablePayload {
         relation: Some(relation),
+        execution: None,
     }
+}
+
+fn decode_execution(
+    raw: &dto::IcebergReadTablePayload,
+) -> Result<IcebergReadExecution, ConnectorCodecError> {
+    let missing = |field| {
+        codec_error(
+            field,
+            ConnectorCodecErrorKind::MissingField,
+            "required Iceberg reader execution field is absent",
+        )
+    };
+    let invalid =
+        |field, message| codec_error(field, ConnectorCodecErrorKind::InvalidValue, message);
+    let execution = raw
+        .execution
+        .as_ref()
+        .ok_or_else(|| missing("iceberg_read_table.execution"))?;
+    let max_read_rows = execution
+        .max_read_rows
+        .ok_or_else(|| missing("iceberg_read_table.execution.max_read_rows"))?;
+    if !(128..=65536).contains(&max_read_rows) {
+        return Err(invalid(
+            "iceberg_read_table.execution.max_read_rows",
+            "Iceberg reader row limit must be between 128 and 65536",
+        ));
+    }
+    let max_read_bytes = execution
+        .max_read_bytes
+        .ok_or_else(|| missing("iceberg_read_table.execution.max_read_bytes"))?;
+    if max_read_bytes < 0 {
+        return Err(invalid(
+            "iceberg_read_table.execution.max_read_bytes",
+            "Iceberg reader size must be nonnegative",
+        ));
+    }
+    let layout = execution
+        .layout
+        .ok_or_else(|| missing("iceberg_read_table.execution.layout"))?;
+    let layout = match dto::IcebergReadLayout::try_from(layout) {
+        Ok(dto::IcebergReadLayout::Offsets) => IcebergReadLayout::Offsets,
+        Ok(dto::IcebergReadLayout::View) => IcebergReadLayout::View,
+        _ => {
+            return Err(invalid(
+                "iceberg_read_table.execution.layout",
+                "Iceberg reader layout is unknown",
+            ));
+        }
+    };
+    let preserve_top_level_dictionary = execution
+        .preserve_top_level_dictionary
+        .ok_or_else(|| missing("iceberg_read_table.execution.preserve_top_level_dictionary"))?;
+    Ok(IcebergReadExecution {
+        sizing: crate::catalog_config::IcebergCatalogReadConfig {
+            max_read_rows,
+            max_read_bytes,
+        },
+        layout,
+        preserve_top_level_dictionary,
+    })
 }
 
 fn decode_relation(

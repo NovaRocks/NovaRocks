@@ -1193,6 +1193,7 @@ mod tests {
             tokio::runtime::Handle::current(),
         );
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current()))
@@ -1399,6 +1400,7 @@ mod tests {
             spawned: AtomicUsize::new(0),
         });
         let mut context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current())),
@@ -1792,6 +1794,7 @@ mod tests {
                 spawned: AtomicUsize::new(0),
             });
             let mut context = FileReadContext {
+                turn: None,
                 cancellation: FileCancellation::new(),
                 deadline: Some(Instant::now() + Duration::from_secs(10)),
                 runtime: Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current())),

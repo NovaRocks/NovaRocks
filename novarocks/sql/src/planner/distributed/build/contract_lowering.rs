@@ -3128,11 +3128,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     node: "Scan",
                     fact: "provider read occurrence",
                 })?;
-        let FinalizedProviderRead {
-            binding,
-            contract,
-            read_budget,
-        } = self
+        let FinalizedProviderRead { binding, contract } = self
             .provider_reads
             .as_mut()
             .ok_or(ContractLoweringError::MissingPlannerFact {
@@ -3184,6 +3180,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         let mut provider_outputs = Vec::with_capacity(contract.schema.len());
         let mut relation_schema = Vec::with_capacity(contract.schema.len());
         let mut provider_values_by_request_ordinal = BTreeMap::new();
+        let mut output_projections = BTreeMap::new();
         for (ordinal, (column, field)) in provider_columns
             .iter()
             .copied()
@@ -3219,8 +3216,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             let provider_column = field.column().clone();
+            let execution_type = full_source_type(field.execution_type());
             let value = self.fragment_mut().add_value(
-                engine_type.clone(),
+                execution_type.clone(),
                 ValueOrigin::ProviderField {
                     scan_node: node,
                     field: provider_column.clone(),
@@ -3239,9 +3237,12 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             insert_output_column("Scan", ordinal, column, value, &mut columns)?;
             provider_outputs.push((provider_column.clone(), value));
+            if execution_type != engine_type {
+                output_projections.insert(value, engine_type);
+            }
             relation_schema.push(RelationField {
                 column: provider_column,
-                ty: engine_type,
+                ty: execution_type,
             });
         }
 
@@ -3445,13 +3446,24 @@ impl<'a> ContractLoweringVisitor<'a> {
             NodeKind::Scan {
                 occurrence: scan_occurrence,
                 relation: Box::new(relation),
-                read_budget,
                 provider_outputs: provider_outputs.into_boxed_slice(),
                 residuals: residuals.into_boxed_slice(),
                 derived_values: derived_values.into_boxed_slice(),
             },
             output.clone().into_boxed_slice(),
         )?;
+        let (node, properties) = if output_projections.is_empty() {
+            (node, properties)
+        } else {
+            let projection =
+                self.project_scan_byte_views(node, &mut output, &mut columns, &output_projections)?;
+            let properties = self
+                .fragment_mut()
+                .node_output_properties(projection)
+                .expect("the scan projection was just inserted")
+                .clone();
+            (projection, properties)
+        };
         // A scan's columns are called what the statement calls them. Where
         // the statement gave the relation a name, that name is part of it: a
         // self-join reads as `a.k = b.k` only because each side says which one
@@ -3473,6 +3485,65 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         })
+    }
+
+    fn project_scan_byte_views(
+        &mut self,
+        scan: NodeId,
+        output: &mut [ValueId],
+        columns: &mut BTreeMap<ColumnId, ValueId>,
+        projections: &BTreeMap<ValueId, ValueType>,
+    ) -> Result<NodeId, ContractLoweringError> {
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut expressions = Vec::with_capacity(output.len());
+        let mut replacements = BTreeMap::new();
+        for value in output.iter_mut() {
+            self.work.step()?;
+            let input = *value;
+            let ty = self.value_declared_type(input)?;
+            let mut expression =
+                self.add_unscoped_expression(node, ty, ContractExprKind::Value(input))?;
+            if let Some(target) = projections.get(&input) {
+                let allow_throw_exception = self.root_allow_throw_reference();
+                expression = self.add_unscoped_expression(
+                    node,
+                    target.clone(),
+                    ContractExprKind::Cast {
+                        expr: expression,
+                        target: target.data_type().clone(),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        allow_throw_exception,
+                        array_failure_mode: None,
+                    },
+                )?;
+            }
+            let root = self.root_definition(
+                node,
+                expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
+            )?;
+            if let Some(target) = projections.get(&input) {
+                *value = self
+                    .fragment_mut()
+                    .add_value(target.clone(), ValueOrigin::Expr { node, root })?;
+                replacements.insert(input, *value);
+            }
+            expressions.push((root, *value));
+        }
+        for column in columns.values_mut() {
+            if let Some(value) = replacements.get(column) {
+                *column = *value;
+            }
+        }
+        self.fragment_mut().add_project(
+            node,
+            scan,
+            expressions.into_boxed_slice(),
+            output.to_vec().into_boxed_slice(),
+        )?;
+        Ok(node)
     }
 
     fn allocate_aggregate_sequence(
@@ -16713,10 +16784,6 @@ mod tests {
                     bucket_contract.clone()
                 } else {
                     contract.clone()
-                },
-                novarocks_physical_plan::ScanReadBudget {
-                    max_batch_rows: 1024,
-                    max_batch_bytes: 1 << 20,
                 },
             );
             let result = lower_read_with_original_emission_observer(

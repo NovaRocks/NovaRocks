@@ -101,13 +101,6 @@ fn hash_scheme(seed: u8) -> HashPartitionScheme {
     }
 }
 
-fn scan_budget() -> ScanReadBudget {
-    ScanReadBudget {
-        max_batch_rows: 4096,
-        max_batch_bytes: 8 * 1024 * 1024,
-    }
-}
-
 fn dop() -> PipelineDopDomain {
     PipelineDopDomain {
         min: 1,
@@ -300,7 +293,6 @@ fn finish_scan_relation_at(
             kind: NodeKind::Scan {
                 occurrence,
                 relation: Box::new(relation),
-                read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, value)]),
                 residuals: Box::default(),
                 derived_values: Box::default(),
@@ -428,7 +420,6 @@ fn finish_scan_predicate_contract(
             kind: NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, value)]),
                 residuals: std::iter::repeat_n(predicate, residual_count)
                     .collect::<Vec<_>>()
@@ -1114,7 +1105,6 @@ fn metadata_relation_retains_its_closed_source_contract() {
                 kind: NodeKind::Scan {
                     occurrence: ProviderReadOccurrenceId::new(0),
                     relation: Box::new(relation),
-                    read_budget: scan_budget(),
                     provider_outputs: Box::from([(column.clone(), value)]),
                     residuals: Box::default(),
                     derived_values: Box::default(),

@@ -30,6 +30,7 @@ use std::{alloc::Layout, cell::RefCell, sync::Arc};
 pub(super) enum Body {
     ArrowScalar,
     Structure,
+    ByteViewProjection,
 }
 
 fn bytes(ty: &DataType) -> bool {
@@ -133,6 +134,10 @@ pub(super) fn prepare(
     result: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<Body>, CastPrepareError> {
+    if novarocks_type_contract::byte_view_to_offsets_projection(source, result) {
+        work.step()?;
+        return Ok(Some(Body::ByteViewProjection));
+    }
     if source.logical_type() != ValueLogicalType::Physical
         || result.logical_type() != ValueLogicalType::Physical
     {
@@ -309,7 +314,7 @@ pub(super) fn evaluate<'a>(
                 "selected CAST source has a foreign concrete carrier",
             ));
         }
-        if body == Body::Structure {
+        if matches!(body, Body::Structure | Body::ByteViewProjection) {
             let mut indices = reserve::<Option<u64>>(selection.len(), &work)?;
             let mut journal = inherited.iter().peekable();
             for (ordinal, logical_row) in selection.iter().enumerate() {
@@ -354,7 +359,10 @@ pub(super) fn evaluate<'a>(
                         .into_kernel()
                 })?;
             work.borrow_mut().flush()?;
-            let out = retag(&compact, recipe.result.data_type(), &work)?;
+            let out = match body {
+                Body::ByteViewProjection => project_byte_views(&compact, &recipe.result, &work)?,
+                _ => retag(&compact, recipe.result.data_type(), &work)?,
+            };
             let mut errors = reserve::<RowDataError>(inherited.len(), &work)?;
             for error in inherited {
                 work.borrow_mut().flush()?;
@@ -494,6 +502,52 @@ pub(super) fn evaluate<'a>(
     })();
     work.into_inner().finish_result(outcome)
 }
+fn project_byte_views(
+    array: &ArrayRef,
+    target: &FunctionValueType,
+    work: &RefCell<EvaluationCheckpoints<'_>>,
+) -> Result<ArrayRef, KernelFailure> {
+    use novarocks_value_arrays::{
+        ValueFailure,
+        decode::ValueConversionContext,
+        hydrate::{HydrateOptions, HydratePlan, HydrateProjection},
+    };
+
+    let failure = |error| match error {
+        ValueFailure::Value(error) => KernelFailure::from_domain(error),
+        ValueFailure::Caller(error) => error,
+    };
+    let mut conversions = ValueConversionContext::default();
+    let mut growth = |_| work.borrow_mut().flush();
+    let mut step = |units| {
+        for _ in 0..units {
+            work.borrow_mut().step()?;
+        }
+        Ok(())
+    };
+    let options = HydrateOptions {
+        projection: HydrateProjection::ExactByteLayouts,
+        ..HydrateOptions::default()
+    };
+    let plan = HydratePlan::plan_with_options_observed(
+        array,
+        target.typed_binding(),
+        options,
+        &mut conversions,
+        &mut |_, _| false,
+        &mut growth,
+        &mut step,
+        &mut |_| work.borrow_mut().flush(),
+    )
+    .map_err(failure)?;
+    plan.require_complete()
+        .map_err(KernelFailure::from_domain)?;
+    plan.execute_observed(&mut conversions, &mut growth, &mut step, &mut |_| {
+        work.borrow_mut().flush()
+    })
+    .map_err(failure)
+}
+
 fn concrete_source(array: &dyn Array) -> bool {
     macro_rules! is {
         ($ty:ty) => {
@@ -515,8 +569,10 @@ fn concrete_source(array: &dyn Array) -> bool {
         DataType::Decimal128(..) => is!(Decimal128Array),
         DataType::Decimal256(..) => is!(Decimal256Array),
         DataType::Utf8 => is!(StringArray),
+        DataType::Utf8View => is!(arrow_array::StringViewArray),
         DataType::LargeUtf8 => is!(arrow_array::LargeStringArray),
         DataType::Binary => is!(BinaryArray),
+        DataType::BinaryView => is!(arrow_array::BinaryViewArray),
         DataType::LargeBinary => is!(arrow_array::LargeBinaryArray),
         DataType::FixedSizeBinary(_) => is!(FixedSizeBinaryArray),
         DataType::Date32 => is!(Date32Array),
@@ -531,6 +587,7 @@ fn concrete_source(array: &dyn Array) -> bool {
         DataType::Struct(_) => is!(StructArray),
         DataType::List(_) => is!(ListArray),
         DataType::LargeList(_) => is!(LargeListArray),
+        DataType::Map(..) => is!(arrow_array::MapArray),
         _ => false,
     }
 }

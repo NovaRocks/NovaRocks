@@ -34,6 +34,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::provider_types::{IcebergReadTypes, IcebergReadView};
+use crate::typed_read::runtime::IcebergReadExecution;
 
 use super::{HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, IcebergRuntimeRelation};
 
@@ -54,6 +55,7 @@ pub struct IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
+            Execution = IcebergReadExecution,
             Column = IcebergColumnHandle,
             Transaction = HiveTransactionHandle,
             Split = IcebergReadSplit,
@@ -67,6 +69,7 @@ impl<P> IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
+            Execution = IcebergReadExecution,
             Column = IcebergColumnHandle,
             Transaction = HiveTransactionHandle,
             Split = IcebergReadSplit,
@@ -163,6 +166,7 @@ impl<P> ConnectorReadWireDecoder for IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
+            Execution = IcebergReadExecution,
             Column = IcebergColumnHandle,
             Transaction = HiveTransactionHandle,
             Split = IcebergReadSplit,
@@ -181,7 +185,7 @@ where
             ConnectorCodecCategory::ReadView,
             |payload, context| IcebergReadTypes::wire_codecs().decode_read_view(payload, context),
         )?;
-        let table = self.decode_private(
+        let (table, execution) = self.decode_private(
             relation.table(),
             ConnectorCodecCategory::ReadTable,
             |payload, context| IcebergReadTypes::wire_codecs().decode_table(payload, context),
@@ -193,11 +197,19 @@ where
                 "public relation category does not match the Iceberg private table payload",
             ));
         }
-        Ok(ConnectorReadRelation::new(
+        let decoded = ConnectorReadRelation::new(
             public_kind,
             self.adapter.wrap_table(table),
             self.adapter.wrap_transaction(*view.transaction()),
-        ))
+        );
+        self.adapter
+            .bind_read_execution(decoded, execution)
+            .map_err(|error| {
+                self.invalid(
+                    ConnectorFieldPath::root("relation").field("execution"),
+                    error.to_string(),
+                )
+            })
     }
 
     fn decode_column_payload(
@@ -250,6 +262,7 @@ impl<P> ConnectorReadWireEncoder for IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
+            Execution = IcebergReadExecution,
             Column = IcebergColumnHandle,
             Transaction = HiveTransactionHandle,
             Split = IcebergReadSplit,
@@ -285,8 +298,14 @@ where
             ));
         }
 
+        let execution_path = ConnectorFieldPath::root("relation").field("execution");
+        let execution = self
+            .adapter
+            .read_execution(relation)
+            .map_err(|error| self.invalid(execution_path.clone(), error.to_string()))?
+            .ok_or_else(|| self.invalid(execution_path, "Iceberg read execution was not frozen"))?;
         let table_bytes = IcebergReadTypes::wire_codecs()
-            .encode_table(table)
+            .encode_table(table, *execution)
             .map_err(|error| self.private_rejection(error))?;
         let table_payload = self.envelope(ConnectorCodecCategory::ReadTable, table_bytes);
         let view_bytes = IcebergReadTypes::wire_codecs()

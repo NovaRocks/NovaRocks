@@ -934,6 +934,4 @@ fn validate_addresses_core<A>(
 #[cfg(test)]
 mod kernel_tests;
 #[cfg(test)]
-mod read_tests;
-#[cfg(test)]
 mod tests;

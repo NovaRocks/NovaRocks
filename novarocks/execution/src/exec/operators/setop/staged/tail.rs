@@ -261,7 +261,11 @@ impl TailSource {
             .as_ref()
             .expect("original set operation tail obligation");
         let data = range.artifact();
-        let allowance = ctx.work().remaining() as usize;
+        let allowance = ctx.work().remaining().min(
+            novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+                .max_rows
+                .get(),
+        ) as usize;
         if allowance == 0 {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }

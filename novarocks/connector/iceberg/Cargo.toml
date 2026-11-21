@@ -28,7 +28,7 @@ workspace = true
 doctest = false
 
 [features]
-# Test fixture observation only; excluded from ordinary/release acceptance.
+reader-test-fixture = []
 
 [dependencies]
 novarocks-failpoint = { workspace = true, features = ["typed"] }

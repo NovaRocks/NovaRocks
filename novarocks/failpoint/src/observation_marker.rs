@@ -106,6 +106,8 @@ marker_registry! {
     CATALOG_RUNTIME_MATERIALIZED => ("NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED", Catalog, Observation(CatalogMaterialization), ["catalog"]),
     CONNECTOR_PAGE_SOURCE_CLOSE => ("NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE", Reader, Observation(ReaderMarker), ["plan_node", "sequence"]),
     CONNECTOR_PAGE_SOURCE_OPEN => ("NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN", Reader, Observation(ReaderMarker), ["plan_node", "sequence"]),
+    CONNECTOR_PARQUET_FIRST_BATCH => ("NOVAROCKS_CONNECTOR_PARQUET_FIRST_BATCH", Reader, Observation(ReaderMarker), ["provider", "plan_node", "scheduled_split_sequence_id", "max_read_rows", "max_read_bytes", "reader_batch_rows", "decoded_rows"]),
+    CONNECTOR_SCAN_FIRST_CHUNK => ("NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK", Reader, Observation(ReaderMarker), ["provider", "plan_node", "scheduled_split_sequence_id", "rows", "utf8_offsets", "utf8_view", "utf8_dictionary", "binary_offsets", "binary_view"]),
     CONNECTOR_UNIT_READER_CLOSE => ("NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE", Reader, Observation(ReaderMarker), ["batches_delivered", "catalog_version", "instance", "provider", "rows_decoded", "scheduled_split_sequence_id"]),
     CONNECTOR_UNIT_READER_OPEN => ("NOVAROCKS_CONNECTOR_UNIT_READER_OPEN", Reader, Observation(ReaderMarker), ["catalog_version", "instance", "provider", "scheduled_split_sequence_id"]),
     CONNECTOR_WRITER_OPENED => ("NOVAROCKS_CONNECTOR_WRITER_OPENED", Writer, Observation(WriterMarker), ["driver_id", "execution_id", "plan_node", "role", "task_key", "write_target", "writer_ordinal"]),

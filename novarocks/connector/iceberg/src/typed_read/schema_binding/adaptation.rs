@@ -87,6 +87,44 @@ struct StructMember {
     adaptation: FieldAdaptation,
 }
 
+#[derive(Clone, Copy)]
+enum BindingLayout {
+    Canonical,
+    ScanRoot,
+    ScanChild,
+}
+
+impl BindingLayout {
+    fn child(self) -> Self {
+        match self {
+            Self::Canonical => Self::Canonical,
+            Self::ScanRoot | Self::ScanChild => Self::ScanChild,
+        }
+    }
+
+    fn retain_leaf(self, source: &Field, target: &Field) -> bool {
+        if matches!(self, Self::Canonical)
+            || target
+                .metadata()
+                .get(NR_LOGICAL_TYPE_KEY)
+                .and_then(|value| ValueLogicalType::from_metadata_value(value).ok())
+                == Some(ValueLogicalType::Variant)
+        {
+            return false;
+        }
+        match (source.data_type(), target.data_type()) {
+            (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
+            | (DataType::BinaryView, DataType::Binary | DataType::LargeBinary) => true,
+            (DataType::Dictionary(keys, values), DataType::Utf8 | DataType::LargeUtf8) => {
+                matches!(self, Self::ScanRoot)
+                    && **keys == DataType::Int32
+                    && matches!(values.as_ref(), DataType::Utf8 | DataType::Utf8View)
+            }
+            _ => false,
+        }
+    }
+}
+
 fn visit_field_leaf_ids(field: &Field, visit: &mut impl FnMut(i32)) -> Result<(), ConnectorError> {
     match field.data_type() {
         DataType::Struct(children) => {
@@ -109,6 +147,32 @@ fn visit_field_leaf_ids(field: &Field, visit: &mut impl FnMut(i32)) -> Result<()
 
 impl FieldAdaptation {
     pub(super) fn bind(source: Option<&Field>, target: &FieldRef) -> Result<Self, AdaptationError> {
+        Self::bind_with_layout(source, target, BindingLayout::Canonical)
+    }
+
+    pub(super) fn bind_for_scan(
+        source: Option<&Field>,
+        target: &FieldRef,
+    ) -> Result<Self, AdaptationError> {
+        Self::bind_with_layout(source, target, BindingLayout::ScanRoot)
+    }
+
+    fn bind_with_layout(
+        source: Option<&Field>,
+        target: &FieldRef,
+        layout: BindingLayout,
+    ) -> Result<Self, AdaptationError> {
+        // Resolve the physical field by ID before choosing its byte layout.
+        // This preserves decoder storage even when struct members were reordered.
+        let target = match source {
+            Some(source) if layout.retain_leaf(source, target) => Arc::new(
+                target
+                    .as_ref()
+                    .clone()
+                    .with_data_type(source.data_type().clone()),
+            ),
+            _ => Arc::clone(target),
+        };
         let kind = match source {
             None if target
                 .metadata()
@@ -118,7 +182,7 @@ impl FieldAdaptation {
             }
             None if target.is_nullable() => Adaptation::TypedNull,
             None => Adaptation::RequiredMissing,
-            Some(source) => Self::bind_present(source, target)?,
+            Some(source) => Self::bind_present(source, &target, layout.child())?,
         };
         let has_required_missing = match &kind {
             Adaptation::Struct(children) => children
@@ -129,13 +193,17 @@ impl FieldAdaptation {
             _ => false,
         };
         Ok(Self {
-            target: Arc::clone(target),
+            target,
             kind,
             has_required_missing,
         })
     }
 
-    fn bind_present(source: &Field, target: &Field) -> Result<Adaptation, AdaptationError> {
+    fn bind_present(
+        source: &Field,
+        target: &Field,
+        child_layout: BindingLayout,
+    ) -> Result<Adaptation, AdaptationError> {
         let physical = source.data_type();
         let desired = target.data_type();
         if physical == desired {
@@ -143,18 +211,30 @@ impl FieldAdaptation {
         }
         Ok(match (physical, desired) {
             (DataType::Struct(source), DataType::Struct(target)) => {
-                Adaptation::Struct(bind_struct_members(source, target)?)
+                Adaptation::Struct(bind_struct_members(source, target, child_layout)?)
             }
             (DataType::List(source), DataType::List(target))
             | (DataType::LargeList(source), DataType::LargeList(target)) => {
-                Adaptation::List(Box::new(Self::bind(same_id(source, target)?, target)?))
+                Adaptation::List(Box::new(Self::bind_with_layout(
+                    same_id(source, target)?,
+                    target,
+                    child_layout,
+                )?))
             }
             (DataType::FixedSizeList(source, n), DataType::FixedSizeList(target, m)) if n == m => {
-                Adaptation::List(Box::new(Self::bind(same_id(source, target)?, target)?))
+                Adaptation::List(Box::new(Self::bind_with_layout(
+                    same_id(source, target)?,
+                    target,
+                    child_layout,
+                )?))
             }
             (DataType::Map(source, s), DataType::Map(target, t)) if s == t => {
                 // Entries carry two Iceberg fields, the key and the value.
-                Adaptation::Map(Box::new(Self::bind(Some(source), target)?))
+                Adaptation::Map(Box::new(Self::bind_with_layout(
+                    Some(source),
+                    target,
+                    child_layout,
+                )?))
             }
             _ => {
                 let logical_variant = target
@@ -425,6 +505,7 @@ impl FieldAdaptation {
 fn bind_struct_members(
     source: &Fields,
     target: &Fields,
+    child_layout: BindingLayout,
 ) -> Result<Vec<StructMember>, AdaptationError> {
     let mut slots = HashMap::with_capacity(source.len());
     for (slot, field) in source.iter().enumerate() {
@@ -439,8 +520,11 @@ fn bind_struct_members(
         .map(|field| {
             let id = target_id(field)?;
             let source_slot = slots.get(&id).copied();
-            let adaptation =
-                FieldAdaptation::bind(source_slot.map(|slot| source[slot].as_ref()), field)?;
+            let adaptation = FieldAdaptation::bind_with_layout(
+                source_slot.map(|slot| source[slot].as_ref()),
+                field,
+                child_layout,
+            )?;
             Ok(StructMember {
                 source_slot,
                 adaptation,

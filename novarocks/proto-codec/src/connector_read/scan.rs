@@ -237,19 +237,6 @@ impl ConnectorTableScanSource {
             dynamic_filters.push(binding);
         }
 
-        if raw.max_batch_rows == 0 {
-            return Err(out_of_range(
-                path.clone().field("max_batch_rows"),
-                "reader batch row budget must be nonzero",
-            ));
-        }
-        if raw.max_batch_bytes == 0 {
-            return Err(out_of_range(
-                path.clone().field("max_batch_bytes"),
-                "reader batch byte budget must be nonzero",
-            ));
-        }
-
         Ok(Self {
             raw,
             table,
@@ -283,14 +270,6 @@ impl ConnectorTableScanSource {
 
     pub fn dynamic_filters(&self) -> &[DynamicFilterBinding] {
         &self.dynamic_filters
-    }
-
-    pub const fn max_batch_rows(&self) -> u64 {
-        self.raw.max_batch_rows
-    }
-
-    pub const fn max_batch_bytes(&self) -> u64 {
-        self.raw.max_batch_bytes
     }
 
     pub const fn as_proto(&self) -> &dto::ConnectorTableScanSource {

@@ -649,9 +649,7 @@ fn compiler_progress_error(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks_physical_plan::{
-        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-    };
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, ExplainLevel, SessionOptimizerSettings, SqlCompileControl,
         SqlCompileIntent, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
@@ -796,10 +794,6 @@ mod tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         )

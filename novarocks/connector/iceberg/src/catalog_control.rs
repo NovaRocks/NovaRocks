@@ -227,6 +227,7 @@ mod tests {
             object_store_config: None,
             warehouse_path: PathBuf::from("/tmp/warehouse"),
             write: Default::default(),
+            read: Default::default(),
             add_files_enabled: false,
             maintenance: Default::default(),
         });
@@ -253,6 +254,7 @@ mod tests {
                 object_store_config: None,
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
                 write: Default::default(),
+                read: Default::default(),
                 add_files_enabled: false,
                 maintenance: Default::default(),
             })

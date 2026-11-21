@@ -45,6 +45,7 @@ pub(crate) use partitioning::parse_optional_partitioning_element;
 pub use partitioning::{parse_table_partitioning_element, parse_table_partitioning_property};
 
 mod data_size;
+pub(crate) use data_size::parse_airlift_data_size;
 pub use data_size::{
     DataSizeFailureReason, DataSizeParseFailure, DataSizeProperty, DataSizePropertyFailure,
     DataSizeRangeFailure, NormalizedDataSize, normalize_data_size_property,

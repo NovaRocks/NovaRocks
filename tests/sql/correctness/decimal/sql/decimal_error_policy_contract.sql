@@ -133,7 +133,8 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_I
 WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS rounded;
 
 -- query 23
-SELECT 1 AS branch,CAST(NULL AS DECIMAL(38,0)) AS v UNION ALL SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 2 AS branch,CAST(1 AS DECIMAL(38,0))+1 AS v ORDER BY branch;
+-- The admitted query's policy applies to both UNION operands (ADR-0241).
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1 AS branch,CAST(NULL AS DECIMAL(38,0)) AS v UNION ALL SELECT 2 AS branch,CAST(1 AS DECIMAL(38,0))+1 AS v ORDER BY branch;
 
 -- query 24
 -- @skip_result_check=true
@@ -141,7 +142,7 @@ SELECT 1 AS branch,CAST(NULL AS DECIMAL(38,0)) AS v UNION ALL SELECT /*+ SET_VAR
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-SELECT CAST(1 AS DECIMAL(38,0))+1 AS v UNION ALL SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(1 AS DECIMAL(38,0))+1 AS v UNION ALL SELECT a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
 
 -- query 25
 -- @skip_result_check=true

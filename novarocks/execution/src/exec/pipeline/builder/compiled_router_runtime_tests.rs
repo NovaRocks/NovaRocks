@@ -720,6 +720,7 @@ mod router_runtime_tests {
             task_key(SOURCE),
             None,
             4,
+            novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
             Arc::clone(&state),
             Arc::new(NoopTaskEventSink),
             None,

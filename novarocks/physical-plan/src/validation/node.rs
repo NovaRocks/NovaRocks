@@ -811,23 +811,12 @@ pub(crate) fn validate_node_semantics(
     match &node.kind {
         NodeKind::Scan {
             relation,
-            read_budget,
             provider_outputs,
             residuals,
             derived_values,
             ..
         } => {
             validate_relation(fragment, node, relation, path, errors);
-            if read_budget.max_batch_rows == 0
-                || read_budget.max_batch_rows > MAX_SCAN_BATCH_ROWS
-                || read_budget.max_batch_bytes == 0
-                || read_budget.max_batch_bytes > MAX_SCAN_BATCH_BYTES
-            {
-                errors.push(ValidationError::new(
-                    path,
-                    "scan read budget must be non-zero and within the supported bounds",
-                ));
-            }
             if provider_outputs.len() != relation.schema().len() {
                 errors.push(ValidationError::new(
                     path,

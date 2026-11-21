@@ -364,8 +364,8 @@ message ConnectorTableScanSource {
   TupleDomain unenforced_predicate = 4;
   optional ConnectorExpression remaining_expression = 5;
   repeated DynamicFilterBinding dynamic_filters = 6;
-  uint64 max_batch_rows = 7;                    // required nonzero.
-  uint64 max_batch_bytes = 8;                   // required nonzero.
+  reserved 7, 8;
+  reserved "max_batch_rows", "max_batch_bytes";
   reserved 9;
   reserved "work_source";
 }

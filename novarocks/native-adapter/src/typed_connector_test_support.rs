@@ -131,6 +131,7 @@ pub mod test_support {
 
     impl novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime for FixtureRuntime {
         type Table = FixtureTable;
+        type Execution = ();
         type Column = FixtureColumn;
         type Transaction = ();
         type Split = FixtureSplit;
@@ -228,15 +229,13 @@ pub mod test_support {
             novarocks_spi::connector::ConnectorCodecError,
         > {
             let table = self.adapter.wrap_table(FixtureTable);
-            self.adapter
-                .relation(relation.kind(), table)
-                .map_err(|error| {
-                    novarocks_spi::connector::ConnectorCodecError::new(
-                        novarocks_spi::connector::ConnectorFieldPath::root("table"),
-                        novarocks_spi::connector::ConnectorCodecErrorKind::InvalidValue,
-                        error.to_string(),
-                    )
-                })
+            Ok(
+                novarocks_spi::connector::read_stack::ConnectorReadRelation::new(
+                    relation.kind(),
+                    table,
+                    self.adapter.wrap_transaction(()),
+                ),
+            )
         }
         fn decode_column_payload(
             &self,
@@ -273,7 +272,7 @@ pub mod test_support {
         fn create_page_stream(
             &self,
             _: &novarocks_spi::connector::read_stack::ConnectorSession,
-            _: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
             _: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
             _: u64,
             _: &[novarocks_spi::connector::read_stack::Assignment<
@@ -372,7 +371,7 @@ pub mod test_support {
         fn create_page_stream(
             &self,
             _: &novarocks_spi::connector::read_stack::ConnectorSession,
-            _: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
             _: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
             _: u64,
             _: &[novarocks_spi::connector::read_stack::Assignment<
@@ -517,8 +516,6 @@ pub mod test_support {
             unenforced_predicate: Some(unconstrained()),
             remaining_expression: None,
             dynamic_filters: Vec::new(),
-            max_batch_rows: 1024,
-            max_batch_bytes: 1 << 20,
         }
     }
 
@@ -781,7 +778,7 @@ mod tests {
         fn create_page_stream(
             &self,
             _session: &ConnectorSession,
-            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
             _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
             scheduled_split_sequence_id: u64,
             _columns: &[novarocks_spi::connector::read_stack::Assignment<
@@ -797,7 +794,7 @@ mod tests {
         fn prepare_page_source(
             &self,
             _session: &ConnectorSession,
-            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
             _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
             scheduled_split_sequence_id: u64,
             _columns: &[novarocks_spi::connector::read_stack::Assignment<
@@ -837,7 +834,7 @@ mod tests {
         let wire_scan = scan_source();
         let decoded_scan = test_support::decoded_scan();
         TypedConnectorReadDescriptor::new(
-            decoded_scan.relation().table().clone(),
+            decoded_scan.relation().clone(),
             decoded_scan.assignments().to_vec(),
             crate::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
                 &wire_scan,
@@ -1029,7 +1026,7 @@ mod tests {
         fn create_page_stream(
             &self,
             _session: &ConnectorSession,
-            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
             _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
             _scheduled_split_sequence_id: u64,
             _columns: &[novarocks_spi::connector::read_stack::Assignment<

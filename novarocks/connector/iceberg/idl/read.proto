@@ -293,6 +293,7 @@ message IcebergMergeTableHandle {
 }
 
 message IcebergReadTablePayload {
+  IcebergReadExecution execution = 1;
   oneof relation {
     IcebergTableHandle table = 10;
     TableChangesFunctionHandle table_function = 11;
@@ -301,6 +302,19 @@ message IcebergReadTablePayload {
     IcebergTableExecuteHandle table_execute = 14;
     IcebergMergeTableHandle merge_table = 15;
   }
+}
+
+message IcebergReadExecution {
+  optional uint32 max_read_rows = 1;
+  optional int64 max_read_bytes = 2;
+  optional IcebergReadLayout layout = 3;
+  optional bool preserve_top_level_dictionary = 4;
+}
+
+enum IcebergReadLayout {
+  ICEBERG_READ_LAYOUT_UNSPECIFIED = 0;
+  ICEBERG_READ_LAYOUT_OFFSETS = 1;
+  ICEBERG_READ_LAYOUT_VIEW = 2;
 }
 
 enum IcebergFileFormat {

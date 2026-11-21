@@ -35,10 +35,6 @@ impl std::fmt::Debug for IcebergObservationSlot {
             .finish_non_exhaustive()
     }
 }
-#[expect(
-    clippy::enum_variant_names,
-    reason = "Marker suffixes are part of the finite observation action names consumed by test controls"
-)]
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 enum Parameters {
@@ -53,6 +49,11 @@ enum Parameters {
         #[serde(default)]
         node_id: Option<i32>,
         max_markers: usize,
+    },
+    ReadRepresentation {
+        statement_run_token: String,
+        scan_layout: crate::typed_read::runtime::IcebergReadLayout,
+        dictionary_output: bool,
     },
     WriterMarker {
         write_session_id: uuid::Uuid,
@@ -70,8 +71,23 @@ impl Parameters {
             | Self::ReaderStatementMarker { max_markers, .. }
             | Self::WriterMarker { max_markers, .. }
             | Self::WriterStatementMarker { max_markers, .. } => *max_markers,
+            Self::ReadRepresentation { .. } => 1,
         }
     }
+    fn statement_input_token(&self) -> Option<&str> {
+        match self {
+            Self::WriterStatementMarker {
+                statement_run_token,
+                ..
+            }
+            | Self::ReadRepresentation {
+                statement_run_token,
+                ..
+            } => Some(statement_run_token),
+            _ => None,
+        }
+    }
+
     fn reader(&self) -> bool {
         matches!(
             self,
@@ -177,6 +193,10 @@ impl IcebergObservationSlot {
                 Parameters::WriterStatementMarker {
                     statement_run_token,
                     ..
+                }
+                | Parameters::ReadRepresentation {
+                    statement_run_token,
+                    ..
                 } => {
                     if !valid_token(statement_run_token) {
                         return Err("Iceberg writer statement target is invalid");
@@ -222,6 +242,18 @@ impl IcebergObservationSlot {
                             ..
                         },
                     ) => a == b,
+                    (
+                        Parameters::ReadRepresentation {
+                            statement_run_token: a,
+                            ..
+                        },
+                        Parameters::ReadRepresentation {
+                            statement_run_token: b,
+                            ..
+                        },
+                    ) => a == b,
+                    (Parameters::ReadRepresentation { .. }, _)
+                    | (_, Parameters::ReadRepresentation { .. }) => false,
                     (a, b) => {
                         a.reader() == b.reader()
                             && std::mem::discriminant(a) != std::mem::discriminant(b)
@@ -274,11 +306,8 @@ impl IcebergObservationSlot {
             return Ok(());
         };
         let matches = |observation: &Observation| {
-            matches!(
-                &observation.parameters,
-                Parameters::WriterStatementMarker { statement_run_token, .. }
-                    if *statement_run_token == input.statement_run_token
-            )
+            observation.parameters.statement_input_token()
+                == Some(input.statement_run_token.as_str())
         };
         // Validate every matching slot before making any first-input mutation.
         for observation in observations.iter().filter(|o| matches(o)) {
@@ -316,11 +345,8 @@ impl IcebergObservationSlot {
             return Ok(());
         };
         let matches = |observation: &Observation| {
-            matches!(
-                &observation.parameters,
-                Parameters::WriterStatementMarker { statement_run_token, .. }
-                    if *statement_run_token == input.statement_run_token
-            )
+            observation.parameters.statement_input_token()
+                == Some(input.statement_run_token.as_str())
         };
         for observation in observations.iter().filter(|o| matches(o)) {
             Self::validate_writer_input_scope(observation, input)?;
@@ -345,6 +371,42 @@ impl IcebergObservationSlot {
         }
         Ok(())
     }
+    pub(crate) fn read_representation(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Option<(crate::typed_read::runtime::IcebergReadLayout, bool)> {
+        let mut state = self.0.lock().ok()?;
+        for observation in state.as_mut()? {
+            let Parameters::ReadRepresentation {
+                scan_layout,
+                dictionary_output,
+                ..
+            } = observation.parameters
+            else {
+                continue;
+            };
+            let cancellation = observation.grant.cancellation();
+            let Some(nominated) = observation.writer_nomination.as_ref() else {
+                continue;
+            };
+            if !cancellation.is_active() {
+                continue;
+            }
+            let actual =
+                context.request_scope_extension_or_insert_with(StatementWorkNomination::default);
+            if !same_nomination(nominated, &actual) {
+                continue;
+            }
+            if observation.claim.is_none() {
+                let mut claim = observation.grant.claim_once(cancellation.process()).ok()?;
+                claim.record_hit().ok()?;
+                observation.claim = Some(claim);
+            }
+            return Some((scan_layout, dictionary_output));
+        }
+        None
+    }
+
     pub fn close(&self) {
         if let Ok(mut state) = self.0.lock() {
             *state = Some(Vec::new());

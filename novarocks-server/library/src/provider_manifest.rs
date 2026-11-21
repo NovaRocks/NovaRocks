@@ -474,7 +474,7 @@ fn iceberg_execution_reader_options(
     config: &NovaRocksConfig,
 ) -> novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions
 {
-    let mut options = novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget();
+    let mut options = novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::default();
     options.reader_options.coalesce_reads = config.runtime.io_coalesce_read_enable;
     options.reader_options.coalesce_max_bytes = config.runtime.io_coalesce_read_max_buffer_size;
     options.reader_options.coalesce_max_gap = config.runtime.io_coalesce_read_max_distance_size;
@@ -1040,8 +1040,12 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
     > {
         use novarocks_connector_iceberg::catalog_config::{
             EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY, IcebergCatalogMaintenanceConfig,
-            IcebergCatalogWriteConfig, MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
-            REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
+            IcebergCatalogReadConfig, IcebergCatalogWriteConfig,
+            MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+            PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+            PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY,
+            REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY, parse_parquet_read_block_size,
+            validate_parquet_read_block_rows,
         };
         use novarocks_query_application::sql::session::registry::{
             PropertyDeclaration, SessionPropertyError, SessionPropertyType, SessionPropertyValue,
@@ -1074,18 +1078,51 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
                 },
             )
         };
+        let (read_rows, read_size) = IcebergCatalogReadConfig::session_defaults(configuration)
+            .map_err(|_| SessionPropertyError::InvalidDeclaration {
+                detail: "Admitted Iceberg catalog has invalid Parquet read sizing",
+            })?;
+        let write_partitions = PropertyDeclaration::catalog(
+            MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+            SessionPropertyType::Integer,
+            Some(SessionPropertyValue::Integer(limit)),
+            "Maximum open Iceberg partition writers per driver",
+            false,
+            move |value| match value {
+                SessionPropertyValue::Integer(value) if (1..=limit).contains(value) => Ok(()),
+                _ => Err(format!("Value must be between 1 and {limit}")),
+            },
+        )?;
+        let parquet_rows = PropertyDeclaration::catalog(
+            PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+            SessionPropertyType::Integer,
+            Some(SessionPropertyValue::Integer(read_rows)),
+            "Parquet: Maximum number of rows read in a batch",
+            false,
+            |value| match value {
+                SessionPropertyValue::Integer(rows) => {
+                    validate_parquet_read_block_rows(*rows).map(|_| ())
+                }
+                _ => Err("Expected INTEGER".to_owned()),
+            },
+        )?;
+        let parquet_bytes = PropertyDeclaration::catalog(
+            PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY,
+            SessionPropertyType::Varchar,
+            Some(SessionPropertyValue::Varchar(read_size)),
+            "Parquet: Maximum size of a block to read",
+            false,
+            |value| match value {
+                SessionPropertyValue::Varchar(size) => {
+                    parse_parquet_read_block_size(size).map(|_| ())
+                }
+                _ => Err("Expected VARCHAR".to_owned()),
+            },
+        )?;
         Ok(vec![
-            PropertyDeclaration::catalog(
-                MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
-                SessionPropertyType::Integer,
-                Some(SessionPropertyValue::Integer(limit)),
-                "Maximum open Iceberg partition writers per driver",
-                false,
-                move |value| match value {
-                    SessionPropertyValue::Integer(value) if (1..=limit).contains(value) => Ok(()),
-                    _ => Err(format!("Value must be between 1 and {limit}")),
-                },
-            )?,
+            write_partitions,
+            parquet_rows,
+            parquet_bytes,
             duration_property(
                 EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,
                 maintenance.expire_snapshots_min_retention,
@@ -1138,6 +1175,8 @@ mod iceberg_session_properties_tests {
                         "iceberg.expire-snapshots.min-retention".into(),
                         "168h".into(),
                     ),
+                    ("parquet.max-read-block-row-count".into(), "512".into()),
+                    ("parquet.max-read-block-size".into(), "0B".into()),
                 ],
             )
             .unwrap();
@@ -1173,5 +1212,17 @@ mod iceberg_session_properties_tests {
             &SessionPropertyValue::Varchar("0s".into()),
         );
         assert!(metadata.prepare_header("lake", expire, "-7d").is_err());
+        let rows = "parquet_max_read_block_row_count";
+        let bytes = "parquet_max_read_block_size";
+        assert_eq!(
+            metadata.lookup(rows).unwrap().default_value(),
+            Some(&SessionPropertyValue::Integer(512)),
+        );
+        assert_eq!(
+            metadata.lookup(bytes).unwrap().default_value(),
+            Some(&SessionPropertyValue::Varchar("0B".into())),
+        );
+        assert!(metadata.prepare_header("lake", rows, "127").is_err());
+        assert!(metadata.prepare_header("lake", bytes, "16MB").is_ok());
     }
 }

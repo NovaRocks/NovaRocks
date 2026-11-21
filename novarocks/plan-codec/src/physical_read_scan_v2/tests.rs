@@ -302,8 +302,6 @@ fn read(count: usize, metadata: bool, residual: bool) -> c::FrozenConnectorRead 
             c::StaticScanDynamicFilter::new(0, Arc::from("v0")),
             c::StaticScanDynamicFilter::new(u32::MAX, Arc::from("v0")),
         ],
-        NonZeroU64::new(123).unwrap(),
-        NonZeroU64::new(4097).unwrap(),
     )
     .unwrap();
     let properties = c::ConnectorReadProperties::try_new(
@@ -637,7 +635,6 @@ fn complete_data_and_metadata_scans_have_independent_sparse_wire_oracles() {
                 .collect::<Vec<_>>(),
             ["v0", "v1"]
         );
-        assert_eq!((f.max_batch_rows, f.max_batch_bytes), (123, 4097));
         assert_eq!(f.remaining_connector_expression_id, Some(u32::MAX));
         assert_eq!(
             f.dynamic_filters
@@ -794,8 +791,6 @@ fn residual_field_variable_value_and_typed_null_use_the_original_algebra() {
         c::TupleDomain::all(),
         Some(expression.clone()),
         vec![],
-        NonZeroU64::new(1).unwrap(),
-        NonZeroU64::new(2).unwrap(),
     )
     .unwrap();
     let schema = Schema::new(vec![Field::new(
@@ -919,7 +914,9 @@ fn mandatory_presence_order_and_original_constructor_laws_fail_closed() {
     x.scans[0].facts.as_mut().unwrap().assignments[0].value_type = None;
     cases.push(x);
     let mut x = raw.clone();
-    x.scans[0].facts.as_mut().unwrap().max_batch_rows = 0;
+    x.scans[0].facts.as_mut().unwrap().assignments[0]
+        .variable
+        .clear();
     cases.push(x);
     let mut x = raw.clone();
     x.scans[0]
@@ -1101,7 +1098,9 @@ fn all_actual_success_and_ordinary_callbacks_keep_the_first_typed_cause() {
     let raw = raw(&r);
     prefixes(|stop| decode_run(&raw, limits(), stop), true);
     let mut wrong = raw;
-    wrong.scans[0].facts.as_mut().unwrap().max_batch_rows = 0;
+    wrong.scans[0].facts.as_mut().unwrap().assignments[0]
+        .variable
+        .clear();
     prefixes(|stop| decode_run(&wrong, limits(), stop), false);
 }
 #[test]

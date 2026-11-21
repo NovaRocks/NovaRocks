@@ -27,10 +27,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use novarocks_physical_plan::{
-    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
-    ProviderReadOccurrenceId, ScanReadBudget,
-};
+use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ProviderReadOccurrenceId};
 use novarocks_spi::connector::StatisticsMetric;
 
 use super::completion::{
@@ -72,7 +69,6 @@ pub struct SqlFinalPlanCompileRequest {
     constant_policy: novarocks_functions::ConstantPolicy,
     control: SqlCompileControl,
     dop_domain: PipelineDopDomain,
-    scan_read_budget: ScanReadBudget,
     limits: CompletionLimits,
     catalog_qualifications: super::CatalogQualifications,
 }
@@ -87,7 +83,6 @@ impl fmt::Debug for SqlFinalPlanCompileRequest {
             .field("session", &self.session)
             .field("environment", &self.environment)
             .field("dop_domain", &self.dop_domain)
-            .field("scan_read_budget", &self.scan_read_budget)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
@@ -109,7 +104,6 @@ impl SqlFinalPlanCompileRequest {
         constant_policy: novarocks_functions::ConstantPolicy,
         control: SqlCompileControl,
         dop_domain: PipelineDopDomain,
-        scan_read_budget: ScanReadBudget,
         limits: CompletionLimits,
     ) -> Self {
         Self {
@@ -124,7 +118,6 @@ impl SqlFinalPlanCompileRequest {
             constant_policy,
             control,
             dop_domain,
-            scan_read_budget,
             limits,
             catalog_qualifications: super::CatalogQualifications::default(),
         }
@@ -167,14 +160,12 @@ impl SqlFinalPlanCompileRequest {
             constant_policy,
             control,
             dop_domain,
-            scan_read_budget,
             limits,
             catalog_qualifications,
         } = self;
         control.check()?;
         validate_final_intent(&intent)?;
         validate_dop_domain(dop_domain)?;
-        validate_scan_read_budget(scan_read_budget)?;
         let display_intent = display_intent(&intent);
         let root_session_admitted = statement.root_session_admitted();
         let query = super::parse_query(&statement)?;
@@ -209,7 +200,6 @@ impl SqlFinalPlanCompileRequest {
             sealed_functions,
             constant_policy,
             dop_domain,
-            scan_read_budget,
             display_intent,
             materialized_source,
             root_session_admitted,
@@ -290,21 +280,6 @@ fn validate_dop_domain(domain: PipelineDopDomain) -> Result<(), SqlCompileError>
     Ok(())
 }
 
-fn validate_scan_read_budget(budget: ScanReadBudget) -> Result<(), SqlCompileError> {
-    if budget.max_batch_rows == 0 || budget.max_batch_bytes == 0 {
-        return Err(SqlCompileError::InvalidRequest(
-            "final physical-plan scan read budget must be non-zero".to_string(),
-        ));
-    }
-    if budget.max_batch_rows > MAX_SCAN_BATCH_ROWS || budget.max_batch_bytes > MAX_SCAN_BATCH_BYTES
-    {
-        return Err(SqlCompileError::InvalidRequest(
-            "final physical-plan scan read budget exceeds the contract limit".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn display_intent(intent: &SqlCompileIntent) -> SqlDisplayIntent {
     match intent {
         SqlCompileIntent::Explain { level, analyze } => SqlDisplayIntent::Explain {
@@ -325,7 +300,6 @@ struct FinalPlanCommon {
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     dop_domain: PipelineDopDomain,
-    scan_read_budget: ScanReadBudget,
     display_intent: SqlDisplayIntent,
     // Both variants hold Arc-backed constant collections. Cloning this source
     // for analysis preserves original pool/ordinal facts, not AST pointers.
@@ -387,16 +361,14 @@ pub(crate) struct FinalizedProviderReadSet {
 pub(crate) struct FinalizedProviderRead {
     pub(crate) binding: SqlTableBindingId,
     pub(crate) contract: ProviderReadStaticContract,
-    pub(crate) read_budget: ScanReadBudget,
 }
 
 impl FinalizedProviderReadSet {
     pub(crate) fn try_from_facts(
-        facts: impl IntoIterator<Item = (ProviderReadFact, ScanReadBudget)>,
+        facts: impl IntoIterator<Item = ProviderReadFact>,
     ) -> Result<Self, SqlCompileError> {
         let mut entries = BTreeMap::new();
-        for (fact, read_budget) in facts {
-            validate_scan_read_budget(read_budget)?;
+        for fact in facts {
             let occurrence = fact.occurrence();
             let binding = fact.binding();
             if entries
@@ -405,7 +377,6 @@ impl FinalizedProviderReadSet {
                     FinalizedProviderRead {
                         binding,
                         contract: fact.into_contract(),
-                        read_budget,
                     },
                 )
                 .is_some()
@@ -443,17 +414,9 @@ impl FinalizedProviderReadSet {
         binding: SqlTableBindingId,
         occurrence: ProviderReadOccurrenceId,
         contract: ProviderReadStaticContract,
-        read_budget: ScanReadBudget,
     ) -> Self {
         Self {
-            entries: BTreeMap::from([(
-                occurrence,
-                FinalizedProviderRead {
-                    binding,
-                    contract,
-                    read_budget,
-                },
-            )]),
+            entries: BTreeMap::from([(occurrence, FinalizedProviderRead { binding, contract })]),
         }
     }
 
@@ -1387,12 +1350,7 @@ pub(super) fn resume_provider_read(
             )));
         }
     }
-    let reads = FinalizedProviderReadSet::try_from_facts(
-        facts
-            .into_vec()
-            .into_iter()
-            .map(|fact| (fact, state.common.scan_read_budget)),
-    )?;
+    let reads = FinalizedProviderReadSet::try_from_facts(facts.into_vec())?;
     let mut draft =
         crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
             &state.physical,
@@ -1490,10 +1448,6 @@ mod tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         )
@@ -3097,15 +3051,11 @@ mod tests {
             ProviderReadFact::negotiated(&original, provider_contract(&original)).unwrap();
         let conflicting_fact =
             ProviderReadFact::negotiated(&conflicting, provider_contract(&conflicting)).unwrap();
-        let budget = ScanReadBudget {
-            max_batch_rows: MAX_SCAN_BATCH_ROWS,
-            max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-        };
 
         assert!(matches!(
             FinalizedProviderReadSet::try_from_facts([
-                (original_fact, budget),
-                (conflicting_fact, budget),
+                original_fact,
+                conflicting_fact,
             ]),
             Err(SqlCompileError::Compilation(message))
                 if message.contains("repeat scan occurrence")

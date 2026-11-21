@@ -80,8 +80,6 @@ pub const MAX_UNPIVOT_LITERAL_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_UNPIVOT_OUTPUT_ROWS: u64 = 1 << 30;
 pub const MAX_UNPIVOT_OUTPUT_BYTES: u64 = 1 << 30;
 pub const MAX_PARTITION_COUNT: u32 = 1 << 20;
-pub const MAX_SCAN_BATCH_ROWS: u64 = 1 << 30;
-pub const MAX_SCAN_BATCH_BYTES: u64 = 1 << 30;
 pub const MAX_PIPELINE_DOP: u32 = 1 << 20;
 
 pub fn validate_fragment(fragment: &Fragment, cuts: &FragmentCuts) -> Result<(), ValidationErrors> {

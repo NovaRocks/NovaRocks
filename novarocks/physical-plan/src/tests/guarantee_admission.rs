@@ -467,7 +467,6 @@ fn fixture_with_guarantee_count(
             kind: NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, source)]),
                 residuals: residuals.into_boxed_slice(),
                 derived_values,

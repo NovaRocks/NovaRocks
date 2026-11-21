@@ -361,7 +361,6 @@ fn tracked_request(sql: &str, catalog: &Arc<CountingCatalog>) -> SqlFinalPlanCom
         template.constant_policy,
         template.control,
         template.dop_domain,
-        template.scan_read_budget,
         template.limits,
     )
 }

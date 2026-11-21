@@ -30,9 +30,7 @@ pub(super) fn assert_original_same_owner(
 
 use novarocks_expression_contract::ExprNode;
 use novarocks_functions::ConstantValue;
-use novarocks_physical_plan::{
-    Fragment, PhysicalNode, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-};
+use novarocks_physical_plan::{Fragment, PhysicalNode, PipelineDopDomain, PlanVersionId};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlAuthoredPhysicalPlan,
     SqlCompileControl, SqlCompileIntent, SqlCompileProgressError, SqlCompiler,
@@ -80,10 +78,6 @@ pub(super) fn table_free_request(
             min: 1,
             max: 8,
             requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: 64,
-            max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
     )

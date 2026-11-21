@@ -130,6 +130,73 @@ pub fn dictionary_value_layout(layout: &DataType) -> Option<DataType> {
     }
 }
 
+/// A scan's byte views may be explicitly projected to an offsets consumer.
+/// The logical value, field labels, nullability and other storage parameters
+/// must agree before an execution recipe can authorize that projection.
+pub fn byte_view_to_offsets_projection(
+    source: &crate::FunctionValueType,
+    target: &crate::FunctionValueType,
+) -> bool {
+    fn field_matches(
+        source: &arrow_schema::Field,
+        target: &arrow_schema::Field,
+        value: &crate::ValueTypeRef,
+    ) -> bool {
+        source.name() == target.name()
+            && source.is_nullable() == target.is_nullable()
+            && source.metadata() == target.metadata()
+            && layout_matches(source.data_type(), target.data_type(), value)
+    }
+
+    fn layout_matches(source: &DataType, target: &DataType, value: &crate::ValueTypeRef) -> bool {
+        use crate::ValueKind;
+        if crate::arrow_data_types_exact(source, target) {
+            return true;
+        }
+        match (source, target, value.kind()) {
+            (DataType::Utf8View, DataType::Utf8, ValueKind::String)
+            | (DataType::BinaryView, DataType::Binary, ValueKind::Binary) => true,
+            (DataType::List(source), DataType::List(target), ValueKind::List(child))
+            | (DataType::LargeList(source), DataType::LargeList(target), ValueKind::List(child)) => {
+                field_matches(source, target, child)
+            }
+            (DataType::Struct(source), DataType::Struct(target), ValueKind::Struct(fields)) => {
+                source.len() == target.len()
+                    && source.len() == fields.len()
+                    && source.iter().zip(target.iter()).zip(fields.iter()).all(
+                        |((source, target), field)| {
+                            field_matches(source, target, field.value_type())
+                        },
+                    )
+            }
+            (
+                DataType::Map(source, source_sorted),
+                DataType::Map(target, target_sorted),
+                ValueKind::Map { key, value },
+            ) => {
+                let (DataType::Struct(source_fields), DataType::Struct(target_fields)) =
+                    (source.data_type(), target.data_type())
+                else {
+                    return false;
+                };
+                source_sorted == target_sorted
+                    && source.name() == target.name()
+                    && source.is_nullable() == target.is_nullable()
+                    && source.metadata() == target.metadata()
+                    && source_fields.len() == 2
+                    && target_fields.len() == 2
+                    && field_matches(&source_fields[0], &target_fields[0], key)
+                    && field_matches(&source_fields[1], &target_fields[1], value)
+            }
+            _ => false,
+        }
+    }
+
+    !crate::arrow_data_types_exact(source.data_type(), target.data_type())
+        && source.same_semantics(target)
+        && layout_matches(source.data_type(), target.data_type(), source.value_type())
+}
+
 enum ParameterFailure<E> {
     Caller(E),
     Carrier(CarrierParameterError),
