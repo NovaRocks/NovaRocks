@@ -626,7 +626,13 @@ mod command_update_type_tests {
 
     #[test]
     fn table_execute_metrics_keep_update_type_with_result_set() {
-        for kind in [StatementKind::AddFiles, StatementKind::Optimize] {
+        for kind in [
+            StatementKind::AddFiles,
+            StatementKind::Optimize,
+            StatementKind::RewriteManifests,
+            StatementKind::ExpireSnapshots,
+            StatementKind::RemoveOrphanFiles,
+        ] {
             assert_eq!(
                 command_update_type(StatementAdmission {
                     kind,
@@ -637,7 +643,7 @@ mod command_update_type_tests {
         }
         assert_eq!(
             command_update_type(StatementAdmission {
-                kind: StatementKind::RewriteManifests,
+                kind: StatementKind::CreateTable,
                 shape: StatementOutputShape::ResultSet
             }),
             None
