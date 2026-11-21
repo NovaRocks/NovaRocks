@@ -263,6 +263,20 @@ impl TrinoErrorExpectation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcebergScanLayout {
+    Offsets,
+    View,
+}
+impl IcebergScanLayout {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offsets => "offsets",
+            Self::View => "view",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryMeta {
     pub order_sensitive: Option<bool>,
@@ -404,6 +418,8 @@ pub struct QueryMeta {
     /// neither authorize faults nor change the query's recovery policy/budget.
     pub native_observation_attempts: Option<Vec<u64>>,
     /// Require a substring to occur in at least one runner-owned BE log.
+    pub iceberg_scan_layout: Option<IcebergScanLayout>,
+    pub iceberg_dictionary_output: Option<bool>,
     pub be_log_contains: Vec<String>,
     /// Reject a substring if it occurs in any runner-owned BE log after this step began.
     pub be_log_not_contains: Vec<String>,

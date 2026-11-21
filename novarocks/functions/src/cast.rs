@@ -1187,7 +1187,9 @@ impl PreparedCastRecipe {
             CastBody::ArrayLeaf(leaf) => leaf.may_fail(),
             CastBody::ArrayText | CastBody::ArrayDateText | CastBody::ArrayJson(_) => true,
             CastBody::SelectedArray(f3_array::Body::ArrowScalar) => true,
-            CastBody::SelectedArray(f3_array::Body::Structure) => false,
+            CastBody::SelectedArray(
+                f3_array::Body::Structure | f3_array::Body::ByteViewProjection,
+            ) => false,
             CastBody::ExtendedScalar(body) => body.may_raise(
                 self.source.data_type(),
                 self.decimal_overflow_policy,

@@ -331,18 +331,8 @@ impl MvWriteFinishInput {
         let version = crate::query_execution::physical_encoding::mint_plan_version();
         let dop = crate::query_execution::contract::completed_plan_dop_domain(None)
             .map_err(contract_error)?;
-        let reads = DmlFinalizedProviderReadSet::try_new(
-            self.facts
-                .take()
-                .expect("original read facts")
-                .into_iter()
-                .map(|fact| DmlFinalizedProviderRead {
-                    fact,
-                    read_budget: novarocks_physical_plan::ScanReadBudget {
-                        max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-                        max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-                    },
-                }),
+        let reads = novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(
+            self.facts.take().expect("original read facts"),
         )
         .map_err(contract_error)?;
         let plan = match self

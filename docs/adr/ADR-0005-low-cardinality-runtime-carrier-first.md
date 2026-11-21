@@ -22,8 +22,12 @@ provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/508 (runtime observability: dict hit rate / hydrate counts)"
   - "discussion: 2026-07-02 低基数方向翻转（design vault umbrella 就地重写）"
 code-anchors:
-  - "novarocks/core/src/exec/chunk/hydrate.rs (hydrate_dictionary_columns)"
+  - "novarocks/execution/src/exec/chunk/hydrate.rs (hydrate_dictionary_columns_owned_observed)"
+  - "novarocks/execution/src/exec/pipeline/operator.rs (InputEncodingPolicy)"
+  - "novarocks/execution/src/exec/chunk/schema.rs (ChunkSlotSchema::reconcile_to_carrier)"
 ---
+
+Iceberg 默认交付普通 offsets。开发语句可按原授权独立启用 view 或保持顶层整列块字符串字典。实际载体沿冻结布局校验，消费方按自身能力选择展开。[ADR-0247](ADR-0247-footer-derived-parquet-reader-representation.md)
 
 ## 问题
 
@@ -33,7 +37,7 @@ code-anchors:
 
 - **plan 主导路线曾是落地现实**：NovaRocks 先照 StarRocks 思路实现了 optimizer 级 logical rewrite（约 5200 行 `LowCardinalityDictionaryRewrite` + `LogicalDecode`/`PhysicalDecode` 计划节点 + 全局字典管理器 + `query_global_dicts` 下发，PR #191/#194），当时的设计原则明写"字典 rewrite 是 optimizer 语义，不是执行层 fallback""dict miss 是 bug，不允许 silent fallback"——即 correctness 由 planner 全责。
 - **一次未遂的中间路线**：随后曾计划"删 logical rewrite、把编码决策切到 wire/物理层"，在写实现计划阶段被代码核实推翻——移除 `LogicalDecode` 等价于把决策挪到 extract 之后，与 cost / runtime filter / 公共子表达式的决策口径冲突。该方向就地改写为七个不变量护栏（PR #455），这组护栏后来成为载体 cutover 的逐字节等价判官。
-- **2026-07-02 方向整体翻转**（本 ADR 固化的决策）。现状：scan 对 Parquet 字典列直出 `DictionaryArray`（消灭了旧读路径"先解码成平铺 Utf8、再按全局字典编回 Int32"的两跳往返）；driver 按算子/sink 声明的编码消费能力按列选择性 hydrate，默认全 hydrate；谓词在 dict values 上求值折成 key 判定、确定性标量在 distinct values 上求值一次再重包装、聚合按 dict key 分组、exchange 走 Arrow IPC dictionary batch（不自造协议）、runtime filter 保持值域语义由 reader 对手边字典折 key bitset（无跨节点 id 协议）。
+- **2026-07-02 方向整体翻转**（本 ADR 固化的决策）。当时的实现：scan 对 Parquet 字典列直出 `DictionaryArray`（消灭了旧读路径"先解码成平铺 Utf8、再按全局字典编回 Int32"的两跳往返）；driver 按算子/sink 声明的编码消费能力按列选择性 hydrate，默认全 hydrate；谓词在 dict values 上求值折成 key 判定、确定性标量在 distinct values 上求值一次再重包装、聚合按 dict key 分组、exchange 走 Arrow IPC dictionary batch（不自造协议）、runtime filter 保持值域语义由 reader 对手边字典折 key bitset（无跨节点 id 协议）。
 - 约 5200 行 plan 级 rewrite 与 native decode 计划节点已删除（PR #500）；StarRocks FE-compatible 路径的全局字典 plan 执行（`query_global_dicts` + FE 已改写的 `Int32` dict-id plan + `DECODE_NODE`）作为协议兼容侧支单独存在（PR #488），不混入 native carrier 主流程。
 - 计划里没有任何 dict 痕迹——就是普通 VARCHAR 计划；`Dictionary` 载体在需要平铺的边界经 `hydrate_dictionary_columns` 物化。
 

@@ -723,6 +723,7 @@ impl novarocks_spi::connector::read_stack::ConnectorSplit for Split {
 }
 impl ProviderReadRuntime for SourceFixture {
     type Table = ();
+    type Execution = ();
     type Column = Column;
     type Transaction = ();
     type Split = Split;

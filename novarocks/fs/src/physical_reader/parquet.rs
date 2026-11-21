@@ -44,6 +44,8 @@ use crate::{
 };
 use novarocks_spi::connector::StorageAccessDomainId;
 
+mod representation;
+
 /// Upper bounds for a footer inspection. They cap metadata retained before a
 /// connector has chosen any scan units and deliberately do not depend on a
 /// connector's own facts budget.
@@ -1055,6 +1057,8 @@ fn finish_inspection(
 
 pub(crate) struct ParquetPhysicalReader {
     decoder: Option<ParquetPushDecoder>,
+    pub(super) decoder_file_schema: Option<SchemaRef>,
+    batch_rows: Option<usize>,
     chunk_reader: BoundChunkReader,
     options: FileReaderOptions,
     positions: VecDeque<PositionSpan>,
@@ -1065,6 +1069,7 @@ pub(crate) struct ParquetPhysicalReader {
 
 #[derive(Clone, Copy, Debug)]
 struct PositionSpan {
+    row_group: usize,
     next: u64,
     remaining: usize,
 }
@@ -1197,22 +1202,63 @@ impl ReaderOpen {
             &request.pruning.pages,
             automatic_ranges.as_ref().map(|ranges| &ranges.by_row_group),
         )?;
-        let reader = build_projected_reader(
-            arrow_metadata,
-            &projected_roots,
-            request.budget.max_rows.get(),
-            &row_groups,
-            selection,
-        )?;
+        let mut active_groups = positions
+            .iter()
+            .filter(|span| span.remaining > 0)
+            .map(|span| span.row_group)
+            .collect::<Vec<_>>();
+        active_groups.dedup();
+        let (decoder, decoder_file_schema, batch_rows) = if active_groups.is_empty() {
+            (None, None, None)
+        } else {
+            // The physical range owns column representation. Individual
+            // decoder runs may prune different groups from that same range.
+            let representation_groups = matches!(
+                self.policy,
+                ParquetInterpretationPolicy::DerivedByteRepresentation {
+                    preserve_top_level_dictionary: true
+                }
+            )
+            .then(|| select_row_groups(metadata.as_ref(), request.range, None, &[]));
+            let (arrow_metadata, estimated_rows) = representation::decoder_layout_and_rows(
+                arrow_metadata,
+                &projected_roots,
+                &active_groups,
+                representation_groups.as_deref().unwrap_or(&active_groups),
+                self.policy,
+                request.sizing,
+            )?;
+            let file_rows = usize::try_from(metadata.file_metadata().num_rows()).map_err(|_| {
+                FileError::new(FileErrorKind::Corrupt, "invalid Parquet file row count")
+            })?;
+            let batch_rows = estimated_rows.min(file_rows);
+            if batch_rows == 0 {
+                return Err(FileError::new(
+                    FileErrorKind::Corrupt,
+                    "Parquet file declares no rows for a nonempty selection",
+                ));
+            }
+            let decoder_file_schema = Arc::clone(arrow_metadata.schema());
+            let decoder = build_projected_reader(
+                arrow_metadata,
+                &projected_roots,
+                batch_rows,
+                &row_groups,
+                selection,
+            )?;
+            (Some(decoder), Some(decoder_file_schema), Some(batch_rows))
+        };
 
         Ok(ParquetPhysicalReader {
-            decoder: Some(reader),
+            closed: decoder.is_none(),
+            decoder,
+            decoder_file_schema,
+            batch_rows,
             chunk_reader: self.chunk_reader,
             options: request.options,
             positions,
             context: request.context,
             metrics: self.metrics,
-            closed: false,
         })
     }
 }
@@ -1318,6 +1364,7 @@ impl ParquetPhysicalReader {
         self.context.check_active()?;
         let began = Instant::now();
         let next = loop {
+            self.context.cooperate().await?;
             let decoder = self
                 .decoder
                 .as_mut()
@@ -1418,6 +1465,10 @@ impl FileBatchReader for ParquetPhysicalReader {
 
     fn metrics_snapshot(&self) -> FileMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    fn reader_batch_rows(&self) -> Option<usize> {
+        self.batch_rows
     }
 }
 
@@ -1573,8 +1624,9 @@ fn row_position_spans(
                 "negative or overflowing Parquet row-group row count",
             )
         })?;
-        if selected.contains(&index) {
+        if rows > 0 && selected.contains(&index) {
             spans.push_back(PositionSpan {
+                row_group: index,
                 next: first_row,
                 remaining: rows,
             });
@@ -1648,6 +1700,7 @@ fn page_selection(
         for range in ranges {
             selected_ranges.push(selection_offset + range.start..selection_offset + range.end);
             positions.push_back(PositionSpan {
+                row_group: row_group_index,
                 next: first_rows[row_group_index] + range.start as u64,
                 remaining: range.end - range.start,
             });

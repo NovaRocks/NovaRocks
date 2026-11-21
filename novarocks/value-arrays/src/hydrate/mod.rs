@@ -36,6 +36,7 @@ mod tree;
 mod validation;
 use tree::Node;
 pub use tree::visit_reachable_child_rows_observed;
+pub(crate) use tree::{check_extent, child_rows};
 pub use validation::{
     required_values_satisfied_observed, validate_required_observed,
     validate_required_rows_observed, validate_required_with_options_observed,

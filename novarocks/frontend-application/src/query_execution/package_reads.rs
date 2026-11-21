@@ -31,7 +31,6 @@
 //! provider froze.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use novarocks_connector_contract::{
@@ -123,7 +122,6 @@ fn author_read(
 ) -> Result<FrozenConnectorRead, PackageFreezeError> {
     let NodeKind::Scan {
         relation,
-        read_budget,
         provider_outputs,
         ..
     } = &node.kind
@@ -195,10 +193,6 @@ fn author_read(
         .map_err(|detail| refused(format!("unenforced predicate {detail}")))?;
     let dynamic_filters =
         scan_dynamic_filters(plan, fragment, node, provider_outputs, encoding).map_err(refused)?;
-    let max_batch_rows = NonZeroU64::new(read_budget.max_batch_rows)
-        .ok_or_else(|| refused("scan budget allows no rows per batch".to_string()))?;
-    let max_batch_bytes = NonZeroU64::new(read_budget.max_batch_bytes)
-        .ok_or_else(|| refused("scan budget allows no bytes per batch".to_string()))?;
     let frozen_scan = FrozenConnectorScan::try_new(
         recipe,
         assignments,
@@ -206,8 +200,6 @@ fn author_read(
         unenforced,
         encoding.remaining_expression.clone(),
         dynamic_filters,
-        max_batch_rows,
-        max_batch_bytes,
     )
     .map_err(|error| refused(error.to_string()))?;
 

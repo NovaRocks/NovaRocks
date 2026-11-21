@@ -57,7 +57,7 @@ impl Scenario for TypedLayout {
         ensure!(
             result.columns.len() == 1
                 && result.columns[0].name == "v"
-                && result.columns[0].type_signature.raw_type == "integer"
+                && result.columns[0].type_signature.raw_type == "bigint"
                 && result.columns[0].type_signature.arguments.is_empty(),
             "original two-row query changed its column layout: {result:?}"
         );

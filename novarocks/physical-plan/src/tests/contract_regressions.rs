@@ -477,7 +477,6 @@ pub(super) fn scan_lineage_filter(
             kind: NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: scan_budget(),
                 provider_outputs: provider_outputs.into_boxed_slice(),
                 residuals: Box::default(),
                 derived_values: Box::default(),
@@ -901,7 +900,6 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
             kind: NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, scan_value)]),
                 residuals: Box::default(),
                 derived_values: Box::default(),

@@ -41,7 +41,7 @@ use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPageStream, ConnectorPollBudget, ConnectorPreparationControl,
     ConnectorPreparationExit, ConnectorPreparationProgress, ConnectorSourceOperations,
-    OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
+    FileReaderFirstBatch, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
 };
 
 use super::super::delete_manager::DeleteEvaluationMode;
@@ -71,6 +71,14 @@ pub fn create_iceberg_page_stream(
     }
     let (mut request, delete_mode) = ParquetSplitRequest::of(request);
     let operations = SplitOperations::bind(&mut request.context)?;
+    let reader_budget = budget.clone();
+    request.context.turn = Some(Arc::new(move || {
+        if reader_budget.try_take(1) {
+            None
+        } else {
+            Some(Box::pin(reader_budget.consume(1)))
+        }
+    }));
     let successor_control = Arc::new(SuccessorPreparationGroup::new());
     // A promoted split holds its prepared input from here on.
     let retained_base_bytes = request.retained_base_bytes();
@@ -86,6 +94,7 @@ pub fn create_iceberg_page_stream(
         operations,
         successor_control,
         metrics: PageSourceMetrics::default(),
+        first_file_batch: None,
         retained_base_bytes,
     }))
 }
@@ -103,11 +112,12 @@ impl ParquetStreamInit {
         let delete_filter = self
             .request
             .delete_manager
-            .open_split(
+            .open_split_sized(
                 &self.request.split,
                 &self.admitted.table_schema,
                 &self.request.delete_domains,
                 self.delete_mode.clone(),
+                self.request.budget,
             )
             .await?;
         Ok(Box::new(self.request.into_source(
@@ -144,6 +154,7 @@ pub struct IcebergParquetPageStream {
     pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
     /// As of the last completed step.
     metrics: PageSourceMetrics,
+    first_file_batch: Option<FileReaderFirstBatch>,
     /// The split's own retention as of the last completed step; successor
     /// and promoted preparation are read live.
     retained_base_bytes: u64,
@@ -152,6 +163,7 @@ pub struct IcebergParquetPageStream {
 impl IcebergParquetPageStream {
     fn observe(&mut self, source: &IcebergParquetPageSource) {
         self.metrics = source.metrics();
+        self.first_file_batch = source.first_file_batch;
         self.retained_base_bytes = source.retained_base_bytes();
     }
 }
@@ -208,6 +220,10 @@ impl Stream for IcebergParquetPageStream {
 impl ConnectorPageStream for IcebergParquetPageStream {
     fn metrics(&self) -> PageSourceMetrics {
         self.metrics
+    }
+
+    fn first_file_batch(&self) -> Option<FileReaderFirstBatch> {
+        self.first_file_batch
     }
 
     fn memory_usage_bytes(&self) -> u64 {

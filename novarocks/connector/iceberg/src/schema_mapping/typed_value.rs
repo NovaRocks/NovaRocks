@@ -19,6 +19,7 @@
 //! an outward format projection and supply none of these semantic decisions.
 
 use crate::iceberg::spec::{PrimitiveType, Type};
+use crate::typed_read::runtime::IcebergReadLayout;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_connector_contract::{ConnectorError, ConnectorErrorKind, PureProviderCompileError};
 use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
@@ -30,7 +31,7 @@ use std::sync::Arc;
 pub(crate) type Failure = PureProviderCompileError<ConnectorError>;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum DeclarationPurpose {
-    Read,
+    Read(IcebergReadLayout),
     CanonicalWriteInput,
 }
 
@@ -65,7 +66,7 @@ pub(crate) fn from_declaration(
         nominal,
         integer,
         &Default::default(),
-        DeclarationPurpose::Read,
+        DeclarationPurpose::Read(IcebergReadLayout::Offsets),
         creation,
     )
 }
@@ -75,6 +76,7 @@ pub(crate) fn from_field(
     nullable: bool,
     nominals: &super::nominal_declaration::NominalSourceDeclarations,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    layout: IcebergReadLayout,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<DeclaredValue, Failure> {
     from_declaration_with_nominals(
@@ -83,7 +85,7 @@ pub(crate) fn from_field(
         nominals.get(&field.id).map(|domain| domain.logical_type()),
         integer,
         nominals,
-        DeclarationPurpose::Read,
+        DeclarationPurpose::Read(layout),
         creation,
     )
 }
@@ -206,7 +208,11 @@ fn author(
                 },
                 domain => ValueKind::Nominal(domain),
             };
-            (data_type.clone(), data_type, kind)
+            let layout = match purpose {
+                DeclarationPurpose::Read(layout) => layout.byte_carrier(&data_type, domain),
+                DeclarationPurpose::CanonicalWriteInput => data_type.clone(),
+            };
+            (data_type, layout, kind)
         }
         Type::Struct(fields) => {
             if nominal.is_some() || integer.is_some() {

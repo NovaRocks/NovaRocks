@@ -82,6 +82,7 @@ fn table_from_document(
             !field.required,
             nominals,
             integers.get(&field.id).copied(),
+            crate::typed_read::runtime::IcebergReadLayout::Offsets,
             creation,
         )?
         .binding;

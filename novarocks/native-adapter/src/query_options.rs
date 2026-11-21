@@ -22,7 +22,6 @@ use novarocks_proto_models::novarocks;
 
 pub fn decode_query_options(src: &novarocks::QueryOptions) -> QueryOptions {
     QueryOptions {
-        batch_size: (src.batch_size > 0).then_some(src.batch_size),
         query_timeout: (src.query_timeout > 0).then_some(src.query_timeout),
         query_delivery_timeout: (src.query_delivery_timeout > 0)
             .then_some(src.query_delivery_timeout),

@@ -1451,10 +1451,7 @@ mod scalar_domain_tests {
             SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
             builtin_sql_function_catalog,
         };
-        use novarocks_physical_plan::{
-            MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
-            ResultValueDomain as D, ScanReadBudget,
-        };
+        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ResultValueDomain as D};
         use novarocks_result_contract::{ScalarOpaqueType as O, ScalarValueType as V};
         for (sql, domain, scalar) in [
             (
@@ -1527,10 +1524,6 @@ mod scalar_domain_tests {
                     min: 1,
                     max: 8,
                     requires_power_of_two: true,
-                },
-                ScanReadBudget {
-                    max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: MAX_SCAN_BATCH_BYTES,
                 },
                 DEFAULT_COMPLETION_LIMITS,
             );
@@ -2251,10 +2244,7 @@ mod scalar_domain_tests {
             SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
             builtin_sql_function_catalog,
         };
-        use novarocks_physical_plan::{
-            MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
-            ResultValueDomain as D, ScanReadBudget,
-        };
+        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ResultValueDomain as D};
         use novarocks_result_contract::{
             NamedScalarField as N, ScalarField as F, ScalarOpaqueType as O, ScalarValueType as V,
         };
@@ -2334,10 +2324,6 @@ mod scalar_domain_tests {
                     min: 1,
                     max: 8,
                     requires_power_of_two: true,
-                },
-                ScanReadBudget {
-                    max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: MAX_SCAN_BATCH_BYTES,
                 },
                 DEFAULT_COMPLETION_LIMITS,
             );

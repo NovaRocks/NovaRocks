@@ -33,11 +33,10 @@ use novarocks_connector_contract::{
     ConnectorReadRelationPayload,
 };
 use novarocks_physical_plan::{
-    Distribution, ExactInputVersion, FragmentBuilder, FragmentId, FragmentSink,
-    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, MetadataRelation, MetadataRelationKind, NodeKind,
-    PhysicalProperties, PipelineDopDomain, PlanBuilder, PlanVersionId, ProviderColumnReference,
-    ProviderReadOccurrenceId, ProviderReadReference, Relation, RelationField, RowMultiplicity,
-    ScanReadBudget, ValueOrigin, ValueType,
+    Distribution, ExactInputVersion, FragmentBuilder, FragmentId, FragmentSink, MetadataRelation,
+    MetadataRelationKind, NodeKind, PhysicalProperties, PipelineDopDomain, PlanBuilder,
+    PlanVersionId, ProviderColumnReference, ProviderReadOccurrenceId, ProviderReadReference,
+    Relation, RelationField, RowMultiplicity, ValueOrigin, ValueType,
 };
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
@@ -202,10 +201,6 @@ pub(crate) fn completed_scan_candidate(version: [u8; 16]) -> CompletedPhysicalPl
             NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 4096,
-                    max_batch_bytes: 8 * 1024 * 1024,
-                },
                 provider_outputs: Box::from([(field, value)]),
                 residuals: Box::default(),
                 derived_values: Box::default(),
@@ -295,10 +290,6 @@ fn literal_query_request(version: [u8; 16], sql: &str) -> SqlFinalPlanCompileReq
             min: 1,
             max: 8,
             requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: MAX_SCAN_BATCH_ROWS,
-            max_batch_bytes: MAX_SCAN_BATCH_BYTES,
         },
         DEFAULT_COMPLETION_LIMITS,
     )

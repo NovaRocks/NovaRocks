@@ -21,6 +21,9 @@ explicit_only = false
 paths = [
     "novarocks/trino-adapter/**",
     "novarocks/query-application/src/**",
+    "novarocks-server/library/src/provider_manifest.rs",
+    "novarocks/connector/iceberg/src/catalog_config.rs",
+    "novarocks/connector/iceberg/src/typed_read/runtime.rs",
     "novarocks/frontend-application/src/query_execution/required_constant_eval.rs",
     "novarocks/frontend-application/src/query_execution/required_constant_eval/**",
     "novarocks/frontend-application/src/query/session_property_computation.rs",

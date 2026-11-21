@@ -25,7 +25,7 @@ use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment;
 use novarocks_spi::connector::read_stack::{
-    ConnectorReadDynamicFilter, ConnectorReadTableHandle, ConnectorSession,
+    ConnectorReadDynamicFilter, ConnectorReadRelation, ConnectorSession,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
@@ -116,26 +116,26 @@ pub type CatalogWriteExecutionResolver = Arc<
 /// semantics after admission.
 #[derive(Clone)]
 pub struct TypedConnectorReadDescriptor {
-    table: ConnectorReadTableHandle,
+    relation: ConnectorReadRelation,
     assignments: Vec<ConnectorReadAssignment>,
     complete_dynamic_filter: Arc<ConnectorReadDynamicFilter>,
 }
 
 impl TypedConnectorReadDescriptor {
     pub fn new(
-        table: ConnectorReadTableHandle,
+        relation: ConnectorReadRelation,
         assignments: Vec<ConnectorReadAssignment>,
         complete_dynamic_filter: Arc<ConnectorReadDynamicFilter>,
     ) -> Self {
         Self {
-            table,
+            relation,
             assignments,
             complete_dynamic_filter,
         }
     }
 
-    pub const fn table(&self) -> &ConnectorReadTableHandle {
-        &self.table
+    pub const fn relation(&self) -> &ConnectorReadRelation {
+        &self.relation
     }
 
     pub fn assignments(&self) -> &[ConnectorReadAssignment] {

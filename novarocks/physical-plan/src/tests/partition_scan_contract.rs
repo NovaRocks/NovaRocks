@@ -148,10 +148,7 @@ fn finish_join(
     )
 }
 
-fn finish_scan_with_budget(
-    relation: Relation,
-    read_budget: ScanReadBudget,
-) -> Result<Fragment, ValidationErrors> {
+fn finish_scan(relation: Relation) -> Result<Fragment, ValidationErrors> {
     let column = relation.schema()[0].column.clone();
     let mut builder = FragmentBuilder::new(FragmentId::new(302));
     let scan = builder.reserve_node_id().unwrap();
@@ -178,7 +175,6 @@ fn finish_scan_with_budget(
             kind: NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget,
                 provider_outputs: Box::from([(column, value)]),
                 residuals: Box::default(),
                 derived_values: Box::default(),
@@ -254,7 +250,6 @@ fn finish_plan_with_partition_distributions(
                 kind: NodeKind::Scan {
                     occurrence: ProviderReadOccurrenceId::new(0),
                     relation: Box::new(relation),
-                    read_budget: scan_budget(),
                     provider_outputs: Box::from([(column, value)]),
                     residuals: Box::default(),
                     derived_values: Box::default(),
@@ -553,35 +548,6 @@ fn system_metadata_accepts_unconstrained_distribution_and_plan_dop() {
     if let Relation::Metadata(metadata) = &mut system {
         metadata.provided_properties.distribution = Distribution::Unconstrained;
     }
-    let fragment = finish_scan_with_budget(system, scan_budget()).unwrap();
+    let fragment = finish_scan(system).unwrap();
     assert_eq!(fragment.dop_domain(), dop());
-}
-
-#[test]
-fn scan_read_budget_rejects_zero_and_over_limit_values() {
-    let binding = connector_binding();
-    let column = ProviderColumnReference {
-        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 34),
-    };
-    let relation = metadata_relation(&binding, column);
-    assert!(contains_error(
-        finish_scan_with_budget(
-            relation.clone(),
-            ScanReadBudget {
-                max_batch_rows: 0,
-                max_batch_bytes: 1,
-            },
-        ),
-        "scan read budget"
-    ));
-    assert!(contains_error(
-        finish_scan_with_budget(
-            relation,
-            ScanReadBudget {
-                max_batch_rows: 1,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES + 1,
-            },
-        ),
-        "scan read budget"
-    ));
 }

@@ -149,6 +149,7 @@ struct PipelineBuildContext {
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
+    output_batch_rows: std::num::NonZeroU32,
 }
 
 struct PipelineRuntimeFilterExecution {

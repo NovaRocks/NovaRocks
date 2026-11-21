@@ -1052,9 +1052,9 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(execution),
             execution.cancellation().clone(),
-            query_opts.as_ref(),
         ),
         typed_connector_session()?,
+        Arc::clone(execution.session_property_inputs()),
     )?;
     let mut prepared = query.clone();
     if has_time_travel_refs(&prepared) {
@@ -1299,13 +1299,10 @@ fn finish_prepared_iceberg_write_assembly(
     let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
         session: write_session.as_ref(),
     };
-    let read_budget = dml_scan_read_budget();
     let plan = completion.finish(
         crate::query_execution::physical_encoding::mint_plan_version(),
         crate::query_execution::contract::completed_plan_dop_domain(query_opts.as_ref())?,
-        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
-            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead { fact, read_budget },
-        ))?,
+        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts)?,
         novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([target])?,
         completion_control,
     )?;
@@ -1344,13 +1341,6 @@ fn finish_prepared_iceberg_write_assembly(
 }
 
 /// How much one write's scan may return in a batch.
-const fn dml_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
-    novarocks_physical_plan::ScanReadBudget {
-        max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-        max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-    }
-}
-
 #[cfg(test)]
 #[allow(
     dead_code,

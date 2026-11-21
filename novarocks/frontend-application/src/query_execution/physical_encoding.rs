@@ -1191,9 +1191,7 @@ mod tests {
         );
     }
 
-    use novarocks_physical_plan::{
-        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-    };
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
     use novarocks_query_application::preparation::{
         FinalPlanCompletionDriver, ReadAccessSink, SqlCompletionFactSource,
     };
@@ -2061,10 +2059,6 @@ mod tests {
                 max: 8,
                 requires_power_of_two: true,
             },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-            },
             DEFAULT_COMPLETION_LIMITS,
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2293,10 +2287,6 @@ mod tests {
                 max: 8,
                 requires_power_of_two: true,
             },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-            },
             DEFAULT_COMPLETION_LIMITS,
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2356,12 +2346,11 @@ mod tests {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         use novarocks_plan_codec::physical_package_v2::{
             FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package, encode_fragment_package,
+            PackageEncodeLimits, decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::{
             FragmentDecodeResourceModel, ResourceModelError,
         };
-        use prost::Message;
         use std::error::Error;
         // The separate COUNT/LIKE regression above keeps the original query
         // shape. Here every output and every column varies, so ordinary column
@@ -2398,10 +2387,6 @@ mod tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         );
@@ -2466,18 +2451,18 @@ mod tests {
                 .nodes()
                 .values()
                 .any(|node| matches!(&node.kind, NodeKind::Values { .. }));
+            let bytes = crate::query_execution::package_freeze::encode_checked_package(
+                &package, &carrier, &control,
+            )
+            .unwrap_or_else(|error| panic!("four-column original-scale fragment {id:?}: {error}"));
+            let production = model
+                .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
+                .expect("production accepts the complete legal four-column package");
+            assert_eq!(production.usage.input_bytes, bytes.len());
             if contains_values {
                 limited_values_packages += 1;
-                // Measure the complete legal producer bytes, then exercise an
-                // explicit caller budget one field below their actual usage.
-                let bytes =
-                    encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &control)
-                        .unwrap()
-                        .encode_to_vec();
-                let production = model
-                    .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
-                    .expect("production accepts the complete legal four-column package");
-                assert_eq!(production.usage.input_bytes, bytes.len());
+                // Use the checked production bytes to set the caller's
+                // field budget one below the package's actual usage.
                 let mut receiver = PackageDecodeLimits::FROZEN.wire;
                 receiver.max_field_occurrences =
                     production.usage.field_occurrences.checked_sub(1).unwrap();
@@ -2522,17 +2507,7 @@ mod tests {
                     before,
                     "the refused Values fragment creates no artifact"
                 );
-                // The caller-limited failure is separate from the normal
-                // production round trip, which must also accept this package.
             }
-            let bytes = crate::query_execution::package_freeze::encode_checked_package(
-                &package, &carrier, &control,
-            )
-            .unwrap_or_else(|error| panic!("four-column original-scale fragment {id:?}: {error}"));
-            let projection = model
-                .preflight(&bytes, PackageDecodeLimits::FROZEN.wire, &control)
-                .unwrap();
-            assert_eq!(projection.usage.input_bytes, bytes.len());
             let decoded =
                 decode_fragment_package(&bytes, &model, &PackageDecodeLimits::FROZEN, &control)
                     .unwrap();
@@ -3127,10 +3102,6 @@ mod tests {
                 NodeKind::Scan {
                     occurrence: ProviderReadOccurrenceId::new(0),
                     relation: Box::new(relation),
-                    read_budget: ScanReadBudget {
-                        max_batch_rows: 4096,
-                        max_batch_bytes: 8 * 1024 * 1024,
-                    },
                     provider_outputs: Box::from([(field, value)]),
                     residuals: Box::default(),
                     derived_values: Box::default(),
@@ -3256,10 +3227,6 @@ mod tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         )

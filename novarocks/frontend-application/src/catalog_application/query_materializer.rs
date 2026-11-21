@@ -1843,10 +1843,6 @@ mod tests {
                         max: 8,
                         requires_power_of_two: true,
                     },
-                    novarocks_physical_plan::ScanReadBudget {
-                        max_batch_rows: 1024,
-                        max_batch_bytes: 1 << 20,
-                    },
                     DEFAULT_COMPLETION_LIMITS,
                 )
                 .with_catalog_qualifications(qualifications.clone());

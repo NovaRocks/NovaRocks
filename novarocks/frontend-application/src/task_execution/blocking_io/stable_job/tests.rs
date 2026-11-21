@@ -376,6 +376,7 @@ struct CanaryProvider {
 }
 impl ProviderReadRuntime for CanaryProvider {
     type Table = ();
+    type Execution = ();
     type Column = CanaryColumn;
     type Transaction = ();
     type Split = CanarySplit;

@@ -1497,9 +1497,7 @@ mod client_render_error_tests {
 #[cfg(test)]
 mod map64_planning_worker_tests {
     use super::*;
-    use novarocks_physical_plan::{
-        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-    };
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileIntent, SqlStatementInput,
         builtin_sql_function_catalog,
@@ -1536,10 +1534,6 @@ mod map64_planning_worker_tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         )

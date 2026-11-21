@@ -482,9 +482,9 @@ fn install_dml_fact_source(
         scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(execution),
             execution.cancellation().clone(),
-            None,
         ),
         crate::query_execution::compiler::typed_connector_session()?,
+        Arc::clone(execution.session_property_inputs()),
     )
 }
 

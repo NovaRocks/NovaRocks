@@ -69,7 +69,7 @@ fn compile(
     }
     work.step()?;
     let codecs = IcebergReadTypes::wire_codecs();
-    let relation = decode(
+    let (relation, execution) = decode(
         frozen,
         draft.relation().table(),
         ConnectorCodecCategory::ReadTable,
@@ -206,7 +206,22 @@ fn compile(
         columns.push(column);
         work.step()?;
     }
-    super::program_fields::validate_program_columns(&relation, &columns, public, work)?;
+    if !super::super::runtime::IcebergReadLayout::applies_to(&relation)
+        && (execution.layout != super::super::runtime::IcebergReadLayout::Offsets
+            || execution.preserve_top_level_dictionary)
+    {
+        return Err(invalid(
+            "execution",
+            "Scan representation selection requires a data relation",
+        ));
+    }
+    super::program_fields::validate_program_columns(
+        &relation,
+        &columns,
+        public,
+        execution.layout,
+        work,
+    )?;
     // Assignments, negotiated predicates, remaining expressions and RF hints
     // retain the original public authority. In particular a private pushed
     // predicate can have been downgraded to pruning-only; it is not an engine

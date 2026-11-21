@@ -19,7 +19,7 @@
 
 use super::{
     StatisticsCollectionProgram, StatisticsRelationIdentity, admit_statistics_scan_binding,
-    contract_violation, statistics_scan_read_budget,
+    contract_violation,
 };
 use crate::query_execution::{
     artifact::PreparedDistributedAttemptTemplate,
@@ -202,6 +202,7 @@ pub(crate) async fn prepare_statistics_computation_in(
         services.completion,
         scope,
         crate::query_execution::compiler::typed_connector_session().map_err(contract_violation)?,
+        Arc::clone(execution.session_property_inputs()),
     )
     .map_err(contract_violation)?;
     custody.sink = Some(ReadAccessSink::new());
@@ -534,13 +535,8 @@ fn build_statistics_plan_parts(
             crate::query_execution::physical_encoding::mint_plan_version(),
             crate::query_execution::contract::completed_plan_dop_domain(None)
                 .map_err(contract_violation)?,
-            novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([
-                novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                    fact,
-                    read_budget: statistics_scan_read_budget(),
-                },
-            ])
-            .map_err(contract_violation)?,
+            novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([fact])
+                .map_err(contract_violation)?,
         ),
         execution
             .sql_semantics()

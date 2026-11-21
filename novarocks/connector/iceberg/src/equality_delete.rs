@@ -23,10 +23,9 @@
 
 use crate::delete_file::{IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat};
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 use novarocks_fs::{FileProjection, FileReadContext, FsAccessHandle};
@@ -159,9 +158,7 @@ impl EqualityColumnBinding {
                     .fields()
                     .iter()
                     .zip(self.indices.iter())
-                    .map(|((_, ty), index)| {
-                        canonical_equality_value(batch.column(*index).as_ref(), row, ty)
-                    })
+                    .map(|((_, ty), index)| canonical_equality_value(batch.column(*index), row, ty))
                     .collect()
             })
             .collect()
@@ -224,11 +221,20 @@ fn validate_materialized_equality_type(
     {
         return Ok(());
     }
-    validate_physical_equality_type(materialized, resolved)
+    match (resolved, materialized) {
+        (P::String, DataType::Utf8View) | (P::Binary, DataType::BinaryView) => Ok(()),
+        (P::String, DataType::Dictionary(keys, values))
+            if **keys == DataType::Int32
+                && matches!(values.as_ref(), DataType::Utf8 | DataType::Utf8View) =>
+        {
+            Ok(())
+        }
+        _ => validate_physical_equality_type(materialized, resolved),
+    }
 }
 
 fn canonical_equality_value(
-    array: &dyn Array,
+    array: &arrow::array::ArrayRef,
     row: usize,
     ty: &crate::iceberg::spec::PrimitiveType,
 ) -> Result<Option<crate::delete_semantics::CanonicalScalar>, String> {
@@ -236,6 +242,21 @@ fn canonical_equality_value(
     use crate::iceberg::spec::PrimitiveType as P;
     use arrow::array::{FixedSizeBinaryArray, Time64MicrosecondArray};
     use std::sync::Arc;
+    if matches!(ty, P::String | P::Binary) {
+        let utf8 = matches!(ty, P::String);
+        let source = crate::typed_read::output::byte_source(array, utf8)
+            .map_err(|error| error.to_string())?;
+        let value = source.value(row).map_err(|error| error.to_string())?;
+        return match value {
+            None => Ok(None),
+            Some(bytes) if utf8 => {
+                let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+                Ok(Some(C::String(Arc::from(text))))
+            }
+            Some(bytes) => Ok(Some(C::Binary(Arc::from(bytes)))),
+        };
+    }
+    let array = array.as_ref();
     if array.is_null(row) {
         return Ok(None);
     }
@@ -276,18 +297,6 @@ fn canonical_equality_value(
             } else {
                 value.to_bits()
             })
-        }
-        (P::String, DataType::Utf8) => {
-            C::String(Arc::from(array_as::<StringArray>(array)?.value(row)))
-        }
-        (P::String, DataType::LargeUtf8) => {
-            C::String(Arc::from(array_as::<LargeStringArray>(array)?.value(row)))
-        }
-        (P::Binary, DataType::Binary) => {
-            C::Binary(Arc::from(array_as::<BinaryArray>(array)?.value(row)))
-        }
-        (P::Binary, DataType::LargeBinary) => {
-            C::Binary(Arc::from(array_as::<LargeBinaryArray>(array)?.value(row)))
         }
         (P::Fixed(length), DataType::FixedSizeBinary(actual))
             if i64::try_from(*length).ok() == Some(i64::from(*actual)) =>
@@ -347,6 +356,7 @@ pub(crate) async fn load_bound_equality_keys(
     group: &crate::delete_semantics::EqualityFieldGroup,
     access: &FsAccessHandle,
     context: &FileReadContext,
+    sizing: novarocks_fs::ReaderSizing,
     mut on_decoded: impl FnMut(usize) + Send,
 ) -> Result<(Vec<EqualityKey>, usize), novarocks_spi::connector::ConnectorError> {
     equality_specs(std::slice::from_ref(spec))
@@ -361,6 +371,7 @@ pub(crate) async fn load_bound_equality_keys(
         FileProjection::FieldIds(group.fields().iter().map(|(id, _)| *id).collect()),
         Vec::new(),
         context.clone(),
+        sizing,
         |batch| {
             decoded_rows += batch.batch.num_rows();
             on_decoded(batch.batch.num_rows());
@@ -390,7 +401,7 @@ mod tests {
     use super::*;
     use crate::delete_semantics::{CanonicalScalar, EqualityFieldGroup};
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use arrow::array::{ArrayRef, FixedSizeBinaryArray};
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, StringArray};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -425,6 +436,7 @@ mod tests {
             )
             .unwrap();
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -446,6 +458,7 @@ mod tests {
                 &group(&[17], &[PrimitiveType::Long]),
                 &access,
                 &context,
+                crate::file_reader::default_parquet_reader_sizing(),
                 |_| {},
             ))
             .unwrap();

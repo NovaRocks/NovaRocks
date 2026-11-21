@@ -1240,6 +1240,7 @@ impl IcebergReadBinding {
             }
         };
         Ok(FileReadContext {
+            turn: None,
             cancellation,
             deadline: Some(deadline),
             runtime: Arc::clone(self.resources.file_runtime()),

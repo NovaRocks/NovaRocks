@@ -17,4 +17,4 @@
 
 //! One revision authority for every private Iceberg codec.
 
-pub(crate) const ICEBERG_CONTRACT_REVISION: u32 = 11;
+pub(crate) const ICEBERG_CONTRACT_REVISION: u32 = 12;

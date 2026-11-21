@@ -1217,15 +1217,73 @@ fn reconcile_owned_type(
 
 fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool {
     matches!(
-        (expected, actual),
-        (
-            DataType::Utf8 | DataType::LargeUtf8,
-            DataType::Dictionary(key, value),
-        ) if key.as_ref() == &DataType::Int32 && value.as_ref() == expected
+        actual,
+        DataType::Dictionary(key, value)
+            if key.as_ref() == &DataType::Int32
+                && novarocks_type_contract::dictionary_value_layout(expected).as_ref()
+                    == Some(value.as_ref())
     )
 }
 
 impl ChunkSchema {
+    /// Reconcile the scan's frozen plain layout with the admitted top-level
+    /// dictionary carrier. The slots retain their original typed bindings.
+    pub(crate) fn reconcile_scan_carriers<E: From<ChunkConstructionFailure>>(
+        schema: &ChunkSchemaRef,
+        columns: &[ArrayRef],
+        storage: ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        mut observe: impl for<'a> FnMut(usize, ArrayNormalizationStep<'a>) -> Result<(), E>,
+    ) -> Result<ChunkSchemaRef, E> {
+        let mut differs = false;
+        for (index, (slot, column)) in schema.slots().iter().zip(columns).enumerate() {
+            observe(
+                index,
+                ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+            )?;
+            differs |= is_dictionary_string_carrier(slot.data_type(), column.data_type());
+        }
+        if !differs {
+            return Ok(Arc::clone(schema));
+        }
+        request_array::<ChunkSlotSchema, E>(schema.slots().len(), &mut request)?;
+        let mut slots = Vec::with_capacity(schema.slots().len());
+        for (index, (slot, column)) in schema.slots().iter().zip(columns).enumerate() {
+            if !is_dictionary_string_carrier(slot.data_type(), column.data_type()) {
+                slots.push(slot.clone());
+                continue;
+            }
+            let source = slot.field();
+            let target = column.data_type();
+            observe(
+                index,
+                ArrayNormalizationStep::RebuildField {
+                    source,
+                    target,
+                    name: source.name(),
+                },
+            )?;
+            let field = Arc::new(Field::new(
+                source.name(),
+                target.clone(),
+                source.is_nullable(),
+            ));
+            slots.push(ChunkSlotSchema::try_new_typed_observed(
+                slot.slot_id(),
+                field,
+                slot.typed_binding().clone(),
+                slot.unique_id(),
+                storage.clone(),
+                |step| observe(index, step),
+            )?);
+        }
+        let actual = Self::try_new_typed_observed(slots, storage, &mut request, |units| {
+            observe(0, ArrayNormalizationStep::InspectConstructionWork { units })
+        })?;
+        request_arc_payload(std::alloc::Layout::new::<Self>(), &mut request)?;
+        Ok(Arc::new(actual))
+    }
+
     /// Assemble typed occurrences without retaining external format metadata.
     /// The creating owner covers the Vec/map/schema wrapper construction first.
     pub fn try_new_typed(

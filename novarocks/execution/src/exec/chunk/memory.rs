@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayData, RecordBatch};
 use arrow::buffer::Buffer;
-use novarocks_spi::connector::ConnectorOutputMemoryToken;
+use novarocks_spi::connector::{ConnectorOutputMemoryToken, SharedSourceHold};
 
 use crate::runtime::mem_tracker::MemTracker;
 
@@ -160,6 +160,10 @@ pub(crate) struct ChunkMemoryCharge {
 enum ChunkMemoryChargeOwner {
     Native(Arc<ChunkAccounting>),
     Connector(Arc<Mutex<ConnectorOutputMemoryToken>>),
+    SharedConnector {
+        source: Arc<Vec<SharedSourceHold>>,
+        output: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    },
 }
 
 impl ChunkMemoryCharge {
@@ -172,6 +176,15 @@ impl ChunkMemoryCharge {
     pub(super) fn connector(output_memory: Arc<Mutex<ConnectorOutputMemoryToken>>) -> Self {
         Self {
             owner: ChunkMemoryChargeOwner::Connector(output_memory),
+        }
+    }
+
+    pub(super) fn shared_connector(
+        source: Arc<Vec<SharedSourceHold>>,
+        output: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    ) -> Self {
+        Self {
+            owner: ChunkMemoryChargeOwner::SharedConnector { source, output },
         }
     }
 
@@ -217,6 +230,18 @@ impl ChunkMemoryCharge {
                     Arc::clone(tracker),
                 )))
             }
+            ChunkMemoryChargeOwner::SharedConnector { source, output } => {
+                // Aliasing a projection preserves both original reservations.
+                // The writer only charges storage created by the projection.
+                Ok(
+                    (connector_retained_bytes != 0).then(|| TransferredChunkBytes {
+                        owner: TransferredChunkBytesOwner::SharedConnector {
+                            _source: Arc::clone(source),
+                            _output: output.clone(),
+                        },
+                    }),
+                )
+            }
             ChunkMemoryChargeOwner::Connector(output_memory) => {
                 // A connector reservation may move only when this chunk is its
                 // sole owner. Shared clones keep the reservation where it is
@@ -255,7 +280,8 @@ impl ChunkMemoryCharge {
     pub(crate) fn tracker(&self) -> Option<Arc<MemTracker>> {
         match &self.owner {
             ChunkMemoryChargeOwner::Native(accounting) => Some(accounting.tracker()),
-            ChunkMemoryChargeOwner::Connector(_) => None,
+            ChunkMemoryChargeOwner::Connector(_)
+            | ChunkMemoryChargeOwner::SharedConnector { .. } => None,
         }
     }
 }
@@ -274,6 +300,10 @@ enum TransferredChunkBytesOwner {
     Connector {
         _output_memory: Arc<Mutex<ConnectorOutputMemoryToken>>,
         retained_bytes: u64,
+    },
+    SharedConnector {
+        _source: Arc<Vec<SharedSourceHold>>,
+        _output: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
     },
 }
 

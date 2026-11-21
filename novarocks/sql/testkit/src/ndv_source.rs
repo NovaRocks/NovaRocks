@@ -42,7 +42,7 @@ use novarocks_types::schema::ColumnDef;
 use std::sync::Arc;
 
 use novarocks_functions::ConstantPolicy;
-use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
+use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
     SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
@@ -120,10 +120,6 @@ fn sql_source_with_columns_and_semantics(
             min: 1,
             max: 8,
             requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: 64,
-            max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
     );

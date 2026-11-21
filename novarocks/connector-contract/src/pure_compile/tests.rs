@@ -22,12 +22,9 @@ use bytes::Bytes;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, ValueLogicalType,
 };
-use std::{
-    num::NonZeroU64,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 #[derive(Default)]
@@ -135,8 +132,6 @@ fn frozen_read(count: usize) -> FrozenConnectorRead {
         TupleDomain::all(),
         None,
         vec![],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

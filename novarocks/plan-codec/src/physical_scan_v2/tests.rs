@@ -282,10 +282,6 @@ fn source() -> p::PhysicalNode {
         kind: p::NodeKind::Scan {
             occurrence: p::ProviderReadOccurrenceId::new(0),
             relation: Box::new(relation),
-            read_budget: p::ScanReadBudget {
-                max_batch_rows: 0,
-                max_batch_bytes: u64::MAX,
-            },
             provider_outputs: Box::from([(column, p::ValueId::new(u32::MAX))]),
             residuals: Box::from([
                 RootOrdinal::new(1),
@@ -319,10 +315,6 @@ fn expected() -> wire::PhysicalNode {
         kind: Some(wire::physical_node::Kind::Scan(wire::ScanNode {
             occurrence_id: Some(0),
             relation_id: Some(u32::MAX),
-            read_budget: Some(wire::ScanReadBudget {
-                max_batch_rows: 0,
-                max_batch_bytes: u64::MAX,
-            }),
             provider_outputs: vec![wire::ProviderOutput {
                 column_payload_id: Some(u32::MAX),
                 value_id: Some(u32::MAX),
@@ -555,7 +547,7 @@ fn with_token_payload_mode<R>(
 }
 
 #[test]
-fn scan_independent_wire_preserves_distinct_equal_column_owners_and_raw_budget() {
+fn scan_independent_wire_preserves_distinct_equal_column_owners() {
     let node = source();
     let c = Control::default();
     with_tokens(
@@ -601,18 +593,12 @@ fn scan_independent_wire_preserves_distinct_equal_column_owners_and_raw_budget()
             // existing mandatory Fragment owner's responsibility.
             let mut raw = expected();
             wire_scan(&mut raw).occurrence_id = Some(u32::MAX);
-            wire_scan(&mut raw).read_budget = Some(wire::ScanReadBudget {
-                max_batch_rows: u64::MAX,
-                max_batch_bytes: 0,
-            });
             c.arm(None);
             let decoded = decode_scan_node(&raw, rdrelations, rdexpr, SOURCE, limits())
                 .unwrap()
                 .0;
             let body = physical(&decoded).unwrap();
             assert_eq!(body.occurrence.get(), u32::MAX);
-            assert_eq!(body.budget.max_batch_rows, u64::MAX);
-            assert_eq!(body.budget.max_batch_bytes, 0);
         },
     );
 }
@@ -871,7 +857,7 @@ fn scan_required_presence_and_unknown_references_reject_before_emission() {
     let node = source();
     let c = Control::default();
     with_tokens(&node, &c, |_, _, _, rdrelations, rdexpr| {
-        for shape in 0..13 {
+        for shape in [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12] {
             let mut raw = expected();
             match shape {
                 0 => raw.kind = None,
@@ -885,7 +871,6 @@ fn scan_required_presence_and_unknown_references_reject_before_emission() {
                 4 => wire_scan(&mut raw).occurrence_id = None,
                 5 => wire_scan(&mut raw).relation_id = None,
                 6 => wire_scan(&mut raw).relation_id = Some(99),
-                7 => wire_scan(&mut raw).read_budget = None,
                 8 => wire_scan(&mut raw).provider_outputs[0].column_payload_id = None,
                 9 => wire_scan(&mut raw).provider_outputs[0].column_payload_id = Some(99),
                 10 => wire_scan(&mut raw).provider_outputs[0].value_id = None,

@@ -24,7 +24,6 @@
 //! frozen private bytes, because the fixture provider has none.
 
 use std::collections::{BTreeMap, HashMap};
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -229,8 +228,6 @@ fn frozen_read_kind(
         unenforced,
         None,
         dynamic_filters,
-        NonZeroU64::new(1024).unwrap(),
-        NonZeroU64::new(1 << 20).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -958,10 +955,6 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
                         },
                     })
                 }),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 1024,
-                    max_batch_bytes: 1 << 20,
-                },
                 provider_outputs: columns
                     .iter()
                     .cloned()

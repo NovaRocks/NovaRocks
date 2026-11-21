@@ -18,7 +18,7 @@
 //! Connector execution resource accounting.
 
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{ConnectorError, ConnectorErrorKind};
 
@@ -183,6 +183,16 @@ impl ConnectorOutputMemoryToken {
     pub fn into_reservation(self) -> ConnectorResourceReservation {
         self.reservation
     }
+
+    /// Give the source and all outputs that depend on its storage access to
+    /// the lifetime of the original lease.
+    pub fn into_shared_source(self) -> SharedSourceHold {
+        SharedSourceHold {
+            // The backend is Send. The mutex protects custody across threads
+            // without granting access to the underlying reservation.
+            reservation: Arc::new(Mutex::new(self.reservation)),
+        }
+    }
 }
 
 impl Debug for ConnectorOutputMemoryToken {
@@ -194,95 +204,27 @@ impl Debug for ConnectorOutputMemoryToken {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+/// Shared lifetime of an original source reservation. The reservation is
+/// released only after the source and the last dependent output drop this hold.
+#[must_use = "keep the source hold with the storage that depends on it"]
+#[derive(Clone)]
+pub struct SharedSourceHold {
+    reservation: Arc<Mutex<ConnectorResourceReservation>>,
+}
 
-    use super::*;
-
-    struct Ledger {
-        retained: Arc<AtomicU64>,
-    }
-
-    impl ConnectorResourceLedger for Ledger {
-        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
-            Ok(ConnectorResourceCheckpoint::new(9))
-        }
-
-        fn try_reserve(
-            &self,
-            _class: ConnectorResourceClass,
-            bytes: u64,
-        ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
-            self.retained.fetch_add(bytes, Ordering::AcqRel);
-            Ok(Box::new(TestReservation {
-                bytes,
-                retained: Arc::clone(&self.retained),
-            }))
-        }
-    }
-
-    struct TestReservation {
-        bytes: u64,
-        retained: Arc<AtomicU64>,
-    }
-
-    impl ConnectorReservationBackend for TestReservation {
-        fn bytes(&self) -> u64 {
-            self.bytes
-        }
-
-        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
-            self.retained.fetch_add(additional, Ordering::AcqRel);
-            self.bytes += additional;
-            Ok(())
-        }
-
-        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
-            let released = self.bytes - bytes;
-            self.retained.fetch_sub(released, Ordering::AcqRel);
-            self.bytes = bytes;
-            Ok(())
-        }
-    }
-
-    impl Drop for TestReservation {
-        fn drop(&mut self) {
-            self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
-        }
-    }
-
-    #[test]
-    fn output_token_keeps_the_exact_reservation_until_the_last_owner_drops() {
-        let retained = Arc::new(AtomicU64::new(0));
-        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
-            retained: Arc::clone(&retained),
-        }));
-        assert_eq!(resources.checkpoint().unwrap().sequence(), 9);
-        let mut reservation = resources
-            .try_reserve(ConnectorResourceClass::ReaderOutput, 32)
-            .unwrap();
-        reservation.try_grow(8).unwrap();
-        assert_eq!(retained.load(Ordering::Acquire), 40);
-        let token = reservation.into_output(17).unwrap();
-        assert_eq!(token.bytes(), 17);
-        assert_eq!(retained.load(Ordering::Acquire), 17);
-        let moved = token;
-        drop(moved);
-        assert_eq!(retained.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn only_output_reservations_can_cross_the_page_boundary() {
-        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
-            retained: Arc::new(AtomicU64::new(0)),
-        }));
-        let reservation = resources
-            .try_reserve(ConnectorResourceClass::ReaderState, 1)
-            .unwrap();
-        assert_eq!(
-            reservation.into_output(1).unwrap_err().kind(),
-            ConnectorErrorKind::InvalidRequest
-        );
+impl SharedSourceHold {
+    pub fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reservation, &other.reservation)
     }
 }
+
+impl Debug for SharedSourceHold {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedSourceHold")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests;

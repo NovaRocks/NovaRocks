@@ -1,6 +1,6 @@
 # UEA-4A-2 四写入端本地 Parquet 语料
 
-这里保存固定的真实写入结果，供 `novarocks/fs/tests/writer_corpus_conformance.rs` 通过生产 FS reader 逐行验值和绝对物理位置。测试不启动 Spark、Trino、Flink 或 PyArrow，也不会下载或重写输入。缺文件或哈希不符即失败。
+这里保存固定的真实写入结果，供 `novarocks/fs/tests/it/writer_corpus.rs` 通过生产 FS reader 逐行验值和绝对物理位置。测试不启动 Spark、Trino、Flink 或 PyArrow，也不会下载或重写输入。缺文件或哈希不符即失败。
 
 总物料单是 `../manifest.json`；从 `tests/benchmarks/uea4a2/fixtures/` 执行 `python3 verify_manifest.py --verify` 会核验四份原始写入收据、数据文件、绝对位置 oracle、短 Iceberg 表附件及已发布 A4/SSB 基线收据哈希。A4/SSB 的远端快照还需按 `../baselines/README.md` 执行只读在线校验。发布只允许在总物料单尚不存在时显式使用 `--publish`，日常校验只读。
 

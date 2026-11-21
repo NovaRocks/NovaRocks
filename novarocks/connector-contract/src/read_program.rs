@@ -228,7 +228,7 @@ mod tests {
     use super::*;
     use crate::*;
     use bytes::Bytes;
-    use std::{num::NonZeroU64, sync::Arc};
+    use std::sync::Arc;
     struct Control(bool);
     impl PureCompileControl for Control {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -281,8 +281,6 @@ mod tests {
             TupleDomain::all(),
             None,
             vec![],
-            NonZeroU64::new(100).unwrap(),
-            NonZeroU64::new(4096).unwrap(),
         )
         .unwrap()
     }
@@ -350,8 +348,6 @@ mod tests {
             TupleDomain::all(),
             None,
             vec![],
-            NonZeroU64::new(100).unwrap(),
-            NonZeroU64::new(4096).unwrap(),
         )
         .unwrap();
         let public = ConnectorReadPublicFacts::try_new(

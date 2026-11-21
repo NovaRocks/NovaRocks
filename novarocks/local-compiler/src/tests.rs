@@ -21,12 +21,9 @@ use bytes::Bytes;
 use novarocks_connector_contract::*;
 use novarocks_physical_plan::*;
 use novarocks_type_contract::{SemanticParameters, ValueLogicalType};
-use std::{
-    num::NonZeroU64,
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 #[derive(Default)]
@@ -164,10 +161,6 @@ fn add_scan(
                     predicate_guarantees: Box::default(),
                     provided_properties: properties(),
                 })),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 100,
-                    max_batch_bytes: 4096,
-                },
                 provider_outputs: output
                     .iter()
                     .map(|value| (column.clone(), *value))
@@ -195,8 +188,6 @@ fn add_scan(
         TupleDomain::all(),
         None,
         vec![],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

@@ -87,6 +87,7 @@ fn iceberg_readers_ignore_bad_hints_and_keep_only_physical_ids() {
                 )
                 .unwrap();
             let context = FileReadContext {
+                turn: None,
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -519,6 +520,7 @@ fn position_path_predicate_reads_related_groups_and_reports_layout_degradation()
             let receipts = RangeReceipts::default();
             let access = recorded_access(&access, &receipts);
             let context = FileReadContext {
+                turn: None,
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -543,10 +545,13 @@ fn position_path_predicate_reads_related_groups_and_reports_layout_degradation()
                     FileProjection::RootNames(vec!["file_path".into(), "pos".into()]),
                     vec![predicate],
                     context,
-                    FileReaderOptions {
-                        coalesce_reads: coalesce,
-                        ..Default::default()
-                    },
+                    (
+                        default_parquet_reader_sizing(),
+                        FileReaderOptions {
+                            coalesce_reads: coalesce,
+                            ..Default::default()
+                        },
+                    ),
                     |batch| {
                         let file_paths = batch
                             .batch
@@ -704,6 +709,7 @@ fn small_position_file_reports_whole_probe_even_when_one_group_matches() {
         let receipts = RangeReceipts::default();
         let access = recorded_access(&access, &receipts);
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -728,10 +734,13 @@ fn small_position_file_reports_whole_probe_even_when_one_group_matches() {
                 FileProjection::RootNames(vec!["file_path".into(), "pos".into()]),
                 vec![predicate],
                 context,
-                FileReaderOptions {
-                    coalesce_reads: coalesce,
-                    ..Default::default()
-                },
+                (
+                    default_parquet_reader_sizing(),
+                    FileReaderOptions {
+                        coalesce_reads: coalesce,
+                        ..Default::default()
+                    },
+                ),
                 |batch| {
                     positions.extend(
                         batch
@@ -788,6 +797,7 @@ fn delete_async_boundaries_preserve_physical_failure_kinds_and_content_corruptio
         )
         .unwrap();
     let context = FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: None,
         runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -825,6 +835,7 @@ fn delete_async_boundaries_preserve_physical_failure_kinds_and_content_corruptio
                 FileProjection::All,
                 Vec::new(),
                 context.clone(),
+                default_parquet_reader_sizing(),
                 |_| Ok(()),
             ))
             .unwrap_err();
@@ -842,6 +853,7 @@ fn delete_async_boundaries_preserve_physical_failure_kinds_and_content_corruptio
             FileProjection::All,
             Vec::new(),
             context.clone(),
+            default_parquet_reader_sizing(),
             |_| Ok(()),
         ))
         .unwrap_err();
@@ -855,6 +867,7 @@ fn delete_async_boundaries_preserve_physical_failure_kinds_and_content_corruptio
             FileProjection::All,
             Vec::new(),
             context,
+            default_parquet_reader_sizing(),
             |_| Ok(()),
         ))
         .unwrap_err();
@@ -907,6 +920,7 @@ fn delete_async_range_admission_retains_resource_exhausted_and_physical_exit() {
         operations.clone(),
     );
     let context = FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: None,
         runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -934,6 +948,7 @@ fn delete_async_range_admission_retains_resource_exhausted_and_physical_exit() {
             FileProjection::All,
             Vec::new(),
             context,
+            default_parquet_reader_sizing(),
             |_| Ok(()),
         ))
         .unwrap_err();

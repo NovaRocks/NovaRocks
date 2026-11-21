@@ -258,11 +258,12 @@ impl StatementFactScope {
         mut self,
         control: novarocks_sql::compiler::SqlCompileControl,
         cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-        options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
     ) -> Self {
         self.planning = Some(StatementPlanningInputs {
             cancellation,
-            batch_target_rows: snapshot_batch_target(options),
+            batch_target_rows: novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+                .max_rows
+                .get() as usize,
             control,
             cpu: None,
         });
@@ -272,12 +273,13 @@ impl StatementFactScope {
         mut self,
         control: novarocks_sql::compiler::SqlCompileControl,
         cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-        options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
         cpu: Arc<FrontendPlanningCpuSource>,
     ) -> Self {
         self.planning = Some(StatementPlanningInputs {
             cancellation,
-            batch_target_rows: snapshot_batch_target(options),
+            batch_target_rows: novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+                .max_rows
+                .get() as usize,
             control,
             cpu: Some(cpu),
         });
@@ -297,14 +299,6 @@ impl StatementFactScope {
         self.query_local_overlays = overlays;
         self
     }
-}
-
-fn snapshot_batch_target(
-    options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
-) -> usize {
-    let resolved =
-        crate::query_execution::contract::ResolvedQueryOptions::from_upstream(options.cloned());
-    novarocks_execution::runtime::query_options::chunk_size(Some(resolved.runtime_options()))
 }
 
 /// Answers relation lookups from the frontend catalog.
@@ -510,6 +504,9 @@ pub(crate) fn install_frontend_fact_source(
     owners: CompletionFactOwners,
     scope: StatementFactScope,
     session: ConnectorSession,
+    session_properties: Arc<
+        novarocks_query_application::sql::session::registry::SessionPropertyInputs,
+    >,
 ) -> Result<(), String> {
     let mut scope = scope;
     let owned_catalog_cpu = scope.planning.as_mut().and_then(|input| {
@@ -525,6 +522,7 @@ pub(crate) fn install_frontend_fact_source(
             Arc::clone(&owners.connector_control),
             Arc::clone(&scope.bindings),
             session,
+            session_properties,
             scope.connector_context.clone(),
             owners.blocking.clone(),
             scope.capacity.clone(),

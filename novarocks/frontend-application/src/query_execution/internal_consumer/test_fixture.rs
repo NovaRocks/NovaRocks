@@ -95,9 +95,7 @@ async fn original_literal_completed_plan(
 ) -> novarocks_query_application::preparation::CompletedPlanWithAccess<
     crate::query_execution::provider_read_facts::FrozenProviderRead,
 > {
-    use novarocks_physical_plan::{
-        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-    };
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
     use novarocks_query_application::preparation::{
         FinalPlanCompletionDriver, ReadAccessSink, SqlCompletionFactSource,
     };
@@ -139,10 +137,6 @@ async fn original_literal_completed_plan(
             min: 1,
             max: 1,
             requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: MAX_SCAN_BATCH_ROWS,
-            max_batch_bytes: MAX_SCAN_BATCH_BYTES,
         },
         DEFAULT_COMPLETION_LIMITS,
     );

@@ -262,13 +262,6 @@ impl StatisticsRelationIdentity {
 ///
 /// A collection has no session to lower this, so it states the contract's own
 /// maximum, which means "unconstrained" rather than a number someone chose.
-const fn statistics_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
-    novarocks_physical_plan::ScanReadBudget {
-        max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-        max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-    }
-}
-
 fn admit_statistics_scan_binding(
     bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     identity: &StatisticsRelationIdentity,

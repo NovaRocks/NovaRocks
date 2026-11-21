@@ -58,6 +58,15 @@ use crate::connector::ConnectorError;
 #[cfg(test)]
 use crate::connector::ConnectorErrorKind;
 
+/// Settings and result of the first nonempty batch from a physical decoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileReaderFirstBatch {
+    pub max_read_rows: usize,
+    pub max_read_bytes: u64,
+    pub reader_batch_rows: usize,
+    pub decoded_rows: usize,
+}
+
 /// A connector read the host polls for pages.
 ///
 /// `Poll::Pending` means the stream registered the context's waker and will
@@ -67,6 +76,10 @@ use crate::connector::ConnectorErrorKind;
 /// polls the stream no more.
 pub trait ConnectorPageStream: Stream<Item = Result<SourcePage, ConnectorError>> + Send {
     fn metrics(&self) -> PageSourceMetrics;
+
+    fn first_file_batch(&self) -> Option<FileReaderFirstBatch> {
+        None
+    }
 
     fn memory_usage_bytes(&self) -> u64;
 

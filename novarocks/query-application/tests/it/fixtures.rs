@@ -16,7 +16,7 @@
 // under the License.
 use novarocks_coordination_contract::{ExecutionEffect, RecoveryMode};
 use novarocks_functions::ConstantPolicy;
-use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
+use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_query_application::api::QueryExecutionKind;
 use novarocks_query_application::preparation::{
     CompletedPhysicalPlanCandidate, ExecutionResourceRequirements, FrozenCostEstimate,
@@ -64,10 +64,6 @@ pub(super) fn table_free_sql(sql: &str) -> novarocks_sql::compiler::SqlAuthoredP
             min: 1,
             max: 8,
             requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: 64,
-            max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
     );

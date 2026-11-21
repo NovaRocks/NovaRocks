@@ -2501,6 +2501,116 @@ mod tests {
         }
     }
 
+    #[test]
+    fn actual_iceberg_dictionary_values_reuse_the_driver_conversion() {
+        use arrow::array::{Array, ArrayRef, DictionaryArray, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Int32Type};
+        use futures::StreamExt;
+        use novarocks_connector_iceberg::typed_read::reader_test_fixture::{
+            FIRST_VALUE, SECOND_VALUE, open_view_scan,
+        };
+        use novarocks_spi::connector::read_stack::ConnectorPollBudget;
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        use novarocks_types::SlotId;
+
+        use crate::connector::SourcePageConverter;
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        use crate::exec::pipeline::operator::{
+            hydrate_for_downstream_with_factory,
+            input_construction::try_runtime_input_construction_factory,
+        };
+        use crate::runtime::task::ExecutionFailure;
+
+        struct PlainReceiver;
+        impl InputEncodingPolicy for PlainReceiver {}
+
+        let file = std::env::temp_dir().join(format!(
+            "novarocks-dictionary-{}.parquet",
+            uuid::Uuid::now_v7()
+        ));
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let file = RemoveFile(file);
+        let io = tokio::runtime::Runtime::new().unwrap();
+        let budget = ConnectorPollBudget::new();
+        let mut stream = open_view_scan(&file.0, io.handle(), &budget, true);
+        let runtime = Arc::new(RuntimeState::default());
+        let factory = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("real reader conversion"),
+            runtime.error_state(),
+        )
+        .unwrap();
+        let mut driver = PipelineDriver::new(1, Vec::new(), None, Vec::new(), runtime, None);
+        let storage = ValueTypeStorageLifetime::pure();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(1),
+            Arc::new(Field::new("s", DataType::Utf8View, true)),
+            FunctionValueType::new(DataType::Utf8View, true)
+                .typed_binding()
+                .clone(),
+            Some(1),
+            storage.clone(),
+        )
+        .unwrap();
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap());
+        let mut converter = SourcePageConverter::with_output_schema(schema);
+
+        let mut dictionaries: Vec<ArrayRef> = Vec::new();
+        for (index, expected) in [FIRST_VALUE, FIRST_VALUE, SECOND_VALUE, SECOND_VALUE]
+            .into_iter()
+            .enumerate()
+        {
+            budget.refill(64);
+            let page = io.block_on(stream.next()).unwrap().unwrap();
+            let chunk = converter
+                .convert_with_factory(page, factory.as_ref())
+                .unwrap();
+            assert_eq!(chunk.len(), 4);
+            let values = chunk.columns()[0]
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .expect("real Iceberg dictionary")
+                .values()
+                .clone();
+            if let Some(previous) = dictionaries.last() {
+                assert_eq!(Arc::ptr_eq(previous, &values), index % 2 != 0);
+            }
+            dictionaries.push(values.clone());
+            let slice = chunk
+                .slice_typed_observed::<ExecutionFailure, _>(1, 2, storage.clone(), |_| Ok(()))
+                .unwrap();
+            let sliced_values = slice.columns()[0]
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .unwrap()
+                .values();
+            assert!(Arc::ptr_eq(sliced_values, &values));
+            let output = hydrate_for_downstream_with_factory(
+                &chunk,
+                &PlainReceiver,
+                Some(factory.as_ref()),
+                &mut driver.value_conversions,
+            )
+            .unwrap();
+            let output = output.columns()[0]
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            assert_eq!(output.value(0), expected);
+            assert!(output.is_null(1));
+        }
+        assert_eq!(driver.value_conversions.stats().converted_values, 2);
+        assert_eq!(driver.value_conversions.stats().cache_hits, 2);
+        budget.refill(64);
+        assert!(io.block_on(stream.next()).is_none());
+        io.block_on(stream.close()).unwrap();
+    }
+
     /// An asynchronous source can stop being pending between the driver's
     /// first check and its terminal-state check. That transition cannot
     /// complete the driver while the exchange sink still owes its EOS.

@@ -69,6 +69,55 @@ impl TypedConnectorReaderMarker {
         ));
     }
 
+    pub(crate) fn emit_first_file_batch(
+        &self,
+        plan_node: i32,
+        batch: novarocks_spi::connector::read_stack::FileReaderFirstBatch,
+    ) {
+        self.observation.observe(&format!(
+            "{} max_read_rows={} max_read_bytes={} reader_batch_rows={} decoded_rows={} provider={} plan_node={plan_node} scheduled_split_sequence_id={}",
+            novarocks_failpoint::observation_marker::CONNECTOR_PARQUET_FIRST_BATCH,
+            batch.max_read_rows,
+            batch.max_read_bytes,
+            batch.reader_batch_rows,
+            batch.decoded_rows,
+            self.provider_id,
+            self.scheduled_split_sequence_id,
+        ));
+    }
+
+    pub(crate) fn emit_first_chunk(
+        &self,
+        plan_node: i32,
+        chunk: &novarocks_execution::exec::chunk::Chunk,
+    ) {
+        use arrow::datatypes::DataType;
+        let (mut offsets, mut view, mut dictionary, mut binary_offsets, mut binary_view) =
+            (0, 0, 0, 0, 0);
+        for array in chunk.columns() {
+            match array.data_type() {
+                DataType::Utf8 | DataType::LargeUtf8 => offsets += 1,
+                DataType::Utf8View => view += 1,
+                DataType::Dictionary(key, value)
+                    if **key == DataType::Int32
+                        && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+                {
+                    dictionary += 1;
+                }
+                DataType::Binary | DataType::LargeBinary => binary_offsets += 1,
+                DataType::BinaryView => binary_view += 1,
+                _ => {}
+            }
+        }
+        self.observation.observe(&format!(
+            "{} utf8_offsets={offsets} utf8_view={view} utf8_dictionary={dictionary} binary_offsets={binary_offsets} binary_view={binary_view} provider={} plan_node={plan_node} scheduled_split_sequence_id={} rows={}",
+            novarocks_failpoint::observation_marker::CONNECTOR_SCAN_FIRST_CHUNK,
+            self.provider_id,
+            self.scheduled_split_sequence_id,
+            chunk.len(),
+        ));
+    }
+
     pub(crate) fn emit(&self, marker: &str) {
         self.observation.observe(&format!(
             "{marker} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",

@@ -20,6 +20,14 @@ explicit_only = false
 [impact]
 paths = [
     "novarocks/connector/iceberg/**",
+    "novarocks/fs/src/read.rs",
+    "novarocks/fs/src/cache/parquet_cache.rs",
+    "novarocks/fs/src/physical_reader/**",
+    "novarocks/value-arrays/src/measure/**",
+    "novarocks/frontend-application/src/query_execution/provider_read_facts.rs",
+    "novarocks/frontend-application/src/query_execution/package_reads.rs",
+    "novarocks/execution/src/connector/page_adapter.rs",
+    "novarocks/worker/src/typed_connector_runtime/stream.rs",
     "novarocks/types/src/value/variant.rs",
     "novarocks/result-render/src/encoder.rs",
     "novarocks/functions/src/evaluation.rs",

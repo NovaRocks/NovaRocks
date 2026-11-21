@@ -2097,10 +2097,7 @@ mod tests {
         use std::sync::Arc;
 
         use arrow::datatypes::DataType;
-        use novarocks_physical_plan::{
-            MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
-            ScanReadBudget, ValueType,
-        };
+        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ValueType};
         use novarocks_query_application::preparation::{
             FinalPlanCompletionDriver, ReadAccessSink, SqlCompletionFactSource,
         };
@@ -2150,10 +2147,6 @@ mod tests {
                 min: 1,
                 max: 1,
                 requires_power_of_two: false,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         );

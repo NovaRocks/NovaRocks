@@ -32,10 +32,7 @@ use novarocks_type_contract::{
     DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
     SemanticParameters,
 };
-use std::{
-    num::NonZeroU64,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Control {
@@ -66,12 +63,6 @@ fn properties() -> PhysicalProperties {
 }
 fn ty(data_type: DataType) -> ValueType {
     ValueType::new(data_type, false)
-}
-fn budget() -> ScanReadBudget {
-    ScanReadBudget {
-        max_batch_rows: 4096,
-        max_batch_bytes: 8388608,
-    }
 }
 fn encoded(
     binding: &ConnectorReadBinding,
@@ -162,7 +153,6 @@ fn append_scan(
             kind: NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(17),
                 relation: Box::new(relation),
-                read_budget: budget(),
                 provider_outputs: Box::from([(column, value)]),
                 residuals: predicate.into_iter().collect(),
                 derived_values: Box::default(),
@@ -371,8 +361,6 @@ fn package(
         domain,
         None,
         vec![],
-        NonZeroU64::new(budget().max_batch_rows).unwrap(),
-        NonZeroU64::new(budget().max_batch_bytes).unwrap(),
     )
     .unwrap();
     let read = public_read(&fragment, scan, frozen).unwrap();

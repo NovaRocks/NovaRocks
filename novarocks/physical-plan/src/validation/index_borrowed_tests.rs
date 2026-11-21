@@ -271,10 +271,6 @@ fn scan_fixture(count: usize) -> Fragment {
     scan.kind = NodeKind::Scan {
         occurrence: ProviderReadOccurrenceId::new(0),
         relation: Box::new(relation),
-        read_budget: ScanReadBudget {
-            max_batch_rows: 4096,
-            max_batch_bytes: 8 * 1024 * 1024,
-        },
         provider_outputs: Box::from([(column, ValueId::new(7))]),
         residuals: Box::default(),
         derived_values: (0..count)
