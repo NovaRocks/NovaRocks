@@ -30,7 +30,7 @@ use uuid::Uuid;
 use super::iceberg_refresh::IcebergMvCorePorts;
 use crate::connector::mutation::{MutationDispatchState, ResolvedCatalogMutation};
 
-const PROCEDURE: &str = "novarocks_mv_document_expiry";
+pub(crate) const PROCEDURE: &str = "novarocks_mv_document_expiry";
 const MAX_ARGUMENT_BYTES: usize = 4096;
 
 #[derive(Debug, PartialEq, Eq)]

@@ -29,6 +29,7 @@ use novarocks_parser::{Span, ast::TrinoTableExecute};
 use novarocks_query_application::{
     admitted_query_context::QueryExecutionContext,
     api::CommandErrorKind,
+    protocol_delivery::QuerySessionOutput as StatementResult,
     session_control::GovernedStatementAction,
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::{

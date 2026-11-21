@@ -466,7 +466,7 @@ impl MaintenanceCommandPorts {
 pub fn maintenance_command_executor(
     ports: MaintenanceCommandPorts,
 ) -> maintenance_command::MaintenanceCommandExecutor {
-    maintenance_command::MaintenanceCommandExecutor::new(ports.kernel(), ports.runtime)
+    maintenance_command::MaintenanceCommandExecutor::new(ports.kernel())
 }
 
 /// Leaf ports for MV metadata and refresh execution.

@@ -26,8 +26,33 @@ const NOT_IN_TRANSACTION: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
-pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] =
-    &[UNSUPPORTED_STATEMENT, NOT_IN_TRANSACTION];
+const PROCEDURE_NOT_REGISTERED: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.procedure_not_found"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
+pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
+    UNSUPPORTED_STATEMENT,
+    NOT_IN_TRANSACTION,
+    PROCEDURE_NOT_REGISTERED,
+];
+
+pub fn procedure_not_registered(name: &ast::ObjectName) -> QueryServiceError {
+    let procedure = name
+        .parts
+        .last()
+        .expect("parsed CALL name has an identifier");
+    QueryServiceError::from_user_error(UserError::from_descriptor(
+        PROCEDURE_NOT_REGISTERED,
+        format!(
+            "Procedure not registered: system.{}",
+            procedure.value.to_ascii_lowercase()
+        ),
+        None,
+        RetryClass::Never,
+    ))
+}
 
 pub fn unsupported_statement(source: &str, span: Span, subject: &str) -> QueryServiceError {
     unsupported_statement_detail(source, span, format!("{subject} is not supported"))
