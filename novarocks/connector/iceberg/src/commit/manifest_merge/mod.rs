@@ -63,6 +63,11 @@ impl<'a> MergeCandidate<'a> {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn into_descriptor(self) -> ManifestFile {
+        self.descriptor
+    }
+
     fn source(&self, snapshot_id: i64) -> ManifestSource<'_> {
         match self.committed {
             Some((snapshot_id, list_path)) => {

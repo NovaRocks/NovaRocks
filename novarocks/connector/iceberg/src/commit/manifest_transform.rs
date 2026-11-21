@@ -138,6 +138,47 @@ async fn ordinary_manifests_core(
             .await?
         }
     };
+    count_manifests(snapshot_id, manifests, eligible_previous)
+}
+
+/// Filtered deletes retain every untouched live source by reference.
+#[cfg(test)]
+pub(super) async fn filtered_manifests(
+    view: &super::staging::StagedView<'_>,
+    snapshot_id: i64,
+    sources: Option<&SnapshotSources<'_>>,
+    removed: &[&LocatedEntry],
+    scope: Option<&ManifestReadScope>,
+) -> Result<OrdinaryManifests> {
+    let Some(sources) = sources else {
+        return count_manifests(snapshot_id, Vec::new(), 0);
+    };
+    let (filtered, eligible_previous) = apply_removals(
+        view.metadata(),
+        view.artifacts(),
+        view.preparation().io_window_width,
+        view.stage_key(),
+        snapshot_id,
+        sources,
+        removed.iter().copied(),
+        scope.map(|scope| (scope, false)),
+    )
+    .await?;
+    count_manifests(
+        snapshot_id,
+        filtered
+            .into_iter()
+            .map(MergeCandidate::into_descriptor)
+            .collect(),
+        eligible_previous,
+    )
+}
+
+fn count_manifests(
+    snapshot_id: i64,
+    manifests: Vec<ManifestFile>,
+    eligible_previous: usize,
+) -> Result<OrdinaryManifests> {
     let created = manifests
         .iter()
         .filter(|manifest| manifest.added_snapshot_id == snapshot_id)

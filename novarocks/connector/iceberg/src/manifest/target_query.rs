@@ -527,6 +527,27 @@ impl ManifestReadScope {
         io: &FileIO,
         active: &(impl Fn() -> Result<()> + Sync),
     ) -> Result<BTreeMap<EntryIdentity, LocatedEntry>> {
+        self.locate_removals(required, false, io, active).await
+    }
+
+    /// The supplied data entries were already located on this snapshot.
+    #[cfg(test)]
+    pub(crate) async fn locate_live_dangling_dvs(
+        &mut self,
+        removed_data: &BTreeMap<&EntryIdentity, &FrozenEntry>,
+        io: &FileIO,
+        active: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<BTreeMap<EntryIdentity, LocatedEntry>> {
+        self.locate_removals(removed_data, true, io, active).await
+    }
+
+    async fn locate_removals(
+        &mut self,
+        required: &BTreeMap<&EntryIdentity, &FrozenEntry>,
+        dangling_only: bool,
+        io: &FileIO,
+        active: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<BTreeMap<EntryIdentity, LocatedEntry>> {
         active()?;
         let domain = self.domain.clone();
         let endpoint = domain.endpoint();
@@ -556,7 +577,9 @@ impl ManifestReadScope {
             let partition = TypedPartition::bind_type(spec, partition_type, &facts.partition)
                 .map_err(delete_error)?;
             partitions.insert((partition, data));
-            required_paths.insert(identity.path());
+            if !dangling_only {
+                required_paths.insert(identity.path());
+            }
             if data {
                 dangling_data_paths.insert(identity.path());
             }
@@ -572,6 +595,9 @@ impl ManifestReadScope {
                 .partition_spec_by_id(spec_id)
                 .ok_or_else(|| invalid(format!("Unknown target partition spec {spec_id}")))?;
             let data = descriptor.content == ManifestContentType::Data;
+            if dangling_only && data {
+                continue;
+            }
             if partitions.iter().any(|(partition, data_requested)| {
                 (!data || *data_requested) && may_contain(descriptor, spec, partition)
             }) {

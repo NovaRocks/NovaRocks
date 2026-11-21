@@ -57,6 +57,45 @@ pub(crate) async fn locate_on_base<'a>(
         .collect()
 }
 
+/// Complete an existing selection authored from the same immutable base.
+#[cfg(test)]
+pub(super) async fn include_dangling_on_base(
+    scope: &mut ManifestReadScope,
+    removals: &mut BTreeMap<super::model::EntryIdentity, LocatedEntry>,
+    io: &FileIO,
+    active: impl Fn() -> Result<()> + Sync,
+) -> Result<()> {
+    let mut data = BTreeMap::new();
+    for (identity, entry) in removals.iter() {
+        active()?;
+        if matches!(identity, super::model::EntryIdentity::DataFile { .. }) {
+            data.insert(identity, &entry.frozen);
+        }
+    }
+    if data.is_empty() {
+        return Ok(());
+    }
+    let dangling = scope.locate_live_dangling_dvs(&data, io, &active).await?;
+    let sources = scope.snapshot_sources()?;
+    for (identity, entry) in dangling {
+        active()?;
+        let entry = manifest_removal_location(&sources, entry)?;
+        match removals.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                let selected = slot.get();
+                if selected.source_index != entry.source_index || selected.ordinal != entry.ordinal
+                {
+                    return Err(duplicate_identity(slot.key()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn manifest_removal_location(
     sources: &SnapshotSources<'_>,
     mut entry: LocatedEntry,
