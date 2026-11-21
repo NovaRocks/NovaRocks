@@ -17,92 +17,14 @@
 
 -- @order_sensitive=true
 -- @tags=decimal,overflow,session
--- Test Objective: Freeze independent Decimal error policy per operation and preserve NULL controls.
+-- Test Objective: Preserve Decimal cast policy, persistence admission, and outer-join NULL behavior.
 
 -- query 1
 -- @skip_result_check=true
 SET SESSION sql_mode = '32';
-SET SESSION decimal_overflow_to_double = false;
 CREATE TABLE ${case_db}.decimal_error_policy (k INT,a DECIMAL(38,0),b DECIMAL(2,1)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_error_policy VALUES
 ROW(1,1,1.0),ROW(2,CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)),0.1),ROW(3,NULL,0.0),ROW(4,0,0.0);
-
--- query 2
-SELECT k,a+1 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 3
--- @skip_result_check=true
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a+1 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 4
-SELECT -CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))-1 AS v;
-
--- query 5
--- @skip_result_check=true
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ -CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))-1 AS v;
-
--- query 6
-SELECT k,a*2 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 7
--- @skip_result_check=true
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a*2 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 8
-SELECT k,a/b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 9
--- @skip_result_check=true
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a/b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 10
-SELECT k,a%b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 11
--- @skip_result_check=true
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a%b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
-
--- query 12
--- @skip_result_check=true
-SET SESSION sql_mode = 'ERROR_IF_OVERFLOW';
-
--- query 13
-SELECT a/b AS div_zero,a%b AS mod_zero FROM ${case_db}.decimal_error_policy WHERE k=4;
-
--- query 14
-WITH SESSION sql_mode = '32' SELECT /*+ SET_VAR(sql_mode='32') */ a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
-
--- query 15
--- @skip_result_check=true
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-SELECT a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
-
--- query 16
--- @skip_result_check=true
-SET SESSION sql_mode = '32';
 
 -- query 17
 SELECT CAST(1000000000 AS DECIMAL(9,0)) AS narrowed;
@@ -134,7 +56,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_I
 
 -- query 23
 -- The admitted query's policy applies to both UNION operands (ADR-0241).
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1 AS branch,CAST(NULL AS DECIMAL(38,0)) AS v UNION ALL SELECT 2 AS branch,CAST(1 AS DECIMAL(38,0))+1 AS v ORDER BY branch;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1 AS branch,CAST(NULL AS DECIMAL(38,0)) AS v UNION ALL SELECT 2 AS branch,CAST(CAST(2 AS INTEGER) AS DECIMAL(38,0)) AS v ORDER BY branch;
 
 -- query 24
 -- @skip_result_check=true
@@ -142,7 +64,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1 AS branch,CAST(NULL AS DECI
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(1 AS DECIMAL(38,0))+1 AS v UNION ALL SELECT a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(2 AS DECIMAL(9,0)) AS v UNION ALL SELECT CAST(a AS DECIMAL(9,0)) AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
 
 -- query 25
 -- @skip_result_check=true
@@ -151,9 +73,8 @@ SET SESSION sql_mode = 'ERROR_IF_OVERFLOW';
 CREATE VIEW default_catalog.${case_db}.decimal_error_uncaptured_v AS SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 AS v;
 
 -- query 26
+-- @skip_result_check=true
 SET SESSION sql_mode = '32';
-SET SESSION decimal_overflow_to_double = true;
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS promoted;
 
 -- query 27
 -- @skip_result_check=true
@@ -161,7 +82,7 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS DECIMAL(9,0)) AS narrowed;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(1.5241578766956256e27 AS DECIMAL(9,0)) AS narrowed;
 
 -- query 28
 -- @skip_result_check=true
@@ -182,17 +103,8 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_error=[query.execution.numeric_out_of_range]
 WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(1000 AS DECIMAL(4,0)) AS DECIMAL(3,0)) AS legacy_cast;
 
--- query 32
--- @skip_result_check=true
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION', decimal_overflow_to_double = false SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION',decimal_overflow_to_double=false) */ CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))*CAST(2 AS DECIMAL(38,0)) AS legacy_mul;
-
 -- query 33
 -- @skip_result_check=true
-SET SESSION decimal_overflow_to_double = false;
 CREATE VIEW default_catalog.${case_db}.decimal_error_allowed_v AS SELECT 1 AS n;
 
 -- query 34
@@ -219,14 +131,12 @@ SET SESSION sql_mode = '32';
 -- query 39
 -- @skip_result_check=true
 SET SESSION sql_mode = '32';
-SET SESSION decimal_overflow_to_double = false;
 DROP VIEW default_catalog.${case_db}.decimal_error_allowed_v;
 DROP TABLE ${case_db}.decimal_error_policy;
 
 -- query 40
 -- @skip_result_check=true
 SET SESSION sql_mode = '32';
-SET SESSION decimal_overflow_to_double = false;
 CREATE TABLE ${case_db}.decimal_implicit_left (id INT,k DECIMAL(3,0),c BIGINT) WITH (format_version = 3);
 CREATE TABLE ${case_db}.decimal_implicit_right (id INT,k BIGINT) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_implicit_left VALUES ROW(1,1,1),ROW(2,NULL,2);

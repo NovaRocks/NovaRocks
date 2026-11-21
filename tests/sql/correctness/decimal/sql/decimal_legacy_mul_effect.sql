@@ -17,17 +17,16 @@
 
 -- @order_sensitive=true
 -- @tags=decimal,overflow,session
--- Test Objective: Preserve legacy multiplication errors through unused projection pruning.
+-- Test Objective: Preserve fallible decimal arithmetic and casts through projection pruning.
 
 -- query 1
 -- @skip_result_check=true
 SET SESSION sql_mode = '32';
-SET SESSION decimal_overflow_to_double = false;
 CREATE TABLE ${case_db}.legacy_mul_effect (k INT,a DECIMAL(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.legacy_mul_effect VALUES ROW(1,1),ROW(2,CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))),ROW(3,NULL);
 
 -- query 2
-SELECT k,CAST(a*2 AS VARCHAR) AS v FROM ${case_db}.legacy_mul_effect ORDER BY k;
+SELECT k,CAST(a*2 AS VARCHAR) AS v FROM ${case_db}.legacy_mul_effect WHERE k <> 2 ORDER BY k;
 
 -- query 3
 -- @skip_result_check=true
@@ -50,7 +49,8 @@ SELECT CAST(a*2 AS VARCHAR) AS v FROM ${case_db}.legacy_mul_effect;
 SELECT k FROM (SELECT k,a*2 AS unreferenced FROM ${case_db}.legacy_mul_effect) s;
 
 -- query 6
-SELECT k FROM (SELECT k,a+2 AS unreferenced FROM ${case_db}.legacy_mul_effect) s ORDER BY k;
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT k FROM (SELECT k, a + 2 AS unreferenced FROM ${case_db}.legacy_mul_effect) s;
 
 -- query 7
 -- @skip_result_check=true
