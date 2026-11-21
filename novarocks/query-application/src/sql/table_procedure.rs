@@ -17,6 +17,7 @@
 
 //! Table EXECUTE procedure declarations, name resolution and argument custody.
 
+mod data_size;
 mod retention;
 
 pub use retention::ProcedureRetentionDuration;
@@ -27,8 +28,8 @@ use novarocks_parser::{
     ast::{CallArgument, Expr, Ident},
 };
 use novarocks_spi::connector::{
-    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorProviderId, DdlPropertyType,
-    DdlPropertyValue,
+    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorDataSize, ConnectorProviderId,
+    DdlPropertyType, DdlPropertyValue,
 };
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
 use novarocks_user_error::{
@@ -92,6 +93,7 @@ pub enum ProcedureArgumentEnum {
 pub enum ProcedureArgumentDefault {
     Boolean(bool),
     Varchar(&'static str),
+    DataSizeBytes(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,7 +101,7 @@ pub struct TableProcedureArgument {
     pub name: &'static str,
     pub value_type: ProcedureArgumentType,
     pub default: Option<ProcedureArgumentDefault>,
-    pub supports_explicit_value: bool,
+    explicit_value_unavailable: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,7 +136,7 @@ const fn argument(name: &'static str, value_type: ProcedureArgumentType) -> Tabl
         name,
         value_type,
         default: None,
-        supports_explicit_value: true,
+        explicit_value_unavailable: None,
     }
 }
 
@@ -149,9 +151,12 @@ const fn with_default(
     }
 }
 
-const fn unsupported(declaration: TableProcedureArgument) -> TableProcedureArgument {
+const fn unsupported(
+    declaration: TableProcedureArgument,
+    reason: &'static str,
+) -> TableProcedureArgument {
     TableProcedureArgument {
-        supports_explicit_value: false,
+        explicit_value_unavailable: Some(reason),
         ..declaration
     }
 }
@@ -174,17 +179,21 @@ const RETENTION: TableProcedureArgument = with_default(
     Value(Type::Varchar),
     DefaultValue::Varchar("7d"),
 );
+const OPTIMIZE_THRESHOLD: TableProcedureArgument = with_default(
+    "file_size_threshold",
+    Value(Type::Varchar),
+    DefaultValue::DataSizeBytes(100 * 1024 * 1024),
+);
 const ICEBERG: &[TableProcedure] = &[
     procedure(
         TableProcedureKind::Optimize,
         "OPTIMIZE",
         &[
-            unsupported(with_default(
-                "file_size_threshold",
-                Value(Type::Varchar),
-                DefaultValue::Varchar("100MB"),
-            )),
-            unsupported(argument("sorted_by", Value(Type::ArrayVarchar))),
+            OPTIMIZE_THRESHOLD,
+            unsupported(
+                argument("sorted_by", Value(Type::ArrayVarchar)),
+                "it requires support for writing files in the specified sort order",
+            ),
         ],
     ),
     procedure(
@@ -373,6 +382,7 @@ pub enum BoundProcedureValue<'a> {
     AddFilesFormat(ConnectorAddFilesFormat),
     AddFilesRecursion(ConnectorAddFilesRecursion),
     RetentionDuration(ProcedureRetentionDuration),
+    FileSizeThreshold(ConnectorDataSize),
     EqualityRows(&'a Expr),
 }
 
@@ -450,7 +460,7 @@ pub fn bind_arguments<'a>(
                     value: bind_value(
                         slot,
                         input,
-                        EnumArgumentContext {
+                        ArgumentContext {
                             sql: source.sql,
                             catalog: source.catalog,
                             procedure: procedure.name,
@@ -556,9 +566,9 @@ fn bind_slots<'a, A: Copy>(
             position
         };
         let slot = &procedure.arguments[index];
-        if !slot.supports_explicit_value {
+        if let Some(reason) = slot.explicit_value_unavailable {
             return Err(not_supported(format!(
-                "Table procedure {} argument '{}' is not supported",
+                "Table procedure {} argument '{}' is not supported: {reason}",
                 procedure.name, slot.name
             )));
         }
@@ -575,7 +585,7 @@ fn bind_slots<'a, A: Copy>(
 }
 
 #[derive(Clone, Copy)]
-struct EnumArgumentContext<'a> {
+struct ArgumentContext<'a> {
     sql: &'a str,
     catalog: &'a str,
     procedure: &'static str,
@@ -585,7 +595,7 @@ struct EnumArgumentContext<'a> {
 fn bind_value<'a>(
     slot: &TableProcedureArgument,
     input: ProcedureInput<'a>,
-    binding: EnumArgumentContext<'_>,
+    binding: ArgumentContext<'_>,
     constants: &mut dyn DdlPropertyConstantPort,
     control: &dyn PureCompileControl,
 ) -> Result<BoundProcedureValue<'a>, QueryServiceError> {
@@ -594,7 +604,7 @@ fn bind_value<'a>(
     {
         return Ok(BoundProcedureValue::EqualityRows(expression));
     }
-    let EnumArgumentContext {
+    let ArgumentContext {
         sql: source,
         catalog,
         span,
@@ -632,6 +642,12 @@ fn bind_value<'a>(
         return ProcedureRetentionDuration::parse(source, span, text, control)
             .map(BoundProcedureValue::RetentionDuration);
     }
+    if let DdlPropertyValue::Varchar(text) = &value
+        && slot.name == OPTIMIZE_THRESHOLD.name
+    {
+        return data_size::parse_file_size_threshold(binding, text, control)
+            .map(BoundProcedureValue::FileSizeThreshold);
+    }
     Ok(BoundProcedureValue::Value(value))
 }
 
@@ -640,7 +656,7 @@ fn bind_procedure_enum<'a>(
     name: &str,
     expression: &Expr,
     input: &str,
-    context: EnumArgumentContext<'_>,
+    context: ArgumentContext<'_>,
 ) -> Result<BoundProcedureValue<'a>, QueryServiceError> {
     const STORAGE_FORMATS: &[&str] = &[
         "ORC",
@@ -820,94 +836,4 @@ fn not_supported(message: impl Into<String>) -> QueryServiceError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::property_evaluation::DdlPropertyConstantError;
-    use super::*;
-    use novarocks_constant_contract::ConstantValue;
-    use novarocks_parser::parser::parse_expression;
-    use novarocks_sql::compiler::{RequiredConstantTarget, SqlCompileControl};
-
-    struct UnreachedEvaluation;
-    impl DdlPropertyConstantPort for UnreachedEvaluation {
-        fn evaluate(
-            &mut self,
-            _: &Expr,
-            _: RequiredConstantTarget,
-        ) -> Result<ConstantValue, DdlPropertyConstantError> {
-            panic!("argument shape must be refused before evaluating its value")
-        }
-    }
-    #[test]
-    fn table_procedure_argument_shape_preserves_pin_error_identities() {
-        let provider = ConnectorProviderId::parse("iceberg").unwrap();
-        for (sql, expected) in [
-            (
-                "expire_snapshots(1, retain_last => 2)",
-                "sql.admit.invalid_table_procedure_arguments",
-            ),
-            (
-                "optimize_manifests(1)",
-                "sql.admit.invalid_table_procedure_arguments",
-            ),
-            (
-                "expire_snapshots(retain_last => 1, RETAIN_LAST => 2)",
-                "sql.admit.duplicate_table_procedure_argument",
-            ),
-            (
-                "expire_snapshots(unknown => 1)",
-                "sql.admit.invalid_table_procedure_argument",
-            ),
-        ] {
-            // These are real shared CallArgument nodes from the Trino parser.
-            // The statement-level TableExecute producer is a separate consumer.
-            let Expr::FunctionCall(call) = parse_expression(sql).unwrap() else {
-                panic!("procedure argument syntax")
-            };
-            let procedure =
-                resolve_table_procedure(&provider, call.name.parts.last().unwrap()).unwrap();
-            let args = call
-                .arguments
-                .iter()
-                .map(TableProcedureInputArgument::from)
-                .collect::<Vec<_>>();
-            let error = bind_arguments(
-                procedure,
-                &args,
-                TableProcedureBindingSource {
-                    sql,
-                    catalog: "iceberg",
-                    statement_span: call.span,
-                },
-                &mut UnreachedEvaluation,
-                &SqlCompileControl::unbounded(),
-            )
-            .unwrap_err();
-            let user = error.user_error().unwrap();
-            assert_eq!(user.code().as_str(), expected, "{sql}");
-            assert!(user.location().is_some());
-        }
-        let Expr::Identifier(name) = parse_expression("missing_procedure").unwrap() else {
-            panic!("real procedure identifier");
-        };
-        let error = resolve_table_procedure(&provider, &name).unwrap_err();
-        let user = error.user_error().unwrap();
-        assert_eq!(user.code().as_str(), "sql.admit.table_procedure_not_found");
-        assert!(user.location().is_none());
-    }
-
-    #[test]
-    fn equality_delete_resolution_matches_the_build_profile() {
-        let provider = ConnectorProviderId::parse("iceberg").unwrap();
-        let Expr::Identifier(name) = parse_expression("add_equality_delete").unwrap() else {
-            panic!("real procedure name");
-        };
-        let result = resolve_table_procedure(&provider, &name);
-        #[cfg(novarocks_dev_controls)]
-        assert!(result.unwrap().dev_only());
-        #[cfg(not(novarocks_dev_controls))]
-        assert_eq!(
-            result.unwrap_err().user_error().unwrap().code().as_str(),
-            "sql.admit.table_procedure_not_found"
-        );
-    }
-}
+mod tests;

@@ -70,6 +70,7 @@ pub(crate) fn prepare_resolved_optimize(
     kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
     engine: RequestScopedMaintenanceEngine,
     target: MaintenanceTarget,
+    file_size_threshold_bytes: u64,
     planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     family: novarocks_result_contract::ClientPresentationFamily,
@@ -82,7 +83,7 @@ pub(crate) fn prepare_resolved_optimize(
         engine,
         target,
         RewriteIntent::Optimize {
-            file_size_threshold_bytes: 100 * 1024 * 1024,
+            file_size_threshold_bytes,
         },
         planning,
         execution,
