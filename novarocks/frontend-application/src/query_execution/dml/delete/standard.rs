@@ -1250,6 +1250,9 @@ mod tests {
         });
         let error = super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
             .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");
+        let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+            panic!("expected the original DATETIME validation error");
+        };
         assert!(error.contains("DATETIME"), "{error}");
     }
 }
