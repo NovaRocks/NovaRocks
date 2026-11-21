@@ -1596,9 +1596,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     }
                     self.load_mv_target_relation_async(name).await?
                 }
-                K::TableExecute { .. } => {
-                    return Err(unsupported("Iceberg table-execute reads are retired"));
-                }
                 _ => {
                     if system_relation_of(name.table_name()).is_some() {
                         return Ok(None);
@@ -1792,9 +1789,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             K::Delta { window } => {
                 pinned_change_window_handle(name, physical.table.metadata(), *window)?
                     .map(crate::typed_read::IcebergRuntimeRelation::ChangeWindow)
-            }
-            K::TableExecute { .. } => {
-                return Err(unsupported("Iceberg table-execute reads are retired"));
             }
             K::Metadata { .. } => {
                 let (base_table, relation) =
@@ -2262,15 +2256,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             pinned_change_window_handle(name, physical.table.metadata(), window)?
                 .map(crate::typed_read::IcebergRuntimeRelation::ChangeWindow),
         )
-    }
-
-    fn get_table_execute_plan(
-        &self,
-        _session: &ConnectorSession,
-        _name: &SchemaTableName,
-        _procedure: novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure,
-    ) -> Result<Option<Self::Table>, ConnectorError> {
-        Err(unsupported("Iceberg table-execute reads are retired"))
     }
 }
 

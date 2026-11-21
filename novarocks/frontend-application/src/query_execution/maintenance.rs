@@ -472,31 +472,6 @@ fn prepare_rewrite_cohort_recipe(
                 physical_plan,
             )
         }
-        ConnectorRewriteCohortRead::DeleteArtifactGroup(group) => {
-            let read = crate::query_execution::cohort_read::QueryRewriteGroupRead {
-                group: group.clone(),
-                group_digest: cohort.group_digest(),
-                planning_pin: session.rewrite().planning_pin(),
-            };
-            let source_binding =
-                crate::query_execution::distributed_rewrite::admit_rewrite_group_scan_binding(
-                    table_bindings.as_ref(),
-                    cohort.scan_execution_schema(),
-                    read.clone(),
-                )?;
-            let physical_plan =
-                crate::query_execution::distributed_rewrite::rewrite_group_scan_physical_plan(
-                    cohort.scan_execution_schema(),
-                    source_binding,
-                )?;
-            (
-                crate::catalog_application::query_bindings::QueryFrozenCohortRead::TableExecute(
-                    read,
-                ),
-                source_binding,
-                physical_plan,
-            )
-        }
     };
     // The session sealed one logical target per frozen group, so this group's
     // writer recipe and its ordinal both come from there. Deriving the ordinal

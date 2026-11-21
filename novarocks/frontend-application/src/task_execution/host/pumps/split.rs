@@ -864,7 +864,6 @@ fn split_backing_bytes(assignment: &wire::SplitAssignment) -> Option<usize> {
             Some(Category::TableChanges(source)) => source.provider_payload.as_ref(),
             Some(Category::ChangeWindow(source)) => source.provider_payload.as_ref(),
             Some(Category::SystemManifest(source)) => source.provider_payload.as_ref(),
-            Some(Category::RewritePositionDeleteFiles(source)) => source.provider_payload.as_ref(),
             Some(Category::SystemRelation(source)) => source.provider_payload.as_ref(),
             None => None,
         };

@@ -181,104 +181,22 @@ impl ConnectorDistributedRewritePlanSummary {
     }
 }
 
-/// One cohort's attempt-local immutable input, owned by its provider.
-#[derive(Clone, Debug)]
-pub struct ConnectorFrozenRewriteGroup {
-    schema_name: Arc<str>,
-    table_name: Arc<str>,
-    operation_id: ConnectorWriteOperationId,
-    artifact_digest: [u8; 32],
-    content: super::ConnectorProcessLocalPayload,
-}
-impl PartialEq for ConnectorFrozenRewriteGroup {
-    fn eq(&self, other: &Self) -> bool {
-        self.schema_name == other.schema_name
-            && self.table_name == other.table_name
-            && self.operation_id == other.operation_id
-            && self.artifact_digest == other.artifact_digest
-    }
-}
-impl Eq for ConnectorFrozenRewriteGroup {}
-impl ConnectorFrozenRewriteGroup {
-    pub fn try_new(
-        schema_name: impl AsRef<str>,
-        table_name: impl AsRef<str>,
-        operation_id: ConnectorWriteOperationId,
-        artifact_digest: [u8; 32],
-        content: super::ConnectorProcessLocalPayload,
-    ) -> Result<Self, ConnectorError> {
-        if schema_name.as_ref().is_empty() || table_name.as_ref().is_empty() {
-            return Err(invalid(
-                "distributed rewrite cohort group requires a schema-qualified relation name",
-            ));
-        }
-        Ok(Self {
-            schema_name: Arc::from(schema_name.as_ref()),
-            table_name: Arc::from(table_name.as_ref()),
-            operation_id,
-            artifact_digest,
-            content,
-        })
-    }
-    pub fn schema_name(&self) -> &str {
-        &self.schema_name
-    }
-    pub fn table_name(&self) -> &str {
-        &self.table_name
-    }
-    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.operation_id
-    }
-    pub const fn artifact_digest(&self) -> [u8; 32] {
-        self.artifact_digest
-    }
-    pub fn content(&self) -> &super::ConnectorProcessLocalPayload {
-        &self.content
-    }
-    fn digest_into(&self, hash: &mut Sha256) {
-        digest_bytes(hash, self.schema_name.as_bytes());
-        digest_bytes(hash, self.table_name.as_bytes());
-        hash.update(self.operation_id.to_bytes());
-        hash.update(self.artifact_digest);
-    }
-}
-
-/// What one sealed cohort reads.
-///
-/// Both variants name their input exactly, and both name the same set the
-/// cohort's commit replaces. The choice is a fact of the operation, not a
-/// preference: a rewrite of table rows has a data file set to pin, and a
-/// rewrite of delete artifacts has none, because it never reads table rows at
-/// all. Modelling that as one optional pin would let a cohort with neither
-/// reach execution.
+/// The exact data input for one sealed rewrite cohort.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorRewriteCohortRead {
-    /// Exactly the data files this cohort rewrites.
     PinnedFileSet(ConnectorPinnedFileSet),
-    /// Exactly the frozen group whose delete artifacts this cohort rewrites.
-    DeleteArtifactGroup(ConnectorFrozenRewriteGroup),
 }
 
 impl ConnectorRewriteCohortRead {
     fn digest_into(&self, hash: &mut Sha256) {
-        // Which files a cohort reads is part of what it is, so two cohorts
-        // that differ only in their input never share a digest -- and the two
-        // read families are tagged apart before their facts are folded in.
-        match self {
-            Self::PinnedFileSet(pinned) => {
-                hash.update([0]);
-                digest_bytes(hash, pinned.namespace().as_bytes());
-                digest_bytes(hash, pinned.table().as_bytes());
-                hash.update(pinned.version_ordinal().to_be_bytes());
-                hash.update((pinned.files().len() as u64).to_be_bytes());
-                for file in pinned.files() {
-                    digest_bytes(hash, file.as_bytes());
-                }
-            }
-            Self::DeleteArtifactGroup(group) => {
-                hash.update([1]);
-                group.digest_into(hash);
-            }
+        let Self::PinnedFileSet(pinned) = self;
+        hash.update([0]);
+        digest_bytes(hash, pinned.namespace().as_bytes());
+        digest_bytes(hash, pinned.table().as_bytes());
+        hash.update(pinned.version_ordinal().to_be_bytes());
+        hash.update((pinned.files().len() as u64).to_be_bytes());
+        for file in pinned.files() {
+            digest_bytes(hash, file.as_bytes());
         }
     }
 }

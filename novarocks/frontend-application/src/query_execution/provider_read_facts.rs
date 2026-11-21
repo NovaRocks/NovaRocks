@@ -629,10 +629,6 @@ impl AdmittedRead {
                 read.pinned.namespace().to_string(),
                 read.pinned.table().to_string(),
             ),
-            Self::Cohort(QueryFrozenCohortRead::TableExecute(read)) => (
-                read.group.schema_name().to_string(),
-                read.group.table_name().to_string(),
-            ),
         };
         SchemaTableName::try_new(&namespace, &table).map_err(ProviderReadError::from)
     }
@@ -760,8 +756,7 @@ fn prepare_read_opening(
                                 )?,
                             )
                         }
-                        QueryFrozenReadInput::PinnedFileSet
-                        | QueryFrozenReadInput::TableExecute => AdmittedRead::Cohort(
+                        QueryFrozenReadInput::PinnedFileSet => AdmittedRead::Cohort(
                             bindings.frozen_cohort_read(need.binding(), input).map_err(
                                 |error| {
                                     ProviderReadError::from(error)
@@ -874,15 +869,14 @@ async fn prepare_observation(
             preparation_digest: *preparation_digest,
         }
     } else if let AdmittedRead::Cohort(cohort) = &opening.admitted {
-        match (need.relation(),cohort) {
-            (ProviderReadRelationNeed::PinnedFileSet { .. },QueryFrozenCohortRead::PinnedFileSet(read)) => {
-                K::PinnedFileSet { pinned:read.pinned.clone() }
+        match (need.relation(), cohort) {
+            (
+                ProviderReadRelationNeed::PinnedFileSet { .. },
+                QueryFrozenCohortRead::PinnedFileSet(read),
+            ) => K::PinnedFileSet {
+                pinned: read.pinned.clone(),
             },
-            (ProviderReadRelationNeed::TableExecute { .. },QueryFrozenCohortRead::TableExecute(read)) => {
-                K::TableExecute { procedure:novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
-                    novarocks_spi::connector::read_stack::ConnectorReadFrozenRewriteGroup::from_cohort(&read.group,read.group_digest)) }
-            },
-            (relation,_)=>return Err(unsupported_family(relation).into()),
+            (relation, _) => return Err(unsupported_family(relation).into()),
         }
     } else {
         match need.relation() {
@@ -1005,9 +999,6 @@ fn relation_open_error(
                 read.pinned.version_ordinal()
             )
         }
-        ProviderReadRelationNeed::TableExecute { .. } => {
-            format!("provider read of {name} cannot be opened as table-execute")
-        }
     };
     ProviderReadError::from(error).context(context)
 }
@@ -1032,9 +1023,6 @@ fn relation_open_missing(
         }
         ProviderReadRelationNeed::PinnedFileSet { .. } => {
             format!("provider read of {name} exposes no pinned file set read")
-        }
-        ProviderReadRelationNeed::TableExecute { .. } => {
-            format!("provider read of {name} exposes no table-execute relation")
         }
     })
 }
@@ -1390,9 +1378,6 @@ fn frozen_input(
         ProviderReadRelationNeed::PinnedFileSet { .. } => {
             return Ok(QueryFrozenReadInput::PinnedFileSet);
         }
-        ProviderReadRelationNeed::TableExecute { .. } => {
-            return Ok(QueryFrozenReadInput::TableExecute);
-        }
         // The binding retains the exact admitted generation. The endpoints
         // are stated by the Delta need and select the window at open time.
         ProviderReadRelationNeed::Delta { .. } => return Ok(QueryFrozenReadInput::Current),
@@ -1423,7 +1408,6 @@ fn unsupported_family(relation: &ProviderReadRelationNeed) -> String {
         ProviderReadRelationNeed::Delta { .. } => ("change window", "incremental view maintenance"),
         ProviderReadRelationNeed::MvTarget { .. } => ("MV target", "incremental view maintenance"),
         ProviderReadRelationNeed::PinnedFileSet { .. } => ("pinned file set", "row mutation"),
-        ProviderReadRelationNeed::TableExecute { .. } => ("table execute", "table maintenance"),
         ProviderReadRelationNeed::Data { .. }
         | ProviderReadRelationNeed::FrozenInputSet { .. }
         | ProviderReadRelationNeed::Metadata { .. } => ("relation", "query"),
@@ -1441,8 +1425,7 @@ fn relation_identity(relation: &ProviderReadRelationNeed) -> &TableIdentity {
         | ProviderReadRelationNeed::Metadata { relation, .. }
         | ProviderReadRelationNeed::Delta { relation, .. }
         | ProviderReadRelationNeed::MvTarget { relation, .. }
-        | ProviderReadRelationNeed::PinnedFileSet { relation }
-        | ProviderReadRelationNeed::TableExecute { relation } => relation,
+        | ProviderReadRelationNeed::PinnedFileSet { relation } => relation,
     }
 }
 
@@ -1508,22 +1491,6 @@ fn open_relation(
                 }))
                 .map(|handle| (handle, None, None))
             }
-            (
-                ProviderReadRelationNeed::TableExecute { .. },
-                QueryFrozenCohortRead::TableExecute(read),
-            ) => metadata
-                .get_table_execute_plan(
-                    session,
-                    table,
-                    novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
-                        novarocks_spi::connector::read_stack::ConnectorReadFrozenRewriteGroup::from_cohort(&read.group, read.group_digest),
-                    ),
-                )
-                .map_err(|error| ProviderReadError::from(error).context(format!("provider read of {name} cannot be opened as table-execute")))?
-                .ok_or_else(|| ProviderReadError::Contract({
-                    format!("provider read of {name} exposes no table-execute relation")
-                }))
-                .map(|handle| (handle, None, None)),
             _ => Err(unsupported_family(relation).into()),
         };
     }
@@ -2291,12 +2258,6 @@ mod tests {
                 relation: identity(),
             }),
             Ok(QueryFrozenReadInput::PinnedFileSet)
-        ));
-        assert!(matches!(
-            frozen_input(&ProviderReadRelationNeed::TableExecute {
-                relation: identity(),
-            }),
-            Ok(QueryFrozenReadInput::TableExecute)
         ));
     }
 

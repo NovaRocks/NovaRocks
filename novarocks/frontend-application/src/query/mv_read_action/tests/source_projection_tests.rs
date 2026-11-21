@@ -878,14 +878,6 @@ impl ProviderReadMetadata for SourceFixture {
     ) -> Result<Option<()>, ConnectorError> {
         panic!("EXPLAIN must reuse the original prepared source receipt")
     }
-    fn get_table_execute_plan(
-        &self,
-        _: &ConnectorSession,
-        _: &SchemaTableName,
-        _: ConnectorReadTableExecuteProcedure,
-    ) -> Result<Option<()>, ConnectorError> {
-        panic!("EXPLAIN cannot open a table procedure")
-    }
 }
 impl ProviderReadSplitManager for SourceFixture {
     fn get_splits<'a>(

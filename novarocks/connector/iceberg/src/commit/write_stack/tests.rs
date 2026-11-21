@@ -3710,9 +3710,7 @@ fn optimize_pins_the_data_file_with_a_materialized_deletion_vector() {
     let [cohort] = plan.cohorts() else {
         panic!("expected a cohort for the delete-bearing file");
     };
-    let novarocks_spi::connector::ConnectorRewriteCohortRead::PinnedFileSet(pinned) = cohort.read() else {
-        panic!("expected a pinned data file set");
-    };
+    let novarocks_spi::connector::ConnectorRewriteCohortRead::PinnedFileSet(pinned) = cohort.read();
     assert_eq!(pinned.files(), &[Arc::<str>::from(file.path.as_str())]);
     assert_eq!(plan.summary().input_delete_files, 1);
     assert_eq!(lake.inventory(), before);

@@ -246,6 +246,7 @@ pub(crate) fn decode_sha256_hex(value: &str) -> Result<[u8; 32], ConnectorError>
         }
     }
 }
+#[cfg(test)]
 fn decode_hex(value: &str, work: &mut Work<'_>) -> Result<[u8; 32], ReadStaticFactsError> {
     if value.len() != 64 {
         return Err(invalid("iceberg artifact digest is not a SHA-256 hex value").into());

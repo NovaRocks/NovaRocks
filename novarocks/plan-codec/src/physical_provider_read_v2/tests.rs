@@ -143,18 +143,17 @@ fn expected(id: u32, kind: i32) -> wire::ProviderReadReferenceDefinition {
         view_payload_id: Some(u32::MAX),
     }
 }
-const KINDS: [ConnectorReadRelationKind; 6] = [
-    ConnectorReadRelationKind::Table,
-    ConnectorReadRelationKind::TableFunction,
-    ConnectorReadRelationKind::ChangeWindow,
-    ConnectorReadRelationKind::SystemTable,
-    ConnectorReadRelationKind::TableExecute,
-    ConnectorReadRelationKind::MergeTable,
+const KINDS: [(ConnectorReadRelationKind, i32); 5] = [
+    (ConnectorReadRelationKind::Table, 1),
+    (ConnectorReadRelationKind::TableFunction, 2),
+    (ConnectorReadRelationKind::ChangeWindow, 3),
+    (ConnectorReadRelationKind::SystemTable, 4),
+    (ConnectorReadRelationKind::MergeTable, 6),
 ];
 
 #[test]
-fn provider_read_namespace_all_six_kinds_independent_wire_sparse_ids_and_original_sources() {
-    for (i, kind) in KINDS.into_iter().enumerate() {
+fn provider_read_namespace_preserves_sparse_wire_kinds_and_original_sources() {
+    for (kind, wire_kind) in KINDS {
         let source = read(kind);
         let ctrl = Control::default();
         let binding_inputs = [(u32::MAX, &source.binding)];
@@ -173,7 +172,7 @@ fn provider_read_namespace_all_six_kinds_independent_wire_sparse_ids_and_origina
             encode_provider_reads(&inputs, &bindings, &payloads, SOURCE, limits()).unwrap();
         assert_eq!(
             encoded.as_wire(),
-            [expected(u32::MAX, i as i32 + 1), expected(0, i as i32 + 1)]
+            [expected(u32::MAX, wire_kind), expected(0, wire_kind)]
         );
         assert_eq!(encoded.source_count(), 2);
         assert!(std::ptr::eq(encoded.bindings(), &bindings));
@@ -190,7 +189,7 @@ fn provider_read_namespace_all_six_kinds_independent_wire_sparse_ids_and_origina
             decode_connector_payloads(payloads.as_wire(), PRIOR_SOURCE, payload_limits(), &ctrl)
                 .unwrap();
         // Hand-authored expected definitions, not a roundtrip-only oracle.
-        let raw = [expected(0, i as i32 + 1), expected(u32::MAX, i as i32 + 1)];
+        let raw = [expected(0, wire_kind), expected(u32::MAX, wire_kind)];
         let received = decode_provider_reads(&raw, &b, &p, SOURCE, limits()).unwrap();
         assert_eq!(received.read(0).unwrap(), Some(&source));
         assert_eq!(received.read(u32::MAX).unwrap(), Some(&source));
@@ -310,7 +309,7 @@ fn provider_read_namespace_receiving_presence_kind_ids_and_sole_version_construc
             Err(Error::InvalidShape(_))
         ));
     }
-    for kind in [0, -1, 7, i32::MAX] {
+    for kind in [0, -1, 5, 7, i32::MAX] {
         assert!(matches!(
             decode_provider_reads(&[expected(0, kind)], &b, &p, SOURCE, limits()),
             Err(Error::InvalidShape(_))
@@ -761,7 +760,7 @@ fn provider_read_namespace_consumes_joint_read_write_ids_without_rebinding_read_
     };
     use novarocks_connector_contract::ConnectorWriteBinding;
 
-    for (at, kind) in KINDS.into_iter().enumerate() {
+    for (kind, wire_kind) in KINDS {
         let source = read(kind);
         let write = ConnectorWriteBinding::new(
             source.binding.descriptor().clone(),
@@ -785,7 +784,7 @@ fn provider_read_namespace_consumes_joint_read_write_ids_without_rebinding_read_
         let inputs = [(0, &source)];
         let projected =
             encode_provider_reads(&inputs, &bindings, &payloads, SOURCE, limits()).unwrap();
-        let raw = [expected(0, at as i32 + 1)];
+        let raw = [expected(0, wire_kind)];
         assert_eq!(projected.as_wire(), raw);
         assert!(std::ptr::eq(projected.bindings(), &bindings));
         assert!(std::ptr::eq(

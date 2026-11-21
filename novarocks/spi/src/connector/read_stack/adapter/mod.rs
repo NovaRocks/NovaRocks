@@ -426,13 +426,6 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         name: &SchemaTableName,
         window: ConnectorReadChangeWindow,
     ) -> Result<Option<Self::Table>, ConnectorError>;
-
-    fn get_table_execute_plan(
-        &self,
-        session: &ConnectorSession,
-        name: &SchemaTableName,
-        procedure: super::runtime::ConnectorReadTableExecuteProcedure,
-    ) -> Result<Option<Self::Table>, ConnectorError>;
 }
 
 pub trait ProviderReadSplitSource<P: ProviderReadRuntime>: Send {
@@ -1304,17 +1297,6 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             .get_change_window_plan(session, name, window)
             .map(|value| value.map(|table| self.wrap_table(table)))
     }
-
-    fn get_table_execute_plan(
-        &self,
-        session: &ConnectorSession,
-        name: &SchemaTableName,
-        procedure: super::runtime::ConnectorReadTableExecuteProcedure,
-    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
-        self.provider
-            .get_table_execute_plan(session, name, procedure)
-            .map(|value| value.map(|table| self.wrap_table(table)))
-    }
 }
 
 impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapter<P> {
@@ -2026,9 +2008,6 @@ mod tests {
                     K::PinnedFileSet { pinned } => self
                         .get_pinned_file_set_handle(session, name, pinned)
                         .map(|v| v.map(|v| (v, None))),
-                    K::TableExecute { procedure } => self
-                        .get_table_execute_plan(session, name, procedure.clone())
-                        .map(|v| v.map(|v| (v, None))),
                 }
             })
         }
@@ -2203,15 +2182,6 @@ mod tests {
             _session: &ConnectorSession,
             _name: &SchemaTableName,
             _window: ConnectorReadChangeWindow,
-        ) -> Result<Option<Self::Table>, ConnectorError> {
-            Ok(None)
-        }
-
-        fn get_table_execute_plan(
-            &self,
-            _session: &ConnectorSession,
-            _name: &SchemaTableName,
-            _procedure: crate::connector::read_stack::ConnectorReadTableExecuteProcedure,
         ) -> Result<Option<Self::Table>, ConnectorError> {
             Ok(None)
         }

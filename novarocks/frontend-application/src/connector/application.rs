@@ -431,30 +431,7 @@ pub fn metadata_list_namespaces_with_planning_pin(
         .map_err(|error| error.to_string())
 }
 
-/// Read immutable branch/tag/snapshot facts through the same exact lease that
-/// admitted the table.  SQL owns the projection of these neutral facts.
-pub fn metadata_read_reference_facts_with_planning_pin(
-    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
-    context: ConnectorRequestContext,
-    namespace: &str,
-    table: &str,
-) -> Result<ConnectorReadReferenceFacts, String> {
-    let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_pin(&binding, context)?;
-    binding
-        .binding()
-        .metadata()
-        .read_reference_facts(ConnectorReadReferenceFactsRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
-            },
-            context,
-        })
-        .map_err(|error| error.to_string())
-}
-
+/// Read immutable branch/tag/snapshot facts using the original planning pin.
 pub(crate) async fn metadata_read_reference_facts_with_planning_pin_async(
     binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,

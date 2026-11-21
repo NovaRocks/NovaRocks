@@ -502,7 +502,6 @@ fn relation_encode(v: c::ConnectorReadRelationKind) -> i32 {
         c::ConnectorReadRelationKind::TableFunction => 2,
         c::ConnectorReadRelationKind::ChangeWindow => 3,
         c::ConnectorReadRelationKind::SystemTable => 4,
-        c::ConnectorReadRelationKind::TableExecute => 5,
         c::ConnectorReadRelationKind::MergeTable => 6,
     }
 }
@@ -516,7 +515,6 @@ fn relation_decode(
             2 => Ok(c::ConnectorReadRelationKind::TableFunction),
             3 => Ok(c::ConnectorReadRelationKind::ChangeWindow),
             4 => Ok(c::ConnectorReadRelationKind::SystemTable),
-            5 => Ok(c::ConnectorReadRelationKind::TableExecute),
             6 => Ok(c::ConnectorReadRelationKind::MergeTable),
             _ => Err(E::InvalidShape("unknown read relation kind")),
         },
