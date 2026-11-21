@@ -21,7 +21,7 @@ use arrow::{
     array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
         Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-        Time64MicrosecondArray, TimestampMicrosecondArray,
+        TimestampMicrosecondArray,
     },
     datatypes::{DataType, Schema, i256},
     record_batch::RecordBatch,
@@ -34,13 +34,14 @@ use novarocks_expression::{
             TextColumn, TextContext, TextError, TypedText, type_expression_text,
         },
     },
-    typing::TypingError,
+    typing::{TypingError, temporal_function_value_type},
 };
 use novarocks_expression_contract::{ExprKind, ValueId};
 use novarocks_functions::{DataFailureReason, largeint};
 use novarocks_type_contract::{
     DecimalOverflowPolicy, FunctionValueType, SemanticParameterId, SemanticParameterKey,
-    SemanticParameterRef, SemanticParameterValue, SemanticParameters, ValueLogicalType,
+    SemanticParameterRef, SemanticParameterValue, SemanticParameters, TemporalPrecision,
+    TemporalType, ValueLogicalType,
 };
 use std::sync::Arc;
 
@@ -304,42 +305,30 @@ fn literal_types_and_cast_parameters_follow_the_checked_unit() {
             "{source}"
         );
     }
-    let temporal: &[(&str, ArrayRef)] = &[
+    let precision = TemporalPrecision::WHOLE_SECONDS;
+    let temporal: &[(&str, TemporalType, ArrayRef)] = &[
         (
             "TIME '01:02:03'",
-            Arc::new(Time64MicrosecondArray::from(vec![3_723_000_000])),
+            TemporalType::Time(precision),
+            Arc::new(Int64Array::from(vec![3_723_000_000_000_000])),
         ),
         (
             "TIMESTAMP '1970-01-02 00:00:00'",
+            TemporalType::Timestamp(precision),
             Arc::new(TimestampMicrosecondArray::from(vec![86_400_000_000])),
         ),
     ];
-    for (source, expected) in temporal {
+    for (source, declaration, expected) in temporal {
         let typed = compile(source, &[], &context);
         let unit = typed.unit();
         let root = unit.definition(unit.roots()[0].definition).unwrap();
-        let expected_type = FunctionValueType::new(expected.data_type().clone(), true);
+        let expected_type = temporal_function_value_type(*declaration, false).unwrap();
         assert_eq!(root.ty, expected_type, "{source}");
-        let ExprKind::Cast {
-            expr,
-            target,
-            allow_throw_exception,
-            decimal_overflow_policy,
-            array_failure_mode: None,
-        } = &root.kind
-        else {
-            panic!("{source}: expected the original text CAST");
-        };
-        assert_eq!(target, expected.data_type(), "{source}");
-        assert_eq!(*decimal_overflow_policy, context.decimal_overflow_policy);
-        assert_eq!(*allow_throw_exception, ALLOW_THROW);
-        assert_eq!(
-            typed.environment().parameters.require(ALLOW_THROW).unwrap(),
-            &SemanticParameterValue::AllowThrowException(true)
+        assert!(matches!(root.kind, ExprKind::Constant(_)), "{source}");
+        assert!(
+            typed.environment().parameters.entries().is_empty(),
+            "{source}"
         );
-        let child = unit.definition(*expr).unwrap();
-        assert!(matches!(child.kind, ExprKind::Constant(_)));
-        assert_eq!(child.ty, FunctionValueType::new(DataType::Utf8, false));
 
         let result = evaluate(&typed, &batch(&[], vec![]));
         assert_eq!(result.batch.shape, CONSTANT_SHAPE, "{source}");

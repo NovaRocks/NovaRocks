@@ -34,7 +34,7 @@ use arrow_schema::DataType;
 use super::binding_control::{self, ScalarCarriers, ScalarTypes};
 use super::intrinsic::{BuiltinDisposition, builtin_disposition};
 use super::resolver::ResolveError;
-use super::scalar_construction::{borrow_creator, with_binding_creation};
+use super::scalar_construction::{borrow_creator, semantic_option, with_binding_creation};
 #[cfg(test)]
 use super::signature::declared_list;
 #[cfg(test)]
@@ -1938,14 +1938,7 @@ fn dynamic_scalar_data_type_with_construction<E>(
             let result = DataType::Struct(fields.into());
             list_type_with_construction(result, creation)?
         }
-        "greatest" | "least" => {
-            let result = widen_dynamic_carriers(argument_types.iter().cloned(), creation)?;
-            if result == DataType::Date32 {
-                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-            } else {
-                result
-            }
-        }
+        "greatest" | "least" => widen_dynamic_carriers(argument_types.iter().cloned(), creation)?,
         "map" => {
             creation.collected_vec::<DataType>(argument_types.len().div_ceil(2))?;
             let keys = argument_types
@@ -2484,17 +2477,28 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             )?;
         }
         "greatest" | "least" => {
-            full_result = fold_value_types_with_creation(
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?
-                    .into_iter(),
+            let values =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            if !observed_all(
+                values.iter().copied(),
+                |value| value.value_type().temporal().is_none(),
                 work,
-                borrow_creator(&mut creation),
-            )?;
-            if full_result.data_type() == &DataType::Date32 {
-                full_result = dynamic_value(
-                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
-                    full_result.nullable(),
-                    full_result.logical_type(),
+            )? {
+                full_result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                    cx.value(DataType::Null, true, ValueLogicalType::Physical)
+                })?;
+                for value in values {
+                    work.step()?;
+                    full_result =
+                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                            let carrier = cx.wider(full_result.data_type(), value.data_type())?;
+                            semantic_option(cx.common(carrier, &full_result, value))
+                        })?
+                        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+                }
+            } else {
+                full_result = fold_value_types_with_creation(
+                    values.into_iter(),
                     work,
                     borrow_creator(&mut creation),
                 )?;
@@ -2790,6 +2794,32 @@ impl BuiltinDynamicScalarResolver {
                         .map_err(super::scalar_construction::binding_owner_failure)
                     })?;
                     work.step()?;
+                    Ok(FunctionArgumentType::Value(target))
+                })
+                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
+        } else if super::scalar_extrema_owner::operation(&self.canonical_name)
+            && (result.value_type().temporal().is_some() || *result.data_type() == DataType::Date32)
+        {
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionArgumentType>(request.arguments.len())
+            })?;
+            request
+                .arguments
+                .iter()
+                .map(|argument| {
+                    let FunctionArgument::Value {
+                        value_type: source, ..
+                    } = argument
+                    else {
+                        return Err(FunctionBindingError::NoMatchingOverload.into());
+                    };
+                    work.step()?;
+                    let target = dynamic_nullable(
+                        &result,
+                        source.nullable(),
+                        work,
+                        borrow_creator(&mut creation),
+                    )?;
                     Ok(FunctionArgumentType::Value(target))
                 })
                 .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?

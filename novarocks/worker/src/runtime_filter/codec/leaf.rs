@@ -198,7 +198,7 @@ pub fn decode_leaf(
         }
         ArtifactKind::ValueSet => {
             let domain =
-                decode_domain_payload(parsed.payload, parsed.contains_null, &parsed.schema)?;
+                decode_domain_payload(parsed.payload, parsed.contains_null, expectations.schema)?;
             if domain.values().is_empty() && !parsed.contains_null {
                 return Err(ArtifactCodecError::NonCanonicalPayload);
             }

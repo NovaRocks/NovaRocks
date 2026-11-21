@@ -1,12 +1,12 @@
 -- query 1
--- types	bigint
-_col0
--1396525594308
+-- types	bigint	bigint	bigint	bigint	bigint
+row_count	date_mismatches	datetime_mismatches	padded_date_mismatches	padded_datetime_mismatches
+80051	0	0	0	0
 
 -- query 2
--- types	bigint
-_col0
--1396525594308
+-- types	bigint	bigint	bigint	bigint	bigint
+row_count	date_mismatches	datetime_mismatches	padded_date_mismatches	padded_datetime_mismatches
+160051	0	0	0	0
 
 -- query 3
 -- types	timestamp(6)
@@ -16,102 +16,102 @@ NULL
 -- query 4
 -- types	timestamp(6)
 _col0
-2020-01-01 00:00:00.000000
+NULL
 
 -- query 5
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 6
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 7
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 8
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123000
+NULL
 
 -- query 9
 -- types	timestamp(6)
 _col0
-2020-01-01 00:00:00.000000
+NULL
 
 -- query 10
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 11
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 12
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 13
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123000
+NULL
 
 -- query 14
 -- types	timestamp(6)
 _col0
-2020-01-01 00:00:00.000000
+NULL
 
 -- query 15
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 16
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 17
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123000
+NULL
 
 -- query 18
 -- types	timestamp(6)
 _col0
-2020-01-01 00:00:00.000000
+NULL
 
 -- query 19
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 20
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 21
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 22
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123000
+NULL
 
 -- query 23
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123000
+NULL
 
 -- query 24
 -- types	timestamp(6)
@@ -126,32 +126,32 @@ NULL
 -- query 26
 -- types	timestamp(6)
 _col0
-2020-02-29 00:00:00.000000
+NULL
 
 -- query 27
 -- types	timestamp(6)
 _col0
-2020-02-28 00:00:00.000000
+NULL
 
 -- query 28
 -- types	timestamp(6)
 _col0
-2000-02-29 00:00:00.000000
+NULL
 
 -- query 29
 -- types	timestamp(6)
 _col0
-2000-02-28 00:00:00.000000
+NULL
 
 -- query 30
 -- types	timestamp(6)
 _col0
-2021-02-28 00:00:00.000000
+NULL
 
 -- query 31
 -- types	timestamp(6)
 _col0
-2100-02-28 00:00:00.000000
+NULL
 
 -- query 32
 -- types	timestamp(6)
@@ -186,7 +186,7 @@ NULL
 -- query 38
 -- types	timestamp(6)
 _col0
-0210-02-28 00:00:00.000000
+NULL
 
 -- query 39
 -- types	timestamp(6)
@@ -196,7 +196,7 @@ NULL
 -- query 40
 -- types	timestamp(6)
 _col0
-2100-02-28 00:00:00.000000
+NULL
 
 -- query 41
 -- types	timestamp(6)
@@ -211,62 +211,62 @@ NULL
 -- query 43
 -- types	timestamp(6)
 _col0
-2100-02-08 00:00:00.000000
+NULL
 
 -- query 44
 -- types	timestamp(6)
 _col0
-2100-02-02 00:00:00.000000
+NULL
 
 -- query 45
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 46
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123000
+NULL
 
 -- query 47
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123456
+NULL
 
 -- query 48
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.100000
+NULL
 
 -- query 49
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 50
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123000
+NULL
 
 -- query 51
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 52
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 53
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.000000
+NULL
 
 -- query 54
 -- types	timestamp(6)
 _col0
-2020-01-01 01:02:03.123456
+NULL
 
 -- query 55
 -- types	timestamp(6)
@@ -337,3 +337,13 @@ NULL
 -- types	timestamp(6)
 _col0
 NULL
+
+-- query 70
+-- types	timestamp(6)	timestamp(6) with time zone
+wall_clock	zoned
+2020-01-01 01:02:03.123456	2020-01-01 01:02:03.123456 UTC
+
+-- query 71
+-- types	timestamp(6)	timestamp(6)	timestamp(6)	timestamp(6)
+leap_day	leap_century	invalid_common_year	invalid_century
+2020-02-29 00:00:00.000000	2000-02-29 00:00:00.000000	NULL	NULL

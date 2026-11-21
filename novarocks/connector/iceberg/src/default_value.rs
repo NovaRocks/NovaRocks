@@ -540,6 +540,12 @@ pub(crate) fn materialize_initial_default(
         .initial_default
         .as_ref()
         .ok_or_else(|| format!("iceberg field {} has no bound initial default", source.id))?;
+    if matches!(layout, DataType::FixedSizeBinary(_)) {
+        return Err(format!(
+            "unsupported initial-default for column {}: arrow type {layout:?} cannot carry an iceberg default",
+            source.name
+        ));
+    }
     literal_to_constant_array(literal, layout, row_count)
 }
 

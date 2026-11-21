@@ -139,10 +139,18 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
             LARGEINT_FLOAT,
             LARGEINT_SIGNED,
             LARGEINT_TEXT,
+            TEMPORAL_WRITE_ASSIGNMENT,
             NULL_LIFT,
             OPAQUE_BINARY,
             SIGNED_LARGEINT,
-            UTF8_LARGEINT
+            TEMPORAL,
+            TEMPORAL_CLOCK,
+            TEMPORAL_WIDEN,
+            TEMPORAL_ZONE,
+            TRY_TEMPORAL,
+            TRY_TEMPORAL_CLOCK,
+            TRY_TEMPORAL_ZONE,
+            UTF8_LARGEINT,
         ]
     );
     for overload in declaration.overloads() {

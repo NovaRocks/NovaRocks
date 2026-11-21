@@ -55,7 +55,7 @@ ORDER BY ym;
 -- query 3
 -- Filter on a specific date range spanning both old and new specs.
 SELECT id, val FROM ${case_db}.t_replace_partition
-WHERE ts >= '2024-01-15 00:00:00' AND ts < '2024-01-21 00:00:00'
+WHERE ts >= TIMESTAMP '2024-01-15 00:00:00' AND ts < TIMESTAMP '2024-01-21 00:00:00'
 ORDER BY id;
 
 -- query 4

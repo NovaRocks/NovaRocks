@@ -458,6 +458,13 @@ pub(super) fn prepared_for_test(
         region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
+    let zone = zone
+        .map(|text| {
+            novarocks_type_contract::TimeZoneKey::parse(text).ok_or(
+                crate::FunctionSpecializationFailure::InvalidInput("invalid statement time zone"),
+            )
+        })
+        .transpose()?;
     let refs = zone
         .map(|_| {
             vec![SemanticParameterRef {
@@ -470,9 +477,7 @@ pub(super) fn prepared_for_test(
         zone.map(|zone| {
             vec![(
                 SemanticParameterId::new(17),
-                SemanticParameterValue::TimeZone(
-                    novarocks_type_contract::TimeZoneKey::parse(zone).expect("test zone"),
-                ),
+                SemanticParameterValue::TimeZone(zone),
             )]
         })
         .unwrap_or_default(),

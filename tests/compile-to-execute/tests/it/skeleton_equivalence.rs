@@ -451,10 +451,7 @@ fn migrated_literals_control_and_conversions_share_the_full_unit() {
         );
     }
     let text = fixture.equivalent("TIME '01:02:03'", &[]);
-    assert_eq!(
-        text.environment().parameters.require(ALLOW_THROW).unwrap(),
-        &SemanticParameterValue::AllowThrowException(true),
-    );
+    assert!(text.environment().parameters.entries().is_empty());
 }
 
 #[test]
@@ -520,13 +517,14 @@ fn identical_local_constant_addresses_do_not_hide_different_values() {
 #[test]
 fn actual_semantic_parameter_values_are_checked() {
     let mut fixture = Fixture::new();
-    let sql = fixture.sql("TIME '01:02:03'", &[]).unwrap();
+    let source = "CASE WHEN TRUE THEN 2147483648 ELSE 1 END";
+    let sql = fixture.sql(source, &[]).unwrap();
     fixture.parameters = SemanticParameters::try_new([(
         ALLOW_THROW.id,
         SemanticParameterValue::AllowThrowException(false),
     )])
     .unwrap();
-    let text = fixture.text("TIME '01:02:03'", &[]).unwrap();
+    let text = fixture.text(source, &[]).unwrap();
     let error = compare_units(&sql, &text).unwrap_err();
     assert!(error.contains("shape and parameters differs"), "{error}");
     assert!(error.contains("AllowThrowException(true)"), "{error}");

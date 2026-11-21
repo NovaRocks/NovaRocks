@@ -393,7 +393,7 @@ fn semantics_descriptor_is_nonrecursive_and_every_actual_layout_is_registered() 
                 .unwrap(),
             &mut BTreeSet::new()
         ),
-        2
+        3
     );
     assert_eq!(
         depth(

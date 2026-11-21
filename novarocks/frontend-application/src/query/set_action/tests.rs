@@ -554,6 +554,11 @@ async fn trino_set_time_zone_uses_original_scoped_constants_and_effects() {
         ),
         (
             "SET TIME ZONE INTERVAL '00:00:00.0000001' HOUR TO SECOND",
+            Some("UTC"),
+            None,
+        ),
+        (
+            "SET TIME ZONE INTERVAL '00:00:00.0000001' HOUR TO SECOND(7)",
             None,
             Some("sql.analyze.invalid_literal"),
         ),

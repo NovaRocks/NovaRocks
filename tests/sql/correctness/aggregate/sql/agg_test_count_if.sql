@@ -87,7 +87,7 @@ select v1, count_if(v2 is null), count_if(v4) from test_count_if group by v1;
 
 -- query 14
 USE ${case_db};
-select count_if(v4 >= 3), count_if(v4 < 3),count_if(v3 = '2022-04-18 03:45:00') from test_count_if;
+select count_if(v4 >= 3), count_if(v4 < 3),count_if(v3 = TIMESTAMP '2022-04-18 03:45:00') from test_count_if;
 
 -- query 15
 USE ${case_db};

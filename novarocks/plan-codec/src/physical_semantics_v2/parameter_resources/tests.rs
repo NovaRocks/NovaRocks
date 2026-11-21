@@ -238,10 +238,17 @@ fn bounded_parameters_preserve_constructor_and_lazy_decoder_error_order() {
         (
             vec![
                 entry(0, AllowThrowException(false)),
-                entry(0, TimeZone("".into())),
+                entry(0, TimeZone("UTC".into())),
                 wire::SemanticParameter { id: 9, value: None },
             ],
             SemanticParameterError::DuplicateId(SemanticParameterId::new(0)),
+        ),
+        (
+            vec![
+                entry(0, AllowThrowException(false)),
+                entry(0, TimeZone("".into())),
+            ],
+            SemanticParameterError::InvalidTimeZone,
         ),
         (
             vec![
@@ -409,7 +416,7 @@ fn bounded_parameter_sending_matches_independent_canonical_wire_and_prepared_loa
         std::alloc::Layout::array::<wire::SemanticParameter>(7)
             .unwrap()
             .size()
-            + 4
+            + "Asia/Shanghai".len()
     );
     let prepared = prepare_semantic_parameters_encode(&table, SOURCE, limits(), &control).unwrap();
     assert_eq!(*prepared.facts(), facts);
@@ -453,8 +460,7 @@ fn bounded_parameter_sending_six_exact_caps_empty_and_occupied_source_floors() {
         ));
     }
     let known = size_of::<SemanticParameters>()
-        + 7 * (size_of::<SemanticParameterId>() + size_of::<SemanticParameterValue>())
-        + 4;
+        + 7 * (size_of::<SemanticParameterId>() + size_of::<SemanticParameterValue>());
     assert!(matches!(
         prepare_semantic_parameters_encode(&table, known - 1, limits(), &EncodeControl::default()),
         Err(Error::InvalidShape(_))
@@ -662,6 +668,11 @@ fn observed_parameters_preserve_original_facts_sparse_ids_layout_and_caller_phas
             max_work: expected_facts.cumulative_work_upper_bound,
         };
         for lowered in 0..=6 {
+            // Receiving has no separate time-zone allocation. Its exact zero
+            // cap is already exercised by the successful, unmodified case.
+            if lowered == 2 && exact.max_timezone_request_bytes == 0 {
+                continue;
+            }
             let mut cap = exact;
             match lowered {
                 0 => {}

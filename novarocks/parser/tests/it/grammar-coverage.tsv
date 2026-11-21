@@ -219,7 +219,7 @@ alternative	statement	87	describeInput	0	DESCRIBE INPUT query_name	parsed-not-su
 alternative	statement	88	describeOutput	0	DESCRIBE OUTPUT query_name	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	89	describeQueryOutput	0	DESCRIBE OUTPUT (WITH q AS (VALUES ?) SELECT ? FROM q)	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	90	setPath	0	SET PATH lake.s, t	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	91	setTimeZone	0	SET TIME ZONE LOCAL	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	91	setTimeZone	0	SET TIME ZONE LOCAL	supported	accept	reviewed-grammar-path	none
 optional	statement	92		1	UPDATE cat.sch.t@dev SET id = ?	supported	accept	reviewed-grammar-path	none
 optional	statement	92		2	UPDATE cat.sch.t SET id = ?, value = ?	supported	accept	reviewed-grammar-path	none
 optional	statement	92		3	UPDATE cat.sch.t SET id = ? WHERE value = ?	supported	accept	reviewed-grammar-path	none
@@ -1990,8 +1990,8 @@ alternative	statement	85		g1.b1.g1.b1	EXECUTE query_name USING 1, ?	parsed-not-s
 alternative	statement	85		g1.b1	EXECUTE query_name USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	86		g1.b1.g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	86		g1.b1	EXECUTE IMMEDIATE 'SELECT ?' USING 1, ?	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	91		g1.b1	SET TIME ZONE LOCAL	parsed-not-supported	accept	reviewed-grammar-path	none
-alternative	statement	91		g1.b2	SET TIME ZONE 'UTC'	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	91		g1.b1	SET TIME ZONE LOCAL	supported	accept	reviewed-grammar-path	none
+alternative	statement	91		g1.b2	SET TIME ZONE 'UTC'	supported	accept	reviewed-grammar-path	none
 alternative	statement	92		g1.b1	UPDATE lake.ns.t @dev SET id = 1	supported	accept	reviewed-grammar-path	none
 alternative	statement	92		g2.b1	UPDATE lake.ns.t SET id = 1, label = 'x'	supported	accept	reviewed-grammar-path	none
 alternative	statement	92		g3.b1	UPDATE lake.ns.t SET id = 1 WHERE id = 2	supported	accept	reviewed-grammar-path	none

@@ -65,7 +65,7 @@ select typeof(cast('s' as BINARY));
 select typeof(cast('2023-03-07' as date));
 
 -- query 15
-SELECT typeof(CAST('2023-03-07 11:22:33' AS datetime));
+SELECT typeof(CAST('2023-03-07 11:22:33' AS timestamp(6)));
 
 -- query 16
 select typeof([1, 2, 3]);
@@ -103,7 +103,7 @@ create table t1 (
   c12 varchar,
   c13 binary,
   c14 date,
-  c15 datetime,
+  c15 timestamp(6),
   c16 array<tinyint>,
   c17 string,
   c18 map<tinyint, varchar>,
@@ -140,3 +140,9 @@ select typeof(c1)
   ,typeof(c19)
   ,typeof(c20)
   from t1;
+
+-- query 24
+SELECT
+    typeof(TIMESTAMP '2023-03-07 11:22:33.1234567'),
+    typeof(TIMESTAMP '2023-03-07 11:22:33.123 UTC'),
+    typeof(TIME '11:22:33.1234567 +05:30');

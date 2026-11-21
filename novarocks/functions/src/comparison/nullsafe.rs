@@ -189,6 +189,15 @@ impl PreparedNullSafeComparisonRecipe {
             FlatLeaf::TimestampMillisecond => p!(TimestampMillisecondType),
             FlatLeaf::TimestampMicrosecond => p!(TimestampMicrosecondType),
             FlatLeaf::TimestampNanosecond => p!(TimestampNanosecondType),
+            FlatLeaf::Temporal(declaration) => {
+                novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+                    declaration,
+                    array,
+                    true,
+                )
+                .map(|_| ())
+                .map_err(|_| invalid("null-safe temporal carrier differs from its binding"))
+            }
             _ => Err(internal(
                 "null-safe recipe contains an unsupported frozen leaf",
             )),

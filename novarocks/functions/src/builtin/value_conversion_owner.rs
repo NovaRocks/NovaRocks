@@ -467,11 +467,16 @@ impl ValueConversionOwner {
                 conversion_environment_valid(input.selected, input.environment, input.parameters);
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !scope || !environment {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "value conversion requires its exact proof scope and declared environment"
-                        .into(),
+                let diagnostic = if value_conversion::temporal_cast_dependencies(
+                    input.selected.overload.as_str(),
                 )
-                .into());
+                .is_empty()
+                {
+                    "value conversion requires its exact proof scope and no environment"
+                } else {
+                    "value conversion requires its exact proof scope and declared environment"
+                };
+                return Err(FunctionBindingError::InvalidBinding(diagnostic.into()).into());
             }
             work.flush().map_err(FunctionEffectOwnerError::Control)?;
             validate().map_err(|error| match error {

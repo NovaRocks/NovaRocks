@@ -340,6 +340,8 @@ fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box
             collection.cumulative_work_upper_bound - count_snapshot.cumulative_work_upper_bound,
             3 * count + 5 + layout.size() + 32
         );
+        // A canonical time-zone key is inline. The unique retained value
+        // needs its BTree request, with no separate name backing.
         let mut tree = ControlResourceCounter::default();
         tree.tree::<SemanticParameterId, SemanticParameterValue>(1)
             .unwrap();
@@ -347,12 +349,12 @@ fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box
         let unique = tail[3].0;
         assert_eq!(
             unique.allocation_requests_upper_bound - lookup.allocation_requests_upper_bound,
-            tree.facts().allocation_requests_upper_bound + 1
+            tree.facts().allocation_requests_upper_bound
         );
         assert_eq!(
             unique.allocation_request_bytes_upper_bound
                 - lookup.allocation_request_bytes_upper_bound,
-            tree.facts().allocation_request_bytes_upper_bound + "Asia/Shanghai".len()
+            tree.facts().allocation_request_bytes_upper_bound
         );
         let mut previous = unique;
         for pair in tail[4..].as_chunks::<2>().0 {

@@ -228,7 +228,7 @@ impl<'a> TextTyping<'a> {
                         .map_err(|cause| typing_error(cause, span))?
                 } else {
                     let ast::TypeKind::Generic(declaration) = &cast.data_type.kind else {
-                        return Err(legacy("non-temporal CAST", span));
+                        return Err(legacy("CAST", span));
                     };
                     let carrier = if declaration.name.value.eq_ignore_ascii_case("date") {
                         DataType::Date32
@@ -245,7 +245,7 @@ impl<'a> TextTyping<'a> {
                     {
                         DataType::Int32
                     } else {
-                        return Err(legacy("non-temporal CAST", span));
+                        return Err(legacy("CAST", span));
                     };
                     FunctionValueType::new(carrier, nullable)
                 };
@@ -258,7 +258,7 @@ impl<'a> TextTyping<'a> {
                     work.control(),
                 )
                 .map_err(|cause| typing_error(cause, span))?
-                .ok_or_else(|| legacy("non-temporal CAST", span))?;
+                .ok_or_else(|| legacy("CAST", span))?;
                 Ok(TextNode::call(binding, Some(declared), vec![child]))
             }
             ast::Expr::Logical(logical) => {
@@ -937,14 +937,14 @@ fn construct_name(expr: &ast::Expr) -> &'static str {
 mod tests {
     use super::*;
     use crate::testkit::{HarnessControl, constant_policy};
-    use arrow::datatypes::TimeUnit;
     use novarocks_type_contract::{
         CompilePhase, DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey,
-        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+        SemanticParameterRef, SemanticParameterValue, SemanticParameters, TemporalPrecision,
+        TemporalType,
     };
 
     #[test]
-    fn temporal_text_literals_emit_the_original_cast_before_call_authorship() {
+    fn temporal_text_literals_emit_a_typed_constant_before_call_authorship() {
         let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
         let allow_throw_exception = SemanticParameterRef {
             id: SemanticParameterId::new(0),
@@ -962,13 +962,12 @@ mod tests {
             parameters: &parameters,
             allow_throw_exception,
         };
-        // This inspection precedes recipe admission: the recipe may refuse
-        // the analyzed cast's successful-NULL contract independently.
+        let precision = TemporalPrecision::WHOLE_SECONDS;
         for (source, expected) in [
-            ("TIME '01:02:03'", DataType::Time64(TimeUnit::Microsecond)),
+            ("TIME '01:02:03'", TemporalType::Time(precision)),
             (
                 "TIMESTAMP '1970-01-01 00:00:01'",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                TemporalType::Timestamp(precision),
             ),
         ] {
             let ast = novarocks_parser::parser::parse_expression(source).unwrap();
@@ -981,21 +980,16 @@ mod tests {
             let root = node
                 .emit(&mut draft, &mut constants, &context, &mut work)
                 .unwrap();
-            let ExprKind::Cast {
-                expr,
-                target,
-                allow_throw_exception: reference,
-                ..
-            } = &draft.definition(root).unwrap().kind
-            else {
-                panic!("the temporal literal emits its original cast");
+            let node = draft.definition(root).unwrap();
+            let ExprKind::Constant(reference) = node.kind else {
+                panic!("the temporal literal emits a typed constant");
             };
-            assert_eq!(target, &expected);
-            assert_eq!(*reference, allow_throw_exception);
-            assert!(matches!(
-                draft.definition(*expr).unwrap().kind,
-                ExprKind::Constant(_)
-            ));
+            let value = constants
+                .resolve_observed(reference, &node.ty, &mut work)
+                .unwrap();
+            assert_eq!(value.value_type().value_type().temporal(), Some(expected));
+            assert_eq!(value.value_type().data_type(), &expected.carrier());
+            assert!(!value.value_type().nullable());
             work.finish().unwrap();
         }
     }

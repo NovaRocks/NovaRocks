@@ -266,7 +266,7 @@ pub(super) fn decode_parameters(
 }
 
 /// Same wire value grammar, fed lazily into the original observed constructor.
-/// Pulling the iterator brackets the bounded Box source copy with the caller's
+/// Pulling the iterator brackets the bounded value projection with the caller's
 /// existing work scope, so no temporary entries Vec or second meter is needed.
 pub(super) fn decode_parameters_observed(
     parameters: &wire::SemanticParameters,

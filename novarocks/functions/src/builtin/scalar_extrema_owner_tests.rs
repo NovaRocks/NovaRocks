@@ -128,12 +128,7 @@ fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
                     FunctionValueType::from_legacy_declared_projection(ty.clone(), nullable);
                 let prepared = prepared_for_test(name, &[source.clone(), source]).unwrap();
                 let result = prepared.contract().result_type();
-                let expected = if *ty == DataType::Date32 {
-                    DataType::Timestamp(TimeUnit::Microsecond, None)
-                } else {
-                    ty.clone()
-                };
-                assert_eq!(result.data_type().clone(), expected);
+                assert_eq!(result.data_type(), ty);
                 assert!(result.nullable());
                 assert_eq!(
                     prepared.contract().effects().argument_control,

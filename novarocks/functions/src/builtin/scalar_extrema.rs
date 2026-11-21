@@ -25,11 +25,17 @@ use crate::{
         cast_output_observed, value_at_f64,
     },
 };
-use arrow_array::{Array, ArrayRef, Float64Array, StringArray, TimestampMicrosecondArray};
+use arrow_array::{
+    Array, ArrayRef, Date32Array, Float64Array, StringArray, TimestampMicrosecondArray,
+};
 use arrow_schema::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{TemporalType, ValueLogicalType};
+use novarocks_value_arrays::decode::PreparedTemporalArray;
 use std::{alloc::Layout, sync::Arc};
+
+use super::temporal_output::TemporalOutputBuilder;
+use crate::temporal_cast::Type;
 #[derive(Clone, Copy, Debug)]
 pub enum ExtremaOperation {
     Greatest,
@@ -94,6 +100,21 @@ pub(super) fn validate_profile(
         return Err(invalid(
             "extrema requires a nonempty exact nullable Physical result profile",
         ));
+    }
+    let result = contract.result_type();
+    if result.value_type().temporal().is_some() || *result.data_type() == DataType::Date32 {
+        for argument in arguments.iter() {
+            observe()?;
+            let FunctionArgumentType::Value(value) = argument else {
+                return Err(invalid("extrema requires value arguments"));
+            };
+            if !value.same_value_domain(result) || value.data_type() != result.data_type() {
+                return Err(invalid(
+                    "extrema argument is outside its selected temporal domain",
+                ));
+            }
+        }
+        return Ok(());
     }
     let mut is_temporal = true;
     let mut is_numeric = true;
@@ -160,15 +181,21 @@ pub(super) fn evaluate<'a>(
     let mut work = EvaluationCheckpoints::new(control);
     let result = (|| {
         validate_profile(input.contract(), || work.step())?;
-        let out = evaluate_values(
-            operation,
-            input.arguments(),
-            input.selection(),
-            Some(input.contract().result_type().data_type()),
-            false,
-            &mut work,
-            None,
-        )?;
+        let out = if let Some(ty) = input.contract().result_type().value_type().temporal() {
+            evaluate_temporal(operation, &input, ty, &mut work)?
+        } else if *input.contract().result_type().data_type() == DataType::Date32 {
+            evaluate_date(operation, &input, &mut work)?
+        } else {
+            evaluate_values(
+                operation,
+                input.arguments(),
+                input.selection(),
+                Some(input.contract().result_type().data_type()),
+                false,
+                &mut work,
+                None,
+            )?
+        };
         SelectedValues::try_new_observed(
             input.selection(),
             input.contract().result_type().data_type(),
@@ -178,6 +205,105 @@ pub(super) fn evaluate<'a>(
         )
     })();
     work.finish_result(result)
+}
+
+fn prefer<T: Ord>(operation: ExtremaOperation, candidate: T, current: T) -> bool {
+    match operation {
+        ExtremaOperation::Greatest => candidate > current,
+        ExtremaOperation::Least => candidate < current,
+    }
+}
+
+fn evaluate_date(
+    operation: ExtremaOperation,
+    input: &ScalarCallInput<'_, '_>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let mut sources = reserve(input.arguments().len(), work)?;
+    for argument in input.arguments() {
+        let array = argument
+            .array()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .ok_or_else(|| invalid("extrema DATE argument violates its frozen carrier"))?;
+        sources.push((*argument, array));
+        work.step()?;
+    }
+    let selection = input.selection();
+    work.flush()?;
+    let mut output = TemporalOutputBuilder::new(Type::Date, selection.len())?;
+    work.flush()?;
+    for (ordinal, row) in selection.iter().enumerate() {
+        work.step()?;
+        let mut chosen = None;
+        for &(argument, array) in &sources {
+            work.step()?;
+            let row = argument.value_row(ordinal, row);
+            if array.is_null(row) {
+                chosen = None;
+                break;
+            }
+            let candidate = array.value(row);
+            if chosen.is_none_or(|current| prefer(operation, candidate, current)) {
+                chosen = Some(candidate);
+            }
+        }
+        match chosen {
+            Some(day) => output.date(day)?,
+            None => output.null(),
+        }
+    }
+    work.flush()?;
+    Ok(output.finish())
+}
+
+fn evaluate_temporal(
+    operation: ExtremaOperation,
+    input: &ScalarCallInput<'_, '_>,
+    ty: TemporalType,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let arguments = &input.contract().selected().argument_types;
+    let mut sources = reserve(arguments.len(), work)?;
+    for (argument, binding) in input.arguments().iter().zip(arguments.iter()) {
+        let FunctionArgumentType::Value(binding) = binding else {
+            return Err(invalid("extrema requires value arguments"));
+        };
+        let source = PreparedTemporalArray::bind(ty, argument.array().as_ref(), binding.nullable())
+            .map_err(|_| invalid("extrema temporal argument violates its frozen carrier"))?;
+        sources.push((*argument, source));
+        work.step()?;
+    }
+    let selection = input.selection();
+    work.flush()?;
+    let mut output = TemporalOutputBuilder::new(Type::Temporal(ty), selection.len())?;
+    work.flush()?;
+    for (ordinal, row) in selection.iter().enumerate() {
+        work.step()?;
+        let mut chosen = None;
+        for (argument, source) in &sources {
+            work.step()?;
+            let Some(value) = source
+                .value(argument.value_row(ordinal, row))
+                .map_err(|_| invalid("extrema has an invalid frozen temporal operand"))?
+            else {
+                chosen = None;
+                break;
+            };
+            let key = value
+                .relation_key(ty)
+                .map_err(|_| invalid("extrema temporal value violates its declared ordering"))?;
+            if chosen.is_none_or(|(current, _)| prefer(operation, key, current)) {
+                chosen = Some((key, value));
+            }
+        }
+        match chosen {
+            Some((_, value)) => output.temporal(ty, value)?,
+            None => output.null(),
+        }
+    }
+    work.flush()?;
+    Ok(output.finish())
 }
 /// The caller owns eager child evaluation. This boundary receives values only
 /// and preserves domain causes at the bounded owner boundary.

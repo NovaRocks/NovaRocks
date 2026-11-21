@@ -63,7 +63,8 @@ create table all_t0 (
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_t0 SELECT x%200, x%200, x%200, x%200, x%200, x, x, x%200, x, x, x, x, x % 8, x % 8, x % 16, x %200, x%200, '2020-02-02', '2020-02-02', x%200, x, x, x, x FROM TABLE(generate_series(1,  30000)) as g(x);
+-- The compact calendar inputs in this range have midnight time parts.
+insert into all_t0 SELECT x%200, x%200, x%200, x%200, x%200, x, CAST(CAST(x AS DATE) AS TIMESTAMP(6)), x%200, x, x, x, x, x % 8, x % 8, x % 16, x %200, x%200, '2020-02-02', '2020-02-02', x%200, x, x, x, x FROM TABLE(generate_series(1,  30000)) as g(x);
 
 -- query 4
 -- @skip_result_check=true

@@ -53,9 +53,9 @@ SELECT * FROM ${case_db}.t_datetime ORDER BY c1;
 
 -- query 3
 -- @skip_result_check=true
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.0';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.012';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.0';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.012';
 
 -- query 4
 -- @order_sensitive=true
@@ -64,9 +64,9 @@ SELECT * FROM ${case_db}.t_datetime ORDER BY c1;
 
 -- query 5
 -- @skip_result_check=true
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.1';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.123';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.123450';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.1';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.123';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.123450';
 
 -- query 6
 -- @order_sensitive=true

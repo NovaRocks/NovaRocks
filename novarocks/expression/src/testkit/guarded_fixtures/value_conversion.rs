@@ -105,6 +105,14 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
         "largeint_to_utf8_text",
         "utf8_to_largeint_null_invalid",
         "null_to_typed_nullable",
+        "temporal",
+        "temporal_widen",
+        "temporal_zone",
+        "temporal_clock",
+        "try_temporal",
+        "try_temporal_zone",
+        "try_temporal_clock",
+        "nested_temporal_write_assignment",
     ] {
         manifest.push(InstalledPureKernel {
             function: FunctionId::try_new("builtin.scalar/value_domain_conversion/v1").unwrap(),

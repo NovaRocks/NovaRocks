@@ -225,6 +225,38 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_implementation_re
             value_conversion::ARRAY_COMMON_COERCION,
             "builtin.scalar/value_domain_conversion/array_common_coercion/selected-v1",
         ),
+        (
+            value_conversion::TEMPORAL,
+            "builtin.scalar/value_domain_conversion/temporal/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_WIDEN,
+            "builtin.scalar/value_domain_conversion/temporal_widen/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_ZONE,
+            "builtin.scalar/value_domain_conversion/temporal_zone/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_CLOCK,
+            "builtin.scalar/value_domain_conversion/temporal_clock/selected-v1",
+        ),
+        (
+            value_conversion::TRY_TEMPORAL,
+            "builtin.scalar/value_domain_conversion/try_temporal/selected-v1",
+        ),
+        (
+            value_conversion::TRY_TEMPORAL_ZONE,
+            "builtin.scalar/value_domain_conversion/try_temporal_zone/selected-v1",
+        ),
+        (
+            value_conversion::TRY_TEMPORAL_CLOCK,
+            "builtin.scalar/value_domain_conversion/try_temporal_clock/selected-v1",
+        ),
+        (
+            value_conversion::TEMPORAL_WRITE_ASSIGNMENT,
+            "builtin.scalar/value_domain_conversion/nested_temporal_write_assignment/selected-v1",
+        ),
     ];
     assert_eq!(owner.implementations.len(), expected.len());
     for record in &owner.implementations {
