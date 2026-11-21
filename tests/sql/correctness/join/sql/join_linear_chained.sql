@@ -27,6 +27,9 @@
 -- 3. Create t1 with int, bigint, and string columns.
 -- 4. Execute inner join, left semi join, and left outer join variants.
 
+-- Expression keys use BIGINT addition and DECIMAL negation to cover the full INT
+-- input range, so both operations can be evaluated before matching rows.
+
 -- query 1
 -- @skip_result_check=true
 
@@ -84,11 +87,11 @@ from ${case_db}.__row_util;
 
 -- inner join on c_int with expression key
 -- query 11
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1;
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and CAST(tt1.c_int AS BIGINT) + 1 = CAST(tt2.c_int AS BIGINT) + 1;
 
 -- inner join on c_int with expression key and filter
 -- query 12
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1 where tt1.k1 % 2 = 0;
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and CAST(tt1.c_int AS BIGINT) + 1 = CAST(tt2.c_int AS BIGINT) + 1 where tt1.k1 % 2 = 0;
 
 -- inner join on c_int + c_bigint
 -- query 13
@@ -136,7 +139,7 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt
 
 -- inner join on negated key (no match)
 -- query 24
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 on -tt1.c_int=tt2.c_int;
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt2 on -CAST(tt1.c_int AS DECIMAL(10, 0)) = CAST(tt2.c_int AS DECIMAL(10, 0));
 
 -- inner join with broadcast hint and CTE
 -- query 25
@@ -149,12 +152,12 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join  w1 tt2 using(c_
 -- left semi join on c_int with expression key
 -- query 26
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and CAST(tt1.c_int AS BIGINT) + 1 = CAST(tt2.c_int AS BIGINT) + 1);
 
 -- left semi join on c_int with expression key and filter
 -- query 27
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1) AND (tt1.k1 % 2 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and CAST(tt1.c_int AS BIGINT) + 1 = CAST(tt2.c_int AS BIGINT) + 1) AND (tt1.k1 % 2 = 0);
 
 -- left semi join on c_int + c_bigint
 -- query 28
@@ -214,7 +217,7 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.
 -- left semi join on negated key (no match)
 -- query 39
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE -tt1.c_int=tt2.c_int);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE -CAST(tt1.c_int AS DECIMAL(10, 0)) = CAST(tt2.c_int AS DECIMAL(10, 0)));
 
 -- left semi join with broadcast hint and CTE
 -- query 40
@@ -227,11 +230,11 @@ WHERE EXISTS (SELECT 1 FROM w1 tt2 WHERE tt1.c_int = tt2.c_int);
 
 -- left outer join on c_int with expression key
 -- query 41
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1;
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and CAST(tt1.c_int AS BIGINT) + 1 = CAST(tt2.c_int AS BIGINT) + 1;
 
 -- left outer join on c_int with expression key and filter
 -- query 42
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1 where tt1.k1 % 2 = 0;
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and CAST(tt1.c_int AS BIGINT) + 1 = CAST(tt2.c_int AS BIGINT) + 1 where tt1.k1 % 2 = 0;
 
 -- left outer join on c_int + c_bigint
 -- query 43
@@ -279,7 +282,7 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${cas
 
 -- left outer join on negated key (no right matches)
 -- query 54
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 on -tt1.c_int=tt2.c_int;
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${case_db}.t1 tt2 on -CAST(tt1.c_int AS DECIMAL(10, 0)) = CAST(tt2.c_int AS DECIMAL(10, 0));
 
 -- left outer join with broadcast hint and CTE
 -- query 55
