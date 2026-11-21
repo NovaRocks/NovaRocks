@@ -64,6 +64,6 @@ first_instant	first_clock
 2000-01-01 01:00:00.000000000001 +01:00	00:00:00.000000000001-01:00
 
 -- query 14
--- types	interval second(1, 12)
+-- types	INTERVAL SECOND(1, 12)
 elapsed
 0 00:00:01.000000000002

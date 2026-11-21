@@ -1,0 +1,9 @@
+-- query 1
+-- types	varchar	varchar	varchar
+_col0	_col1	_col2
+timestamp(7)	timestamp(3) with time zone	time(7) with time zone
+
+-- query 3
+-- types	varchar	varchar
+local_type	zoned_type
+timestamp(6)	timestamp(6) with time zone

@@ -140,9 +140,3 @@ select typeof(c1)
   ,typeof(c19)
   ,typeof(c20)
   from t1;
-
--- query 24
-SELECT
-    typeof(TIMESTAMP '2023-03-07 11:22:33.1234567'),
-    typeof(TIMESTAMP '2023-03-07 11:22:33.123 UTC'),
-    typeof(TIME '11:22:33.1234567 +05:30');
