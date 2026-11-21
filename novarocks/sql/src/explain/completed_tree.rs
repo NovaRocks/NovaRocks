@@ -880,7 +880,7 @@ struct ExprText<'a> {
 
 impl std::fmt::Display for ExprText<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.write(formatter, self.expr.ok_or(fmt::Error)?, 0)
+        self.write(formatter, self.expr.ok_or(fmt::Error)?, 0, false)
     }
 }
 
@@ -905,6 +905,7 @@ impl ExprText<'_> {
         formatter: &mut std::fmt::Formatter<'_>,
         expr: ExprId,
         depth: usize,
+        predicate_operand: bool,
     ) -> std::fmt::Result {
         if depth > Self::MAX_DEPTH {
             return Err(fmt::Error);
@@ -916,7 +917,16 @@ impl ExprText<'_> {
         let inner = |expr: ExprId| ExprTextAt {
             text: self.nested(expr),
             depth: depth.saturating_add(1),
+            predicate_operand: false,
         };
+        let operand = |expr| ExprTextAt {
+            predicate_operand: true,
+            ..inner(expr)
+        };
+        let grouped = predicate_operand && needs_predicate_group(&node.kind);
+        if grouped {
+            formatter.write_str("(")?;
+        }
         match &node.kind {
             ExprKind::Value(value) => self
                 .context
@@ -938,7 +948,7 @@ impl ExprText<'_> {
             ExprKind::Unary { op, expr } => {
                 use novarocks_expression_contract::UnaryOperator;
                 match op {
-                    UnaryOperator::Not => write!(formatter, "NOT {}", inner(*expr)),
+                    UnaryOperator::Not => write!(formatter, "NOT {}", operand(*expr)),
                 }
             }
             ExprKind::Binary {
@@ -946,9 +956,9 @@ impl ExprText<'_> {
             } => write!(
                 formatter,
                 "{} {} {}",
-                inner(*left),
+                operand(*left),
                 binary_operator_text(*op),
-                inner(*right)
+                operand(*right)
             ),
             ExprKind::Conjunction { args } => {
                 write_joined(formatter, args, " AND ", |arg| inner(*arg))
@@ -968,7 +978,7 @@ impl ExprText<'_> {
             ExprKind::IsNull { expr, negated } => write!(
                 formatter,
                 "{} IS {}NULL",
-                inner(*expr),
+                operand(*expr),
                 if *negated { "NOT " } else { "" }
             ),
             ExprKind::IsTruthValue {
@@ -978,7 +988,7 @@ impl ExprText<'_> {
             } => write!(
                 formatter,
                 "{} IS {}{}",
-                inner(*expr),
+                operand(*expr),
                 if *negated { "NOT " } else { "" },
                 if *value { "TRUE" } else { "FALSE" }
             ),
@@ -993,7 +1003,7 @@ impl ExprText<'_> {
                 write!(
                     formatter,
                     "{} {}IN (",
-                    inner(*expr),
+                    operand(*expr),
                     if *negated { "NOT " } else { "" }
                 )?;
                 write_joined(formatter, list, ", ", |item| inner(*item))?;
@@ -1007,10 +1017,10 @@ impl ExprText<'_> {
             } => write!(
                 formatter,
                 "{} {}BETWEEN {} AND {}",
-                inner(*expr),
+                operand(*expr),
                 if *negated { "NOT " } else { "" },
-                inner(*low),
-                inner(*high)
+                operand(*low),
+                operand(*high)
             ),
             ExprKind::Like {
                 expr,
@@ -1019,9 +1029,9 @@ impl ExprText<'_> {
             } => write!(
                 formatter,
                 "{} {}LIKE {}",
-                inner(*expr),
+                operand(*expr),
                 if *negated { "NOT " } else { "" },
-                inner(*pattern)
+                operand(*pattern)
             ),
             ExprKind::Case {
                 operand,
@@ -1052,16 +1062,8 @@ impl ExprText<'_> {
                     .kind;
                 let needs_parentheses = matches!(
                     operand_kind,
-                    ExprKind::Binary { .. }
-                        | ExprKind::Unary { .. }
-                        | ExprKind::Conjunction { .. }
-                        | ExprKind::IsNull { .. }
-                        | ExprKind::IsTruthValue { .. }
-                        | ExprKind::InList { .. }
-                        | ExprKind::Between { .. }
-                        | ExprKind::Like { .. }
-                        | ExprKind::Lambda { .. }
-                );
+                    ExprKind::Binary { .. } | ExprKind::Lambda { .. }
+                ) || needs_predicate_group(operand_kind);
                 write_negation(formatter, needs_parentheses, |out| {
                     write!(out, "{}", inner(*operand))
                 })
@@ -1079,20 +1081,66 @@ impl ExprText<'_> {
                     &function.function_id,
                 )
                 .ok_or(fmt::Error)?;
+                // Retain the established infix grouping for arithmetic. A
+                // comparison binds more tightly than AND/OR, and needs its
+                // outer parentheses only when it occupies an operand slot.
+                if operator.arithmetic().is_some() {
+                    formatter.write_str("(")?;
+                }
                 write!(
                     formatter,
-                    "({} {} {})",
-                    inner(*left),
+                    "{} {} {}",
+                    operand(*left),
                     operator.sql(),
-                    inner(*right)
-                )
+                    operand(*right)
+                )?;
+                if operator.arithmetic().is_some() {
+                    formatter.write_str(")")?;
+                }
+                Ok(())
             }
             ExprKind::FunctionCall { function, args } => {
                 write!(formatter, "{}(", function_text(&function.function_id))?;
                 write_joined(formatter, args, ", ", |arg| inner(*arg))?;
                 write!(formatter, ")")
             }
+        }?;
+        if grouped {
+            formatter.write_str(")")?;
         }
+        Ok(())
+    }
+}
+
+fn needs_predicate_group(kind: &ExprKind) -> bool {
+    use novarocks_expression_contract::BinaryOperator;
+    use novarocks_type_contract::OperatorFunction;
+
+    match kind {
+        ExprKind::FunctionCall { function, .. } => {
+            OperatorFunction::from_function_id(&function.function_id).is_some_and(|operator| {
+                operator.comparison().is_some() || operator.is_null_safe_comparison()
+            })
+        }
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::EqForNull
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+        ),
+        ExprKind::Unary { .. }
+        | ExprKind::Conjunction { .. }
+        | ExprKind::IsNull { .. }
+        | ExprKind::IsTruthValue { .. }
+        | ExprKind::InList { .. }
+        | ExprKind::Between { .. }
+        | ExprKind::Like { .. } => true,
+        // Disjunction already groups at non-root rendering depth.
+        _ => false,
     }
 }
 
@@ -1100,12 +1148,17 @@ impl ExprText<'_> {
 struct ExprTextAt<'a> {
     text: ExprText<'a>,
     depth: usize,
+    predicate_operand: bool,
 }
 
 impl std::fmt::Display for ExprTextAt<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.text
-            .write(formatter, self.text.expr.ok_or(fmt::Error)?, self.depth)
+        self.text.write(
+            formatter,
+            self.text.expr.ok_or(fmt::Error)?,
+            self.depth,
+            self.predicate_operand,
+        )
     }
 }
 
@@ -1465,6 +1518,7 @@ impl TreeContext<'_> {
                         ExprTextAt {
                             text: self.expr(fragment, node.id, *root),
                             depth: 1,
+                            predicate_operand: false,
                         }
                         .fmt(f)
                     })

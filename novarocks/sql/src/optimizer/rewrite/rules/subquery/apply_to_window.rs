@@ -424,7 +424,14 @@ fn check_preconditions_opt(
     let col_map = collect_scan_column_map(apply_left);
     let mut partition_by = Vec::new();
     for conj in &a.correlation_conjuncts {
-        let (outer_side, _inner) = scalar_utils::orient_eq(arena, *conj, &corr_ids)?;
+        let (outer_side, inner_side) = scalar_utils::orient_eq(arena, *conj, &corr_ids)?;
+        // Correlated equality and PARTITION BY must identify the same rows.
+        // Ordinary floating equality and grouping disagree on NaN.
+        if ![outer_side, inner_side].into_iter().all(|operand| {
+            crate::common::binary_operator::permits_equality_substitution(arena.data_type(operand))
+        }) {
+            return None;
+        }
         let column_id = scalar_utils::is_column_ref(arena, outer_side)?;
         match col_map.get(&column_id) {
             Some((tab, _)) if *tab == correlated_outer_table => {}

@@ -151,12 +151,16 @@ from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null and t1
 -- join on expression key (c_int + 1) and c_int
 -- query 18
 select count(1)
-from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_int + 1 = t2.c_int + 1 and t1.c_int = t2.c_int;
+from ${case_db}.t1 join ${case_db}.t1 t2
+  on CAST(t1.c_int AS BIGINT) + 1 = CAST(t2.c_int AS BIGINT) + 1
+ and t1.c_int = t2.c_int;
 
 -- join on mismatched expression key (c_int + 1 vs c_int + 2)
 -- query 19
 select count(1)
-from ${case_db}.t1 join ${case_db}.t1 t2 on t1.c_int + 1 = t2.c_int + 2 and t1.c_int = t2.c_int;
+from ${case_db}.t1 join ${case_db}.t1 t2
+  on CAST(t1.c_int AS BIGINT) + 1 = CAST(t2.c_int AS BIGINT) + 2
+ and t1.c_int = t2.c_int;
 
 -- join on float + int
 -- query 20
