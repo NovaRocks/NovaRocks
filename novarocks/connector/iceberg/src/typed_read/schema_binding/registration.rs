@@ -79,8 +79,8 @@ pub(crate) fn preview_registration(
             continue;
         };
         let adaptation =
-            FieldAdaptation::bind(Some(fields.schema.field(slot)), target).map_err(|error| {
-                match error {
+            FieldAdaptation::bind(Some(fields.schema.field(slot)), target, table_schema).map_err(
+                |error| match error {
                     AdaptationError::Invalid(error) => Error::Corrupt(error),
                     AdaptationError::TypeMismatch {
                         field,
@@ -98,8 +98,8 @@ pub(crate) fn preview_registration(
                             }
                         }
                     }
-                }
-            })?;
+                },
+            )?;
         if let Some(field) = adaptation.missing_required() {
             return Err(Error::MissingRequiredChild(field.to_owned()));
         }

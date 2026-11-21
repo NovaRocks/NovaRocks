@@ -33,7 +33,7 @@ use novarocks_value_arrays::{
 
 use crate::iceberg::spec::Type;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TemporalReadProjection {
     Identity,
     Leaf(TemporalType),

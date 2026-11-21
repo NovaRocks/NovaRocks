@@ -1386,7 +1386,7 @@ fn try_partition_only_page_source(
             IcebergColumnSource::Physical { .. }
             | IcebergColumnSource::MutationSpecId(_)
             | IcebergColumnSource::MutationPartition(_)
-            | IcebergColumnSource::InitialDefault
+            | IcebergColumnSource::InitialDefault(_)
             | IcebergColumnSource::TypedNull
             | IcebergColumnSource::Metadata(_)
             | IcebergColumnSource::StoredRowLineage(_) => return Ok(None),

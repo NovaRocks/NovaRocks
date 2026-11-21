@@ -518,11 +518,11 @@ pub fn require_v3_for_column_default(
 
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampMicrosecondArray,
-    TimestampNanosecondArray, new_null_array,
+    Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, TimeUnit};
 
 /// Arrow field metadata key carrying Iceberg format-v3 initial defaults.
 ///
@@ -530,113 +530,17 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 /// SQL schema projection must not define a competing key.
 pub const ICEBERG_INITIAL_DEFAULT_META_KEY: &str = "novarocks.iceberg.initial_default";
 
-/// Materialize an Iceberg format-v3 initial default for a missing physical
-/// column. Missing metadata deliberately yields a typed null array so schema
-/// evolution has one provider-owned interpretation on every execution node.
-pub fn build_iceberg_default_array(
-    target_field: &Field,
+/// Materialize the original default of a field already bound by Iceberg ID.
+pub(crate) fn materialize_initial_default(
+    source: &crate::iceberg::spec::NestedField,
+    layout: &DataType,
     row_count: usize,
 ) -> Result<ArrayRef, String> {
-    let Some(json) = target_field
-        .metadata()
-        .get(ICEBERG_INITIAL_DEFAULT_META_KEY)
-    else {
-        return Ok(new_null_array(target_field.data_type(), row_count));
-    };
-    let json_value: serde_json::Value = crate::metadata_json::from_str(json).map_err(|error| {
-        format!(
-            "corrupted initial-default JSON for column {}: {error}",
-            target_field.name()
-        )
-    })?;
-    let iceberg_type = arrow_type_to_iceberg_type(target_field.data_type()).map_err(|error| {
-        format!(
-            "unsupported initial-default for column {}: {error}",
-            target_field.name()
-        )
-    })?;
-    let literal = IcebergLiteral::try_from_json(json_value, &iceberg_type)
-        .map_err(|error| {
-            format!(
-                "decode initial-default for column {}: {error}",
-                target_field.name()
-            )
-        })?
-        .ok_or_else(|| {
-            format!(
-                "initial-default JSON for column {} produced no literal",
-                target_field.name()
-            )
-        })?;
-    literal_to_constant_array(&literal, target_field.data_type(), row_count)
-}
-
-fn arrow_type_to_iceberg_type(data_type: &DataType) -> Result<Type, String> {
-    use crate::iceberg::spec::{ListType, MapType, NestedField};
-    Ok(match data_type {
-        DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 => Type::Primitive(PrimitiveType::Int),
-        DataType::Int64 => Type::Primitive(PrimitiveType::Long),
-        DataType::Float32 => Type::Primitive(PrimitiveType::Float),
-        DataType::Float64 => Type::Primitive(PrimitiveType::Double),
-        DataType::Decimal128(precision, scale) => Type::Primitive(PrimitiveType::Decimal {
-            precision: *precision as u32,
-            scale: *scale as u32,
-        }),
-        DataType::Utf8 => Type::Primitive(PrimitiveType::String),
-        DataType::Date32 => Type::Primitive(PrimitiveType::Date),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Type::Primitive(PrimitiveType::Timestamp)
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
-            Type::Primitive(PrimitiveType::Timestamptz)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
-            Type::Primitive(PrimitiveType::TimestampNs)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
-            Type::Primitive(PrimitiveType::TimestamptzNs)
-        }
-        DataType::Binary | DataType::LargeBinary => Type::Primitive(PrimitiveType::Binary),
-        DataType::List(element_field) => {
-            Type::List(ListType::new(Arc::new(NestedField::optional(
-                1,
-                "element",
-                arrow_type_to_iceberg_type(element_field.data_type())?,
-            ))))
-        }
-        DataType::Map(entries_field, _) => {
-            let DataType::Struct(entry_fields) = entries_field.data_type() else {
-                return Err(format!(
-                    "arrow Map field entries must be a Struct, got {:?}",
-                    entries_field.data_type()
-                ));
-            };
-            if entry_fields.len() < 2 {
-                return Err(format!(
-                    "arrow Map entries struct must have at least 2 fields, got {}",
-                    entry_fields.len()
-                ));
-            }
-            Type::Map(MapType::new(
-                Arc::new(NestedField::required(
-                    1,
-                    "key",
-                    arrow_type_to_iceberg_type(entry_fields[0].data_type())?,
-                )),
-                Arc::new(NestedField::optional(
-                    2,
-                    "value",
-                    arrow_type_to_iceberg_type(entry_fields[1].data_type())?,
-                )),
-            ))
-        }
-        other => {
-            return Err(format!(
-                "arrow type {other:?} cannot carry an iceberg default"
-            ));
-        }
-    })
+    let literal = source
+        .initial_default
+        .as_ref()
+        .ok_or_else(|| format!("iceberg field {} has no bound initial default", source.id))?;
+    literal_to_constant_array(literal, layout, row_count)
 }
 
 /// Build an Arrow constant array of length `row_count` whose every element is
@@ -753,12 +657,17 @@ pub fn literal_to_constant_array(
         (PrimitiveLiteral::Int(v), DataType::Date32) => {
             Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
         }
-        (PrimitiveLiteral::Long(v), DataType::Timestamp(TimeUnit::Nanosecond, _)) => {
-            Arc::new(TimestampNanosecondArray::from(vec![*v; row_count])) as ArrayRef
+        (PrimitiveLiteral::Long(v), DataType::Time64(TimeUnit::Microsecond)) => {
+            Arc::new(Time64MicrosecondArray::from(vec![*v; row_count])) as ArrayRef
         }
-        (PrimitiveLiteral::Long(v), DataType::Timestamp(TimeUnit::Microsecond, _)) => {
-            Arc::new(TimestampMicrosecondArray::from(vec![*v; row_count])) as ArrayRef
-        }
+        (PrimitiveLiteral::Long(v), DataType::Timestamp(TimeUnit::Nanosecond, zone)) => Arc::new(
+            TimestampNanosecondArray::from(vec![*v; row_count]).with_timezone_opt(zone.clone()),
+        )
+            as ArrayRef,
+        (PrimitiveLiteral::Long(v), DataType::Timestamp(TimeUnit::Microsecond, zone)) => Arc::new(
+            TimestampMicrosecondArray::from(vec![*v; row_count]).with_timezone_opt(zone.clone()),
+        )
+            as ArrayRef,
         (PrimitiveLiteral::Binary(b), DataType::Binary) => {
             let slice = b.as_slice();
             Arc::new(BinaryArray::from(vec![slice; row_count])) as ArrayRef

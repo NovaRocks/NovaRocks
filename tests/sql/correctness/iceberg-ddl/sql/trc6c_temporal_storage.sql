@@ -52,7 +52,7 @@ ALTER TABLE temporal_v2 ADD COLUMN elapsed INTERVAL DAY TO SECOND;
 -- query 7
 -- @skip_result_check=true
 CREATE TABLE temporal_defaults (id INTEGER) WITH (format_version = 3);
-INSERT INTO temporal_defaults VALUES ROW(1);
+INSERT INTO temporal_defaults VALUES ROW(1), ROW(2);
 
 -- query 8
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
@@ -63,7 +63,7 @@ ALTER TABLE temporal_defaults ADD COLUMN zoned TIMESTAMP(12) WITH TIME ZONE
 -- @skip_result_check=true
 ALTER TABLE temporal_defaults ADD COLUMN zoned TIMESTAMP(12) WITH TIME ZONE
     DEFAULT '2024-01-01 00:00:00.1234567897 UTC';
-INSERT INTO temporal_defaults (id) VALUES ROW(2);
+INSERT INTO temporal_defaults (id) VALUES ROW(3);
 
 -- query 10
 SELECT id, zoned FROM temporal_defaults ORDER BY id;

@@ -25,11 +25,33 @@ use novarocks_type_contract::{
 
 use super::domain::IcebergEqualityDeleteRecipe;
 use crate::iceberg::arrow::schema_to_arrow_schema;
+use crate::iceberg::spec::Schema;
+use crate::temporal::TemporalReadProjection;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EqualityDeleteFileTarget {
     pub arrow_schema: SchemaRef,
+    pub temporals: Box<[TemporalReadProjection]>,
+}
+
+impl EqualityDeleteFileTarget {
+    pub(crate) fn from_schema(schema: &Schema) -> Result<Self, String> {
+        let arrow_schema =
+            Arc::new(schema_to_arrow_schema(schema).map_err(|error| {
+                format!("convert frozen Iceberg equality-delete schema: {error}")
+            })?);
+        let temporals = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| TemporalReadProjection::from_type(&field.field_type))
+            .collect();
+        Ok(Self {
+            arrow_schema,
+            temporals,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -200,18 +222,18 @@ fn resolve_core(
             .map_err(invalid)?;
         work.step()?;
     }
-    let arrow_schema = Arc::new(work.opaque(|| schema_to_arrow_schema(&target))?.map_err(
-        |error| {
-            invalid(format!(
-                "convert frozen Iceberg equality-delete schema: {error}"
-            ))
-        },
-    )?);
+    let target = work
+        .opaque(|| EqualityDeleteFileTarget::from_schema(&target))?
+        .map_err(invalid)?;
     work.opaque(|| {
-        crate::commit::write_adaptation::validate_batch_schema(expected_schema, &arrow_schema)
+        crate::commit::write_adaptation::validate_temporal_batch_schema(
+            expected_schema,
+            &target.arrow_schema,
+            &target.temporals,
+        )
     })?
     .map_err(invalid)?;
-    Ok(EqualityDeleteFileTarget { arrow_schema })
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -258,7 +280,12 @@ mod tests {
     }
     #[test]
     fn equality_target_uses_frozen_type_and_field_id() {
-        let (recipe, input) = fixture(serde_json::json!("timestamptz"));
+        let (recipe, physical) = fixture(serde_json::json!("timestamptz"));
+        let zoned = crate::temporal::declaration(&crate::iceberg::spec::PrimitiveType::Timestamptz)
+            .unwrap();
+        let input = Arc::new(Schema::new(vec![
+            physical.field(0).clone().with_data_type(zoned.carrier()),
+        ]));
         let target = equality_delete_target_for_compile(&recipe, &input, &control()).unwrap();
         assert_eq!(
             target,
@@ -280,6 +307,7 @@ mod tests {
                 Some("+00:00".into())
             )
         );
+        assert!(equality_delete_target_from_recipe(&recipe, &physical).is_err());
     }
     #[test]
     fn equality_target_rejects_variant_uuid_and_missing_projection() {

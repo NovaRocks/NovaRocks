@@ -41,9 +41,13 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} O
 -- binary literals are rejected by the existing statement lowering. Keep the
 -- non-NULL FF00 binary data writer/read assertion above, and exercise equality
 -- adaptation with expressible timestamptz, decimal and string keys.
+-- The equality procedure's zone-less timestamp text is cast in the session
+-- zone. Use the same zone as the instant inserted above.
 -- query 4
 -- @skip_result_check=true
+SET TIME ZONE 'UTC';
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['ts', 'd', 's'], rows => ARRAY[ROW('2024-01-02 03:04:05.123456',12.34,'東京')]);
+SET TIME ZONE LOCAL;
 
 -- query 5
 SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ORDER BY id;

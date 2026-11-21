@@ -157,7 +157,7 @@ pub(super) struct OutputCursor {
 
 struct TemporalOutput {
     projection: Arc<[Option<TemporalOutputColumn>]>,
-    sources: Box<[arrow::array::ArrayRef]>,
+    sources: Box<[(arrow::array::ArrayRef, bool)]>,
 }
 
 impl OutputCursor {
@@ -202,7 +202,7 @@ impl OutputCursor {
                 projection: projection.clone(),
                 sources: columns
                     .iter()
-                    .map(|column| column.source().clone())
+                    .map(|column| (column.source().clone(), column.is_constant()))
                     .collect(),
             });
         }
@@ -228,11 +228,12 @@ impl OutputCursor {
                     .iter()
                     .zip(temporal.sources.iter())
                     .filter_map(|(column, source)| column.as_ref().map(|column| (column, source)))
-                    .try_fold(0, |total, (column, source)| {
+                    .try_fold(0, |total, (column, (source, constant))| {
+                        let source_row = if *constant { 0 } else { row };
                         Ok(total
                             + column.projection.additional_read_bytes(
                                 source,
-                                row..row + 1,
+                                source_row..source_row + 1,
                                 &column.path,
                                 &mut || context.check_active().map_err(map_file_error),
                             )?)

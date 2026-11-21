@@ -102,6 +102,10 @@ impl<'a> OutputColumn<'a> {
     pub const fn source(&self) -> &'a ArrayRef {
         self.source
     }
+
+    pub const fn is_constant(&self) -> bool {
+        self.constant
+    }
 }
 
 /// Serial, producer-local planner over a single final row domain. It keeps

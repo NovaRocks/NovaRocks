@@ -32,6 +32,7 @@ use std::sync::Arc;
 use crate::exec::hash_table::allocation::AggregateVec;
 use crate::runtime_filter::contribution::{
     ControlledOrderedTupleError, OrderedScalarRef, OrderedTupleError, RuntimeOrderContract,
+    RuntimeOrderKey,
 };
 use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedOrderKey};
 use arrow::array::{
@@ -475,7 +476,7 @@ impl AggregateTopNBoundaryState {
         contract: impl Into<crate::runtime_filter::RuntimeOrderContractRef>,
     ) -> Result<Self, AggregateTopNBoundaryError> {
         let contract = contract.into();
-        validate_topn_boundary_contract(&contract)?;
+        validate_legacy_topn_boundary_contract(&contract)?;
         Ok(Self {
             limit: limit.get() as usize,
             contract,
@@ -517,11 +518,14 @@ impl OwnedAggregateTopNBoundaryState {
         contract: crate::runtime_filter::RuntimeOrderContractRef,
         host: &OrderedTopNAllocationHost,
     ) -> Result<Self, OwnedTopNBoundaryError> {
-        validate_topn_boundary_contract(&contract)?;
-        let data_type = contract.keys()[0].data_type();
-        if !novarocks_local_program::is_aggregate_topn_key_carrier(data_type) {
+        let key = single_topn_boundary_key(&contract)?;
+        let supported = key.value_type().map_or_else(
+            || novarocks_local_program::is_aggregate_topn_key_carrier(key.data_type()),
+            novarocks_local_program::is_aggregate_topn_key_type,
+        );
+        if !supported {
             return Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
-                actual: topn_type_description(data_type),
+                actual: topn_type_description(key.data_type()),
             }
             .into());
         }
@@ -576,15 +580,22 @@ impl AggregateTopNBoundaryBinding {
     }
 }
 
-fn validate_topn_boundary_contract(
+fn single_topn_boundary_key(
     contract: &RuntimeOrderContract,
-) -> Result<(), AggregateTopNBoundaryError> {
-    if contract.keys().len() != 1 {
+) -> Result<&RuntimeOrderKey, AggregateTopNBoundaryError> {
+    let [key] = contract.keys() else {
         return Err(AggregateTopNBoundaryError::UnsupportedKeyArity {
             actual: contract.keys().len(),
         });
-    }
-    let data_type = contract.keys()[0].data_type();
+    };
+    Ok(key)
+}
+
+#[cfg(test)]
+fn validate_legacy_topn_boundary_contract(
+    contract: &RuntimeOrderContract,
+) -> Result<(), AggregateTopNBoundaryError> {
+    let data_type = single_topn_boundary_key(contract)?.data_type();
     if !matches!(
         data_type,
         DataType::Int8
