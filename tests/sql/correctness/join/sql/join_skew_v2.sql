@@ -438,7 +438,7 @@ CREATE TABLE ${case_db}.skew_t1 (
 -- query 82
 -- @skip_result_check=true
 INSERT INTO ${case_db}.skew_t1(c_key, c_tinyint, c_smallint, c_int, c_bigint, c_largeint, c_float, c_double, c_decimal, c_date, c_datetime, c_string)
-SELECT t.c_key, t.c_key % 100 as c_tinyint, t.c_key % 1000 as c_smallint, t.c_key % 10000 as c_int, t.c_key % 100000 as c_bigint, t.c_key % 1000000 as c_largeint, t.c_key % 10000000 as c_float, t.c_key % 100000000 as c_double, t.c_key % 1000000000 as c_decimal, t.c_key % 10000000000 as c_date, t.c_key % 100000000000 as c_datetime, t.c_key % 1000000000000 as c_string
+SELECT t.c_key, t.c_key % 100 as c_tinyint, t.c_key % 1000 as c_smallint, t.c_key % 10000 as c_int, t.c_key % 100000 as c_bigint, t.c_key % 1000000 as c_largeint, t.c_key % 10000000 as c_float, t.c_key % 100000000 as c_double, t.c_key % 1000000000 as c_decimal, t.c_key % 10000000000 as c_date, TRY_CAST(CONCAT('2000-', LPAD(CAST(t.c_key / 100 AS VARCHAR), 2, '0'), '-', LPAD(CAST(t.c_key % 100 AS VARCHAR), 2, '0')) AS TIMESTAMP(6)) as c_datetime, t.c_key % 1000000000000 as c_string
 FROM TABLE(generate_series(1, 4095*2)) t(c_key);
 
 -- query 83
@@ -448,13 +448,13 @@ TRUNCATE TABLE ${case_db}.t2;
 -- query 84
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t2(c_key, c_tinyint, c_smallint, c_int, c_bigint, c_largeint, c_float, c_double, c_decimal, c_date, c_datetime, c_string)
-SELECT t.c_key, t.c_key % 100 as c_tinyint, t.c_key % 1000 as c_smallint, t.c_key % 10000 as c_int, t.c_key % 100000 as c_bigint, t.c_key % 1000000 as c_largeint, t.c_key % 10000000 as c_float, t.c_key % 100000000 as c_double, t.c_key % 1000000000 as c_decimal, t.c_key % 10000000000 as c_date, t.c_key % 100000000000 as c_datetime, t.c_key % 1000000000000 as c_string
+SELECT t.c_key, t.c_key % 100 as c_tinyint, t.c_key % 1000 as c_smallint, t.c_key % 10000 as c_int, t.c_key % 100000 as c_bigint, t.c_key % 1000000 as c_largeint, t.c_key % 10000000 as c_float, t.c_key % 100000000 as c_double, t.c_key % 1000000000 as c_decimal, t.c_key % 10000000000 as c_date, TRY_CAST(CONCAT('2000-', LPAD(CAST(t.c_key / 100 AS VARCHAR), 2, '0'), '-', LPAD(CAST(t.c_key % 100 AS VARCHAR), 2, '0')) AS TIMESTAMP(6)) as c_datetime, t.c_key % 1000000000000 as c_string
 FROM TABLE(generate_series(1, 4095*2)) t(c_key);
 
 -- query 85
 -- @skip_result_check=true
 INSERT INTO ${case_db}.skew_t1(c_key, c_tinyint, c_smallint, c_int, c_bigint, c_largeint, c_float, c_double, c_decimal, c_date, c_datetime, c_string)
-SELECT t.c_key % 1, t.c_key % 1 as c_tinyint, t.c_key % 1 as c_smallint, t.c_key % 1 as c_int, t.c_key % 1 as c_bigint, t.c_key % 1 as c_largeint, t.c_key % 1 as c_float, t.c_key % 1 as c_double, t.c_key % 1 as c_decimal, t.c_key % 1 as c_date, t.c_key % 1 as c_datetime, t.c_key % 1 as c_string
+SELECT t.c_key % 1, t.c_key % 1 as c_tinyint, t.c_key % 1 as c_smallint, t.c_key % 1 as c_int, t.c_key % 1 as c_bigint, t.c_key % 1 as c_largeint, t.c_key % 1 as c_float, t.c_key % 1 as c_double, t.c_key % 1 as c_decimal, t.c_key % 1 as c_date, CAST(NULL AS TIMESTAMP(6)) as c_datetime, t.c_key % 1 as c_string
 FROM TABLE(generate_series(1, 4095*2)) t(c_key);
 
 -- query 86

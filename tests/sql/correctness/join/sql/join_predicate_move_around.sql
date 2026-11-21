@@ -179,7 +179,7 @@ INSERT INTO ${case_db}.test_all_type_not_null VALUES
 -- @order_sensitive=false
 select * from
 (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
-and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
+and t1d = 20 and t1f = 1.1 and id_datetime between TIMESTAMP '2021-01-01 00:00:00' and TIMESTAMP '2021-02-01 00:00:00' and id_decimal = 1.2) t1
  inner join ${case_db}.test_all_type_not_null t2
 on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < t2.id_datetime;
 
@@ -188,7 +188,7 @@ on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < 
 -- @order_sensitive=false
 select * from
 (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
-and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
+and t1d = 20 and t1f = 1.1 and id_datetime between TIMESTAMP '2021-01-01 00:00:00' and TIMESTAMP '2021-02-01 00:00:00' and id_decimal = 1.2) t1
  left join ${case_db}.test_all_type_not_null t2
 on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < t2.id_datetime;
 
@@ -231,7 +231,7 @@ on abs(t1.t1b + t1.t1d) = t2.t1b;
 -- @order_sensitive=false
 select * from ${case_db}.test_all_type_not_null t2
 inner join (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
-and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
+and t1d = 20 and t1f = 1.1 and id_datetime between TIMESTAMP '2021-01-01 00:00:00' and TIMESTAMP '2021-02-01 00:00:00' and id_decimal = 1.2) t1
 on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < t2.id_datetime;
 
 -- query 29
@@ -239,7 +239,7 @@ on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < 
 -- @order_sensitive=false
 select * from ${case_db}.test_all_type_not_null t2
 right join (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
-and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
+and t1d = 20 and t1f = 1.1 and id_datetime between TIMESTAMP '2021-01-01 00:00:00' and TIMESTAMP '2021-02-01 00:00:00' and id_decimal = 1.2) t1
 on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < t2.id_datetime;
 
 -- ============================================================
