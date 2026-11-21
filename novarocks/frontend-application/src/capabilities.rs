@@ -25,7 +25,6 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
-use tokio::runtime::Handle;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};

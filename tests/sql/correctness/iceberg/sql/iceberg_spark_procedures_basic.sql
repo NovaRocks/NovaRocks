@@ -18,8 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=iceberg,procedures,spark
--- Test Spark-style Iceberg procedure CALL routing for supported maintenance
--- procedures and no-candidate position-delete rewrite.
+-- Verify that retired Spark-style CALL procedures leave Iceberg data unchanged.
 
 -- query 1
 -- @skip_result_check=true
@@ -43,6 +42,8 @@ INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES ROW(2, 20);
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_manifests
 CALL proc_ice_${uuid0}.system.rewrite_manifests("table" => 'ns_${uuid0}.orders');
 
 -- query 4
@@ -50,16 +51,17 @@ CALL proc_ice_${uuid0}.system.rewrite_manifests("table" => 'ns_${uuid0}.orders')
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_position_delete_files
 CALL proc_ice_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders');
 
 -- query 5
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
--- Scanned GC requires Provider safety proof even for an old cutoff.
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.remove_orphan_files
 CALL proc_ice_${uuid0}.system.remove_orphan_files("table" => 'ns_${uuid0}.orders', older_than => TIMESTAMP '2020-01-01 00:00:00');
 
 -- query 6
@@ -71,12 +73,15 @@ SELECT id, amount FROM orders ORDER BY id;
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.expire_snapshots
 CALL proc_ice_${uuid0}.system.expire_snapshots("table" => 'ns_${uuid0}.orders', retain_last => 1);
 
 -- query 8
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
--- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
--- @skip_result_check=true
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_data_files
 CALL proc_ice_${uuid0}.system.rewrite_data_files("table" => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
 
 -- query 9

@@ -18,7 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=iceberg,procedures,errors
--- Validate Spark-style Iceberg procedure rejection paths.
+-- Reject unknown and retired CALL names while preserving ordinary v2 deletes.
 
 -- query 1
 -- @skip_result_check=true
@@ -43,32 +43,36 @@ INSERT INTO proc_err_${uuid0}.ns_${uuid0}.v2_orders VALUES ROW(1), ROW(2), ROW(3
 DELETE FROM proc_err_${uuid0}.ns_${uuid0}.v2_orders WHERE id = 2;
 
 -- query 4
--- @expect_error=Iceberg procedures must use system namespace
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_manifests
 CALL proc_err_${uuid0}.admin.rewrite_manifests("table" => 'ns_${uuid0}.orders');
 
 -- query 5
--- @expect_error=unsupported Iceberg system procedure
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.unknown_proc
 CALL proc_err_${uuid0}.system.unknown_proc("table" => 'ns_${uuid0}.orders');
 
 -- query 6
--- @expect_error=where is not supported
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_position_delete_files
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', "where" => 'id = 1');
 
 -- query 7
--- @expect_error=unsupported rewrite_position_delete_files option
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_position_delete_files
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', options => map('partial-progress.enabled', 'true'));
 
 -- query 8
--- @expect_error=target-file-size-bytes
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_position_delete_files
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', options => map('target-file-size-bytes', '134217728'));
 
 -- query 9
--- The original V2 refusal retains its typed Data fact through safe projection.
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_position_delete_files
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.v2_orders', options => map('rewrite-all', 'true'));
 
 -- query 10
