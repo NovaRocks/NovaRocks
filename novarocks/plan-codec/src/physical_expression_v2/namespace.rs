@@ -1257,6 +1257,7 @@ fn count_kind(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             refs = numeric_add(
                 numeric_add(

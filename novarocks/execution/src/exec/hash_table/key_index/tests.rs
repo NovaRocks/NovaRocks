@@ -1412,6 +1412,76 @@ fn presence_index_retains_one_exact_representative_per_class_without_exposing_id
 }
 
 #[test]
+fn join_float_key_relation_rejects_nan_before_presence_or_dense_ids() {
+    let (owner, tracker) = owner_with_tracker();
+    let types = [FunctionValueType::new(DataType::Float64, true)];
+    let keys = input(
+        &[Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            Some(f64::from_bits(0x7ff8_0000_0000_0042)),
+            Some(-0.0),
+            Some(0.0),
+            None,
+        ]))],
+        &types,
+        &[0, 1, 0, 2, 3, 4],
+        owner.as_ref(),
+    );
+    for (equality, count, matched, participates) in [
+        (
+            KeyEquality::IeeeFloat,
+            1,
+            [0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 1, 1, 0],
+        ),
+        (
+            KeyEquality::SqlGrouping(NullPolicy::Equal),
+            3,
+            [1; 6],
+            [1; 6],
+        ),
+    ] {
+        let spec =
+            KeySpec::with_equalities(&types, &[equality], owner.as_ref(), &|| Ok(())).unwrap();
+        for purpose in [IndexPurpose::PresenceOnly, IndexPurpose::KeyIds] {
+            let mut index =
+                KeyIndex::new(spec.clone(), purpose, tracker.clone(), owner.as_ref()).unwrap();
+            let hashes = index_hash(&keys, &index, &tracker, owner.as_ref());
+            let prepared = PreparedKeyBatch::new(
+                index.spec(),
+                &keys,
+                AggregateAllocator::new(tracker.clone()),
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            if purpose == IndexPurpose::PresenceOnly {
+                assert_eq!(
+                    index
+                        .include_presence(&prepared, &hashes, owner.as_ref(), &CopyControl)
+                        .unwrap(),
+                    count,
+                );
+                let probe = index
+                    .contains_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+                    .unwrap();
+                assert_eq!(probe.present(), &matched);
+                assert_eq!(probe.participates(), &participates);
+            } else {
+                let result = index
+                    .intern_batch(&prepared, &hashes, owner.as_ref(), &CopyControl)
+                    .unwrap();
+                assert_eq!(result.new_keys().len(), count);
+                assert_eq!(result.matches()[3], result.matches()[4]);
+                for (result, participate) in result.matches().iter().zip(participates) {
+                    assert_eq!(matches!(result, KeyMatch::Found(_)), participate != 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn mixed_fixed_bytes_and_complex_index_batches_preserve_full_tuple_equality() {
     let (owner, tracker) = owner_with_tracker();
     let mut lists = ListBuilder::new(Int32Builder::new());

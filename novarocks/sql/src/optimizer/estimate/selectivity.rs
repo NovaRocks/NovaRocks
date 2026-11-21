@@ -37,6 +37,20 @@ pub(crate) fn estimate_selectivity(
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
+    if let Some((operator, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+    {
+        return match operator {
+            BinOp::Eq | BinOp::EqForNull => {
+                estimate_eq_selectivity(arena, left, right, column_stats)
+            }
+            BinOp::Ne => 1.0 - estimate_eq_selectivity(arena, left, right, column_stats),
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                estimate_range_selectivity(arena, left, right, operator, column_stats)
+            }
+            _ => PREDICATE_UNKNOWN_FILTER,
+        };
+    }
     match arena.node(expr) {
         ScalarNode::BinaryOp {
             left, op, right, ..
@@ -54,13 +68,6 @@ pub(crate) fn estimate_selectivity(
                 let l = estimate_selectivity(arena, *left, column_stats);
                 let r = estimate_selectivity(arena, *right, column_stats);
                 l + r - l * r
-            }
-            BinOp::Eq | BinOp::EqForNull => {
-                estimate_eq_selectivity(arena, *left, *right, column_stats)
-            }
-            BinOp::Ne => 1.0 - estimate_eq_selectivity(arena, *left, *right, column_stats),
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                estimate_range_selectivity(arena, *left, *right, *op, column_stats)
             }
             _ => PREDICATE_UNKNOWN_FILTER,
         },

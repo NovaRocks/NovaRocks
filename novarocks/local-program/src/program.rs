@@ -255,6 +255,7 @@ pub struct ProgramJoinKey {
     pub probe: ProgramRootRef,
     pub build: ProgramRootRef,
     pub null_safe: bool,
+    pub match_relation: novarocks_type_contract::JoinKeyMatch,
 }
 
 /// The admitted local condition. Value equality and scope equality retain

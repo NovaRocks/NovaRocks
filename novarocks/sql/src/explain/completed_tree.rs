@@ -1027,6 +1027,7 @@ impl ExprText<'_> {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 formatter.write_str("CASE")?;
                 if let Some(operand) = operand {
@@ -1064,6 +1065,27 @@ impl ExprText<'_> {
                 write_negation(formatter, needs_parentheses, |out| {
                     write!(out, "{}", inner(*operand))
                 })
+            }
+            ExprKind::FunctionCall { function, args }
+                if novarocks_type_contract::OperatorFunction::from_function_id(
+                    &function.function_id,
+                )
+                .is_some() =>
+            {
+                let [left, right] = args.as_ref() else {
+                    return Err(fmt::Error);
+                };
+                let operator = novarocks_type_contract::OperatorFunction::from_function_id(
+                    &function.function_id,
+                )
+                .ok_or(fmt::Error)?;
+                write!(
+                    formatter,
+                    "({} {} {})",
+                    inner(*left),
+                    operator.sql(),
+                    inner(*right)
+                )
             }
             ExprKind::FunctionCall { function, args } => {
                 write!(formatter, "{}(", function_text(&function.function_id))?;

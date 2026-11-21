@@ -50,34 +50,34 @@ select c_d64_max * c_d64_max from ${case_db}.t_decimal_precision_overflow where 
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 select c_d128_large * c_d64_max from ${case_db}.t_decimal_precision_overflow where c_id = 1;
 
--- query 12
+-- query 8
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 select c_d128_max * c_d128_max from ${case_db}.t_decimal_precision_overflow where c_id = 1;
 
--- query 15
+-- query 9
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 select 12345678901234567890123456789.123456789 * 98765432109876543210987654321.987654321;
 
--- query 36
+-- query 10
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 select 1234567890123456789.1234567890123456789 * 1.0000000000000000000;
 
--- query 38
+-- query 11
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 select 1234567890123456789012345678901234567.0 * 1.0;
 
--- query 40
+-- query 12
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 select c_id, c_d128_large * c_d64_max + 1.0 from ${case_db}.t_decimal_precision_overflow where c_id <= 2 order by 1;
 
--- query 41
+-- query 13
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 select c_id, (c_d128_max * c_d128_max) / 2.0 from ${case_db}.t_decimal_precision_overflow where c_id <= 2 order by 1;
 
--- query 51
+-- query 14
 -- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 SELECT 0.58000000 * 0.970825897017235893 * 3021621.785498;
 
--- query 52
+-- query 15
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_decimal_precision_overflow;

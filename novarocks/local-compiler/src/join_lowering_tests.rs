@@ -332,6 +332,7 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
                     )
                     .unwrap(),
                 null_safe,
+                match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             })
         }
         Family::NestLoop { .. } => None,

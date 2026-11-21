@@ -212,6 +212,7 @@ fn append_broadcast_join(
                         left: left_key,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }]),
                     residual: None,
                 },

@@ -98,6 +98,7 @@ fn collect_scalar_column_id_refs_strict_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_scalar_column_id_refs_strict_inner(arena, *operand, out)?;
@@ -209,6 +210,21 @@ fn collect_join_equi_keys_opt(
     right_cols: &HashSet<QualifiedRef>,
     keys: &mut Vec<ScalarJoinEquiKey>,
 ) {
+    if let Some((BinOp::Eq, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+    {
+        if let (Some((JoinSide::Left, le)), Some((JoinSide::Right, re)))
+        | (Some((JoinSide::Right, re)), Some((JoinSide::Left, le))) = (
+            classify_scalar_operand(arena, left, left_ids, right_ids, left_cols, right_cols),
+            classify_scalar_operand(arena, right, left_ids, right_ids, left_cols, right_cols),
+        ) {
+            keys.push(ScalarJoinEquiKey {
+                left: le,
+                right: re,
+            });
+        }
+        return;
+    }
     match arena.node(expr) {
         ScalarNode::BinaryOp {
             left,
@@ -223,27 +239,9 @@ fn collect_join_equi_keys_opt(
                 arena, *right, left_ids, right_ids, left_cols, right_cols, keys,
             );
         }
-        // Only strict `Eq`. `EqForNull` (<=>) is null-safe (NULL <=> NULL is
-        // true), so deriving IS NOT NULL on its operands would change results;
-        // it is intentionally excluded (matches StarRocks `isEqual()`).
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } => match (
-            classify_scalar_operand(arena, *left, left_ids, right_ids, left_cols, right_cols),
-            classify_scalar_operand(arena, *right, left_ids, right_ids, left_cols, right_cols),
-        ) {
-            (Some((JoinSide::Left, le)), Some((JoinSide::Right, re)))
-            | (Some((JoinSide::Right, re)), Some((JoinSide::Left, le))) => {
-                keys.push(ScalarJoinEquiKey {
-                    left: le,
-                    right: re,
-                });
-            }
-            _ => {}
-        },
+        ScalarNode::Nested(inner) => collect_join_equi_keys_opt(
+            arena, *inner, left_ids, right_ids, left_cols, right_cols, keys,
+        ),
         _ => {}
     }
 }
@@ -466,6 +464,9 @@ pub(crate) fn join_equi_keys_opt(
     let Some(cond_id) = join_op.condition else {
         return Vec::new();
     };
+    if !crate::optimizer::cascades_rules::implement::safe_key_operand(arena, cond_id) {
+        return Vec::new();
+    }
     let left_cols = collect_qualified_output_columns_opt(left);
     let right_cols = collect_qualified_output_columns_opt(right);
     let left_ids = collect_output_ids_opt(left);
@@ -606,6 +607,7 @@ mod typed_legacy {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(operand) = operand {
                     collect_column_id_refs_inner(operand, out);

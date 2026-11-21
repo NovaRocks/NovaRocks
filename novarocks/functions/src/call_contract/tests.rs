@@ -63,7 +63,6 @@ impl Fixture {
                 SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
             ),
             (7, SemanticParameterValue::AllowThrowException(true)),
-            (91, SemanticParameterValue::DecimalOverflowToDouble(false)),
             (300, SemanticParameterValue::GroupConcatLegacy(true)),
             (19, SemanticParameterValue::GroupConcatMaxLen(-9)),
         ];

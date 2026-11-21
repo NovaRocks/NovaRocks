@@ -675,6 +675,7 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
         let expression = typed(ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(novarocks_parser::ast::AstBox::new(column_expr(
                 1, None, "key",
             ))),

@@ -50,6 +50,11 @@ const UNKNOWN_FUNCTION: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const AMBIGUOUS_FUNCTION_CALL: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.ambiguous_function_call"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const TYPE_MISMATCH: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.type_mismatch"),
     phase: ErrorPhase::Analyze,
@@ -139,6 +144,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_SCHEMA,
     UNKNOWN_COLUMN,
     UNKNOWN_FUNCTION,
+    AMBIGUOUS_FUNCTION_CALL,
     TYPE_MISMATCH,
     INVALID_LITERAL,
     INVALID_ARGUMENT,
@@ -165,6 +171,7 @@ pub enum AnalyzeErrorKind {
     UnknownSchema,
     UnknownColumn,
     UnknownFunction,
+    AmbiguousFunctionCall,
     TypeMismatch,
     InvalidLiteral,
     InvalidArgument,
@@ -193,6 +200,7 @@ impl AnalyzeErrorKind {
             Self::UnknownSchema => UNKNOWN_SCHEMA,
             Self::UnknownColumn => UNKNOWN_COLUMN,
             Self::UnknownFunction => UNKNOWN_FUNCTION,
+            Self::AmbiguousFunctionCall => AMBIGUOUS_FUNCTION_CALL,
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
@@ -632,6 +640,16 @@ impl AnalyzeError {
         }
     }
 
+    pub(crate) fn ambiguous_function_call(
+        error: novarocks_functions::FunctionBindingError,
+        span: Span,
+    ) -> Self {
+        let mut result = Self::function_binding(error);
+        result.kind = AnalyzeErrorKind::AmbiguousFunctionCall;
+        result.span = Some(span);
+        result
+    }
+
     pub(crate) fn function_binding(error: novarocks_functions::FunctionBindingError) -> Self {
         match error {
             novarocks_functions::FunctionBindingError::Control(error) => Self::control(error),
@@ -859,6 +877,7 @@ mod tests {
                 "sql.analyze.unknown_schema",
                 "sql.analyze.unknown_column",
                 "sql.analyze.unknown_function",
+                "sql.analyze.ambiguous_function_call",
                 "sql.analyze.type_mismatch",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.invalid_argument",

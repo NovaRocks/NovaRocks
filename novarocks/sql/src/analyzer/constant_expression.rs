@@ -590,6 +590,7 @@ fn validate_scalar(
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(expr) = else_expr {
                     pending.push(expr);

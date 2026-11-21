@@ -56,6 +56,9 @@ mod array_text;
 #[path = "cast/selected.rs"]
 mod selected;
 mod trino_array_leaf;
+pub(crate) use trino_array_leaf::{
+    FloatWidth as TrinoFloatWidth, decimal_to_float_bits as trino_decimal_to_float_bits,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CastOperation {

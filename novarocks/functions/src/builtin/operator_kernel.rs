@@ -165,7 +165,7 @@ impl PreparedScalarKernel for BinaryOperatorKernel {
     }
 
     fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
-        use crate::scalar_resources::BinaryPrimitiveOutput as Output;
+        use crate::scalar_resources::PrimitiveBuilderOutput as Output;
         let output = match self.contract.result_type().data_type() {
             DataType::Boolean => Output::Boolean,
             DataType::Int8 => Output::Int8,
@@ -181,13 +181,13 @@ impl PreparedScalarKernel for BinaryOperatorKernel {
             self.operation.as_ref(),
             Operation::Signed(..) | Operation::Decimal(..)
         );
-        Some(crate::ScalarInvocationResourceProfile::binary_primitive(
+        Some(crate::ScalarInvocationResourceProfile::primitive_builder(
             output, row_errors,
         ))
     }
 
     fn instance_retained_upper_bound(&self) -> usize {
-        0
+        std::mem::size_of::<Instance>()
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
@@ -324,7 +324,7 @@ impl ScalarKernelInstance for Instance {
     }
 
     fn retained_bytes(&self) -> usize {
-        0
+        std::mem::size_of::<Self>()
     }
 }
 
@@ -455,11 +455,10 @@ where
             return Ok(None);
         }
         let operator = operator.comparison().expect("ordinary floating comparison");
-        let compared = left.value(l).partial_cmp(&right.value(r));
-        Ok(Some(
-            compared.map_or(operator == ComparisonOperator::Ne, |ord| {
-                operator.apply(ord)
-            }),
-        ))
+        Ok(Some(crate::comparison::ieee_float_comparison(
+            operator,
+            left.value(l),
+            right.value(r),
+        )))
     })
 }

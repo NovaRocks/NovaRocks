@@ -308,6 +308,7 @@ impl Fixture {
                 let yes = constant(&mut b, &mut pools, owner, t.clone(), checked::i64(1));
                 let no = constant(&mut b, &mut pools, owner, t.clone(), checked::i64(2));
                 Some(ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then: Box::from([(test, yes)]),
                     else_expr: Some(no),

@@ -1,9 +1,9 @@
--- query 8
+-- query 1
 -- types	decimal(36, 18)
 exact_product
 15241578780673678.515622620750190521
 
--- query 27
+-- query 3
 -- types	decimal(38, 6)
 product
 0.000001

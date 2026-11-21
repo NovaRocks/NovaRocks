@@ -158,6 +158,7 @@ pub fn case_program(kind: CaseKind) -> Fixture {
             None,
             result_type,
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(when_first, then_first), (when_second, then_second)]),
                 else_expr: otherwise,

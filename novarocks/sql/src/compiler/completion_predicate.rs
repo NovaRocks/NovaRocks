@@ -57,6 +57,9 @@ pub(super) fn lower_provider_predicates(
         .iter()
         .enumerate()
         .filter_map(|(ordinal, predicate)| {
+            if !provider_guarantee_supports_atom(predicate) {
+                return None;
+            }
             let occurrence = u32::try_from(ordinal).ok()?;
             let (column, domain) = lower_atom_with_literal(
                 predicate,
@@ -74,6 +77,37 @@ pub(super) fn lower_provider_predicates(
         .into_boxed_slice()
 }
 
+fn provider_guarantee_supports_atom(predicate: &TypedExpr) -> bool {
+    let predicate = unnest(predicate);
+    let ExprKind::FunctionCall { binding, .. } = &predicate.kind else {
+        return true;
+    };
+    let Some((operator, operands)) = crate::common::binary_operator::typed_operands(predicate)
+    else {
+        return false;
+    };
+    if operator.comparison().is_none()
+        || operator.comparison_overload_text() != Some(binding.selected.overload.as_str())
+    {
+        return false;
+    }
+    let [left, right] = operands.map(unnest);
+    if !novarocks_physical_plan::supports_provider_scan_comparison(&left.value_type)
+        || !novarocks_physical_plan::supports_provider_scan_comparison(&right.value_type)
+    {
+        return false;
+    }
+    match (&left.kind, &right.kind) {
+        (ExprKind::ColumnRef { .. }, ExprKind::Literal(_) | ExprKind::Constant(_)) => {
+            !right.value_type.nullable()
+        }
+        (ExprKind::Literal(_) | ExprKind::Constant(_), ExprKind::ColumnRef { .. }) => {
+            !left.value_type.nullable()
+        }
+        _ => false,
+    }
+}
+
 /// Shared exact atom author. Each caller supplies its original column identity
 /// and complete type checks; this function never resolves names or scans.
 pub(super) fn lower_atom_with_column(
@@ -88,25 +122,31 @@ fn lower_atom_with_literal(
     resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
     lower_literal: fn(&TypedExpr, ConnectorValueType) -> Option<ConnectorValue>,
 ) -> Option<(u32, Domain)> {
-    match &unnest(predicate).kind {
-        ExprKind::BinaryOp {
-            left, op, right, ..
-        } => {
-            let (column, op, literal) = if let Some(column) = resolve_column(left) {
-                (column, *op, right.as_ref())
-            } else {
-                (
-                    resolve_column(right)?,
-                    reverse_comparison(*op),
-                    left.as_ref(),
+    let predicate = unnest(predicate);
+    if let Some((op, [left, right])) = crate::common::binary_operator::typed_comparison(predicate) {
+        // A standard floating predicate can exclude NaN or distinguish the
+        // value relation from Provider metadata ordering. Keep its own evaluation.
+        if crate::common::binary_operator::typed_operands(predicate).is_some()
+            && [left, right].iter().any(|operand| {
+                !crate::common::binary_operator::permits_equality_substitution(
+                    operand.value_type.data_type(),
                 )
-            };
-            let value = lower_literal(literal, column.value_type)?;
-            Some((
-                column.ordinal,
-                comparison_domain(column.value_type, op, value)?,
-            ))
+            })
+        {
+            return None;
         }
+        let (column, op, literal) = if let Some(column) = resolve_column(left) {
+            (column, op, right)
+        } else {
+            (resolve_column(right)?, reverse_comparison(op), left)
+        };
+        let value = lower_literal(literal, column.value_type)?;
+        return Some((
+            column.ordinal,
+            comparison_domain(column.value_type, op, value)?,
+        ));
+    }
+    match &predicate.kind {
         ExprKind::IsNull { expr, negated } => {
             let column = resolve_column(expr)?;
             Some((

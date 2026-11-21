@@ -6052,6 +6052,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 validate_non_contract_aggregate_projection_expr(operand)?;
@@ -6215,6 +6216,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 validate_projection_filter_expr(operand)?;
@@ -6282,6 +6284,18 @@ fn count_equality_join_keys(
     left_qualifiers: &[String],
     right_qualifiers: &[String],
 ) -> Result<usize, String> {
+    if let Some((BinOp::Eq, [left, right])) = crate::common::binary_operator::typed_comparison(expr)
+    {
+        let left_side = join_key_side(left, left_qualifiers, right_qualifiers)?;
+        let right_side = join_key_side(right, left_qualifiers, right_qualifiers)?;
+        if left_side == right_side {
+            return Err(
+                "Iceberg IMV refresh contract equi-join predicates must compare left and right join inputs"
+                    .to_string(),
+            );
+        }
+        return Ok(1);
+    }
     match &expr.kind {
         ExprKind::BinaryOp {
             left,
@@ -6292,22 +6306,6 @@ fn count_equality_join_keys(
             count_equality_join_keys(left, left_qualifiers, right_qualifiers)?
                 + count_equality_join_keys(right, left_qualifiers, right_qualifiers)?,
         ),
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } => {
-            let left_side = join_key_side(left, left_qualifiers, right_qualifiers)?;
-            let right_side = join_key_side(right, left_qualifiers, right_qualifiers)?;
-            if left_side == right_side {
-                return Err(
-                    "Iceberg IMV refresh contract equi-join predicates must compare left and right join inputs"
-                        .to_string(),
-                );
-            }
-            Ok(1)
-        }
         ExprKind::Nested(expr) => count_equality_join_keys(expr, left_qualifiers, right_qualifiers),
         _ => Err(
             "Iceberg IMV refresh contract supports only AND-combined equi-join predicates"

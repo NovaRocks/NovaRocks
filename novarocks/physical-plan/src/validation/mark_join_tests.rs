@@ -88,6 +88,7 @@ fn mark_fragment(
                     left: key_left,
                     right: key_right,
                     null_safe: false,
+                    match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                 }]),
                 scope_keys: Box::default(),
                 eligibility: None,

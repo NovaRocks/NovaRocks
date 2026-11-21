@@ -215,20 +215,33 @@ impl<'a> super::AnalyzerContext<'a> {
                         },
                         value_type: right_type,
                     };
-                    conds.push(TypedExpr {
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Boolean,
-                            false,
-                        ),
+                    if crate::common::binary_operator::requires_legacy_wide(
+                        left_ref.value_type.value_type(),
+                    ) || crate::common::binary_operator::requires_legacy_wide(
+                        right_ref.value_type.value_type(),
+                    ) {
+                        conds.push(TypedExpr {
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Boolean,
+                                false,
+                            ),
 
-                        kind: ExprKind::BinaryOp {
-                            left: novarocks_parser::ast::AstBox::new(left_ref),
-                            op: BinOp::Eq,
-                            right: novarocks_parser::ast::AstBox::new(right_ref),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        },
-                    });
+                            kind: ExprKind::BinaryOp {
+                                left: novarocks_parser::ast::AstBox::new(left_ref),
+                                op: BinOp::Eq,
+                                right: novarocks_parser::ast::AstBox::new(right_ref),
+                                decimal_overflow_policy:
+                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                            },
+                        });
+                    } else {
+                        conds.push(self.analyze_binary_operator(
+                            novarocks_type_contract::OperatorFunction::Equal,
+                            left_ref,
+                            right_ref,
+                            col_obj.span,
+                        )?);
+                    }
                 }
                 if conds.is_empty() {
                     None

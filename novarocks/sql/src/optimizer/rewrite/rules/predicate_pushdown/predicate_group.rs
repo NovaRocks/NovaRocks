@@ -221,6 +221,7 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             let operand_key = operand
                 .as_ref()

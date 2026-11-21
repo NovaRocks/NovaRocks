@@ -851,10 +851,6 @@ mod tests {
     fn stored_replay_keeps_the_existing_uncaptured_semantics_refusals() {
         for (hint, feature) in [
             ("sql_mode='GROUP_CONCAT_LEGACY'", "GROUP_CONCAT_LEGACY"),
-            (
-                "decimal_overflow_to_double=true",
-                "decimal_overflow_to_double",
-            ),
             ("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW"),
         ] {
             let catalog = catalog(declaration(

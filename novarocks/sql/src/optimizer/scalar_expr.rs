@@ -100,6 +100,7 @@ fn collect_column_ids_strict_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_column_ids_strict_inner(arena, *operand, out)?;
@@ -398,6 +399,7 @@ pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.is_some_and(|expr| contains_aggregate(arena, expr))
                 || when_then.iter().any(|(when, then)| {
@@ -431,17 +433,29 @@ pub(crate) fn sort_key_column_id(arena: &ScalarArena, key: &SortKey) -> Option<C
 }
 
 pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String {
-    if let Some(operand) = scalar_operand(arena, expr) {
-        let needs_parentheses = !matches!(
-            arena.node(operand),
-            ScalarNode::ColumnRef(_)
-                | ScalarNode::LambdaParamRef { .. }
-                | ScalarNode::Literal(_)
-                | ScalarNode::Constant(_)
-                | ScalarNode::FunctionCall { .. }
-                | ScalarNode::AggregateCall { .. }
-                | ScalarNode::Cast { .. }
+    if let Some((operator, [left, right])) =
+        crate::common::binary_operator::scalar_operands(arena, expr)
+    {
+        return format!(
+            "{} {} {}",
+            scalar_display_name_with_parens(arena, left),
+            operator.sql(),
+            scalar_display_name_with_parens(arena, right)
         );
+    }
+    if let Some(operand) = scalar_operand(arena, expr) {
+        let needs_parentheses = crate::common::binary_operator::scalar_operands(arena, operand)
+            .is_some()
+            || !matches!(
+                arena.node(operand),
+                ScalarNode::ColumnRef(_)
+                    | ScalarNode::LambdaParamRef { .. }
+                    | ScalarNode::Literal(_)
+                    | ScalarNode::Constant(_)
+                    | ScalarNode::FunctionCall { .. }
+                    | ScalarNode::AggregateCall { .. }
+                    | ScalarNode::Cast { .. }
+            );
         return render_negation(&scalar_display_name(arena, operand), needs_parentheses);
     }
     match arena.node(expr) {
@@ -627,6 +641,9 @@ fn literal_display_name(value: &LiteralValue) -> String {
 }
 
 fn scalar_display_name_with_parens(arena: &ScalarArena, expr: ScalarId) -> String {
+    if crate::common::binary_operator::scalar_operands(arena, expr).is_some() {
+        return format!("({})", scalar_display_name(arena, expr));
+    }
     match arena.node(expr) {
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
@@ -806,6 +823,7 @@ fn contains_function_matching(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.is_some_and(|expr| contains_function_matching(arena, expr, matches))
                 || when_then.iter().any(|(when, then)| {
@@ -938,6 +956,41 @@ fn arrow_format_has_row_error(source: &DataType) -> bool {
     }
 }
 
+pub(crate) fn scalar_call_can_fail(binding: &crate::binding::SqlFunctionBinding) -> bool {
+    assert_eq!(
+        binding.kind,
+        novarocks_functions::FunctionKind::Scalar,
+        "a non-row binding cannot be consumed as a scalar function"
+    );
+    binding.declared_scalar_invocation_data
+        || binding
+            .admitted_execution_abi
+            .is_some_and(|abi| abi.may_raise_invocation_data())
+        || match binding.semantics.intrinsic_row_error {
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
+            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
+                unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+            }
+        }
+}
+
+pub(crate) fn scalar_cast_can_fail(
+    source: &DataType,
+    target: &DataType,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+) -> bool {
+    if let Some(mode) = array_failure_mode {
+        mode == novarocks_type_contract::ArrayCastFailureMode::ReportError
+    } else {
+        cast_has_intrinsic_row_error(source, target, true)
+            || (decimal_overflow_policy
+                == novarocks_type_contract::DecimalOverflowPolicy::ReportError
+                && novarocks_type_contract::is_checked_decimal_numeric_cast(source, target))
+    }
+}
+
 /// Whether evaluating the scalar can expose an intrinsic row error or a checked
 /// Decimal numeric overflow, including errors from any argument expression.
 /// This effect is independent from function volatility.
@@ -950,24 +1003,7 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         )
     };
     let own_error = match arena.node(expr) {
-        ScalarNode::FunctionCall { binding, .. } => {
-            assert_eq!(
-                binding.kind,
-                novarocks_functions::FunctionKind::Scalar,
-                "a non-row binding cannot be consumed as a scalar function"
-            );
-            binding.declared_scalar_invocation_data
-                || binding
-                    .admitted_execution_abi
-                    .is_some_and(|abi| abi.may_raise_invocation_data())
-                || match binding.semantics.intrinsic_row_error {
-                    novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
-                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
-                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
-                        unreachable!("a scalar function cannot carry a non-row intrinsic fact")
-                    }
-                }
-        }
+        ScalarNode::FunctionCall { binding, .. } => scalar_call_can_fail(binding),
         ScalarNode::BinaryOp {
             op,
             decimal_overflow_policy,
@@ -986,18 +1022,12 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
             decimal_overflow_policy,
             array_failure_mode,
             ..
-        } => {
-            if let Some(mode) = array_failure_mode {
-                *mode == novarocks_type_contract::ArrayCastFailureMode::ReportError
-            } else {
-                cast_has_intrinsic_row_error(arena.data_type(*child), arena.data_type(expr), true)
-                    || (*decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                        && novarocks_type_contract::is_checked_decimal_numeric_cast(
-                            arena.data_type(*child),
-                            arena.data_type(expr),
-                        ))
-            }
-        }
+        } => scalar_cast_can_fail(
+            arena.data_type(*child),
+            arena.data_type(expr),
+            *decimal_overflow_policy,
+            *array_failure_mode,
+        ),
         _ => false,
     };
     if own_error {
@@ -1044,6 +1074,7 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.is_some_and(|expr| can_fail(arena, expr))
                 || when_then
@@ -1387,6 +1418,7 @@ mod intrinsic_error_consumer_tests {
         );
         let branch = arena.intern(
             ScalarNode::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: vec![(condition, catching)],
                 else_expr: Some(boolean),

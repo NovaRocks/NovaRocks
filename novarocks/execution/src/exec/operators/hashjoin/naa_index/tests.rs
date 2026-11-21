@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// These private tests exercise cursor candidate qualification before the join emits rows.
 use super::super::{
     build_capture::{EvaluatedJoinKeyPage, EvaluatedKeyProjection, InputRunWriter},
     build_finalize::{FinalizeOptions, FinalizeStep, FinalizeWorker, JoinBuildFrame},

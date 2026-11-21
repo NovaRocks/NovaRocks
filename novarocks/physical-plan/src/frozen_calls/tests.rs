@@ -517,6 +517,7 @@ fn case_fixture(constants: &mut crate::tests::constant_fixture::ConstantFixture)
             lambda_scope: None,
             ty: boolean(),
             kind: ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(definition, definition)]),
                 else_expr: Some(otherwise),

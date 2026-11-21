@@ -751,6 +751,61 @@ fn standard_arithmetic_uses_the_original_real_width_and_selected_rows() {
 }
 
 #[test]
+fn standard_mixed_arithmetic_rounds_decimals_directly_to_the_selected_ieee_width() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+
+    let double = constant("DECIMAL '1801439850948188.9' + 0e0", &context);
+    assert_eq!(
+        double
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            .to_bits(),
+        0x4319_9999_9999_9974,
+    );
+
+    let columns = [
+        column("r", 5, DataType::Float32, false),
+        column("d", 17, DataType::Decimal128(38, 37), true),
+    ];
+    // The coefficient lies just above the first REAL midpoint around 1.0.
+    // Rounding via DOUBLE would return the neighboring REAL value.
+    let above_midpoint = 10_000_000_596_046_447_753_906_250_000_000_000_001;
+    let values = Decimal128Array::from(vec![Some(above_midpoint), None])
+        .with_precision_and_scale(38, 37)
+        .unwrap();
+    let typed = compile("r + d", &columns, &context);
+    let coercion = novarocks_functions::builtin::value_conversion::OPERATOR_DECIMAL_FLOAT_COERCION;
+    assert!(typed.unit().definitions().iter().any(|definition| matches!(
+        &definition.kind,
+        ExprKind::FunctionCall { function, .. } if function.overload.as_str() == coercion
+    )));
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(Float32Array::from(vec![0.0, 0.0])),
+            Arc::new(values),
+        ],
+    );
+    let checked = evaluate(&typed, &input);
+    assert_compared(&checked, 2, 2);
+    let output = checked
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert_eq!(output.value(0).to_bits(), 0x3f80_0001);
+    assert!(output.is_null(1));
+    assert!(checked.batch.errors.is_empty());
+}
+
+#[test]
 fn ordinary_and_null_safe_float_comparisons_preserve_distinct_relations() {
     use arrow::array::{BooleanArray, Float64Array};
 

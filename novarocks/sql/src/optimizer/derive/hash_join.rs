@@ -638,6 +638,7 @@ mod tests {
                 )
                 .unwrap(),
                 null_safe,
+                match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             })
             .collect();
         TestHashJoinOp {

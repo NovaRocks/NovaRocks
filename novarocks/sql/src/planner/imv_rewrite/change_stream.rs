@@ -415,6 +415,7 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand
                 .as_deref()

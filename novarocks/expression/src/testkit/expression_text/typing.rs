@@ -595,6 +595,7 @@ impl TextNode {
                     .map(|child| child.emit(draft, constants, context, work))
                     .transpose()?;
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then,
                     else_expr,
@@ -620,13 +621,33 @@ impl TextNode {
                         constant: argument.typing.constant.clone(),
                     });
                 }
+                let widened_target;
+                let expected_result = if changed
+                    && binding.selected.overload.as_str()
+                        == novarocks_functions::builtin::value_conversion::OPERATOR_DECIMAL_FLOAT_COERCION
+                {
+                    let [FunctionArgument::Value { value_type, .. }] = &request_args[..] else {
+                        return Err(typing_error(
+                            TypingError::InvalidShape("operator coercion requires its original operand"),
+                            novarocks_parser::SYNTHETIC,
+                        ));
+                    };
+                    widened_target = expected_result
+                        .as_ref()
+                        .map(|target| target.with_nullable(target.nullable() || value_type.nullable()))
+                        .transpose()
+                        .map_err(TextError::ValueType)?;
+                    widened_target.as_ref()
+                } else {
+                    expected_result.as_ref()
+                };
                 let revised;
                 let binding = if changed {
                     work.flush()?;
                     let request = novarocks_functions::FunctionBindingRequest {
                         arguments: &request_args,
                         logical_argument_count: request_args.len(),
-                        expected_result_type: expected_result.as_ref(),
+                        expected_result_type: expected_result,
                     };
                     revised = context
                         .functions
@@ -651,7 +672,7 @@ impl TextNode {
                 let id = draft.add(None, ty, ExprKind::FunctionCall { function, args })?;
                 let request = physical_call_request(
                     &request_args,
-                    expected_result.as_ref(),
+                    expected_result,
                     context.constant_policy,
                     constants,
                 );

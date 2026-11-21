@@ -489,6 +489,7 @@ impl Fixture {
                 12,
                 1,
                 K::CaseExpression(wire::CaseExpression {
+                    ieee_float_equality: Some(false),
                     operand_expr_id: None,
                     arms: vec![wire::WhenThen {
                         when_expr_id: Some(4),
@@ -690,6 +691,7 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
         (
             12,
             novarocks_expression_contract::ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(id(4), id(0))]),
                 else_expr: Some(id(16)),

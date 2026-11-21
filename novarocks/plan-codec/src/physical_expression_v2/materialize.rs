@@ -730,6 +730,9 @@ fn owned_kind(
                     w.step()?;
                 }
                 novarocks_expression_contract::ExprKind::Case {
+                    ieee_float_equality: v.ieee_float_equality.ok_or_else(|| {
+                        shape("CASE expression is missing its authored equality mode")
+                    })?,
                     operand: v.operand_expr_id.map(p::ExprId::new),
                     when_then: boxed(arms, w)?,
                     else_expr: v.else_expr_id.map(p::ExprId::new),

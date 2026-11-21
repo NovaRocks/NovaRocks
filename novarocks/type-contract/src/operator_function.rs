@@ -92,6 +92,23 @@ impl OperatorFunction {
         }
     }
 
+    /// The fixed overload identity of each private comparison owner.
+    pub const fn comparison_overload_text(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Equal => "builtin.scalar/__operator_equal/comparison-v1",
+            Self::NotEqual => "builtin.scalar/__operator_not_equal/comparison-v1",
+            Self::LessThan => "builtin.scalar/__operator_less_than/comparison-v1",
+            Self::LessThanOrEqual => "builtin.scalar/__operator_less_than_or_equal/comparison-v1",
+            Self::GreaterThan => "builtin.scalar/__operator_greater_than/comparison-v1",
+            Self::GreaterThanOrEqual => {
+                "builtin.scalar/__operator_greater_than_or_equal/comparison-v1"
+            }
+            Self::Identical => "builtin.scalar/__operator_identical/comparison-v1",
+            Self::Distinct => "builtin.scalar/__operator_distinct/comparison-v1",
+            _ => return None,
+        })
+    }
+
     pub const fn arithmetic(self) -> Option<ArithmeticOperator> {
         Some(match self {
             Self::Add => ArithmeticOperator::Add,

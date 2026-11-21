@@ -105,6 +105,7 @@ pub enum StaticExprKind {
         is_not_in: bool,
     },
     Case {
+        ieee_float_equality: bool,
         has_case_expr: bool,
         has_else_expr: bool,
         children: Vec<CompiledExprId>,

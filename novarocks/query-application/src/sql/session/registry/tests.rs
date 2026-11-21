@@ -95,6 +95,11 @@ fn metadata_never_materializes_fixed_or_dynamic_defaults_into_inputs() {
     let inputs = SessionPropertyInputs::default();
     let metadata = registry.visible_metadata(&inputs, &[]).unwrap();
     assert!(inputs.raw_values().is_empty());
+    assert!(
+        metadata
+            .iter()
+            .all(|row| row.name != "decimal_overflow_to_double")
+    );
     for name in [
         "query_mem_limit",
         "runtime_filter_scan_wait_time",

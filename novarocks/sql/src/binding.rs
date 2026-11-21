@@ -104,6 +104,8 @@ pub enum SqlResultConstraintOrigin {
     Unconstrained,
     /// A common target authored from the original ARRAY element declarations.
     ArrayCommonCoercion,
+    /// An operand target selected by an installed numeric operator overload.
+    OperatorDecimalFloatCoercion,
     ValueDomainConversion {
         /// The original full final assignment/CAST target, before the one
         /// conversion owner chose its explicit intermediate contract.
@@ -170,6 +172,21 @@ impl SqlFunctionBinding {
             decimal_overflow_policy,
             result_constraint: Some(result_constraint),
             result_constraint_origin: SqlResultConstraintOrigin::ArrayCommonCoercion,
+            group_concat: None,
+            aggregate_state_source: None,
+        }))
+    }
+
+    pub(crate) fn new_with_operator_decimal_float_constraint(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint: novarocks_functions::FunctionValueType,
+    ) -> Self {
+        Self(Arc::new(SqlFunctionCallFacts {
+            resolved,
+            decimal_overflow_policy,
+            result_constraint: Some(result_constraint),
+            result_constraint_origin: SqlResultConstraintOrigin::OperatorDecimalFloatCoercion,
             group_concat: None,
             aggregate_state_source: None,
         }))

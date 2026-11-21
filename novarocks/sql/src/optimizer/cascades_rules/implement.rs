@@ -33,7 +33,6 @@ use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::scalar_expr;
 #[cfg(test)]
 use crate::planner::payload::WindowExpr;
-use novarocks_types::wider_type;
 
 pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
     memo.groups
@@ -61,6 +60,9 @@ struct ScalarHashJoinEqCondition {
     left: ScalarId,
     right: ScalarId,
     null_safe: bool,
+    match_relation: novarocks_type_contract::JoinKeyMatch,
+    origin: ScalarId,
+    bound_comparison: bool,
 }
 
 /// Orient an eq pair so that the first element references the left child's
@@ -73,11 +75,7 @@ fn orient_eq_pair(
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
 ) -> Option<ScalarHashJoinEqCondition> {
-    let ScalarHashJoinEqCondition {
-        left: a,
-        right: b,
-        null_safe,
-    } = pair;
+    let (a, b) = (pair.left, pair.right);
     let a_ids = scalar_expr::collect_column_ids_strict(arena, a)?;
     let b_ids = scalar_expr::collect_column_ids_strict(arena, b)?;
     if a_ids.is_empty() || b_ids.is_empty() {
@@ -102,7 +100,7 @@ fn orient_eq_pair(
         return Some(ScalarHashJoinEqCondition {
             left: a,
             right: b,
-            null_safe,
+            ..pair
         });
     }
     // Unambiguous exclusive swap: a from right only, b from left only.
@@ -110,7 +108,7 @@ fn orient_eq_pair(
         return Some(ScalarHashJoinEqCondition {
             left: b,
             right: a,
-            null_safe,
+            ..pair
         });
     }
     None
@@ -131,52 +129,69 @@ fn hash_join_key_type_is_supported(data_type: &DataType) -> bool {
     )
 }
 
-fn hash_join_eq_condition_is_hashable(arena: &ScalarArena, eq: &ScalarHashJoinEqCondition) -> bool {
-    let left_type = arena.data_type(eq.left);
-    let right_type = arena.data_type(eq.right);
-    if left_type == right_type {
-        return hash_join_key_type_is_supported(left_type);
-    }
-    let common_type = wider_type(left_type, right_type);
-    hash_join_key_type_is_supported(&common_type)
-}
-
 fn coerce_hash_join_eq_condition(
     arena: &ScalarArena,
     eq: ScalarHashJoinEqCondition,
 ) -> Option<ScalarHashJoinEqCondition> {
-    if hash_join_eq_condition_is_hashable(arena, &eq) {
-        return Some(eq);
+    let left = arena.value_type(eq.left);
+    let right = arena.value_type(eq.right);
+    if eq.bound_comparison {
+        return (left.value_type().kind() == right.value_type().kind()
+            && left.data_type() == right.data_type()
+            && eq
+                .match_relation
+                .supports(left.data_type(), left.logical_type(), eq.null_safe)
+            && hash_join_key_type_is_supported(left.data_type()))
+        .then_some(eq);
     }
-    None
+    // The original membership and wider-number author can leave a compatible
+    // common carrier for physical comparison lowering. Preserve that route.
+    let carrier = novarocks_types::wider_type(left.data_type(), right.data_type());
+    hash_join_key_type_is_supported(&carrier).then_some(eq)
 }
 
-fn eq_condition_to_expr(
-    arena: &mut ScalarArena,
-    eq: ScalarHashJoinEqCondition,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    arena.intern_observed(
-        ScalarNode::BinaryOp {
-            left: eq.left,
-            op: if eq.null_safe {
-                BinOp::EqForNull
-            } else {
-                BinOp::Eq
-            },
-            right: eq.right,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        novarocks_type_contract::FunctionValueType::new(
-            DataType::Boolean,
-            if eq.null_safe {
-                false
-            } else {
-                arena.nullable(eq.left) || arena.nullable(eq.right)
-            },
-        ),
-        control,
-    )
+fn comparison_key(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarHashJoinEqCondition> {
+    use novarocks_type_contract::{JoinKeyMatch, OperatorFunction};
+
+    let (left, right, null_safe, bound_comparison) = if let Some((operator, [left, right])) =
+        crate::common::binary_operator::scalar_operands(arena, expr)
+    {
+        let null_safe = match operator {
+            OperatorFunction::Equal => false,
+            OperatorFunction::Identical => true,
+            _ => return None,
+        };
+        (left, right, null_safe, true)
+    } else {
+        let ScalarNode::BinaryOp {
+            left, op, right, ..
+        } = arena.node(expr)
+        else {
+            return None;
+        };
+        let null_safe = match op {
+            BinOp::Eq => false,
+            BinOp::EqForNull => true,
+            _ => return None,
+        };
+        (*left, *right, null_safe, false)
+    };
+    let match_relation = if bound_comparison
+        && !null_safe
+        && matches!(arena.data_type(left), DataType::Float32 | DataType::Float64)
+    {
+        JoinKeyMatch::IeeeFloat
+    } else {
+        JoinKeyMatch::Grouping
+    };
+    Some(ScalarHashJoinEqCondition {
+        left,
+        right,
+        null_safe,
+        match_relation,
+        origin: expr,
+        bound_comparison,
+    })
 }
 
 fn append_residual_condition(
@@ -224,6 +239,12 @@ fn extract_eq_conditions(
     let Some(cond) = condition else {
         return Ok((vec![], None));
     };
+    // Pre-matching can suppress required expressions or run a key early.
+    // A whole-condition totality and stability proof keeps both evaluations
+    // equivalent, including when common keys are lifted out of OR branches.
+    if !safe_key_operand(arena, cond) {
+        return Ok((vec![], Some(cond)));
+    }
     let mut eq_pairs = Vec::new();
     let mut others = Vec::new();
     collect_conjuncts(arena, cond, &mut eq_pairs, &mut others);
@@ -268,33 +289,15 @@ fn collect_conjuncts(
             collect_conjuncts(arena, *left, eq_pairs, others);
             collect_conjuncts(arena, *right, eq_pairs, others);
         }
-        ScalarNode::BinaryOp {
-            left, op, right, ..
-        } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
-            // Treat as equi-join key when BOTH sides reference at least
-            // one column. A side that's purely literal/constant
-            // (`col = 2002`) is a filter, not an equi-key; let it fall
-            // through to `others` so the optimizer pushes it down to a
-            // scan filter. Expression keys (`-tt1.c_int = tt2.c_int`,
-            // `lower(a.x) = b.x`, …) are valid join keys — the
-            // exec-layer hash join hashes the lowered expression, and
-            // `orient_eq_pair` below collects column refs from each
-            // side to determine left/right orientation.
-            let left_has_col = expr_has_column_ref(arena, *left);
-            let right_has_col = expr_has_column_ref(arena, *right);
-            if left_has_col && right_has_col {
-                eq_pairs.push(ScalarHashJoinEqCondition {
-                    left: *left,
-                    right: *right,
-                    null_safe: matches!(op, BinOp::EqForNull),
-                });
-            } else {
-                others.push(expr);
+        _ => match comparison_key(arena, expr) {
+            Some(pair)
+                if expr_has_column_ref(arena, pair.left)
+                    && expr_has_column_ref(arena, pair.right) =>
+            {
+                eq_pairs.push(pair)
             }
-        }
-        _ => {
-            others.push(expr);
-        }
+            _ => others.push(expr),
+        },
     }
 }
 
@@ -302,6 +305,8 @@ fn collect_conjuncts(
 /// Check if two eq pairs are structurally equal (possibly with swapped sides).
 fn eq_pair_matches(a: &ScalarHashJoinEqCondition, b: &ScalarHashJoinEqCondition) -> bool {
     a.null_safe == b.null_safe
+        && a.match_relation == b.match_relation
+        && a.bound_comparison == b.bound_comparison
         && ((a.left == b.left && a.right == b.right) || (a.left == b.right && a.right == b.left))
 }
 
@@ -356,7 +361,7 @@ fn try_extract_common_eq_from_or(
         for eq in eqs {
             if !common.iter().any(|c| eq_pair_matches(c, eq)) {
                 // Keep non-common eq pairs as regular conjuncts.
-                remaining_parts.push(eq_condition_to_expr(arena, eq.clone(), control)?);
+                remaining_parts.push(eq.origin);
             }
         }
         if let Some(branch_expr) = scalar_expr::combine_conjuncts(arena, remaining_parts, control)?
@@ -513,7 +518,7 @@ pub(crate) struct JoinToHashJoin;
 type ScalarJoinCondition =
     novarocks_physical_plan::HashJoinCondition<Vec<PhysicalHashJoinEqCondition>, ScalarId>;
 
-fn safe_key_operand(arena: &ScalarArena, expression: ScalarId) -> bool {
+pub(crate) fn safe_key_operand(arena: &ScalarArena, expression: ScalarId) -> bool {
     !scalar_expr::can_fail(arena, expression)
         && !scalar_expr::contains_non_replica_deterministic_function(arena, expression)
 }
@@ -573,6 +578,7 @@ fn null_aware_hash_condition(
             left: pair.left,
             right: pair.right,
             null_safe: pair.null_safe,
+            match_relation: pair.match_relation,
         });
     }
     let mut scope_keys = Vec::new();
@@ -583,18 +589,7 @@ fn null_aware_hash_condition(
         scalar_expr::split_conjuncts(arena, eligibility, &mut conjuncts);
         let mut safe_prefix = true;
         for conjunct in conjuncts {
-            let pair = match arena.node(conjunct) {
-                ScalarNode::BinaryOp {
-                    left, op, right, ..
-                } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
-                    Some(ScalarHashJoinEqCondition {
-                        left: *left,
-                        right: *right,
-                        null_safe: *op == BinOp::EqForNull,
-                    })
-                }
-                _ => None,
-            };
+            let pair = comparison_key(arena, conjunct);
             // A nullable Value-demand prefix cannot suppress required work
             // after UNKNOWN. A nonnullable safe prefix, or a total E, can.
             let extracted = pair
@@ -614,6 +609,7 @@ fn null_aware_hash_condition(
                     left: pair.left,
                     right: pair.right,
                     null_safe: pair.null_safe,
+                    match_relation: pair.match_relation,
                 });
             } else {
                 remaining.push(conjunct);
@@ -692,43 +688,13 @@ impl Rule for JoinToHashJoin {
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
             for pair in raw_eq_conds {
-                let a = pair.left;
-                let b = pair.right;
-                let null_safe = pair.null_safe;
-                match orient_eq_pair(pair, &memo.scalars, &left_ids, &right_ids) {
-                    Some(oriented) => {
-                        if let Some(coerced) =
-                            coerce_hash_join_eq_condition(&memo.scalars, oriented.clone())
-                        {
-                            eq_conds.push(coerced);
-                        } else {
-                            let residual =
-                                eq_condition_to_expr(&mut memo.scalars, oriented, control)?;
-                            append_residual_condition(
-                                &mut memo.scalars,
-                                &mut other,
-                                residual,
-                                control,
-                            )?;
-                        }
-                    }
-                    None => {
-                        let residual = eq_condition_to_expr(
-                            &mut memo.scalars,
-                            ScalarHashJoinEqCondition {
-                                left: a,
-                                right: b,
-                                null_safe,
-                            },
-                            control,
-                        )?;
-                        append_residual_condition(
-                            &mut memo.scalars,
-                            &mut other,
-                            residual,
-                            control,
-                        )?;
-                    }
+                let original = pair.origin;
+                let oriented = orient_eq_pair(pair, &memo.scalars, &left_ids, &right_ids)
+                    .and_then(|pair| coerce_hash_join_eq_condition(&memo.scalars, pair));
+                if let Some(pair) = oriented {
+                    eq_conds.push(pair);
+                } else {
+                    append_residual_condition(&mut memo.scalars, &mut other, original, control)?;
                 }
             }
         } else {
@@ -745,6 +711,7 @@ impl Rule for JoinToHashJoin {
                 left: eq.left,
                 right: eq.right,
                 null_safe: eq.null_safe,
+                match_relation: eq.match_relation,
             })
             .collect();
         let other_condition = other;
@@ -1845,21 +1812,25 @@ mod eq_pair_tests {
         left: TypedExpr,
         right: TypedExpr,
     ) -> ScalarHashJoinEqCondition {
-        ScalarHashJoinEqCondition {
-            left: intern_typed(
-                arena,
-                &left,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap(),
-            right: intern_typed(
-                arena,
-                &right,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap(),
-            null_safe: false,
-        }
+        let expression = TypedExpr {
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                left.value_type.nullable() || right.value_type.nullable(),
+            ),
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(left),
+                op: BinOp::Eq,
+                right: novarocks_parser::ast::AstBox::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+        };
+        let origin = intern_typed(
+            arena,
+            &expression,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        comparison_key(arena, origin).expect("fixture equality")
     }
 
     fn assert_column_name(arena: &ScalarArena, expr: ScalarId, expected: &str) {

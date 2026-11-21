@@ -350,6 +350,7 @@ fn scalar_claim_cannot_borrow_another_guarded_occurrences_proof() {
             None,
             boolean(true),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(call, call)]),
                 else_expr: Some(otherwise),

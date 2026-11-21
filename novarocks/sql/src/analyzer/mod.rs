@@ -1906,6 +1906,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Case {
+                ieee_float_equality,
                 operand,
                 when_then,
                 else_expr,
@@ -1913,6 +1914,7 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Case {
+                    ieee_float_equality,
                     operand: operand.map(|expr| {
                         novarocks_parser::ast::AstBox::new(
                             self.substitute_select_aliases_for_select_inner(
@@ -2138,6 +2140,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Case {
+                ieee_float_equality,
                 operand,
                 when_then,
                 else_expr,
@@ -2145,6 +2148,7 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Case {
+                    ieee_float_equality,
                     operand: operand.map(|expr| {
                         novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
                             expr.into_inner(),
@@ -3408,10 +3412,12 @@ impl<'a> AnalyzerContext<'a> {
                 negated,
             },
             ExprKind::Case {
+                ieee_float_equality,
                 operand,
                 when_then,
                 else_expr,
             } => ExprKind::Case {
+                ieee_float_equality,
                 operand: operand.map(|e| {
                     novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
                         e.into_inner(),
@@ -3484,6 +3490,7 @@ fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand
                 .as_ref()
@@ -5319,6 +5326,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_ref()
@@ -5363,6 +5371,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_ref()
@@ -5430,6 +5439,10 @@ mod tests {
             ),
             (
                 "select 1 where false or parse_json('{}') not in (select parse_json('null'))",
+                ApplyClause::Where,
+            ),
+            (
+                "select 1 where (false or parse_json('{}') not in (select parse_json('null'))) is true",
                 ApplyClause::Where,
             ),
             (
@@ -5574,13 +5587,11 @@ mod tests {
             expr_has_qualified_column(cond, "l1", "l_suppkey"),
             "outer self-join column must keep its qualifier in correlated EXISTS filter: {cond:?}"
         );
-        let ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &cond.kind
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(cond)
         else {
-            panic!("expected binary correlation condition, got: {cond:?}");
+            panic!("expected original correlation equality, got: {cond:?}");
         };
-        assert_eq!(*op, BinOp::Eq);
         assert!(
             expr_has_qualified_column(left, "l2", "l_partkey"),
             "inner column should stay on the original SQL left side in Apply inner filter: {cond:?}"
@@ -5804,13 +5815,11 @@ mod tests {
         let spec = only_predicate_spec(sel);
         let cond = apply_inner_filter(&spec.inner);
 
-        let ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &cond.kind
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(cond)
         else {
-            panic!("expected binary correlation condition, got: {cond:?}");
+            panic!("expected original correlation equality, got: {cond:?}");
         };
-        assert_eq!(*op, BinOp::Eq);
         assert!(expr_has_qualified_column(left, "t", "s_1"));
         assert!(expr_has_qualified_column(right, "s", "d_1"));
     }
@@ -6002,6 +6011,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_ref()
@@ -6552,8 +6562,10 @@ mod tests {
             panic!("expected Select body");
         };
         assert_eq!(sel.projection.len(), 2);
-        let ExprKind::BinaryOp { left, .. } = &sel.projection[1].expr.kind else {
-            panic!("expected binary op in second projection");
+        let Some((novarocks_type_contract::OperatorFunction::Add, [left, _])) =
+            crate::common::binary_operator::typed_operands(&sel.projection[1].expr)
+        else {
+            panic!("expected bound addition in second projection");
         };
         let ExprKind::Literal(crate::analysis::LiteralValue::Int(value)) = &left.kind else {
             panic!("expected alias to be substituted with original literal");
@@ -6601,6 +6613,7 @@ mod tests {
                     operand,
                     when_then,
                     else_expr,
+                    ..
                 } => {
                     operand
                         .as_ref()
@@ -6877,6 +6890,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => operand
                 .as_ref()
                 .and_then(|expr| find_grouping_ref_id(expr, name))
@@ -6959,6 +6973,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_ref()
@@ -7032,6 +7047,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_ref()
@@ -8704,13 +8720,82 @@ mod tests {
             panic!("expected common correlation to be factored into top-level AND: {filter:?}");
         };
         assert!(
-            matches!(&left.kind, ExprKind::BinaryOp { op: BinOp::Eq, .. }),
+            matches!(
+                crate::common::binary_operator::typed_comparison(left),
+                Some((BinOp::Eq, _))
+            ),
             "left conjunct should be the common equality correlation: {left:?}"
         );
         assert!(
             matches!(&right.kind, ExprKind::BinaryOp { op: BinOp::Or, .. }),
             "right conjunct should retain the residual OR predicate: {right:?}"
         );
+    }
+
+    #[test]
+    fn scalar_apply_factors_common_correlation_with_total_cast() {
+        use crate::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM (SELECT CAST(k1 AS INTEGER) AS k1 FROM t1) t1 \
+             WHERE (SELECT count(*) FROM t2 \
+                    WHERE (t2.k1 = CAST(t1.k1 AS BIGINT) AND t2.k2 = 1) \
+                       OR (t2.k1 = CAST(t1.k1 AS BIGINT) AND t2.k2 = 2)) > 0",
+        )
+        .expect("analyze scalar Apply with OR correlation");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.apply_specs.len(), 1);
+
+        let QueryBody::Select(inner_select) = &select.apply_specs[0].inner.body else {
+            panic!("expected scalar Apply inner select");
+        };
+        let filter = inner_select
+            .filter
+            .as_ref()
+            .expect("expected scalar Apply inner filter");
+        let ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+            ..
+        } = &filter.kind
+        else {
+            panic!("expected common correlation to be factored into top-level AND: {filter:?}");
+        };
+        assert!(
+            matches!(
+                crate::common::binary_operator::typed_comparison(left),
+                Some((BinOp::Eq, _))
+            ),
+            "left conjunct should be the common equality correlation: {left:?}"
+        );
+        assert!(
+            matches!(&right.kind, ExprKind::BinaryOp { op: BinOp::Or, .. }),
+            "right conjunct should retain the residual OR predicate: {right:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_apply_retains_or_when_factoring_could_skip_a_fallible_predicate() {
+        let resolved = parse_and_analyze_for_apply_specs(
+            "SELECT k1 FROM t1 \
+             WHERE (SELECT count(*) FROM t2 \
+                    WHERE (t2.k1 = t1.k1 AND t2.k2 = 1) \
+                       OR (t2.k1 = t1.k1 AND t2.k2 / t2.k1 = 2)) > 0",
+        )
+        .expect("analyze scalar Apply with a fallible OR branch");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        let QueryBody::Select(inner) = &select.apply_specs[0].inner.body else {
+            panic!("expected scalar Apply inner select");
+        };
+        assert!(matches!(
+            &inner.filter.as_ref().expect("expected filter").kind,
+            ExprKind::BinaryOp { op: BinOp::Or, .. }
+        ));
     }
 
     #[test]
@@ -8736,12 +8821,8 @@ mod tests {
         );
 
         let filter = select.filter.as_ref().expect("expected WHERE filter");
-        let ExprKind::BinaryOp {
-            left,
-            op: BinOp::Lt,
-            right,
-            ..
-        } = &filter.kind
+        let Some((BinOp::Lt, [left, right])) =
+            crate::common::binary_operator::typed_comparison(filter)
         else {
             panic!("expected k1 < scalar subquery comparison, got {filter:?}");
         };

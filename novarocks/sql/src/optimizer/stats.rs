@@ -4604,6 +4604,7 @@ mod tests {
                             )
                             .unwrap(),
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         },
                         PhysicalHashJoinEqCondition {
                             left: intern_typed(
@@ -4619,6 +4620,7 @@ mod tests {
                             )
                             .unwrap(),
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         },
                     ],
                     residual: None,
@@ -4704,6 +4706,7 @@ mod tests {
                         )
                         .unwrap(),
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: None,
                 },
@@ -5863,6 +5866,7 @@ mod tests {
                         )
                         .unwrap(),
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: None,
                 },

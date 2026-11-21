@@ -244,6 +244,7 @@ impl Fixture {
                         checked::null(),
                     );
                     ExprKind::Case {
+                        ieee_float_equality: false,
                         operand: None,
                         when_then: Box::from([(test, then)]),
                         else_expr: Some(otherwise),

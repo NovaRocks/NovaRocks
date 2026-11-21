@@ -805,6 +805,7 @@ mod tests {
                         left: left_key,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: None,
                 },
@@ -1006,6 +1007,7 @@ mod tests {
             left: left_key,
             right: right_key,
             null_safe: false,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         };
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
@@ -1187,6 +1189,7 @@ mod tests {
             left: left_key,
             right: right_key,
             null_safe: false,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         };
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
@@ -1410,6 +1413,7 @@ mod tests {
                             left: left_key,
                             right: right_key,
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         }],
                         residual: None,
                     },

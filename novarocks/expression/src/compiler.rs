@@ -619,6 +619,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     operand,
                     when_then,
                     else_expr,
+                    ..
                 } => case_child(*operand, when_then, *else_expr, next),
                 _ => return Err(ExprCompileError::UnsupportedExpression(id).into()),
             };
@@ -984,6 +985,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     }
                 }
                 ExprKind::Case {
+                    ieee_float_equality,
                     operand,
                     when_then,
                     else_expr,
@@ -1000,6 +1002,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         work.step()?;
                     }
                     StaticExprKind::Case {
+                        ieee_float_equality: *ieee_float_equality,
                         has_case_expr: operand.is_some(),
                         has_else_expr: else_expr.is_some(),
                         children,
@@ -1809,11 +1812,13 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                 }
                 (
                     ExprKind::Case {
+                        ieee_float_equality,
                         operand,
                         when_then,
                         else_expr,
                     },
                     StaticExprKind::Case {
+                        ieee_float_equality: compiled_ieee_equality,
                         has_case_expr,
                         has_else_expr,
                         children,
@@ -1829,6 +1834,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     };
                     if invocation.control != expected
                         || *has_case_expr != operand.is_some()
+                        || ieee_float_equality != compiled_ieee_equality
                         || *has_else_expr != else_expr.is_some()
                         || children.len() != count
                         || invocation.arguments.len() != count

@@ -109,7 +109,6 @@ pub(crate) fn digest_effect_declaration(hasher: &mut Sha256, effects: &FunctionE
             SemanticParameterKey::StatementStartUtc => 1,
             SemanticParameterKey::TimeZone => 2,
             SemanticParameterKey::AllowThrowException => 3,
-            SemanticParameterKey::DecimalOverflowToDouble => 4,
             SemanticParameterKey::GroupConcatLegacy => 5,
             SemanticParameterKey::GroupConcatMaxLen => 6,
         }]);

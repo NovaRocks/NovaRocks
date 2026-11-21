@@ -20,18 +20,18 @@
 -- Test Objective: Preserve an exact decimal product and the declared result of a saved expression.
 -- Oracle: the unchanged exact product and Trino 484 decimal_multiply_positive_half.
 
--- query 8
+-- query 1
 SELECT CAST(123456789.123456789 AS DECIMAL(18,9)) *
        CAST(123456789.123456789 AS DECIMAL(18,9)) AS exact_product;
 
--- query 24
+-- query 2
 -- @skip_result_check=true
 CREATE VIEW default_catalog.${case_db}.decimal_replay_control_view AS
 SELECT CAST(1 AS DECIMAL(33,0)) * CAST('0.0000005' AS DECIMAL(7,7)) AS product;
 
--- query 27
+-- query 3
 SELECT product FROM default_catalog.${case_db}.decimal_replay_control_view;
 
--- query 28
+-- query 4
 -- @skip_result_check=true
 DROP VIEW default_catalog.${case_db}.decimal_replay_control_view;

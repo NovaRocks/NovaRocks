@@ -236,6 +236,8 @@ pub enum ExprKind {
         negated: bool,
     },
     Case {
+        /// Use ordinary IEEE equality for the original floating comparison domain.
+        ieee_float_equality: bool,
         operand: Option<ExprId>,
         when_then: Box<[(ExprId, ExprId)]>,
         else_expr: Option<ExprId>,
@@ -267,6 +269,7 @@ impl ExprKind {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => Some(ControlShape::Case {
                 simple: operand.is_some(),
                 arms: u32::try_from(when_then.len()).map_err(|_| {
@@ -381,6 +384,7 @@ impl ExprKind {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(id) = operand {
                     visit(*id)?;

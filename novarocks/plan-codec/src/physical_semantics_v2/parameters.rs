@@ -33,9 +33,6 @@ pub(super) fn encode_key(key: SemanticParameterKey) -> i32 {
         SemanticParameterKey::AllowThrowException => {
             wire::SemanticParameterKey::AllowThrowException
         }
-        SemanticParameterKey::DecimalOverflowToDouble => {
-            wire::SemanticParameterKey::DecimalOverflowToDouble
-        }
         SemanticParameterKey::GroupConcatLegacy => wire::SemanticParameterKey::GroupConcatLegacy,
         SemanticParameterKey::GroupConcatMaxLen => wire::SemanticParameterKey::GroupConcatMaxLen,
     }) as i32
@@ -49,9 +46,6 @@ pub(super) fn decode_key(key: i32) -> Result<SemanticParameterKey, SemanticsCode
         Ok(wire::SemanticParameterKey::TimeZone) => Ok(SemanticParameterKey::TimeZone),
         Ok(wire::SemanticParameterKey::AllowThrowException) => {
             Ok(SemanticParameterKey::AllowThrowException)
-        }
-        Ok(wire::SemanticParameterKey::DecimalOverflowToDouble) => {
-            Ok(SemanticParameterKey::DecimalOverflowToDouble)
         }
         Ok(wire::SemanticParameterKey::GroupConcatLegacy) => {
             Ok(SemanticParameterKey::GroupConcatLegacy)
@@ -168,9 +162,6 @@ fn emit_parameter_entries(
             SemanticParameterValue::AllowThrowException(value) => {
                 wire::semantic_parameter::Value::AllowThrowException(*value)
             }
-            SemanticParameterValue::DecimalOverflowToDouble(value) => {
-                wire::semantic_parameter::Value::DecimalOverflowToDouble(*value)
-            }
             SemanticParameterValue::GroupConcatLegacy(value) => {
                 wire::semantic_parameter::Value::GroupConcatLegacy(*value)
             }
@@ -206,9 +197,6 @@ fn decode_value(
         }
         Some(Value::AllowThrowException(value)) => {
             Ok(SemanticParameterValue::AllowThrowException(*value))
-        }
-        Some(Value::DecimalOverflowToDouble(value)) => {
-            Ok(SemanticParameterValue::DecimalOverflowToDouble(*value))
         }
         Some(Value::GroupConcatLegacy(value)) => {
             Ok(SemanticParameterValue::GroupConcatLegacy(*value))
@@ -477,7 +465,6 @@ mod tests {
                 entry(0, Value::StatementStartUtcMicros(i64::MIN)),
                 entry(9, Value::TimeZone("-07:30".into())),
                 entry(11, Value::AllowThrowException(false)),
-                entry(13, Value::DecimalOverflowToDouble(true)),
                 entry(15, Value::GroupConcatLegacy(false)),
                 entry(u32::MAX, Value::GroupConcatMaxLen(-77)),
             ],
@@ -495,10 +482,6 @@ mod tests {
             (
                 SemanticParameterId::new(11),
                 SemanticParameterValue::AllowThrowException(false),
-            ),
-            (
-                SemanticParameterId::new(13),
-                SemanticParameterValue::DecimalOverflowToDouble(true),
             ),
             (
                 SemanticParameterId::new(15),
@@ -561,7 +544,7 @@ mod tests {
                 &SemanticParameterValue::AllowThrowException(value)
             );
             let wrong = SemanticParameterRef {
-                expected_key: SemanticParameterKey::DecimalOverflowToDouble,
+                expected_key: SemanticParameterKey::GroupConcatLegacy,
                 ..decoded
             };
             assert!(table.require(wrong).is_err());
@@ -658,10 +641,6 @@ mod tests {
                 wire::SemanticParameterKey::AllowThrowException,
             ),
             (
-                SemanticParameterKey::DecimalOverflowToDouble,
-                wire::SemanticParameterKey::DecimalOverflowToDouble,
-            ),
-            (
                 SemanticParameterKey::GroupConcatLegacy,
                 wire::SemanticParameterKey::GroupConcatLegacy,
             ),
@@ -674,7 +653,7 @@ mod tests {
             assert_eq!(encode_key(typed), wire_key as i32);
             assert_eq!(decode_key(wire_key as i32).unwrap(), typed);
         }
-        for bad_key in [0, -1, 7, i32::MAX] {
+        for bad_key in [0, -1, 4, 7, i32::MAX] {
             let reference = wire::SemanticParameterRef {
                 id: Some(0),
                 expected_key: bad_key,

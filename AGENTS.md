@@ -293,7 +293,7 @@ SQL client
 
 - `novarocks/expression-contract/src/{unit,builder}.rs`
   `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
-  codec 用受检的中立 parts 构造单元。修订号 33 的 package 在 PhysicalNode 信封承载单元，
+  codec 用受检的中立 parts 构造单元。修订号 34 的 package 在 PhysicalNode 信封承载单元，
   类型、常量和函数绑定由 package 共享。节点字段的根与端口由 `physical-plan/src/node_roots.rs` 核对。
   见 [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
@@ -397,7 +397,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 16、test-only 为 13；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 17、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`

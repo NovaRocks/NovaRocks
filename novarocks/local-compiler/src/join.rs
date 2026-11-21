@@ -1109,16 +1109,39 @@ fn lower_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFa
                     if !same {
                         return Err(unsupported(node, "join key carriers differ"));
                     }
+                    if !key.match_relation.supports(
+                        probe_type.data_type(),
+                        probe_type.logical_type(),
+                        key.null_safe,
+                    ) {
+                        return Err(unsupported(
+                            node,
+                            "join key match relation differs from its actual type or NULL mode",
+                        ));
+                    }
                     keys.push(ProgramJoinKey {
                         probe: lowered(expressions, probe_key)?,
                         build: lowered(expressions, build_key)?,
                         null_safe: key.null_safe,
+                        match_relation: key.match_relation,
                     });
                     work.step()?;
                 }
                 Ok(keys)
             };
             let keys = lower_keys(condition.keys(), work)?;
+            if condition.is_null_aware() {
+                for key in &keys {
+                    if key.match_relation != novarocks_type_contract::JoinKeyMatch::Grouping {
+                        return Err(unsupported(
+                            node,
+                            "NULL-aware membership value keys require grouping equality",
+                        )
+                        .into());
+                    }
+                    work.step()?;
+                }
+            }
             let scope_keys = lower_keys(
                 condition.scope_keys().map_or(&[][..], |keys| keys.as_ref()),
                 work,

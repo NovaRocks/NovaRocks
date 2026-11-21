@@ -36,6 +36,7 @@ mod literal;
 mod route;
 #[doc(hidden)]
 pub mod syntax_constant;
+pub use conversion::operator_decimal_float;
 pub use literal::{LiteralEmission, LiteralSyntax, TypedLiteral, supports_typed_string};
 pub use route::{ScalarTypingRoute, scalar_typing_route};
 pub use syntax_constant::{LiteralValue, admit_syntax_constant};
@@ -221,6 +222,13 @@ pub struct ValueDomainConversion {
     pub expected_result: FunctionValueType,
     pub target: FunctionValueType,
     pub tail: Option<CarrierConversion>,
+    pub origin: ValueConversionOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueConversionOrigin {
+    ValueDomain,
+    OperatorDecimalFloat,
 }
 
 #[derive(Debug)]
@@ -495,6 +503,8 @@ fn type_selected_call(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeTyping, TypingError> {
     check_shape(&binding, children.len())?;
+    let arithmetic = OperatorFunction::from_function_id(&binding.function_id)
+        .is_some_and(|operator| operator.arithmetic().is_some());
     let conversions = binding
         .selected
         .argument_types
@@ -506,6 +516,12 @@ fn type_selected_call(
                     "selected scalar expects a lambda argument",
                 ));
             };
+            if arithmetic
+                && matches!(child.value_type.data_type(), DataType::Decimal128(..))
+                && matches!(target.data_type(), DataType::Float32 | DataType::Float64)
+            {
+                return conversion::operator_decimal_float(context, child, target, work);
+            }
             conversion::coerce_argument(context, child, target, work)
         })
         .collect::<Result<_, _>>()?;

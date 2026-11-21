@@ -81,13 +81,13 @@ enum Source {
         operation: crate::bit_numeric::BitwiseOp,
         width: BitwiseWidth,
     },
-    BinaryPrimitive {
-        output: BinaryPrimitiveOutput,
+    PrimitiveBuilder {
+        output: PrimitiveBuilderOutput,
         row_errors: bool,
     },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BinaryPrimitiveOutput {
+pub(crate) enum PrimitiveBuilderOutput {
     Boolean,
     Int8,
     Int16,
@@ -98,7 +98,7 @@ pub(crate) enum BinaryPrimitiveOutput {
     Decimal128,
 }
 
-impl BinaryPrimitiveOutput {
+impl PrimitiveBuilderOutput {
     fn layout(self) -> Result<(Option<usize>, usize), ScalarResourceError> {
         use arrow_array::{
             BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
@@ -192,9 +192,12 @@ impl ScalarInvocationResourceProfile {
         }
     }
 
-    pub(crate) const fn binary_primitive(output: BinaryPrimitiveOutput, row_errors: bool) -> Self {
+    pub(crate) const fn primitive_builder(
+        output: PrimitiveBuilderOutput,
+        row_errors: bool,
+    ) -> Self {
         Self {
-            source: Source::BinaryPrimitive { output, row_errors },
+            source: Source::PrimitiveBuilder { output, row_errors },
         }
     }
 
@@ -206,8 +209,8 @@ impl ScalarInvocationResourceProfile {
         selected_rows: usize,
     ) -> Result<ScalarInvocationRequestFacts, ScalarResourceError> {
         match self.source {
-            Source::BinaryPrimitive { output, row_errors } => {
-                binary_primitive_requests(selected_rows, output, row_errors)
+            Source::PrimitiveBuilder { output, row_errors } => {
+                primitive_builder_requests(selected_rows, output, row_errors)
             }
             Source::Int64Shift => int64_shift_requests(selected_rows),
             Source::NarrowShift(width) => narrow_shift_requests(selected_rows, width),
@@ -230,9 +233,9 @@ impl ScalarInvocationResourceProfile {
         arguments: &[crate::EvaluatedArgument<'_>],
     ) -> Result<ScalarInvocationRequestFacts, ScalarResourceError> {
         match self.source {
-            // The whole wrapper validates both actual input carriers before
+            // The whole wrapper validates the actual input carriers before
             // the kernel. Every admitted input is a flat Arrow scalar.
-            Source::BinaryPrimitive { .. } => {}
+            Source::PrimitiveBuilder { .. } => {}
             Source::Int64Shift => {
                 // Original wrong arity exits before reading any argument.
                 // Do not inspect unrelated carriers or reorder that failure.
@@ -321,9 +324,9 @@ fn empty_shift_requests(
     })
 }
 
-fn binary_primitive_requests(
+fn primitive_builder_requests(
     rows: usize,
-    output: BinaryPrimitiveOutput,
+    output: PrimitiveBuilderOutput,
     row_errors: bool,
 ) -> Result<ScalarInvocationRequestFacts, ScalarResourceError> {
     require_arrow_model()?;

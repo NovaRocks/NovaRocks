@@ -769,6 +769,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_deref()

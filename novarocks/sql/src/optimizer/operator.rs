@@ -630,6 +630,7 @@ pub(crate) struct PhysicalHashJoinEqCondition {
     pub left: ScalarId,
     pub right: ScalarId,
     pub null_safe: bool,
+    pub match_relation: novarocks_type_contract::JoinKeyMatch,
 }
 
 #[derive(Clone, Debug)]

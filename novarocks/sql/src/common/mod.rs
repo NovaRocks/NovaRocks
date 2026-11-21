@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod binary_operator;
 pub(crate) mod change_stream;
 pub(crate) mod expr;
 pub(crate) mod imv;

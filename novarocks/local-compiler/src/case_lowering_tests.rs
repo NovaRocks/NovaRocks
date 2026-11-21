@@ -594,6 +594,7 @@ fn fixture(
             NodeId::new(0),
             result_type.clone(),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand,
                 when_then: Box::from([(when[0], then[0]), (when[1], then[1])]),
                 else_expr,
@@ -737,6 +738,7 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<BoundExprSet, FlowError> 
                     operand,
                     when_then,
                     else_expr,
+                    ..
                 } => {
                     let mut args = Vec::new();
                     args.extend(*operand);
@@ -1013,6 +1015,7 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                     has_case_expr,
                     has_else_expr,
                     children,
+                    ..
                 } = arena.node(invocation.definition).unwrap().kind()
                 else {
                     panic!("direct CASE definition")

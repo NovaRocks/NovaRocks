@@ -141,11 +141,13 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             negated: true,
         },
         12 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(child)),
             when_then: vec![(marker(), marker())].into(),
             else_expr: Some(boxed(marker())),
         },
         13 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(marker())),
             when_then: vec![(marker(), marker())].into(),
             else_expr: Some(boxed(child)),
@@ -187,11 +189,13 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             negated: true,
         },
         21 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(marker())),
             when_then: vec![(marker(), marker()), (child, marker())].into(),
             else_expr: Some(boxed(marker())),
         },
         22 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(marker())),
             when_then: vec![(marker(), marker()), (marker(), child)].into(),
             else_expr: Some(boxed(marker())),
@@ -366,6 +370,7 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
                 operand: Some(operand),
                 when_then,
                 else_expr: Some(else_expr),
+                ..
             },
             12 | 13 | 21 | 22,
         ) => {

@@ -21,13 +21,13 @@ use crate::fixtures::{compile_table_free, expression_sources, session, text};
 use crate::fold_observation::FoldProbe;
 use arrow::array::Decimal128Array;
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, UnaryOperator};
+use novarocks_expression_contract::{ExprId, ExprKind, UnaryOperator};
 use novarocks_functions::ConstantValue;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlCompileControl};
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_sql_testkit::sql_fixture_constant_policy;
 use novarocks_type_contract::{
-    CompilePhase, DecimalOverflowPolicy, RegexpCountPatternSource, ValueLogicalType,
+    CompilePhase, OperatorFunction, RegexpCountPatternSource, ValueLogicalType,
 };
 use std::sync::Arc;
 
@@ -41,21 +41,26 @@ fn is_null(value: &ConstantValue) -> bool {
         .unwrap()
 }
 
+fn binary_operands(kind: &ExprKind, operator: OperatorFunction) -> Option<[ExprId; 2]> {
+    let ExprKind::FunctionCall { function, args } = kind else {
+        return None;
+    };
+    let &[left, right] = args.as_ref() else {
+        return None;
+    };
+    (OperatorFunction::from_function_id(&function.function_id) == Some(operator))
+        .then_some([left, right])
+}
+
 #[test]
 fn folds_int32_addition_without_an_integer_carrier_roundtrip() {
     let probe = Arc::new(FoldProbe::default());
     let owner = compile("SELECT CAST(1 AS INT) + CAST(1 AS INT)", &probe);
     let receipts = probe.receipts.lock().unwrap();
-    let (receipt, left, right) = receipts
+    let (receipt, [left, right]) = receipts
         .iter()
-        .find_map(|receipt| match receipt.root().kind {
-            ExprKind::Binary {
-                left,
-                op: BinaryOperator::Add,
-                right,
-                ..
-            } => Some((receipt, left, right)),
-            _ => None,
+        .find_map(|receipt| {
+            binary_operands(&receipt.root().kind, OperatorFunction::Add).map(|args| (receipt, args))
         })
         .unwrap();
     for input in [left, right] {
@@ -67,13 +72,13 @@ fn folds_int32_addition_without_an_integer_carrier_roundtrip() {
     let result = receipt.result.as_ref().unwrap();
     assert_eq!(result.value_type().data_type(), &DataType::Int32);
     assert_eq!(result.try_i64().unwrap(), Some(2));
-    assert!(!expression_sources(&owner).any(|(_, _, node)| matches!(
-        node.kind,
-        ExprKind::Binary {
-            op: BinaryOperator::Add,
-            ..
-        }
-    )));
+    assert!(
+        !expression_sources(&owner).any(|(_, _, node)| binary_operands(
+            &node.kind,
+            OperatorFunction::Add
+        )
+        .is_some())
+    );
 }
 
 #[test]
@@ -124,15 +129,7 @@ fn folds_decimal_multiplication_and_checked_rounding_cast_with_exact_coefficient
     let receipts = probe.receipts.lock().unwrap();
     let multiplication = receipts
         .iter()
-        .find(|receipt| {
-            matches!(
-                receipt.root().kind,
-                ExprKind::Binary {
-                    op: BinaryOperator::Multiply,
-                    ..
-                }
-            )
-        })
+        .find(|receipt| binary_operands(&receipt.root().kind, OperatorFunction::Multiply).is_some())
         .unwrap();
     assert_eq!(
         decimal_coefficient(multiplication.result.as_ref().unwrap()),
@@ -212,12 +209,9 @@ fn folds_successful_negation_and_keeps_the_overflowing_call() {
 }
 
 #[test]
-fn checked_decimal_error_remains_ordinary_evaluation_while_policy_null_is_success() {
+fn standard_decimal_overflow_remains_an_unfolded_call_in_both_sql_modes() {
     let sql = "SELECT CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)) + 1";
-    for (mode, policy) in [
-        ("", DecimalOverflowPolicy::OutputNull),
-        ("ERROR_IF_OVERFLOW", DecimalOverflowPolicy::ReportError),
-    ] {
+    for mode in ["", "ERROR_IF_OVERFLOW"] {
         let probe = Arc::new(FoldProbe::default());
         let semantics =
             SqlSemanticSettings::default().with_sql_mode(SqlMode::from_assignment(mode));
@@ -225,40 +219,16 @@ fn checked_decimal_error_remains_ordinary_evaluation_while_policy_null_is_succes
         let receipts = probe.receipts.lock().unwrap();
         let addition = receipts
             .iter()
-            .find(|receipt| {
-                matches!(
-                    receipt.root().kind,
-                    ExprKind::Binary {
-                        op: BinaryOperator::Add,
-                        ..
-                    }
-                )
-            })
+            .find(|receipt| binary_operands(&receipt.root().kind, OperatorFunction::Add).is_some())
             .unwrap();
-        let ExprKind::Binary {
-            decimal_overflow_policy,
-            ..
-        } = addition.root().kind
-        else {
-            unreachable!()
-        };
-        assert_eq!(decimal_overflow_policy, policy);
-        let retains_addition = expression_sources(&owner).any(|(_, _, node)| {
-            matches!(
-                node.kind,
-                ExprKind::Binary {
-                    op: BinaryOperator::Add,
-                    ..
-                }
+        assert!(addition.result.is_none());
+        assert!(
+            expression_sources(&owner).any(|(_, _, node)| binary_operands(
+                &node.kind,
+                OperatorFunction::Add
             )
-        });
-        if policy == DecimalOverflowPolicy::OutputNull {
-            assert!(is_null(addition.result.as_ref().unwrap()));
-            assert!(!retains_addition);
-        } else {
-            assert!(addition.result.is_none());
-            assert!(retains_addition);
-        }
+            .is_some())
+        );
     }
 }
 

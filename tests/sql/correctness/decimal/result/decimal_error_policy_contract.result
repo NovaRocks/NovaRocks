@@ -1,52 +1,52 @@
--- query 17
+-- query 2
 -- types	decimal(9, 0)
 narrowed
 NULL
 
--- query 19
+-- query 4
 -- types	decimal(5, 2)
 carry
 NULL
 
--- query 21
+-- query 6
 -- types	decimal(5, 2)
 input_null
 NULL
 
--- query 22
+-- query 7
 -- types	decimal(4, 2)
 rounded
 12.35
 
--- query 23
+-- query 8
 -- types	integer	decimal(38, 0)
 branch	v
 1	NULL
 2	2
 
--- query 29
+-- query 14
 -- legacy
 allowed_null_policy
 1
 
--- query 30
+-- query 15
 -- legacy
 same_physical_type
 1
 
--- query 35
+-- query 19
 -- types	integer
 n
 1
 
--- query 41
+-- query 25
 -- types	integer	integer	varchar
 left_id	right_id	merged_key
 1	10	1
 NULL	20	1000
 NULL	30	NULL
 
--- query 43
+-- query 27
 -- types	integer	integer	varchar
 left_id	right_id	merged_key
 2	NULL	NULL

@@ -220,6 +220,7 @@ fn branch_fixture(is_case: bool) -> (Definitions, ExpressionControlFlow<ExprId>)
     let ty = ValueType::new(DataType::Boolean, false);
     let kind = if is_case {
         ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: Box::from([(arguments[0], arguments[1])]),
             else_expr: Some(arguments[2]),

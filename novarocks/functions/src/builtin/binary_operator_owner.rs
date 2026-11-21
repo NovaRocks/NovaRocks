@@ -110,10 +110,13 @@ fn overload(
     result: &str,
     own_row_error: FunctionIntrinsicRowError,
 ) -> Result<FunctionOverloadDeclaration, FunctionCatalogError> {
-    let identity = FunctionOverloadId::try_new(format!(
-        "builtin.scalar/{}/{name}-v1",
-        operator.catalog_name(),
-    ))
+    let identity = match operator.comparison_overload_text() {
+        Some(identity) => FunctionOverloadId::try_new(identity),
+        None => FunctionOverloadId::try_new(format!(
+            "builtin.scalar/{}/{name}-v1",
+            operator.catalog_name(),
+        )),
+    }
     .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
         subject: "builtin binary operator overload",
         value: error.to_string().into(),

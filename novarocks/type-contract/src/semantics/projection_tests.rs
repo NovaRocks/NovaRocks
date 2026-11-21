@@ -64,7 +64,7 @@ fn table() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(3),
-            SemanticParameterValue::DecimalOverflowToDouble(true),
+            SemanticParameterValue::GroupConcatLegacy(true),
         ),
         (
             SemanticParameterId::new(4),
