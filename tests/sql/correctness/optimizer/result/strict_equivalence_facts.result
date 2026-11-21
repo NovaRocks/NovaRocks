@@ -94,7 +94,7 @@ PLAN FRAGMENT 1
                TABLE: ${case_db}.strict_eq_a
                columns: a1, a2, payload
                min-max stats
-               predicates: a1 <=> a2 AND a1 IS NOT NULL AND a2 IS NOT NULL
+               predicates: a1 IS NOT DISTINCT FROM a2 AND a1 IS NOT NULL AND a2 IS NOT NULL
       7:BROADCAST EXCHANGE stats={rows=2}
     8:BROADCAST EXCHANGE stats={rows=2}
 PLAN FRAGMENT 2

@@ -58,14 +58,14 @@ SELECT date_format('2020-01-01', '%Y-%m');
 -- 3. A string literal against a DATE column folds to a DATE constant,
 --    rendered as a calendar date with no CAST left in the scan predicate.
 -- ---------------------------------------------------------------------------
--- @explain_contains=predicates: (dt = 2020-01-01)
+-- @explain_contains=predicates: dt = 2020-01-01
 -- @explain_not_contains=CAST(
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
 
 -- ---------------------------------------------------------------------------
 -- 4. The typed DATE literal must produce exactly the same scan predicate.
 -- ---------------------------------------------------------------------------
--- @explain_contains=predicates: (dt = 2020-01-01)
+-- @explain_contains=predicates: dt = 2020-01-01
 -- @explain_not_contains=CAST(
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = DATE '2020-01-01';
 
@@ -104,7 +104,7 @@ SET SESSION disable_optimizer_rules = 'FoldConstant';
 -- @explain_contains=[40000 + 2000 + 96 AS
 SELECT 40000 + 2000 + 96;
 
--- @explain_contains=predicates: (dt = CAST('2020-01-01' AS Date32))
+-- @explain_contains=predicates: dt = CAST('2020-01-01' AS Date32)
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
 
 -- ---------------------------------------------------------------------------
