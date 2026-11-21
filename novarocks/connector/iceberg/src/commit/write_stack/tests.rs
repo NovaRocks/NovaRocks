@@ -2799,9 +2799,23 @@ fn assert_write_admission_refused_without_io(
     );
     let requests = all_write_admission_requests(&runtime, incarnation, catalog_handle);
     assert_eq!(
-        requests.len(),
-        11,
-        "all flavors, intents and equality delete"
+        requests
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "append",
+            "overwrite",
+            "partition overwrite",
+            "row delta",
+            "equality delete",
+            "staged create",
+            "row mutation",
+            "data rewrite",
+            "full document publication",
+            "incremental document publication",
+        ],
+        "all surviving flavors and intents, including equality delete"
     );
     for (name, mut request) in requests {
         request.context = request.context.with_initiation(initiation);

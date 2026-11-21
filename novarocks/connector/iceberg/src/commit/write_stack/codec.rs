@@ -3102,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn position_writer_without_fixed_or_selected_input_is_rejected() {
+    fn position_writer_without_a_fixed_mutation_input_is_rejected() {
         let facets = generation();
         let codec = IcebergWriteValueCodec::new("catalog.iceberg");
         for branch in [
@@ -3125,7 +3125,7 @@ mod tests {
             assert!(
                 failure
                     .detail()
-                    .contains("exactly one position input recipe")
+                    .contains("requires a fixed mutation input recipe")
             );
         }
     }
