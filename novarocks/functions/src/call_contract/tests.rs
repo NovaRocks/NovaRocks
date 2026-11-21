@@ -284,7 +284,7 @@ fn exact_nonempty_frozen_parameter_closure_preserves_values_and_drops_unused_sco
     let contract =
         FunctionCallContract::from_refined(input, &receipt, fixture.selected.clone(), &observer)
             .unwrap();
-    assert_eq!(contract.parameters().entries().len(), 6);
+    assert_eq!(contract.parameters().entries().len(), 5);
     for reference in &fixture.environment {
         assert_eq!(
             contract.parameters().require(*reference).unwrap(),
@@ -316,7 +316,7 @@ fn exact_nonempty_frozen_parameter_closure_preserves_values_and_drops_unused_sco
     assert_eq!(contract.effects(), receipt.facts());
     assert_eq!(fixture.refinements.load(Ordering::Relaxed), 1);
     assert_eq!(observer.entries.load(Ordering::Relaxed), 2);
-    assert!(observer.events.lock().unwrap().contains(&6));
+    assert!(observer.events.lock().unwrap().contains(&5));
 }
 
 #[test]
@@ -369,7 +369,7 @@ fn nonempty_projection_work_preserves_control_failures_without_invalid_program_f
             expected
         );
         assert_eq!(observer.entries.load(Ordering::Relaxed), 2);
-        assert_eq!(observer.events.lock().unwrap().as_slice(), &[0, 0, 6]);
+        assert_eq!(observer.events.lock().unwrap().as_slice(), &[0, 0, 5]);
     }
 }
 

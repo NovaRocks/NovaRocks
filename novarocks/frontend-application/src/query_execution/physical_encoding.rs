@@ -1350,9 +1350,12 @@ mod tests {
         use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 
+        // Give the optimizer enough rows for a partial COUNT to reduce
+        // the gather. Table-free series provide exact cardinalities without
+        // requiring an external relation or executing the statement.
         let sql = "SELECT COUNT(*) AS row_count \
-            FROM (VALUES (7), (19)) AS l(id) \
-            JOIN (VALUES (7), (19)) AS r(id) ON l.id = r.id";
+            FROM TABLE(generate_series(1, 4096)) AS l(id) \
+            JOIN TABLE(generate_series(1, 4096)) AS r(id) ON l.id = r.id";
         let request = request_with_settings(
             sql,
             SessionOptimizerSettings {
@@ -1541,51 +1544,6 @@ mod tests {
                 .encode_to_vec();
             assert_eq!(&again, bytes, "fragment {id:?} roundtrips byte-identically");
         }
-    }
-
-    /// A real sealed RAND-only subset; a table-free statement binds no
-    /// function, but the compiler refuses an empty pure catalog. This is not
-    /// the Server catalogue.
-    fn sealed_rand_subset() -> novarocks_functions::PureEngineFunctionCatalog {
-        use novarocks_functions::{
-            EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
-            InstalledPureKernel, PureImplementationDeclaration, PureImplementationId,
-            PureKernelAbi,
-        };
-        let actual =
-            novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
-                .expect("builtin catalogue");
-        let mut builder = EngineFunctionCatalogBuilder::new();
-        builder
-            .register(
-                actual
-                    .definition("rand", FunctionKind::Scalar)
-                    .expect("rand definition")
-                    .clone(),
-            )
-            .expect("register rand");
-        builder
-            .seal_pure(
-                [
-                    "builtin.scalar/rand/()->f64;strict;legacy",
-                    "builtin.scalar/rand/(i64)->f64;strict;legacy",
-                ]
-                .into_iter()
-                .map(|overload| InstalledPureKernel {
-                    function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
-                    kind: FunctionKind::Scalar,
-                    implementation: PureImplementationDeclaration {
-                        overload: FunctionOverloadId::try_new(overload).unwrap(),
-                        implementation: PureImplementationId::try_new(
-                            "builtin.scalar/rand/selected-v1",
-                        )
-                        .unwrap(),
-                        abi: PureKernelAbi::ScalarV1,
-                    },
-                    aggregate_state_format: None,
-                }),
-            )
-            .expect("sealed rand subset")
     }
 
     /// Package admission within the test encode limits' source/coexistence
@@ -1873,7 +1831,10 @@ mod tests {
         novarocks_physical_plan::FragmentId,
         novarocks_local_program::LocalProgram,
     > {
-        compiled_programs_with_functions(sql, &sealed_rand_subset())
+        compiled_programs_with_functions(
+            sql,
+            &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        )
     }
 
     fn compiled_programs_with_functions(
