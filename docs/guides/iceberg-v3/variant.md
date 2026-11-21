@@ -30,7 +30,7 @@ Iceberg `variant` 是逻辑类型。NovaRocks 读取其他引擎写出的顶层 
 | CTAS / MV 暂存建表 | 列定义含 Variant 时在 namespace 探测与暂存请求之前拒绝 |
 | CREATE TABLE LIKE | 保留源声明类型；目标含 Variant 时拒绝，不探测或创建目标 |
 | 已有表的普通 schema 修改 | 普通 ADD、rename / comment / drop / reorder 等保留；已有 Variant 同类型 MODIFY 沿原 no-op 规则 |
-| ADD FILES | 目标表含 Variant 时拒绝 |
+| ADD FILES | 规划准入目标为 v1/v2，含 Variant 的 v3 表不准入 |
 | DELETE | v3 部分覆盖写 DV，完整覆盖逻辑移除数据文件及独占旧位置删除项；不因表内存在普通 Variant 列而拒绝 |
 | TRUNCATE | 不写出 Variant 数据文件，沿原有元数据操作路径执行 |
 | ADD EQUALITY DELETE | 等值键不能是 Variant；表内其他 Variant 列不构成全表禁止 |

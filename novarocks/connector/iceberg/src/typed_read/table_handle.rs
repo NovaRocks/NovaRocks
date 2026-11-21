@@ -41,6 +41,15 @@ use super::column_handle::{
     ColumnIdentityCategory, IcebergColumnHandle, decode_tuple_domain, encode_tuple_domain, invalid,
 };
 
+pub(crate) fn validate_name_mapping_carrier(mapping: &str) -> Result<(), ConnectorError> {
+    if mapping.is_empty() || mapping.len() > MAX_JSON_BYTES {
+        return Err(invalid(
+            "iceberg name mapping json must be non-empty and bounded when present",
+        ));
+    }
+    Ok(())
+}
+
 fn nested_variant_path(data_type: &crate::iceberg::spec::Type, path: &str) -> Option<String> {
     use crate::iceberg::spec::Type;
     fn visit(data_type: &Type, path: String) -> Option<String> {
@@ -246,12 +255,8 @@ impl IcebergTableHandle {
                 "iceberg table location must be non-empty and bounded",
             ));
         }
-        if let Some(name_mapping_json) = name_mapping_json.as_deref()
-            && (name_mapping_json.is_empty() || name_mapping_json.len() > MAX_JSON_BYTES)
-        {
-            return Err(invalid(
-                "iceberg name mapping json must be non-empty and bounded when present",
-            ));
+        if let Some(name_mapping_json) = name_mapping_json.as_deref() {
+            validate_name_mapping_carrier(name_mapping_json)?;
         }
         if partition_spec_jsons.len() > MAX_PARTITION_SPECS {
             return Err(ConnectorError::new(

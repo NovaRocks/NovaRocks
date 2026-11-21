@@ -22,6 +22,7 @@
 
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
     LakePublicationFamily, LakePublicationId, LakePublicationStatementTag, LakePublicationTarget,
     LakePublicationTerminal,
 };
@@ -33,10 +34,53 @@ use crate::dml::attempt::{
 use crate::dml::error::DmlError;
 use crate::dml::service::DmlService;
 use crate::query_execution::dml::add_files::{
-    AddFilesCommand, AddFilesEngine, AddFilesFailure, AddFilesFinalization, AddFilesOutcome,
-    AddFilesPlanError, AddFilesPlanFacts, PlanAddFilesRequest, PreparedAddFiles, ResolvedAddFiles,
+    AddFilesCommand, AddFilesDispatchState, AddFilesEngine, AddFilesFailure, AddFilesFinalization,
+    AddFilesOutcome, AddFilesPlanError, AddFilesPlanFacts, PlanAddFilesRequest, PreparedAddFiles,
+    ResolvedAddFiles,
 };
 use novarocks_query_application::admitted_query_context::RequestContext;
+use novarocks_workload_control::{CancellationReason, ResultWindowAlias, WorkError};
+use std::sync::Arc;
+
+struct RegistrationByteAuthor(ResultWindowAlias);
+
+impl ConnectorPayloadByteBudget for RegistrationByteAuthor {
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| registration_work_error(WorkError::ArithmeticOverflow))?;
+        let receipt = self
+            .0
+            .reserve_payload_bytes(bytes)
+            .map_err(registration_work_error)?;
+        Ok(ConnectorPayloadRetentionGuard::new(receipt))
+    }
+}
+
+pub(crate) fn registration_byte_author(
+    window: ResultWindowAlias,
+) -> ConnectorPayloadRetentionGuard {
+    ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(RegistrationByteAuthor(window)))
+}
+
+fn registration_work_error(error: WorkError) -> ConnectorError {
+    let kind = match &error {
+        WorkError::Capacity(_) | WorkError::CapacityWaitTimeout | WorkError::ArithmeticOverflow => {
+            ConnectorErrorKind::ResourceExhausted
+        }
+        WorkError::Cancelled(
+            CancellationReason::DeadlineExceeded
+            | CancellationReason::FrontendDrainDeadlineExceeded,
+        ) => ConnectorErrorKind::DeadlineExceeded,
+        WorkError::Cancelled(_) | WorkError::Closed | WorkError::Released => {
+            ConnectorErrorKind::Cancelled
+        }
+        _ => ConnectorErrorKind::Internal,
+    };
+    ConnectorError::from_domain(kind, error)
+}
 
 /// A planned ADD FILES operation whose provider dispatch has not begun.
 ///
@@ -74,7 +118,7 @@ impl DmlService {
                 resolved.target.namespace.clone(),
                 resolved.target.table.clone(),
             ],
-            location: resolved.location,
+            arguments: resolved.arguments,
         };
         self.prepare_add_files_request(
             engine,
@@ -96,11 +140,6 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<PreparedAddFilesAttempt, DmlError> {
-        if !is_secret_free_source_location(&command.location) {
-            return Err(DmlError::executor(
-                "ADD FILES source location must not contain credentials or query parameters",
-            ));
-        }
         let publication_id = LakePublicationId::new_v7();
         let prepared = engine
             .plan_add_files(PlanAddFilesRequest {
@@ -121,6 +160,7 @@ impl DmlService {
         &self,
         engine: &dyn AddFilesEngine,
         prepared: PreparedAddFilesAttempt,
+        byte_author: ConnectorPayloadRetentionGuard,
     ) -> Result<u32, DmlError> {
         let PreparedAddFilesAttempt {
             prepared,
@@ -129,7 +169,7 @@ impl DmlService {
         attempt
             .mark_dispatch_possible()
             .map_err(DmlError::executor)?;
-        finish(engine, prepared, &mut attempt)
+        finish(engine, prepared, &mut attempt, byte_author)
     }
 }
 
@@ -158,8 +198,9 @@ fn finish(
     engine: &dyn AddFilesEngine,
     prepared: PreparedAddFiles,
     attempt: &mut DmlPublicationAttempt,
+    byte_author: ConnectorPayloadRetentionGuard,
 ) -> Result<u32, DmlError> {
-    match engine.execute_add_files(prepared.handle.as_ref()) {
+    match engine.execute_add_files(prepared.handle.as_ref(), byte_author) {
         AddFilesOutcome::KnownCommitted {
             receipt,
             finalization,
@@ -188,10 +229,15 @@ fn finish(
                 }
             }
         }
-        // This boundary is deliberate: a plan was retained and execute was
-        // invoked, so even an adapter-local failure cannot grant a retry.
         AddFilesOutcome::KnownUncommitted { failure }
-        | AddFilesOutcome::ContractFailure { failure, .. } => unknown(attempt, failure),
+        | AddFilesOutcome::ContractFailure {
+            failure,
+            dispatch: AddFilesDispatchState::ConfirmedNotDispatched,
+        } => failed(attempt.terminal_known_uncommitted(), failure),
+        AddFilesOutcome::ContractFailure {
+            failure,
+            dispatch: AddFilesDispatchState::PossiblyDispatched,
+        } => failed(attempt.terminal_commit_unknown(), failure),
     }
 }
 
@@ -200,9 +246,8 @@ fn committed(
     file_count: u32,
     finalization: AddFilesFinalization,
 ) -> Result<u32, DmlError> {
-    let finalization = finalization_state(&finalization);
     let terminal = attempt
-        .terminal_known_committed(finalization)
+        .terminal_known_committed(finalization_state(&finalization))
         .map_err(DmlError::executor)?
         .clone();
     finalization_error(terminal, finalization, file_count)
@@ -214,26 +259,23 @@ fn committed_after_adjudication(
     file_count: u32,
     finalization: AddFilesFinalization,
 ) -> Result<u32, DmlError> {
-    let finalization = finalization_state(&finalization);
     let terminal = attempt
         .finish_adjudication(
             capability,
             DmlPublicationAdjudicationOutcome::KnownCommitted,
-            finalization,
+            finalization_state(&finalization),
         )
         .map_err(DmlError::executor)?
         .clone();
     finalization_error(terminal, finalization, file_count)
 }
 
-fn unknown(attempt: &mut DmlPublicationAttempt, failure: AddFilesFailure) -> Result<u32, DmlError> {
-    let terminal = attempt
-        .terminal_commit_unknown()
-        .map_err(DmlError::executor)?
-        .clone();
-    Err(DmlError::commit(&failure.message)
-        .with_compile_control(failure.compile_control_error())
-        .with_publication_terminal(terminal))
+fn failed(
+    terminal: Result<&LakePublicationTerminal, crate::dml::attempt::DmlPublicationAttemptError>,
+    failure: AddFilesFailure,
+) -> Result<u32, DmlError> {
+    let terminal = terminal.map_err(DmlError::executor)?.clone();
+    Err(DmlError::from_application(failure.into_service()).with_publication_terminal(terminal))
 }
 
 fn unknown_after_adjudication(
@@ -241,17 +283,14 @@ fn unknown_after_adjudication(
     capability: DmlPublicationAdjudication,
     failure: AddFilesFailure,
 ) -> Result<u32, DmlError> {
-    let terminal = attempt
-        .finish_adjudication(
+    failed(
+        attempt.finish_adjudication(
             capability,
             DmlPublicationAdjudicationOutcome::CommitUnknown,
             DmlPublicationFinalization::NotApplicable,
-        )
-        .map_err(DmlError::executor)?
-        .clone();
-    Err(DmlError::commit(&failure.message)
-        .with_compile_control(failure.compile_control_error())
-        .with_publication_terminal(terminal))
+        ),
+        failure,
+    )
 }
 
 fn finalization_state(finalization: &AddFilesFinalization) -> DmlPublicationFinalization {
@@ -263,163 +302,26 @@ fn finalization_state(finalization: &AddFilesFinalization) -> DmlPublicationFina
 
 fn finalization_error(
     terminal: LakePublicationTerminal,
-    finalization: DmlPublicationFinalization,
+    finalization: AddFilesFinalization,
     file_count: u32,
 ) -> Result<u32, DmlError> {
-    if finalization == DmlPublicationFinalization::Failed {
-        return Err(DmlError::known_committed_finalization_failed(
-            terminal,
-            "ADD FILES finalization failed",
-        ));
+    match finalization {
+        AddFilesFinalization::Complete => Ok(file_count),
+        AddFilesFinalization::Failed(failure) => {
+            Err(DmlError::from_application(failure.into_service())
+                .with_publication_terminal(terminal))
+        }
     }
-    Ok(file_count)
 }
 
 fn plan_error(error: AddFilesPlanError) -> DmlError {
     match error {
         AddFilesPlanError::KnownUncommitted(failure)
         | AddFilesPlanError::ContractFailure { failure, .. } => {
-            DmlError::executor(&failure.message)
-                .with_compile_control(failure.compile_control_error())
+            DmlError::from_application(failure.into_service())
         }
     }
-}
-
-fn is_secret_free_source_location(location: &str) -> bool {
-    !location.contains('@') && !location.contains('?')
 }
 
 #[cfg(test)]
-mod tests {
-    use std::any::Any;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
-
-    use super::*;
-    use crate::query_execution::dml::add_files::{
-        AddFilesEvidence, AddFilesPlanSummary, AddFilesPrepared,
-    };
-    use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
-    use novarocks_query_application::api::BackendTopologySnapshot;
-    use novarocks_query_application::cancellation::QueryCancellationSource;
-    use novarocks_spi::connector::ConnectorDataMutationSourceScope;
-    use novarocks_types::ClusterRole;
-
-    struct TestPrepared;
-
-    impl AddFilesPrepared for TestPrepared {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingAddFilesEngine {
-        plan_calls: AtomicUsize,
-        execute_calls: AtomicUsize,
-    }
-
-    impl AddFilesEngine for RecordingAddFilesEngine {
-        fn plan_add_files(
-            &self,
-            request: PlanAddFilesRequest,
-        ) -> Result<PreparedAddFiles, AddFilesPlanError> {
-            self.plan_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(PreparedAddFiles {
-                facts: AddFilesPlanFacts {
-                    catalog: "ice".to_string(),
-                    namespace: "db".to_string(),
-                    table: "orders".to_string(),
-                    source_location: request.command.location,
-                    provider_id: "iceberg".to_string(),
-                    instance_id: "ice".to_string(),
-                    incarnation: [1; 16],
-                    mutation_operation_id: request.mutation_operation_id,
-                    request_digest: [2; 32],
-                    plan_digest: [3; 32],
-                    state_digest: [4; 32],
-                    summary: AddFilesPlanSummary {
-                        file_count: 1,
-                        row_count: 2,
-                        total_bytes: 3,
-                    },
-                    source_scope: ConnectorDataMutationSourceScope::try_new_directory([5; 32])
-                        .expect("valid source scope"),
-                    public_plan_wire: vec![6],
-                },
-                handle: Arc::new(TestPrepared),
-            })
-        }
-
-        fn execute_add_files(&self, _prepared: &dyn AddFilesPrepared) -> AddFilesOutcome {
-            self.execute_calls.fetch_add(1, Ordering::SeqCst);
-            unreachable!("this test must not cross the dispatch edge")
-        }
-
-        fn adjudicate_add_files(
-            &self,
-            _prepared: &dyn AddFilesPrepared,
-            _evidence: &AddFilesEvidence,
-        ) -> AddFilesOutcome {
-            unreachable!("this test must not adjudicate")
-        }
-    }
-
-    fn context() -> RequestContext {
-        let cancellation = QueryCancellationSource::new();
-        RequestContext::admit(RequestAdmission::new(
-            Some("ice".to_string()),
-            "db".to_string(),
-            ClusterRole::Fe,
-            BackendTopologySnapshot::empty(1),
-            Some(Instant::now() + Duration::from_secs(30)),
-            cancellation.view(),
-            Default::default(),
-            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            Some(
-                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
-                    novarocks_result_contract::TrinoJsonFacts {
-                        parametric_datetime: true,
-                        variant: true,
-                        variant_binary: true,
-                    },
-                ),
-            ),
-        ))
-    }
-
-    #[test]
-    fn caller_source_validation_does_not_treat_path_spelling_as_credentials() {
-        assert!(is_secret_free_source_location(
-            "s3://bucket/secret-data/files"
-        ));
-        assert!(!is_secret_free_source_location(
-            "s3://key:secret@bucket/files"
-        ));
-        assert!(!is_secret_free_source_location(
-            "s3://bucket/files?token=secret"
-        ));
-    }
-
-    #[test]
-    fn planned_add_files_does_not_dispatch_until_the_second_edge() {
-        let engine = RecordingAddFilesEngine::default();
-        let prepared = DmlService::new()
-            .prepare_add_files(
-                &engine,
-                AddFilesCommand {
-                    table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
-                    location: "s3://bucket/source".to_string(),
-                },
-                &context(),
-                None,
-            )
-            .expect("plan ADD FILES without dispatch");
-
-        assert_eq!(engine.plan_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 0);
-        drop(prepared);
-        assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 0);
-    }
-}
+mod tests;

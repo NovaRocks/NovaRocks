@@ -603,7 +603,8 @@ fn command_update_type(
         StatementOutputShape::ResultSet
             if matches!(
                 admission.kind,
-                StatementKind::Optimize
+                StatementKind::AddFiles
+                    | StatementKind::Optimize
                     | StatementKind::RewriteManifests
                     | StatementKind::ExpireSnapshots
                     | StatementKind::RemoveOrphanFiles
@@ -612,5 +613,40 @@ fn command_update_type(
             update_type(admission.kind)
         }
         StatementOutputShape::ResultSet | StatementOutputShape::UndeterminedCall => None,
+    }
+}
+
+#[cfg(test)]
+mod command_update_type_tests {
+    use super::*;
+    use novarocks_query_application::{
+        session::{StatementAdmission, StatementOutputShape},
+        statement_kind::StatementKind,
+    };
+
+    #[test]
+    fn table_execute_metrics_keep_update_type_with_result_set() {
+        for kind in [
+            StatementKind::AddFiles,
+            StatementKind::Optimize,
+            StatementKind::RewriteManifests,
+            StatementKind::ExpireSnapshots,
+            StatementKind::RemoveOrphanFiles,
+        ] {
+            assert_eq!(
+                command_update_type(StatementAdmission {
+                    kind,
+                    shape: StatementOutputShape::ResultSet
+                }),
+                Some("ALTER TABLE EXECUTE")
+            );
+        }
+        assert_eq!(
+            command_update_type(StatementAdmission {
+                kind: StatementKind::CreateTable,
+                shape: StatementOutputShape::ResultSet
+            }),
+            None
+        );
     }
 }

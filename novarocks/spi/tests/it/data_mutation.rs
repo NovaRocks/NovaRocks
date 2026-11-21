@@ -15,26 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "connector-conformance")]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use novarocks_connector_contract::PureProviderCompileError;
+use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
 use novarocks_spi::connector::{
-    ConnectorControlRuntimeId, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
-    ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
+    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorControlRuntimeId,
+    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation,
+    ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
-    ConnectorDataMutationReconcileRequest, ConnectorDataMutationSession,
-    ConnectorDataMutationSourceScope, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorProviderBindingKey,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity,
-    ConnectorTableMetadata, ConnectorTableRequest, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationSession, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorNamespaceRequest,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
     ProviderBindingEpoch,
 };
 
@@ -75,7 +75,8 @@ impl ConnectorMetadata for FakeMetadata {
     fn load_table(
         &self,
         _: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        _: &mut ConnectorReadSchemaCreation<'_>,
+    ) -> Result<ConnectorTableMetadata, PureProviderCompileError<ConnectorError>> {
         unreachable!()
     }
 }
@@ -186,12 +187,7 @@ impl ConnectorDataMutation for FakeDataMutation {
         let plan = ConnectorDataMutationPlan::try_new(
             &request,
             [7; 32],
-            ConnectorDataMutationPlanSummary::try_new(2, 11, 101).expect("summary"),
-            Some(source_scope()),
-            Some(
-                novarocks_spi::connector::ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable([9; 32])
-                    .expect("domain"),
-            ),
+            ConnectorDataMutationPlanSummary::new(2, 11, 101),
             Bytes::from_static(b"secret-plan"),
         )?;
         plans.insert(
@@ -274,14 +270,15 @@ fn planning_request(
     ConnectorDataMutationPlanningRequest::try_new(
         operation_id,
         fake.key.clone(),
-        ConnectorDataMutationOperation::register_existing_files(table, source).expect("operation"),
+        ConnectorDataMutationOperation::register_existing_files(
+            table,
+            Some(source.into()),
+            Some(ConnectorAddFilesFormat::Parquet),
+            ConnectorAddFilesRecursion::Fail,
+        ),
         context(),
     )
     .expect("planning request")
-}
-
-fn source_scope() -> ConnectorDataMutationSourceScope {
-    ConnectorDataMutationSourceScope::try_new_directory([7; 32]).expect("source scope")
 }
 
 #[test]
@@ -369,10 +366,8 @@ fn lease_validates_all_execute_and_reconcile_outcomes() {
 #[test]
 fn bounds_and_exact_generation_fail_closed() {
     assert_eq!(
-        ConnectorDataMutationPlanSummary::try_new(MAX_CONNECTOR_DATA_MUTATION_FILES + 1, 0, 0,)
-            .expect_err("file bound")
-            .kind(),
-        ConnectorErrorKind::ResourceExhausted
+        ConnectorDataMutationPlanSummary::new(u32::MAX, 0, 0).file_count(),
+        u32::MAX
     );
 
     let fake = FakeDataMutation::new("fake-beta", "beta", [8; 16]);
@@ -382,11 +377,6 @@ fn bounds_and_exact_generation_fail_closed() {
             &request,
             [0; 32],
             ConnectorDataMutationPlanSummary::default(),
-            Some(source_scope()),
-            Some(
-                novarocks_spi::connector::ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable([9; 32])
-                    .expect("domain"),
-            ),
             Bytes::from(vec![
                 0;
                 MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES + 1
@@ -412,5 +402,99 @@ fn bounds_and_exact_generation_fail_closed() {
         .expect("wrong generation")
         .kind(),
         ConnectorErrorKind::InvalidRequest
+    );
+}
+
+fn plan(
+    format: ConnectorAddFilesFormat,
+    recursion: ConnectorAddFilesRecursion,
+) -> ConnectorDataMutationPlan {
+    let instance_id = ConnectorInstanceId::parse("analytics").expect("instance ID");
+    let request = ConnectorDataMutationPlanningRequest::try_new(
+        ConnectorMutationOperationId::from_bytes([3; 16]),
+        ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([4; 16]),
+        },
+        ConnectorDataMutationOperation::register_existing_files(
+            ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
+                .expect("table"),
+            Some("s3://bucket/source".into()),
+            Some(format),
+            recursion,
+        ),
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            1024,
+            2048,
+        )
+        .expect("context"),
+    )
+    .expect("request");
+    ConnectorDataMutationPlan::try_new(
+        &request,
+        [5; 32],
+        ConnectorDataMutationPlanSummary::new(1, 2, 3),
+        Bytes::from_static(b"opaque-plan"),
+    )
+    .expect("plan")
+}
+
+#[test]
+fn data_mutation_plan_wire_round_trips_and_binds_registration_options() {
+    let plan = plan(
+        ConnectorAddFilesFormat::Parquet,
+        ConnectorAddFilesRecursion::Fail,
+    );
+    let wire = plan.try_to_wire_v1().expect("encode plan");
+    let decoded = ConnectorDataMutationPlan::try_from_wire_v1(&wire).expect("decode plan");
+    assert_eq!(decoded, plan);
+    assert_eq!(decoded.request_digest(), plan.request_digest());
+    let changed_format = self::plan(
+        ConnectorAddFilesFormat::Orc,
+        ConnectorAddFilesRecursion::Fail,
+    );
+    let changed_recursion = self::plan(
+        ConnectorAddFilesFormat::Parquet,
+        ConnectorAddFilesRecursion::Include,
+    );
+    assert_ne!(decoded.request_digest(), changed_format.request_digest());
+    assert_ne!(decoded.request_digest(), changed_recursion.request_digest());
+
+    let mut tampered = wire.to_vec();
+    let last = tampered.last_mut().expect("plan digest");
+    *last ^= 1;
+    assert!(ConnectorDataMutationPlan::try_from_wire_v1(&tampered).is_err());
+}
+
+#[test]
+fn data_mutation_receipt_wire_rejects_trailing_data() {
+    let plan = plan(
+        ConnectorAddFilesFormat::Parquet,
+        ConnectorAddFilesRecursion::Fail,
+    );
+    let receipt = ConnectorDataMutationReceipt::try_new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: plan.owner().instance_id.clone(),
+        },
+        plan.owner().incarnation,
+        plan.operation_id(),
+        plan.operation_kind(),
+        plan.request_digest(),
+        plan.plan_digest(),
+        plan.state_digest(),
+        plan.summary(),
+        Bytes::from_static(b"opaque-receipt"),
+    )
+    .expect("receipt");
+    let mut wire = receipt.try_to_wire_v1().expect("encode receipt").to_vec();
+    wire.push(0);
+    assert_eq!(
+        ConnectorDataMutationReceipt::try_from_wire_v1(&wire)
+            .expect_err("trailing receipt bytes must fail")
+            .kind(),
+        ConnectorErrorKind::CorruptData
     );
 }

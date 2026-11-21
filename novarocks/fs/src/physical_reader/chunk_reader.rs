@@ -172,6 +172,10 @@ impl BoundChunkReader {
         self
     }
 
+    pub(crate) fn storage_bytes_read(&self) -> u64 {
+        self.metrics.bytes_read.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn small_file_buffer(&self) -> SmallFileBuffer {
         Arc::clone(&self.small_file)
     }

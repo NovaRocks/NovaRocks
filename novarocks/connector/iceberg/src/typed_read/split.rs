@@ -36,6 +36,13 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use crate::delete_semantics::{PinnedEndpointFacts, ReadDomain, ReadObservationId};
 use crate::iceberg::spec::{DataFileFormat, PartitionSpec, Schema};
 
+pub(crate) fn validate_data_file_path(path: &str) -> Result<(), ConnectorError> {
+    if path.is_empty() || path.len() > MAX_PATH_BYTES {
+        return Err(invalid("iceberg split path must be non-empty and bounded"));
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_read_domain(domain: &ReadDomain) -> dto::IcebergReadDomain {
     let endpoint = domain.endpoint();
     dto::IcebergReadDomain {
@@ -782,9 +789,7 @@ impl IcebergSplit {
             affinity_key,
         } = params;
 
-        if path.is_empty() || path.len() > MAX_PATH_BYTES {
-            return Err(invalid("iceberg split path must be non-empty and bounded"));
-        }
+        validate_data_file_path(&path)?;
         if file_format == IcebergFileFormat::Puffin {
             return Err(invalid(
                 "an iceberg data split is never in the puffin delete-artifact format",

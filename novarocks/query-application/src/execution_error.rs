@@ -42,6 +42,46 @@ pub use novarocks_coordination_contract::{
     TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
 };
 
+/// The connector explicitly approved its bounded diagnostic for protocol use.
+pub fn has_explicit_connector_detail(error: &crate::session_error::QueryServiceError) -> bool {
+    use novarocks_spi::connector::{ConnectorError, ConnectorMutationFailure};
+    let Some(cause) = error.failure_cause() else {
+        return false;
+    };
+    cause
+        .downcast_ref::<ConnectorError>()
+        .or_else(|| {
+            cause
+                .downcast_ref::<ConnectorMutationFailure>()?
+                .connector_source()
+        })
+        .and_then(ConnectorError::public_failure_detail)
+        .is_some()
+}
+
+/// Project the publication verdict from the original terminal for a specific
+/// data mutation. The statement tag is selected at admission, not from SQL text.
+pub fn data_mutation_publication_effect(
+    error: &crate::session_error::QueryServiceError,
+    tag: &str,
+) -> Option<crate::api::StatementExternalEffectDisposition> {
+    use crate::api::StatementExternalEffectDisposition as Effect;
+    use novarocks_spi::connector::{LakePublicationDisposition as Verdict, LakePublicationFamily};
+    let terminal = error.publication_terminal()?;
+    if terminal.header().family() != LakePublicationFamily::DataMutation
+        || !terminal
+            .client_statement_tag()
+            .is_some_and(|actual| actual.as_str() == tag)
+    {
+        return None;
+    }
+    Some(match terminal.disposition() {
+        Verdict::KnownUncommitted => Effect::KnownUncommitted,
+        Verdict::CommitUnknown => Effect::CommitUnknown,
+        Verdict::KnownCommitted => Effect::KnownCommitted,
+    })
+}
+
 pub trait ExecutionFailurePresentation {
     fn topology_requirement(&self) -> NativeAttemptTopologyRequirement;
     fn descriptor(&self) -> SqlExecutionErrorDescriptor;

@@ -37,7 +37,7 @@ use novarocks_spi::connector::ConnectorMutationFailure;
 
 use crate::iceberg::spec::TableMetadata;
 
-use super::model::{Dependency, EntryIdentity};
+use super::model::Dependency;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Culprit {
@@ -46,10 +46,6 @@ pub enum Culprit {
         actual: Option<i64>,
     },
     Snapshot(i64),
-    Entry {
-        snapshot: i64,
-        identity: EntryIdentity,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -73,8 +73,9 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         DropPartitionField => "DROP PARTITION FIELD",
         CreateTag => "CREATE TAG",
         DropTag => "DROP TAG",
-        AddFiles => "ADD FILES",
-        Optimize | RewriteManifests | ExpireSnapshots | RemoveOrphanFiles => "ALTER TABLE EXECUTE",
+        AddFiles | Optimize | RewriteManifests | ExpireSnapshots | RemoveOrphanFiles => {
+            "ALTER TABLE EXECUTE"
+        }
         AlterMaterializedViewRefresh => "ALTER MATERIALIZED VIEW REFRESH",
         PauseMaterializedViewRefresh => "PAUSE MATERIALIZED VIEW REFRESH",
         ResumeMaterializedViewRefresh => "RESUME MATERIALIZED VIEW REFRESH",
@@ -87,5 +88,4 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-#[path = "update_type_tests.rs"]
 mod tests;

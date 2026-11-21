@@ -148,26 +148,50 @@ pub(crate) fn optimize_result(
     else {
         return Err("OPTIMIZE requires data rewrite outcome facts".into());
     };
+    table_execute_metrics(
+        &[
+            (
+                "rewritten_data_files_count",
+                Some(i64::from(rewritten_data_files_count)),
+            ),
+            (
+                "removed_delete_files_count",
+                Some(i64::from(removed_delete_files_count)),
+            ),
+            (
+                "added_data_files_count",
+                added_data_files_count.map(i64::from),
+            ),
+        ],
+        "build Iceberg optimize metrics",
+    )
+    .map(MaintenanceStatementResult::Query)
+}
+
+pub(crate) fn add_files_result(file_count: u32) -> Result<QueryResult, String> {
+    table_execute_metrics(
+        &[("added_data_files", Some(i64::from(file_count)))],
+        "build Iceberg ADD FILES metrics",
+    )
+}
+
+fn table_execute_metrics(
+    rows: &[(&str, Option<i64>)],
+    context: &str,
+) -> Result<QueryResult, String> {
     build_query_result(
         vec![
             column("metric_name", DataType::Utf8, false),
             column("metric_value", DataType::Int64, true),
         ],
         vec![
-            Arc::new(StringArray::from(vec![
-                "rewritten_data_files_count",
-                "removed_delete_files_count",
-                "added_data_files_count",
-            ])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![
-                Some(i64::from(rewritten_data_files_count)),
-                Some(i64::from(removed_delete_files_count)),
-                added_data_files_count.map(i64::from),
-            ])) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|(name, _)| *name),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from_iter(rows.iter().map(|(_, value)| *value))) as ArrayRef,
         ],
-        "build Iceberg optimize metrics",
+        context,
     )
-    .map(MaintenanceStatementResult::Query)
 }
 
 pub(crate) fn procedure_metrics_result(
@@ -207,43 +231,4 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explicit_maintenance_keeps_metric_schema_without_rows() {
-        let result = procedure_metrics_result(None).unwrap();
-        assert_eq!(result.row_count(), 0);
-        assert_eq!(
-            result
-                .columns
-                .iter()
-                .map(|column| (column.name(), column.data_type()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("metric_name", &DataType::Utf8),
-                ("metric_value", &DataType::Int64)
-            ],
-        );
-        let result = procedure_metrics_result(Some(
-            ProcedureMetrics::from_counts([("scanned_files_count", 9), ("deleted_files_count", 1)])
-                .unwrap(),
-        ))
-        .unwrap();
-        assert_eq!(result.row_count(), 2);
-        let batch = &result.batches[0];
-        let names = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let values = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(names.value(0), "scanned_files_count");
-        assert_eq!(names.value(1), "deleted_files_count");
-        assert_eq!(values.values().as_ref(), &[9, 1]);
-    }
-}
+mod tests;

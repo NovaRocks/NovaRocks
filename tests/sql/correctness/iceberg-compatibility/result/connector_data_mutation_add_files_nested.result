@@ -1,0 +1,22 @@
+-- query 2
+-- types	bigint	row(note varchar, flag integer, fresh varchar)
+id	details
+1	["alpha",17,null]
+2	["beta",22,null]
+
+-- query 3
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 4
+-- types	bigint	row(note varchar, flag integer, fresh varchar)
+id	details
+1	["alpha",17,null]
+2	["beta",22,null]
+
+-- query 9
+-- types	bigint	row(flag integer, absent varchar, initialized varchar)	array(row(value integer))	map(varchar, integer)
+id	details	items	codes
+1	[7,null,"seed"]	[[17],null]	{"x":91}
+2	NULL	NULL	NULL

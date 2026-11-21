@@ -21,6 +21,7 @@ mod delete_encoding;
 mod format_guard;
 
 mod lower_bound;
+pub(in crate::commit) mod registered;
 mod rolling;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

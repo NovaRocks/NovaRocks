@@ -11,6 +11,10 @@ catalogs = []
 # the file target. A catalog session can lower its open-partition cap with
 # SET SESSION lake.max_partitions_per_writer = 32, where lake is the catalog.
 
+# Opt in to ALTER TABLE EXECUTE add_files on this Iceberg catalog.
+# The property is a string Boolean and defaults to "false".
+# "iceberg.add-files-procedure.enabled" = "true"
+
 # Optional Iceberg maintenance minimums, also under [catalogs.properties].
 # "iceberg.expire-snapshots.min-retention" = "7d"
 # "iceberg.remove-orphan-files.min-retention" = "7d"

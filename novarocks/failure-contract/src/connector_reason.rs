@@ -44,6 +44,26 @@ pub const ICEBERG_INVALID_METADATA: FailureReason =
 pub const ICEBERG_FILESYSTEM_ERROR: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(55).unwrap());
 
-/// An explicit Iceberg metadata maintenance procedure failed to commit.
+/// An explicit Iceberg operation failed to commit.
 pub const ICEBERG_COMMIT_ERROR: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(56).unwrap());
+
+/// A table procedure rejected supplied or missing arguments.
+pub const PROCEDURE_ARGUMENT_INVALID: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(57).unwrap());
+
+/// ADD FILES was disabled in the selected catalog.
+pub const ADD_FILES_DISABLED: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(58).unwrap());
+
+/// The requested external source was neither an existing file nor a directory.
+pub const LOCATION_NOT_FOUND: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(59).unwrap());
+
+/// A file's physical type cannot be read as the bound target field.
+pub const SOURCE_TYPE_MISMATCH: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(60).unwrap());
+
+/// A required target field was absent or had NULL values.
+pub const NOT_NULL_VIOLATION: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(61).unwrap());

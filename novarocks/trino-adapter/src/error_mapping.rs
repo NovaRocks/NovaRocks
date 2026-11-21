@@ -101,6 +101,7 @@ enum Code {
     AlreadyExists,
     NotSupported,
     InvalidSessionProperty,
+    ConstraintViolation,
     NotInTransaction,
     InvalidAnalyzeProperty,
     InvalidCatalogProperty,
@@ -177,6 +178,7 @@ impl Code {
             InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
             NotInTransaction => (21, "NOT_IN_TRANSACTION", "USER_ERROR"),
             InvalidWindowFrame => (15, "INVALID_WINDOW_FRAME", "USER_ERROR"),
+            ConstraintViolation => (16, "CONSTRAINT_VIOLATION", "USER_ERROR"),
             NumericOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
             AdministrativelyKilled => (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
@@ -262,6 +264,7 @@ pub(crate) fn query_error_for_query_with_effect(
 
 enum PublicMessage<'a> {
     Borrowed(&'a str),
+    AddFilesUnknown(&'a str),
     Session(&'a StatementSessionError),
     Execution(&'a ExecutionFailureInput),
     CommitFailure {
@@ -277,6 +280,7 @@ impl fmt::Display for PublicMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Borrowed(message) => formatter.write_str(message),
+            Self::AddFilesUnknown(message) => write!(formatter, "Failed to add files: {message}"),
             Self::Session(error) => fmt::Display::fmt(error, formatter),
             Self::CommitFailure { input, unknown } => {
                 formatter.write_str("Failed to commit the transaction during write: ")?;
@@ -429,6 +433,57 @@ fn service_error(
     sql: &str,
     effect: Option<StatementExternalEffectDisposition>,
 ) -> TrinoQueryError {
+    if let Some(input) = error.execution_failure() {
+        let publication =
+            novarocks_query_application::execution_error::data_mutation_publication_effect(
+                error,
+                "add_files",
+            );
+        let public_effect = StatementExternalEffectDisposition::combine(
+            StatementExternalEffectDisposition::combine(
+                error.external_effect_disposition(),
+                effect,
+            ),
+            publication,
+        )
+        .filter(|effect| effect.do_not_retry());
+        if publication == Some(StatementExternalEffectDisposition::CommitUnknown) {
+            let message = if add_files_execution_code(input, publication.is_some())
+                == Some(Code::IcebergCommitError)
+            {
+                PublicMessage::Borrowed(input.detail().as_str())
+            } else {
+                PublicMessage::AddFilesUnknown(input.detail().as_str())
+            };
+            return project_message(
+                query_id,
+                Code::IcebergCommitError,
+                message,
+                None,
+                public_effect,
+            );
+        }
+        if let Some(code) = add_files_execution_code(input, publication.is_some()) {
+            return project_message(
+                query_id,
+                code,
+                PublicMessage::Borrowed(input.detail().as_str()),
+                None,
+                public_effect,
+            );
+        }
+        if input.fact().class() == FailureClass::Unsupported
+            && novarocks_query_application::execution_error::has_explicit_connector_detail(error)
+        {
+            return project_message(
+                query_id,
+                Code::NotSupported,
+                PublicMessage::Borrowed(input.detail().as_str()),
+                None,
+                public_effect,
+            );
+        }
+    }
     let code = if let Some(input) = error.execution_failure() {
         execution_code(input)
     } else if let Some(user) = error.user_error() {
@@ -525,6 +580,26 @@ fn open_partition_limit(input: &ExecutionFailureInput) -> Option<(u64, u64)> {
     let resource = fact.resource()?;
     let (limit, opening) = (resource.limit?, resource.requested?);
     (resource.dimension == ResourceDimension::Items && opening > limit).then_some((limit, opening))
+}
+
+fn add_files_execution_code(input: &ExecutionFailureInput, registration: bool) -> Option<Code> {
+    use novarocks_execution_contract::failure::connector_reason::*;
+    let fact = input.fact();
+    if matches!(fact.class(), FailureClass::Resource | FailureClass::Control) {
+        return None;
+    }
+    Some(match fact.reason() {
+        ADD_FILES_DISABLED => Code::PermissionDenied,
+        PROCEDURE_ARGUMENT_INVALID => Code::InvalidProcedureArgument,
+        LOCATION_NOT_FOUND => Code::NotFound,
+        SOURCE_TYPE_MISMATCH => Code::TypeMismatch,
+        NOT_NULL_VIOLATION => Code::ConstraintViolation,
+        ICEBERG_COMMIT_ERROR | ICEBERG_COMMIT_STATE_UNKNOWN if registration => {
+            Code::IcebergCommitError
+        }
+        COMMIT_TRANSACTION_CONFLICT if registration => Code::TransactionConflict,
+        _ => return None,
+    })
 }
 
 fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
@@ -881,5 +956,161 @@ mod session_property_projection_tests {
             }
             assert_eq!(service.user_error().unwrap().code().as_str(), descriptor);
         }
+    }
+}
+
+#[cfg(test)]
+mod add_files_projection_tests {
+    use super::*;
+    use novarocks_execution_contract::{
+        SafeDetail,
+        failure::{FailureFact, connector_reason::*},
+    };
+    use novarocks_query_application::execution_error::ExecutionFailureSite;
+
+    #[test]
+    fn add_files_reason_projects_code_type_and_original_detail() {
+        let cases = [
+            (
+                ADD_FILES_DISABLED,
+                4,
+                "PERMISSION_DENIED",
+                "USER_ERROR",
+                "add_files procedure is disabled",
+            ),
+            (
+                PROCEDURE_ARGUMENT_INVALID,
+                30,
+                "INVALID_PROCEDURE_ARGUMENT",
+                "USER_ERROR",
+                "Required procedure argument 'location' is missing",
+            ),
+            (
+                LOCATION_NOT_FOUND,
+                5,
+                "NOT_FOUND",
+                "USER_ERROR",
+                "Location not found: s3://bucket/source",
+            ),
+            (
+                SOURCE_TYPE_MISMATCH,
+                58,
+                "TYPE_MISMATCH",
+                "USER_ERROR",
+                "Target 'id' column is 'int' type, but got source 'string' type",
+            ),
+            (
+                NOT_NULL_VIOLATION,
+                16,
+                "CONSTRAINT_VIOLATION",
+                "USER_ERROR",
+                "NULL value not allowed for NOT NULL column: id",
+            ),
+            (
+                ICEBERG_COMMIT_ERROR,
+                0x0504_000c,
+                "ICEBERG_COMMIT_ERROR",
+                "EXTERNAL",
+                "Failed to add files: File already exists: s3://bucket/source",
+            ),
+            (
+                ICEBERG_COMMIT_STATE_UNKNOWN,
+                0x0504_000c,
+                "ICEBERG_COMMIT_ERROR",
+                "EXTERNAL",
+                "Failed to add files: publication response lost",
+            ),
+            (
+                COMMIT_TRANSACTION_CONFLICT,
+                17,
+                "TRANSACTION_CONFLICT",
+                "USER_ERROR",
+                "Failed to add files: catalog rejected the current base",
+            ),
+        ];
+        use novarocks_spi::connector::{
+            LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
+            LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationStatementTag,
+            LakePublicationTarget, LakePublicationTerminal,
+        };
+        for (reason, code, name, ty, expected_message) in cases {
+            let publication = match reason {
+                ICEBERG_COMMIT_STATE_UNKNOWN => Some((
+                    LakePublicationDisposition::CommitUnknown,
+                    LakePublicationNextAction::InspectPublishedState,
+                )),
+                ICEBERG_COMMIT_ERROR | COMMIT_TRANSACTION_CONFLICT => Some((
+                    LakePublicationDisposition::KnownUncommitted,
+                    LakePublicationNextAction::RetryStatement,
+                )),
+                _ => None,
+            };
+            let class = if publication.is_some() {
+                FailureClass::Dependency
+            } else {
+                FailureClass::Data
+            };
+            let input = ExecutionFailureInput::new(
+                FailureFact::new(class, reason),
+                SafeDetail::truncating(expected_message),
+                ExecutionFailureSite::Coordinator,
+            );
+            let mut error = QueryServiceError::from_execution_failure(input);
+            if let Some((disposition, next_action)) = publication {
+                error = error.attach_publication_terminal(LakePublicationTerminal::new(
+                    LakePublicationMarkerHeader::new(
+                        LakePublicationId::new_v7(),
+                        LakePublicationFamily::DataMutation,
+                    ),
+                    LakePublicationTarget::try_new(
+                        "ice".to_string(),
+                        "db".to_string(),
+                        Some("t".to_string()),
+                        Some("main".to_string()),
+                    )
+                    .unwrap(),
+                    disposition,
+                    next_action,
+                    Some(LakePublicationStatementTag::try_new("add_files".to_string()).unwrap()),
+                ));
+            }
+            let projected = query_error(TrinoErrorSource::Service {
+                error: &error,
+                sql: "",
+            });
+            assert_eq!(
+                (
+                    projected.error_code,
+                    projected.error_name,
+                    projected.error_type
+                ),
+                (code, name, ty)
+            );
+            if reason == ICEBERG_COMMIT_STATE_UNKNOWN {
+                assert!(
+                    projected.message.contains(expected_message),
+                    "{}",
+                    projected.message
+                );
+            } else {
+                assert_eq!(projected.message, expected_message);
+            }
+        }
+    }
+
+    #[test]
+    fn add_files_reason_preserves_the_original_resource_class() {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(FailureClass::Resource, ICEBERG_COMMIT_ERROR),
+            SafeDetail::truncating("original resource refusal"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryServiceError::from_execution_failure(input);
+        let projected = query_error(TrinoErrorSource::Service {
+            error: &error,
+            sql: "",
+        });
+        assert_eq!(projected.error_name, "GENERIC_INSUFFICIENT_RESOURCES");
+        assert_eq!(projected.error_type, "INSUFFICIENT_RESOURCES");
     }
 }

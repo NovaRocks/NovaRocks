@@ -17,7 +17,7 @@
 
 //! Current admission policies decide which source scope to observe.
 
-use super::super::model::{ArtifactWriter, Dependency, EntryIdentity, OperationIntent};
+use super::super::model::{ArtifactWriter, Dependency, OperationIntent};
 use super::row_delta::validate_row_delta;
 use super::{Culprit, RemovedDataFiles, ValidationInputs, Verdict};
 use crate::iceberg::Result;
@@ -123,17 +123,6 @@ async fn validate_dependency_checks(
                 .snapshot_by_id(*id)
                 .is_none()
                 .then_some(Culprit::Snapshot(*id)),
-            Dependency::RegisteredFilesNotLive(paths) => {
-                let parent = inputs.parent;
-                let requested = paths.iter().map(String::as_str).collect();
-                let live = inputs.live_data_matches(&requested).await?;
-                paths.iter().find_map(|path| {
-                    live.contains(path).then(|| Culprit::Entry {
-                        snapshot: parent.expect("live data has a parent"),
-                        identity: EntryIdentity::DataFile { path: path.clone() },
-                    })
-                })
-            }
         };
         if let Some(culprit) = culprit {
             return Ok(Verdict::Broken {
@@ -147,7 +136,9 @@ async fn validate_dependency_checks(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::model::{ArtifactKind, AttemptToken, ObjectIdentity, OperationToken};
+    use super::super::super::model::{
+        ArtifactKind, AttemptToken, EntryIdentity, ObjectIdentity, OperationToken,
+    };
     use super::super::HistoryGap;
     use super::*;
     use crate::iceberg::io::FileIO;
@@ -155,7 +146,7 @@ mod tests {
         FormatVersion, Operation, PartitionSpec, Schema, Snapshot, SortOrder, Summary,
         TableMetadataBuilder,
     };
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     struct TestIo {
         io: FileIO,
@@ -334,24 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_files_on_an_unborn_ref_have_no_live_conflict() {
-        assert_eq!(
-            check(
-                &[Dependency::RegisteredFilesNotLive(vec![
-                    "/external/file.parquet".into()
-                ])],
-                None,
-                &metadata(),
-                None
-            )
-            .await,
-            Verdict::Holds
-        );
-    }
-
-    #[tokio::test]
-    async fn live_registration_reports_exact_entry_and_history_reads_only_own_manifests() {
-        use super::super::history::{HistoryObservationError, physical_added_data};
+    async fn compact_live_entries_preserve_identity_position_and_size() {
         use crate::iceberg::spec::{
             DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter,
             ManifestWriterBuilder,
@@ -363,8 +337,6 @@ mod tests {
         for (id, path) in [
             (11, "/external/first.parquet"),
             (12, "/external/second.parquet"),
-            (13, "/external/second.parquet"),
-            (14, "/external/first.parquet"),
         ] {
             let file = DataFileBuilder::default()
                 .content(DataContentType::Data)
@@ -390,11 +362,7 @@ mod tests {
                 metadata.default_partition_spec().as_ref().clone(),
             )
             .build_v2_data();
-            if id == 13 {
-                writer.add_existing_file(file, 12, 2, Some(2)).unwrap();
-            } else {
-                writer.add_file(file, id - 10).unwrap();
-            }
+            writer.add_file(file, id - 10).unwrap();
             let manifest = writer.write_manifest_file().await.unwrap();
             let list_path = dir
                 .path()
@@ -414,9 +382,6 @@ mod tests {
                 id - 10,
             );
             let mut manifests = inherited_manifests;
-            if id == 13 {
-                manifests.retain(|descriptor| descriptor.added_snapshot_id != 12);
-            }
             manifests.push(manifest.clone());
             list.add_manifests(manifests.into_iter()).unwrap();
             list.close().await.unwrap();
@@ -427,7 +392,7 @@ mod tests {
                 .with_timestamp_ms(metadata.last_updated_ms() + 1)
                 .with_manifest_list(list_path)
                 .with_summary(Summary {
-                    operation: if id == 12 || id == 13 {
+                    operation: if id == 12 {
                         Operation::Replace
                     } else {
                         Operation::Append
@@ -453,7 +418,7 @@ mod tests {
             .entries()
             .to_vec();
         }
-        let mut inputs = ValidationInputs::new(&metadata, Some(12), &io);
+        let inputs = ValidationInputs::new(&metadata, Some(12), &io);
         let live = inputs.compact_live_entries().await.unwrap();
         assert_eq!(live.len(), 2);
         let identity = EntryIdentity::DataFile {
@@ -464,78 +429,6 @@ mod tests {
         assert_eq!(live[&identity].source_index, 0);
         assert_eq!(live[&identity].ordinal, 0);
         assert_eq!(live[&identity].logical_size, 100);
-        assert_eq!(
-            validate_dependencies(
-                &[Dependency::RegisteredFilesNotLive(vec![
-                    "/external/first.parquet".into()
-                ])],
-                Some(999),
-                &mut inputs
-            )
-            .await
-            .unwrap(),
-            Verdict::Broken {
-                dependency: Dependency::RegisteredFilesNotLive(vec![
-                    "/external/first.parquet".into()
-                ]),
-                culprit: Culprit::Entry {
-                    snapshot: 12,
-                    identity
-                }
-            }
-        );
-        assert_eq!(
-            validate_dependencies(
-                &[Dependency::RegisteredFilesNotLive(vec![
-                    "/external/new.parquet".into()
-                ])],
-                Some(999),
-                &mut inputs
-            )
-            .await
-            .unwrap(),
-            Verdict::Holds
-        );
-        let corrupted = ValidationInputs::new(&metadata, Some(14), &io);
-        let duplicate_paths = BTreeSet::from(["/external/first.parquet"]);
-        assert!(
-            corrupted
-                .live_data_matches(&duplicate_paths)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("Duplicate live Iceberg entry identity")
-        );
-        let unrelated_paths = BTreeSet::from(["/external/second.parquet"]);
-        assert_eq!(
-            corrupted.live_data_matches(&unrelated_paths).await.unwrap(),
-            BTreeSet::from(["/external/second.parquet".to_owned()]),
-        );
-
-        let observe =
-            |start, end| physical_added_data(&metadata, start, end, io.file_io(), || Ok(()));
-        let replaced = observe(Some(11), Some(13)).await.unwrap();
-        assert_eq!(replaced.window.endpoints(), (Some(11), Some(13)));
-        assert_eq!(
-            replaced.paths,
-            BTreeSet::from(["/external/second.parquet".to_owned()])
-        );
-        assert!(observe(Some(12), Some(13)).await.unwrap().paths.is_empty());
-        assert!(observe(Some(13), Some(13)).await.unwrap().paths.is_empty());
-        assert_eq!(
-            observe(None, Some(13)).await.unwrap().paths,
-            BTreeSet::from([
-                "/external/first.parquet".to_owned(),
-                "/external/second.parquet".to_owned()
-            ]),
-        );
-        assert!(matches!(
-            observe(Some(13), Some(11)).await,
-            Err(HistoryObservationError::Gap(HistoryGap::StartNotAncestor {
-                start: 13,
-                parent: Some(11)
-            }))
-        ));
     }
 
     #[test]

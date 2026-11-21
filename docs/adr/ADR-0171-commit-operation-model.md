@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0246
+    scope: "Section 1 ADD FILES dependency on the exact main reference"
+    link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"
   - id: ADR-0244
     scope: "RefUnchanged and the conservative conflict-domain policy for ordinary Iceberg DELETE, UPDATE, and MERGE"
     link: "ADR-0244-iceberg-row-dml-conflict-validation.md"
@@ -46,6 +49,8 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/recovery.rs (FrozenPublicationFacts)"
   - "novarocks/connector/iceberg/src/catalog_control/staged_create/publication.rs (publish)"
 ---
+
+> 第 1 节的 ADD FILES 依赖由 [ADR-0246](ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 接替。登记在准确 main 快照上匹配候选，沿原提交内核冻结 ref 条件。
 
 > [ADR-0244](ADR-0244-iceberg-row-dml-conflict-validation.md) 更新本裁决中普通 Iceberg DELETE、UPDATE、MERGE 的保守冲突策略、依赖选择与阶段性重评条件。不可变意图、依赖框架和发布权继续适用。
 

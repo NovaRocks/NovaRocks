@@ -19,16 +19,20 @@ use super::*;
 
 #[test]
 fn calibration_takes_the_minimum_of_observed_ratios() {
+    let entry = |lower| EntrySize {
+        lower,
+        layout: lower,
+    };
     let mut calibration = Calibration::default();
     assert!(!calibration.reaches(4, 5));
-    calibration.observe(15, 5).unwrap();
+    calibration.observe(15, entry(5)).unwrap();
     assert!(calibration.reaches(4, 12));
-    calibration.observe(50, 10).unwrap();
+    calibration.observe(50, entry(10)).unwrap();
     assert!(!calibration.reaches(4, 13));
-    calibration.observe(12, 6).unwrap();
+    calibration.observe(12, entry(6)).unwrap();
     assert!(!calibration.reaches(4, 9));
     assert!(calibration.reaches(4, 8));
-    assert!(calibration.observe(9, 10).is_err());
+    assert!(calibration.observe(9, entry(10)).is_err());
 }
 
 #[tokio::test]

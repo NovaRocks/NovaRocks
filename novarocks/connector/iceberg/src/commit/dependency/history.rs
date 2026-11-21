@@ -19,15 +19,7 @@
 
 use std::collections::BTreeSet;
 
-#[cfg(test)]
-use crate::commit::manifest_sources::SnapshotSources;
-#[cfg(test)]
-use crate::iceberg::io::FileIO;
-#[cfg(test)]
-use crate::iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
 use crate::iceberg::spec::{Operation, SnapshotRef, TableMetadata};
-#[cfg(test)]
-use crate::iceberg::{Error, ErrorKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HistoryGap {
@@ -96,105 +88,4 @@ pub fn history_window(
         parent,
         snapshots,
     })
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub enum HistoryObservationError {
-    Gap(HistoryGap),
-    #[allow(
-        dead_code,
-        reason = "The ADD FILES caller will consume the original read cause"
-    )]
-    Read(Error),
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub struct PhysicalAddedData {
-    pub window: HistoryWindow,
-    pub paths: BTreeSet<String>,
-}
-
-/// Read only manifests newly written by snapshots in the exact ancestor window.
-/// Physical data paths include REPLACE. A manifest-only rewrite carries existing
-/// entries and cannot add a path to this result.
-#[cfg(test)]
-pub async fn physical_added_data(
-    metadata: &TableMetadata,
-    start: Option<i64>,
-    parent: Option<i64>,
-    io: &FileIO,
-    active: impl Fn() -> crate::iceberg::Result<()>,
-) -> Result<PhysicalAddedData, HistoryObservationError> {
-    active().map_err(HistoryObservationError::Read)?;
-    let window = history_window(metadata, start, parent).map_err(HistoryObservationError::Gap)?;
-    let window_ids: BTreeSet<_> = window.snapshots().iter().map(|s| s.snapshot_id()).collect();
-    let mut paths = BTreeSet::new();
-    for snapshot in window.snapshots() {
-        let sources = SnapshotSources::load(metadata, snapshot, io, &active)
-            .await
-            .map_err(HistoryObservationError::Read)?;
-        // With no known E, the oldest snapshot has to prove an actual
-        // initial live set. A disconnected import may look parentless while
-        // its retained manifests name an owner outside this history.
-        let initial_root = start.is_none() && snapshot.parent_snapshot_id().is_none();
-        if initial_root {
-            for source in sources.sources() {
-                let descriptor = source.descriptor;
-                if descriptor.content == ManifestContentType::Data
-                    && descriptor.added_snapshot_id != snapshot.snapshot_id()
-                    && (descriptor.has_added_files() || descriptor.has_existing_files())
-                {
-                    return Err(HistoryObservationError::Read(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "History root {} cannot prove data from manifest {}",
-                            snapshot.snapshot_id(),
-                            descriptor.manifest_path
-                        ),
-                    )));
-                }
-            }
-        }
-        sources
-            .fold(
-                io,
-                &active,
-                |descriptor| {
-                    descriptor.added_snapshot_id == snapshot.snapshot_id()
-                        && descriptor.content == ManifestContentType::Data
-                },
-                |entry| {
-                    if initial_root
-                        && entry.raw.is_alive()
-                        && (entry.raw.status != ManifestStatus::Added
-                            || entry.sequences.snapshot_id != Some(snapshot.snapshot_id()))
-                    {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "History root {} cannot prove the physical addition of {}",
-                                snapshot.snapshot_id(),
-                                entry.raw.file_path()
-                            ),
-                        ));
-                    }
-                    if entry.raw.status == ManifestStatus::Added
-                        && entry.raw.content_type() == DataContentType::Data
-                        && entry
-                            .sequences
-                            .snapshot_id
-                            .is_some_and(|id| window_ids.contains(&id))
-                    {
-                        paths.insert(entry.raw.file_path().to_owned());
-                    }
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(HistoryObservationError::Read)?;
-    }
-    active().map_err(HistoryObservationError::Read)?;
-    Ok(PhysicalAddedData { window, paths })
 }
