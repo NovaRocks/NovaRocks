@@ -89,6 +89,9 @@ pub enum ConnectorDataMutationOperation {
         format: Option<ConnectorAddFilesFormat>,
         recursion: ConnectorAddFilesRecursion,
     },
+    /// SQL TRUNCATE TABLE. The target is the table's main branch.
+    TruncateMain { table: ConnectorTableHandle },
+    /// Legacy full-ref deletion, including an explicit @main target.
     Truncate {
         table: ConnectorTableHandle,
         target_ref: Arc<str>,
@@ -110,6 +113,10 @@ impl ConnectorDataMutationOperation {
         }
     }
 
+    pub fn truncate_main(table: ConnectorTableHandle) -> Self {
+        Self::TruncateMain { table }
+    }
+
     pub fn truncate(
         table: ConnectorTableHandle,
         target_ref: impl Into<Arc<str>>,
@@ -125,19 +132,21 @@ impl ConnectorDataMutationOperation {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::RegisterExistingFiles { .. } => REGISTER_EXISTING_FILES_KIND,
-            Self::Truncate { .. } => TRUNCATE_KIND,
+            Self::TruncateMain { .. } | Self::Truncate { .. } => TRUNCATE_KIND,
         }
     }
 
     pub const fn table(&self) -> &ConnectorTableHandle {
         match self {
-            Self::RegisterExistingFiles { table, .. } | Self::Truncate { table, .. } => table,
+            Self::RegisterExistingFiles { table, .. }
+            | Self::TruncateMain { table }
+            | Self::Truncate { table, .. } => table,
         }
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
         match self {
-            Self::RegisterExistingFiles { .. } => Ok(()),
+            Self::RegisterExistingFiles { .. } | Self::TruncateMain { .. } => Ok(()),
             Self::Truncate { target_ref, .. } => validate_bounded_text(
                 target_ref,
                 MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES,
@@ -163,6 +172,11 @@ impl ConnectorDataMutationOperation {
                 }
                 hasher.update([format.map_or(0, ConnectorAddFilesFormat::digest_tag)]);
                 hasher.update([recursion.digest_tag()]);
+            }
+            Self::TruncateMain { .. } => {
+                // Existing full-ref DELETE digests and recovery envelopes stay stable.
+                digest_bytes(hasher, b"main");
+                digest_bytes(hasher, b"truncate-main");
             }
             Self::Truncate { target_ref, .. } => digest_bytes(hasher, target_ref.as_bytes()),
         }

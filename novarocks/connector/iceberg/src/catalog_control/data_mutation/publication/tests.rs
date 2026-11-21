@@ -120,7 +120,7 @@ fn exercise_truncate(behavior: Behavior) {
             ConnectorDataMutationPlanningRequest::try_new(
                 ConnectorMutationOperationId::new(),
                 adapter.binding_key().clone(),
-                ConnectorDataMutationOperation::truncate(metadata.table, "main").unwrap(),
+                ConnectorDataMutationOperation::truncate_main(metadata.table),
                 table_context(),
             )
             .unwrap(),
@@ -180,13 +180,16 @@ fn exercise_truncate(behavior: Behavior) {
         behavior,
     }));
     let intent = freeze_intent(&cached.private, &operation, &marker).unwrap();
+    assert!(matches!(intent.protocol(), CommitProtocol::Truncate));
+    assert_eq!(intent.start(), None);
+    assert!(intent.dependencies().is_empty());
     let policy = RetryPolicy::from_properties(&HashMap::from([
         ("commit.retry.num-retries".into(), "1".into()),
         ("commit.retry.min-wait-ms".into(), "0".into()),
         ("commit.retry.max-wait-ms".into(), "0".into()),
     ]))
     .unwrap();
-    let preparer = crate::commit::truncate::TruncatePreparer;
+    let preparer = crate::commit::filter_delete::FilterDeletePreparer::always_true();
     let running = operation.clone();
     let result = operation.runtime().block_on(async move {
         attempt::run(

@@ -24,6 +24,12 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
+use novarocks_failure_contract::{
+    FailureProjection, SharedFailureCause,
+    connector_reason::{
+        ICEBERG_COMMIT_ERROR, ICEBERG_COMMIT_STATE_UNKNOWN, ICEBERG_COMMIT_VALIDATION_CONFLICT,
+    },
+};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ExternalMutationEffect, ExternalMutationEvidence,
@@ -42,7 +48,22 @@ use novarocks_sql::semantic::ObjectName;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TruncateCommand {
     pub target_parts: Vec<String>,
-    pub target_ref: String,
+    pub target: TruncateTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TruncateTarget {
+    Main,
+    WholeBranch(String),
+}
+
+impl TruncateTarget {
+    fn ref_name(&self) -> &str {
+        match self {
+            Self::Main => "main",
+            Self::WholeBranch(name) => name,
+        }
+    }
 }
 
 pub struct PlanTruncateRequest {
@@ -56,6 +77,7 @@ pub struct PlanTruncateRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TruncateFailureKind {
+    AuthoredCommit(SharedFailureCause),
     Interrupted(novarocks_type_contract::CompileControlError),
     InvalidRequest,
     NotFound,
@@ -78,6 +100,13 @@ pub struct TruncateFailure {
     pub message: String,
 }
 impl TruncateFailure {
+    pub(crate) fn authored_commit_cause(&self) -> Option<&SharedFailureCause> {
+        match &self.kind {
+            TruncateFailureKind::AuthoredCommit(cause) => Some(cause),
+            _ => None,
+        }
+    }
+
     pub(crate) fn compile_control_error(
         &self,
     ) -> Option<novarocks_type_contract::CompileControlError> {
@@ -227,7 +256,7 @@ impl TruncateEngine for DmlExecutionKernel {
         &self,
         request: PlanTruncateRequest,
     ) -> Result<PreparedTruncate, TruncatePlanError> {
-        if request.command.target_ref.is_empty() {
+        if request.command.target.ref_name().is_empty() {
             return Err(TruncatePlanError::KnownUncommitted(TruncateFailure {
                 kind: TruncateFailureKind::InvalidRequest,
                 message: "TRUNCATE target ref must not be empty".to_string(),
@@ -280,7 +309,10 @@ impl TruncateEngine for DmlExecutionKernel {
                 namespace: target.namespace.clone().into(),
                 table: target.table.clone().into(),
             },
-            DataMutationIntent::truncate(request.command.target_ref.clone()),
+            match &request.command.target {
+                TruncateTarget::Main => DataMutationIntent::TruncateMain,
+                TruncateTarget::WholeBranch(name) => DataMutationIntent::truncate(name.as_str()),
+            },
             connector_context,
         )
         .map_err(project_plan_error)?;
@@ -291,7 +323,7 @@ impl TruncateEngine for DmlExecutionKernel {
             catalog: target.catalog,
             namespace: target.namespace,
             table: target.table,
-            target_ref: request.command.target_ref,
+            target_ref: request.command.target.ref_name().to_owned(),
             provider_id: descriptor.provider_id.as_str().to_string(),
             instance_id: descriptor.instance_id.as_str().to_string(),
             incarnation: plan.owner().incarnation.to_bytes(),
@@ -501,6 +533,11 @@ fn project_uncommitted(
         KnownUncommittedDataMutation::Planning(error) => project_connector_error(error),
         KnownUncommittedDataMutation::Provider(failure) => project_mutation_failure(failure),
     };
+    if projected.authored_commit_cause().is_some()
+        && let ExternalMutationFinalization::Failed(error) = &cleanup
+    {
+        tracing::warn!(%error, "uncommitted TRUNCATE retains incomplete cleanup");
+    }
     projected.message =
         crate::connector::mutation::known_uncommitted_message(&projected.message, &cleanup);
     projected
@@ -530,6 +567,19 @@ fn project_connector_error(error: ConnectorError) -> TruncateFailure {
 }
 
 fn project_mutation_failure(failure: ConnectorMutationFailure) -> TruncateFailure {
+    if matches!(
+        failure.failure_fact().reason(),
+        ICEBERG_COMMIT_ERROR | ICEBERG_COMMIT_STATE_UNKNOWN | ICEBERG_COMMIT_VALIDATION_CONFLICT
+    ) && let Some(cause) = failure
+        .connector_source()
+        .and_then(std::error::Error::source)
+        .and_then(|cause| cause.downcast_ref::<SharedFailureCause>())
+    {
+        return TruncateFailure {
+            kind: TruncateFailureKind::AuthoredCommit(cause.clone()),
+            message: failure.message().to_owned(),
+        };
+    }
     TruncateFailure {
         kind: match failure.kind() {
             ConnectorMutationFailureKind::Interrupted => TruncateFailureKind::Interrupted(

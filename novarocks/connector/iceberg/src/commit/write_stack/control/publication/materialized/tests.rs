@@ -19,11 +19,11 @@
 
 use super::*;
 use crate::commit::fast_append::FastAppendPreparer;
+use crate::commit::filter_delete::FilterDeletePreparer;
 use crate::commit::model::AddedContent;
 use crate::commit::overwrite::preparer_tests::{Fixture, data};
 use crate::commit::row_delta::RowDeltaPreparer;
 use crate::commit::staging::{StagingBase, StagingEngine};
-use crate::commit::truncate::TruncatePreparer;
 use crate::commit::write_stack::test_support::sample_partition;
 use crate::iceberg::spec::{DataFileBuilder, DataFileFormat, FormatVersion, Struct};
 use novarocks_spi::connector::ConnectorMutationFailure;
@@ -164,7 +164,10 @@ async fn rebound_missing_target_reports_validation_conflict() {
     let io = fixture.operation.begin_attempt().unwrap();
     let step = remove_target(&fixture, &source, &io).await;
     let intent = fixture.intent(&source, "main", Vec::new());
-    let base = fixture.stage(source, &intent, &TruncatePreparer).await.0;
+    let base = fixture
+        .stage(source, &intent, &FilterDeletePreparer::always_true())
+        .await
+        .0;
     let mut staging = StagingEngine::begin(
         StagingBase::Existing {
             metadata: base,

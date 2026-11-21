@@ -28,16 +28,17 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
 };
 
-use super::conflict::{commit_state_unknown, transaction_conflict, validation_conflict};
+use super::commit_failure::{CommitFailureKind, original_commit_failure, validation_failure};
+use super::conflict::validation_conflict;
 #[cfg(test)]
 use super::dependency::ValidationInputs;
 use super::dependency::{self, Verdict};
 #[cfg(test)]
 use super::model::ObjectIdentity;
 use super::model::{
-    ArtifactReferences, ArtifactWriter, CleanupScope, CommitStyle, FrozenRequest,
-    IcebergCleanupReport, OperationIntent, PublicationOutcome, PublicationReport, RequestShape,
-    WindowValidation,
+    ArtifactReferences, ArtifactWriter, CleanupScope, FrozenRequest, IcebergCleanupReport,
+    OperationIntent, PublicationOutcome, PublicationReport, RequestShape, WindowValidation,
+    validate_target_branch,
 };
 use super::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use super::staging::{PreparedChange, Preparer, StagingBase, StagingEngine};
@@ -408,7 +409,17 @@ async fn run_in_phase(
                             .load_target_with_snapshots(&attempt, intent.snapshot_loading())
                             .await
                     };
-                    let base = loaded.map_err(|error| before_dispatch_failure(&error))?;
+                    let base = loaded.map_err(|error| {
+                        if intent.protocol().requires_target_branch()
+                            && error.kind() == ErrorKind::TableNotFound
+                        {
+                            return validation_failure(
+                                intent.protocol().operation(),
+                                "Iceberg commit target table does not exist",
+                            );
+                        }
+                        before_dispatch_failure(&error)
+                    })?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
                     let (request, retained) = prepare(
@@ -457,11 +468,11 @@ async fn run_in_phase(
                 };
             }
             CatalogOutcome::CommitUnknown { failure, evidence } => {
-                let failure = if intent.protocol().operation().style() == CommitStyle::Transaction {
-                    commit_state_unknown(failure)
-                } else {
-                    failure
-                };
+                let failure = original_commit_failure(
+                    intent.protocol().operation(),
+                    CommitFailureKind::Unknown,
+                    failure,
+                );
                 // Preserve every owned object, including prior attempts with partial cleanup.
                 return Report {
                     publication: PublicationOutcome::Unknown {
@@ -485,12 +496,13 @@ async fn run_in_phase(
                 let wait = policy.backoff(attempt_number);
                 let left = policy.total_timeout.saturating_sub(started.elapsed());
                 if wait >= left {
-                    let failure =
-                        if intent.protocol().operation().style() == CommitStyle::Transaction {
-                            transaction_conflict(failure, attempt_number + 1)
-                        } else {
-                            failure
-                        };
+                    let failure = original_commit_failure(
+                        intent.protocol().operation(),
+                        CommitFailureKind::Contention {
+                            attempts: attempt_number + 1,
+                        },
+                        failure,
+                    );
                     return rejected(operation, failure).await;
                 }
                 // Retired objects remain owned until a terminal result. Backoff starts no deletion.
@@ -518,12 +530,20 @@ async fn run_in_phase(
                 return rejected(operation, failure).await;
             }
             CatalogOutcome::KnownUncommitted { failure } => {
-                let failure = if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && intent.protocol().operation().style() == CommitStyle::Transaction
-                {
-                    transaction_conflict(failure, attempt_number + 1)
+                let kind = if failure.kind() == ConnectorMutationFailureKind::Conflict {
+                    Some(CommitFailureKind::Contention {
+                        attempts: attempt_number + 1,
+                    })
+                } else if intent.protocol().requires_target_branch() {
+                    Some(CommitFailureKind::Rejected)
                 } else {
-                    failure
+                    None
+                };
+                let failure = match kind {
+                    Some(kind) => {
+                        original_commit_failure(intent.protocol().operation(), kind, failure)
+                    }
+                    None => failure,
                 };
                 return rejected(operation, failure).await;
             }
@@ -616,15 +636,27 @@ async fn prepare(
         StagingBase::Existing { metadata, .. } => metadata,
         StagingBase::Create { staged, .. } => staged.initial_metadata(),
     };
-    attempt
-        .check_stage_snapshot_ids(metadata)
-        .map_err(|error| before_dispatch_failure(&error))?;
+    let protocol = intent.protocol();
+    if !protocol.requires_target_branch() {
+        attempt
+            .check_stage_snapshot_ids(metadata)
+            .map_err(|error| before_dispatch_failure(&error))?;
+    }
     if let StagingBase::Existing { metadata, .. } = &base {
         if intent.target().uuid != Some(metadata.uuid()) {
-            return Err(ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Conflict,
-                "Iceberg commit target table UUID was replaced",
-            ));
+            let message = "Iceberg commit target table UUID was replaced";
+            return Err(if protocol.requires_target_branch() {
+                validation_failure(protocol.operation(), message)
+            } else {
+                ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message)
+            });
+        }
+        if protocol.requires_target_branch() {
+            validate_target_branch(metadata, intent.target_ref())
+                .map_err(|detail| validation_failure(protocol.operation(), detail))?;
+            attempt
+                .check_stage_snapshot_ids(metadata)
+                .map_err(|error| before_dispatch_failure(&error))?;
         }
         let parent = metadata
             .snapshot_for_ref(intent.target_ref())

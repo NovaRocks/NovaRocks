@@ -142,7 +142,6 @@ async fn ordinary_manifests_core(
 }
 
 /// Filtered deletes retain every untouched live source by reference.
-#[cfg(test)]
 pub(super) async fn filtered_manifests(
     view: &super::staging::StagedView<'_>,
     snapshot_id: i64,

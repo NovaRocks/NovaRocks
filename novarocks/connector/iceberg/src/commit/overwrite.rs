@@ -251,7 +251,6 @@ pub(crate) async fn prepare_snapshot_change(
     .await
 }
 
-#[cfg(test)]
 pub(super) async fn prepare_filtered_delete_snapshot_change(
     view: &super::staging::StagedView<'_>,
     intent: &super::model::OperationIntent,

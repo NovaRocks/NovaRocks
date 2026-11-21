@@ -152,7 +152,6 @@ const SNAPSHOT_TOTALS: [(&str, &str, &str); 6] = [
 ];
 
 /// Iceberg filter deletes carry known totals from the current branch head.
-#[cfg(test)]
 pub(super) fn finalize_filtered_delete_summary(
     mut props: HashMap<String, String>,
     previous: Option<&Summary>,

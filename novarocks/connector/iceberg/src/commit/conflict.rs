@@ -19,14 +19,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_failure_contract::{
-    FailureProjection, connector_reason::ICEBERG_COMMIT_STATE_UNKNOWN,
-};
-use novarocks_spi::connector::{
-    ConnectorError, ConnectorMutationFailure, ConnectorMutationFailureKind,
-};
+use novarocks_spi::connector::{ConnectorError, ConnectorMutationFailure};
 
-use super::commit_failure::{CommitFailureKind, commit_failure};
+use super::commit_failure::{CommitFailureKind, original_commit_failure, validation_failure};
 use super::model::{CommitOperation, EntryIdentity};
 use crate::iceberg::spec::{DataFile, TableMetadata};
 
@@ -55,41 +50,11 @@ pub(crate) trait MayMatch: fmt::Display + Send + Sync {
 }
 
 pub(crate) fn validation_conflict(message: impl Into<Arc<str>>) -> ConnectorMutationFailure {
-    let message = message.into();
-    let original =
-        ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message.clone());
-    commit_failure(
-        CommitOperation::Write,
-        CommitFailureKind::Validation,
-        original,
-        &message,
-    )
-}
-
-pub(crate) fn transaction_conflict(
-    original: ConnectorMutationFailure,
-    attempts: u32,
-) -> ConnectorMutationFailure {
-    let detail = original.message().to_owned();
-    commit_failure(
-        CommitOperation::Write,
-        CommitFailureKind::Contention { attempts },
-        original,
-        &detail,
-    )
+    validation_failure(CommitOperation::Write, message)
 }
 
 pub(crate) fn commit_state_unknown(original: ConnectorMutationFailure) -> ConnectorMutationFailure {
-    if original.failure_fact().reason() == ICEBERG_COMMIT_STATE_UNKNOWN {
-        return original;
-    }
-    let detail = original.message().to_owned();
-    commit_failure(
-        CommitOperation::Write,
-        CommitFailureKind::Unknown,
-        original,
-        &detail,
-    )
+    original_commit_failure(CommitOperation::Write, CommitFailureKind::Unknown, original)
 }
 
 #[cfg(test)]

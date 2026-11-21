@@ -25,7 +25,8 @@ use super::window::{
     snapshot_ids,
 };
 use super::{ValidationInputs, Verdict};
-use crate::commit::conflict::{CandidateFile, validation_conflict};
+use crate::commit::commit_failure::validation_failure;
+use crate::commit::conflict::CandidateFile;
 use crate::commit::model::{
     ArtifactWriter, CommitOperation, EntryIdentity, FrozenEntry, StartSnapshot,
 };
@@ -75,11 +76,14 @@ pub(super) async fn validate_rewrite_files(
         Err(last_known) => {
             trace.reject("history", None);
             let endpoint = |id: Option<i64>| id.map_or_else(|| "null".into(), |id| id.to_string());
-            return Ok(Verdict::ValidationConflict(validation_conflict(format!(
-                "Cannot determine history between starting snapshot {} and the last known ancestor {}",
-                endpoint(start),
-                endpoint(last_known),
-            ))));
+            return Ok(Verdict::ValidationConflict(validation_failure(
+                CommitOperation::Optimize,
+                format!(
+                    "Cannot determine history between starting snapshot {} and the last known ancestor {}",
+                    endpoint(start),
+                    endpoint(last_known),
+                ),
+            )));
         }
     };
     trace.window_len = Some(window.snapshots().len());
@@ -116,9 +120,10 @@ pub(super) async fn validate_rewrite_files(
         {
             io.check_active()?;
             trace.reject(POSITION_DELETE_CHECK, Some(&path));
-            return Ok(Verdict::ValidationConflict(validation_conflict(format!(
-                "Cannot commit, found new position delete for replaced data file: {path}"
-            ))));
+            return Ok(Verdict::ValidationConflict(validation_failure(
+                CommitOperation::Optimize,
+                format!("Cannot commit, found new position delete for replaced data file: {path}"),
+            )));
         }
     }
     io.check_active()?;

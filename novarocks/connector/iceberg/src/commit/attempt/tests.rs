@@ -16,6 +16,7 @@
 // under the License.
 
 mod row_delta_window;
+mod truncate;
 
 use super::super::fast_append::FastAppendPreparer;
 use super::super::model::{
@@ -1486,7 +1487,7 @@ impl Preparer for RemoveAfterAppend {
             summary: intent.summary().clone(),
             token: intent.token(),
         })?;
-        super::super::truncate::TruncatePreparer
+        super::super::filter_delete::FilterDeletePreparer::always_true()
             .prepare(view, &remove_intent)
             .await
     }

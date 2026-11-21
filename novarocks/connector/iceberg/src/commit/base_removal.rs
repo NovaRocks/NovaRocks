@@ -58,7 +58,6 @@ pub(crate) async fn locate_on_base<'a>(
 }
 
 /// Complete an existing selection authored from the same immutable base.
-#[cfg(test)]
 pub(super) async fn include_dangling_on_base(
     scope: &mut ManifestReadScope,
     removals: &mut BTreeMap<super::model::EntryIdentity, LocatedEntry>,

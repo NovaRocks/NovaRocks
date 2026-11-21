@@ -31,7 +31,6 @@ pub mod data_writer;
 pub(crate) mod dependency;
 pub mod equality_delete_writer;
 pub(crate) mod fast_append;
-#[cfg(test)]
 pub(crate) mod filter_delete;
 pub mod frozen_write;
 pub(crate) mod helpers;

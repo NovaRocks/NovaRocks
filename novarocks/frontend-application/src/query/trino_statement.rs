@@ -3,7 +3,7 @@
 //! Temporary typed statement entrance for Trino compatibility tests.
 
 use super::*;
-use crate::query_execution::dml::truncate::TruncateCommand;
+use crate::query_execution::dml::truncate::{TruncateCommand, TruncateTarget};
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
     session::{QuerySessionStatement, StatementAdmission, StatementOutputShape},
@@ -486,12 +486,15 @@ impl FrontendQuerySession {
                         .map_err(product_command_service_error);
                     return self.run_trino_action(statement, action).await;
                 }
-                CatalogSqlCommand::TruncateTable { table, target_ref } => {
+                CatalogSqlCommand::TruncateTable {
+                    table,
+                    target_ref: _,
+                } => {
                     return self
                         .execute_trino_truncate(
                             TruncateCommand {
                                 target_parts: table.parts,
-                                target_ref,
+                                target: TruncateTarget::Main,
                             },
                             None,
                             CommandEntry { statement, input },
@@ -569,6 +572,7 @@ impl FrontendQuerySession {
         let execution_owner = statement
             .take_execution_owner()
             .expect("SQL command has one execution owner");
+        let main_truncate = matches!(&command.target, TruncateTarget::Main);
         let dml = Arc::clone(&self.service.dml);
         let engine = Arc::clone(&self.service.truncate_engine);
         let prepare_dml = Arc::clone(&dml);
@@ -589,9 +593,13 @@ impl FrontendQuerySession {
                     .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
             },
             move |prepared| {
-                dml.execute_prepared_truncate(engine.as_ref(), prepared)
-                    .map(|()| StatementResult::Ok)
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                let result = dml.execute_prepared_truncate(engine.as_ref(), prepared);
+                if main_truncate {
+                    dml_result(result)
+                } else {
+                    result.map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                }
+                .map(|()| StatementResult::Ok)
             },
         )) as TypedCommandWorker;
         self.finish_command_worker_with_unknown_count(
@@ -802,7 +810,7 @@ impl FrontendQuerySession {
                     .execute_trino_truncate(
                         TruncateCommand {
                             target_parts: table.parts,
-                            target_ref: branch,
+                            target: TruncateTarget::WholeBranch(branch),
                         },
                         Some(projection),
                         CommandEntry { statement, input },

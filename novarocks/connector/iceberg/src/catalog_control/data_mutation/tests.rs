@@ -90,6 +90,7 @@ impl IcebergDataMutationBackend for FakeBackend {
         let source = fake_source_metadata();
         Ok((
             PlannedIcebergMutation::Truncate {
+                mode: TruncateMode::WholeBranch,
                 payload: IcebergDataMutationPlanPayloadV2 {
                     version: PLAN_PAYLOAD_VERSION,
                     namespace: self.namespace.clone(),
@@ -435,8 +436,7 @@ fn exact_runtime_truncate_commits_and_replays_without_a_catalog_registry() {
     let planning = ConnectorDataMutationPlanningRequest::try_new(
         operation_id,
         adapter.binding_key().clone(),
-        ConnectorDataMutationOperation::truncate(metadata.table, "main")
-            .expect("truncate operation"),
+        ConnectorDataMutationOperation::truncate_main(metadata.table),
         table_context(),
     )
     .expect("planning request");
@@ -450,6 +450,101 @@ fn exact_runtime_truncate_commits_and_replays_without_a_catalog_registry() {
         ExternalMutationOutcome::KnownCommitted { .. }
     ));
     assert_eq!(first, replay);
+}
+
+#[test]
+fn missing_planned_truncate_target_preserves_operation_specific_failure() {
+    use crate::catalog::admission_test_support::publish_catalog_fixture;
+    use crate::catalog::catalog_request::CatalogPublicationRequest;
+    use crate::catalog::error::CatalogOutcome;
+    use novarocks_failure_contract::FailureProjection;
+
+    for main_truncate in [true, false] {
+        let (executor, _warehouse, provider) = exact_provider_with_empty_table();
+        let adapter = IcebergDataMutationAdapter::try_new(Arc::clone(&provider)).unwrap();
+        let context = table_context();
+        let metadata = provider
+            .load_table(
+                ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("t"),
+                    },
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: context.clone(),
+                },
+                &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut |_| Ok(()),
+                    &mut |_| Ok(()),
+                ),
+            )
+            .unwrap();
+        let operation = if main_truncate {
+            ConnectorDataMutationOperation::truncate_main(metadata.table)
+        } else {
+            ConnectorDataMutationOperation::truncate(metadata.table, "main").unwrap()
+        };
+        let plan = adapter
+            .plan_mutation(
+                ConnectorDataMutationPlanningRequest::try_new(
+                    ConnectorMutationOperationId::new(),
+                    adapter.binding_key().clone(),
+                    operation,
+                    context,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let dropped = executor.block_on(publish_catalog_fixture(
+            provider.runtime(),
+            provider.incarnation(),
+            CatalogPublicationRequest::DropTable {
+                table: CatalogTableName::new("db", "t"),
+                no_op_if_missing: false,
+                purge: false,
+                capture: None,
+            },
+        ));
+        assert!(
+            matches!(dropped, CatalogOutcome::KnownCommitted { .. }),
+            "{dropped:?}"
+        );
+
+        // A separate context makes the initial marker lookup observe the
+        // actual missing table instead of the cached planning observation.
+        let outcome = adapter
+            .execute(ConnectorDataMutationExecuteRequest::try_new(plan, table_context()).unwrap())
+            .unwrap();
+        let ExternalMutationOutcome::KnownUncommitted {
+            failure,
+            cleanup: ExternalMutationFinalization::Complete,
+        } = outcome
+        else {
+            panic!("missing table must be known uncommitted: {outcome:?}");
+        };
+        if main_truncate {
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
+            assert_eq!(
+                failure.failure_fact().reason(),
+                connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT
+            );
+            assert_eq!(
+                failure.connector_source().unwrap().public_failure_detail(),
+                Some(
+                    "Failed to commit during truncate: Iceberg commit target table does not exist"
+                )
+            );
+        } else {
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::NotFound);
+            assert_ne!(
+                failure.failure_fact().reason(),
+                connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT
+            );
+        }
+    }
 }
 
 pub(super) fn write_external_parquet(
@@ -509,7 +604,7 @@ fn mutation_recovery_rejects_changed_source_sequence_and_nested_unknown_fields()
 }
 
 #[tokio::test]
-async fn mutation_source_freeze_uses_snapshot_sequence_when_another_ref_advances() {
+async fn marker_source_uses_snapshot_sequence_when_another_ref_advances() {
     use crate::commit::fast_append::FastAppendPreparer;
     use crate::commit::overwrite::preparer_tests::Fixture;
     let fixture = Fixture::new();
@@ -1139,4 +1234,24 @@ fn registration_switch_and_required_arguments_are_admitted_in_order_without_io()
         assert_eq!(error.failure_fact().reason(), reason);
         assert_admission_left_no_io(&warehouse, &listener);
     }
+}
+
+#[test]
+fn main_truncate_and_full_branch_delete_have_distinct_replay_keys() {
+    let (adapter, key, instance_id) = test_adapter(Arc::new(FakeBackend::new()));
+    let operation_id = ConnectorMutationOperationId::new();
+    let legacy = truncate_request(key.clone(), instance_id.clone(), operation_id, "main");
+    let handle =
+        ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table")).expect("handle");
+    let truncate = ConnectorDataMutationPlanningRequest::try_new(
+        operation_id,
+        key,
+        ConnectorDataMutationOperation::truncate_main(handle),
+        test_context(),
+    )
+    .expect("request");
+    assert_eq!(legacy.operation().kind(), truncate.operation().kind());
+    assert_ne!(legacy.request_digest(), truncate.request_digest());
+    assert!(adapter.plan_mutation(legacy).is_ok());
+    assert!(adapter.plan_mutation(truncate).is_err());
 }

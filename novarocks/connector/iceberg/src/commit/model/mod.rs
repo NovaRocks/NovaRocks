@@ -52,7 +52,7 @@ pub use outcome::{
 };
 pub(crate) use protocol::{
     CommitOperation, CommitProtocol, CommitStyle, WindowValidation, WriteSessionCommitProtocol,
-    WriterSchemaSpec,
+    WriterSchemaSpec, validate_target_branch,
 };
 pub use request::{
     BaseIdentity, FrozenBaseFacts, FrozenRequest, FrozenRequestParts, RequestShape,

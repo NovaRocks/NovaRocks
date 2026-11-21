@@ -510,7 +510,6 @@ impl ManifestReadScope {
 
     /// A commit removes live physical entries even when a deletion vector
     /// supersedes their row-read effect. This borrows only already bound sources.
-    #[cfg(test)]
     pub(crate) fn live_position_entries(&self) -> impl Iterator<Item = &LocatedEntry> {
         self.bound
             .values()
@@ -531,7 +530,6 @@ impl ManifestReadScope {
     }
 
     /// The supplied data entries were already located on this snapshot.
-    #[cfg(test)]
     pub(crate) async fn locate_live_dangling_dvs(
         &mut self,
         removed_data: &BTreeMap<&EntryIdentity, &FrozenEntry>,

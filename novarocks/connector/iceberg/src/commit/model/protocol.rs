@@ -19,7 +19,7 @@
 
 use super::{FrozenEntry, IsolationLevel};
 use crate::commit::dependency::RowDeltaWindowCheck;
-use crate::iceberg::TableRequirement;
+use crate::iceberg::{TableRequirement, spec::TableMetadata};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +99,7 @@ impl WriteSessionCommitProtocol {
 #[derive(Debug)]
 pub(crate) enum CommitProtocol {
     Legacy,
+    Truncate,
     RowDelta {
         window: RowDeltaWindowCheck,
         writer: WriterSchemaSpec,
@@ -119,6 +120,7 @@ impl CommitProtocol {
     pub(crate) const fn operation(&self) -> CommitOperation {
         match self {
             Self::Legacy => CommitOperation::Legacy,
+            Self::Truncate => CommitOperation::Truncate,
             Self::RowDelta { .. } => CommitOperation::Write,
             Self::RewriteFiles { .. } => CommitOperation::Optimize,
         }
@@ -126,7 +128,7 @@ impl CommitProtocol {
 
     pub(crate) fn window(&self) -> WindowValidation<'_> {
         match self {
-            Self::Legacy => WindowValidation::None,
+            Self::Legacy | Self::Truncate => WindowValidation::None,
             Self::RowDelta { window, .. } => WindowValidation::RowDelta(window),
             Self::RewriteFiles { replaced } => WindowValidation::RewriteFiles(replaced),
         }
@@ -134,9 +136,24 @@ impl CommitProtocol {
 
     pub(crate) const fn writer_schema_spec(&self) -> Option<WriterSchemaSpec> {
         match self {
-            Self::Legacy | Self::RewriteFiles { .. } => None,
+            Self::Legacy | Self::Truncate | Self::RewriteFiles { .. } => None,
             Self::RowDelta { writer, .. } => Some(*writer),
         }
+    }
+    pub(crate) const fn requires_target_branch(&self) -> bool {
+        matches!(self, Self::Truncate | Self::RewriteFiles { .. })
+    }
+}
+
+/// A table with no current snapshot has an empty main branch without a ref entry.
+pub(crate) fn validate_target_branch(metadata: &TableMetadata, name: &str) -> Result<(), String> {
+    match metadata.refs().get(name) {
+        Some(reference) if reference.is_branch() => Ok(()),
+        Some(_) => Err(format!(
+            "{name} is a tag, not a branch. Tags cannot be targets for producing snapshots"
+        )),
+        None if name == "main" && metadata.current_snapshot_id().is_none() => Ok(()),
+        None => Err(format!("Iceberg target branch does not exist: {name}")),
     }
 }
 

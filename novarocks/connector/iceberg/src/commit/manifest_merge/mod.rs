@@ -63,7 +63,6 @@ impl<'a> MergeCandidate<'a> {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn into_descriptor(self) -> ManifestFile {
         self.descriptor
     }

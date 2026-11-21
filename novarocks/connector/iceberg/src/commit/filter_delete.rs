@@ -32,6 +32,10 @@ use super::manifest_sources::{LocatedEntry, duplicate_identity};
 use super::model::OperationIntent;
 use super::staging::{PreparedChange, Preparer, StagedView};
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "The production TRUNCATE judge matches all rows")
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileVerdict {
     AllRows,

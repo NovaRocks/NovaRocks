@@ -45,6 +45,7 @@ pub enum DataMutationIntent {
         format: Option<ConnectorAddFilesFormat>,
         recursion: ConnectorAddFilesRecursion,
     },
+    TruncateMain,
     Truncate {
         target_ref: Arc<str>,
     },
@@ -81,6 +82,7 @@ impl DataMutationIntent {
             } => Ok(ConnectorDataMutationOperation::register_existing_files(
                 table, location, format, recursion,
             )),
+            Self::TruncateMain => Ok(ConnectorDataMutationOperation::truncate_main(table)),
             Self::Truncate { target_ref } => {
                 ConnectorDataMutationOperation::truncate(table, target_ref)
             }
@@ -242,6 +244,7 @@ pub struct DataMutationSession {
     table: ConnectorTableIdentity,
     plan: novarocks_spi::connector::ConnectorDataMutationPlan,
     context: ConnectorRequestContext,
+    main_truncate: bool,
     phase: DataMutationSessionPhase,
 }
 
@@ -318,6 +321,7 @@ impl DataMutationSession {
                 DataMutationDispatchState::ConfirmedNotDispatched,
             ));
         }
+        let main_truncate = matches!(&intent, DataMutationIntent::TruncateMain);
         let operation = intent.into_operation(metadata.table).map_err(|error| {
             ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
@@ -335,6 +339,7 @@ impl DataMutationSession {
             table,
             plan,
             context,
+            main_truncate,
             phase: DataMutationSessionPhase::Planned,
         })
     }
@@ -454,10 +459,16 @@ impl DataMutationSession {
         // retains the original provider owner and its exact journal entry.
         let original_failure = original_failure.clone();
         let original_evidence = expected.as_ref().clone();
+        let mut context = self.context.clone();
+        if self.main_truncate {
+            // The original marker observation needs the state after the
+            // possible external effect. Retain this statement's authority.
+            context = context.after_external_effect();
+        }
         let reconcile = match ConnectorDataMutationReconcileRequest::try_new(
             &self.plan,
             expected.as_ref().clone(),
-            self.context.clone(),
+            context,
         ) {
             Ok(request) => request,
             Err(_error) => {
@@ -618,6 +629,8 @@ mod tests {
         ExecuteContractFailure,
     }
 
+    struct PlanningObservation;
+
     struct FakeProvider {
         descriptor: ConnectorInstanceDescriptor,
         key: ConnectorProviderBindingKey,
@@ -627,6 +640,7 @@ mod tests {
         plan_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
+        observed_reconcile_context: Mutex<Option<ConnectorRequestContext>>,
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -649,6 +663,7 @@ mod tests {
                 plan_calls: AtomicUsize::new(0),
                 execute_calls: AtomicUsize::new(0),
                 reconcile_calls: AtomicUsize::new(0),
+                observed_reconcile_context: Mutex::new(None),
                 events: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -825,6 +840,7 @@ mod tests {
             request: ConnectorDataMutationReconcileRequest,
         ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
             self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            *self.observed_reconcile_context.lock().unwrap() = Some(request.context.clone());
             assert_eq!(
                 request
                     .evidence
@@ -1166,6 +1182,52 @@ mod tests {
             }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn main_truncate_reconcile_refreshes_the_original_observation_only() {
+        for main_truncate in [true, false] {
+            let provider = FakeProvider::new(Mode::UnknownThenCommitted);
+            let finalizer = Finalizer {
+                events: provider.events.clone(),
+                fail: false,
+            };
+            let context = context();
+            let deadline = context.deadline();
+            let planning = context.request_scope_extension_or_insert_with(|| PlanningObservation);
+            let intent = if main_truncate {
+                DataMutationIntent::TruncateMain
+            } else {
+                DataMutationIntent::truncate("main")
+            };
+            let mut session = DataMutationSession::plan(
+                &Resolver::new(provider.clone()),
+                &provider.descriptor.instance_id,
+                ConnectorMutationOperationId::new(),
+                table(&provider.descriptor.instance_id),
+                intent,
+                context,
+            )
+            .unwrap();
+            let ResolvedDataMutation::CommitUnknown { evidence, .. } =
+                session.execute_once(&finalizer)
+            else {
+                panic!("expected one unknown dispatch");
+            };
+            assert!(matches!(
+                session.adjudicate_once(evidence, &finalizer),
+                ResolvedDataMutation::KnownCommitted(_)
+            ));
+
+            let observed = provider.observed_reconcile_context.lock().unwrap();
+            let observed = observed.as_ref().unwrap();
+            assert_eq!(observed.deadline(), deadline);
+            assert_eq!(observed.fresh_catalog_observation_required(), main_truncate);
+            let scope = observed.request_scope_extension_or_insert_with(|| PlanningObservation);
+            assert_eq!(Arc::ptr_eq(&planning, &scope), !main_truncate);
+            assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

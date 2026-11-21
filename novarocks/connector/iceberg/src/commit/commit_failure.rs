@@ -17,7 +17,7 @@
 
 //! Iceberg's sole author of operation-specific public commit failure detail.
 
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 use novarocks_failure_contract::connector_reason::{
     COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_ERROR, ICEBERG_COMMIT_STATE_UNKNOWN,
@@ -64,6 +64,33 @@ impl FailureProjection for PublicCommitFailure {
     fn failure_fact(&self) -> FailureFact {
         FailureFact::new(FailureClass::Dependency, self.reason)
     }
+}
+
+/// Describe a first validation failure under its operation's public commit style.
+pub(crate) fn validation_failure(
+    operation: CommitOperation,
+    detail: impl Into<Arc<str>>,
+) -> ConnectorMutationFailure {
+    let detail = detail.into();
+    let original =
+        ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, detail.clone());
+    commit_failure(operation, CommitFailureKind::Validation, original, &detail)
+}
+
+/// Preserve the original catalog failure and add the selected publication outcome.
+pub(crate) fn original_commit_failure(
+    operation: CommitOperation,
+    kind: CommitFailureKind,
+    original: ConnectorMutationFailure,
+) -> ConnectorMutationFailure {
+    if operation == CommitOperation::Legacy
+        || (matches!(kind, CommitFailureKind::Unknown)
+            && original.failure_fact().reason() == ICEBERG_COMMIT_STATE_UNKNOWN)
+    {
+        return original;
+    }
+    let detail = original.message().to_owned();
+    commit_failure(operation, kind, original, &detail)
 }
 
 /// The caller supplies public detail selected by the original Provider owner.
@@ -141,14 +168,8 @@ pub(crate) fn commit_failure(
     if metadata_maintenance {
         return ConnectorMutationFailure::from_connector(source);
     }
-    // Preserve the row-delta kernel's original diagnostic. Its public
-    // projection is the Provider-authored cause, carried beside this message.
-    let mutation_detail = if operation == CommitOperation::Write {
-        body.into_owned()
-    } else {
-        source.message().to_owned()
-    };
-    ConnectorMutationFailure::new(disposition, mutation_detail).with_connector_source(source)
+    // Keep the kernel diagnostic separate from the Provider's public projection.
+    ConnectorMutationFailure::new(disposition, body.into_owned()).with_connector_source(source)
 }
 
 #[cfg(test)]
