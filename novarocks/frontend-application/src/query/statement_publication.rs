@@ -844,7 +844,7 @@ mod tests {
 }
 
 #[cfg(test)]
-fn original_attempt() -> DmlPublicationAttempt {
+pub(super) fn original_attempt() -> DmlPublicationAttempt {
     DmlPublicationAttempt::new(
         novarocks_spi::connector::LakePublicationId::new_v7(),
         novarocks_spi::connector::LakePublicationFamily::DataMutation,

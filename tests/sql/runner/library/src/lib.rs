@@ -307,7 +307,16 @@ fn evaluate_expected_error_outcome(
             Some(error)
                 if error.error_name == expected.name && error.error_type == expected.error_type =>
             {
-                Ok(())
+                if let Some(prefix) = &meta.expect_error
+                    && !error.message.starts_with(prefix)
+                {
+                    Err(format!(
+                        "expected Trino error message starting with {prefix:?} at statement {count}, got {:?}",
+                        error.message
+                    ))
+                } else {
+                    Ok(())
+                }
             }
             Some(error) => Err(format!(
                 "expected Trino error {},{} at statement {count}, got {},{}: {}",

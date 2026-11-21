@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::*;
+
 use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, RootOrdinal};
 use novarocks_physical_plan::{FragmentId, NodeId, NodeKind, PhysicalPlan, ValueId, ValueOrigin};
 

@@ -21,7 +21,8 @@
 
 use crate::actor::Actor;
 use crate::actor_turn::{
-    ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, CompletedEffect, EffectTicket,
+    ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, CompletedEffect,
+    EffectStartStatus, EffectTicket,
 };
 use crate::exit_work::{HandoffCell, HandoffState};
 use crate::sync::Arc;
@@ -263,7 +264,7 @@ where
         runtime: &ActorRuntime<A>,
         host: &'h ActorHostTurn<A>,
     ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
-        self.peek_candidate_inner(runtime, host, None::<fn(&A::Effect) -> _>)
+        self.peek_candidate_inner(runtime, host, None::<fn(&A::Effect, bool) -> _>)
     }
     /// Only this exact pending metadata may qualify an already withdrawn
     /// carrier for handoff after stop. Normal business keeps its usual gate.
@@ -273,20 +274,39 @@ where
         host: &'h ActorHostTurn<A>,
         handoff: impl FnOnce(&A::Effect) -> Option<std::sync::Arc<HandoffCell>>,
     ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
+        self.peek_candidate_with_stop_observation(runtime, host, |effect, _| handoff(effect))
+    }
+
+    /// Allow the original host to observe that the stopped scope specifically
+    /// fenced an otherwise ready Business action. The callback runs outside
+    /// runtime locks and may return the action's original withdrawal cell.
+    pub fn peek_candidate_with_stop_observation<'h>(
+        &self,
+        runtime: &ActorRuntime<A>,
+        host: &'h ActorHostTurn<A>,
+        handoff: impl FnOnce(&A::Effect, bool) -> Option<std::sync::Arc<HandoffCell>>,
+    ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
         self.peek_candidate_inner(runtime, host, Some(handoff))
     }
+
     fn peek_candidate_inner<'h>(
         &self,
         runtime: &ActorRuntime<A>,
         host: &'h ActorHostTurn<A>,
-        handoff: Option<impl FnOnce(&A::Effect) -> Option<std::sync::Arc<HandoffCell>>>,
+        handoff: Option<impl FnOnce(&A::Effect, bool) -> Option<std::sync::Arc<HandoffCell>>>,
     ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
         self.validate_candidate_host(runtime, host)?;
         let Some(marker) = self.ready.front().copied() else {
             return Ok(None);
         };
         let entry = self.candidate_entry(marker)?;
-        let normal = runtime.effect_ready_for(host, entry.effect.input, entry.effect.action)?;
+        let status = runtime.effect_start_status_for_dispatch(
+            host,
+            entry.effect.input,
+            entry.effect.action,
+            false,
+        )?;
+        let normal = status == EffectStartStatus::Ready;
         let mut metadata = if normal || handoff.is_some() {
             Some(
                 runtime
@@ -298,7 +318,11 @@ where
         };
         let withdrawn = metadata
             .as_ref()
-            .and_then(|metadata| handoff.and_then(|handoff| handoff(metadata)))
+            .and_then(|metadata| {
+                handoff.and_then(|handoff| {
+                    handoff(metadata, status == EffectStartStatus::StoppedBusiness)
+                })
+            })
             .filter(|cell| cell.state() == HandoffState::Withdrawn);
         if !normal
             && (withdrawn.is_none()

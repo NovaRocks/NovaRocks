@@ -19,11 +19,14 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(test)]
 use crate::commit::manifest_sources::SnapshotSources;
+#[cfg(test)]
 use crate::iceberg::io::FileIO;
-use crate::iceberg::spec::{
-    DataContentType, ManifestContentType, ManifestStatus, Operation, SnapshotRef, TableMetadata,
-};
+#[cfg(test)]
+use crate::iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+use crate::iceberg::spec::{Operation, SnapshotRef, TableMetadata};
+#[cfg(test)]
 use crate::iceberg::{Error, ErrorKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,7 +56,7 @@ impl HistoryWindow {
         &'a self,
         operations: &'a [Operation],
     ) -> impl Iterator<Item = &'a SnapshotRef> {
-        self.snapshots
+        self.snapshots()
             .iter()
             .filter(move |snapshot| operations.contains(&snapshot.summary().operation))
     }
@@ -95,12 +98,18 @@ pub fn history_window(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub enum HistoryObservationError {
     Gap(HistoryGap),
+    #[allow(
+        dead_code,
+        reason = "The ADD FILES caller will consume the original read cause"
+    )]
     Read(Error),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub struct PhysicalAddedData {
     pub window: HistoryWindow,
@@ -110,6 +119,7 @@ pub struct PhysicalAddedData {
 /// Read only manifests newly written by snapshots in the exact ancestor window.
 /// Physical data paths include REPLACE. A manifest-only rewrite carries existing
 /// entries and cannot add a path to this result.
+#[cfg(test)]
 pub async fn physical_added_data(
     metadata: &TableMetadata,
     start: Option<i64>,

@@ -28,6 +28,7 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
 };
 
+use super::conflict::{commit_state_unknown, transaction_conflict, validation_conflict};
 #[cfg(test)]
 use super::dependency::ValidationInputs;
 use super::dependency::{self, Verdict};
@@ -455,6 +456,11 @@ async fn run_in_phase(
                 };
             }
             CatalogOutcome::CommitUnknown { failure, evidence } => {
+                let failure = if intent.is_ordinary_row_delta() {
+                    commit_state_unknown(failure)
+                } else {
+                    failure
+                };
                 // Preserve every owned object, including prior attempts with partial cleanup.
                 return Report {
                     publication: PublicationOutcome::Unknown {
@@ -478,6 +484,11 @@ async fn run_in_phase(
                 let wait = policy.backoff(attempt_number);
                 let left = policy.total_timeout.saturating_sub(started.elapsed());
                 if wait >= left {
+                    let failure = if intent.is_ordinary_row_delta() {
+                        transaction_conflict(failure, attempt_number + 1)
+                    } else {
+                        failure
+                    };
                     return rejected(operation, failure).await;
                 }
                 // Retired objects remain owned until a terminal result. Backoff starts no deletion.
@@ -505,6 +516,13 @@ async fn run_in_phase(
                 return rejected(operation, failure).await;
             }
             CatalogOutcome::KnownUncommitted { failure } => {
+                let failure = if failure.kind() == ConnectorMutationFailureKind::Conflict
+                    && intent.is_ordinary_row_delta()
+                {
+                    transaction_conflict(failure, attempt_number + 1)
+                } else {
+                    failure
+                };
                 return rejected(operation, failure).await;
             }
             CatalogOutcome::Unsupported(error) => {
@@ -609,16 +627,49 @@ async fn prepare(
         let parent = metadata
             .snapshot_for_ref(intent.target_ref())
             .map(|s| s.snapshot_id());
-        match dependency::validate(intent, metadata, parent, attempt)
+        let verdict = if intent.is_ordinary_row_delta() {
+            let removed_data = attempt
+                .row_delta_removed_data()
+                .map_err(|error| before_dispatch_failure(&error))?;
+            dependency::validate_with_removed_data(
+                intent,
+                metadata,
+                parent,
+                attempt,
+                removed_data.as_deref(),
+            )
             .await
-            .map_err(|e| before_dispatch_failure(&e))?
-        {
+        } else {
+            dependency::validate(intent, metadata, parent, attempt).await
+        }
+        .map_err(|error| before_dispatch_failure(&error))?;
+        match verdict {
             Verdict::Holds => {}
             verdict => {
+                if let Some(failure) = verdict.row_delta_conflict(
+                    metadata,
+                    intent.start().map(|start| start.snapshot_id),
+                    parent,
+                ) {
+                    return Err(failure);
+                }
                 return Err(ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Conflict,
                     format!("Iceberg commit dependency failed: {verdict:?}"),
                 ));
+            }
+        }
+        if intent.is_ordinary_row_delta() {
+            for requirement in &prefix.requirements {
+                if matches!(
+                    requirement,
+                    crate::iceberg::TableRequirement::CurrentSchemaIdMatch { .. }
+                        | crate::iceberg::TableRequirement::DefaultSpecIdMatch { .. }
+                ) {
+                    requirement
+                        .check(Some(metadata))
+                        .map_err(|error| validation_conflict(error.to_string()))?;
+                }
             }
         }
     }
@@ -662,6 +713,9 @@ pub(crate) fn before_dispatch_failure(error: &Error) -> ConnectorMutationFailure
     use std::error::Error as _;
     let mut source = error.source();
     while let Some(cause) = source {
+        if let Some(failure) = cause.downcast_ref::<ConnectorMutationFailure>() {
+            return failure.clone();
+        }
         if let Some(error) = cause.downcast_ref::<ConnectorError>() {
             return ConnectorMutationFailure::from_connector(error.clone());
         }

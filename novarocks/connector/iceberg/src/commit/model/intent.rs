@@ -56,13 +56,6 @@ pub struct OperationIntentParts {
     pub start: Option<StartSnapshot>,
     pub changes: FileChanges,
     pub dependencies: Vec<Dependency>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "The immutable intent retains the caller's isolation contract for diagnostics; concrete dependency checks encode its validation behavior."
-        )
-    )]
     pub isolation: IsolationLevel,
     pub shape: RequestShape,
     pub summary: BTreeMap<String, String>,
@@ -89,6 +82,11 @@ impl OperationIntent {
         }
         if parts.start.is_some_and(|start| start.sequence_number < 0) {
             return Err(invalid("Start snapshot sequence must be nonnegative"));
+        }
+        if parts.dependencies.iter().any(|dependency| {
+            matches!(dependency, Dependency::RowDeltaWindow(check) if check.isolation() != parts.isolation)
+        }) {
+            return Err(invalid("Row-delta validation does not have the intent's admitted isolation level"));
         }
         if parts.shape == RequestShape::Create && parts.start.is_some() {
             return Err(invalid(
@@ -126,6 +124,11 @@ impl OperationIntent {
         self.shape() != RequestShape::Create
             && self.shape() != RequestShape::DocumentExpiry
             && !self.dependencies().contains(&Dependency::RefUnchanged)
+    }
+    pub(crate) fn is_ordinary_row_delta(&self) -> bool {
+        self.dependencies()
+            .iter()
+            .any(|dependency| matches!(dependency, Dependency::RowDeltaWindow(_)))
     }
     pub fn target(&self) -> &TableTarget {
         &self.parts.target

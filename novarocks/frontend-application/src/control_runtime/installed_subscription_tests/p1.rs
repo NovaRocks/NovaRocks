@@ -728,22 +728,32 @@ async fn run(domain_error: bool) {
         .process
         .close_original_host_registration_for_fixture();
     bootstrap.fixture.finish().await;
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
     drop(c.next_compute.take());
     c.next_stage.take().unwrap().complete();
-    assert!(
-        c.custody
-            .first_retired
-            .as_ref()
-            .unwrap()
-            .is_reclaimed()
-            .unwrap()
-    );
+    // Actual exit can be visible before the first stage's final backing reset.
+    // Observe that exact reset while the original payload and Root stay held.
+    let first_retired = c.custody.first_retired.as_ref().unwrap();
+    drive_until(
+        &bootstrap.process,
+        &mut bootstrap.joint,
+        std::future::poll_fn(|_| {
+            if first_retired.is_reclaimed().unwrap() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+        cleanup_deadline,
+    )
+    .await
+    .expect("the original first stage must be reclaimed before payload and Root release");
     drop(c.custody.payload.take());
     let root = c.custody.root.take().unwrap();
     root.business.release();
     root.owner.complete();
     drive(&mut bootstrap.joint);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout_at(cleanup_deadline.into(), async {
         let released = scope.wait_released();
         tokio::pin!(released);
         loop {

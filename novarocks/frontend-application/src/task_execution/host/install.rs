@@ -110,10 +110,8 @@ pub(crate) struct InstallAttemptHost<'a> {
     pub(crate) initial_now: novarocks_coordination_contract::MonotonicInstant,
     #[cfg(test)]
     pub(crate) fixture_observation_budget: Option<super::observations::ObservationBudget>,
-    #[cfg(all(test, novarocks_dev_controls))]
-    pub(crate) fixture_establish_handoff: Option<
-        &'a crate::query_execution::native_execution_adapter::original_install_fixture::OriginalInstallRow,
-    >,
+    #[cfg(test)]
+    pub(crate) fixture_send_handoff: Option<super::transport::OriginalSendHandoffFixture<'a>>,
     pub(crate) process: &'a FrontendAttemptRuntime,
     pub(crate) data: &'a FrontendDataRuntime,
     pub(crate) clock: Arc<dyn MonotonicClock>,
@@ -152,8 +150,8 @@ impl InstallAttemptHost<'_> {
             initial_now,
             #[cfg(test)]
             fixture_observation_budget,
-            #[cfg(all(test, novarocks_dev_controls))]
-            fixture_establish_handoff,
+            #[cfg(test)]
+            fixture_send_handoff,
             process,
             data,
             clock,
@@ -584,8 +582,8 @@ impl InstallAttemptHost<'_> {
             Ok(prepared) => prepared,
             Err(original) => return Err(retain_install_refusal((original, funding))),
         };
-        #[cfg(all(test, novarocks_dev_controls))]
-        let prepared = if let Some(row) = fixture_establish_handoff {
+        #[cfg(test)]
+        let prepared = if let Some(fixture) = fixture_send_handoff {
             let mut prepared = prepared;
             let wake = prepared
                 .binding
@@ -593,8 +591,7 @@ impl InstallAttemptHost<'_> {
                 .as_ref()
                 .expect("SAME original Host transport tracker")
                 .host_waker();
-            prepared.binding.executor =
-                row.decorate_original_executor(prepared.binding.executor.clone(), wake);
+            prepared.binding.executor = fixture.decorate(prepared.binding.executor.clone(), wake);
             prepared
         } else {
             prepared

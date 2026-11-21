@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod row_delta_window;
+
 use super::super::fast_append::FastAppendPreparer;
 use super::super::model::{
     AddedContent, Dependency, FileChanges, IsolationLevel, OperationIntentParts, TableTarget,
@@ -31,6 +33,7 @@ use std::sync::{
 enum Dispatch {
     Commit,
     ConflictThen(Box<TableMetadata>),
+    ConflictSequence(Vec<TableMetadata>),
     Unknown,
     AlwaysConflict,
     CancelAfterCommit,
@@ -140,6 +143,15 @@ impl Publisher for ControlledPublisher<'_> {
             && call == 1
         {
             *self.metadata.lock().unwrap() = metadata.as_ref().clone();
+            return CatalogOutcome::uncommitted(
+                ConnectorMutationFailureKind::Conflict,
+                "Injected concurrent catalog commit",
+            );
+        }
+        if let Dispatch::ConflictSequence(bases) = &self.dispatch
+            && let Some(base) = bases.get(call - 1)
+        {
+            *self.metadata.lock().unwrap() = base.clone();
             return CatalogOutcome::uncommitted(
                 ConnectorMutationFailureKind::Conflict,
                 "Injected concurrent catalog commit",

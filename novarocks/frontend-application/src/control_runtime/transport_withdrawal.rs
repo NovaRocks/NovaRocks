@@ -19,6 +19,9 @@ use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody};
 use novarocks_attempt_protocol::port_output::AttemptToLogicalBody;
 use novarocks_control_runtime::exit_work::HandoffCell;
 use novarocks_coordination_contract::AttemptActionId;
+#[cfg(test)]
+mod tests;
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock, Weak},
@@ -47,6 +50,17 @@ impl AttemptEffectEnvelope {
 
     pub(crate) fn handoff(&self) -> Option<&Arc<HandoffCell>> {
         self.handoff.as_ref()
+    }
+
+    pub(super) fn handoff_for_dispatch(&self, stopped_business: bool) -> Option<Arc<HandoffCell>> {
+        let cell = self.handoff()?;
+        if stopped_business && matches!(self.protocol.body, EffectBody::AdmitQueuedInput { .. }) {
+            // A queued admission can be stranded in the timer batch that
+            // must retire before Core's Stop cursor can reach the admission.
+            // Let that same unused admission take its original teardown path.
+            cell.withdraw();
+        }
+        Some(cell.clone())
     }
 
     pub(crate) fn is_attempt_port(&self) -> bool {

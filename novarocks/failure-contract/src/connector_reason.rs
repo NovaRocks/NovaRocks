@@ -24,7 +24,18 @@ use std::num::NonZeroU16;
 pub const ICEBERG_TOO_MANY_OPEN_PARTITIONS: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(50).unwrap());
 
-// Reasons 51 through 53 are reserved for row-level commit outcomes.
+/// A catalog transaction could not commit after exhausting its contention retries.
+pub const COMMIT_TRANSACTION_CONFLICT: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(51).unwrap());
+
+/// Iceberg row-delta validation found a change that invalidates the write.
+pub const ICEBERG_COMMIT_VALIDATION_CONFLICT: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(52).unwrap());
+
+/// The catalog may have applied the Iceberg write, but the outcome is unknown.
+pub const ICEBERG_COMMIT_STATE_UNKNOWN: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(53).unwrap());
+
 /// Iceberg metadata required by maintenance is missing or invalid.
 pub const ICEBERG_INVALID_METADATA: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(54).unwrap());

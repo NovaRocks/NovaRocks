@@ -19,10 +19,11 @@
 //! No Ready source, M author, Work, Scope, Source or HostRegistry is retained.
 
 use super::*;
-use crate::control_runtime::host::EffectExecutor;
 use crate::fixtures::native_recipe::ReadCloseGate;
 use crate::query_execution::lifecycle_plan::AttemptCredentialStorage;
-use crate::task_execution::host::transport::OriginalEstablishHandoff;
+use crate::task_execution::host::transport::{
+    OriginalSendHandoff, OriginalSendHandoffFixture, OriginalSendTarget,
+};
 use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_execution_contract::TaskIdentity;
 
@@ -59,7 +60,7 @@ pub(crate) struct OriginalInstallRow {
     actual_actor: Mutex<Option<novarocks_control_runtime_core::identity::ActorId>>,
     original_disposal_gate: Mutex<Option<Weak<ReadCloseGate>>>,
     establish_target: Mutex<Option<ParticipationRef>>,
-    establish_handoff: Mutex<Weak<OriginalEstablishHandoff>>,
+    establish_handoff: Mutex<Weak<OriginalSendHandoff>>,
 }
 impl OriginalInstallProbe {
     pub(crate) fn row(&self, index: usize) -> Option<Arc<OriginalInstallRow>> {
@@ -140,22 +141,18 @@ impl OriginalInstallRow {
         Ok(())
     }
 
-    pub(crate) fn original_establish_handoff(&self) -> Option<Arc<OriginalEstablishHandoff>> {
+    pub(crate) fn original_establish_handoff(&self) -> Option<Arc<OriginalSendHandoff>> {
         self.establish_handoff.lock().unwrap().upgrade()
     }
 
-    pub(crate) fn decorate_original_executor(
-        &self,
-        original: Arc<dyn EffectExecutor>,
-        wake: std::task::Waker,
-    ) -> Arc<dyn EffectExecutor> {
-        let target = { *self.establish_target.lock().unwrap() };
-        let Some(target) = target else {
-            return original;
-        };
-        let decorator = OriginalEstablishHandoff::new(original, target, wake);
-        *self.establish_handoff.lock().unwrap() = Arc::downgrade(&decorator);
-        decorator
+    pub(super) fn original_send_handoff_fixture(&self) -> Option<OriginalSendHandoffFixture<'_>> {
+        self.establish_target
+            .lock()
+            .unwrap()
+            .map(|participation| OriginalSendHandoffFixture {
+                target: OriginalSendTarget::Establish(participation),
+                observation: &self.establish_handoff,
+            })
     }
 
     pub(crate) fn hold_original_disposal(&self, original: &Arc<ReadCloseGate>) {

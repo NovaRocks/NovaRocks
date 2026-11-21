@@ -442,6 +442,11 @@ impl ActualStatisticsRun {
             }
         };
         peer.defer_single_root_terminal().unwrap();
+        // This fixture observes the exact final ACK on success. Production
+        // Release may independently finish before that optional read.
+        let _release_guard = case
+            .is_success()
+            .then(|| peer.hold_single_root_release_for_final_ack().unwrap());
         logical.probe.release_activation();
 
         // Observe the SAME checked End receipt after real EOF CPU work and

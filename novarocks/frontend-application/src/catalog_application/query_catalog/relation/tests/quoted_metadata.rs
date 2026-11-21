@@ -120,6 +120,7 @@ fn binding_at_epoch(epoch: u8, counts: Arc<Counts>) -> ConnectorControlBinding {
     let instance = base.descriptor().instance_id.clone();
     let metadata = Arc::new(ObservedMetadata {
         owner: instance.clone(),
+        epoch,
         error: None,
         counts,
     });

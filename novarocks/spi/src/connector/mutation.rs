@@ -202,6 +202,12 @@ impl ConnectorMutationFailure {
             source: Some(error),
         }
     }
+    /// Attach the originating connector fact while preserving the mutation disposition.
+    pub fn with_connector_source(mut self, source: ConnectorError) -> Self {
+        self.source = Some(source);
+        self
+    }
+
     pub fn connector_source(&self) -> Option<&ConnectorError> {
         self.source.as_ref()
     }

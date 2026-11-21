@@ -545,11 +545,16 @@ impl FrontendProviderReadFacts {
 /// thing a name and a version would select is a different read.
 enum AdmittedRead {
     Relation(crate::catalog_application::query_bindings::QueryScanMaterialization),
+    RowMutationCurrent {
+        materialization: crate::catalog_application::query_bindings::QueryScanMaterialization,
+        source: novarocks_spi::connector::ConnectorRowMutationCurrent,
+    },
     RowMutationMatch {
         materialization: crate::catalog_application::query_bindings::QueryScanMaterialization,
         original_identity: novarocks_spi::connector::ConnectorTableIdentity,
         original_source: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
         snapshot_id: Option<i64>,
+        preparation_digest: [u8; 32],
     },
     PreparedSource(Arc<crate::catalog_application::query_bindings::QueryPreparedSourceRead>),
     MvTarget {
@@ -566,6 +571,9 @@ impl AdmittedRead {
     fn planning_pin(&self) -> &ConnectorControlPlanningPin {
         match self {
             Self::Relation(materialization)
+            | Self::RowMutationCurrent {
+                materialization, ..
+            }
             | Self::RowMutationMatch {
                 materialization, ..
             }
@@ -598,7 +606,7 @@ impl AdmittedRead {
                 original_identity.namespace.to_string(),
                 original_identity.table.to_string(),
             ),
-            Self::Relation(_) | Self::MvTarget { .. } => {
+            Self::Relation(_) | Self::RowMutationCurrent { .. } | Self::MvTarget { .. } => {
                 let identity = relation_identity(relation);
                 (
                     identity.namespace.clone(),
@@ -676,63 +684,82 @@ fn prepare_read_opening(
     } else {
         let input = frozen_input(relation)?;
         let binding = bindings.binding(need.binding())?;
-        if let crate::catalog_application::query_bindings::QueryTableBindingAdmission::RowMutationMatch(
-            _, snapshot_id,
-        ) = &binding.admission
-        {
-            if !matches!(relation, ProviderReadRelationNeed::Data { .. })
-                || input != QueryFrozenReadInput::Current
-            {
-                return Err("mutation target scan differs from its signed selector".to_string().into());
-            }
-            let original = binding.source_metadata.as_ref().ok_or_else(|| {
-                "mutation target scan lost its original table observation".to_string()
-            })?;
-            AdmittedRead::RowMutationMatch {
-                materialization: bindings.frozen_read_input(need.binding(), input)?,
-                original_identity: original.identity.clone(),
-                original_source: original.source_read_facts().cloned(),
-                snapshot_id: *snapshot_id,
-            }
-        } else {
-        let prepared = match relation {
-            ProviderReadRelationNeed::Data { .. }
-            | ProviderReadRelationNeed::FrozenInputSet { .. } => {
-                binding.prepared_source_read(input)?
-            }
-            ProviderReadRelationNeed::Delta {
-                from_snapshot_id,
-                to_snapshot_id,
-                ..
-            } => binding.prepared_change_window(*from_snapshot_id, *to_snapshot_id)?,
-            _ => None,
-        };
-        if let Some(prepared) = prepared {
-            AdmittedRead::PreparedSource(prepared)
-        } else {
-            match input {
-                QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
-                    AdmittedRead::Relation(
-                        bindings
-                            .frozen_read_input(need.binding(), input)
-                            .map_err(|error| {
-                                ProviderReadError::from(error)
-                                    .context(format!("provider read of {name}"))
-                            })?,
-                    )
+        use crate::catalog_application::query_bindings::QueryTableBindingAdmission;
+        match &binding.admission {
+            QueryTableBindingAdmission::RowMutationCurrent(_, source) => {
+                if !matches!(
+                    relation,
+                    ProviderReadRelationNeed::Data { .. }
+                        | ProviderReadRelationNeed::FrozenInputSet { .. }
+                ) || input != QueryFrozenReadInput::Current
+                {
+                    return Err("mutation Current source differs from its admitted selector"
+                        .to_string()
+                        .into());
                 }
-                QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
-                    AdmittedRead::Cohort(
-                        bindings
-                            .frozen_cohort_read(need.binding(), input)
-                            .map_err(|error| {
-                                ProviderReadError::from(error)
-                                    .context(format!("provider read of {name}"))
-                            })?,
-                    )
+                AdmittedRead::RowMutationCurrent {
+                    materialization: bindings.frozen_read_input(need.binding(), input)?,
+                    source: source.clone(),
                 }
             }
-        }
+            QueryTableBindingAdmission::RowMutationMatch(_, snapshot_id, preparation_digest) => {
+                if !matches!(relation, ProviderReadRelationNeed::Data { .. })
+                    || input != QueryFrozenReadInput::Current
+                {
+                    return Err("mutation target scan differs from its signed selector"
+                        .to_string()
+                        .into());
+                }
+                let original = binding.source_metadata.as_ref().ok_or_else(|| {
+                    "mutation target scan lost its original table observation".to_string()
+                })?;
+                AdmittedRead::RowMutationMatch {
+                    materialization: bindings.frozen_read_input(need.binding(), input)?,
+                    original_identity: original.identity.clone(),
+                    original_source: original.source_read_facts().cloned(),
+                    snapshot_id: *snapshot_id,
+                    preparation_digest: *preparation_digest,
+                }
+            }
+            _ => {
+                let prepared = match relation {
+                    ProviderReadRelationNeed::Data { .. }
+                    | ProviderReadRelationNeed::FrozenInputSet { .. } => {
+                        binding.prepared_source_read(input)?
+                    }
+                    ProviderReadRelationNeed::Delta {
+                        from_snapshot_id,
+                        to_snapshot_id,
+                        ..
+                    } => binding.prepared_change_window(*from_snapshot_id, *to_snapshot_id)?,
+                    _ => None,
+                };
+                if let Some(prepared) = prepared {
+                    AdmittedRead::PreparedSource(prepared)
+                } else {
+                    match input {
+                        QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
+                            AdmittedRead::Relation(
+                                bindings.frozen_read_input(need.binding(), input).map_err(
+                                    |error| {
+                                        ProviderReadError::from(error)
+                                            .context(format!("provider read of {name}"))
+                                    },
+                                )?,
+                            )
+                        }
+                        QueryFrozenReadInput::PinnedFileSet
+                        | QueryFrozenReadInput::TableExecute => AdmittedRead::Cohort(
+                            bindings.frozen_cohort_read(need.binding(), input).map_err(
+                                |error| {
+                                    ProviderReadError::from(error)
+                                        .context(format!("provider read of {name}"))
+                                },
+                            )?,
+                        ),
+                    }
+                }
+            }
         }
     };
     let planning_pin = admitted.planning_pin().clone();
@@ -816,10 +843,13 @@ async fn prepare_observation(
         *observation = Some(ReadObservation::OriginalPreparedSource);
         return Ok(());
     }
-    let kind = if let AdmittedRead::RowMutationMatch {
+    let kind = if let AdmittedRead::RowMutationCurrent { source, .. } = &opening.admitted {
+        K::RowMutationCurrent(source.clone())
+    } else if let AdmittedRead::RowMutationMatch {
         materialization,
         original_source,
         snapshot_id,
+        preparation_digest,
         ..
     } = &opening.admitted
     {
@@ -829,6 +859,7 @@ async fn prepare_observation(
                 "mutation target scan has no original provider access provenance".to_string()
             })?,
             snapshot_id: *snapshot_id,
+            preparation_digest: *preparation_digest,
         }
     } else if let AdmittedRead::Cohort(cohort) = &opening.admitted {
         match (need.relation(),cohort) {
@@ -1243,13 +1274,16 @@ fn finish_read_from_opened(
         .clone();
 
     // 6. Take the capability and account for it in the same breath.
-    let access = read
-        .seal_attempt_access(request_control, &negotiated.handle)
-        .map_err(|error| {
-            ProviderReadError::from(error).context(format!(
-                "provider read of {name} cannot seal its per-attempt access"
-            ))
-        })?;
+    let access = if matches!(&opening.admitted, AdmittedRead::RowMutationMatch { .. }) {
+        read.seal_row_mutation_attempt_access(request_control, &negotiated.handle)
+    } else {
+        read.seal_attempt_access(request_control, &negotiated.handle)
+    }
+    .map_err(|error| {
+        ProviderReadError::from(error).context(format!(
+            "provider read of {name} cannot seal its per-attempt access"
+        ))
+    })?;
     deposits
         .deposit(
             need.occurrence(),

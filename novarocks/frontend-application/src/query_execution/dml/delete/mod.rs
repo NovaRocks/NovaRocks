@@ -232,7 +232,8 @@ pub(crate) async fn prepare_delete_write_async(
 
 /// Load through the already admitted generation, without acquiring a new lease
 /// or using a synchronous joining metadata wrapper.
-async fn load_delete_target_async(
+#[cfg(novarocks_dev_controls)]
+async fn load_equality_delete_target_async(
     target: &crate::catalog_application::resolver::TargetBackend,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,

@@ -517,10 +517,12 @@ pub enum ConnectorReadRelationPreparationKind {
         version: ConnectorReadRelationVersion,
         reference: Option<String>,
     },
+    RowMutationCurrent(crate::connector::ConnectorRowMutationCurrent),
     RowMutationMatch {
         table: crate::connector::ConnectorTableHandle,
         original_source: crate::connector::ConnectorProcessLocalPayload,
         snapshot_id: Option<i64>,
+        preparation_digest: [u8; 32],
     },
     FrozenMvTarget {
         table: crate::connector::ConnectorTableHandle,
@@ -919,6 +921,30 @@ impl ConnectorReadRequestControl {
         Arc::clone(&self.splits)
     }
 
+    /// Seal the final rewritten-target predicate while this request still
+    /// owns the matching provider sealer. The resulting fact carries no read
+    /// authority and can outlive this request control.
+    pub fn rewritten_target_fact(
+        &self,
+        frozen: &ConnectorReadTableHandle,
+    ) -> Result<ConnectorRewrittenTargetFact, ConnectorError> {
+        if frozen.binding() != &self.binding {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Rewritten-target predicate belongs to another read binding",
+            ));
+        }
+        match &self.attempt_access {
+            ConnectorReadAttemptAccessMode::Provider(sealer) => {
+                sealer.rewritten_target_fact(frozen)
+            }
+            _ => Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "Connector read attempt access cannot seal rewritten-target predicates",
+            )),
+        }
+    }
+
     /// Seal the final, already-negotiated handle into a provider-owned
     /// per-attempt access source. Providers without request-vended access use
     /// an exact static rebind to these same generation services.
@@ -973,6 +999,9 @@ impl ConnectorReadRequestControl {
     }
 }
 
+/// Provider-owned predicate evidence bound to an exact rewritten-target scan.
+pub type ConnectorRewrittenTargetFact = crate::connector::ConnectorProcessLocalPayload;
+
 /// Provider-owned factory sealed against one exact, final read handle.
 pub trait ConnectorReadAttemptAccessSealer: Send + Sync {
     fn seal(
@@ -980,6 +1009,17 @@ pub trait ConnectorReadAttemptAccessSealer: Send + Sync {
         frozen: &ConnectorReadTableHandle,
         mint: ConnectorReadAttemptAccessMint,
     ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError>;
+
+    /// Project the final predicate of an admitted row-mutation match scan.
+    fn rewritten_target_fact(
+        &self,
+        _frozen: &ConnectorReadTableHandle,
+    ) -> Result<ConnectorRewrittenTargetFact, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "Connector does not supply rewritten-target predicate evidence",
+        ))
+    }
 }
 
 /// Authority issued only after a request control verifies one exact final

@@ -5,6 +5,10 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0244
+    scope: "Rule 6's RefUnchanged and no-retry policy for ordinary Iceberg row-level writes"
+    link: "ADR-0244-iceberg-row-dml-conflict-validation.md"
 partially-supersedes:
   - id: ADR-0171
     scope: "Section 1 addition representation for compact receiving; WholeSet intents, dependencies, inheritance and publication authority remain active"
@@ -35,6 +39,8 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/new_manifests.rs (StageNewFiles, prepare_added_manifests)"
   - "novarocks/connector/iceberg/src/commit/model/artifacts.rs (ArtifactLedger::seal_compact_stage)"
 ---
+
+> [ADR-0244](ADR-0244-iceberg-row-dml-conflict-validation.md) 更新第 6 条普通 Iceberg 行级写入的依赖与重试政策。紧凑接收、滚动 manifest、按条目核对覆盖和固定 ref 的刷新政策继续适用。
 
 ## 问题
 

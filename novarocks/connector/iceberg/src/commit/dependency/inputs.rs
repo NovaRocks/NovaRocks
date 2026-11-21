@@ -43,6 +43,7 @@ pub struct LiveEntry {
 pub type LiveSet = BTreeMap<EntryIdentity, LiveEntry>;
 
 pub struct ValidationInputs<'a> {
+    pub(super) stage: Option<usize>,
     pub metadata: &'a TableMetadata,
     pub parent: Option<i64>,
     io: &'a dyn ArtifactWriter,
@@ -57,6 +58,7 @@ impl<'a> ValidationInputs<'a> {
         io: &'a dyn ArtifactWriter,
     ) -> Self {
         Self {
+            stage: None,
             metadata,
             parent,
             io,

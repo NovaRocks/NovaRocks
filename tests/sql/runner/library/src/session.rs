@@ -958,6 +958,9 @@ DELETE FROM t WHERE c = '2020-01-01 00:00:00.0';";
 }
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 mod session_tests {
     //! The HTTP peer is an independent protocol oracle. It owns its listener,
     //! accepted sockets and a bounded thread; Drop stops and joins even when a
@@ -976,7 +979,7 @@ mod session_tests {
     };
 
     #[derive(Clone, Debug)]
-    struct Request {
+    pub(super) struct Request {
         method: String,
         path: String,
         headers: BTreeMap<String, String>,
@@ -990,7 +993,7 @@ mod session_tests {
         wait_for_action: bool,
     }
 
-    struct Reply {
+    pub(super) struct Reply {
         method: &'static str,
         path: &'static str,
         body: String,
@@ -1001,7 +1004,7 @@ mod session_tests {
         fault_gate: Option<Arc<FaultPeerGate>>,
     }
     impl Reply {
-        fn json(method: &'static str, path: &'static str, body: &str) -> Self {
+        pub(super) fn json(method: &'static str, path: &'static str, body: &str) -> Self {
             Self {
                 method,
                 path,
@@ -1013,7 +1016,7 @@ mod session_tests {
                 fault_gate: None,
             }
         }
-        fn queued(path: &'static str, next: &str) -> Self {
+        pub(super) fn queued(path: &'static str, next: &str) -> Self {
             Self::json(
                 "POST",
                 path,
@@ -1029,14 +1032,14 @@ mod session_tests {
             self
         }
     }
-    struct Peer {
+    pub(super) struct Peer {
         port: u16,
         stop: Arc<AtomicBool>,
         requests: Arc<Mutex<Vec<Request>>>,
         worker: Option<JoinHandle<()>>,
     }
     impl Peer {
-        fn start(replies: Vec<Reply>) -> Self {
+        pub(super) fn start(replies: Vec<Reply>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             listener.set_nonblocking(true).unwrap();
@@ -1135,14 +1138,14 @@ mod session_tests {
                 db: None,
             }
         }
-        fn session(&self) -> TrinoCaseSession {
+        pub(super) fn session(&self) -> TrinoCaseSession {
             TrinoCaseSession::new_with_deadline(
                 &self.config(),
                 Some(Instant::now() + Duration::from_secs(10)),
             )
             .unwrap()
         }
-        fn finish(mut self) -> Vec<Request> {
+        pub(super) fn finish(mut self) -> Vec<Request> {
             self.stop.store(true, Ordering::Relaxed);
             self.worker.take().unwrap().join().unwrap();
             self.requests.lock().unwrap().clone()
@@ -1557,7 +1560,7 @@ mod session_tests {
         assert_eq!(message.matches('中').count(), 1000);
         assert_eq!(peer.finish().len(), 2);
     }
-    fn trino_error(message: &str) -> String {
+    pub(super) fn trino_error(message: &str) -> String {
         serde_json::json!({"id":"q","error":{"message":message,"errorCode":1,"errorName":"GENERIC_USER_ERROR","errorType":"USER_ERROR"}}).to_string()
     }
     #[test]
@@ -1603,7 +1606,7 @@ mod session_tests {
         assert_eq!(peer.finish().len(), 8);
     }
 
-    fn generic_user_expectation() -> QueryMeta {
+    pub(super) fn generic_user_expectation() -> QueryMeta {
         QueryMeta {
             expect_trino_error: Some(TrinoErrorExpectation {
                 name: "GENERIC_USER_ERROR".into(),

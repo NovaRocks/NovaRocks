@@ -32,7 +32,7 @@ mod call_source;
 mod capacity;
 mod covered;
 mod effect_source;
-#[cfg(all(test, novarocks_dev_controls))]
+#[cfg(test)]
 mod establish_handoff_fixture;
 mod establish_material;
 mod execute;
@@ -75,8 +75,10 @@ pub(crate) use covered::{
 pub(crate) use effect_source::{
     AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
 };
-#[cfg(all(test, novarocks_dev_controls))]
-pub(crate) use establish_handoff_fixture::{OriginalEstablishHandoff, OriginalEstablishRelease};
+#[cfg(test)]
+pub(crate) use establish_handoff_fixture::{
+    OriginalSendHandoff, OriginalSendHandoffFixture, OriginalSendRelease, OriginalSendTarget,
+};
 pub(crate) use establish_material::{AttemptEstablishMaterial, EstablishMaterialPreparation};
 pub(crate) use failure_abort::{
     FailureAbortAttempt, FailureResidualPort, NativeFailureCleanup, PreparedSingleSend,

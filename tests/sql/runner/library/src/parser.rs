@@ -994,10 +994,10 @@ pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&st
         return Ok(());
     };
     ensure!(
-        meta.expect_error.is_none()
-            && meta.expect_error_code.is_none()
+        meta.expect_error_code.is_none()
             && !meta.has_sql_error_assertion()
-            && meta.expect_error_tier.is_none(),
+            && meta.expect_error_tier.is_none()
+            && (meta.expect_error.is_none() || expected.name != "SYNTAX_ERROR"),
         "@expect_trino_error cannot be combined with another error expectation"
     );
     if let Some(sql) = sql {
@@ -1764,6 +1764,9 @@ fn prepare_suite_hook(
 }
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 mod opt5_directive_tests {
     use super::*;
     use regex::Regex;
@@ -1892,84 +1895,9 @@ mod opt5_directive_tests {
         assert_eq!(&decorative[frames.sections[1].1.clone()], "SELECT 3");
     }
 
-    fn meta_re() -> Regex {
+    pub(super) fn meta_re() -> Regex {
         // Same regex used by the runner — see tests/sql/runner/src/main.rs:1600.
         Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap()
-    }
-
-    // Runner correctness belongs at the parser/returned HTTP outcome boundary;
-    // these pure tests need no native cluster and run with the regular owner.
-    #[test]
-    fn trino_error_expectation_checks_protocol_fields_and_optional_ordinal() {
-        let re = meta_re();
-        let meta = parse_meta(
-            &["-- @expect_trino_error= MISSING_COLUMN_NAME , USER_ERROR ".into()],
-            &re,
-        )
-        .unwrap();
-        assert_eq!(
-            meta.expect_trino_error,
-            Some(TrinoErrorExpectation {
-                name: "MISSING_COLUMN_NAME".into(),
-                error_type: "USER_ERROR".into(),
-                statement_ordinal: None,
-            })
-        );
-        for value in [
-            "",
-            "MISSING_COLUMN_NAME",
-            ",USER_ERROR",
-            "MISSING_COLUMN_NAME,",
-            "A,B,C",
-            "A,B,0",
-            "A,B,2,3",
-        ] {
-            assert!(
-                parse_meta(&[format!("-- @expect_trino_error={value}")], &re).is_err(),
-                "{value}"
-            );
-        }
-        assert!(parse_meta(&["-- @expect_trino_error".into()], &re).is_err());
-        let legacy = QueryMeta {
-            expect_error: Some("marker".into()),
-            ..Default::default()
-        };
-        assert!(
-            validate_trino_error_expectation(&merge_meta(&legacy, &meta), Some("SELECT x"))
-                .is_err()
-        );
-        let valid = [
-            "SELECT ';'",
-            "-- leading comment\nSELECT absent; -- trailing",
-            "INVALID SQL",
-        ];
-        for sql in valid {
-            validate_trino_error_expectation(&meta, Some(sql)).unwrap();
-        }
-        for sql in [
-            "",
-            "-- comment only",
-            "SELECT 1; SELECT 2",
-            "shell: echo marker",
-        ] {
-            assert!(
-                validate_trino_error_expectation(&meta, Some(sql)).is_err(),
-                "{sql}"
-            );
-        }
-        assert!(meta.has_error_expectation());
-
-        let indexed = parse_meta(
-            &["-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2".into()],
-            &re,
-        )
-        .unwrap();
-        validate_trino_error_expectation(&indexed, Some("USE fixture; SELECT idSELECT id"))
-            .unwrap();
-        for sql in ["SELECT 1", "USE fixture; SELECT idSELECT id; SELECT 3"] {
-            assert!(validate_trino_error_expectation(&indexed, Some(sql)).is_err());
-        }
-        assert!(validate_trino_error_expectation(&merge_meta(&legacy, &indexed), None).is_err());
     }
 
     #[test]

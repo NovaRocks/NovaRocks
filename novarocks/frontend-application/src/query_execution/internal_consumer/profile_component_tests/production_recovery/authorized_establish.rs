@@ -19,7 +19,7 @@
 //! No Worker receipt, terminal or actual exit is inferred from a missing RPC.
 use super::*;
 use crate::fixtures::history::{CapturedHistory, WorkExpectation};
-use crate::task_execution::host::transport::OriginalEstablishRelease;
+use crate::task_execution::host::transport::OriginalSendRelease;
 use novarocks_control_runtime::exit_work::HandoffState;
 use novarocks_control_runtime_core::history::HistoryFact;
 
@@ -130,7 +130,7 @@ pub(super) async fn cancel_original_authorized_handoff(
         .unwrap();
     // The original handoff/withdrawal winner determines NotStarted. Returning
     // this exact job never creates a second operation, permission or RPC.
-    assert_eq!(gate.release(), OriginalEstablishRelease::Accepted(held));
+    assert_eq!(gate.release(), OriginalSendRelease::Accepted(held));
     assert_eq!(gate.accepted(), Some(held));
     assert_eq!(gate.additional_matches(), 0);
     assert!(gate.held().is_none());

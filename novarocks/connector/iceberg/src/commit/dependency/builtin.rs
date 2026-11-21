@@ -18,7 +18,8 @@
 //! Current admission policies decide which source scope to observe.
 
 use super::super::model::{ArtifactWriter, Dependency, EntryIdentity, OperationIntent};
-use super::{Culprit, ValidationInputs, Verdict};
+use super::row_delta::validate_row_delta;
+use super::{Culprit, RemovedDataFiles, ValidationInputs, Verdict};
 use crate::iceberg::Result;
 use crate::iceberg::spec::TableMetadata;
 
@@ -29,11 +30,23 @@ pub async fn validate(
     parent: Option<i64>,
     io: &dyn ArtifactWriter,
 ) -> Result<Verdict> {
+    validate_with_removed_data(intent, metadata, parent, io, None).await
+}
+
+pub(crate) async fn validate_with_removed_data(
+    intent: &OperationIntent,
+    metadata: &TableMetadata,
+    parent: Option<i64>,
+    io: &dyn ArtifactWriter,
+    removed_data: Option<&dyn RemovedDataFiles>,
+) -> Result<Verdict> {
     let mut inputs = ValidationInputs::new(metadata, parent, io);
-    validate_dependencies(
+    inputs.stage = intent.compact_stage();
+    validate_dependency_checks(
         intent.dependencies(),
         intent.start().map(|start| start.snapshot_id),
         &mut inputs,
+        Some(RowDeltaInputs { io, removed_data }),
     )
     .await
 }
@@ -47,21 +60,59 @@ pub(crate) async fn diagnose_ref_unchanged(
     io: &dyn ArtifactWriter,
 ) -> Result<Verdict> {
     let mut inputs = ValidationInputs::new(metadata, parent, io);
-    validate_dependencies(
+    validate_dependency_checks(
         &[Dependency::RefUnchanged],
         intent.start().map(|start| start.snapshot_id),
         &mut inputs,
+        None,
     )
     .await
 }
 
+#[cfg(test)]
 async fn validate_dependencies(
     dependencies: &[Dependency],
     start: Option<i64>,
     inputs: &mut ValidationInputs<'_>,
 ) -> Result<Verdict> {
+    validate_dependency_checks(dependencies, start, inputs, None).await
+}
+
+#[derive(Clone, Copy)]
+struct RowDeltaInputs<'a> {
+    io: &'a dyn ArtifactWriter,
+    removed_data: Option<&'a dyn RemovedDataFiles>,
+}
+
+async fn validate_dependency_checks(
+    dependencies: &[Dependency],
+    start: Option<i64>,
+    inputs: &mut ValidationInputs<'_>,
+    row_delta: Option<RowDeltaInputs<'_>>,
+) -> Result<Verdict> {
     for dependency in dependencies {
         let culprit = match dependency {
+            Dependency::RowDeltaWindow(check) => {
+                let row_delta = row_delta.ok_or_else(|| {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::Unexpected,
+                        "Row-delta validation requires its original attempt inputs",
+                    )
+                })?;
+                let verdict = validate_row_delta(
+                    dependency,
+                    check,
+                    inputs,
+                    start,
+                    row_delta.io,
+                    row_delta.removed_data,
+                )
+                .await?;
+                if verdict != Verdict::Holds {
+                    return Ok(verdict);
+                }
+                None
+            }
             Dependency::NoRead => None,
             Dependency::RefUnchanged => (inputs.parent != start).then_some(Culprit::Ref {
                 expected: start,

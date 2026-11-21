@@ -241,7 +241,12 @@ pub enum QueryTableBindingAdmission {
     /// admitted its read materialization or terminal write target.
     Exact(ConnectorControlPlanningPin),
     /// One statement's signed mutation target scan and admitted base.
-    RowMutationMatch(ConnectorControlPlanningPin, Option<i64>),
+    RowMutationMatch(ConnectorControlPlanningPin, Option<i64>, [u8; 32]),
+    /// An ordinary Current source sharing the admitted mutation table and base.
+    RowMutationCurrent(
+        ConnectorControlPlanningPin,
+        novarocks_spi::connector::ConnectorRowMutationCurrent,
+    ),
     /// A provider-frozen read has no independent table-selector materialization.
     /// Its source facts remain opaque in the provider request, while this
     /// retained lease fences the synthetic SQL relation to one exact control
@@ -252,9 +257,10 @@ pub enum QueryTableBindingAdmission {
 impl QueryTableBindingAdmission {
     pub fn exact_planning_pin(&self) -> Result<ConnectorControlPlanningPin, String> {
         match self {
-            Self::Exact(lease) | Self::FrozenRead(lease) | Self::RowMutationMatch(lease, _) => {
-                Ok(lease.clone())
-            }
+            Self::Exact(lease)
+            | Self::FrozenRead(lease)
+            | Self::RowMutationMatch(lease, _, _)
+            | Self::RowMutationCurrent(lease, _) => Ok(lease.clone()),
             Self::Local => Err("query binding has no connector planning pin".to_string()),
         }
     }
@@ -715,7 +721,8 @@ impl QueryTableBindingStore {
             }
             if let QueryTableBindingAdmission::Exact(lease)
             | QueryTableBindingAdmission::FrozenRead(lease)
-            | QueryTableBindingAdmission::RowMutationMatch(lease, _) = &binding.admission
+            | QueryTableBindingAdmission::RowMutationMatch(lease, _, _)
+            | QueryTableBindingAdmission::RowMutationCurrent(lease, _) = &binding.admission
             {
                 let descriptor = lease.binding().descriptor();
                 material.extend_from_slice(descriptor.provider_id.as_str().as_bytes());
@@ -908,6 +915,82 @@ impl QueryTableBindingStore {
             .map_err(Clone::clone);
         entries.insert(key, result);
         response
+    }
+
+    /// Install the original target observation before completing ordinary Current reads.
+    pub(crate) fn register_row_mutation_current(
+        &self,
+        original: &novarocks_spi::connector::ConnectorTableMetadata,
+        planning_pin: &ConnectorControlPlanningPin,
+        preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+    ) -> Result<(), String> {
+        let source = preparation
+            .current_source(original)
+            .map_err(|error| error.to_string())?;
+        let control = planning_pin.binding();
+        if control.descriptor().instance_id != preparation.owner().instance_id
+            || control.incarnation() != preparation.owner().incarnation
+        {
+            return Err("row mutation Current read has another planning generation".into());
+        }
+        let identity = source.identity();
+        let catalog = identity.instance_id.as_str();
+        let namespace = identity.namespace.as_ref();
+        let table = identity.table.as_ref();
+        let key = QueryTableBindingKey::strict_base(catalog, namespace, table);
+        self.resolve_or_insert_with_id(key, |id| {
+            let mut materialization =
+                super::query_catalog::connector_table_materialization_from_metadata(
+                    original.clone(),
+                    planning_pin.clone(),
+                )?;
+            materialization.statistics_pin = control
+                .statistics()
+                .map(|statistics| {
+                    statistics
+                        .row_mutation_statistics_version(&source)
+                        .map(
+                            |data_version| crate::connector::backend::ResolvedTableStatisticsPin {
+                                table: preparation.match_source().clone(),
+                                data_version,
+                            },
+                        )
+                })
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let mut binding =
+                super::query_materializer::connector_query_binding_from_materialization(
+                    materialization,
+                    catalog,
+                    namespace,
+                    table,
+                    id,
+                )?;
+            binding.admission = QueryTableBindingAdmission::RowMutationCurrent(
+                planning_pin.clone(),
+                source.clone(),
+            );
+            Ok(binding)
+        })?;
+        Ok(())
+    }
+
+    /// The one original rewritten target, already installed during catalog
+    /// completion. The returned token carries no relation or predicate facts.
+    pub(crate) fn row_mutation_match_binding(&self) -> Result<Option<SqlTableBindingId>, String> {
+        let bindings = self.by_id.lock().expect("query table binding by-id lock");
+        let mut matches = bindings.iter().filter_map(|(id, binding)| {
+            matches!(
+                binding.admission,
+                QueryTableBindingAdmission::RowMutationMatch(..)
+            )
+            .then_some(*id)
+        });
+        let target = matches.next();
+        if matches.next().is_some() {
+            return Err("statement admitted more than one row mutation match target".into());
+        }
+        Ok(target)
     }
 
     pub fn binding(&self, id: SqlTableBindingId) -> Result<Arc<QueryTableBinding>, String> {

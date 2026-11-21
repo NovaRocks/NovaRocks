@@ -250,12 +250,15 @@ pub(crate) struct StreamedComputationProducer {
     scope: WorkScope,
 }
 impl StreamedComputationProducer {
-    pub(crate) fn native_body_exited(&self) -> Result<(), WorkError> {
-        let handle = StreamedComputationCutHandle {
+    pub(crate) fn cut_handle(&self) -> StreamedComputationCutHandle {
+        StreamedComputationCutHandle {
             activity: std::sync::Arc::downgrade(&self.activity),
             scope: self.scope.clone(),
-        };
-        handle.native_body_exited()
+        }
+    }
+
+    pub(crate) fn native_body_exited(&self) -> Result<(), WorkError> {
+        self.cut_handle().native_body_exited()
     }
 }
 impl StreamedComputationCutHandle {
