@@ -46,12 +46,11 @@ impl MaintenanceCommandExecutor {
     fn prepare_metadata_source(
         &self,
         lowered: crate::table_maintenance::ParsedMaintenanceStatement,
-        spark_call: bool,
         context: MaintenanceRequestContext<'_>,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         lease: novarocks_spi::connector::ConnectorMetadataMaintenanceSession,
-        retained: Option<table_execute::MetadataPreparation>,
+        retained: table_execute::MetadataPreparation,
     ) -> Result<MaintenanceCommandCall, CommandError> {
         let profile = lease.io_profile().map_err(|e| e.to_string())?;
         let capacity = execution.result_capacity().ok_or_else(|| {
@@ -71,8 +70,8 @@ impl MaintenanceCommandExecutor {
         let connector = connector_context.clone().with_io_admission(
             io.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>
         );
-        let needs_metadata_cpu = retained.as_ref().is_some_and(|retained| matches!(
-            retained.intent,
+        let needs_metadata_cpu = matches!(
+            &retained.intent,
             crate::connector::metadata_maintenance::MetadataMaintenanceIntent::TrinoExpireSnapshots {
                 inputs: novarocks_spi::connector::ConnectorExpireSnapshotsExecute {
                     clean_expired_metadata: true,
@@ -80,7 +79,7 @@ impl MaintenanceCommandExecutor {
                 },
                 ..
             }
-        ));
+        );
         let pending = MetadataProductPreparation {
             kernel: self.kernel.clone(),
             execution: execution.clone(),
@@ -88,7 +87,6 @@ impl MaintenanceCommandExecutor {
             lease,
             retained,
             lowered,
-            spark_call,
             catalog: context.current_catalog.map(str::to_owned),
             database: context.current_database.to_owned(),
         };
@@ -177,9 +175,8 @@ struct MetadataProductPreparation {
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector: novarocks_spi::connector::ConnectorRequestContext,
     lease: novarocks_spi::connector::ConnectorMetadataMaintenanceSession,
-    retained: Option<table_execute::MetadataPreparation>,
+    retained: table_execute::MetadataPreparation,
     lowered: crate::table_maintenance::ParsedMaintenanceStatement,
-    spark_call: bool,
     catalog: Option<String>,
     database: String,
 }
@@ -189,10 +186,6 @@ impl MetadataProductPreparation {
         &self,
         io: &super::io_admission::MetadataIoAdmission,
     ) -> Result<MetadataCpu, novarocks_workload_control::WorkError> {
-        let retained = self
-            .retained
-            .as_ref()
-            .expect("clean expiration has the original table binding");
         let runtime = self.kernel.rewrite_runtime()?;
         let capacity = io.root_capacity()?;
         let wake = Arc::new(MetadataCpuWake::default());
@@ -203,7 +196,7 @@ impl MetadataProductPreparation {
             .planning_metadata_cpu_port(
                 capacity.root_scope(),
                 capacity.try_window_alias()?,
-                &retained.planning,
+                &self.retained.planning,
                 self.execution.cancellation().clone(),
                 runtime.execution.0.runtime().clone(),
                 wake.clone(),
@@ -224,15 +217,17 @@ impl MetadataProductPreparation {
             Some(cpu) => self.connector.with_metadata_cpu(cpu.port.clone()),
             None => self.connector,
         };
-        let mut engine = RequestScopedMaintenanceEngine::new(
+        let retained = self.retained;
+        let table = RequestScopedMaintenanceEngine::target_identity(&retained.target)
+            .map_err(TerminalError::from)?;
+        let engine = RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             self.execution,
             connector.clone(),
-        );
-        if let Some(retained) = self.retained {
-            let table = RequestScopedMaintenanceEngine::target_identity(&retained.target)
-                .map_err(TerminalError::from)?;
-            let call = crate::connector::metadata_maintenance::MetadataMaintenanceCall::try_new_on_session(
+        )
+        .with_metadata_target(retained.target, retained.planning);
+        let call =
+            crate::connector::metadata_maintenance::MetadataMaintenanceCall::try_new_on_session(
                 self.lease,
                 novarocks_spi::connector::ConnectorMutationOperationId::new(),
                 table,
@@ -240,9 +235,7 @@ impl MetadataProductPreparation {
                 connector,
             )
             .map_err(|error| TerminalError::from(format!("{error:?}")))?;
-            original.install_call(call).map_err(TerminalError::from)?;
-            engine = engine.with_metadata_target(retained.target, retained.planning);
-        }
+        original.install_call(call).map_err(TerminalError::from)?;
         original
             .install_engine(engine.clone())
             .map_err(TerminalError::from)?;
@@ -251,7 +244,6 @@ impl MetadataProductPreparation {
             engine,
             retained: original.clone(),
             lowered: self.lowered,
-            spark_call: self.spark_call,
             catalog: self.catalog,
             database: self.database,
         })))
@@ -657,7 +649,6 @@ struct MetadataProductInput {
     engine: RequestScopedMaintenanceEngine,
     retained: MaintenanceActionState,
     lowered: crate::table_maintenance::ParsedMaintenanceStatement,
-    spark_call: bool,
     catalog: Option<String>,
     database: String,
 }
@@ -670,7 +661,6 @@ async fn make_metadata_product(
             &input.engine,
             &input.retained,
             input.lowered,
-            input.spark_call,
             MaintenanceRequestContext {
                 current_catalog: input.catalog.as_deref(),
                 current_database: &input.database,

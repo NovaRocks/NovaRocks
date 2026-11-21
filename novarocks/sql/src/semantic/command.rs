@@ -190,31 +190,9 @@ pub enum StatisticsSqlCommand {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MaintenanceSqlCommand {
-    Call {
-        procedure: ObjectName,
-        arguments: Vec<ProcedureArgumentSql>,
-        argument_mode: ProcedureArgumentModeSql,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcedureArgumentSql {
-    pub name: Option<String>,
-    pub value: MaintenanceValueSql,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcedureArgumentModeSql {
     Empty,
     Positional,
     Named,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MaintenanceValueSql {
-    Literal(CommandLiteral),
-    Timestamp(CommandLiteral),
-    Map(Vec<(CommandLiteral, CommandLiteral)>),
 }

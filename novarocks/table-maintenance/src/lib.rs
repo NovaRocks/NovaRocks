@@ -22,8 +22,6 @@
 //! this crate supplies the single target conflict gate and rewrite/cleanup
 //! state machines shared by SQL and MV.
 
-use std::collections::BTreeMap;
-
 pub mod activity;
 pub mod product;
 pub mod runtime;
@@ -60,14 +58,6 @@ impl MaintenanceEffectId {
 /// One typed maintenance operation after SQL lowering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaintenanceActionRequest {
-    RewriteDataFiles {
-        target: MaintenanceTarget,
-        base_snapshot_id: i64,
-        job_id: Option<i64>,
-        options: BTreeMap<String, String>,
-        branch: Option<String>,
-        where_clause: Option<String>,
-    },
     RewriteManifests {
         target: MaintenanceTarget,
         use_caching: Option<bool>,
@@ -81,11 +71,6 @@ pub enum MaintenanceActionRequest {
     RemoveOrphanFiles {
         target: MaintenanceTarget,
         older_than_ms: i64,
-    },
-    RewritePositionDeleteFiles {
-        target: MaintenanceTarget,
-        options: BTreeMap<String, String>,
-        where_clause: Option<String>,
     },
 }
 
@@ -124,13 +109,6 @@ pub enum MaintenanceActionOutcome {
     },
     RemoveOrphanFiles {
         orphan_file_locations: Vec<String>,
-    },
-    RewritePositionDeleteFiles {
-        rewritten_delete_files_count: i32,
-        /// `None` is an unknown publication fact, distinct from zero files.
-        added_delete_files_count: Option<i32>,
-        rewritten_bytes_count: i64,
-        added_bytes_count: i64,
     },
 }
 

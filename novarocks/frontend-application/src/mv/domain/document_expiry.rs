@@ -485,7 +485,6 @@ mod tests {
     #[test]
     fn trino_document_expiry_keeps_the_authored_integer_spelling() {
         use novarocks_parser::{ast::TrinoStatement, parser};
-        use novarocks_sql::semantic::MaintenanceSqlCommand;
 
         let legacy = call(
             "CALL ice.system.novarocks_mv_document_expiry(\"table\" => 'sales.mv', keep_last => 2, token => 'once')",
@@ -509,9 +508,6 @@ mod tests {
             assert_eq!(authored, spelling);
             assert_eq!(*parsed_value, 2);
             assert_eq!(&sql[literal.span.start()..literal.span.end()], spelling);
-            let statement = call.maintenance_command().unwrap();
-            assert!(matches!(statement, MaintenanceSqlCommand::Call { .. }));
-            assert_eq!(statement, legacy.maintenance_command().unwrap());
             let decoded = decode_call(&call);
             if admitted {
                 assert_eq!(decoded.unwrap(), decode_call(&legacy).unwrap());

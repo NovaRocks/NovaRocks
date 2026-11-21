@@ -33,7 +33,6 @@ pub(crate) fn maintenance_facts_from_stats(
         current_snapshot_id: stats.current_snapshot_id,
         total_data_files: stats.total_data_files.map(|value| value as i64),
         max_compactable_data_files: stats.max_compactable_data_files.map(|value| value as i64),
-        total_delete_files: stats.total_delete_files.map(|value| value as i64),
         total_files_size_bytes: stats.total_files_size_bytes.map(|value| value as i64),
         oldest_snapshot_timestamp_ms: stats
             .snapshots

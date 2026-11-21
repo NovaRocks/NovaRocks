@@ -34,7 +34,6 @@ pub struct MaintenanceCoordinatorConfig {
     pub tick_interval_ms: u64,
     pub max_concurrent: usize,
     pub compaction_min_data_files: i64,
-    pub dv_min_delete_files: i64,
     pub action_cooldown_ms: i64,
     pub max_consecutive_failures: u32,
 }
@@ -45,7 +44,6 @@ impl MaintenanceCoordinatorConfig {
         tick_interval_ms: u64,
         max_concurrent: usize,
         compaction_min_data_files: i64,
-        dv_min_delete_files: i64,
         action_cooldown_ms: i64,
         max_consecutive_failures: u32,
     ) -> Self {
@@ -54,7 +52,6 @@ impl MaintenanceCoordinatorConfig {
             tick_interval_ms,
             max_concurrent,
             compaction_min_data_files,
-            dv_min_delete_files,
             action_cooldown_ms,
             max_consecutive_failures,
         }
@@ -68,7 +65,6 @@ impl Default for MaintenanceCoordinatorConfig {
             tick_interval_ms: 60_000,
             max_concurrent: 1,
             compaction_min_data_files: 100,
-            dv_min_delete_files: 10,
             action_cooldown_ms: 3_600_000,
             max_consecutive_failures: 4,
         }
@@ -78,7 +74,6 @@ impl Default for MaintenanceCoordinatorConfig {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MaintenanceActionKind {
     Expire,
-    RewritePositionDeletes,
     Optimize,
 }
 
@@ -88,9 +83,6 @@ pub enum AutomaticMaintenanceAction {
         older_than_ms: i64,
         retain_last: u32,
     },
-    RewritePositionDeletes {
-        min_input_files: usize,
-    },
     Optimize,
 }
 
@@ -98,7 +90,6 @@ impl AutomaticMaintenanceAction {
     pub const fn kind(&self) -> MaintenanceActionKind {
         match self {
             Self::ExpireSnapshots { .. } => MaintenanceActionKind::Expire,
-            Self::RewritePositionDeletes { .. } => MaintenanceActionKind::RewritePositionDeletes,
             Self::Optimize => MaintenanceActionKind::Optimize,
         }
     }
@@ -113,7 +104,6 @@ pub enum MaintenanceSkipReason {
     SnapshotUnchanged,
     MissingSummaryStats,
     BelowThreshold,
-    SuppressedByOptimize,
     Cooldown,
     FailureBackoff,
     CircuitBroken,
@@ -191,11 +181,6 @@ pub enum OptimizeDurableOutcome {
 #[async_trait::async_trait]
 pub trait AutomaticMaintenanceRunner: Send {
     async fn expire_snapshots_durably(
-        &mut self,
-        request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
-
-    async fn rewrite_position_deletes_durably(
         &mut self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
@@ -290,7 +275,6 @@ pub struct MvMaintenanceFacts {
     pub current_snapshot_id: Option<i64>,
     pub total_data_files: Option<i64>,
     pub max_compactable_data_files: Option<i64>,
-    pub total_delete_files: Option<i64>,
     pub total_files_size_bytes: Option<i64>,
     pub oldest_snapshot_timestamp_ms: Option<i64>,
     pub snapshot_count: usize,
@@ -306,7 +290,6 @@ pub struct MvMaintenanceFacts {
 const DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS: i64 = 432_000_000;
 const DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP: u32 = 1;
 const DEFAULT_TARGET_FILE_SIZE_BYTES: i64 = 536_870_912;
-const MIN_POSITION_DELETE_INPUT_FILES: usize = 2;
 const SMALL_FILE_RATIO_NUMERATOR: i64 = 3;
 const SMALL_FILE_RATIO_DENOMINATOR: i64 = 4;
 const FAILURE_BACKOFF_BASE_MS: i64 = 60_000;
@@ -336,7 +319,6 @@ impl MaintenancePolicyState {
                 tick_interval_ms: config.tick_interval_ms.max(1),
                 max_concurrent: config.max_concurrent.max(1),
                 compaction_min_data_files: config.compaction_min_data_files.max(1),
-                dv_min_delete_files: config.dv_min_delete_files.max(1),
                 max_consecutive_failures: config.max_consecutive_failures.max(1),
                 ..config
             },
@@ -554,19 +536,6 @@ impl MaintenanceCoordinator {
                         })
                         .await
                 }
-                AutomaticMaintenanceAction::RewritePositionDeletes { min_input_files } => {
-                    let mut options = BTreeMap::new();
-                    options.insert("min-input-files".to_string(), min_input_files.to_string());
-                    runner
-                        .rewrite_position_deletes_durably(
-                            MaintenanceActionRequest::RewritePositionDeleteFiles {
-                                target: attempt.target.clone(),
-                                options,
-                                where_clause: None,
-                            },
-                        )
-                        .await
-                }
                 AutomaticMaintenanceAction::Optimize => {
                     match runner.optimize_durably(attempt.target.clone()).await {
                         Ok(OptimizeDurableOutcome::Finished { effect_id }) => {
@@ -639,9 +608,6 @@ fn expected_outcome(kind: MaintenanceActionKind, outcome: &MaintenanceActionOutc
         (
             MaintenanceActionKind::Expire,
             MaintenanceActionOutcome::ExpireSnapshots { .. }
-        ) | (
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceActionOutcome::RewritePositionDeleteFiles { .. }
         )
     )
 }
@@ -653,7 +619,6 @@ struct TablePolicy {
     expire_min_keep: u32,
     target_file_size_bytes: i64,
     compaction_min_data_files: i64,
-    dv_min_delete_files: i64,
 }
 
 impl TablePolicy {
@@ -673,7 +638,6 @@ impl TablePolicy {
                 .unwrap_or(DEFAULT_TARGET_FILE_SIZE_BYTES)
                 .max(1),
             compaction_min_data_files: config.compaction_min_data_files,
-            dv_min_delete_files: config.dv_min_delete_files,
         }
     }
 }
@@ -689,7 +653,6 @@ fn evaluate_facts(
     if !policy.enabled {
         for kind in [
             MaintenanceActionKind::Expire,
-            MaintenanceActionKind::RewritePositionDeletes,
             MaintenanceActionKind::Optimize,
         ] {
             evaluation
@@ -709,40 +672,15 @@ fn evaluate_facts(
             MaintenanceActionKind::Optimize,
             MaintenanceSkipReason::SnapshotUnchanged,
         ));
-        evaluation.skips.push((
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceSkipReason::SnapshotUnchanged,
-        ));
         return evaluation;
     }
     let optimize = admit(MaintenanceActionKind::Optimize, state, config, now_ms)
         .and_then(|()| plan_optimize(facts, policy));
-    let optimize_planned = optimize.is_ok();
     match optimize {
         Ok(action) => evaluation.actions.push(action),
         Err(skip) => evaluation
             .skips
             .push((MaintenanceActionKind::Optimize, skip)),
-    }
-    if optimize_planned {
-        evaluation.skips.push((
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceSkipReason::SuppressedByOptimize,
-        ));
-    } else {
-        match admit(
-            MaintenanceActionKind::RewritePositionDeletes,
-            state,
-            config,
-            now_ms,
-        )
-        .and_then(|()| plan_rewrite_position_deletes(facts, policy))
-        {
-            Ok(action) => evaluation.actions.push(action),
-            Err(skip) => evaluation
-                .skips
-                .push((MaintenanceActionKind::RewritePositionDeletes, skip)),
-        }
     }
     evaluation
 }
@@ -763,13 +701,11 @@ fn admit(
     {
         return Err(MaintenanceSkipReason::FailureBackoff);
     }
-    if matches!(
-        kind,
-        MaintenanceActionKind::Optimize | MaintenanceActionKind::RewritePositionDeletes
-    ) && state
-        .last_action_ms
-        .get(&kind)
-        .is_some_and(|last| last.saturating_add(config.action_cooldown_ms) > now_ms)
+    if kind == MaintenanceActionKind::Optimize
+        && state
+            .last_action_ms
+            .get(&kind)
+            .is_some_and(|last| last.saturating_add(config.action_cooldown_ms) > now_ms)
     {
         return Err(MaintenanceSkipReason::Cooldown);
     }
@@ -823,21 +759,6 @@ fn plan_optimize(
         return Err(MaintenanceSkipReason::BelowThreshold);
     }
     Ok(AutomaticMaintenanceAction::Optimize)
-}
-
-fn plan_rewrite_position_deletes(
-    facts: &MvMaintenanceFacts,
-    policy: &TablePolicy,
-) -> Result<AutomaticMaintenanceAction, MaintenanceSkipReason> {
-    let Some(delete_files) = facts.total_delete_files else {
-        return Err(MaintenanceSkipReason::MissingSummaryStats);
-    };
-    if delete_files < policy.dv_min_delete_files {
-        return Err(MaintenanceSkipReason::BelowThreshold);
-    }
-    Ok(AutomaticMaintenanceAction::RewritePositionDeletes {
-        min_input_files: MIN_POSITION_DELETE_INPUT_FILES,
-    })
 }
 
 fn failure_backoff_ms(attempt: u32) -> i64 {
@@ -973,7 +894,6 @@ mod tests {
             current_snapshot_id: Some(3),
             total_data_files: Some(200),
             max_compactable_data_files: Some(200),
-            total_delete_files: Some(0),
             total_files_size_bytes: Some(200 * 1024 * 1024),
             oldest_snapshot_timestamp_ms: Some(1_000),
             snapshot_count: 3,
@@ -1025,20 +945,6 @@ mod tests {
             })
         }
 
-        async fn rewrite_position_deletes_durably(
-            &mut self,
-            _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
-            self.calls
-                .push(MaintenanceActionKind::RewritePositionDeletes);
-            Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
-                rewritten_delete_files_count: 1,
-                added_delete_files_count: Some(1),
-                rewritten_bytes_count: 1,
-                added_bytes_count: 1,
-            })
-        }
-
         async fn optimize_durably(
             &mut self,
             _target: MaintenanceTarget,
@@ -1060,7 +966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_prefers_durable_optimize_and_suppresses_delete_rewrite() {
+    async fn policy_dispatches_durable_optimize() {
         let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
         let attempt = coordinator
             .try_begin(1, target("mv"), &policy_facts(), NOW)
@@ -1071,10 +977,6 @@ mod tests {
                 .actions
                 .contains(&AutomaticMaintenanceAction::Optimize)
         );
-        assert!(attempt.evaluation().skips.contains(&(
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceSkipReason::SuppressedByOptimize,
-        )));
         let report = run_attempt(&mut coordinator, attempt, &mut Runner::default(), NOW).await;
         assert_eq!(
             report.completed,
@@ -1255,7 +1157,6 @@ mod tests {
         assert!(attempt.evaluation().actions.is_empty());
         for kind in [
             MaintenanceActionKind::Expire,
-            MaintenanceActionKind::RewritePositionDeletes,
             MaintenanceActionKind::Optimize,
         ] {
             assert!(

@@ -120,8 +120,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         target: &MaintenanceTarget,
     ) -> Result<(), novarocks_query_application::session_error::QueryServiceError>;
 
-    fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String>;
-
     async fn execute_action(
         &self,
         state: &MaintenanceActionState,
@@ -153,7 +151,6 @@ pub trait TableMaintenanceService: Send + Sync {
         _engine: &dyn TableMaintenanceEngine,
         _state: &MaintenanceActionState,
         _statement: crate::table_maintenance::ParsedMaintenanceStatement,
-        _spark_procedure: bool,
         _context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, TerminalError> {
         Err(TerminalError::pre_dispatch_failed(
@@ -393,14 +390,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         )
         .map_err(crate::mv::domain::readiness::connector_application_error)?;
         self.reject_direct_rewrite_on_mv(target, &exact_lease).await
-    }
-
-    fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
-        self::iceberg::current_snapshot_id_with_ports(
-            self.kernel.connector_control().as_ref(),
-            target,
-            self.connector_context.clone(),
-        )
     }
 
     async fn execute_action(
@@ -728,15 +717,7 @@ fn rewrite_sink_mode(
         ConnectorWriteInputShape::RowLineage { .. } => {
             Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::RowLineageData)
         }
-        ConnectorWriteInputShape::PositionDelete { .. } => {
-            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::PositionDeletes)
-        }
-        ConnectorWriteInputShape::DeletionVector { .. } => {
-            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::DeletionVectors)
-        }
-        ConnectorWriteInputShape::EqualityDelete { .. } => {
-            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::EqualityDeletes)
-        }
+        _ => Err("OPTIMIZE requires a data-file writer input".to_string()),
     }
 }
 
