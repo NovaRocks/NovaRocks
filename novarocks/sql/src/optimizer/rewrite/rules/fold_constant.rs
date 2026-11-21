@@ -662,10 +662,6 @@ fn fold_scalar_uncached(
     Ok(try_fold_node_current(arena, rebuilt, ctx, work)?.unwrap_or(rebuilt))
 }
 
-/// Keep the source-sensitive path intact, while still folding the producer's
-/// numeric arguments. Do not memoize this contextual result: the same producer
-/// may independently be folded when it is another projection's root.
-
 /// Fold a rebuilt node only after every direct child has become a constant.
 fn try_fold_node_current(
     arena: &mut ScalarArena,

@@ -4855,10 +4855,6 @@ fn observed_all<T>(
 #[path = "constant_binding_tests.rs"]
 pub(super) mod constant_binding_tests;
 
-/// Construct the actual private DS scalar definition for cross-crate runtime
-/// tests before public catalogue registration. No production caller enables
-/// this feature; binding, metadata and installed declarations keep one author.
-
 #[cfg(test)]
 pub(super) fn ndv_invocation_data_test_catalog() -> EngineFunctionCatalog {
     let original = build_builtin_engine_function_catalog().unwrap();

@@ -189,16 +189,16 @@ mod tests {
             panic!("binary numeric kernels must not wait");
         }
     }
-    fn instance(name: &str, types: &[FunctionValueType; 2]) -> ScalarEvaluationInstance {
-        let prepared = super::super::numeric_mod_owner::prepared_for_test(name, types).unwrap();
+    fn instance(types: &[FunctionValueType; 2]) -> ScalarEvaluationInstance {
+        let prepared = super::super::numeric_mod_owner::prepared_for_test("mod", types).unwrap();
         ScalarEvaluationInstance::instantiate(prepared).unwrap()
     }
-    fn dense(name: &str, left: ArrayRef, right: ArrayRef) -> ArrayRef {
+    fn dense(left: ArrayRef, right: ArrayRef) -> ArrayRef {
         let types = [
             FunctionValueType::from_legacy_declared_projection(left.data_type().clone(), true),
             FunctionValueType::from_legacy_declared_projection(right.data_type().clone(), true),
         ];
-        let mut instance = instance(name, &types);
+        let mut instance = instance(&types);
         let arguments = [
             EvaluatedArgument::Column(&left),
             EvaluatedArgument::Column(&right),
@@ -209,9 +209,8 @@ mod tests {
         assert!(output.errors().is_empty());
         output.into_parts().1
     }
-    fn floats(name: &str, left: Vec<Option<f64>>, right: Vec<Option<f64>>) -> ArrayRef {
+    fn floats(left: Vec<Option<f64>>, right: Vec<Option<f64>>) -> ArrayRef {
         dense(
-            name,
             Arc::new(Float64Array::from(left)),
             Arc::new(Float64Array::from(right)),
         )
@@ -266,7 +265,7 @@ mod tests {
             -3,
             0,
         ];
-        let expected_mod = [
+        let expected = [
             Some(0.0),
             Some(-1.0),
             Some(0.0),
@@ -279,33 +278,20 @@ mod tests {
             Some(1.0),
             None,
         ];
-        for (name, expected) in [("mod", expected_mod)] {
-            let result = dense(
-                name,
-                Arc::new(Int64Array::from(left.to_vec())),
-                Arc::new(Int64Array::from(right.to_vec())),
-            );
-            assert_values(&result, &expected);
-        }
+        let result = dense(
+            Arc::new(Int64Array::from(left.to_vec())),
+            Arc::new(Int64Array::from(right.to_vec())),
+        );
+        assert_values(&result, &expected);
     }
 
     #[test]
     fn signed_sources_keep_full_integer_precision_until_final_float_output() {
-        for name in ["mod"] {
-            let result = dense(
-                name,
-                Arc::new(Int64Array::from(vec![9007199254740993, i64::MAX, i64::MIN])),
-                Arc::new(Int64Array::from(vec![2, 2, -3])),
-            );
-            assert_values(
-                &result,
-                &[
-                    Some(1.0),
-                    Some(1.0),
-                    Some(if name == "mod" { -2.0 } else { 1.0 }),
-                ],
-            );
-        }
+        let result = dense(
+            Arc::new(Int64Array::from(vec![9007199254740993, i64::MAX, i64::MIN])),
+            Arc::new(Int64Array::from(vec![2, 2, -3])),
+        );
+        assert_values(&result, &[Some(1.0), Some(1.0), Some(-2.0)]);
     }
 
     #[test]
@@ -326,62 +312,54 @@ mod tests {
             Some(-f64::MAX),
             Some(0.9),
         ];
-        for (name, expected) in [(
-            "mod",
-            [
-                Some(-1.0),
-                Some(1.0),
-                Some(0.0),
-                Some(-1.0),
-                Some(-1.0),
-                None,
-            ],
-        )] {
-            assert_values(&floats(name, left.clone(), right.clone()), &expected);
-            let result = dense(
-                name,
-                Arc::new(Float32Array::from(vec![f32::MAX])),
-                Arc::new(Int8Array::from(vec![2])),
-            );
-            assert_values(&result, &[Some(1.0)]);
-        }
+        let expected = [
+            Some(-1.0),
+            Some(1.0),
+            Some(0.0),
+            Some(-1.0),
+            Some(-1.0),
+            None,
+        ];
+        assert_values(&floats(left, right), &expected);
+        let result = dense(
+            Arc::new(Float32Array::from(vec![f32::MAX])),
+            Arc::new(Int8Array::from(vec![2])),
+        );
+        assert_values(&result, &[Some(1.0)]);
     }
 
     #[test]
     fn nonfinite_zero_divisor_and_null_are_successful_null_without_row_errors() {
-        for name in ["mod"] {
-            let result = floats(
-                name,
-                vec![
-                    Some(f64::NAN),
-                    Some(f64::INFINITY),
-                    Some(3.0),
-                    Some(3.0),
-                    Some(3.0),
-                    None,
-                    Some(3.0),
-                    Some(-0.0),
-                ],
-                vec![
-                    Some(1.0),
-                    Some(1.0),
-                    Some(f64::NAN),
-                    Some(f64::NEG_INFINITY),
-                    Some(0.0),
-                    Some(2.0),
-                    None,
-                    Some(3.0),
-                ],
-            );
-            assert_values(
-                &result,
-                &[None, None, None, None, None, None, None, Some(0.0)],
-            );
-        }
+        let result = floats(
+            vec![
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(3.0),
+                Some(3.0),
+                Some(3.0),
+                None,
+                Some(3.0),
+                Some(-0.0),
+            ],
+            vec![
+                Some(1.0),
+                Some(1.0),
+                Some(f64::NAN),
+                Some(f64::NEG_INFINITY),
+                Some(0.0),
+                Some(2.0),
+                None,
+                Some(3.0),
+            ],
+        );
+        assert_values(
+            &result,
+            &[None, None, None, None, None, None, None, Some(0.0)],
+        );
     }
 
     #[test]
-    fn all_36_profiles_for_each_real_owner_use_the_original_integer_reader() {
+    fn all_36_profiles_use_the_original_integer_reader() {
         fn profiles(value: i8) -> [ArrayRef; 6] {
             [
                 Arc::new(Int8Array::from(vec![value])),
@@ -392,16 +370,14 @@ mod tests {
                 Arc::new(Float64Array::from(vec![f64::from(value)])),
             ]
         }
-        for (name, expected) in [("mod", -1.0)] {
-            let mut pairs = 0;
-            for left in profiles(-7) {
-                for right in profiles(3) {
-                    assert_values(&dense(name, left.clone(), right), &[Some(expected)]);
-                    pairs += 1;
-                }
+        let mut pairs = 0;
+        for left in profiles(-7) {
+            for right in profiles(3) {
+                assert_values(&dense(left.clone(), right), &[Some(-1.0)]);
+                pairs += 1;
             }
-            assert_eq!(pairs, 36);
         }
+        assert_eq!(pairs, 36);
     }
 
     #[test]
@@ -420,7 +396,7 @@ mod tests {
             FunctionValueType::new(DataType::Int64, false),
             FunctionValueType::new(DataType::Int16, false),
         ];
-        let mut instance = instance("mod", &types);
+        let mut instance = instance(&types);
         let result = instance
             .evaluate(selection, &arguments, &Control::default())
             .unwrap();
@@ -442,7 +418,7 @@ mod tests {
             FunctionValueType::new(DataType::Int8, false),
             FunctionValueType::new(DataType::Int8, false),
         ];
-        let mut broadcast = instance("mod", &types);
+        let mut broadcast = instance(&types);
         assert_values(
             broadcast
                 .evaluate(selection, &arguments, &Control::default())
@@ -463,7 +439,7 @@ mod tests {
             FunctionValueType::new(DataType::Float64, true),
             FunctionValueType::new(DataType::Int32, false),
         ];
-        let mut reverse = instance("mod", &types);
+        let mut reverse = instance(&types);
         assert_values(
             reverse
                 .evaluate(selection, &arguments, &Control::default())
@@ -475,7 +451,7 @@ mod tests {
             EvaluatedArgument::SelectedColumn(&compact),
             EvaluatedArgument::Column(&right),
         ];
-        let mut wrong_shape = instance("mod", &types);
+        let mut wrong_shape = instance(&types);
         assert!(matches!(
             wrong_shape.evaluate(selection, &wrong, &Control::default()),
             Err(ref cause) if crate::kernel_control::test_contract::input(cause)
@@ -515,7 +491,7 @@ mod tests {
             EvaluatedArgument::Constant(&left),
             EvaluatedArgument::Constant(&right),
         ];
-        let mut instance = instance("mod", &[ty.clone(), ty]);
+        let mut instance = instance(&[ty.clone(), ty]);
         assert_values(
             instance
                 .evaluate(Selection::all(3), &arguments, &Control::default())
@@ -535,24 +511,22 @@ mod tests {
             EvaluatedArgument::Scalar(&right),
         ];
         let source = FunctionValueType::new(DataType::Float64, true);
-        for name in ["mod"] {
-            let mut instance = instance(name, &[source.clone(), source.clone()]);
-            let control = Control::default();
-            let result = instance
-                .evaluate(Selection::all(0), &arguments, &control)
-                .unwrap();
-            assert!(result.values().is_empty());
-            assert_eq!(result.values().data_type(), &DataType::Float64);
-            assert!(result.errors().is_empty());
-            assert_eq!(
-                control.calls().iter().filter(|units| **units == 0).count(),
-                3
-            );
-        }
+        let mut instance = instance(&[source.clone(), source.clone()]);
+        let control = Control::default();
+        let result = instance
+            .evaluate(Selection::all(0), &arguments, &control)
+            .unwrap();
+        assert!(result.values().is_empty());
+        assert_eq!(result.values().data_type(), &DataType::Float64);
+        assert!(result.errors().is_empty());
+        assert_eq!(
+            control.calls().iter().filter(|units| **units == 0).count(),
+            3
+        );
     }
 
     #[test]
-    fn both_owners_keep_entry_256_tail_and_publication_failures_typed_and_latched() {
+    fn entry_256_tail_and_publication_failures_stay_typed_and_latched() {
         let left: ArrayRef = Arc::new(Float64Array::from(vec![-7.0]));
         let right: ArrayRef = Arc::new(Float64Array::from(vec![3.0]));
         let arguments = [
@@ -562,43 +536,41 @@ mod tests {
         let source = FunctionValueType::new(DataType::Float64, true);
         let types = [source.clone(), source];
         let selection = Selection::all(320);
-        for name in ["mod"] {
-            let mut baseline = instance(name, &types);
-            let control = Control::default();
-            baseline.evaluate(selection, &arguments, &control).unwrap();
-            let calls = control.calls();
-            let body_entry = calls
-                .iter()
-                .enumerate()
-                .filter(|(_, units)| **units == 0)
-                .nth(3)
-                .unwrap()
-                .0;
-            let interior = calls.iter().position(|units| *units == 256).unwrap();
-            assert!(body_entry < interior);
-            assert_eq!(calls[interior + 1], 64);
-            for error in [
-                KernelFailure::Cancelled,
-                KernelFailure::DeadlineExceeded,
-                KernelFailure::ResourceExhausted,
-            ] {
-                for at in [0, body_entry, interior, interior + 1, calls.len() - 1] {
-                    let mut instance = instance(name, &types);
-                    let control = Control::refusing(at, error.clone());
-                    assert_eq!(
-                        instance
-                            .evaluate(selection, &arguments, &control)
-                            .unwrap_err(),
-                        error
-                    );
-                    assert_eq!(control.calls().len(), at + 1);
-                    assert_eq!(
-                        instance
-                            .evaluate(selection, &arguments, &Control::default())
-                            .unwrap_err(),
-                        KernelFailure::InstanceFailed
-                    );
-                }
+        let mut baseline = instance(&types);
+        let control = Control::default();
+        baseline.evaluate(selection, &arguments, &control).unwrap();
+        let calls = control.calls();
+        let body_entry = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, units)| **units == 0)
+            .nth(3)
+            .unwrap()
+            .0;
+        let interior = calls.iter().position(|units| *units == 256).unwrap();
+        assert!(body_entry < interior);
+        assert_eq!(calls[interior + 1], 64);
+        for error in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            for at in [0, body_entry, interior, interior + 1, calls.len() - 1] {
+                let mut instance = instance(&types);
+                let control = Control::refusing(at, error.clone());
+                assert_eq!(
+                    instance
+                        .evaluate(selection, &arguments, &control)
+                        .unwrap_err(),
+                    error
+                );
+                assert_eq!(control.calls().len(), at + 1);
+                assert_eq!(
+                    instance
+                        .evaluate(selection, &arguments, &Control::default())
+                        .unwrap_err(),
+                    KernelFailure::InstanceFailed
+                );
             }
         }
     }
@@ -612,21 +584,19 @@ mod tests {
             EvaluatedArgument::Scalar(&right),
         ];
         let source = FunctionValueType::new(DataType::Float64, true);
-        for name in ["mod"] {
-            let mut instance = instance(name, &[source.clone(), source.clone()]);
-            let control = Control::default();
-            assert_eq!(
-                instance
-                    .evaluate(Selection::all(usize::MAX), &arguments, &control)
-                    .unwrap_err(),
-                KernelFailure::ResourceExhausted
-            );
-            assert!(control.calls().iter().all(|units| *units < 256));
-            assert_eq!(
-                control.calls().iter().filter(|units| **units == 0).count(),
-                4
-            );
-        }
+        let mut instance = instance(&[source.clone(), source.clone()]);
+        let control = Control::default();
+        assert_eq!(
+            instance
+                .evaluate(Selection::all(usize::MAX), &arguments, &control)
+                .unwrap_err(),
+            KernelFailure::ResourceExhausted
+        );
+        assert!(control.calls().iter().all(|units| *units < 256));
+        assert_eq!(
+            control.calls().iter().filter(|units| **units == 0).count(),
+            4
+        );
     }
 
     #[test]
@@ -642,38 +612,36 @@ mod tests {
             FunctionValueType::new(DataType::Int64, false),
         ];
         let selection = Selection::all(513);
-        for name in ["mod"] {
-            let mut baseline = instance(name, &types);
-            let control = Control::default();
-            baseline.evaluate(selection, &arguments, &control).unwrap();
-            for cause in [
-                KernelFailure::Cancelled,
-                KernelFailure::DeadlineExceeded,
-                KernelFailure::ResourceExhausted,
-                crate::kernel_control::invalid("original invalid"),
-                crate::kernel_control::internal("original internal"),
-                KernelFailure::Operational(crate::kernel_control::KernelDiagnostic::new(
-                    "original operational",
-                )),
-                KernelFailure::InstanceFailed,
-            ] {
-                for at in 0..control.calls().len() {
-                    let mut kernel = instance(name, &types);
-                    let refusal = Control::refusing(at, cause.clone());
-                    assert_eq!(
-                        kernel
-                            .evaluate(selection, &arguments, &refusal)
-                            .unwrap_err(),
-                        cause
-                    );
-                    assert_eq!(refusal.calls().len(), at + 1);
-                    assert_eq!(
-                        kernel
-                            .evaluate(selection, &arguments, &Control::default())
-                            .unwrap_err(),
-                        KernelFailure::InstanceFailed
-                    );
-                }
+        let mut baseline = instance(&types);
+        let control = Control::default();
+        baseline.evaluate(selection, &arguments, &control).unwrap();
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            crate::kernel_control::invalid("original invalid"),
+            crate::kernel_control::internal("original internal"),
+            KernelFailure::Operational(crate::kernel_control::KernelDiagnostic::new(
+                "original operational",
+            )),
+            KernelFailure::InstanceFailed,
+        ] {
+            for at in 0..control.calls().len() {
+                let mut kernel = instance(&types);
+                let refusal = Control::refusing(at, cause.clone());
+                assert_eq!(
+                    kernel
+                        .evaluate(selection, &arguments, &refusal)
+                        .unwrap_err(),
+                    cause
+                );
+                assert_eq!(refusal.calls().len(), at + 1);
+                assert_eq!(
+                    kernel
+                        .evaluate(selection, &arguments, &Control::default())
+                        .unwrap_err(),
+                    KernelFailure::InstanceFailed
+                );
             }
         }
     }

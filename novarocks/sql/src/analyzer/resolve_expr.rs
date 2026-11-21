@@ -3961,9 +3961,6 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 }
 
-/// Freeze the slice domain before overload binding. Runtime kernels receive
-/// a canonical temporal value, checked INT count, and literal control strings.
-
 fn function_order_by_position(expr: &ast::Expr) -> Option<i64> {
     match expr {
         ast::Expr::Literal(ast::Literal {
