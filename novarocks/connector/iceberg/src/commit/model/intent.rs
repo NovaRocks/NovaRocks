@@ -19,7 +19,9 @@
 
 use std::collections::BTreeMap;
 
-use super::{AddedContent, Dependency, FrozenEntry, OperationToken, RequestShape, invalid};
+use super::{
+    AddedContent, CommitProtocol, Dependency, FrozenEntry, OperationToken, RequestShape, invalid,
+};
 use crate::iceberg::{Result, TableIdent};
 use uuid::Uuid;
 
@@ -56,7 +58,7 @@ pub struct OperationIntentParts {
     pub start: Option<StartSnapshot>,
     pub changes: FileChanges,
     pub dependencies: Vec<Dependency>,
-    pub isolation: IsolationLevel,
+    pub(crate) protocol: CommitProtocol,
     pub shape: RequestShape,
     pub summary: BTreeMap<String, String>,
     pub token: OperationToken,
@@ -83,10 +85,12 @@ impl OperationIntent {
         if parts.start.is_some_and(|start| start.sequence_number < 0) {
             return Err(invalid("Start snapshot sequence must be nonnegative"));
         }
-        if parts.dependencies.iter().any(|dependency| {
-            matches!(dependency, Dependency::RowDeltaWindow(check) if check.isolation() != parts.isolation)
-        }) {
-            return Err(invalid("Row-delta validation does not have the intent's admitted isolation level"));
+        if matches!(&parts.protocol, CommitProtocol::RowDelta { .. })
+            && (parts.shape != RequestShape::SnapshotProducing || !parts.dependencies.is_empty())
+        {
+            return Err(invalid(
+                "Row-delta requires a snapshot operation with one validation window",
+            ));
         }
         if parts.shape == RequestShape::Create && parts.start.is_some() {
             return Err(invalid(
@@ -125,10 +129,8 @@ impl OperationIntent {
             && self.shape() != RequestShape::DocumentExpiry
             && !self.dependencies().contains(&Dependency::RefUnchanged)
     }
-    pub(crate) fn is_ordinary_row_delta(&self) -> bool {
-        self.dependencies()
-            .iter()
-            .any(|dependency| matches!(dependency, Dependency::RowDeltaWindow(_)))
+    pub(crate) const fn protocol(&self) -> &CommitProtocol {
+        &self.parts.protocol
     }
     pub fn target(&self) -> &TableTarget {
         &self.parts.target
@@ -144,10 +146,6 @@ impl OperationIntent {
     }
     pub fn dependencies(&self) -> &[Dependency] {
         &self.parts.dependencies
-    }
-    #[cfg(test)]
-    pub const fn isolation(&self) -> IsolationLevel {
-        self.parts.isolation
     }
     pub const fn shape(&self) -> RequestShape {
         self.parts.shape

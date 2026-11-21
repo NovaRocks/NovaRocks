@@ -323,7 +323,7 @@ impl Preparer for ManagedOverwrite<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commit::model::{FileChanges, IsolationLevel, OperationIntentParts, TableTarget};
+    use crate::commit::model::{FileChanges, OperationIntentParts, TableTarget};
     use crate::commit::overwrite::preparer_tests::Fixture;
     use crate::commit::publication_descriptor::{AttributionPlan, PublicationDescriptor};
     use crate::commit::staging::{StagingBase, StagingEngine};
@@ -426,7 +426,7 @@ mod tests {
             start: None,
             changes: FileChanges::default(),
             dependencies: vec![Dependency::RefUnchanged],
-            isolation: IsolationLevel::Serializable,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::from([(ICEBERG_WRITE_SESSION_MARKER_PROPERTY.into(), session)]),
             token: fixture.operation.token(),

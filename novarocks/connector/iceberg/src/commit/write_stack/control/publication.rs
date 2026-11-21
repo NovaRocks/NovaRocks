@@ -41,9 +41,9 @@ use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::dependency::ValidationInputs;
 use crate::commit::model::EntryIdentity;
 use crate::commit::model::{
-    AddedContent, BaseIdentity, CleanupScope, FileChanges, FrozenRequest, IsolationLevel,
+    AddedContent, BaseIdentity, CleanupScope, CommitProtocol, FileChanges, FrozenRequest,
     ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken, RequestShape,
-    StartSnapshot, TableTarget,
+    StartSnapshot, TableTarget, WriteSessionCommitProtocol, WriterSchemaSpec,
 };
 #[cfg(test)]
 use crate::commit::model::{
@@ -191,7 +191,8 @@ struct WriteRecipe<'a> {
     compact_stage: Option<usize>,
     materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
     fixed_mutation: bool,
-    isolation: Option<IsolationLevel>,
+    session_protocol: WriteSessionCommitProtocol,
+    writer: WriterSchemaSpec,
     selected: Option<crate::commit::selected_rewrite::SelectedRewriteFiles>,
     start: Option<StartSnapshot>,
     target: TableTarget,
@@ -340,18 +341,14 @@ impl<'a> WriteRecipe<'a> {
         } else {
             PreparedChange::default()
         };
-        // The writer schema and spec are exact admission facts, independent of the
-        // ref dependency. A concurrent schema/spec change never reinterprets files.
-        prefix
-            .requirements
-            .push(crate::iceberg::TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: facts.schema_id(),
-            });
-        prefix
-            .requirements
-            .push(crate::iceberg::TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: facts.default_partition_spec_id(),
-            });
+        let writer = WriterSchemaSpec {
+            schema_id: facts.schema_id(),
+            default_spec_id: facts.default_partition_spec_id(),
+        };
+        // A legacy operation keeps its original stage assertions.
+        if let WriteSessionCommitProtocol::Legacy = handle.commit_protocol() {
+            prefix.requirements.extend(writer.requirements());
+        }
         let target = TableTarget {
             ident: crate::iceberg::TableIdent::from_strs([facts.namespace(), facts.table_name()])
                 .map_err(|e| invalid(e.to_string()))?,
@@ -364,7 +361,8 @@ impl<'a> WriteRecipe<'a> {
             compact_stage: None,
             materialized,
             fixed_mutation,
-            isolation: handle.row_mutation_isolation(),
+            session_protocol: handle.commit_protocol(),
+            writer,
             selected,
             start: facts.base_snapshot_id().map(|id| StartSnapshot {
                 snapshot_id: id,
@@ -492,25 +490,32 @@ impl<'a> WriteRecipe<'a> {
                 removed.push(entry.frozen.clone());
             }
         }
+        let (dependencies, protocol) = match self.session_protocol {
+            WriteSessionCommitProtocol::Legacy => {
+                (self.dependencies.clone(), CommitProtocol::Legacy)
+            }
+            WriteSessionCommitProtocol::RowDelta(_) => {
+                let window = operation.row_delta_check().ok_or_else(|| {
+                    format_error(internal(
+                        "Iceberg row-delta operation lost its frozen validation",
+                    ))
+                })?;
+                (
+                    Vec::new(),
+                    CommitProtocol::RowDelta {
+                        window: window.clone(),
+                        writer: self.writer,
+                    },
+                )
+            }
+        };
         OperationIntent::new(OperationIntentParts {
             target: self.target.clone(),
             target_ref: self.target_ref.clone(),
             start: self.start,
             changes: FileChanges { added, removed },
-            dependencies: match self.isolation {
-                Some(_) => vec![crate::commit::model::Dependency::RowDeltaWindow(
-                    operation
-                        .row_delta_check()
-                        .ok_or_else(|| {
-                            format_error(internal(
-                                "Iceberg row-delta operation lost its frozen validation",
-                            ))
-                        })?
-                        .clone(),
-                )],
-                None => self.dependencies.clone(),
-            },
-            isolation: self.isolation.unwrap_or(IsolationLevel::Serializable),
+            dependencies,
+            protocol,
             shape: RequestShape::SnapshotProducing,
             summary: self.summary.clone(),
             token: operation.token(),
@@ -521,7 +526,7 @@ impl<'a> WriteRecipe<'a> {
                 None => intent,
             };
             Ok(
-                if self.isolation.is_none()
+                if matches!(self.session_protocol, WriteSessionCommitProtocol::Legacy)
                     && self.summary.keys().any(|key| {
                         key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX)
                     })
@@ -786,7 +791,8 @@ impl IcebergWriteSessionControl {
         let (operation, journal) = self.adopt_compact_operation(handle, compact, context)?;
         let recipe = WriteRecipe::freeze(handle, &[], documents).and_then(|mut recipe| {
             let validation = recipe
-                .isolation
+                .session_protocol
+                .row_delta_isolation()
                 .map(|isolation| {
                     let scope = received
                         .row_conflict_scope(&recipe.source)?
@@ -1566,7 +1572,7 @@ mod recovery_tests {
                     removed: Vec::new(),
                 },
                 dependencies: vec![Dependency::NoRead],
-                isolation: IsolationLevel::Serializable,
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: RequestShape::SnapshotProducing,
                 summary: BTreeMap::from([(
                     "novarocks.write.session.v1".into(),
@@ -1933,7 +1939,7 @@ mod keyed_preparation_tests {
             start: None,
             changes: FileChanges::default(),
             dependencies: vec![crate::commit::model::Dependency::RefUnchanged],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: documents
                 .records

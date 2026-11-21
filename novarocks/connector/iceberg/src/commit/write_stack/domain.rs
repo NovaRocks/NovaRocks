@@ -2381,7 +2381,7 @@ pub struct IcebergWriteCommitSession {
     session_id: IcebergWriteSessionId,
     creation_scope: Option<IcebergCreationScope>,
     mutation_read: Option<IcebergMutationReadRecipe>,
-    row_mutation_isolation: Option<crate::commit::model::IsolationLevel>,
+    commit_protocol: crate::commit::model::WriteSessionCommitProtocol,
     table: IcebergWriteTableFacts,
     flavor: IcebergWriteFlavor,
     purpose: ConnectorWriteAdmissionPurpose,
@@ -2559,14 +2559,13 @@ impl IcebergWriteCommitSession {
         mut self,
         isolation: crate::commit::model::IsolationLevel,
     ) -> Self {
-        self.row_mutation_isolation = Some(isolation);
+        self.commit_protocol =
+            crate::commit::model::WriteSessionCommitProtocol::RowDelta(isolation);
         self
     }
 
-    pub(crate) const fn row_mutation_isolation(
-        &self,
-    ) -> Option<crate::commit::model::IsolationLevel> {
-        self.row_mutation_isolation
+    pub(crate) const fn commit_protocol(&self) -> crate::commit::model::WriteSessionCommitProtocol {
+        self.commit_protocol
     }
 
     pub(crate) fn with_mutation_read(mut self, recipe: IcebergMutationReadRecipe) -> Self {
@@ -2755,7 +2754,7 @@ impl IcebergWriteCommitSession {
             session_id,
             creation_scope: None,
             mutation_read: None,
-            row_mutation_isolation: None,
+            commit_protocol: crate::commit::model::WriteSessionCommitProtocol::Legacy,
             table,
             flavor,
             purpose,

@@ -27,8 +27,8 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::CatalogPublisher;
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    BaseIdentity, FileChanges, IcebergCleanupReport, IsolationLevel, OperationIntent,
-    OperationIntentParts, OperationToken, PublicationOutcome, RequestShape, TableTarget,
+    BaseIdentity, FileChanges, IcebergCleanupReport, OperationIntent, OperationIntentParts,
+    OperationToken, PublicationOutcome, RequestShape, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::staging::PreparedChange;
@@ -143,7 +143,7 @@ fn retry_scenario(scenario: Scenario) {
                 start: None,
                 changes: FileChanges::default(),
                 dependencies: vec![],
-                isolation: IsolationLevel::Snapshot,
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: RequestShape::MetadataOnly,
                 summary: Default::default(),
                 token,
@@ -411,7 +411,7 @@ fn rewrite_captured_uuid_rejects_same_name_replacement_before_any_commit_dispatc
                 start: None,
                 changes: FileChanges::default(),
                 dependencies: vec![],
-                isolation: IsolationLevel::Snapshot,
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: RequestShape::MetadataOnly,
                 summary: Default::default(),
                 token,

@@ -37,8 +37,8 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::{CatalogPublisher, PublicationPreparer};
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    ArtifactWriter, Dependency, FileChanges, FrozenRequest, IsolationLevel, OperationIntent,
-    OperationIntentParts, RequestShape, TableTarget,
+    ArtifactWriter, Dependency, FileChanges, FrozenRequest, OperationIntent, OperationIntentParts,
+    RequestShape, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
 use crate::commit::publication_descriptor::PublicationDescriptor;
@@ -150,7 +150,7 @@ fn freeze_intent(
             removed: vec![],
         },
         dependencies: vec![Dependency::RefUnchanged],
-        isolation: IsolationLevel::Serializable,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: marker_summary(marker)?,
         token: operation.token(),
@@ -176,7 +176,7 @@ fn freeze_registration_intent(
             removed: vec![],
         },
         dependencies: vec![],
-        isolation: IsolationLevel::Serializable,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: marker_summary(marker)?,
         token: operation.token(),

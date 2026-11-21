@@ -17,13 +17,10 @@
 
 //! Only the dependencies used by current operation admission are represented here.
 
-use crate::commit::dependency::RowDeltaWindowCheck;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dependency {
     RefUnchanged,
     NoRead,
     /// Preparation-time check only; metadata publication has no atomic snapshot-existence requirement.
     MeasuredSnapshotExists(i64),
-    RowDeltaWindow(RowDeltaWindowCheck),
 }

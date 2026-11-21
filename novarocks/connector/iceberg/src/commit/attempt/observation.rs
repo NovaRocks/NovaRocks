@@ -1801,8 +1801,8 @@ mod tests {
         };
         use crate::commit::attempt::prepared::{PinnedExpiryPreparer, PublicationPreparer};
         use crate::commit::model::{
-            Dependency, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
-            RequestShape, TableTarget,
+            Dependency, FileChanges, OperationIntent, OperationIntentParts, RequestShape,
+            TableTarget,
         };
         use crate::iceberg::{TableIdent, TableUpdate};
 
@@ -1910,7 +1910,7 @@ mod tests {
                     start: None,
                     changes: FileChanges::default(),
                     dependencies: vec![Dependency::NoRead],
-                    isolation: IsolationLevel::Snapshot,
+                    protocol: crate::commit::model::CommitProtocol::Legacy,
                     shape: RequestShape::DocumentExpiry,
                     summary: Default::default(),
                     token: operation.token(),

@@ -1361,7 +1361,9 @@ fn project_released_state(
                 format!("{message}; staged files remain at {staging_dir}"),
             );
             Ok(ConnectorWriteAbortOutcome::CommitUnknown {
-                failure: if handle.row_mutation_isolation().is_some() {
+                failure: if handle.commit_protocol().operation().style()
+                    == crate::commit::model::CommitStyle::Transaction
+                {
                     crate::commit::conflict::commit_state_unknown(failure)
                 } else {
                     failure
@@ -1403,7 +1405,8 @@ impl IcebergWriteSessionControl {
             .adjudicate_session_inner_async(handle, evidence, context)
             .await?;
         if let ExternalMutationOutcome::CommitUnknown { failure, .. } = &mut outcome
-            && handle.row_mutation_isolation().is_some()
+            && handle.commit_protocol().operation().style()
+                == crate::commit::model::CommitStyle::Transaction
         {
             *failure = crate::commit::conflict::commit_state_unknown(failure.clone());
         }
@@ -4824,7 +4827,7 @@ mod eager_attempt_io_tests {
                 removed: vec![],
             },
             dependencies: vec![crate::commit::model::Dependency::NoRead],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),
             token: writer.attempt.operation(),

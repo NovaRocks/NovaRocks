@@ -35,8 +35,9 @@ use super::dependency::{self, Verdict};
 #[cfg(test)]
 use super::model::ObjectIdentity;
 use super::model::{
-    ArtifactReferences, ArtifactWriter, CleanupScope, FrozenRequest, IcebergCleanupReport,
-    OperationIntent, PublicationOutcome, PublicationReport, RequestShape,
+    ArtifactReferences, ArtifactWriter, CleanupScope, CommitStyle, FrozenRequest,
+    IcebergCleanupReport, OperationIntent, PublicationOutcome, PublicationReport, RequestShape,
+    WindowValidation,
 };
 use super::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use super::staging::{PreparedChange, Preparer, StagingBase, StagingEngine};
@@ -456,7 +457,7 @@ async fn run_in_phase(
                 };
             }
             CatalogOutcome::CommitUnknown { failure, evidence } => {
-                let failure = if intent.is_ordinary_row_delta() {
+                let failure = if intent.protocol().operation().style() == CommitStyle::Transaction {
                     commit_state_unknown(failure)
                 } else {
                     failure
@@ -484,11 +485,12 @@ async fn run_in_phase(
                 let wait = policy.backoff(attempt_number);
                 let left = policy.total_timeout.saturating_sub(started.elapsed());
                 if wait >= left {
-                    let failure = if intent.is_ordinary_row_delta() {
-                        transaction_conflict(failure, attempt_number + 1)
-                    } else {
-                        failure
-                    };
+                    let failure =
+                        if intent.protocol().operation().style() == CommitStyle::Transaction {
+                            transaction_conflict(failure, attempt_number + 1)
+                        } else {
+                            failure
+                        };
                     return rejected(operation, failure).await;
                 }
                 // Retired objects remain owned until a terminal result. Backoff starts no deletion.
@@ -517,7 +519,7 @@ async fn run_in_phase(
             }
             CatalogOutcome::KnownUncommitted { failure } => {
                 let failure = if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && intent.is_ordinary_row_delta()
+                    && intent.protocol().operation().style() == CommitStyle::Transaction
                 {
                     transaction_conflict(failure, attempt_number + 1)
                 } else {
@@ -627,7 +629,7 @@ async fn prepare(
         let parent = metadata
             .snapshot_for_ref(intent.target_ref())
             .map(|s| s.snapshot_id());
-        let verdict = if intent.is_ordinary_row_delta() {
+        let verdict = if matches!(intent.protocol().window(), WindowValidation::RowDelta(_)) {
             let removed_data = attempt
                 .row_delta_removed_data()
                 .map_err(|error| before_dispatch_failure(&error))?;
@@ -645,32 +647,22 @@ async fn prepare(
         .map_err(|error| before_dispatch_failure(&error))?;
         match verdict {
             Verdict::Holds => {}
+            Verdict::ValidationConflict(failure) => return Err(failure),
             verdict => {
-                if let Some(failure) = verdict.row_delta_conflict(
-                    metadata,
-                    intent.start().map(|start| start.snapshot_id),
-                    parent,
-                ) {
-                    return Err(failure);
-                }
                 return Err(ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Conflict,
                     format!("Iceberg commit dependency failed: {verdict:?}"),
                 ));
             }
         }
-        if intent.is_ordinary_row_delta() {
-            for requirement in &prefix.requirements {
-                if matches!(
-                    requirement,
-                    crate::iceberg::TableRequirement::CurrentSchemaIdMatch { .. }
-                        | crate::iceberg::TableRequirement::DefaultSpecIdMatch { .. }
-                ) {
-                    requirement
-                        .check(Some(metadata))
-                        .map_err(|error| validation_conflict(error.to_string()))?;
-                }
-            }
+    }
+    let mut prefix = prefix.clone();
+    if let Some(writer) = intent.protocol().writer_schema_spec() {
+        for requirement in writer.requirements() {
+            requirement
+                .check(Some(metadata))
+                .map_err(|error| validation_conflict(error.to_string()))?;
+            prefix.requirements.push(requirement);
         }
     }
     let mut engine = StagingEngine::begin_attempt(
@@ -682,7 +674,7 @@ async fn prepare(
     )
     .map_err(|e| before_dispatch_failure(&e))?;
     engine
-        .stage_change(prefix.clone())
+        .stage_change(prefix)
         .map_err(|e| before_dispatch_failure(&e))?;
     for preparer in preparers {
         engine

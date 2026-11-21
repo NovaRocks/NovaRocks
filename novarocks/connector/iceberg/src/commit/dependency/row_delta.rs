@@ -30,7 +30,7 @@ use crate::commit::conflict::{
     CandidateFile, MayMatch, RowDeltaValidationFacts, validation_conflict,
 };
 use crate::commit::manifest_sources::SnapshotSources;
-use crate::commit::model::{ArtifactWriter, Dependency, EntryIdentity, IsolationLevel};
+use crate::commit::model::{ArtifactWriter, EntryIdentity, IsolationLevel};
 use crate::delete_semantics::{POSITION_FILE_PATH_FIELD_ID, TypedPartition};
 use crate::iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus, Operation,
@@ -62,10 +62,6 @@ pub(crate) struct RowDeltaWindowCheck {
 }
 
 impl RowDeltaWindowCheck {
-    pub(crate) const fn isolation(&self) -> IsolationLevel {
-        self.isolation
-    }
-
     // The write operation installs this dependency when it freezes its row-delta intent.
     pub(crate) fn new(
         isolation: IsolationLevel,
@@ -150,7 +146,6 @@ impl Drop for WindowTrace {
 }
 
 pub(super) async fn validate_row_delta(
-    dependency: &Dependency,
     check: &RowDeltaWindowCheck,
     inputs: &ValidationInputs<'_>,
     start: Option<i64>,
@@ -175,10 +170,12 @@ pub(super) async fn validate_row_delta(
         Ok(window) => window,
         Err(reason) => {
             trace.reject("history", None);
-            return Ok(Verdict::Unprovable {
-                dependency: dependency.clone(),
-                reason,
-            });
+            return Ok(Verdict::ValidationConflict(history_conflict(
+                &reason,
+                metadata,
+                start,
+                inputs.parent,
+            )));
         }
     };
     trace.window_len = Some(window.snapshots().len());

@@ -658,7 +658,7 @@ impl CompletedStep {
 }
 
 fn missing(path: &str) -> Error {
-    crate::commit::new_manifests::row_delta_validation_error(format!(
+    crate::commit::new_manifests::commit_validation_error(format!(
         "Missing required files to delete: {path}"
     ))
 }

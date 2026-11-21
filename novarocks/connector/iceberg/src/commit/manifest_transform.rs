@@ -371,7 +371,7 @@ fn changed_entry(
     message: &'static str,
 ) -> Error {
     if observation.is_some_and(|(_, later_snapshot)| later_snapshot) {
-        return super::new_manifests::row_delta_validation_error(format!(
+        return super::new_manifests::commit_validation_error(format!(
             "Missing required files to delete: {}",
             expected.frozen.identity().path(),
         ));

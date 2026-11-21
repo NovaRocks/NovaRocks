@@ -82,7 +82,7 @@ fn invariant(message: impl Into<String>) -> Error {
         .with_source(ConnectorError::new(ConnectorErrorKind::Internal, message))
 }
 
-pub(crate) fn row_delta_validation_error(message: impl Into<String>) -> Error {
+pub(crate) fn commit_validation_error(message: impl Into<String>) -> Error {
     let message = message.into();
     let failure = super::conflict::validation_conflict(message.clone());
     Error::new(ErrorKind::DataInvalid, message).with_source(failure)
@@ -90,7 +90,7 @@ pub(crate) fn row_delta_validation_error(message: impl Into<String>) -> Error {
 
 pub(crate) fn validate_position_format(source: FormatVersion, base: FormatVersion) -> Result<()> {
     if source == FormatVersion::V2 && base >= FormatVersion::V3 {
-        return Err(row_delta_validation_error(format!(
+        return Err(commit_validation_error(format!(
             "Must use DVs for position deletes in V{}: writer used V2 position deletes",
             base as u8,
         )));

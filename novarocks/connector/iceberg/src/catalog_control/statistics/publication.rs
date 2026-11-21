@@ -22,9 +22,8 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::CatalogPublisher;
 use crate::commit::attempt::{self, Publisher, RecoveryPreflight, RetryPolicy};
 use crate::commit::model::{
-    ArtifactWriter, BaseIdentity, Dependency, FileChanges, FrozenRequest, IsolationLevel,
-    OperationIntent, OperationIntentParts, OperationToken, RequestShape, StartSnapshot,
-    TableTarget,
+    ArtifactWriter, BaseIdentity, Dependency, FileChanges, FrozenRequest, OperationIntent,
+    OperationIntentParts, OperationToken, RequestShape, StartSnapshot, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::recovery::FrozenPublicationFacts;
@@ -179,7 +178,7 @@ impl Projection {
             }),
             changes: FileChanges::default(),
             dependencies: vec![Dependency::MeasuredSnapshotExists(self.snapshot_id)],
-            isolation: IsolationLevel::Serializable,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::MetadataOnly,
             summary: BTreeMap::new(),
             token: OperationToken::from_mutation(self.operation_id),

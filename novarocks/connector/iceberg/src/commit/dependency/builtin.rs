@@ -17,7 +17,7 @@
 
 //! Current admission policies decide which source scope to observe.
 
-use super::super::model::{ArtifactWriter, Dependency, OperationIntent};
+use super::super::model::{ArtifactWriter, Dependency, OperationIntent, WindowValidation};
 use super::row_delta::validate_row_delta;
 use super::{Culprit, RemovedDataFiles, ValidationInputs, Verdict};
 use crate::iceberg::Result;
@@ -42,13 +42,24 @@ pub(crate) async fn validate_with_removed_data(
 ) -> Result<Verdict> {
     let mut inputs = ValidationInputs::new(metadata, parent, io);
     inputs.stage = intent.compact_stage();
-    validate_dependency_checks(
-        intent.dependencies(),
-        intent.start().map(|start| start.snapshot_id),
-        &mut inputs,
-        Some(RowDeltaInputs { io, removed_data }),
-    )
-    .await
+    let start = intent.start().map(|start| start.snapshot_id);
+    let dependency = validate_dependency_checks(intent.dependencies(), start, &inputs);
+    if dependency != Verdict::Holds {
+        return Ok(dependency);
+    }
+    match intent.protocol().window() {
+        WindowValidation::None => Ok(Verdict::Holds),
+        WindowValidation::RowDelta(check) => {
+            validate_row_delta(check, &inputs, start, io, removed_data).await
+        }
+        WindowValidation::RewriteFiles(replaced) => Err(crate::iceberg::Error::new(
+            crate::iceberg::ErrorKind::Unexpected,
+            format!(
+                "RewriteFiles validation is unavailable for {} frozen removals",
+                replaced.len()
+            ),
+        )),
+    }
 }
 
 /// Reuse the dependency owner for a metadata-only post-rejection diagnosis.
@@ -59,14 +70,12 @@ pub(crate) async fn diagnose_ref_unchanged(
     parent: Option<i64>,
     io: &dyn ArtifactWriter,
 ) -> Result<Verdict> {
-    let mut inputs = ValidationInputs::new(metadata, parent, io);
-    validate_dependency_checks(
+    let inputs = ValidationInputs::new(metadata, parent, io);
+    Ok(validate_dependency_checks(
         &[Dependency::RefUnchanged],
         intent.start().map(|start| start.snapshot_id),
-        &mut inputs,
-        None,
-    )
-    .await
+        &inputs,
+    ))
 }
 
 #[cfg(test)]
@@ -75,44 +84,16 @@ async fn validate_dependencies(
     start: Option<i64>,
     inputs: &mut ValidationInputs<'_>,
 ) -> Result<Verdict> {
-    validate_dependency_checks(dependencies, start, inputs, None).await
+    Ok(validate_dependency_checks(dependencies, start, inputs))
 }
 
-#[derive(Clone, Copy)]
-struct RowDeltaInputs<'a> {
-    io: &'a dyn ArtifactWriter,
-    removed_data: Option<&'a dyn RemovedDataFiles>,
-}
-
-async fn validate_dependency_checks(
+fn validate_dependency_checks(
     dependencies: &[Dependency],
     start: Option<i64>,
-    inputs: &mut ValidationInputs<'_>,
-    row_delta: Option<RowDeltaInputs<'_>>,
-) -> Result<Verdict> {
+    inputs: &ValidationInputs<'_>,
+) -> Verdict {
     for dependency in dependencies {
         let culprit = match dependency {
-            Dependency::RowDeltaWindow(check) => {
-                let row_delta = row_delta.ok_or_else(|| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::Unexpected,
-                        "Row-delta validation requires its original attempt inputs",
-                    )
-                })?;
-                let verdict = validate_row_delta(
-                    dependency,
-                    check,
-                    inputs,
-                    start,
-                    row_delta.io,
-                    row_delta.removed_data,
-                )
-                .await?;
-                if verdict != Verdict::Holds {
-                    return Ok(verdict);
-                }
-                None
-            }
             Dependency::NoRead => None,
             Dependency::RefUnchanged => (inputs.parent != start).then_some(Culprit::Ref {
                 expected: start,
@@ -125,13 +106,13 @@ async fn validate_dependency_checks(
                 .then_some(Culprit::Snapshot(*id)),
         };
         if let Some(culprit) = culprit {
-            return Ok(Verdict::Broken {
+            return Verdict::Broken {
                 dependency: dependency.clone(),
                 culprit,
-            });
+            };
         }
     }
-    Ok(Verdict::Holds)
+    Verdict::Holds
 }
 
 #[cfg(test)]

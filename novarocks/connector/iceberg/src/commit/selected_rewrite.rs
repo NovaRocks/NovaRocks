@@ -495,7 +495,7 @@ mod preparer_tests {
             }),
             changes: FileChanges { added, removed },
             dependencies: vec![Dependency::RefUnchanged],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape,
             summary: BTreeMap::new(),
             token: writer.attempt.operation(),

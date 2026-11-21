@@ -356,7 +356,7 @@ mod tests {
                 removed: live.values().map(|e| e.frozen.clone()).collect(),
             },
             dependencies: vec![crate::commit::model::Dependency::RefUnchanged],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),
             token: fixture.operation.token(),

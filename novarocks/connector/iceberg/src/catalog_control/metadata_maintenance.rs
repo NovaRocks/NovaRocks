@@ -25,8 +25,8 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::CatalogPublisher;
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    AttemptToken, BaseIdentity, Dependency, FileChanges, FrozenRequest, IsolationLevel,
-    OperationIntent, OperationIntentParts, OperationToken, RequestShape, TableTarget,
+    AttemptToken, BaseIdentity, Dependency, FileChanges, FrozenRequest, OperationIntent,
+    OperationIntentParts, OperationToken, RequestShape, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::snapshot_lifecycle_helpers::reclamation::ReclamationReport;
@@ -550,7 +550,7 @@ impl MaintenanceEngine {
             start: None,
             changes: FileChanges::default(),
             dependencies: vec![Dependency::NoRead],
-            isolation: IsolationLevel::Serializable,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::from([(MARKER_PROPERTY.into(), marker)]),
             token,
