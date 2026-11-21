@@ -905,7 +905,7 @@ impl ExprText<'_> {
         formatter: &mut std::fmt::Formatter<'_>,
         expr: ExprId,
         depth: usize,
-        predicate_operand: bool,
+        operator_operand: bool,
     ) -> std::fmt::Result {
         if depth > Self::MAX_DEPTH {
             return Err(fmt::Error);
@@ -917,13 +917,13 @@ impl ExprText<'_> {
         let inner = |expr: ExprId| ExprTextAt {
             text: self.nested(expr),
             depth: depth.saturating_add(1),
-            predicate_operand: false,
+            operator_operand: false,
         };
         let operand = |expr| ExprTextAt {
-            predicate_operand: true,
+            operator_operand: true,
             ..inner(expr)
         };
-        let grouped = predicate_operand && needs_predicate_group(&node.kind);
+        let grouped = operator_operand && needs_operand_group(&node.kind);
         if grouped {
             formatter.write_str("(")?;
         }
@@ -1063,7 +1063,7 @@ impl ExprText<'_> {
                 let needs_parentheses = matches!(
                     operand_kind,
                     ExprKind::Binary { .. } | ExprKind::Lambda { .. }
-                ) || needs_predicate_group(operand_kind);
+                ) || needs_operand_group(operand_kind);
                 write_negation(formatter, needs_parentheses, |out| {
                     write!(out, "{}", inner(*operand))
                 })
@@ -1081,23 +1081,13 @@ impl ExprText<'_> {
                     &function.function_id,
                 )
                 .ok_or(fmt::Error)?;
-                // Retain the established infix grouping for arithmetic. A
-                // comparison binds more tightly than AND/OR, and needs its
-                // outer parentheses only when it occupies an operand slot.
-                if operator.arithmetic().is_some() {
-                    formatter.write_str("(")?;
-                }
                 write!(
                     formatter,
                     "{} {} {}",
                     operand(*left),
                     operator.sql(),
                     operand(*right)
-                )?;
-                if operator.arithmetic().is_some() {
-                    formatter.write_str(")")?;
-                }
-                Ok(())
+                )
             }
             ExprKind::FunctionCall { function, args } => {
                 write!(formatter, "{}(", function_text(&function.function_id))?;
@@ -1112,14 +1102,16 @@ impl ExprText<'_> {
     }
 }
 
-fn needs_predicate_group(kind: &ExprKind) -> bool {
+fn needs_operand_group(kind: &ExprKind) -> bool {
     use novarocks_expression_contract::BinaryOperator;
     use novarocks_type_contract::OperatorFunction;
 
     match kind {
         ExprKind::FunctionCall { function, .. } => {
             OperatorFunction::from_function_id(&function.function_id).is_some_and(|operator| {
-                operator.comparison().is_some() || operator.is_null_safe_comparison()
+                operator.arithmetic().is_some()
+                    || operator.comparison().is_some()
+                    || operator.is_null_safe_comparison()
             })
         }
         ExprKind::Binary { op, .. } => matches!(
@@ -1148,7 +1140,7 @@ fn needs_predicate_group(kind: &ExprKind) -> bool {
 struct ExprTextAt<'a> {
     text: ExprText<'a>,
     depth: usize,
-    predicate_operand: bool,
+    operator_operand: bool,
 }
 
 impl std::fmt::Display for ExprTextAt<'_> {
@@ -1157,7 +1149,7 @@ impl std::fmt::Display for ExprTextAt<'_> {
             formatter,
             self.text.expr.ok_or(fmt::Error)?,
             self.depth,
-            self.predicate_operand,
+            self.operator_operand,
         )
     }
 }
@@ -1518,7 +1510,7 @@ impl TreeContext<'_> {
                         ExprTextAt {
                             text: self.expr(fragment, node.id, *root),
                             depth: 1,
-                            predicate_operand: false,
+                            operator_operand: false,
                         }
                         .fmt(f)
                     })

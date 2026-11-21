@@ -33,6 +33,7 @@ use super::win_magic_util::{
 use crate::column_id::ColumnId;
 use crate::common::ApplyKind;
 use crate::common::{JoinKind, OutputColumn};
+use crate::optimizer::cascades_rules::implement::safe_key_operand;
 use crate::optimizer::operator::{
     ApplyOp, LogicalAggregateOp, Operator, ScalarAggregateSpec, SortOp, WindowOp,
 };
@@ -55,6 +56,8 @@ pub(super) struct WinMagicMatch {
     pub outer_conjuncts: Vec<ScalarId>,
     /// The single outer conjunct that references `APPLY_OUT`.
     pub subquery_conjunct: ScalarId,
+    /// Whether any original conjunct after the subquery conjunct moves before it.
+    pub moves_suffix: bool,
     /// Outer-side ColumnRef of each correlation conjunct — the window PARTITION BY keys.
     pub partition_by: Vec<ScalarId>,
     /// The inner single aggregate call (name in WHITELIST, non-distinct).
@@ -285,6 +288,11 @@ fn apply_plan_inner(
     if scalar_utils::collect_column_ids(arena, after_pred).contains(&a.output_column.column_id) {
         return Ok(None); // APPLY_OUT survived (comparison used an unhandled node)
     }
+    // A moved suffix can otherwise suppress an error in the original predicate
+    // or in its scalar projection, which is visible only after replacement.
+    if m.moves_suffix && !safe_key_operand(arena, after_pred) {
+        return Ok(None);
+    }
     let after = scalar_utils::filter(window, after_pred);
 
     Ok(Some(after))
@@ -447,7 +455,8 @@ fn check_preconditions_opt(
         m.extend(collect_scan_column_map(apply_right));
         m
     };
-    let mut outer_conjuncts = scalar_utils::split_and(arena, where_pred);
+    let original_conjuncts = scalar_utils::split_and(arena, where_pred);
+    let mut outer_conjuncts = original_conjuncts.clone();
 
     // 4a. Each correlation conjunct must have a phys-identical twin among outer conjuncts.
     let mut unmatched_corr = a.correlation_conjuncts.clone();
@@ -479,6 +488,23 @@ fn check_preconditions_opt(
         return None;
     }
 
+    // Splitting an AND across filters changes which rows demand its conjuncts.
+    // A pending prefix error may have been cleared by the subquery conjunct,
+    // and a suffix error may become visible before it would have been demanded.
+    let original_sub_pos = original_conjuncts
+        .iter()
+        .position(|&conjunct| conjunct == subquery_conjunct)?;
+    let (prefix, subquery_and_suffix) = original_conjuncts.split_at(original_sub_pos);
+    let suffix = &subquery_and_suffix[1..];
+    if prefix
+        .iter()
+        .chain(suffix)
+        .any(|&conjunct| !safe_key_operand(arena, conjunct))
+    {
+        return None;
+    }
+    let moves_suffix = !suffix.is_empty();
+
     // 4c. Drop outer conjuncts that reference ONLY `correlated_outer_table`.
     outer_conjuncts.retain(|oc| {
         let refs = scalar_utils::collect_column_ids(arena, *oc);
@@ -502,8 +528,9 @@ fn check_preconditions_opt(
     }
 
     Some(WinMagicMatch {
-        outer_conjuncts: scalar_utils::split_and(arena, where_pred),
+        outer_conjuncts: original_conjuncts,
         subquery_conjunct,
+        moves_suffix,
         partition_by,
         inner_agg,
         inner_agg_output,
