@@ -45,7 +45,6 @@ serde_json.workspace = true
 allocator-api2.workspace = true
 hashbrown = { workspace = true, features = ["raw", "allocator-api2"] }
 hex.workspace = true
-libm = "0.2"
 base64.workspace = true
 arrow-array.workspace = true
 arrow-row = "60.1.0"
@@ -66,8 +65,6 @@ num-traits.workspace = true
 rand.workspace = true
 ryu.workspace = true
 sha2.workspace = true
-
-twox-hash.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

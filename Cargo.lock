@@ -3651,7 +3651,6 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "icu_properties",
- "libm",
  "md-5 0.10.6",
  "novarocks-arrow-batch-codec",
  "novarocks-constant-contract",
@@ -3667,7 +3666,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "twox-hash",
  "url",
 ]
 
@@ -6971,9 +6969,6 @@ name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
-dependencies = [
- "rand 0.9.5",
-]
 
 [[package]]
 name = "typed-builder"
