@@ -5733,6 +5733,10 @@ fn is_constant_default_expression(expr: &TypedExpr) -> bool {
         ExprKind::BinaryOp { left, right, .. } => {
             is_constant_default_expression(left) && is_constant_default_expression(right)
         }
+        ExprKind::FunctionCall { .. } => crate::common::binary_operator::typed_operands(expr)
+            .is_some_and(|(_, [left, right])| {
+                is_constant_default_expression(left) && is_constant_default_expression(right)
+            }),
         ExprKind::UnaryOp { expr, .. } => is_constant_default_expression(expr),
         _ => false,
     }

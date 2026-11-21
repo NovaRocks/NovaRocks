@@ -1,4 +1,4 @@
 -- query 1
--- types	decimal(38, 12)
+-- types	decimal(38, 6)
 promo_revenue
-16.433390926989
+16.433391
