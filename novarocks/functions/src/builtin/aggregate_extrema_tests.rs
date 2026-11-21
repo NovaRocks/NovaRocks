@@ -937,6 +937,125 @@ fn aggregate_extrema_split_phases_distinct_idempotence_and_unsupported_options()
 struct Storage([MaybeUninit<u8>; size_of::<InstalledExtremaState>()]);
 
 #[test]
+fn aggregate_extrema_temporal_partial_merge_keeps_the_actual_zoned_winner() {
+    use novarocks_type_contract::{
+        TemporalCarrier, TemporalMicros, TemporalPrecision, TimeZoneKey, ValueKind, ValueLayout,
+        ValueTypeRef, ValueTypeStorageLifetime,
+    };
+
+    let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+    let source_type = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::Temporal(declaration),
+            true,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&declaration.carrier(), ValueTypeStorageLifetime::pure()).unwrap(),
+    )
+    .unwrap();
+    let previous = TemporalValue::TimestampWithTimeZone {
+        instant: TemporalMicros::new(-1, 999_999).unwrap(),
+        zone: TimeZoneKey::from_offset_minutes(840).unwrap(),
+    };
+    let winner = TemporalValue::TimestampWithTimeZone {
+        instant: TemporalMicros::new(0, 1).unwrap(),
+        zone: TimeZoneKey::from_offset_minutes(-420).unwrap(),
+    };
+    let tied = TemporalValue::TimestampWithTimeZone {
+        instant: TemporalMicros::new(0, 1).unwrap(),
+        zone: TimeZoneKey::UTC,
+    };
+    let mut array = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(4, 14);
+    for value in [previous, winner, tied] {
+        let TemporalCarrier::ZonedTimestamp(bytes) = value.to_carrier(declaration).unwrap() else {
+            panic!("zoned test value must have its exact fixed-width carrier");
+        };
+        array.append_value(bytes).unwrap();
+    }
+    array.append_null();
+    let input: ArrayRef = Arc::new(array.finish());
+
+    let fixture = Fixture::new(
+        "max",
+        source_type.clone(),
+        DecimalOverflowPolicy::ReportError,
+    );
+    let ctrl = RuntimeControl::default();
+    let prepared = fixture
+        .prepare(AggregateKernelPhase::Partial, &CompileControl::default())
+        .unwrap();
+    let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
+        panic!("installed temporal aggregate");
+    };
+    assert_eq!(handle.contract().intermediate_type(), &source_type);
+    assert_eq!(
+        handle.memory_policy(),
+        AggregateStateMemoryPolicy::FixedZero
+    );
+    let mut storage: [Storage; 3] = std::array::from_fn(|_| {
+        Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()])
+    });
+    let mut states = storage
+        .each_mut()
+        .map(|item| handle.initialize_in(&mut item.0, &ctrl).unwrap());
+    let args = [EvaluatedArgument::Column(&input)];
+    let selected = SelectedAggregateUpdateInput::try_new(
+        handle.contract(),
+        Selection::all(4),
+        &args,
+        &[],
+        &ctrl,
+    )
+    .unwrap();
+    handle
+        .prepare_update_batch(&mut states, &[0, 0, 1, 2], selected, &ctrl)
+        .unwrap()
+        .run(&ctrl)
+        .unwrap();
+    let mut carried = handle.emit(&states, &[0, 1, 2], 3, &ctrl).unwrap();
+    let read = |array: &ArrayRef, expected: &[Option<TemporalValue>]| {
+        let decoded = PreparedTemporalArray::bind(declaration, array.as_ref(), true).unwrap();
+        assert_eq!(array.len(), expected.len());
+        for (row, &value) in expected.iter().enumerate() {
+            assert_eq!(decoded.value(row).unwrap(), value);
+        }
+    };
+    read(&carried, &[Some(winner), Some(tied), None]);
+
+    for (phase, groups) in [
+        (AggregateKernelPhase::Intermediate, &[0, 0, 1][..]),
+        (AggregateKernelPhase::Final, &[0, 1][..]),
+    ] {
+        let prepared = fixture.prepare(phase, &CompileControl::default()).unwrap();
+        let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
+            panic!("installed temporal aggregate merge");
+        };
+        assert_eq!(handle.contract().final_type(), &source_type);
+        let mut storage: [Storage; 2] = std::array::from_fn(|_| {
+            Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()])
+        });
+        let mut states = storage
+            .each_mut()
+            .map(|item| handle.initialize_in(&mut item.0, &ctrl).unwrap());
+        let selected = SelectedAggregateMergeInput::try_new(
+            handle.contract(),
+            Selection::all(carried.len()),
+            EvaluatedArgument::Column(&carried),
+            &ctrl,
+        )
+        .unwrap();
+        handle
+            .prepare_merge_batch(&mut states, groups, selected, &ctrl)
+            .unwrap()
+            .run(&ctrl)
+            .unwrap();
+        carried = handle.emit(&states, &[0, 1], 2, &ctrl).unwrap();
+        read(&carried, &[Some(winner), None]);
+    }
+}
+
+#[test]
 fn aggregate_extrema_actual_erased_group_mapping_and_all_emission_first_causes() {
     for name in ["min", "max"] {
         let fixture = Fixture::new(name, ty(true), DecimalOverflowPolicy::OutputNull);

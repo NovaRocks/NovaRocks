@@ -1,0 +1,10 @@
+-- query 1
+-- types	timestamp(12) with time zone	timestamp(12) with time zone	timestamp(12)
+latest	earliest	latest_local
+2024-01-01 00:00:00.123456789124 UTC	2024-01-01 08:00:00.123456789123 Asia/Shanghai	2024-01-01 00:00:00.123456789124
+
+-- query 2
+-- types	timestamp(12) with time zone
+latest
+2024-01-01 00:00:00.123456789124 UTC
+2024-01-01 00:00:00.123456789124 UTC
