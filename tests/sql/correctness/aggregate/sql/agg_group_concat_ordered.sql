@@ -26,7 +26,7 @@
 -- 3. Assert ordered global group_concat output.
 CREATE TABLE ${case_db}.t_agg_group_concat_ordered (
     k INT,
-    s STRING
+    s VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_ordered VALUES

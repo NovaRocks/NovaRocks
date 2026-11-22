@@ -57,7 +57,6 @@ pub(crate) mod declaration_widening;
 mod expression_typing;
 #[cfg(any(test, novarocks_dev_controls))]
 pub(crate) use expression_typing::negation_for_test;
-mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
 mod logical_output;
@@ -468,7 +467,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     let query =
         crate::sql_mode::normalize_concat_query_with_semantics(query.clone(), sql_semantics);
     let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
-    let mut materialized_source = materialized
+    let materialized_source = materialized
         .map(|source| source.loan(&query, control))
         .transpose()
         .map_err(|error| match error {
@@ -483,18 +482,6 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
             ),
             other => AnalyzeError::internal(other.to_string()),
         })?;
-    if let Some(assignments) = assignments {
-        let source = materialized_source.get_or_insert_with(|| {
-            crate::compiler::materialized_values::MaterializedSourceBorrow::empty(&query)
-        });
-        write_assignment::materialize_write_literal_contexts(
-            &query,
-            assignments,
-            source,
-            constant_policy,
-            control,
-        )?;
-    }
     let materialized_values = materialized_source.as_ref().map(|source| source.view());
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
@@ -807,14 +794,14 @@ impl<'a> AnalyzerContext<'a> {
         if public_type == DataType::Int64 {
             return Ok(mask);
         }
-        // The public INTEGER is a real typed conversion. Preserve its author's
-        // NULL law and the original internal non-null BIGINT Repeat slot.
-        let target = helpers::declared_cast_value_type(
-            &mask,
-            FunctionValueType::new(public_type, true),
-            self.control,
-        )?;
-        self.cast_to_value_type(mask, target, input.span())
+        // A mask for at most 31 grouping arguments fits the public INTEGER.
+        // The internal Repeat slot keeps its own required BIGINT declaration.
+        self.cast_with_trino_mode(
+            mask,
+            FunctionValueType::new(public_type, false),
+            novarocks_type_contract::TrinoCastMode::Explicit,
+            input.span(),
+        )
     }
 
     /// Reuse the completed GROUP BY author's actual expressions, including
@@ -1153,7 +1140,7 @@ impl<'a> AnalyzerContext<'a> {
                 let (from, scope) = self.analyze_table_query(table)?;
                 let mut projection = Vec::new();
                 let mut columns = Vec::new();
-                self.append_wildcard_projection(&scope, &mut projection, &mut columns)?;
+                self.append_wildcard_projection(&scope, &mut projection, &mut columns, table.span)?;
                 Ok((
                     QueryBody::Select(ResolvedSelect {
                         from: Some(from),
@@ -1466,9 +1453,11 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- WHERE clause ---
         let filter = match &select.selection {
-            Some(expr) => Some(super::analyzer::subquery_rewrite::coerce_where_to_bool(
+            Some(expr) => Some(self.require_boolean_predicate(
                 self.analyze_expr(expr, &scope)?,
-            )),
+                "WHERE clause",
+                expr.span(),
+            )?),
             None => None,
         };
 
@@ -1609,7 +1598,9 @@ impl<'a> AnalyzerContext<'a> {
             Some(expr) => {
                 let analyzed = self.analyze_expr(expr, &scope);
                 match analyzed {
-                    Ok(h) => Some(h),
+                    Ok(h) => {
+                        Some(self.require_boolean_predicate(h, "HAVING clause", expr.span())?)
+                    }
                     Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
                         // Maybe references a SELECT alias — build alias scope
@@ -1622,7 +1613,11 @@ impl<'a> AnalyzerContext<'a> {
                         }
                         let h = self.analyze_expr(expr, &alias_scope)?;
                         // Substitute alias refs with real expressions
-                        Some(self.substitute_select_aliases(h, &projection))
+                        Some(self.require_boolean_predicate(
+                            self.substitute_select_aliases(h, &projection),
+                            "HAVING clause",
+                            expr.span(),
+                        )?)
                     }
                 }
             }
@@ -1834,7 +1829,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Cast {
-                array_failure_mode,
+                cast_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
@@ -1842,7 +1837,7 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Cast {
-                    array_failure_mode,
+                    cast_mode,
                     expr: novarocks_parser::ast::AstBox::new(
                         self.substitute_select_aliases_for_select_inner(
                             inner.into_inner(),
@@ -2078,7 +2073,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Cast {
-                array_failure_mode,
+                cast_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
@@ -2086,7 +2081,7 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Cast {
-                    array_failure_mode,
+                    cast_mode,
                     expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
                         inner.into_inner(),
                         projection,
@@ -2531,6 +2526,7 @@ impl<'a> AnalyzerContext<'a> {
                             scope,
                             &mut projection,
                             &mut output_columns,
+                            columns.span,
                         )?;
                         continue;
                     };
@@ -2573,6 +2569,7 @@ impl<'a> AnalyzerContext<'a> {
                     {
                         self.check_control()?;
                         found = true;
+                        scope.check_read_column(*col_id, &[], columns.span)?;
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
                                 column_id: *col_id,
@@ -2614,34 +2611,37 @@ impl<'a> AnalyzerContext<'a> {
         scope: &AnalyzerScope,
         projection: &mut Vec<ProjectItem>,
         output_columns: &mut Vec<OutputColumn>,
+        span: novarocks_parser::Span,
     ) -> Result<(), AnalyzeError> {
         for (qualifier, col_name, col_id, value_type, field_name) in scope.iter_columns() {
             self.check_control()?;
-            // FULL OUTER USING columns are exposed as a synthetic
-            // `COALESCE(left.col, right.col)` expression. SELECT *
-            // expansion must use that expression instead of the
-            // raw left-side ColumnRef so right-only rows show
-            // the right-side value.
-            let typed = if let Some(expr) = field_name
+            scope.check_read_column(*col_id, &[], span)?;
+            let (typed, id) = if let Some(expr) = field_name
                 .as_deref()
                 .and_then(|name| scope.computed_column_for(name))
             {
-                expr.clone()
+                let id = self.alloc_column_id(None, col_name.clone(), expr.value_type.clone());
+                let logical = self.logical_output_type(None, expr, scope)?;
+                self.factory.borrow_mut().set_logical_type(id, logical);
+                (expr.clone(), id)
             } else {
-                TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: *col_id,
-                        qualifier: qualifier.clone(),
-                        column: col_name.clone(),
+                (
+                    TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: *col_id,
+                            qualifier: qualifier.clone(),
+                            column: col_name.clone(),
+                        },
+                        value_type: value_type.clone(),
                     },
-                    value_type: value_type.clone(),
-                }
+                    *col_id,
+                )
             };
             output_columns.push(OutputColumn {
                 field_name: field_name.clone(),
-                column_id: *col_id,
+                column_id: id,
                 name: col_name.clone(),
-                value_type: value_type.clone(),
+                value_type: typed.value_type.clone(),
 
                 is_internal: false,
             });
@@ -2649,7 +2649,7 @@ impl<'a> AnalyzerContext<'a> {
                 field_name: field_name.clone(),
                 expr: typed,
                 output_name: col_name.clone(),
-                output_column_id: *col_id,
+                output_column_id: id,
             });
         }
         Ok(())
@@ -3314,12 +3314,12 @@ impl<'a> AnalyzerContext<'a> {
                 volatility,
             },
             ExprKind::Cast {
-                array_failure_mode,
+                cast_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
             } => ExprKind::Cast {
-                array_failure_mode,
+                cast_mode,
                 expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
                     inner.into_inner(),
                     from_scope,
@@ -4261,9 +4261,9 @@ mod tests {
                 DataType::Int32,
             ),
             (
-                "SELECT (CAST(s AS ROW(a bigint))).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
+                "SELECT (CAST(s AS ROW(mapped integer))).mapped FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 None,
-                DataType::Int64,
+                DataType::Int32,
             ),
             (
                 "SELECT s.A FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
@@ -4278,6 +4278,13 @@ mod tests {
             assert_eq!(output.field_name.as_deref(), expected_name, "{sql}");
             assert_eq!(output.value_type.data_type(), &expected_type, "{sql}");
         }
+        let changing_value_type = "SELECT CAST(s AS ROW(a bigint)).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t";
+        let query = parse_native_query(changing_value_type).unwrap();
+        let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
     }
 
     #[test]
@@ -5198,48 +5205,69 @@ mod tests {
     }
 
     #[test]
-    fn decimal_literal_over_decimal128_precision_infers_decimal256() {
-        let resolved =
-            parse_raw_and_analyze("select 123456789012345678901234567890.123456789 as d")
-                .expect("wide decimal literal should analyze");
-
-        assert_eq!(
-            resolved.output_columns[0].value_type.data_type().clone(),
-            DataType::Decimal256(39, 9)
-        );
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
-        assert_eq!(
-            select.projection[0].expr.value_type.data_type().clone(),
-            DataType::Decimal256(39, 9)
-        );
+    fn decimal_literal_maximum_precision_preserves_exact_declared_type() {
+        for (literal, precision, scale) in [
+            ("12345678901234567890123456789.123456789", 38, 9),
+            ("0.00000000000000000000000000000000000001", 38, 38),
+            ("DECIMAL '0.00000000000000000000000000000000000001'", 38, 38),
+            ("0.1", 1, 1),
+            ("DECIMAL '000.000'", 3, 3),
+            ("DECIMAL '0000'", 1, 0),
+            ("DECIMAL '0001.20'", 3, 2),
+        ] {
+            let resolved = parse_raw_and_analyze(&format!("SELECT {literal} AS d"))
+                .unwrap_or_else(|error| panic!("{literal}: {error}"));
+            let expected = DataType::Decimal128(precision, scale);
+            assert_eq!(
+                resolved.output_columns[0].value_type.data_type(),
+                &expected,
+                "{literal}"
+            );
+            let QueryBody::Select(select) = &resolved.body else {
+                panic!("expected select body");
+            };
+            assert_eq!(
+                select.projection[0].expr.value_type.data_type(),
+                &expected,
+                "{literal}"
+            );
+        }
     }
 
     #[test]
-    fn decimal_literal_above_decimal256_precision_is_rejected() {
-        let err = parse_raw_and_analyze(
-            "select 12345678901234567890123456789012345678901234567890123456789012345678901234567.1",
-        )
-        .expect_err("decimal literal above Decimal256 precision should fail during analysis");
-
-        assert!(
-            err.contains("decimal literal precision 78 exceeds maximum precision 76"),
-            "unexpected error: {err}"
-        );
+    fn decimal_literals_above_precision_38_are_rejected() {
+        for (precision, literal) in [
+            (39, "123456789012345678901234567890.123456789"),
+            (
+                78,
+                "12345678901234567890123456789012345678901234567890123456789012345678901234567.1",
+            ),
+        ] {
+            let err = parse_raw_and_analyze(&format!("SELECT {literal}"))
+                .expect_err("an out-of-range DECIMAL literal must fail during analysis");
+            assert!(
+                err.contains(&format!(
+                    "decimal literal precision {precision} exceeds maximum precision 38"
+                )),
+                "unexpected error: {err}"
+            );
+        }
+        let error = parse_raw_and_analyze("SELECT 0.000000000000000000000000000000000000001")
+            .expect_err("a 39-digit fractional scale must fail during analysis");
+        assert!(error.contains("decimal literal scale 39 exceeds maximum scale 38"));
     }
 
     #[test]
-    fn array_agg_window_decimal_literal_preserves_decimal256_item() {
+    fn array_agg_window_preserves_maximum_decimal_item_precision() {
         let (resolved, _) = parse_and_analyze_with_registry(
-            "select array_agg(123456789012345678901234567890.123456789) \
+            "select array_agg(12345678901234567890123456789.123456789) \
          over(partition by o_orderstatus order by o_orderkey) as arr from orders",
         )
-        .expect("array_agg window over wide decimal literal should analyze");
+        .expect("array_agg window over a 38-digit DECIMAL literal should analyze");
 
         let expected = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
             "item",
-            DataType::Decimal256(39, 9),
+            DataType::Decimal128(38, 9),
             true,
         )));
         assert_eq!(
@@ -5512,12 +5540,7 @@ mod tests {
 
     #[test]
     fn json_typed_literals_preserve_the_declared_domain_and_original_bytes() {
-        for text in [
-            "1.00",
-            "123456789012345678901234567890",
-            "1E400",
-            "not JSON",
-        ] {
+        for text in ["1.00", "123456789012345678901234567890", "1E308"] {
             let sql = format!("select JSON '{text}'");
             let resolved = parse_and_analyze(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
             let item = &select_body(&resolved).projection[0].expr;
@@ -5528,6 +5551,18 @@ mod tests {
             assert!(!item.value_type.nullable());
             assert!(
                 matches!(&item.kind, ExprKind::Literal(LiteralValue::String(actual)) if actual == text)
+            );
+        }
+        for text in ["1E400", "not JSON"] {
+            let sql = format!("select JSON '{text}'");
+            let query = parse_native_query(&sql).unwrap();
+            let Err(error) = analyze(&query, &TestCatalog, "default") else {
+                panic!("expected an invalid JSON literal: {sql}");
+            };
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::InvalidLiteral,
+                "{sql}"
             );
         }
         let resolved = parse_and_analyze("select JSON '1.00' in (select JSON '1.0')")
@@ -6483,7 +6518,7 @@ mod tests {
     #[test]
     fn test_array_map_lambda_cast_param_resolves_lambda_scope() {
         let resolved = parse_raw_and_analyze(
-            "SELECT array_map(x -> CAST(x AS STRING), array_generate(1, 3, 1))",
+            "SELECT array_map(x -> CAST(x AS VARCHAR), array_generate(1, 3, 1))",
         )
         .expect("array_map lambda parameter should resolve in lambda scope");
         assert_eq!(resolved.output_columns.len(), 1);
@@ -6581,7 +6616,7 @@ mod tests {
     #[test]
     fn select_alias_without_as_is_visible_inside_lambda_body() {
         parse_raw_and_analyze(
-            "SELECT cast(if (1 > rand(), '[]', '') as array<string>) l, \
+            "SELECT IF(1 > rand(), CAST(ARRAY[] AS ARRAY(VARCHAR)), ARRAY[CAST('' AS VARCHAR)]) l, \
              array_map(x -> concat(x, l), ['a'])",
         )
         .expect("lambda body should resolve earlier select alias without AS");
@@ -6629,7 +6664,7 @@ mod tests {
         }
 
         let resolved = parse_raw_and_analyze(
-            "SELECT cast(if (1 > rand(), '[]', '') as array<string>) l, \
+            "SELECT IF(1 > rand(), CAST(ARRAY[] AS ARRAY(VARCHAR)), ARRAY[CAST('' AS VARCHAR)]) l, \
              array_map(x -> concat(x, l), ['a'])",
         )
         .expect("analysis should succeed");
@@ -7180,13 +7215,15 @@ mod tests {
                         assert!(!mask.value_type.nullable());
                     }
                     if count <= 31 {
-                        assert!(
-                            matches!(&select.projection[0].expr.kind, ExprKind::Cast { expr, .. } if matches!(expr.kind, ExprKind::ColumnRef { .. }))
-                        );
-                        assert!(
-                            select.projection[0].expr.value_type.nullable(),
-                            "original narrowing CAST NULL law"
-                        );
+                        assert!(matches!(
+                            &select.projection[0].expr.kind,
+                            ExprKind::Cast {
+                                expr,
+                                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                                ..
+                            } if matches!(expr.kind, ExprKind::ColumnRef { .. })
+                        ));
+                        assert!(!select.projection[0].expr.value_type.nullable());
                     }
                 } else {
                     assert!(matches!(
@@ -7796,9 +7833,22 @@ mod tests {
     }
 
     #[test]
-    fn bool_or_window_coerces_non_boolean_arguments() {
+    fn boolean_aggregates_require_boolean_inputs_or_unknown_null() {
+        for sql in [
+            "select bool_or(o_orderkey) over (partition by o_custkey order by o_orderkey) from orders",
+            "select bool_or(o_orderkey) from orders",
+            "select count_if(o_orderkey) from orders",
+        ] {
+            let error = parse_and_analyze(sql)
+                .err()
+                .unwrap_or_else(|| panic!("numeric input is not BOOLEAN: {sql}"));
+            assert!(
+                error.contains("no matching declared overload"),
+                "{sql}: {error}"
+            );
+        }
         let resolved = parse_and_analyze(
-            "select bool_or(o_orderkey) over (partition by o_custkey order by o_orderkey) as v \
+            "select bool_or(NULL) over (partition by o_custkey order by o_orderkey) as v \
              from orders",
         )
         .expect("bool_or window should analyze");
@@ -7815,7 +7865,10 @@ mod tests {
         };
         assert_eq!(name, "bool_or");
         assert_eq!(args.len(), 1);
-        let ExprKind::Cast { target, .. } = &args[0].kind else {
+        let ExprKind::Cast {
+            target, cast_mode, ..
+        } = &args[0].kind
+        else {
             panic!(
                 "expected bool_or window argument cast, got {:?}",
                 args[0].kind
@@ -7823,16 +7876,38 @@ mod tests {
         };
         assert_eq!(target, &arrow::datatypes::DataType::Boolean);
         assert_eq!(
+            *cast_mode,
+            Some(novarocks_type_contract::TrinoCastMode::Implicit)
+        );
+        parse_and_analyze(
+            "select count_if(NULL), bool_or(CAST(o_orderkey AS BOOLEAN)) from orders",
+        )
+        .expect("ordinary aggregates accept BOOLEAN and unknown NULL");
+        assert_eq!(
             args[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Boolean
         );
     }
 
     #[test]
-    fn sum_avg_cast_varchar_arguments_to_double_in_analyzer_ir() {
+    fn sum_and_avg_require_explicit_cast_for_varchar_arguments() {
+        for name in ["sum", "avg"] {
+            for distinct in ["", "distinct "] {
+                let sql = format!("select {name}({distinct}o_orderstatus) from orders");
+                let error = parse_and_analyze(&sql)
+                    .err()
+                    .unwrap_or_else(|| panic!("VARCHAR input must be rejected: {sql}"));
+                assert!(
+                    error.contains("no matching declared overload"),
+                    "{sql}: {error}"
+                );
+            }
+        }
         let resolved =
-            parse_and_analyze("select sum(o_orderstatus), avg(o_orderstatus) from orders")
-                .expect("string aggregate arguments should analyze");
+            parse_and_analyze(
+                "select sum(CAST(o_orderstatus AS DOUBLE)), avg(TRY_CAST(o_orderstatus AS DOUBLE)) from orders",
+            )
+            .expect("explicitly typed DOUBLE aggregate arguments should analyze");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
@@ -7850,12 +7925,21 @@ mod tests {
             let ExprKind::Cast {
                 target,
                 expr: inner,
+                cast_mode,
                 ..
             } = &args[0].kind
             else {
                 panic!("expected aggregate argument cast, got {:?}", args[0].kind);
             };
             assert_eq!(target, &arrow::datatypes::DataType::Float64);
+            assert_eq!(
+                *cast_mode,
+                Some(if name == "sum" {
+                    novarocks_type_contract::TrinoCastMode::Explicit
+                } else {
+                    novarocks_type_contract::TrinoCastMode::Try
+                })
+            );
             assert_eq!(
                 args[0].value_type.data_type().clone(),
                 arrow::datatypes::DataType::Float64
@@ -7868,9 +7952,13 @@ mod tests {
     }
 
     #[test]
-    fn length_casts_numeric_argument_to_varchar() {
-        let resolved = parse_and_analyze("select length(o_orderkey) from orders")
-            .expect("length should analyze");
+    fn length_requires_an_explicit_varchar_cast_for_numeric_input() {
+        let error = parse_and_analyze("select length(o_orderkey) from orders")
+            .err()
+            .expect("length requires a character argument");
+        assert!(error.contains("no matching declared overload"), "{error}");
+        let resolved = parse_and_analyze("select length(CAST(o_orderkey AS VARCHAR)) from orders")
+            .expect("length accepts the explicit text value");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
@@ -7881,10 +7969,20 @@ mod tests {
             );
         };
         assert_eq!(name, "length");
-        let ExprKind::Cast { target, expr, .. } = &args[0].kind else {
+        let ExprKind::Cast {
+            target,
+            expr,
+            cast_mode,
+            ..
+        } = &args[0].kind
+        else {
             panic!("expected length argument cast, got {:?}", args[0].kind);
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
+        assert_eq!(
+            *cast_mode,
+            Some(novarocks_type_contract::TrinoCastMode::Explicit)
+        );
         assert_eq!(
             args[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Utf8
@@ -7896,9 +7994,11 @@ mod tests {
     }
 
     #[test]
-    fn left_casts_value_argument_but_preserves_length_type() {
-        let resolved = parse_and_analyze("select strleft(o_totalprice, 6) from orders")
-            .expect("strleft should analyze");
+    fn substring_keeps_explicit_text_cast_and_integer_positions() {
+        let resolved = parse_and_analyze(
+            "select substring(CAST(o_totalprice AS VARCHAR), INTEGER '1', INTEGER '6') from orders",
+        )
+        .expect("substring accepts the explicit text value");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
@@ -7908,19 +8008,31 @@ mod tests {
                 sel.projection[0].expr.kind
             );
         };
-        assert_eq!(name, "strleft");
-        let ExprKind::Cast { target, expr, .. } = &args[0].kind else {
-            panic!("expected left value argument cast, got {:?}", args[0].kind);
+        assert_eq!(name, "substring");
+        let ExprKind::Cast {
+            target,
+            expr,
+            cast_mode,
+            ..
+        } = &args[0].kind
+        else {
+            panic!("expected substring argument cast, got {:?}", args[0].kind);
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
+        assert_eq!(
+            *cast_mode,
+            Some(novarocks_type_contract::TrinoCastMode::Explicit)
+        );
         assert_eq!(
             expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64
         );
-        assert_eq!(
-            args[1].value_type.data_type().clone(),
-            arrow::datatypes::DataType::Int64
-        );
+        for position in &args[1..] {
+            assert_eq!(
+                position.value_type.data_type(),
+                &arrow::datatypes::DataType::Int32
+            );
+        }
     }
 
     #[test]
@@ -7943,38 +8055,28 @@ mod tests {
     }
 
     #[test]
-    fn date_trunc_casts_numeric_value_argument_to_datetime() {
-        let resolved = parse_and_analyze("select date_trunc('week', o_orderkey) from orders")
-            .expect("date_trunc should analyze");
-        let QueryBody::Select(sel) = &resolved.body else {
-            panic!("expected Select body");
-        };
-        let ExprKind::FunctionCall { args, .. } = &sel.projection[0].expr.kind else {
-            panic!(
-                "expected FunctionCall, got {:?}",
-                sel.projection[0].expr.kind
-            );
-        };
-        let ExprKind::Cast { target, expr, .. } = &args[1].kind else {
-            panic!(
-                "expected date_trunc value argument cast, got {:?}",
-                args[1].kind
-            );
-        };
-        assert_eq!(
-            target,
-            &arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+    fn date_trunc_does_not_convert_numeric_input_to_timestamp() {
+        let sql = "select date_trunc('week', o_orderkey) from orders";
+        let error = parse_and_analyze(sql).expect_err("numeric input is not temporal");
+        assert!(
+            error.contains("no matching declared overload"),
+            "{sql}: {error}"
         );
-        assert_eq!(
-            expr.value_type.data_type().clone(),
-            arrow::datatypes::DataType::Int64
-        );
+        parse_and_analyze(
+            "select date_trunc('week', TIMESTAMP '2026-11-22 00:00:00'), date_trunc('week', DATE '2026-11-22')",
+        ).expect("DATE and TIMESTAMP overloads are admitted");
     }
 
     #[test]
-    fn split_returns_varchar_array_and_casts_arguments() {
-        let resolved = parse_and_analyze("select split(o_orderkey, 1) from orders")
-            .expect("split should analyze");
+    fn split_returns_varchar_array_after_explicit_argument_casts() {
+        let error = parse_and_analyze("select split(o_orderkey, 1) from orders")
+            .err()
+            .expect("split requires character arguments");
+        assert!(error.contains("no matching declared overload"), "{error}");
+        let resolved = parse_and_analyze(
+            "select split(CAST(o_orderkey AS VARCHAR), CAST(1 AS VARCHAR)) from orders",
+        )
+        .expect("split accepts both explicit text arguments");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
@@ -7989,16 +8091,20 @@ mod tests {
                 sel.projection[0].expr.kind
             );
         };
-        assert!(matches!(args[0].kind, ExprKind::Cast { .. }));
-        assert!(matches!(args[1].kind, ExprKind::Cast { .. }));
-        assert_eq!(
-            args[0].value_type.data_type().clone(),
-            arrow::datatypes::DataType::Utf8
-        );
-        assert_eq!(
-            args[1].value_type.data_type().clone(),
-            arrow::datatypes::DataType::Utf8
-        );
+        assert_eq!(args.len(), 2);
+        for argument in args {
+            assert!(matches!(
+                argument.kind,
+                ExprKind::Cast {
+                    cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                    ..
+                }
+            ));
+            assert_eq!(
+                argument.value_type.data_type(),
+                &arrow::datatypes::DataType::Utf8
+            );
+        }
     }
 
     #[test]
@@ -8778,23 +8884,29 @@ mod tests {
 
     #[test]
     fn scalar_apply_retains_or_when_factoring_could_skip_a_fallible_predicate() {
-        let resolved = parse_and_analyze_for_apply_specs(
-            "SELECT k1 FROM t1 \
-             WHERE (SELECT count(*) FROM t2 \
-                    WHERE (t2.k1 = t1.k1 AND t2.k2 = 1) \
-                       OR (t2.k1 = t1.k1 AND t2.k2 / t2.k1 = 2)) > 0",
-        )
-        .expect("analyze scalar Apply with a fallible OR branch");
-        let QueryBody::Select(select) = &resolved.body else {
-            panic!("expected select body");
-        };
-        let QueryBody::Select(inner) = &select.apply_specs[0].inner.body else {
-            panic!("expected scalar Apply inner select");
-        };
-        assert!(matches!(
-            &inner.filter.as_ref().expect("expected filter").kind,
-            ExprKind::BinaryOp { op: BinOp::Or, .. }
-        ));
+        for fallible in ["t2.k2 / t2.k1 = 2", "CAST(t2.k2 AS TINYINT) = 2"] {
+            let sql = format!(
+                "SELECT k1 FROM t1 \
+                 WHERE (SELECT count(*) FROM t2 \
+                        WHERE (t2.k1 = t1.k1 AND t2.k2 = 1) \
+                           OR (t2.k1 = t1.k1 AND {fallible})) > 0"
+            );
+            let resolved = parse_and_analyze_for_apply_specs(&sql)
+                .expect("analyze scalar Apply with a fallible OR branch");
+            let QueryBody::Select(select) = &resolved.body else {
+                panic!("expected select body");
+            };
+            let QueryBody::Select(inner) = &select.apply_specs[0].inner.body else {
+                panic!("expected scalar Apply inner select");
+            };
+            assert!(
+                matches!(
+                    &inner.filter.as_ref().expect("expected filter").kind,
+                    ExprKind::BinaryOp { op: BinOp::Or, .. }
+                ),
+                "{fallible}"
+            );
+        }
     }
 
     #[test]

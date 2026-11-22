@@ -23,8 +23,8 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_merge_row_id ;
 DROP TABLE IF EXISTS ${case_db}.s_merge_row_id ;
-CREATE TABLE ${case_db}.t_merge_row_id (id BIGINT, v STRING) WITH (format_version = 3);
-CREATE TABLE ${case_db}.s_merge_row_id (id BIGINT, v STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t_merge_row_id (id BIGINT, v VARCHAR) WITH (format_version = 3);
+CREATE TABLE ${case_db}.s_merge_row_id (id BIGINT, v VARCHAR) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_merge_row_id VALUES ROW(1,'a'),ROW(2,'b'),ROW(3,'c');
 INSERT INTO ${case_db}.s_merge_row_id VALUES ROW(2,'bb'),ROW(4,'d'),ROW(5,'e');
 ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_merge_row_id EXECUTE create_tag(name => 'before_merge', replace => false, if_not_exists => false);

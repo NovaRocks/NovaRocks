@@ -19,9 +19,10 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompilePhase,
-    FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
-    OperatorFunction, PureCompileControl, ValueLogicalType, wider_comparison_value_type,
+    ArgumentControl, AssignmentCommonTypeError, CallEffects, CallProofScope, CompileCheckpoints,
+    CompilePhase, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
+    ObservableEffects, OperatorFunction, PureCompileControl, ValueLogicalType,
+    assignment_common_value_type,
 };
 
 use super::binding_control;
@@ -217,13 +218,23 @@ impl BinaryOperatorOwner {
             }
         } else {
             let [left, right] = inputs;
-            work.flush()?;
-            let common = wider_comparison_value_type(left, right)
-                .map_err(|_| FunctionBindingError::NoMatchingOverload)?;
+            let common =
+                assignment_common_value_type(left, right, work).map_err(|error| match error {
+                    AssignmentCommonTypeError::Control(error) => {
+                        FunctionBindingError::Control(error)
+                    }
+                    AssignmentCommonTypeError::Construction(error) => {
+                        FunctionBindingError::ValueType(error.into())
+                    }
+                    AssignmentCommonTypeError::IncompatibleShape(_) => {
+                        FunctionBindingError::NoMatchingOverload
+                    }
+                })?;
             let args = [
                 common.with_nullable(left_null)?,
                 common.with_nullable(right_null)?,
             ];
+            work.flush()?;
             BinaryOperatorKernel::validate_comparison(
                 self.operator,
                 [&args[0], &args[1]],

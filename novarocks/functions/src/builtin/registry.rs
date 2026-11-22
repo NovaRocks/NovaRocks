@@ -903,6 +903,12 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Boolean),
     );
 
+    add(
+        m,
+        "try",
+        Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+    );
+
     // Conditional / null-handling functions whose return type is the
     // widening over every argument's type. These rely on the resolver's
     // pass-3 widening-cast match (`BindMode::Widening`) — strict and
@@ -1181,6 +1187,18 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ),
         );
     }
+
+    add(
+        m,
+        super::array_element_at_owner::SUBSCRIPT_NAME,
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::Int64,
+            ],
+            TypeSpec::Any("T"),
+        ),
+    );
 
     // array_join / array_to_string: List<*> + Utf8 -> Utf8
     for name in ["array_join", "array_to_string"] {

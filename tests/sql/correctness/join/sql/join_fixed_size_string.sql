@@ -72,10 +72,10 @@ CREATE TABLE ${case_db}.t1 (
     k1 bigint ,
     c_int int ,
     c_bigint bigint ,
-    c_str4 STRING ,
-    c_str8 STRING ,
-    c_str16 STRING ,
-    c_str32 STRING
+    c_str4 VARCHAR ,
+    c_str8 VARCHAR ,
+    c_str16 VARCHAR ,
+    c_str32 VARCHAR
 ) WITH (format_version = 3);
 
 -- query 11
@@ -101,10 +101,10 @@ CREATE TABLE ${case_db}.t2 (
     k1 bigint ,
     c_int int ,
     c_bigint bigint ,
-    c_str4 STRING ,
-    c_str8 STRING ,
-    c_str16 STRING ,
-    c_str32 STRING
+    c_str4 VARCHAR ,
+    c_str8 VARCHAR ,
+    c_str16 VARCHAR ,
+    c_str32 VARCHAR
 ) WITH (format_version = 3);
 
 -- query 14

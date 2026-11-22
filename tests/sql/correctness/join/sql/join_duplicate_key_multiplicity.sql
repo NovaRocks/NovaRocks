@@ -28,11 +28,11 @@ DROP TABLE IF EXISTS ${case_db}.t_join_duplicate_key_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_duplicate_key_r;
 CREATE TABLE ${case_db}.t_join_duplicate_key_l (
   id INT,
-  ltag STRING
+  ltag VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_duplicate_key_r (
   id INT,
-  rtag STRING
+  rtag VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_duplicate_key_l VALUES
   ROW(1, 'L1a'),

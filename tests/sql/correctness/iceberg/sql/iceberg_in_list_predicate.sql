@@ -21,7 +21,7 @@
 CREATE SCHEMA iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0};
 -- query 2
 CREATE TABLE iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0}.iceberg_in_tbl_${uuid0} (
-  col_str STRING,
+  col_str VARCHAR,
   col_int INT
 );
 -- query 3

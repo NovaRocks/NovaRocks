@@ -43,14 +43,23 @@ pub fn read_stored_mv_query(
     target: &novarocks_types::naming::TableIdentity,
 ) -> Result<novarocks_parser::ast::Query, novarocks_sql::analyze_error::AnalyzeError> {
     use novarocks_sql::analyze_error::{AnalyzeError, StoredDefinition};
-    novarocks_parser::parser::parse_query(sql).map_err(|error| {
+    let query = novarocks_parser::parser::parse_query(sql).map_err(|error| {
         AnalyzeError::stored_definition_parse_failure(
             StoredDefinition::materialized_view(target.fqn()),
             std::sync::Arc::from(sql),
             error,
             None,
         )
-    })
+    })?;
+    if let Some((span, name)) = novarocks_sql::find_retired_type_in_query(&query) {
+        return Err(AnalyzeError::stored_definition_retired_type(
+            StoredDefinition::materialized_view(target.fqn()),
+            std::sync::Arc::from(sql),
+            span,
+            &name,
+        ));
+    }
+    Ok(query)
 }
 
 #[cfg(test)]
@@ -105,6 +114,20 @@ mod tests {
                     .and_then(|cause| cause.downcast_ref::<novarocks_parser::ParserError>()),
                 Some(&original)
             );
+        }
+    }
+
+    #[test]
+    fn stored_mv_names_the_rebuild_for_nested_retired_declarations() {
+        let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
+        for sql in [
+            "SELECT CAST(NULL AS ARRAY(LARGEINT))",
+            "SELECT CAST(NULL AS DECIMAL(39,0))",
+        ] {
+            let error = read_stored_mv_query(sql, &target).unwrap_err();
+            assert_eq!(error.stored_view_definition_source(), Some(sql));
+            assert_eq!(error.stored_definition().unwrap().name(), "ice.db.mv");
+            assert!(error.message().contains("must be rebuilt"));
         }
     }
 

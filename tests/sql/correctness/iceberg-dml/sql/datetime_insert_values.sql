@@ -23,10 +23,10 @@
 DROP TABLE IF EXISTS ${case_db}.t_datetime_insert_values;
 CREATE TABLE ${case_db}.t_datetime_insert_values (
   id INT,
-  dt DATETIME
+  dt TIMESTAMP(6)
 );
 INSERT INTO ${case_db}.t_datetime_insert_values VALUES
-  ROW(1, '2024-03-01 10:20:30');
+  ROW(1, TIMESTAMP '2024-03-01 10:20:30');
 INSERT INTO ${case_db}.t_datetime_insert_values
 SELECT 2, CAST('2024-12-31 23:59:59' AS TIMESTAMP);
 INSERT INTO ${case_db}.t_datetime_insert_values

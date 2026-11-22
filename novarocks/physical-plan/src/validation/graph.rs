@@ -1571,10 +1571,9 @@ pub(crate) fn validate_result_port_fields(
             let name = field.alias.as_deref().unwrap_or(&field.name);
             if column.source_ordinal as usize != ordinal
                 || column.name != name
-                || !novarocks_type_contract::result_render_type::render_field_matches_storage(
+                || !novarocks_type_contract::result_render_type::render_field_matches_declaration(
                     &column.field,
-                    field.ty.data_type(),
-                    field.ty.nullable(),
+                    &field.ty,
                 )
             {
                 errors.push(ValidationError::new(

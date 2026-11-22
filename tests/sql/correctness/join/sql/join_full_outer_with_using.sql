@@ -758,7 +758,7 @@ ORDER BY k;
 -- query 78
 -- Inline VALUES FULL OUTER + expression columns
 -- @order_sensitive=true
-SELECT k, k * 10 as k_scaled, CONCAT('K', CAST(k AS STRING)) as k_str, v1, v2
+SELECT k, k * 10 as k_scaled, CONCAT('K', CAST(k AS VARCHAR)) as k_str, v1, v2
 FROM
     (VALUES ROW(1, 'a'), ROW(2, 'b')) AS t(k, v1) FULL OUTER JOIN
     (VALUES ROW(2, 'x'), ROW(3, 'y')) AS u(k, v2) USING (k)
@@ -892,7 +892,7 @@ ORDER BY k1, k2;
 -- FULL OUTER USING + string functions on values
 -- @order_sensitive=true
 SELECT k1, k2,
-       CONCAT('K1:', CAST(k1 AS STRING)) as k1_str,
+       CONCAT('K1:', CAST(k1 AS VARCHAR)) as k1_str,
        LENGTH(v1) as len_v1,
        UPPER(v2) as v2_upper
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)

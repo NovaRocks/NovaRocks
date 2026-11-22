@@ -556,7 +556,7 @@ mod tests {
         let input = col(id);
         TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(input),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

@@ -195,13 +195,13 @@ fn typed_expr_semantically_eq_with(
         }
         (
             ExprKind::Cast {
-                array_failure_mode: left_array_mode,
+                cast_mode: left_array_mode,
                 expr: left_expr,
                 target: left_target,
                 decimal_overflow_policy: left_policy,
             },
             ExprKind::Cast {
-                array_failure_mode: right_array_mode,
+                cast_mode: right_array_mode,
                 expr: right_expr,
                 target: right_target,
                 decimal_overflow_policy: right_policy,

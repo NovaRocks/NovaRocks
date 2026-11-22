@@ -24,10 +24,10 @@ USE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
 DROP TABLE IF EXISTS orders_local;
 CREATE TABLE orders_local (
   id INT,
-  amount FLOAT
+  amount REAL
 ) WITH (format_version = 2);
 INSERT INTO orders_local VALUES ROW(1, 10.5), ROW(2, 20.25);
-ALTER TABLE orders_local ADD COLUMN note_text STRING DEFAULT NULL;
+ALTER TABLE orders_local ADD COLUMN note_text VARCHAR DEFAULT NULL;
 
 -- query 2
 SELECT id, amount, note_text FROM orders_local ORDER BY id;
@@ -61,7 +61,7 @@ SELECT * FROM orders_local ORDER BY id;
 SELECT note_text FROM orders_local;
 
 -- query 12
-ALTER TABLE orders_local ADD COLUMN note_text STRING DEFAULT NULL;
+ALTER TABLE orders_local ADD COLUMN note_text VARCHAR DEFAULT NULL;
 
 -- query 13
 SELECT id, total_amount, note_text FROM orders_local ORDER BY id;

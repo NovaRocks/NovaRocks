@@ -1012,7 +1012,7 @@ mod tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     child: source,
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: policy,

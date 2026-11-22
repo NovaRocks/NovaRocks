@@ -966,6 +966,7 @@ fn every_control_and_proof_variant_projects_exactly_including_higher_order() {
         ArgumentControl::TypeOnly,
         ArgumentControl::If,
         ArgumentControl::Coalesce,
+        ArgumentControl::Try,
         ArgumentControl::SimpleCase,
         ArgumentControl::SearchedCase,
         ArgumentControl::Aggregate,

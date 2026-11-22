@@ -15,200 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real LocalCompiler Date32 float profiles, native literal projection and host first-failure evidence.
-use super::*;
-use crate::EvaluationInput;
-use crate::testkit::PassThroughCallHost;
-use arrow::array::{Date32Array, Float32Array, Float64Array, UInt32Array};
-use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
-// Proleptic Gregorian day offsets from 1970-01-01: 2024-02-29 is
-// 19_723 + 31 + 28 = 19_782; astronomical -0001-12-31 is -719_529.
-// The date -> float contract encodes year*10000 + month*100 + day, so the
-// latter date has coefficient -10_000 + 1_200 + 31 = -8_769. Day 71 is
-// 1970-03-13 (31 January days + 28 February days + 12).
-// Expected IEEE bits are independently rounded from those integer
-// coefficients. At these positive Float32 magnitudes the ULP is 2: ties
-// round to even, giving 19700100, 20240228, 19691232 and 19700312.
-// -8769 is exact in both formats; all coefficients are exact in Float64.
-// No runtime conversion, Arrow cast, or retired evaluator generates them.
-fn expected_date_floats(target: &DataType, coefficients: &[Option<i32>]) -> ArrayRef {
-    match target {
-        DataType::Float32 => Arc::new(Float32Array::from(
-            coefficients
-                .iter()
-                .map(|value| {
-                    value.map(|value| {
-                        f32::from_bits(match value {
-                            19_700_101 => 0x4b96_4cc2,
-                            20_240_229 => 0x4b9a_6bb2,
-                            19_691_231 => 0x4b96_3b70,
-                            -8_769 => 0xc609_0400,
-                            19_700_313 => 0x4b96_4d2c,
-                            _ => panic!("coefficient absent from independent IEEE table"),
-                        })
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )),
-        DataType::Float64 => Arc::new(Float64Array::from(
-            coefficients
-                .iter()
-                .map(|value| {
-                    value.map(|value| {
-                        f64::from_bits(match value {
-                            19_700_101 => 0x4172_c998_5000_0000,
-                            20_240_229 => 0x4173_4d76_5000_0000,
-                            19_691_231 => 0x4172_c76d_f000_0000,
-                            -8_769 => 0xc0c1_2080_0000_0000,
-                            19_700_313 => 0x4172_c9a5_9000_0000,
-                            _ => panic!("coefficient absent from independent IEEE table"),
-                        })
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )),
-        _ => panic!("exact date-to-float profile"),
-    }
-}
-fn date_batch(program: &CompiledFixture, dates: ArrayRef) -> RecordBatch {
-    let count = dates.len();
-    let schema = program.input_schema().clone();
-    RecordBatch::try_new(
-        schema,
-        vec![
-            dates,
-            Arc::new(Int64Array::from(vec![42; count])),
-            Arc::new(BooleanArray::from(vec![true; count])),
-        ],
-    )
-    .unwrap()
-}
+use crate::testkit::numeric_fixtures::{Source, Wrap, cast_fixture_in_mode};
+use crate::{CallAuthorError, CapabilityRefusal};
+use arrow::datatypes::DataType;
+use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
+
 #[test]
-fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants() {
-    for target in [DataType::Float32, DataType::Float64] {
-        for nullable in [false, true] {
-            let source: ArrayRef = Arc::new(Date32Array::from(if nullable {
-                vec![
-                    Some(-7),
-                    Some(0),
-                    None,
-                    Some(19_782),
-                    Some(-1),
-                    Some(-719_529),
-                ]
-            } else {
-                vec![
-                    Some(-7),
-                    Some(0),
-                    Some(0),
-                    Some(19_782),
-                    Some(-1),
-                    Some(-719_529),
-                ]
-            }));
-            let source = source.slice(1, 5);
-            for policy in [
-                DecimalOverflowPolicy::OutputNull,
-                DecimalOverflowPolicy::ReportError,
-            ] {
-                for allow in [false, true] {
-                    let program = compiled(
-                        FunctionValueType::new(DataType::Date32, nullable),
-                        FunctionValueType::new(target.clone(), nullable),
-                        Source::Column,
-                        Wrap::Bare,
-                        policy,
-                        allow,
-                    );
-                    let batch = date_batch(&program, source.clone());
-                    let rows = [0, 1, 3, 4];
-                    let selection = Selection::try_sparse(5, &rows).unwrap();
-                    let mut evaluator = instance(&program);
-                    let occurrence = cast_root_use(&program);
-                    let summary = evaluator.effects[&occurrence];
-                    assert!(
-                        summary
-                            .for_use(summary.context())
-                            .unwrap()
-                            .may_raise_row_error
-                    );
-                    let output = evaluator
-                        .evaluate(
-                            EvaluationInput::Batch {
-                                batch: &batch,
-                                source: None,
-                            },
-                            ScalarInvocationScope::new(selection, selection),
-                            ScalarInvocationActivation::Activated,
-                            &Control,
-                            &mut PassThroughCallHost,
-                        )
-                        .unwrap();
-                    let full_expected = expected_date_floats(
-                        &target,
-                        &[
-                            Some(19_700_101),
-                            if nullable { None } else { Some(19_700_101) },
-                            Some(20_240_229),
-                            Some(19_691_231),
-                            Some(-8_769),
-                        ],
-                    );
-                    let expected = arrow::compute::take(
-                        full_expected.as_ref(),
-                        &UInt32Array::from(rows.map(|r| r as u32).to_vec()),
-                        None,
-                    )
-                    .unwrap();
-                    assert_eq!(output.values().to_data(), expected.to_data());
-                    assert!(output.errors().is_empty());
-                    let empty = [];
-                    let output = instance(&program)
-                        .evaluate(
-                            EvaluationInput::Batch {
-                                batch: &batch,
-                                source: None,
-                            },
-                            {
-                                let selection = Selection::try_sparse(5, &empty).unwrap();
-                                ScalarInvocationScope::new(selection, selection)
-                            },
-                            ScalarInvocationActivation::Activated,
-                            &Control,
-                            &mut PassThroughCallHost,
-                        )
-                        .unwrap();
-                    assert_eq!(output.values().data_type(), &target);
-                    assert_eq!(output.values().len(), 0);
-                    assert!(output.errors().is_empty());
-                    let constant = compiled(
-                        FunctionValueType::new(DataType::Date32, false),
-                        FunctionValueType::new(target.clone(), false),
-                        Source::Constant,
-                        Wrap::Bare,
-                        policy,
-                        allow,
-                    );
-                    let batch = date_batch(&constant, Arc::new(Date32Array::from(vec![0; 5])));
-                    let output = instance(&constant)
-                        .evaluate(
-                            EvaluationInput::Batch {
-                                batch: &batch,
-                                source: None,
-                            },
-                            ScalarInvocationScope::new(selection, selection),
-                            ScalarInvocationActivation::Activated,
-                            &Control,
-                            &mut PassThroughCallHost,
-                        )
-                        .unwrap();
-                    assert_eq!(
-                        output.values().to_data(),
-                        expected_date_floats(&target, &[Some(19_700_313); 4]).to_data()
-                    );
-                    assert!(output.errors().is_empty());
-                }
-            }
+fn date_cannot_cast_to_floating_types() {
+    for float in [DataType::Float32, DataType::Float64] {
+        let (source, target) = (DataType::Date32, float);
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+            let result = cast_fixture_in_mode(
+                FunctionValueType::new(source.clone(), true),
+                FunctionValueType::new(target.clone(), true),
+                Source::Column,
+                Wrap::Bare,
+                mode,
+                false,
+            );
+            assert!(matches!(
+                result,
+                Err(CallAuthorError::Capability(CapabilityRefusal::Primitive {
+                    cast: None,
+                    ..
+                }))
+            ));
         }
     }
 }

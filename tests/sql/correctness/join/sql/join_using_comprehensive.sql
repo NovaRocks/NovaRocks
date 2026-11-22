@@ -430,7 +430,7 @@ ORDER BY id;
 SELECT id,
        id * 2 as id_double,
        id + 100 as id_offset,
-       CONCAT('ID_', CAST(id AS STRING)) as id_str,
+       CONCAT('ID_', CAST(id AS VARCHAR)) as id_str,
        v1, v2, v3, v4, v5
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(id)
         INNER JOIN ${case_db}.t3 USING(id)

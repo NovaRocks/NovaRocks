@@ -26,7 +26,7 @@
 -- 3. Sort by multiple keys and assert exact row order.
 DROP TABLE IF EXISTS ${case_db}.t_sort_multi_key;
 CREATE TABLE ${case_db}.t_sort_multi_key (
-  grp STRING,
+  grp VARCHAR,
   v INT,
   id INT
 ) WITH (format_version = 3);

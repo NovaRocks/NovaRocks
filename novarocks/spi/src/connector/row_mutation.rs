@@ -465,6 +465,28 @@ pub struct ConnectorRowMutationCurrent {
     snapshot_id: Option<i64>,
 }
 
+fn projected_before_storage<'a>(
+    before: &ConnectorMutationTargetField,
+    after_fields: &'a [ConnectorMutationTargetField],
+) -> Option<&'a novarocks_type_contract::FunctionValueType> {
+    let value = before.execution_type()?.typed_binding().borrowed();
+    after_fields.iter().find_map(|after| {
+        let storage = after.storage_type()?;
+        if after.field().name() != before.field().name()
+            || after.field().data_type() != before.field().data_type()
+        {
+            return None;
+        }
+        let input = after.execution_type()?.typed_binding().borrowed();
+        value
+            .same_physical_binding_ignoring_nullability_observed(input, || {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .expect("the observer is infallible")
+            .then_some(storage)
+    })
+}
+
 impl ConnectorRowMutationCurrent {
     pub fn identity(&self) -> &super::ConnectorTableIdentity {
         &self.identity
@@ -537,21 +559,21 @@ impl ConnectorRowMutationPreparation {
         base_version.validate()?;
         match_contract.validate()?;
         let match_source_schema_digest = canonical_schema_digest(match_source_schema.as_ref())?;
-        for (expected, storage) in match_contract
+        for (expected, storage, before) in match_contract
             .identity_fields()
             .iter()
-            .map(|field| (field.field(), None))
+            .map(|field| (field.field(), None, None))
             .chain(
                 match_contract
                     .before_fields()
                     .iter()
-                    .map(|field| (field.field(), None)),
+                    .map(|field| (field.field(), None, Some(field))),
             )
             .chain(
                 match_contract
                     .after_fields()
                     .iter()
-                    .map(|field| (field.field(), field.storage_type())),
+                    .map(|field| (field.field(), field.storage_type(), None)),
             )
         {
             let mut matching = match_source_schema
@@ -564,13 +586,20 @@ impl ConnectorRowMutationPreparation {
                     "row-mutation match source omits a signed match field",
                 )
             })?;
+            let storage = if let Some(before) = before
+                && actual.data_type() != expected.data_type()
+            {
+                projected_before_storage(before, match_contract.after_fields())
+            } else {
+                storage
+            };
             let matches = matching.next().is_none()
                 && !(actual.is_nullable() && !expected.is_nullable())
                 && if let Some(storage) = storage {
-                    // The match source remains ReadT; an after field carries
-                    // canonical W independently. Borrow the original layout
-                    // matcher so raw source attributes never become normalized
-                    // execution attributes or inferred logical domains.
+                    // The match source keeps formal storage. When a before
+                    // field uses the same checked byte projection as the
+                    // canonical input, the after field supplies the original
+                    // storage proof for both roles.
                     novarocks_type_contract::value_layout_matches_carrier_observed::<
                         novarocks_type_contract::ValueTypeError,
                     >(
@@ -1395,6 +1424,22 @@ mod tests {
             valid.match_contract().after_fields()[0].field().data_type(),
             &DataType::Binary
         );
+        for domain in [
+            novarocks_type_contract::ValueLogicalType::Physical,
+            novarocks_type_contract::ValueLogicalType::Hll,
+        ] {
+            let before = ConnectorMutationTargetField::try_new_typed(
+                ConnectorWriteFieldToken::from_bytes([3; 32]),
+                Field::new("value", DataType::Binary, true),
+                1,
+                FunctionValueType::try_with_logical_type(DataType::Binary, true, domain).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                projected_before_storage(&before, valid.match_contract().after_fields()).is_some(),
+                domain == novarocks_type_contract::ValueLogicalType::Physical,
+            );
+        }
         for wrong_source in [
             Field::new("value", DataType::Binary, false),
             Field::new("value", DataType::FixedSizeBinary(8), false),

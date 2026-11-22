@@ -161,17 +161,17 @@ impl Scenario for JsonMembership {
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control.execute(format!("CREATE SCHEMA {CATALOG}.{DATABASE}"))?;
         control.execute(format!(
-            "CREATE TABLE {CATALOG}.{DATABASE}.probe (id BIGINT, txt STRING)"
+            "CREATE TABLE {CATALOG}.{DATABASE}.probe (id BIGINT, txt VARCHAR)"
         ))?;
         control.execute(format!(
-            "CREATE TABLE {CATALOG}.{DATABASE}.rhs (txt STRING)"
+            "CREATE TABLE {CATALOG}.{DATABASE}.rhs (txt VARCHAR)"
         ))?;
         for low in [1, 1025, 2049] {
             let high = low + 1023;
-            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.probe SELECT generate_series, CASE WHEN generate_series % 17=0 THEN NULL ELSE CONCAT('{{\"a\":',CAST(generate_series % 13 AS STRING),',\"b\":1}}') END FROM TABLE(generate_series({low},{high}))"))?;
+            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.probe SELECT generate_series, CASE WHEN generate_series % 17=0 THEN NULL ELSE CONCAT('{{\"a\":',CAST(generate_series % 13 AS VARCHAR),',\"b\":1}}') END FROM TABLE(generate_series({low},{high}))"))?;
         }
         for (low, high) in [(0, 4), (5, 8)] {
-            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.rhs SELECT CONCAT('{{\"b\":1,\"a\":',CAST(generate_series AS STRING),'}}') FROM TABLE(generate_series({low},{high}))"))?;
+            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.rhs SELECT CONCAT('{{\"b\":1,\"a\":',CAST(generate_series AS VARCHAR),'}}') FROM TABLE(generate_series({low},{high}))"))?;
         }
         control.execute(format!(
             "INSERT INTO {CATALOG}.{DATABASE}.rhs VALUES ROW(NULL), ROW('{{\"b\":1,\"a\":0}}')"
@@ -508,39 +508,43 @@ fn await_held_probe(
 }
 fn seed_capacity(context: &mut ScenarioContext, control: &mut SqlSession) -> Result<()> {
     control.execute(format!(
-        "CREATE TABLE {CATALOG}.{DATABASE}.big_rhs (txt STRING)"
+        "CREATE TABLE {CATALOG}.{DATABASE}.big_rhs (txt VARCHAR)"
     ))?;
     // Keep each JSON small: PARSE_JSON's original worst-case RawValue resource
     // envelope grows quadratically in one value's length. Large individual
     // values exercise that producer's admission rather than retained RHS size.
     // Each independent INSERT has at most 2MiB of string body before metadata.
     let seed_rows = 2 * 1024 * 1024 / BIG_TEXT;
+    let key_prefix = r#"{"key":"#;
+    let text_prefix = r#","large":""#;
+    let object_suffix = r#""}"#;
     for low in (1..=BIG_ROWS).step_by(seed_rows as usize) {
         let high = (low + seed_rows - 1).min(BIG_ROWS);
-        control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.big_rhs SELECT CONCAT('{{\"key\":',CAST(generate_series AS STRING),',\"large\":\"',REPEAT('x',{BIG_TEXT}),'\"}}') FROM TABLE(generate_series({low},{high}))"))?;
+        control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.big_rhs SELECT CONCAT('{key_prefix}',CAST(generate_series AS VARCHAR),'{text_prefix}',REPEAT('x',{BIG_TEXT}),'{object_suffix}') FROM TABLE(generate_series({low},{high}))"))?;
     }
     context.action("bounded large RHS fixture written");
     CAPACITY_SETTINGS.apply(control)?;
     context.action("applied original pipeline_dop=1 session property; batch size remains default");
-    // SUM consumes every original PARSE_JSON result; COUNT alone could prune
-    // that producer. The private snapshot and frozen execution options match
-    // the target. No build is retained in this independent producer control.
+    // PARSE_JSON can return NULL even with a non-null input, so counting its
+    // results requires the producer. Sum the original compact payload lengths
+    // separately. The snapshot, pipeline settings and budget match the target.
     let produced = control.execute(format!(
-        "WITH SESSION query_mem_limit = {CAPACITY_BYTES} SELECT COUNT(*), SUM(LENGTH(CAST(parse_json(txt) AS STRING))) FROM {CATALOG}.{DATABASE}.big_rhs"))?;
-    require_result_types(&produced, &["bigint", "bigint"])?;
-    // Original renderer syntax has 22 bytes plus the decimal key digits.
+        "WITH SESSION query_mem_limit = {CAPACITY_BYTES} SELECT COUNT(*), COUNT(parse_json(txt)), SUM(LENGTH(txt)) FROM {CATALOG}.{DATABASE}.big_rhs"))?;
+    require_result_types(&produced, &["bigint", "bigint", "bigint"])?;
     // Each source key is distinct, so the canonical set cannot collapse it.
-    let expected_length = BIG_ROWS * (BIG_TEXT + 22) + decimal_digit_total(BIG_ROWS);
+    let object_overhead = (key_prefix.len() + text_prefix.len() + object_suffix.len()) as i64;
+    let expected_length = BIG_ROWS * (BIG_TEXT + object_overhead) + decimal_digit_total(BIG_ROWS);
     ensure!(
         produced.rows
             == vec![vec![
+                TrinoValue::Integer(BIG_ROWS),
                 TrinoValue::Integer(BIG_ROWS),
                 TrinoValue::Integer(expected_length),
             ]],
         "same-budget complete original JSON producer control failed: {produced:?}"
     );
     context.action(
-        "same-budget complete JSON producer control passed count and parsed-content length",
+        "same-budget complete JSON producer control passed source count, parsed count and payload length",
     );
     context.action("begin same-budget small mark control");
     let small = control.execute(selected_sql(Case::FullEos).replacen(

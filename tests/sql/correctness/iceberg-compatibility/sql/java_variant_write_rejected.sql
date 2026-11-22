@@ -82,18 +82,15 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_like_rejected_${uuid0} (LIKE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0});
 
 -- query 11
--- @expect_error_tier=drift
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0}, column extra_variant
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD COLUMN extra_variant VARIANT;
 
 -- query 12
--- @expect_error_tier=drift
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0}, column extra_struct.v
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD COLUMN extra_struct ROW(v VARIANT);
 
 -- query 13
--- @expect_error_tier=drift
--- @expect_error=unsupported Iceberg type evolution from int to variant
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ALTER COLUMN id SET DATA TYPE VARIANT;
 
 -- query 14
@@ -103,24 +100,27 @@ ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uui
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_default_ctas_rejected_${uuid0} AS SELECT id,v FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0};
 
 -- query 15
--- Existing Variant does not block ordinary metadata changes or its type no-op.
+-- Existing external Variant permits ordinary metadata changes.
 -- @skip_result_check=true
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD COLUMN note_text STRING;
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ADD COLUMN note_text VARCHAR;
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} RENAME COLUMN note_text TO note_renamed;
 COMMENT ON COLUMN iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0}.note_renamed IS 'ordinary metadata remains supported';
 COMMENT ON COLUMN iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0}.v IS 'external Variant remains readable';
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ALTER COLUMN v SET DATA TYPE VARIANT;
 
 -- query 16
-SELECT id,note_renamed FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ORDER BY id;
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ALTER COLUMN v SET DATA TYPE VARIANT;
 
 -- query 17
+SELECT id,note_renamed FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ORDER BY id;
+
+-- query 18
 -- @skip_result_check=true
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} DROP COLUMN note_renamed;
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} SET PROPERTIES extra_properties = MAP(ARRAY['iru9.metadata-control'], ARRAY['allowed']);
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} EXECUTE unset_extra_properties(keys => ARRAY['iru9.metadata-control'], if_exists => false);
 
--- query 18
+-- query 19
 -- @result_contains=IRU9_UNCHANGED_OK
 shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
@@ -128,6 +128,6 @@ mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace ${case_db} --table java_variant_rejected_${uuid0} --output "$receipt_dir"
 
--- query 19
+-- query 20
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} ;

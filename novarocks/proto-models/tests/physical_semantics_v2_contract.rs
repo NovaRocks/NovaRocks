@@ -757,7 +757,7 @@ fn call_policy_presence_preserves_absent_unspecified_and_unknown_for_typed_decod
 }
 
 #[test]
-fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_values() {
+fn calls_and_binary_share_one_semantic_policy_with_unchanged_numeric_wire_values() {
     let pool = pool();
     for (message, tag, presence) in [
         ("novarocks.physical_semantics_v2.FrozenCall", 4, true),
@@ -767,7 +767,6 @@ fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_v
             true,
         ),
         ("novarocks.physical_package_v2.BinaryExpression", 4, false),
-        ("novarocks.physical_package_v2.CastExpression", 3, false),
     ] {
         let descriptor = pool.get_message_by_name(message).unwrap();
         let field = descriptor
@@ -792,11 +791,7 @@ fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_v
             &[0x20, value][..],
         )
         .unwrap();
-        let cast =
-            novarocks_proto_models::physical_package_v2::CastExpression::decode(&[0x18, value][..])
-                .unwrap();
         assert_eq!(binary.decimal_overflow_policy, i32::from(value));
-        assert_eq!(cast.decimal_overflow_policy, i32::from(value));
     }
 }
 

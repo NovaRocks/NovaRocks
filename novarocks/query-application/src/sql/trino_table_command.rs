@@ -41,7 +41,9 @@ use super::table_procedure::{
     resolve_table_procedure,
 };
 use super::trino_admission::unsupported_statement;
-use super::{lower_command_literal, lower_object_name, lower_sql_type};
+use super::{
+    lower_command_literal, lower_object_name, lower_sql_type, validate_bounded_varchar_default,
+};
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
 pub fn lower_trino_rename_table(
@@ -58,6 +60,7 @@ pub fn lower_trino_rename_table(
 pub fn lower_trino_add_column(
     source: &str,
     statement: &ast::TrinoAddColumn,
+    control: &dyn PureCompileControl,
 ) -> Result<CatalogSqlCommand, QueryServiceError> {
     reject_existence_clause(
         source,
@@ -80,10 +83,11 @@ pub fn lower_trino_add_column(
             "ADD COLUMN with COMMENT or WITH",
         ));
     }
-    let data_type = lower_sql_type(&column.data_type).map_err(invalid_value)?;
+    let data_type = lower_sql_type(&column.data_type, source, control)?;
     let default = match &column.default_value {
         None => None,
         Some(ast::Expr::Literal(literal)) => {
+            validate_bounded_varchar_default(source, literal, &data_type, control)?;
             Some(lower_command_literal(literal).map_err(invalid_value)?)
         }
         Some(expression) => {
@@ -153,6 +157,7 @@ pub fn lower_trino_drop_column(
 pub fn lower_trino_set_column_type(
     source: &str,
     statement: &ast::TrinoSetColumnType,
+    control: &dyn PureCompileControl,
 ) -> Result<CatalogSqlCommand, QueryServiceError> {
     reject_existence_clause(
         source,
@@ -164,7 +169,7 @@ pub fn lower_trino_set_column_type(
         &statement.table_name,
         IcebergSchemaSqlChange::ModifyColumn {
             path: lower_object_name(&statement.column_name).parts,
-            data_type: lower_sql_type(&statement.data_type).map_err(invalid_value)?,
+            data_type: lower_sql_type(&statement.data_type, source, control)?,
         },
     ))
 }

@@ -17,11 +17,13 @@
 use super::*;
 use arrow::array::Float32Array;
 use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::testkit::numeric_fixtures::{cast_fixture_in_mode, compiled_cast};
 use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
 use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
+use novarocks_type_contract::TrinoCastMode;
 
 #[test]
-fn truthful_nonnullable_widening_is_preserved_and_complete_package_rejects_false_narrowing_claim() {
+fn truthful_nonnullable_widening_and_try_narrowing_have_different_null_contracts() {
     // The current Physical scalar literal author can produce a nonempty I64
     // source. I8(false) source production needs the later CV/channel slice;
     // neither a retagged I64 literal nor a NULL(false) proves it here.
@@ -33,78 +35,70 @@ fn truthful_nonnullable_widening_is_preserved_and_complete_package_rejects_false
         Some(i64::MAX),
     ];
     for target in [DataType::Int64, DataType::Float32, DataType::Float64] {
-        for policy in [
-            DecimalOverflowPolicy::OutputNull,
-            DecimalOverflowPolicy::ReportError,
-        ] {
-            for allow in [false, true] {
-                let program = compiled(
-                    FunctionValueType::new(DataType::Int64, false),
-                    FunctionValueType::new(target.clone(), false),
-                    Source::Column,
-                    Wrap::Bare,
-                    policy,
-                    allow,
-                );
-                let batch = sliced_batch(&program, &values);
-                let output = instance(&program)
-                    .evaluate(
-                        EvaluationInput::Batch {
-                            batch: &batch,
-                            source: None,
-                        },
-                        {
-                            let selection = Selection::all(values.len());
-                            ScalarInvocationScope::new(selection, selection)
-                        },
-                        ScalarInvocationActivation::Activated,
-                        &Control,
-                        &mut PassThroughCallHost,
-                    )
+        let program = compiled_cast(
+            FunctionValueType::new(DataType::Int64, false),
+            FunctionValueType::new(target.clone(), false),
+            Source::Column,
+            Wrap::Bare,
+            TrinoCastMode::Implicit,
+            false,
+        );
+        let batch = sliced_batch(&program, &values);
+        let output = instance(&program)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                {
+                    let selection = Selection::all(values.len());
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
+        assert_eq!(output.values().null_count(), 0);
+        match target {
+            DataType::Int64 => assert_eq!(signed_values(&output), values.to_vec()),
+            DataType::Float32 => {
+                let actual = output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
                     .unwrap();
-                assert_eq!(output.values().null_count(), 0);
-                match target {
-                    DataType::Int64 => assert_eq!(signed_values(&output), values.to_vec()),
-                    DataType::Float32 => {
-                        let actual = output
-                            .values()
-                            .as_any()
-                            .downcast_ref::<Float32Array>()
-                            .unwrap();
-                        for (row, value) in values.iter().enumerate() {
-                            assert_eq!(
-                                actual.value(row).to_bits(),
-                                (value.unwrap() as f32).to_bits()
-                            );
-                        }
-                    }
-                    DataType::Float64 => {
-                        let actual = output
-                            .values()
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .unwrap();
-                        for (row, value) in values.iter().enumerate() {
-                            assert_eq!(
-                                actual.value(row).to_bits(),
-                                (value.unwrap() as f64).to_bits()
-                            );
-                        }
-                    }
-                    _ => unreachable!(),
+                for (row, value) in values.iter().enumerate() {
+                    assert_eq!(
+                        actual.value(row).to_bits(),
+                        (value.unwrap() as f32).to_bits()
+                    );
                 }
             }
+            DataType::Float64 => {
+                let actual = output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                for (row, value) in values.iter().enumerate() {
+                    assert_eq!(
+                        actual.value(row).to_bits(),
+                        (value.unwrap() as f64).to_bits()
+                    );
+                }
+            }
+            _ => unreachable!(),
         }
     }
-    // The call author refuses this declaration before runtime: a non-null Int8
-    // result cannot promise successful NULL for a narrowing Int64 cast.
-    let error = match cast_fixture(
+    // An out-of-range explicit cast raises an error, while TRY_CAST can return NULL.
+    let error = match cast_fixture_in_mode(
         FunctionValueType::new(DataType::Int64, false),
         FunctionValueType::new(DataType::Int8, false),
         Source::Column,
         Wrap::Bare,
-        DecimalOverflowPolicy::ReportError,
-        true,
+        TrinoCastMode::Try,
+        false,
     ) {
         Err(error) => error,
         Ok(_) => panic!("narrowing cast was admitted"),
@@ -113,7 +107,45 @@ fn truthful_nonnullable_widening_is_preserved_and_complete_package_rejects_false
         error,
         novarocks_expression::CallAuthorError::Control(_)
     ));
-    assert!(error.to_string().contains("successful-NULL"));
+    assert!(matches!(
+        error,
+        novarocks_expression::CallAuthorError::Capability(_)
+    ));
+}
+
+#[test]
+fn signed_store_assignment_reports_overflow_and_keeps_source_null() {
+    use novarocks_failure_contract::kernel_reason::NUMERIC_OUT_OF_RANGE;
+    use novarocks_functions::DataFailureReason;
+
+    let program = compiled_cast(
+        FunctionValueType::new(DataType::Int64, true),
+        FunctionValueType::new(DataType::Int32, true),
+        Source::Column,
+        Wrap::Bare,
+        TrinoCastMode::StoreAssignment,
+        false,
+    );
+    let batch = sliced_batch(&program, &[Some(1), Some(2_147_483_648), None]);
+    let selection = Selection::all(3);
+    let output = instance(&program)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    assert_eq!(signed_values(&output), [Some(1), None, None]);
+    assert_eq!(errors(&output), [1]);
+    assert_eq!(
+        output.errors()[0].reason(),
+        DataFailureReason::Domain(NUMERIC_OUT_OF_RANGE)
+    );
 }
 
 #[test]
@@ -127,12 +159,12 @@ fn cast_joins_real_required_child_errors_and_guarded_control_never_turns_them_in
         Wrap::And,
         Wrap::Or,
     ] {
-        let program = compiled(
+        let program = compiled_cast(
             FunctionValueType::new(DataType::Int64, true),
             FunctionValueType::new(DataType::Int8, true),
             Source::Add,
             wrap,
-            DecimalOverflowPolicy::OutputNull,
+            TrinoCastMode::Try,
             false,
         );
         let batch = input(
@@ -205,12 +237,12 @@ fn cast_joins_real_required_child_errors_and_guarded_control_never_turns_them_in
 
 #[test]
 fn cast_runtime_all_original_failure_categories_stop_at_exact_callback_and_latch_without_replay() {
-    let program = compiled(
+    let program = compiled_cast(
         FunctionValueType::new(DataType::Int64, true),
         FunctionValueType::new(DataType::Int8, true),
         Source::Column,
         Wrap::Coalesce,
-        DecimalOverflowPolicy::ReportError,
+        TrinoCastMode::Explicit,
         true,
     );
     let source = (0..320)
@@ -247,7 +279,7 @@ fn cast_runtime_all_original_failure_categories_stop_at_exact_callback_and_latch
             &mut PassThroughCallHost,
         )
         .unwrap();
-    assert!(output.errors().is_empty());
+    assert_eq!(errors(&output), (0..320).step_by(3).collect::<Vec<_>>());
     let trace = recorder.trace();
     assert!(trace.contains(&256));
     assert!(trace.iter().all(|units| *units <= 256));

@@ -1,9 +1,9 @@
 -- query 11
--- types	varchar	bigint	bigint
+-- types	varchar(16)	bigint	bigint
 scenario	row_count	id_sum
 partial_coverage	20	54400
 
 -- query 14
--- types	varchar	bigint	bigint
+-- types	varchar(16)	bigint	bigint
 scenario	row_count	id_sum
 partial_coverage	20	54400

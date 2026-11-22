@@ -24,14 +24,14 @@ DROP TABLE IF EXISTS ${case_db}.t_datetime_tz_src;
 DROP TABLE IF EXISTS ${case_db}.t_datetime_tz_sink;
 CREATE TABLE ${case_db}.t_datetime_tz_src (
   id BIGINT,
-  local_dt STRING,
-  tz STRING
+  local_dt VARCHAR,
+  tz VARCHAR
 );
 CREATE TABLE ${case_db}.t_datetime_tz_sink (
   id BIGINT,
-  local_dt STRING,
-  tz STRING,
-  normalized_dt DATETIME
+  local_dt VARCHAR,
+  tz VARCHAR,
+  normalized_dt TIMESTAMP(6)
 );
 INSERT INTO ${case_db}.t_datetime_tz_src VALUES
   ROW(1, '2024-01-01 08:00:00', '+08:00'),

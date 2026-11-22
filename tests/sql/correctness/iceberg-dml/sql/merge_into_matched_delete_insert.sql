@@ -38,14 +38,14 @@ DROP TABLE IF EXISTS ${case_db}.t_v3_merge_matched_delete_insert ;
 DROP TABLE IF EXISTS ${case_db}.s_v3_merge_matched_delete_insert ;
 CREATE TABLE ${case_db}.t_v3_merge_matched_delete_insert (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.t_v3_merge_matched_delete_insert VALUES
   ROW(1, 'a'),
   ROW(2, 'b');
 CREATE TABLE ${case_db}.s_v3_merge_matched_delete_insert (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.s_v3_merge_matched_delete_insert VALUES
   ROW(2, 'b'),

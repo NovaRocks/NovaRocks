@@ -27,9 +27,9 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 create table t0 (
-    c0 STRING,
-    c1 STRING,
-    c2 STRING
+    c0 VARCHAR,
+    c1 VARCHAR,
+    c2 VARCHAR
 ) WITH (format_version = 3);
 
 -- query 3
@@ -47,7 +47,7 @@ select length(c0), max(length(c1)), max(length(c2)) from (select * from t0 union
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(generate_series(1,  4096));
+insert into t0 SELECT CAST(generate_series AS VARCHAR), CAST(4096 - generate_series AS VARCHAR), CAST(generate_series AS VARCHAR) FROM TABLE(generate_series(1,  4096));
 
 -- query 7
 USE ${case_db};

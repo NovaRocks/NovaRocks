@@ -28,7 +28,7 @@ DROP TABLE IF EXISTS ${case_db}.t_filter_is_not_null_and_range;
 CREATE TABLE ${case_db}.t_filter_is_not_null_and_range (
   id INT,
   k INT,
-  payload STRING
+  payload VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_is_not_null_and_range VALUES
   ROW(1, NULL, 'n1'),

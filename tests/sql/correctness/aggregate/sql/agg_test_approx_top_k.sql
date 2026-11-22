@@ -27,19 +27,19 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t_without_null" (
-  "c_id" INT(11) NOT NULL,
-  "c_int" INT(11) NOT NULL,
+  "c_id" INTEGER NOT NULL,
+  "c_int" INTEGER NOT NULL,
   "c_tinyint" TINYINT NOT NULL,
   "c_smallint" SMALLINT NOT NULL,
   "c_bigint" BIGINT NOT NULL,
   "c_largeint" LARGEINT NOT NULL,
-  "c_float" FLOAT NOT NULL,
+  "c_float" REAL NOT NULL,
   "c_double" DOUBLE NOT NULL,
   "c_char" CHAR(10) NOT NULL,
   "c_varchar" VARCHAR(100) NOT NULL,
   "c_date" DATE NOT NULL,
-  "c_datetime" DATETIME NOT NULL,
-  "c_decimal" DECIMAL64(9,3) NOT NULL
+  "c_datetime" TIMESTAMP(6) NOT NULL,
+  "c_decimal" DECIMAL(9,3) NOT NULL
 ) WITH (format_version = 3);
 
 -- query 3
@@ -434,19 +434,19 @@ SELECT c_id, APPROX_TOP_K(c_decimal) over() FROM t_without_null WHERE c_id >= 71
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t_with_null" (
-  "c_id" INT(11) ,
-  "c_int" INT(11) ,
+  "c_id" INTEGER ,
+  "c_int" INTEGER ,
   "c_tinyint" TINYINT ,
   "c_smallint" SMALLINT ,
   "c_bigint" BIGINT ,
   "c_largeint" LARGEINT ,
-  "c_float" FLOAT ,
+  "c_float" REAL ,
   "c_double" DOUBLE ,
   "c_char" CHAR(10) ,
   "c_varchar" VARCHAR(100) ,
   "c_date" DATE ,
-  "c_datetime" DATETIME ,
-  "c_decimal" DECIMAL64(9,3)
+  "c_datetime" TIMESTAMP(6) ,
+  "c_decimal" DECIMAL(9,3)
 ) WITH (format_version = 3);
 
 -- query 53
@@ -785,20 +785,20 @@ SELECT c_id, APPROX_TOP_K(c_decimal) over() FROM t_with_null WHERE c_id > 100 OR
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t_partition" (
-  "c_id" INT(11) ,
-  "c_partition" INT(11) ,
-  "c_int" INT(11) ,
+  "c_id" INTEGER ,
+  "c_partition" INTEGER ,
+  "c_int" INTEGER ,
   "c_tinyint" TINYINT ,
   "c_smallint" SMALLINT ,
   "c_bigint" BIGINT ,
   "c_largeint" LARGEINT ,
-  "c_float" FLOAT ,
+  "c_float" REAL ,
   "c_double" DOUBLE ,
   "c_char" CHAR(10) ,
   "c_varchar" VARCHAR(100) ,
   "c_date" DATE ,
-  "c_datetime" DATETIME ,
-  "c_decimal" DECIMAL64(9,3)
+  "c_datetime" TIMESTAMP(6) ,
+  "c_decimal" DECIMAL(9,3)
 ) WITH (format_version = 3);
 
 -- query 119
@@ -1035,8 +1035,8 @@ SELECT APPROX_TOP_K(c_decimal) over() FROM t_partition WHERE c_id > 10000;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t_bool" (
-  "c_id" INT(11) NOT NULL,
-  "c_partition" INT(11) NOT NULL,
+  "c_id" INTEGER NOT NULL,
+  "c_partition" INTEGER NOT NULL,
   "c_bool" BOOLEAN
 ) WITH (format_version = 3);
 

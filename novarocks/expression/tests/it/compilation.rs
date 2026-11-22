@@ -1296,11 +1296,9 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
             None,
             int(true),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                 expr: a,
                 target: DataType::Int64,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: parameter,
             },
         )
         .unwrap();
@@ -3156,9 +3154,12 @@ fn sparse_non_dfs_nested_shared_calls_keep_actual_edges_claims_and_compile_prefi
 fn zero_port_compiler_keeps_unsupported_primitive_capabilities() {
     use crate::zero_port;
     use arrow::array::{
-        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float64Array, new_null_array,
+        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float64Array,
+        TimestampSecondArray, new_null_array,
     };
+    use arrow::datatypes::TimeUnit;
     use novarocks_functions::{ArithmeticPrepareError, CastPrepareError, ComparisonPrepareError};
+    use novarocks_type_contract::TrinoCastMode;
 
     let allow_id = SemanticParameterId::new(0);
     let parameters = SemanticParameters::try_new([(
@@ -3253,9 +3254,23 @@ fn zero_port_compiler_keeps_unsupported_primitive_capabilities() {
         |args| ExprKind::Cast {
             expr: args[0],
             target: DataType::Int8,
-            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            allow_throw_exception: allow,
-            array_failure_mode: None,
+            cast_mode: TrinoCastMode::Explicit,
+        },
+        &parameters,
+    );
+    assert!(matches!(
+        result,
+        Err(ExprCompileError::Cast(CastPrepareError::Illegal))
+    ));
+
+    let target = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let result = zero_port::primitive(
+        [Arc::new(TimestampSecondArray::from(vec![1])) as ArrayRef],
+        FunctionValueType::new(target.clone(), false),
+        |args| ExprKind::Cast {
+            expr: args[0],
+            target,
+            cast_mode: TrinoCastMode::Explicit,
         },
         &parameters,
     );
@@ -3288,7 +3303,7 @@ fn zero_port_compiler_keeps_unsupported_primitive_capabilities() {
 }
 
 #[test]
-fn null_list_json_carrier_compiles_live_and_unused_with_exact_scalar_policy() {
+fn null_list_json_carrier_compiles_live_and_unused_with_the_implicit_mode() {
     let source = ValueType::new(
         DataType::List(Arc::new(Field::new("source-item", DataType::Null, true))),
         false,
@@ -3312,119 +3327,99 @@ fn null_list_json_carrier_compiles_live_and_unused_with_exact_scalar_policy() {
     let input = ValueId::new(0);
     let values = [(input, source.clone())];
     let layout = layouts(&values);
-    let parameter = SemanticParameterRef {
-        id: SemanticParameterId::new(7),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
     for unused in [false, true] {
-        for overflow_policy in [
-            DecimalOverflowPolicy::OutputNull,
-            DecimalOverflowPolicy::ReportError,
-        ] {
-            for allow in [false, true] {
-                let mut builder = builder();
-                let child = builder
-                    .add(None, source.clone(), ExprKind::Value(input))
-                    .unwrap();
-                let cast = builder
-                    .add(
-                        None,
-                        result.clone(),
-                        ExprKind::Cast {
-                            expr: child,
-                            target: result.data_type().clone(),
-                            decimal_overflow_policy: overflow_policy,
-                            allow_throw_exception: parameter,
-                            array_failure_mode: None,
-                        },
-                    )
-                    .unwrap();
-                let ports = vec![ExprPort {
-                    values: values.clone().into(),
-                }];
-                let (unit, catalogue) = if unused {
-                    resolved::type_only_fixture(
-                        builder,
-                        [(cast, result.clone()), (child, source.clone())],
-                        ports,
-                    )
-                } else {
-                    builder
-                        .root(cast, EvaluationDemand::Value, RootScope::Port(0))
-                        .unwrap();
-                    (finish(builder, ports), catalogue())
-                };
-                let parameters = SemanticParameters::try_new([(
-                    parameter.id,
-                    SemanticParameterValue::AllowThrowException(allow),
-                )])
+        let mut builder = builder();
+        let child = builder
+            .add(None, source.clone(), ExprKind::Value(input))
+            .unwrap();
+        let cast = builder
+            .add(
+                None,
+                result.clone(),
+                ExprKind::Cast {
+                    expr: child,
+                    target: result.data_type().clone(),
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
+                },
+            )
+            .unwrap();
+        let ports = vec![ExprPort {
+            values: values.clone().into(),
+        }];
+        let (unit, catalogue) = if unused {
+            resolved::type_only_fixture(
+                builder,
+                [(cast, result.clone()), (child, source.clone())],
+                ports,
+            )
+        } else {
+            builder
+                .root(cast, EvaluationDemand::Value, RootScope::Port(0))
                 .unwrap();
-                let control = Control::good();
-                let mut work =
-                    CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
-                let compiled = compile_expr_set_pure(
-                    &unit,
-                    EvaluationEnvironment {
-                        constants: &ConstantPools::empty(),
-                        parameters: &parameters,
-                    },
-                    ScopeLayouts {
-                        ports: std::slice::from_ref(&layout),
-                        all_ports: None,
-                    },
-                    policy(),
-                    &catalogue,
-                    &mut work,
-                )
-                .unwrap();
-                work.finish().unwrap();
-                let local_child = compiled.compiled_definition(child).unwrap();
-                let local_cast = compiled.compiled_definition(cast).unwrap();
-                let retained = compiled.definitions().node(local_cast).unwrap();
-                assert_eq!(retained.value_type(), Some(&result));
-                assert_eq!(
-                    compiled
-                        .definitions()
-                        .node(local_child)
-                        .unwrap()
-                        .value_type(),
-                    Some(&source)
-                );
-                assert!(matches!(
-                    retained.kind(),
-                    StaticExprKind::PreparedCast {
-                        operation: novarocks_functions::CastOperation::Carrier,
-                        child,
-                        decimal_overflow_policy,
-                        allow_throw_exception,
-                        array_failure_mode: None,
-                    } if *child == local_child && *decimal_overflow_policy == overflow_policy
-                         && *allow_throw_exception == allow
-                ));
-                let root = &compiled.roots()[0];
-                assert_eq!(
-                    compiled.control_flow().uses().len(),
-                    if unused { 1 } else { 2 }
-                );
-                let recipe = compiled.recipes().cast(root.use_id);
-                if unused {
-                    let uses = compiled.control_flow().uses();
-                    assert_eq!(uses[&root.use_id].control, ControlShape::TypeOnly);
-                    assert!(uses[&root.use_id].arguments.is_empty());
-                    assert!(
-                        uses.values().all(|usage| usage.definition != local_cast
-                            && usage.definition != local_child)
-                    );
-                    assert!(recipe.is_none());
-                } else {
-                    let recipe = recipe.unwrap();
-                    assert_eq!(recipe.source_type(), &source);
-                    assert_eq!(recipe.result_type(), &result);
-                    assert_eq!(recipe.policy(), overflow_policy);
-                    assert_eq!(recipe.allow_throw_exception(), allow);
-                    assert_eq!(recipe.array_failure_mode(), None);
-                }
-            }
+            (finish(builder, ports), catalogue())
+        };
+        let parameters = SemanticParameters::default();
+        let control = Control::good();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let compiled = compile_expr_set_pure(
+            &unit,
+            EvaluationEnvironment {
+                constants: &ConstantPools::empty(),
+                parameters: &parameters,
+            },
+            ScopeLayouts {
+                ports: std::slice::from_ref(&layout),
+                all_ports: None,
+            },
+            policy(),
+            &catalogue,
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        let local_child = compiled.compiled_definition(child).unwrap();
+        let local_cast = compiled.compiled_definition(cast).unwrap();
+        let retained = compiled.definitions().node(local_cast).unwrap();
+        assert_eq!(retained.value_type(), Some(&result));
+        assert_eq!(
+            compiled
+                .definitions()
+                .node(local_child)
+                .unwrap()
+                .value_type(),
+            Some(&source)
+        );
+        assert!(matches!(
+            retained.kind(),
+            StaticExprKind::PreparedCast {
+                operation: novarocks_functions::CastOperation::Carrier,
+                child,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
+            } if *child == local_child
+        ));
+        let root = &compiled.roots()[0];
+        assert_eq!(
+            compiled.control_flow().uses().len(),
+            if unused { 1 } else { 2 }
+        );
+        let recipe = compiled.recipes().cast(root.use_id);
+        if unused {
+            let uses = compiled.control_flow().uses();
+            assert_eq!(uses[&root.use_id].control, ControlShape::TypeOnly);
+            assert!(uses[&root.use_id].arguments.is_empty());
+            assert!(
+                uses.values()
+                    .all(|usage| usage.definition != local_cast && usage.definition != local_child)
+            );
+            assert!(recipe.is_none());
+        } else {
+            let recipe = recipe.unwrap();
+            assert_eq!(recipe.source_type(), &source);
+            assert_eq!(recipe.result_type(), &result);
+            assert_eq!(
+                recipe.cast_mode(),
+                Some(novarocks_type_contract::TrinoCastMode::Implicit)
+            );
         }
     }
 }

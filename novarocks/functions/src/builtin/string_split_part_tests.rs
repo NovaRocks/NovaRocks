@@ -771,16 +771,15 @@ fn string_split_part_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
             logical_argument_count: 3,
             expected_result_type: None,
         };
-        let raw_selected = owner
-            .resolve(raw_request, crate::binding_test_control())
-            .unwrap();
-        assert_eq!(
-            raw_selected.argument_types.as_ref(),
-            selected.argument_types.as_ref()
-        );
+        assert!(matches!(
+            owner.resolve(raw_request, crate::binding_test_control()),
+            Err(crate::FunctionBindingError::NoMatchingOverload)
+        ));
         assert!(matches!(
             prepared_for_test_with_policy(name, &raw_types, DecimalOverflowPolicy::OutputNull),
-            Err(FunctionSpecializationFailure::InvalidInput(_))
+            Err(FunctionSpecializationFailure::Binding(
+                crate::FunctionBindingError::NoMatchingOverload
+            ))
         ));
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),

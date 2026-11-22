@@ -35,7 +35,7 @@ CREATE CATALOG mv_read_sem_part_v3_${uuid0} USING iceberg WITH ("iceberg.catalog
 CREATE SCHEMA mv_read_sem_part_v3_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
-  customer STRING,
+  customer VARCHAR,
   amount BIGINT
 ) WITH (partitioning = ARRAY['customer'], format_version = 3);
 INSERT INTO mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders VALUES

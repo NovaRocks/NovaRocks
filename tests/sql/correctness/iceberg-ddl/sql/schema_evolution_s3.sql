@@ -24,10 +24,10 @@ USE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};
 DROP TABLE IF EXISTS orders_s3;
 CREATE TABLE orders_s3 (
   id INT,
-  amount FLOAT
+  amount REAL
 ) WITH (format_version = 2);
 INSERT INTO orders_s3 VALUES ROW(1, 10.5), ROW(2, 20.25);
-ALTER TABLE orders_s3 ADD COLUMN note_text STRING DEFAULT NULL;
+ALTER TABLE orders_s3 ADD COLUMN note_text VARCHAR DEFAULT NULL;
 
 -- query 2
 SELECT id, amount, note_text FROM orders_s3 ORDER BY id;
@@ -47,7 +47,7 @@ ALTER TABLE orders_s3 DROP COLUMN note_text;
 SELECT id + 10000000000 AS widened_id, total_amount FROM orders_s3 ORDER BY id;
 
 -- query 7
-ALTER TABLE orders_s3 ADD COLUMN note_text STRING DEFAULT NULL;
+ALTER TABLE orders_s3 ADD COLUMN note_text VARCHAR DEFAULT NULL;
 
 -- query 8
 SELECT id, total_amount, note_text FROM orders_s3 ORDER BY id;

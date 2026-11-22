@@ -23,24 +23,31 @@ INSERT INTO ${case_db}.scalar_integer_mutation VALUES ROW(1,127,32767),ROW(2,-12
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 2
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 UPDATE ${case_db}.scalar_integer_mutation SET age=32768 WHERE id=1;
-SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 3
-DELETE FROM ${case_db}.scalar_integer_mutation WHERE t=-128;
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 4
+UPDATE ${case_db}.scalar_integer_mutation SET age=TRY_CAST(32768 AS SMALLINT) WHERE id=1;
+SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
+
+-- query 5
+DELETE FROM ${case_db}.scalar_integer_mutation WHERE t=-128;
+SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
+
+-- query 6
 CREATE TABLE ${case_db}.scalar_integer_partition(id INT,t TINYINT,age SMALLINT) WITH (partitioning = ARRAY['t'], format_version = 2);
 INSERT INTO ${case_db}.scalar_integer_partition VALUES ROW(1,127,1),ROW(2,-128,2),ROW(3,NULL,3);
 DELETE FROM ${case_db}.scalar_integer_partition WHERE t=-128;
 SELECT id,t,age FROM ${case_db}.scalar_integer_partition ORDER BY id;
 
--- query 5
+-- query 7
 ALTER TABLE ${case_db}.scalar_integer_mutation EXECUTE add_equality_delete(columns => ARRAY['t'], rows => ARRAY[ROW(127)]);
 SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
--- query 6
+-- query 8
 -- @skip_result_check=true
 DROP TABLE ${case_db}.scalar_integer_mutation ;
 DROP TABLE ${case_db}.scalar_integer_partition ;

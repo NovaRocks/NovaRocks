@@ -25,24 +25,24 @@ CREATE TABLE ${case_db}.t_update_assignment_conversion (
   id INT,
   d DECIMAL(8,2),
   dt DATE,
-  ts DATETIME,
+  ts TIMESTAMP(6),
   n INT,
-  nullable_text STRING,
-  required_text STRING NOT NULL
+  nullable_text VARCHAR,
+  required_text VARCHAR NOT NULL
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_update_assignment_conversion VALUES
-  ROW(1, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required'),
-  ROW(2, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required');
+  ROW(1, 0, DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00.000000', 0, 'before', 'required'),
+  ROW(2, 0, DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00.000000', 0, 'before', 'required');
 
 -- query 2
-SELECT CAST(CAST(DECIMAL '12.345' AS DECIMAL(8, 3)) AS DECIMAL(8, 2)) AS d, CAST('2024-02-29' AS DATE) AS dt, CAST('2024-02-29 12:34:56.123456' AS DATETIME) AS ts, CAST('123' AS INT) AS n, CAST(NULL AS STRING) AS nullable_text;
+SELECT CAST(CAST(DECIMAL '12.345' AS DECIMAL(8, 3)) AS DECIMAL(8, 2)) AS d, CAST('2024-02-29' AS DATE) AS dt, CAST('2024-02-29 12:34:56.123456' AS TIMESTAMP(6)) AS ts, CAST(BIGINT '123' AS INTEGER) AS n, CAST(NULL AS VARCHAR) AS nullable_text;
 -- query 3
 -- @skip_result_check=true
 UPDATE ${case_db}.t_update_assignment_conversion
 SET d = CAST(12.345 AS DECIMAL(8,3)),
-    dt = '2024-02-29',
-    ts = '2024-02-29 12:34:56.123456',
-    n = '123',
+    dt = DATE '2024-02-29',
+    ts = CAST('2024-02-29 12:34:56.123456' AS TIMESTAMP(6)),
+    n = BIGINT '123',
     nullable_text = NULL
 WHERE id = 1;
 -- query 4
@@ -50,17 +50,18 @@ SELECT d, dt, ts, n, nullable_text
 FROM ${case_db}.t_update_assignment_conversion WHERE id = 1;
 
 -- query 5
-SELECT CAST(CAST((- (DECIMAL '12.345')) AS DECIMAL(8, 3)) AS DECIMAL(8, 2)) AS d, CAST(CAST(2147483648 AS BIGINT) AS INT) AS n;
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT CAST(BIGINT '2147483648' AS INTEGER);
 -- query 6
--- @skip_result_check=true
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 UPDATE ${case_db}.t_update_assignment_conversion
-SET d = CAST((- (DECIMAL '12.345')) AS DECIMAL(8, 3)), n = CAST(2147483648 AS BIGINT)
+SET d = DECIMAL '-12.345', n = BIGINT '2147483648'
 WHERE id = 2;
 -- query 7
 SELECT d, n FROM ${case_db}.t_update_assignment_conversion WHERE id = 2;
 
 -- query 8
-SELECT CAST(NULL AS STRING) AS required_text;
+SELECT CAST(NULL AS VARCHAR) AS required_text;
 -- query 9
 -- @expect_error=[query.execution.invalid_data] Data failure
 UPDATE ${case_db}.t_update_assignment_conversion SET required_text = NULL WHERE id = 1;
@@ -71,54 +72,53 @@ SELECT id, required_text FROM ${case_db}.t_update_assignment_conversion ORDER BY
 DROP TABLE ${case_db}.t_update_assignment_conversion ;
 
 
--- STRING parsing uses the same ordinary CAST author for UPDATE assignment.
--- Raw floating-point NaN identity is outside this text conversion case.
+-- Explicit text casts and UPDATE preserve the Trino floating-point values.
 -- query 12
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_update_assignment_nonfinite ;
 CREATE TABLE ${case_db}.t_update_assignment_nonfinite (
   id INT,
-  token STRING,
-  nullable_float FLOAT,
+  token VARCHAR,
+  nullable_float REAL,
   nullable_double DOUBLE,
-  required_float FLOAT NOT NULL,
+  required_float REAL NOT NULL,
   required_double DOUBLE NOT NULL
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_update_assignment_nonfinite VALUES
   ROW(1, 'NaN', 21, 22, 11, 12),
-  ROW(2, 'inf', 21, 22, 11, 12),
-  ROW(3, '-inf', 21, 22, 11, 12),
+  ROW(2, 'Infinity', 21, 22, 11, 12),
+  ROW(3, '-Infinity', 21, 22, 11, 12),
   ROW(4, '1e1000', 21, 22, 11, 12),
   ROW(5, '2.5', 21, 22, 11, 12);
 
 -- query 13
 -- @skip_result_check=true
 UPDATE ${case_db}.t_update_assignment_nonfinite
-SET nullable_float = token, nullable_double = token
+SET nullable_float = CAST(token AS REAL), nullable_double = CAST(token AS DOUBLE)
 WHERE id <= 4;
 -- query 14
 SELECT id, token,
        nullable_float IS NULL AS float_is_null,
-       CAST(token AS FLOAT) IS NULL AS cast_float_is_null,
+       CAST(token AS REAL) IS NULL AS cast_float_is_null,
        nullable_double IS NULL AS double_is_null,
        CAST(token AS DOUBLE) IS NULL AS cast_double_is_null
 FROM ${case_db}.t_update_assignment_nonfinite ORDER BY id;
 
--- Each failed assignment must leave both required values and the other rows intact.
+-- Assignments from VARCHAR require an explicit conversion. Rejections keep the previous rows.
 -- query 15
--- @expect_error=[query.execution.invalid_data] Data failure
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 UPDATE ${case_db}.t_update_assignment_nonfinite
 SET required_float = token WHERE id = 1;
 -- query 16
--- @expect_error=[query.execution.invalid_data] Data failure
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 UPDATE ${case_db}.t_update_assignment_nonfinite
 SET required_double = token WHERE id = 2;
 -- query 17
--- @expect_error=[query.execution.invalid_data] Data failure
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 UPDATE ${case_db}.t_update_assignment_nonfinite
 SET required_float = token WHERE id = 3;
 -- query 18
--- @expect_error=[query.execution.invalid_data] Data failure
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 UPDATE ${case_db}.t_update_assignment_nonfinite
 SET required_double = token WHERE id = 4;
 -- query 19

@@ -168,17 +168,17 @@ fn simple_case_leaves_later_labels_unselected_and_uses_exact_decimal_coercion() 
 }
 
 #[test]
-fn simple_case_preserves_legacy_wide_equality_after_float_alignment() {
-    let input = Arc::new(Float64Array::from(vec![Some(-0.0), Some(0.0)])) as ArrayRef;
+fn simple_case_uses_standard_float_equality_with_a_max_precision_decimal_label() {
+    let input = Arc::new(Float64Array::from(vec![Some(-0.0), Some(0.0), Some(1.0)])) as ArrayRef;
     assert_eq!(
         evaluate_case(
-            "SELECT CASE k WHEN CAST(1 AS DECIMAL(39,0)) THEN CAST(9 AS BIGINT) \
+            "SELECT CASE k WHEN CAST(1 AS DECIMAL(38,0)) THEN CAST(9 AS BIGINT) \
                WHEN 0e0 THEN CAST(1 AS BIGINT) ELSE CAST(2 AS BIGINT) END FROM fixture",
             input,
-            &[0, 1],
-            false,
+            &[0, 1, 2],
+            true,
             2,
         ),
-        [Some(2), Some(1)],
+        [Some(1), Some(1), Some(9)],
     );
 }

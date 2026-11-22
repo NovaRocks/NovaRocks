@@ -30,7 +30,7 @@ CREATE CATALOG imv_agg_cut_${uuid0} USING iceberg WITH ("iceberg.catalog.type" =
 CREATE SCHEMA imv_agg_cut_${uuid0}.ns_${uuid0};
 CREATE TABLE imv_agg_cut_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO imv_agg_cut_${uuid0}.ns_${uuid0}.orders VALUES

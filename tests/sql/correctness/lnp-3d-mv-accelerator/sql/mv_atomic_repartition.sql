@@ -31,7 +31,7 @@ CREATE CATALOG lnp3d_repart_${uuid0} USING iceberg WITH ("iceberg.catalog.type" 
 CREATE SCHEMA lnp3d_repart_${uuid0}.ns_${uuid0};
 CREATE TABLE lnp3d_repart_${uuid0}.ns_${uuid0}.orders (
   k1 INT NOT NULL,
-  region STRING,
+  region VARCHAR,
   v1 BIGINT
 ) WITH (format_version = 3);
 INSERT INTO lnp3d_repart_${uuid0}.ns_${uuid0}.orders VALUES

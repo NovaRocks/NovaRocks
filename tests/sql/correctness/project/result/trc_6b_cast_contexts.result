@@ -1,0 +1,67 @@
+-- query 1
+-- types	integer	integer
+k	value
+1	42
+2	NULL
+3	NULL
+
+-- query 3
+-- types	integer	integer
+k	value
+1	11
+2	NULL
+3	23
+
+-- query 6
+-- types	varchar(2)	varchar(2)	char(4)	varchar(4)
+literal	narrowed	padded	trimmed
+甲乙	甲乙	"é   "	é
+
+-- query 8
+-- types	bigint	bigint
+empty_length	ascii_length
+NULL	3
+
+-- query 12
+-- types	boolean	decimal(6, 1)
+coerced	common_decimal
+true	1.0
+
+-- query 13
+-- types	real
+k
+1.6777216E7
+
+-- query 15
+-- types	bigint
+k
+1
+2
+
+-- query 16
+-- types	varchar	array(integer)
+original_text	array_value
+{"k":1}	NULL
+
+-- query 17
+-- types	integer	bigint
+division	overflow
+NULL	NULL
+
+-- query 18
+-- types	integer	integer	bigint
+k	division	addition
+1	4	41
+2	NULL	NULL
+3	6	NULL
+
+-- query 28
+-- types	double	double	boolean	bigint	date
+total	mean	any_true	counted	week
+1.0	0.5	true	0	2026-11-16
+
+-- query 29
+-- types	integer	boolean
+k	any_true
+1	true
+2	true

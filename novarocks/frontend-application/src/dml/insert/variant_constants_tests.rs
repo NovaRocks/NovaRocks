@@ -101,6 +101,20 @@ fn analyze(
     .map(|_| ())
 }
 
+fn assert_variant_wrapper_is_unsupported(
+    query: ast::Query,
+    constants: Option<SqlExpressionConstants>,
+) {
+    let Err(SqlCompileError::Analyze(error)) = analyze(query, constants) else {
+        panic!("expected the compiler to refuse the legacy VARIANT wrapper");
+    };
+    assert_eq!(
+        error.kind(),
+        novarocks_sql::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+    );
+    assert_eq!(error.message(), "SQL type variant is not supported");
+}
+
 #[test]
 fn original_encoder_keeps_variant_constants_and_mixed_multiline_syntax() {
     let sql = r#"VALUES (1 + 2, parse_json('{"a":1}')), (NULL, parse_json('null')), (7, NULL)"#;
@@ -138,18 +152,14 @@ fn original_encoder_keeps_variant_constants_and_mixed_multiline_syntax() {
         assert_eq!(value.try_binary().unwrap(), Some(expected.as_slice()));
     }
     assert_eq!(constants.len(), 2, "SQL NULL has no replacement constant");
-    analyze(shaped, Some(constants)).expect("actual compiler keeps complete Variant domains");
+    assert_variant_wrapper_is_unsupported(shaped, Some(constants));
 }
 
 #[test]
 fn ordinary_binary_bytes_do_not_establish_variant() {
     let (query, constants) = shape("VALUES (1, X'050000001100000C2A')");
     assert!(constants.is_none());
-    let error = analyze(query, None).unwrap_err();
-    assert!(
-        error.to_string().contains("no matching declared overload"),
-        "{error}"
-    );
+    assert_variant_wrapper_is_unsupported(query, None);
 }
 
 #[test]
@@ -212,8 +222,15 @@ fn constant_occurrences_follow_the_original_insert_column_mapping() {
         constants[0].value().value_type().logical_type(),
         ValueLogicalType::Variant
     );
-    analyze(query, Some(constants))
-        .expect("the typed constant follows its exact target occurrence");
+    let expected =
+        novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes("42").unwrap();
+    assert_eq!(
+        constants[0].value().try_binary().unwrap(),
+        Some(expected.as_slice())
+    );
+    let (ordered, _) = shape("VALUES (7, parse_json('42')), (8, NULL)");
+    assert!(query.body.syntax_eq(&ordered.body));
+    assert_variant_wrapper_is_unsupported(query, Some(constants));
 }
 
 #[test]

@@ -37,7 +37,7 @@ CREATE CATALOG ice_ivm_float_db_${uuid0} USING iceberg WITH ("iceberg.catalog.ty
 CREATE SCHEMA ice_ivm_float_db_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   reading DOUBLE
 ) WITH (format_version = 3);
 USE ice_ivm_float_db_${uuid0}.ns_${uuid0};

@@ -24,9 +24,9 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}."t0" (
-  "v1" int(11) ,
-  "v2" int(11) ,
-  "v3" int(11)
+  "v1" INTEGER ,
+  "v2" INTEGER ,
+  "v3" INTEGER
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}."t0" (v1, v2, v3) values
@@ -122,9 +122,9 @@ SELECT v1, v2, v3, lag(v3 , 2) IGNORE NULLS OVER(partition BY v1 ORDER BY v2) FR
 -- query 18
 -- @skip_result_check=true
 CREATE TABLE ${case_db}."t_all_null" (
-  "v1" int(11) ,
-  "v2" int(11) ,
-  "v3" int(11)
+  "v1" INTEGER ,
+  "v2" INTEGER ,
+  "v3" INTEGER
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}."t_all_null" (v1, v2, v3) values

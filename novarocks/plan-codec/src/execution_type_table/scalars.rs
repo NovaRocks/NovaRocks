@@ -261,7 +261,10 @@ pub(super) fn compatible<H>(
             }
         }
         (ValueKind::Scalar(expected), actual) => expected == actual,
-        (ValueKind::String, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => true,
+        (
+            ValueKind::String | ValueKind::BoundedCharacter(_),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+        ) => true,
         (ValueKind::Binary, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) => {
             true
         }

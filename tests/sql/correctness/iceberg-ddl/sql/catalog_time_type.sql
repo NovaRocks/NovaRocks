@@ -26,8 +26,8 @@ CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_tim
 );
 -- query 3
 INSERT INTO iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} VALUES
-  ROW(1, '01:02:03'),
-  ROW(2, '20:20:20'),
+  ROW(1, TIME '01:02:03'),
+  ROW(2, TIME '20:20:20'),
   ROW(3, NULL);
 -- query 4
 SELECT col_id, col_time

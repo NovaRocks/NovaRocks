@@ -25,21 +25,21 @@ DROP TABLE IF EXISTS ${case_db}.t_null_insert_sink;
 CREATE TABLE ${case_db}.t_null_insert_src (
   id BIGINT,
   c_int BIGINT,
-  c_str STRING,
+  c_str VARCHAR,
   c_dec DECIMAL(9, 2),
-  c_dt DATETIME
+  c_dt TIMESTAMP(6)
 );
 CREATE TABLE ${case_db}.t_null_insert_sink (
   id INT,
   c_int INT,
-  c_str STRING,
+  c_str VARCHAR,
   c_dec DECIMAL(9, 2),
-  c_dt DATETIME
+  c_dt TIMESTAMP(6)
 );
 INSERT INTO ${case_db}.t_null_insert_src VALUES
   ROW(1, NULL, NULL, NULL, NULL),
-  ROW(2, 20, 'ok', 12.30, '2024-01-02 03:04:05'),
-  ROW(3, NULL, 'tail', NULL, '2024-06-01 00:00:00');
+  ROW(2, 20, 'ok', 12.30, TIMESTAMP '2024-01-02 03:04:05'),
+  ROW(3, NULL, 'tail', NULL, TIMESTAMP '2024-06-01 00:00:00');
 INSERT INTO ${case_db}.t_null_insert_sink
 SELECT id, c_int, c_str, c_dec, c_dt
 FROM ${case_db}.t_null_insert_src;

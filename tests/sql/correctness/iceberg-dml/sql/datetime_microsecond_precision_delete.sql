@@ -30,22 +30,22 @@
 DROP TABLE IF EXISTS ${case_db}.t_datetime;
 CREATE TABLE ${case_db}.t_datetime (
     c1 int,
-    c2 datetime
+    c2 TIMESTAMP(6)
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_datetime VALUES
-ROW(1, '2020-01-01 00:00:00'),
-ROW(2, '2020-01-01 00:00:00.0'),
-ROW(3, '2020-01-01 00:00:00.01'),
-ROW(4, '2020-01-01 00:00:00.012'),
-ROW(5, '2020-01-01 00:00:00.0123'),
-ROW(6, '2020-01-01 00:00:00.01234'),
-ROW(7, '2020-01-01 00:00:00.012345'),
-ROW(8, '2020-01-01 00:00:00.1'),
-ROW(9, '2020-01-01 00:00:00.12'),
-ROW(10, '2020-01-01 00:00:00.123'),
-ROW(11, '2020-01-01 00:00:00.1234'),
-ROW(12, '2020-01-01 00:00:00.12345'),
-ROW(13, '2020-01-01 00:00:00.123450');
+ROW(1, TIMESTAMP '2020-01-01 00:00:00'),
+ROW(2, TIMESTAMP '2020-01-01 00:00:00.0'),
+ROW(3, TIMESTAMP '2020-01-01 00:00:00.01'),
+ROW(4, TIMESTAMP '2020-01-01 00:00:00.012'),
+ROW(5, TIMESTAMP '2020-01-01 00:00:00.0123'),
+ROW(6, TIMESTAMP '2020-01-01 00:00:00.01234'),
+ROW(7, TIMESTAMP '2020-01-01 00:00:00.012345'),
+ROW(8, TIMESTAMP '2020-01-01 00:00:00.1'),
+ROW(9, TIMESTAMP '2020-01-01 00:00:00.12'),
+ROW(10, TIMESTAMP '2020-01-01 00:00:00.123'),
+ROW(11, TIMESTAMP '2020-01-01 00:00:00.1234'),
+ROW(12, TIMESTAMP '2020-01-01 00:00:00.12345'),
+ROW(13, TIMESTAMP '2020-01-01 00:00:00.123450');
 
 -- query 2
 -- @order_sensitive=true
@@ -53,9 +53,9 @@ SELECT * FROM ${case_db}.t_datetime ORDER BY c1;
 
 -- query 3
 -- @skip_result_check=true
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.0';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.012';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.0';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.012';
 
 -- query 4
 -- @order_sensitive=true
@@ -64,9 +64,9 @@ SELECT * FROM ${case_db}.t_datetime ORDER BY c1;
 
 -- query 5
 -- @skip_result_check=true
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.1';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.123';
-DELETE FROM ${case_db}.t_datetime WHERE c2 = '2020-01-01 00:00:00.123450';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.1';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.123';
+DELETE FROM ${case_db}.t_datetime WHERE c2 = TIMESTAMP '2020-01-01 00:00:00.123450';
 
 -- query 6
 -- @order_sensitive=true

@@ -502,7 +502,10 @@ fn check_layout_observed<E: From<ExecutionValueTypeError>>(
                 })?;
             if equal { Ok(()) } else { Err(mismatch()) }
         }
-        (ValueKind::String, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => Ok(()),
+        (
+            ValueKind::String | ValueKind::BoundedCharacter(_),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+        ) => Ok(()),
         (ValueKind::Binary, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) => {
             Ok(())
         }

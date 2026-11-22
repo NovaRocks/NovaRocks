@@ -31,7 +31,7 @@ CREATE TABLE ${case_db}.t (
 
 -- query 2
 -- @skip_result_check=true
-ALTER TABLE ${case_db}.t ADD COLUMN c2.v2_2 STRING;
+ALTER TABLE ${case_db}.t ADD COLUMN c2.v2_2 VARCHAR;
 
 -- query 3
 -- @skip_result_check=true

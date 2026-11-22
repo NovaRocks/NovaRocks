@@ -272,11 +272,7 @@ fn resolved_definition(
     let mut kind = kind.clone();
     let mut values = Vec::new();
     match &mut kind {
-        ExprKind::Cast {
-            allow_throw_exception,
-            ..
-        }
-        | ExprKind::Binary {
+        ExprKind::Binary {
             allow_throw_exception: Some(allow_throw_exception),
             ..
         } => {
@@ -450,10 +446,7 @@ fn migrated_literals_control_and_conversions_share_the_full_unit() {
         );
     }
     let text = fixture.equivalent("TIME '01:02:03'", &[]);
-    assert_eq!(
-        text.environment().parameters.require(ALLOW_THROW).unwrap(),
-        &SemanticParameterValue::AllowThrowException(true),
-    );
+    assert!(text.environment().parameters.require(ALLOW_THROW).is_err());
 }
 
 #[test]
@@ -517,19 +510,19 @@ fn identical_local_constant_addresses_do_not_hide_different_values() {
 }
 
 #[test]
-fn actual_semantic_parameter_values_are_checked() {
-    let mut fixture = Fixture::new();
-    let sql = fixture.sql("TIME '01:02:03'", &[]).unwrap();
-    fixture.parameters = SemanticParameters::try_new([(
-        ALLOW_THROW.id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
-    let text = fixture.text("TIME '01:02:03'", &[]).unwrap();
+fn actual_cast_modes_are_checked() {
+    let fixture = Fixture::new();
+    let columns = [column("input_text", 34, DataType::Utf8, true)];
+    let sql = fixture
+        .sql("CAST(input_text AS INTEGER)", &columns)
+        .unwrap();
+    let text = fixture
+        .text("TRY_CAST(input_text AS INTEGER)", &columns)
+        .unwrap();
     let error = compare_units(&sql, &text).unwrap_err();
     assert!(error.contains("shape and parameters differs"), "{error}");
-    assert!(error.contains("AllowThrowException(true)"), "{error}");
-    assert!(error.contains("AllowThrowException(false)"), "{error}");
+    assert!(error.contains("cast_mode: Explicit"), "{error}");
+    assert!(error.contains("cast_mode: Try"), "{error}");
 }
 
 #[test]

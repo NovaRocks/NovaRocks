@@ -15,26 +15,28 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Independent legacy mode and catching controls; no recorded outputs.
+-- Strict conversion errors and the independent TRY and TRY_CAST scopes.
+
 -- query 1
-SET SESSION sql_mode = '0';
-SELECT CAST(CAST(2147483648 AS DOUBLE) AS INT) IS NULL AS caught_range;
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT CAST(DOUBLE '2147483648' AS INTEGER) AS narrowed;
 
 -- query 2
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.numeric_out_of_range
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(2147483648 AS DOUBLE) AS INT) AS narrowed;
+SELECT TRY_CAST(DOUBLE '2147483648' AS INTEGER) AS try_cast_range, TRY(CAST(DOUBLE '2147483648' AS INTEGER)) AS try_range;
 
 -- query 3
-WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(127 AS DOUBLE) AS TINYINT) AS narrowed;
+SELECT CAST(DOUBLE '127' AS TINYINT) AS narrowed;
 
 -- query 4
-SELECT CAST(unhex('FF') AS VARCHAR) IS NULL AS caught_utf8;
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(X'FF' AS VARCHAR);
 
 -- query 5
 SELECT CAST(CAST('2020-01-01' AS DATE) AS VARCHAR) AS rendered;
 
 -- query 6
--- @skip_result_check=true
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT TRY_CAST(CAST('bad' AS INTEGER) AS BIGINT);
+
+-- query 7
+SELECT CASE WHEN false THEN CAST(DOUBLE '2147483648' AS INTEGER) ELSE 17 END AS kept;

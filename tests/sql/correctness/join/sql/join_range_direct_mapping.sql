@@ -78,8 +78,8 @@ CREATE TABLE ${case_db}.t1 (
     c_largeint_null bigint ,
     c_double double,
     c_double_null double ,
-    c_string STRING,
-    c_string_null STRING
+    c_string VARCHAR,
+    c_string_null VARCHAR
 ) WITH (format_version = 3);
 
 -- query 11

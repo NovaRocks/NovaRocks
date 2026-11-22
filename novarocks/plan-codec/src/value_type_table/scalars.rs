@@ -16,7 +16,9 @@
 // under the License.
 
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
-use novarocks_type_contract::{MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueKind, ValueLogicalType};
+use novarocks_type_contract::{
+    CharacterKind, CharacterType, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueKind, ValueLogicalType,
+};
 
 use super::{
     Failure,
@@ -85,7 +87,8 @@ pub(crate) fn validate<H>(value: &wire::ScalarValue) -> Result<S, Failure<H>> {
         | (u8::from(value.scale.is_some()) << 2)
         | (u8::from(value.time_unit.is_some()) << 3)
         | (u8::from(value.timezone.is_some()) << 4)
-        | (u8::from(value.interval_unit.is_some()) << 5);
+        | (u8::from(value.interval_unit.is_some()) << 5)
+        | (u8::from(value.character_length.is_some()) << 6);
     let (required, allowed) = match kind {
         S::Unspecified => return Err(invalid("missing logical scalar kind")),
         S::FixedSizeBinary => (1, 1),
@@ -93,10 +96,21 @@ pub(crate) fn validate<H>(value: &wire::ScalarValue) -> Result<S, Failure<H>> {
         S::Timestamp => (8, 24),
         S::Time32 | S::Time64 | S::Duration => (8, 8),
         S::Interval => (32, 32),
+        S::Char | S::Varchar => (64, 64),
         _ => (0, 0),
     };
     if present & required != required || present & !allowed != 0 {
         return Err(invalid("missing or irrelevant logical scalar parameter"));
+    }
+    if let Some(length) = value.character_length {
+        let character_kind = if kind == S::Char {
+            CharacterKind::Char
+        } else {
+            CharacterKind::Varchar
+        };
+        if CharacterType::new(character_kind, length).is_none() {
+            return Err(invalid("invalid logical character length"));
+        }
     }
     if value.fixed_binary_width.is_some_and(|width| width < 0) {
         return Err(invalid("negative logical fixed binary width"));
@@ -153,6 +167,18 @@ pub(crate) fn decode_with_source_facts<H>(
     let mut retained = 0usize;
     let data_type = match kind {
         S::String => return Ok((ValueKind::String, 0)),
+        S::Char | S::Varchar => {
+            let character_kind = if kind == S::Char {
+                CharacterKind::Char
+            } else {
+                CharacterKind::Varchar
+            };
+            let character = value
+                .character_length
+                .and_then(|length| CharacterType::new(character_kind, length))
+                .ok_or_else(|| invalid("invalid logical character length"))?;
+            return Ok((ValueKind::BoundedCharacter(character), 0));
+        }
         S::Binary => return Ok((ValueKind::Binary, 0)),
         S::Null => DataType::Null,
         S::Boolean => DataType::Boolean,
@@ -210,6 +236,13 @@ pub(crate) fn encode<H>(
     let mut value = wire::ScalarValue::default();
     let scalar = match kind {
         ValueKind::String => S::String,
+        ValueKind::BoundedCharacter(character) => {
+            value.character_length = Some(character.length());
+            match character.kind() {
+                CharacterKind::Char => S::Char,
+                CharacterKind::Varchar => S::Varchar,
+            }
+        }
         ValueKind::Binary => S::Binary,
         ValueKind::Scalar(data_type) => match data_type {
             DataType::Null => S::Null,

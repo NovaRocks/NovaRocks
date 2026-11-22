@@ -28,7 +28,7 @@ DROP TABLE IF EXISTS ${case_db}.t_filter_basic_comparison;
 CREATE TABLE ${case_db}.t_filter_basic_comparison (
   id INT,
   v INT,
-  name STRING
+  name VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_basic_comparison VALUES
   ROW(1, 10, 'a'),

@@ -28,11 +28,11 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_outer_runtime_empty_build_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_right_outer_runtime_empty_build_r;
 CREATE TABLE ${case_db}.t_join_right_outer_runtime_empty_build_l (
   id INT,
-  lv STRING
+  lv VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_right_outer_runtime_empty_build_r (
   id INT,
-  rv STRING
+  rv VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_right_outer_runtime_empty_build_l VALUES
   ROW(1, 'L1'),

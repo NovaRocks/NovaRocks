@@ -27,19 +27,19 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 create table t0 (
-    c0 STRING,
-    c1 STRING
+    c0 VARCHAR,
+    c1 VARCHAR
 ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT generate_series, generate_series FROM TABLE(generate_series(1,  1500));
+insert into t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR) FROM TABLE(generate_series(1,  1500));
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT generate_series, NULL FROM TABLE(generate_series(1,  1500));
+insert into t0 SELECT CAST(generate_series AS VARCHAR), NULL FROM TABLE(generate_series(1,  1500));
 
 -- query 5
 USE ${case_db};

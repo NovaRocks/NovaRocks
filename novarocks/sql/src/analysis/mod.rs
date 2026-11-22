@@ -644,7 +644,7 @@ pub enum ExprKind {
     },
     /// CAST expression.
     Cast {
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
         expr: AstBox<TypedExpr>,
         target: DataType,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,

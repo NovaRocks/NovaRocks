@@ -8,15 +8,10 @@ d	dt	ts	n	nullable_text
 d	dt	ts	n	nullable_text
 12.35	2024-02-29	2024-02-29 12:34:56.123456	123	NULL
 
--- query 5
--- types	decimal(8, 2)	integer
-d	n
--12.35	NULL
-
 -- query 7
 -- types	decimal(8, 2)	integer
 d	n
--12.35	NULL
+0.00	0
 
 -- query 8
 -- types	varchar
@@ -32,19 +27,19 @@ id	required_text
 -- query 14
 -- types	integer	varchar	boolean	boolean	boolean	boolean
 id	token	float_is_null	cast_float_is_null	double_is_null	cast_double_is_null
-1	NaN	true	true	true	true
-2	inf	true	true	true	true
-3	-inf	true	true	true	true
-4	1e1000	true	true	true	true
+1	NaN	false	false	false	false
+2	Infinity	false	false	false	false
+3	-Infinity	false	false	false	false
+4	1e1000	false	false	false	false
 5	2.5	false	false	false	false
 
 -- query 19
 -- types	integer	boolean	boolean	boolean	boolean
 id	required_float_unchanged	required_double_unchanged	float_is_null	double_is_null
-1	true	true	true	true
-2	true	true	true	true
-3	true	true	true	true
-4	true	true	true	true
+1	true	true	false	false
+2	true	true	false	false
+3	true	true	false	false
+4	true	true	false	false
 5	true	true	false	false
 
 -- query 20

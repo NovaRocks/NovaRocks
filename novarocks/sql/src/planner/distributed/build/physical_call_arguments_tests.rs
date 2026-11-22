@@ -22,10 +22,7 @@ use arrow::{
 };
 use novarocks_constant_contract::{ConstantPool, ConstantValue};
 use novarocks_physical_plan::{ConstantPoolId, ConstantReference, ExprId, ValueId};
-use novarocks_type_contract::{
-    DecimalOverflowPolicy, FunctionValueType, PureCompileControl, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, ValueLogicalType,
-};
+use novarocks_type_contract::{FunctionValueType, PureCompileControl, ValueLogicalType};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -357,14 +354,9 @@ fn physical_call_request_value_and_cast_stay_nonconstant_with_actual_nullable_so
     let cast = source(
         result.clone(),
         ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
             expr: ExprId::new(0),
             target: DataType::Utf8,
-            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            allow_throw_exception: SemanticParameterRef {
-                id: SemanticParameterId::new(u32::MAX),
-                expected_key: SemanticParameterKey::AllowThrowException,
-            },
         },
     );
     let (actual, constant) = value(

@@ -20,7 +20,7 @@ use super::*;
 use crate::optimizer::{OptimizedOperatorNode, operator::Operator, scalar::ScalarNode};
 use arrow::datatypes::DataType;
 use novarocks_functions::PureKernelAbi;
-use novarocks_type_contract::FunctionIntrinsicRowError;
+use novarocks_type_contract::{FunctionIntrinsicRowError, OperatorFunction, TrinoCastMode};
 
 fn compile(sql: &str) -> SqlOptimizedOutput {
     compile_with_id_type(sql, DataType::Int64)
@@ -200,7 +200,7 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                 };
                 assert_eq!(
                     binding.function_id.as_str(),
-                    "builtin.scalar/__array_element_at/v1"
+                    OperatorFunction::ArraySubscript.function_id_text()
                 );
                 assert_eq!(access.len(), 2);
                 let inner = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
@@ -216,13 +216,26 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                         "item", inner, true
                     )))
                 );
-                assert_eq!(arena.data_type(access[1]), &DataType::Int32);
+                assert_eq!(arena.data_type(access[1]), &DataType::Int64);
                 assert!(arena.nullable(access[1]));
+                let ScalarNode::Cast {
+                    child: conditional,
+                    target,
+                    cast_mode,
+                    ..
+                } = arena.node(access[1])
+                else {
+                    panic!("expected widening of the original IF index");
+                };
+                assert_eq!(target, &DataType::Int64);
+                assert_eq!(*cast_mode, Some(TrinoCastMode::Implicit));
+                assert_eq!(arena.data_type(*conditional), &DataType::Int32);
+                assert!(arena.nullable(*conditional));
                 let ScalarNode::FunctionCall {
                     binding,
                     args: branches,
                     ..
-                } = arena.node(access[1])
+                } = arena.node(*conditional)
                 else {
                     panic!("primitive IF source");
                 };

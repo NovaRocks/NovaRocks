@@ -19,18 +19,13 @@
 use super::*;
 use arrow::array::{Decimal128Array, Int8Array, Int16Array, Int32Array};
 use novarocks_expression::EvaluationInput;
-use novarocks_expression::testkit::PassThroughCallHost;
-use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
-const OVERFLOW: &str =
-    "Expr evaluate meet error: The numeric type cast involving decimal overflows";
-fn modes() -> [(DecimalOverflowPolicy, bool); 4] {
-    [
-        (DecimalOverflowPolicy::OutputNull, false),
-        (DecimalOverflowPolicy::OutputNull, true),
-        (DecimalOverflowPolicy::ReportError, false),
-        (DecimalOverflowPolicy::ReportError, true),
-    ]
-}
+use novarocks_expression::testkit::{PassThroughCallHost, numeric_fixtures::compiled_cast};
+use novarocks_failure_contract::kernel_reason::NUMERIC_OUT_OF_RANGE;
+use novarocks_functions::{DataFailureReason, ScalarInvocationActivation, ScalarInvocationScope};
+use novarocks_type_contract::TrinoCastMode;
+
+const MODES: [TrinoCastMode; 2] = [TrinoCastMode::Explicit, TrinoCastMode::Try];
+
 // Pure input construction and output inspection, never a reference conversion.
 fn integral_input(dtype: &DataType, raw: Vec<Option<i64>>) -> ArrayRef {
     macro_rules! array {
@@ -68,16 +63,12 @@ enum Expected {
 }
 use Expected::{Overflow as O, SourceNull as N, Value as V};
 impl Expected {
-    // Only interpret a handwritten overflow marker's existing policy response.
-    // Integral numeric CAST ignores allow-throw for OutputNull overflow.
-    fn result(self, policy: DecimalOverflowPolicy) -> (Option<i128>, Option<&'static str>) {
+    fn outcome(self, mode: TrinoCastMode) -> (Option<i128>, Option<DataFailureReason>) {
         match self {
             Self::Value(value) => (Some(value), None),
             Self::SourceNull => (None, None),
-            Self::Overflow if policy == DecimalOverflowPolicy::ReportError => {
-                (None, Some(OVERFLOW))
-            }
-            Self::Overflow => (None, None),
+            Self::Overflow if mode == TrinoCastMode::Try => (None, None),
+            Self::Overflow => (None, Some(DataFailureReason::Domain(NUMERIC_OUT_OF_RANGE))),
         }
     }
 }
@@ -85,16 +76,16 @@ fn compare_integral(dtype: DataType) {
     // All four carriers represent -100/0/100 exactly. Scale zero keeps the
     // raw integer, and precision4 admits absolute magnitudes below 10_000.
     let expected_full = [V(-100), N, V(100), V(0)];
-    for (policy, allow) in modes() {
+    for mode in MODES {
         let target = DataType::Decimal128(4, 0);
         let full = integral_input(&dtype, vec![Some(-100), None, Some(100), Some(0)]);
-        let program = compiled(
+        let program = compiled_cast(
             FunctionValueType::new(dtype.clone(), true),
             FunctionValueType::new(target.clone(), true),
             Source::Column,
             Wrap::Bare,
-            policy,
-            allow,
+            mode,
+            false,
         );
         for (source, fixed) in [
             (full.clone(), expected_full.as_slice()),
@@ -134,17 +125,17 @@ fn compare_integral(dtype: DataType) {
                 let mut wanted = Vec::new();
                 let mut errors = Vec::new();
                 for (ordinal, row) in rows.iter().copied().enumerate() {
-                    let (value, error) = fixed[row].result(policy);
+                    let (value, error) = fixed[row].outcome(mode);
                     wanted.push(value);
-                    if let Some(message) = error {
-                        errors.push((ordinal, message.to_owned()));
+                    if let Some(reason) = error {
+                        errors.push((ordinal, reason));
                     }
                 }
                 assert_eq!(values(out.values()), wanted);
                 assert_eq!(
                     out.errors()
                         .iter()
-                        .map(|e| (e.selected_ordinal(), e.message().to_owned()))
+                        .map(|e| (e.selected_ordinal(), e.reason()))
                         .collect::<Vec<_>>(),
                     errors
                 );
@@ -154,19 +145,19 @@ fn compare_integral(dtype: DataType) {
 }
 
 #[test]
-fn integral_decimal128_actual_compiler_i8_to_4_0_policy_selection_and_carrier() {
+fn integral_decimal128_actual_compiler_i8_to_4_0_modes_selection_and_carrier() {
     compare_integral(DataType::Int8);
 }
 #[test]
-fn integral_decimal128_actual_compiler_i16_to_4_0_policy_selection_and_carrier() {
+fn integral_decimal128_actual_compiler_i16_to_4_0_modes_selection_and_carrier() {
     compare_integral(DataType::Int16);
 }
 #[test]
-fn integral_decimal128_actual_compiler_i32_to_4_0_policy_selection_and_carrier() {
+fn integral_decimal128_actual_compiler_i32_to_4_0_modes_selection_and_carrier() {
     compare_integral(DataType::Int32);
 }
 #[test]
-fn integral_decimal128_actual_compiler_i64_to_4_0_policy_selection_and_carrier() {
+fn integral_decimal128_actual_compiler_i64_to_4_0_modes_selection_and_carrier() {
     compare_integral(DataType::Int64);
 }
 
@@ -176,41 +167,30 @@ mod after;
 fn decimal_to_tinyint_overflow_keeps_its_selected_row_error() {
     use crate::zero_port;
     use novarocks_expression_contract::ExprKind;
-    use novarocks_type_contract::{
-        SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-        SemanticParameters,
-    };
+    use novarocks_type_contract::SemanticParameters;
 
     let input: ArrayRef = Arc::new(
         Decimal128Array::from(vec![1000])
             .with_precision_and_scale(4, 0)
             .unwrap(),
     );
-    let parameter = SemanticParameterId::new(0);
-    let parameters = SemanticParameters::try_new([(
-        parameter,
-        SemanticParameterValue::AllowThrowException(true),
-    )])
-    .unwrap();
     let unit = zero_port::primitive(
         [input],
         FunctionValueType::new(DataType::Int8, true),
         |children| ExprKind::Cast {
             expr: children[0],
             target: DataType::Int8,
-            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            allow_throw_exception: SemanticParameterRef {
-                id: parameter,
-                expected_key: SemanticParameterKey::AllowThrowException,
-            },
-            array_failure_mode: None,
+            cast_mode: TrinoCastMode::Explicit,
         },
-        &parameters,
+        &SemanticParameters::default(),
     )
     .unwrap();
     let output = zero_port::evaluate(unit);
     assert!(output.values().is_null(0));
     assert_eq!(output.errors().len(), 1);
     assert_eq!(output.errors()[0].selected_ordinal(), 0);
-    assert_eq!(output.errors()[0].message(), OVERFLOW);
+    assert_eq!(
+        output.errors()[0].reason(),
+        DataFailureReason::Domain(NUMERIC_OUT_OF_RANGE)
+    );
 }

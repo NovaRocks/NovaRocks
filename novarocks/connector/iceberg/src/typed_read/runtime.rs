@@ -67,10 +67,44 @@ impl IcebergReadLayout {
     }
 
     pub(crate) fn applies_to(relation: &IcebergRuntimeRelation) -> bool {
-        matches!(
-            relation,
-            IcebergRuntimeRelation::Table(_) | IcebergRuntimeRelation::ChangeWindow(_)
-        )
+        match relation {
+            IcebergRuntimeRelation::Table(table) => !table.is_data_rewrite_read(),
+            IcebergRuntimeRelation::ChangeWindow(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// A data rewrite reads storage values for its exact writer binding. Ordinary
+/// reads publish SQL values and may choose a view layout for variable bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IcebergReadProjection {
+    Sql(IcebergReadLayout),
+    DataRewrite,
+}
+
+impl IcebergReadProjection {
+    pub(crate) fn for_table(table: &IcebergTableHandle, layout: IcebergReadLayout) -> Self {
+        if table.is_data_rewrite_read() {
+            Self::DataRewrite
+        } else {
+            Self::Sql(layout)
+        }
+    }
+
+    pub(crate) const fn projects_fixed_as_binary(self) -> bool {
+        matches!(self, Self::Sql(_))
+    }
+
+    pub(crate) fn byte_carrier(
+        self,
+        data_type: &arrow::datatypes::DataType,
+        domain: novarocks_type_contract::ValueLogicalType,
+    ) -> arrow::datatypes::DataType {
+        match self {
+            Self::Sql(layout) => layout.byte_carrier(data_type, domain),
+            Self::DataRewrite => data_type.clone(),
+        }
     }
 }
 
@@ -142,6 +176,13 @@ impl IcebergRuntimeRelation {
             Self::ChangeWindow(handle) => handle.schema_table_name(),
             Self::SystemTable(handle) => handle.schema_table_name(),
             Self::MergeTable(handle) => handle.schema_table_name(),
+        }
+    }
+
+    pub(crate) fn read_projection(&self, layout: IcebergReadLayout) -> IcebergReadProjection {
+        match self {
+            Self::Table(table) => IcebergReadProjection::for_table(table, layout),
+            _ => IcebergReadProjection::Sql(layout),
         }
     }
 }

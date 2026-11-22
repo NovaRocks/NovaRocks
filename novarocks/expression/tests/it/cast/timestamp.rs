@@ -17,25 +17,23 @@
 
 use super::*;
 use arrow::array::{
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray,
 };
 use arrow::datatypes::TimeUnit;
-use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::testkit::{PassThroughCallHost, numeric_fixtures::compiled_cast};
 use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
-use novarocks_functions::SelectedValues;
-use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
+use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+use novarocks_functions::{
+    CastPrepareError, DataFailureReason, PreparedCastRecipe, ScalarInvocationActivation,
+    ScalarInvocationScope, SelectedValues,
+};
+use novarocks_type_contract::TrinoCastMode;
 
-const UNITS: [TimeUnit; 4] = [
-    TimeUnit::Second,
-    TimeUnit::Millisecond,
-    TimeUnit::Microsecond,
-    TimeUnit::Nanosecond,
-];
+const MICROS: DataType = DataType::Timestamp(TimeUnit::Microsecond, None);
+const NANOS: DataType = DataType::Timestamp(TimeUnit::Nanosecond, None);
+const MODES: [TrinoCastMode; 2] = [TrinoCastMode::Explicit, TrinoCastMode::Try];
 
-fn timestamp_type(unit: TimeUnit, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(DataType::Timestamp(unit, None), nullable)
-}
 pub(super) fn timestamp_array(unit: TimeUnit, values: Vec<Option<i64>>) -> ArrayRef {
     match unit {
         TimeUnit::Second => Arc::new(TimestampSecondArray::from(values)),
@@ -44,262 +42,99 @@ pub(super) fn timestamp_array(unit: TimeUnit, values: Vec<Option<i64>>) -> Array
         TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(values)),
     }
 }
+
 fn timestamp_values(output: &SelectedValues<'_>) -> Vec<Option<i64>> {
-    macro_rules! values {
-        ($array:ty) => {
-            output
-                .values()
-                .as_any()
-                .downcast_ref::<$array>()
-                .unwrap()
-                .iter()
-                .collect()
-        };
-    }
-    match output.values().data_type() {
-        DataType::Timestamp(TimeUnit::Second, None) => values!(TimestampSecondArray),
-        DataType::Timestamp(TimeUnit::Millisecond, None) => values!(TimestampMillisecondArray),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => values!(TimestampMicrosecondArray),
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => values!(TimestampNanosecondArray),
-        other => panic!("timestamp result lost its exact carrier: {other:?}"),
-    }
+    output
+        .values()
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap()
+        .iter()
+        .collect()
 }
+
 fn timestamp_batch(
     program: &CompiledFixture,
-    values: &[Option<i64>],
+    source: ArrayRef,
     flags: &[Option<bool>],
 ) -> RecordBatch {
-    let schema = program.input_schema().clone();
-    let DataType::Timestamp(unit, None) = schema.field(0).data_type() else {
-        panic!("actual frozen timestamp source")
-    };
-    let mut padded = vec![Some(99)];
-    padded.extend_from_slice(values);
-    padded.push(Some(-99));
+    let len = source.len();
     RecordBatch::try_new(
-        schema.clone(),
+        program.input_schema().clone(),
         vec![
-            timestamp_array(*unit, padded).slice(1, values.len()),
-            Arc::new(Int64Array::from(vec![Some(42); values.len()])),
+            source,
+            Arc::new(Int64Array::from(vec![Some(42); len])),
             Arc::new(BooleanArray::from(flags.to_vec())),
         ],
     )
     .unwrap()
 }
 
-// Independent coefficient tables for [-1001,-1,0,1,1001,MIN,MAX,NULL].
-// Unit ratios are decimal powers; narrowing truncates toward zero. The table
-// explicitly records range overflow as a successful NULL except for the
-// separately frozen microsecond-to-nanosecond row-error contract.
-fn expected_constant_unit(source: TimeUnit, target: TimeUnit) -> i64 {
-    use TimeUnit::*;
-    match (source, target) {
-        (Second, Second)
-        | (Millisecond, Millisecond)
-        | (Microsecond, Microsecond)
-        | (Nanosecond, Nanosecond) => 71,
-        (Second, Millisecond) | (Millisecond, Microsecond) | (Microsecond, Nanosecond) => 71_000,
-        (Second, Microsecond) | (Millisecond, Nanosecond) => 71_000_000,
-        (Second, Nanosecond) => 71_000_000_000,
-        (Millisecond, Second)
-        | (Microsecond, Millisecond)
-        | (Nanosecond, Microsecond)
-        | (Microsecond, Second)
-        | (Nanosecond, Millisecond)
-        | (Nanosecond, Second) => 0,
-    }
-}
-
 #[test]
-fn timestamp_cast_nonnullable_contract_requires_only_five_successful_null_promises() {
-    for source in UNITS {
-        for target in UNITS {
-            let safe_widen = matches!(
-                (source, target),
-                (
-                    TimeUnit::Second,
-                    TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
-                ) | (
-                    TimeUnit::Millisecond,
-                    TimeUnit::Microsecond | TimeUnit::Nanosecond
-                )
-            );
-            let authored = cast_fixture(
-                timestamp_type(source, false),
-                timestamp_type(target, false),
-                Source::Column,
-                Wrap::Bare,
-                DecimalOverflowPolicy::ReportError,
-                false,
-            );
-            if safe_widen {
-                let error = match authored {
-                    Err(error) => error.to_string(),
-                    Ok(fixture) => fixture.compile(&Control).unwrap_err().to_string(),
-                };
-                assert!(error.contains("successful-NULL"));
-                continue;
-            }
-            let fixture = authored.expect("timestamp cast admitted");
-            let result = fixture.compile(&Control);
-            {
-                let program = result.unwrap();
-                let batch =
-                    timestamp_batch(&program, &[Some(i64::MAX), Some(-1)], &[Some(true); 2]);
-                let output = instance(&program)
-                    .evaluate(
-                        EvaluationInput::Batch {
-                            batch: &batch,
-                            source: None,
-                        },
-                        ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
-                        ScalarInvocationActivation::Activated,
-                        &Control,
-                        &mut PassThroughCallHost,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    errors(&output),
-                    if (source, target) == (TimeUnit::Microsecond, TimeUnit::Nanosecond) {
-                        vec![0]
-                    } else {
-                        vec![]
-                    }
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn timestamp_cast_literal_broadcast_and_batch_splits_keep_original_coefficients() {
-    for source in UNITS {
-        for target in UNITS {
-            let program = compiled(
-                timestamp_type(source, false),
-                timestamp_type(target, true),
-                Source::Constant,
-                Wrap::Bare,
-                DecimalOverflowPolicy::OutputNull,
-                false,
-            );
-            let batch = timestamp_batch(&program, &[Some(i64::MAX); 5], &[Some(true); 5]);
-            let coefficient = Some(expected_constant_unit(source, target));
-            let rows = [0, 2, 4];
-            let mut evaluator = instance(&program);
-            for _ in 0..2 {
-                let output = evaluator
-                    .evaluate(
-                        EvaluationInput::Batch {
-                            batch: &batch,
-                            source: None,
-                        },
-                        {
-                            let selection = Selection::try_sparse(5, &rows).unwrap();
-                            ScalarInvocationScope::new(selection, selection)
-                        },
-                        ScalarInvocationActivation::Activated,
-                        &Control,
-                        &mut PassThroughCallHost,
-                    )
-                    .unwrap();
-                assert_eq!(timestamp_values(&output), vec![coefficient; 3]);
-                assert!(output.errors().is_empty());
-            }
-        }
-    }
-}
-
-#[test]
-fn timestamp_cast_guards_distinguish_successful_nulls_from_required_overflow_errors() {
-    for allow in [false, true] {
-        for policy in [
-            DecimalOverflowPolicy::OutputNull,
-            DecimalOverflowPolicy::ReportError,
+fn timestamp_narrowing_rounds_signed_half_microseconds_on_selected_rows() {
+    let input = [
+        Some(99),
+        Some(-1001),
+        Some(-501),
+        Some(-500),
+        Some(-499),
+        Some(0),
+        Some(499),
+        Some(500),
+        Some(501),
+        Some(1001),
+        Some(i64::MIN),
+        Some(i64::MAX),
+        None,
+    ];
+    let expected = [
+        Some(-1),
+        Some(-1),
+        Some(0),
+        Some(0),
+        Some(0),
+        Some(0),
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(-9_223_372_036_854_776),
+        Some(9_223_372_036_854_776),
+        None,
+    ];
+    let input = timestamp_array(TimeUnit::Nanosecond, input.to_vec()).slice(1, expected.len());
+    for mode in MODES {
+        let program = compiled_cast(
+            FunctionValueType::new(NANOS, true),
+            FunctionValueType::new(MICROS, true),
+            Source::Column,
+            Wrap::Bare,
+            mode,
+            false,
+        );
+        let batch = timestamp_batch(&program, input.clone(), &[Some(true); 12]);
+        for rows in [
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11][..],
+            &[0, 2, 4, 6, 9, 11],
+            &[],
         ] {
-            for wrap in [Wrap::Bare, Wrap::IsNull, Wrap::If, Wrap::Coalesce] {
-                let program = compiled(
-                    timestamp_type(TimeUnit::Microsecond, true),
-                    timestamp_type(TimeUnit::Nanosecond, true),
-                    Source::Column,
-                    wrap,
-                    policy,
-                    allow,
-                );
-                let batch = timestamp_batch(
-                    &program,
-                    &[Some(i64::MAX), None, Some(1), Some(i64::MAX)],
-                    &[Some(true), Some(true), Some(true), Some(false)],
-                );
-                let output = instance(&program)
-                    .evaluate(
-                        EvaluationInput::Batch {
-                            batch: &batch,
-                            source: None,
-                        },
-                        ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
-                        ScalarInvocationActivation::Activated,
-                        &Control,
-                        &mut PassThroughCallHost,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    errors(&output),
-                    if matches!(wrap, Wrap::If) {
-                        vec![0]
-                    } else {
-                        vec![0, 3]
-                    }
-                );
-                if matches!(wrap, Wrap::IsNull) {
-                    let values = output
-                        .values()
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .unwrap();
-                    assert_eq!(
-                        values.iter().collect::<Vec<_>>(),
-                        vec![None, Some(true), Some(false), None]
-                    );
-                } else {
-                    assert_eq!(
-                        timestamp_values(&output),
-                        match wrap {
-                            Wrap::If => vec![None, None, Some(1000), Some(71)],
-                            Wrap::Coalesce => vec![None, Some(71), Some(1000), None],
-                            _ => vec![None, None, Some(1000), None],
-                        }
-                    );
-                }
-                for error in output.errors() {
-                    assert!(error.message().contains("microsecond->nanosecond overflow"));
-                }
-            }
-            let program = compiled(
-                timestamp_type(TimeUnit::Second, true),
-                timestamp_type(TimeUnit::Nanosecond, true),
-                Source::Column,
-                Wrap::Coalesce,
-                policy,
-                allow,
-            );
-            let batch =
-                timestamp_batch(&program, &[Some(i64::MAX), None, Some(1)], &[Some(true); 3]);
+            let selection = Selection::try_sparse(batch.num_rows(), rows).unwrap();
             let output = instance(&program)
                 .evaluate(
                     EvaluationInput::Batch {
                         batch: &batch,
                         source: None,
                     },
-                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    ScalarInvocationScope::new(selection, selection),
                     ScalarInvocationActivation::Activated,
                     &Control,
                     &mut PassThroughCallHost,
                 )
                 .unwrap();
+            assert_eq!(output.selection(), selection);
+            assert_eq!(output.values().data_type(), &MICROS);
             assert_eq!(
                 timestamp_values(&output),
-                vec![Some(71), Some(71), Some(1000000000)]
+                rows.iter().map(|&row| expected[row]).collect::<Vec<_>>()
             );
             assert!(output.errors().is_empty());
         }
@@ -307,51 +142,197 @@ fn timestamp_cast_guards_distinguish_successful_nulls_from_required_overflow_err
 }
 
 #[test]
-fn timestamp_cast_actual_runtime_callbacks_preserve_all_seven_causes_and_failed_latch() {
-    let program = compiled(
-        timestamp_type(TimeUnit::Microsecond, true),
-        timestamp_type(TimeUnit::Nanosecond, true),
+fn timestamp_narrowing_preserves_required_constant_broadcast() {
+    for mode in MODES {
+        for (unit, expected) in [(TimeUnit::Microsecond, 71), (TimeUnit::Nanosecond, 0)] {
+            let program = compiled_cast(
+                FunctionValueType::new(DataType::Timestamp(unit, None), false),
+                FunctionValueType::new(MICROS, false),
+                Source::Constant,
+                Wrap::Bare,
+                mode,
+                false,
+            );
+            let source = timestamp_array(unit, vec![Some(99); 5]);
+            let batch = timestamp_batch(&program, source, &[Some(true); 5]);
+            let selection = Selection::try_sparse(batch.num_rows(), &[1, 4]).unwrap();
+            let output = instance(&program)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
+            assert_eq!(output.selection(), selection);
+            assert_eq!(timestamp_values(&output), [Some(expected); 2]);
+            assert!(output.errors().is_empty());
+        }
+    }
+}
+
+#[test]
+fn timestamp_precision_pairs_without_a_recipe_remain_unsupported() {
+    let units = [
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+        TimeUnit::Nanosecond,
+    ];
+    for source in units {
+        for target in units {
+            if source == target || (source, target) == (TimeUnit::Nanosecond, TimeUnit::Microsecond)
+            {
+                continue;
+            }
+            for mode in MODES {
+                assert!(
+                    matches!(
+                        PreparedCastRecipe::try_new_trino(
+                            &FunctionValueType::new(DataType::Timestamp(source, None), false),
+                            &FunctionValueType::new(DataType::Timestamp(target, None), true),
+                            mode,
+                            &Control,
+                        ),
+                        Err(CastPrepareError::Unsupported)
+                    ),
+                    "{mode:?} {source:?} -> {target:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn timestamp_text_cast_errors_and_successful_nulls_survive_control_wrappers() {
+    for mode in MODES {
+        for wrap in [Wrap::Bare, Wrap::IsNull, Wrap::If, Wrap::Coalesce] {
+            let program = compiled_cast(
+                FunctionValueType::new(DataType::Utf8, true),
+                FunctionValueType::new(MICROS, true),
+                Source::Column,
+                wrap,
+                mode,
+                false,
+            );
+            let source = Arc::new(StringArray::from(vec![
+                Some("bad"),
+                None,
+                Some("1970-01-01 00:00:00.000001"),
+                Some("bad"),
+            ]));
+            let batch = timestamp_batch(
+                &program,
+                source,
+                &[Some(true), Some(true), Some(true), Some(false)],
+            );
+            let selection = Selection::all(4);
+            let output = instance(&program)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
+            let expected_errors = match (mode, wrap) {
+                (TrinoCastMode::Try, _) => vec![],
+                (_, Wrap::If) => vec![0],
+                _ => vec![0, 3],
+            };
+            assert_eq!(errors(&output), expected_errors);
+            assert!(
+                output
+                    .errors()
+                    .iter()
+                    .all(|e| e.reason() == DataFailureReason::Domain(INVALID_CAST_ARGUMENT))
+            );
+            let tried = mode == TrinoCastMode::Try;
+            if matches!(wrap, Wrap::IsNull) {
+                let values = output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap();
+                let invalid = tried.then_some(true);
+                assert_eq!(
+                    values.iter().collect::<Vec<_>>(),
+                    [invalid, Some(true), Some(false), invalid]
+                );
+            } else {
+                assert_eq!(
+                    timestamp_values(&output),
+                    match wrap {
+                        Wrap::If => [None, None, Some(1), Some(71)],
+                        Wrap::Coalesce if tried => [Some(71), Some(71), Some(1), Some(71)],
+                        Wrap::Coalesce => [None, Some(71), Some(1), None],
+                        _ => [None, None, Some(1), None],
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn timestamp_cast_runtime_checkpoints_keep_original_failures_and_latch() {
+    let program = compiled_cast(
+        FunctionValueType::new(DataType::Utf8, true),
+        FunctionValueType::new(MICROS, true),
         Source::Column,
         Wrap::Coalesce,
-        DecimalOverflowPolicy::OutputNull,
+        TrinoCastMode::Explicit,
         false,
     );
-    let batch = timestamp_batch(
-        &program,
-        &[Some(i64::MAX), None, Some(-1)],
-        &[Some(true); 3],
-    );
+    let source = Arc::new(StringArray::from_iter(
+        [Some("bad"), None]
+            .into_iter()
+            .chain(std::iter::repeat_n(Some("1970-01-01 00:00:00.000001"), 318)),
+    ));
+    let batch = timestamp_batch(&program, source, &[Some(true); 320]);
+    let selection = Selection::all(320);
+    let scope = ScalarInvocationScope::new(selection, selection);
+    let input = EvaluationInput::Batch {
+        batch: &batch,
+        source: None,
+    };
     let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
     let output = instance(&program)
         .evaluate(
-            EvaluationInput::Batch {
-                batch: &batch,
-                source: None,
-            },
-            ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+            input,
+            scope,
             ScalarInvocationActivation::Activated,
             &recorder,
             &mut PassThroughCallHost,
         )
         .unwrap();
-    assert_eq!(errors(&output), vec![0]);
+    assert_eq!(errors(&output), [0]);
+    assert_eq!(&timestamp_values(&output)[..3], &[None, Some(71), Some(1)]);
     let trace = recorder.trace();
+    assert!(trace.contains(&256));
+    assert!(trace.iter().all(|units| *units <= 256));
     for stop_at in 1..=trace.len() {
         for cause in causes() {
             let control = CallbackControl::new(cause.clone(), stop_at);
             let mut evaluator = instance(&program);
-            assert!(
-                matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(3), Selection::all(3)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
-            );
+            assert!(matches!(
+                evaluator.evaluate(input, scope, ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost),
+                Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause
+            ));
             assert_eq!(control.trace(), trace[..stop_at]);
             let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
             assert!(matches!(
                 evaluator.evaluate(
-                    EvaluationInput::Batch {
-                        batch: &batch,
-                        source: None
-                    },
-                    ScalarInvocationScope::new(Selection::all(3), Selection::all(3)),
+                    input,
+                    scope,
                     ScalarInvocationActivation::Activated,
                     &after,
                     &mut PassThroughCallHost
@@ -359,35 +340,6 @@ fn timestamp_cast_actual_runtime_callbacks_preserve_all_seven_causes_and_failed_
                 Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
             ));
             assert!(after.trace().is_empty());
-        }
-    }
-    let values = vec![Some(1); 320];
-    let batch = timestamp_batch(&program, &values, &[Some(true); 320]);
-    let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    let output = instance(&program)
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &batch,
-                source: None,
-            },
-            ScalarInvocationScope::new(Selection::all(320), Selection::all(320)),
-            ScalarInvocationActivation::Activated,
-            &recorder,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
-    assert_eq!(timestamp_values(&output), vec![Some(1000); 320]);
-    let trace = recorder.trace();
-    assert!(trace.contains(&256));
-    assert!(trace.iter().all(|units| *units <= 256));
-    for stop_at in (1..=trace.len()).filter(|&n| n == 1 || n == trace.len() || trace[n - 1] == 256)
-    {
-        for cause in causes() {
-            let control = CallbackControl::new(cause.clone(), stop_at);
-            assert!(
-                matches!(instance(&program).evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(320), Selection::all(320)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
-            );
-            assert_eq!(control.trace(), trace[..stop_at]);
         }
     }
 }

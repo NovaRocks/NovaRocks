@@ -47,13 +47,11 @@ pub enum StaticExprKind {
     /// A checked value retaining its complete field/type and pool ordinal.
     Constant(novarocks_functions::ConstantValue),
     Input,
-    /// Cast retaining its exact operation, failure mode and admitted semantic parameter.
+    /// Cast retaining its exact operation and failure mode.
     PreparedCast {
         operation: novarocks_functions::CastOperation,
         child: CompiledExprId,
-        decimal_overflow_policy: DecimalOverflowPolicy,
-        allow_throw_exception: bool,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: novarocks_type_contract::TrinoCastMode,
     },
     /// Intrinsic arithmetic retaining its exact admitted semantic parameter.
     PreparedArithmetic {
@@ -158,11 +156,7 @@ impl StaticExprKind {
 
     pub fn decimal_overflow_policy(&self) -> Option<DecimalOverflowPolicy> {
         match self {
-            Self::PreparedCast {
-                decimal_overflow_policy,
-                ..
-            }
-            | Self::PreparedArithmetic {
+            Self::PreparedArithmetic {
                 decimal_overflow_policy,
                 ..
             } => Some(*decimal_overflow_policy),

@@ -31,8 +31,8 @@ CREATE CATALOG ice_ivm_minmax_string_db_${uuid0} USING iceberg WITH ("iceberg.ca
 CREATE SCHEMA ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items (
   id BIGINT,
-  region STRING,
-  name STRING
+  region VARCHAR,
+  name VARCHAR
 ) WITH (format_version = 3);
 USE ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0};
 

@@ -27,11 +27,11 @@ DROP TABLE IF EXISTS ${case_db}.t_two_part_src;
 DROP TABLE IF EXISTS ${case_db}.t_two_part_sink;
 CREATE TABLE ${case_db}.t_two_part_src (
   id BIGINT,
-  v STRING
+  v VARCHAR
 );
 CREATE TABLE ${case_db}.t_two_part_sink (
   id BIGINT,
-  v STRING
+  v VARCHAR
 );
 INSERT INTO ${case_db}.t_two_part_src VALUES
   ROW(1, 'alpha'),

@@ -383,10 +383,11 @@ fn analyze_mutation_query(
 fn mor_generated_errors_point_to_user_expression_and_typed_assignment() {
     // The source expression is independently admitted. Its ordinary
     // assignment conversion belongs to the complete-query typed projection.
-    analyze_mutation_query(test_query("SELECT CAST(NULL AS HLL)")).unwrap();
+    let incompatible_assignment = "CAST(NULL AS DATE)";
+    analyze_mutation_query(test_query(&format!("SELECT {incompatible_assignment}"))).unwrap();
     for (value, code) in [
         ("s.missing", "sql.analyze.unknown_column"),
-        ("CAST(NULL AS HLL)", "sql.analyze.type_mismatch"),
+        (incompatible_assignment, "sql.analyze.type_mismatch"),
     ] {
         let source = format!(
             "MERGE INTO ice.db1.t AS t\nUSING (SELECT 1 AS id) AS s ON t.id = s.id\nWHEN MATCHED THEN UPDATE SET v = {value}"

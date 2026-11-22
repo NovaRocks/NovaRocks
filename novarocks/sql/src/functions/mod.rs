@@ -52,6 +52,7 @@ use novarocks_functions::{
     FunctionResultType, FunctionValueType, FunctionVisibility, ResolvedAggregateSignature,
     ResolvedFunctionBinding, aggregate_types::DistinctAggregate,
 };
+use novarocks_type_contract::{ValueKind, trino_can_coerce_scalar};
 
 #[cfg(test)]
 pub(crate) use resolver::resolve_scalar_function;
@@ -436,6 +437,9 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         request: FunctionBindingRequest<'_>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        if matches!(aggregate, DistinctAggregate::Sum | DistinctAggregate::Avg) {
+            require_sql_aggregate_input(request.arguments, DataType::Float64)?;
+        }
         EngineFunctionCatalog::resolve_distinct_aggregate(self, aggregate, request, control)
     }
 
@@ -446,6 +450,24 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         arguments: &[FunctionArgument],
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        if let Some(declaration) = self
+            .definition(name, FunctionKind::Aggregate)
+            .and_then(FunctionDefinition::binding_declaration)
+        {
+            let domain = match declaration.function_id().as_str() {
+                "builtin.aggregate/sum/v1" | "builtin.aggregate/avg/v1" => Some(DataType::Float64),
+                "builtin.aggregate/bool_or/v1"
+                | "builtin.aggregate/bool_and/v1"
+                | "builtin.aggregate/boolor_agg/v1"
+                | "builtin.aggregate/booland_agg/v1"
+                | "builtin.aggregate/every/v1"
+                | "builtin.aggregate/count_if/v1" => Some(DataType::Boolean),
+                _ => None,
+            };
+            if let Some(domain) = domain {
+                require_sql_aggregate_input(arguments, domain)?;
+            }
+        }
         self.resolve_bound_user(
             name,
             FunctionKind::Aggregate,
@@ -546,6 +568,20 @@ pub(crate) fn resolve_sql_aggregate_binding(
             )
         }
     })
+}
+
+// Derived aggregate metadata can describe internal carriers. Public argument
+// matching still requires the original SQL value to belong to the input domain.
+fn require_sql_aggregate_input(
+    arguments: &[FunctionArgument],
+    domain: DataType,
+) -> Result<(), FunctionBindingError> {
+    if let Some(FunctionArgument::Value { value_type, .. }) = arguments.first()
+        && !trino_can_coerce_scalar(value_type.value_type().kind(), &ValueKind::Scalar(domain))
+    {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_sql_aggregate_call(

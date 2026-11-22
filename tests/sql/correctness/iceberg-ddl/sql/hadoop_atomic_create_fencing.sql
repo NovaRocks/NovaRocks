@@ -25,13 +25,13 @@ CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};
 CREATE TABLE events (
   id BIGINT,
-  payload STRING
+  payload VARCHAR
 ) WITH (format_version = 2);
 
 -- query 2
 CREATE TABLE IF NOT EXISTS events (
   id BIGINT,
-  payload STRING
+  payload VARCHAR
 ) WITH (format_version = 2);
 
 -- query 3

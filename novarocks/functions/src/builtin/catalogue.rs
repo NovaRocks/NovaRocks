@@ -868,7 +868,7 @@ fn builtin_scalar_overload_id(
 
 fn builtin_scalar_semantics(name: &str) -> FunctionSemantics {
     let argument_evaluation = match name {
-        "case" | "coalesce" | "if" | "ifnull" | "nullif" | "nvl" => {
+        "case" | "coalesce" | "if" | "ifnull" | "nullif" | "nvl" | "try" => {
             FunctionArgumentEvaluation::ShortCircuit
         }
         _ => FunctionArgumentEvaluation::Eager,
@@ -942,6 +942,13 @@ fn scalar_result_nullable_from_types(
         // Invalid JSON and integer negation overflow are required Data failures.
         "__json_canonical_key" | super::negation_owner::NAME => {
             first_value.is_some_and(FunctionValueType::nullable)
+        }
+        super::array_element_at_owner::SUBSCRIPT_NAME => {
+            let child_nullable = first_value
+                .and_then(|list| list.value_type().child_type_at(0))
+                .is_none_or(|item| item.nullable());
+            child_nullable
+                || nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
         crate::native_like::ESCAPE_FUNCTION_NAME => {
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
@@ -1026,6 +1033,7 @@ pub(super) fn binding_resolution_error(error: ResolveError) -> FunctionBindingEr
         ResolveError::UnknownFunction => FunctionBindingError::UnknownFunction,
         ResolveError::HiddenFunction => FunctionBindingError::HiddenFunction,
         ResolveError::NoMatchingSignature { .. } => FunctionBindingError::NoMatchingOverload,
+        ResolveError::AmbiguousSignature { .. } => FunctionBindingError::AmbiguousOverload,
         ResolveError::Control(error) => FunctionBindingError::Control(error),
         ResolveError::BadSignature(message) => FunctionBindingError::InvalidBinding(message.into()),
     }
@@ -2905,6 +2913,181 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
     }
 }
 
+pub(super) fn strict_on_unknown(name: &str, signature: &str) -> bool {
+    matches!(
+        builtin_disposition(name),
+        Some(BuiltinDisposition::WindowBoundary)
+    ) || scalar_overload_effects(name, signature).is_some_and(|effects| {
+        effects.null_behavior == novarocks_type_contract::FunctionNullBehavior::Strict
+    })
+}
+
+fn scalar_overload_effects(
+    name: &str,
+    signature: &str,
+) -> Option<novarocks_type_contract::FunctionEffectDeclaration> {
+    match name {
+        name if super::window_ranking_owner::operation(name).is_some() => {
+            Some(super::window_ranking_owner::effects())
+        }
+        name if super::window_value_owner::operation(name).is_some() => {
+            Some(super::window_value_owner::effects())
+        }
+        name if super::window_ntile_owner::operation(name).is_some() => {
+            Some(super::window_ntile_owner::effects())
+        }
+        name if super::window_offset_owner::operation(name).is_some() => {
+            Some(super::window_offset_owner::effects())
+        }
+        "abs" => Some(super::abs_owner::effects()),
+        super::negation_owner::NAME => super::negation_owner::effects(signature),
+        name if super::scalar_rows_owner::operation(name).is_some() => {
+            super::scalar_rows_owner::operation(name).map(super::scalar_rows_owner::effects)
+        }
+        "nullif" => Some(super::nullif_owner::effects()),
+        name if super::control_owner::operation(name).is_some() => {
+            Some(super::control_owner::effects(
+                super::control_owner::operation(name).expect("matched control operation"),
+            ))
+        }
+        "crc32" => Some(super::crc32_owner::effects()),
+        "parse_json" => Some(super::parse_json_owner::effects()),
+        "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
+        crate::native_like::ESCAPE_FUNCTION_NAME => Some(super::like_escape_owner::effects()),
+        "json_object" => Some(super::json_object_owner::effects()),
+        "array_sortby" => Some(super::array_sortby_owner::effects()),
+        name if super::string_measure_owner::operation(name).is_some() => {
+            Some(super::string_measure_owner::effects())
+        }
+        name if super::string_case_owner::operation(name).is_some() => {
+            Some(super::string_case_owner::effects())
+        }
+        name @ ("concat" | "array_concat") => {
+            super::string_concat_owner::operation(name).map(super::string_concat_owner::effects)
+        }
+        name if super::string_trim_owner::operation(name).is_some() => {
+            Some(super::string_trim_owner::effects())
+        }
+        name if super::string_translate_owner::operation(name).is_some() => {
+            Some(super::string_translate_owner::effects())
+        }
+        name if super::string_url_encode_owner::operation(name).is_some() => {
+            Some(super::string_url_encode_owner::effects())
+        }
+        name if super::string_url_decode_owner::operation(name).is_some() => {
+            Some(super::string_url_decode_owner::effects())
+        }
+        name if super::string_substring_owner::operation(name).is_some() => {
+            Some(super::string_substring_owner::effects())
+        }
+        name if super::string_left_right_owner::operation(name).is_some() => {
+            Some(super::string_left_right_owner::effects())
+        }
+        name if super::string_repeat_owner::operation(name).is_some() => {
+            Some(super::string_repeat_owner::effects())
+        }
+        name if super::string_locate_owner::operation(name).is_some() => {
+            Some(super::string_locate_owner::effects())
+        }
+        name if super::string_initcap_owner::operation(name).is_some() => {
+            Some(super::string_initcap_owner::effects())
+        }
+        name if super::string_pad_owner::operation(name).is_some() => {
+            Some(super::string_pad_owner::effects())
+        }
+        name if super::string_replace_owner::operation(name).is_some() => {
+            Some(super::string_replace_owner::effects())
+        }
+        name if super::string_split_part_owner::operation(name).is_some() => {
+            Some(super::string_split_part_owner::effects())
+        }
+        name if super::string_sha2_owner::operation(name).is_some() => {
+            Some(super::string_sha2_owner::effects())
+        }
+        name if super::string_concat_ws_owner::operation(name).is_some() => {
+            Some(super::string_concat_ws_owner::effects())
+        }
+        name if super::string_from_base64_owner::operation(name).is_some() => {
+            Some(super::string_from_base64_owner::effects())
+        }
+        name if super::string_hex_owner::operation(name).is_some() => {
+            Some(super::string_hex_owner::effects())
+        }
+        "split" => Some(super::string_split_owner::effects()),
+        "__map_element_at" => Some(super::map_element_at_owner::effects()),
+        "__array_element_at" => Some(super::array_element_at_owner::effects()),
+        super::array_element_at_owner::SUBSCRIPT_NAME => {
+            Some(super::array_element_at_owner::subscript_effects())
+        }
+        "array_append" => Some(super::array_append_owner::effects()),
+        name if super::calendar_unixtime_owner::operation(name).is_some() => {
+            Some(super::calendar_unixtime_owner::effects())
+        }
+        name if super::string_md5_owner::operation(name).is_some() => {
+            Some(super::string_md5_owner::effects())
+        }
+        name if super::map_projection_owner::operation(name).is_some() => {
+            Some(super::map_projection_owner::effects())
+        }
+        name if super::map_size_owner::operation(name) => Some(super::map_size_owner::effects()),
+        name if super::array_match_owner::operation(name).is_some() => {
+            Some(super::array_match_owner::effects())
+        }
+        name if super::collection_cardinality_owner::operation(name).is_some() => {
+            Some(super::collection_cardinality_owner::effects())
+        }
+        name if super::calendar_period_diff_owner::operation(name).is_some() => {
+            Some(super::calendar_period_diff_owner::effects())
+        }
+        name if super::calendar_diff_owner::operation(name).is_some() => {
+            Some(super::calendar_diff_owner::effects())
+        }
+        name if super::calendar_extended_owner::operation(name).is_some() => {
+            Some(super::calendar_extended_owner::effects(
+                super::calendar_extended_owner::operation(name).expect("matched operation"),
+            ))
+        }
+        name if super::calendar_parts_owner::operation(name).is_some() => {
+            Some(super::calendar_parts_owner::effects())
+        }
+        name if super::string_extended_owner::operation(name).is_some() => {
+            Some(super::string_extended_owner::effects(
+                super::string_extended_owner::operation(name).expect("matched operation"),
+            ))
+        }
+        name if super::date_owner::operation(name).is_some() => Some(super::date_owner::effects()),
+        "regexp_count" => Some(super::regexp_count_owner::effects()),
+        "parse_url" => Some(super::string_parse_url_owner::effects()),
+        "to_base64" => Some(super::string_to_base64_owner::effects()),
+        "regexp_position" => Some(super::regexp_position_owner::effects()),
+        name if super::string_reverse_owner::operation(name).is_some() => {
+            Some(super::string_reverse_owner::effects())
+        }
+        "dround" => Some(super::dround_owner::effects()),
+        name if super::bit_shift_owner::operation(name).is_some() => {
+            Some(super::bit_shift_owner::effects())
+        }
+        name if super::bitwise_owner::operation(name).is_some() => {
+            Some(super::bitwise_owner::effects())
+        }
+        "rand" | "random" => Some(super::rand_owner::effects()),
+        "sleep" => Some(super::sleep_owner::effects()),
+        name if super::numeric_elementary_owner::is_installed(name) => {
+            Some(super::numeric_elementary_owner::effects())
+        }
+        name if super::numeric_mod_owner::operation(name).is_some() => {
+            Some(super::numeric_mod_owner::effects())
+        }
+        name if super::numeric_binary_owner::operation(name).is_some() => {
+            Some(super::numeric_binary_owner::effects())
+        }
+        name if super::numeric_unary_owner::operation(name).is_some() => {
+            Some(super::numeric_unary_owner::effects())
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn scalar_definition_parts(
     name: &str,
     signatures: &[String],
@@ -2928,174 +3111,7 @@ pub(super) fn scalar_definition_parts(
             .into_iter()
             .zip(signatures)
             .map(|(identity, signature)| {
-                let effects = match name {
-                    name if super::window_ranking_owner::operation(name).is_some() => {
-                        Some(super::window_ranking_owner::effects())
-                    }
-                    name if super::window_value_owner::operation(name).is_some() => {
-                        Some(super::window_value_owner::effects())
-                    }
-                    name if super::window_ntile_owner::operation(name).is_some() => {
-                        Some(super::window_ntile_owner::effects())
-                    }
-                    name if super::window_offset_owner::operation(name).is_some() => {
-                        Some(super::window_offset_owner::effects())
-                    }
-                    "abs" => Some(super::abs_owner::effects()),
-                    super::negation_owner::NAME => super::negation_owner::effects(signature),
-                    name if super::scalar_rows_owner::operation(name).is_some() => {
-                        super::scalar_rows_owner::operation(name)
-                            .map(super::scalar_rows_owner::effects)
-                    }
-                    "nullif" => Some(super::nullif_owner::effects()),
-                    name if super::control_owner::operation(name).is_some() => {
-                        Some(super::control_owner::effects(
-                            super::control_owner::operation(name)
-                                .expect("matched control operation"),
-                        ))
-                    }
-                    "crc32" => Some(super::crc32_owner::effects()),
-                    "parse_json" => Some(super::parse_json_owner::effects()),
-                    "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
-                    crate::native_like::ESCAPE_FUNCTION_NAME => {
-                        Some(super::like_escape_owner::effects())
-                    }
-                    "json_object" => Some(super::json_object_owner::effects()),
-                    "array_sortby" => Some(super::array_sortby_owner::effects()),
-                    name if super::string_measure_owner::operation(name).is_some() => {
-                        Some(super::string_measure_owner::effects())
-                    }
-                    name if super::string_case_owner::operation(name).is_some() => {
-                        Some(super::string_case_owner::effects())
-                    }
-                    name @ ("concat" | "array_concat") => {
-                        super::string_concat_owner::operation(name)
-                            .map(super::string_concat_owner::effects)
-                    }
-                    name if super::string_trim_owner::operation(name).is_some() => {
-                        Some(super::string_trim_owner::effects())
-                    }
-                    name if super::string_translate_owner::operation(name).is_some() => {
-                        Some(super::string_translate_owner::effects())
-                    }
-                    name if super::string_url_encode_owner::operation(name).is_some() => {
-                        Some(super::string_url_encode_owner::effects())
-                    }
-                    name if super::string_url_decode_owner::operation(name).is_some() => {
-                        Some(super::string_url_decode_owner::effects())
-                    }
-                    name if super::string_substring_owner::operation(name).is_some() => {
-                        Some(super::string_substring_owner::effects())
-                    }
-                    name if super::string_left_right_owner::operation(name).is_some() => {
-                        Some(super::string_left_right_owner::effects())
-                    }
-                    name if super::string_repeat_owner::operation(name).is_some() => {
-                        Some(super::string_repeat_owner::effects())
-                    }
-                    name if super::string_locate_owner::operation(name).is_some() => {
-                        Some(super::string_locate_owner::effects())
-                    }
-                    name if super::string_initcap_owner::operation(name).is_some() => {
-                        Some(super::string_initcap_owner::effects())
-                    }
-                    name if super::string_pad_owner::operation(name).is_some() => {
-                        Some(super::string_pad_owner::effects())
-                    }
-                    name if super::string_replace_owner::operation(name).is_some() => {
-                        Some(super::string_replace_owner::effects())
-                    }
-                    name if super::string_split_part_owner::operation(name).is_some() => {
-                        Some(super::string_split_part_owner::effects())
-                    }
-                    name if super::string_sha2_owner::operation(name).is_some() => {
-                        Some(super::string_sha2_owner::effects())
-                    }
-                    name if super::string_concat_ws_owner::operation(name).is_some() => {
-                        Some(super::string_concat_ws_owner::effects())
-                    }
-                    name if super::string_from_base64_owner::operation(name).is_some() => {
-                        Some(super::string_from_base64_owner::effects())
-                    }
-                    name if super::string_hex_owner::operation(name).is_some() => {
-                        Some(super::string_hex_owner::effects())
-                    }
-                    "split" => Some(super::string_split_owner::effects()),
-                    "__map_element_at" => Some(super::map_element_at_owner::effects()),
-                    "__array_element_at" => Some(super::array_element_at_owner::effects()),
-                    "array_append" => Some(super::array_append_owner::effects()),
-                    name if super::calendar_unixtime_owner::operation(name).is_some() => {
-                        Some(super::calendar_unixtime_owner::effects())
-                    }
-                    name if super::string_md5_owner::operation(name).is_some() => {
-                        Some(super::string_md5_owner::effects())
-                    }
-                    name if super::map_projection_owner::operation(name).is_some() => {
-                        Some(super::map_projection_owner::effects())
-                    }
-                    name if super::map_size_owner::operation(name) => {
-                        Some(super::map_size_owner::effects())
-                    }
-                    name if super::array_match_owner::operation(name).is_some() => {
-                        Some(super::array_match_owner::effects())
-                    }
-                    name if super::collection_cardinality_owner::operation(name).is_some() => {
-                        Some(super::collection_cardinality_owner::effects())
-                    }
-                    name if super::calendar_period_diff_owner::operation(name).is_some() => {
-                        Some(super::calendar_period_diff_owner::effects())
-                    }
-                    name if super::calendar_diff_owner::operation(name).is_some() => {
-                        Some(super::calendar_diff_owner::effects())
-                    }
-                    name if super::calendar_extended_owner::operation(name).is_some() => {
-                        Some(super::calendar_extended_owner::effects(
-                            super::calendar_extended_owner::operation(name)
-                                .expect("matched operation"),
-                        ))
-                    }
-                    name if super::calendar_parts_owner::operation(name).is_some() => {
-                        Some(super::calendar_parts_owner::effects())
-                    }
-                    name if super::string_extended_owner::operation(name).is_some() => {
-                        Some(super::string_extended_owner::effects(
-                            super::string_extended_owner::operation(name)
-                                .expect("matched operation"),
-                        ))
-                    }
-                    name if super::date_owner::operation(name).is_some() => {
-                        Some(super::date_owner::effects())
-                    }
-                    "regexp_count" => Some(super::regexp_count_owner::effects()),
-                    "parse_url" => Some(super::string_parse_url_owner::effects()),
-                    "to_base64" => Some(super::string_to_base64_owner::effects()),
-                    "regexp_position" => Some(super::regexp_position_owner::effects()),
-                    name if super::string_reverse_owner::operation(name).is_some() => {
-                        Some(super::string_reverse_owner::effects())
-                    }
-                    "dround" => Some(super::dround_owner::effects()),
-                    name if super::bit_shift_owner::operation(name).is_some() => {
-                        Some(super::bit_shift_owner::effects())
-                    }
-                    name if super::bitwise_owner::operation(name).is_some() => {
-                        Some(super::bitwise_owner::effects())
-                    }
-                    "rand" | "random" => Some(super::rand_owner::effects()),
-                    "sleep" => Some(super::sleep_owner::effects()),
-                    name if super::numeric_elementary_owner::is_installed(name) => {
-                        Some(super::numeric_elementary_owner::effects())
-                    }
-                    name if super::numeric_mod_owner::operation(name).is_some() => {
-                        Some(super::numeric_mod_owner::effects())
-                    }
-                    name if super::numeric_binary_owner::operation(name).is_some() => {
-                        Some(super::numeric_binary_owner::effects())
-                    }
-                    name if super::numeric_unary_owner::operation(name).is_some() => {
-                        Some(super::numeric_unary_owner::effects())
-                    }
-                    _ => None,
-                };
+                let effects = scalar_overload_effects(name, signature);
                 FunctionOverloadDeclaration {
                     semantics: effects
                         .as_ref()
@@ -3198,7 +3214,7 @@ pub fn contribute_builtin_functions(
 ) -> Result<(), FunctionCatalogError> {
     builder.register(super::value_conversion::value_conversion_definition()?)?;
     for operator in novarocks_type_contract::OperatorFunction::ALL {
-        if operator != novarocks_type_contract::OperatorFunction::Negation {
+        if operator.arithmetic().is_some() || operator.comparison_overload_text().is_some() {
             builder.register(super::binary_operator_owner::definition(operator)?)?;
         }
     }
@@ -3339,7 +3355,7 @@ pub fn contribute_builtin_functions(
             "__map_element_at" => {
                 super::map_element_at_owner::definition(&name, declaration, resolver)?
             }
-            "__array_element_at" => {
+            "__array_element_at" | super::array_element_at_owner::SUBSCRIPT_NAME => {
                 super::array_element_at_owner::definition(&name, declaration, resolver)?
             }
             "array_append" => super::array_append_owner::definition(&name, declaration, resolver)?,

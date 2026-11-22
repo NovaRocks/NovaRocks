@@ -19,9 +19,9 @@
 -- The input domain, overflow-to-NULL, and all coefficients are independent oracles.
 -- query 1
 CREATE TABLE ${case_db}.scalar_integer_domain(id INT,t TINYINT,age SMALLINT,i INT);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(127,128)) g(x);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(32767,32768)) g(x);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(-129,-128)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,TRY_CAST(x AS TINYINT),TRY_CAST(x AS SMALLINT),x FROM TABLE(generate_series(127,128)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,TRY_CAST(x AS TINYINT),TRY_CAST(x AS SMALLINT),x FROM TABLE(generate_series(32767,32768)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,TRY_CAST(x AS TINYINT),TRY_CAST(x AS SMALLINT),x FROM TABLE(generate_series(-129,-128)) g(x);
 SELECT id,t,age,i FROM ${case_db}.scalar_integer_domain ORDER BY id;
 
 -- query 2
@@ -31,7 +31,7 @@ sum(t) AS tiny_sum,sum(age) AS age_sum,sum(i) AS int_sum
 FROM ${case_db}.scalar_integer_domain GROUP BY 1,2,3;
 
 -- query 3
-SELECT CAST(128 AS TINYINT) AS tiny_overflow,CAST(32768 AS SMALLINT) AS small_overflow,
+SELECT TRY_CAST(128 AS TINYINT) AS tiny_overflow,TRY_CAST(32768 AS SMALLINT) AS small_overflow,
 CAST(-128 AS TINYINT) AS tiny_min,CAST(-32768 AS SMALLINT) AS small_min;
 
 -- query 4
@@ -62,16 +62,23 @@ ALTER TABLE ${case_db}.scalar_integer_domain ALTER COLUMN renamed SET DATA TYPE 
 
 -- query 10
 -- Refusal leaves the original domain and values intact; 128 still overflows TINYINT.
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 INSERT INTO ${case_db}.scalar_integer_domain (id,renamed) VALUES ROW(999,128);
+
+-- query 11
 SELECT typeof(renamed) AS tiny_type,sum(renamed) AS tiny_sum,count(renamed) AS tiny_count
 FROM ${case_db}.scalar_integer_domain GROUP BY 1;
 
--- query 11
+-- query 12
 -- An ordinary field without a nominal declaration can still widen normally.
 ALTER TABLE ${case_db}.scalar_integer_domain ALTER COLUMN t SET DATA TYPE BIGINT;
 SELECT typeof(t) AS wide_type,count(t) AS wide_count
 FROM ${case_db}.scalar_integer_domain GROUP BY 1;
 
--- query 12
+-- query 13
 -- @skip_result_check=true
 DROP TABLE ${case_db}.scalar_integer_domain;
+
+-- query 14
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT CAST(128 AS TINYINT);

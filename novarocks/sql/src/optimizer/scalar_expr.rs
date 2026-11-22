@@ -524,12 +524,10 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
         ScalarNode::Cast {
             child,
             target,
-            array_failure_mode,
+            cast_mode,
             ..
         } => {
-            let name = if *array_failure_mode
-                == Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull)
-            {
+            let name = if *cast_mode == Some(novarocks_type_contract::TrinoCastMode::Try) {
                 "try_cast"
             } else {
                 "cast"
@@ -956,6 +954,24 @@ fn arrow_format_has_row_error(source: &DataType) -> bool {
     }
 }
 
+fn implicit_cast_has_intrinsic_row_error(source: &DataType, target: &DataType) -> bool {
+    if source == target || source == &DataType::Null {
+        return false;
+    }
+    match (source, target) {
+        (DataType::List(source), DataType::List(target)) => {
+            implicit_cast_has_intrinsic_row_error(source.data_type(), target.data_type())
+        }
+        (_, DataType::Decimal128(..)) => {
+            !novarocks_type_contract::trino_decimal_widening_is_total(source, target)
+        }
+        // The canonical DATE/TIMESTAMP carriers can overflow a narrower clock.
+        (_, DataType::Timestamp(..) | DataType::Time32(..) | DataType::Time64(..)) => true,
+        (_, DataType::Map(..) | DataType::Struct(..)) => true,
+        _ => false,
+    }
+}
+
 fn scalar_invocation_can_fail(binding: &crate::binding::SqlFunctionBinding) -> bool {
     binding.declared_scalar_invocation_data
         || binding
@@ -980,18 +996,30 @@ pub(crate) fn scalar_call_can_fail(binding: &crate::binding::SqlFunctionBinding)
 }
 
 pub(crate) fn scalar_cast_can_fail(
-    source: &DataType,
-    target: &DataType,
+    source: &novarocks_type_contract::FunctionValueType,
+    result: &novarocks_type_contract::FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+    cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
 ) -> bool {
-    if let Some(mode) = array_failure_mode {
-        mode == novarocks_type_contract::ArrayCastFailureMode::ReportError
-    } else {
-        cast_has_intrinsic_row_error(source, target, true)
-            || (decimal_overflow_policy
-                == novarocks_type_contract::DecimalOverflowPolicy::ReportError
-                && novarocks_type_contract::is_checked_decimal_numeric_cast(source, target))
+    use novarocks_type_contract::{DecimalOverflowPolicy, TrinoCastMode};
+    let source_carrier = source.data_type();
+    let result_carrier = result.data_type();
+    match cast_mode {
+        Some(TrinoCastMode::Explicit | TrinoCastMode::StoreAssignment) => {
+            !signed_widening_domains(source, result)
+        }
+        Some(TrinoCastMode::Try) => false,
+        Some(TrinoCastMode::Implicit) => {
+            implicit_cast_has_intrinsic_row_error(source_carrier, result_carrier)
+        }
+        None => {
+            cast_has_intrinsic_row_error(source_carrier, result_carrier, true)
+                || (decimal_overflow_policy == DecimalOverflowPolicy::ReportError
+                    && novarocks_type_contract::is_checked_decimal_numeric_cast(
+                        source_carrier,
+                        result_carrier,
+                    ))
+        }
     }
 }
 
@@ -1004,7 +1032,7 @@ fn signed_integer_bounds(arena: &ScalarArena, mut expression: ScalarId) -> Optio
         if let ScalarNode::Cast {
             child,
             target,
-            array_failure_mode: None,
+            cast_mode: None | Some(novarocks_type_contract::TrinoCastMode::Implicit),
             ..
         } = arena.node(expression)
             && target == value_type.data_type()
@@ -1113,13 +1141,13 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         ScalarNode::Cast {
             child,
             decimal_overflow_policy,
-            array_failure_mode,
+            cast_mode,
             ..
         } => scalar_cast_can_fail(
-            arena.data_type(*child),
-            arena.data_type(expr),
+            arena.value_type(*child),
+            arena.value_type(expr),
             *decimal_overflow_policy,
-            *array_failure_mode,
+            *cast_mode,
         ),
         _ => false,
     };
@@ -1212,7 +1240,7 @@ mod tests {
         );
         let cast = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: source,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1222,7 +1250,7 @@ mod tests {
         assert_eq!(signed_integer_literal(&arena, cast), Some(127));
         let nullable_cast = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: source,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1252,7 +1280,7 @@ mod tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     child,
                     target: output.clone(),
                     decimal_overflow_policy:
@@ -1327,7 +1355,7 @@ mod tests {
         );
         let nullable = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: integer,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: OutputNull,
@@ -1336,7 +1364,7 @@ mod tests {
         );
         let throwing = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,
@@ -1444,7 +1472,7 @@ mod intrinsic_error_consumer_tests {
                 child: smallint,
                 target: DataType::Int32,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                array_failure_mode: None,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
             },
             integer_type.clone(),
         );
@@ -1564,7 +1592,7 @@ mod intrinsic_error_consumer_tests {
                 ScalarNode::Cast {
                     child: original,
                     target: DataType::Int64,
-                    array_failure_mode: None,
+                    cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                 },
                 divisor_type.clone(),
@@ -1800,7 +1828,7 @@ mod intrinsic_cast_effect_tests {
             ] {
                 let cast = arena.intern(
                     ScalarNode::Cast {
-                        array_failure_mode: None,
+                        cast_mode: None,
                         child,
                         target: target.clone(),
                         decimal_overflow_policy: policy,
@@ -1809,6 +1837,63 @@ mod intrinsic_cast_effect_tests {
                 );
                 assert_eq!(can_fail(&arena, cast), expected);
             }
+        }
+    }
+
+    #[test]
+    fn capped_decimal_coercion_keeps_implicit_row_errors_visible() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
+
+        let list = |ty| DataType::List(Arc::new(Field::new("item", ty, true)));
+        for (source, target, expected) in [
+            (
+                DataType::Decimal128(38, 0),
+                DataType::Decimal128(38, 38),
+                true,
+            ),
+            (
+                list(DataType::Int64),
+                list(DataType::Decimal128(38, 38)),
+                true,
+            ),
+            (
+                DataType::Date32,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            (
+                DataType::Decimal128(7, 2),
+                DataType::Decimal128(12, 2),
+                false,
+            ),
+            (
+                DataType::Decimal128(10, 0),
+                DataType::Decimal128(12, 2),
+                false,
+            ),
+            (DataType::Int32, DataType::Decimal128(12, 2), false),
+            (
+                list(DataType::Decimal128(10, 0)),
+                list(DataType::Decimal128(12, 2)),
+                false,
+            ),
+            (DataType::Int32, DataType::Int64, false),
+        ] {
+            let mut arena = ScalarArena::new();
+            let child = arena.intern(
+                ScalarNode::ColumnRef(ColumnId(1)),
+                FunctionValueType::new(source, false),
+            );
+            let cast = arena.intern(
+                ScalarNode::Cast {
+                    child,
+                    target: target.clone(),
+                    cast_mode: Some(TrinoCastMode::Implicit),
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                },
+                FunctionValueType::new(target, false),
+            );
+            assert_eq!(can_fail(&arena, cast), expected);
         }
     }
 
@@ -1939,7 +2024,7 @@ mod intrinsic_cast_effect_tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     child,
                     target: target.clone(),
                     decimal_overflow_policy: OutputNull,

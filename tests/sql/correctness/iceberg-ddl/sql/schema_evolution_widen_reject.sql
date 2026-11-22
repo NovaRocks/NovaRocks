@@ -25,8 +25,8 @@ DROP TABLE IF EXISTS bad;
 CREATE TABLE bad (
   i BIGINT,
   d DOUBLE,
-  s STRING,
-  ts DATETIME
+  s VARCHAR,
+  ts TIMESTAMP(6)
 ) WITH (format_version = 2);
 
 -- query 2
@@ -35,7 +35,7 @@ ALTER TABLE bad ALTER COLUMN i SET DATA TYPE INT;
 
 -- query 3
 -- @expect_error=unsupported Iceberg type evolution
-ALTER TABLE bad ALTER COLUMN d SET DATA TYPE FLOAT;
+ALTER TABLE bad ALTER COLUMN d SET DATA TYPE REAL;
 
 -- query 4
 -- @expect_error=unsupported Iceberg type evolution

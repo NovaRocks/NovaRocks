@@ -45,8 +45,8 @@ CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.events (
-  dt STRING,
-  region STRING,
+  dt VARCHAR,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 

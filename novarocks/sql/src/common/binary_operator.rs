@@ -53,21 +53,15 @@ pub(crate) fn requires_legacy_wide(value: &ValueTypeRef) -> bool {
     }
 }
 
-/// Preserve the original mixed-domain coercion and comparison when an
-/// admitted textual or Boolean operand participates in a numeric predicate.
-pub(crate) fn requires_legacy_mixed_comparison(
-    left: &novarocks_type_contract::FunctionValueType,
-    right: &novarocks_type_contract::FunctionValueType,
-) -> bool {
-    let text_or_bool = |value: &novarocks_type_contract::FunctionValueType| {
-        value.logical_type() == ValueLogicalType::Physical
-            && matches!(
-                value.data_type(),
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Boolean
-            )
-    };
-    (text_or_bool(left) && novarocks_type_contract::is_numeric_value_type(right))
-        || (text_or_bool(right) && novarocks_type_contract::is_numeric_value_type(left))
+/// Composite predicates retain their exact element comparison recipe.
+pub(crate) fn uses_structural_comparison(value: &ValueTypeRef) -> bool {
+    matches!(
+        value.kind(),
+        ValueKind::List(_)
+            | ValueKind::FixedSizeList { .. }
+            | ValueKind::Struct(_)
+            | ValueKind::Map { .. }
+    )
 }
 
 pub(crate) fn typed_call(
@@ -100,7 +94,8 @@ pub(crate) fn typed_operands(
         return None;
     };
     Some((
-        OperatorFunction::from_function_id(&binding.function_id)?,
+        OperatorFunction::from_function_id(&binding.function_id)
+            .filter(|operator| operator.is_infix())?,
         [left, right],
     ))
 }
@@ -116,7 +111,8 @@ pub(crate) fn scalar_operands(
         return None;
     };
     Some((
-        OperatorFunction::from_function_id(&binding.function_id)?,
+        OperatorFunction::from_function_id(&binding.function_id)
+            .filter(|operator| operator.is_infix())?,
         [*left, *right],
     ))
 }

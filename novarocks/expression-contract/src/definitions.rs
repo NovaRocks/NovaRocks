@@ -211,9 +211,7 @@ pub enum ExprKind {
     Cast {
         expr: ExprId,
         target: DataType,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        allow_throw_exception: SemanticParameterRef,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: novarocks_type_contract::TrinoCastMode,
     },
     IsNull {
         expr: ExprId,
@@ -329,10 +327,6 @@ impl ExprKind {
                 allow_throw_exception,
                 ..
             } => allow_throw_exception.as_ref(),
-            Self::Cast {
-                allow_throw_exception,
-                ..
-            } => Some(allow_throw_exception),
             _ => None,
         }
         .into_iter()

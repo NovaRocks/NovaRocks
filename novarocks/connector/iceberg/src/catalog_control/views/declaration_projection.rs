@@ -29,7 +29,8 @@ use novarocks_spi::connector::{
     read_stack::ConnectorReadSchemaCreation,
 };
 use novarocks_type_contract::{
-    FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+    CharacterKind, FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType,
+    ValueTypeRef,
 };
 use std::sync::Arc;
 
@@ -146,6 +147,16 @@ fn write_type(
     // remains with the analyzed body; it grants no additional SQL type fact.
     Ok(match value.kind() {
         ValueKind::String => primitive(PrimitiveType::String),
+        ValueKind::BoundedCharacter(character) => match character.kind() {
+            CharacterKind::Varchar => primitive(PrimitiveType::String),
+            CharacterKind::Char => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Iceberg view types do not support CHAR",
+                )
+                .into());
+            }
+        },
         ValueKind::Binary => primitive(PrimitiveType::Binary),
         ValueKind::Nominal(ValueLogicalType::Uuid) => primitive(PrimitiveType::Uuid),
         ValueKind::Nominal(ValueLogicalType::Variant) => {

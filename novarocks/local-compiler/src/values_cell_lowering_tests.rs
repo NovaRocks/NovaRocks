@@ -23,15 +23,7 @@
 use super::*;
 use arrow_array::{Int8Array, Int16Array};
 use novarocks_local_program::{StaticValuesBacking, StaticValuesCell};
-use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, SemanticParameterId, SemanticParameterKey,
-    SemanticParameterRef, SemanticParameterValue,
-};
-
-const ALLOW: SemanticParameterRef = SemanticParameterRef {
-    id: SemanticParameterId::new(5),
-    expected_key: SemanticParameterKey::AllowThrowException,
-};
+use novarocks_type_contract::EvaluationDemand;
 
 #[derive(Clone, Copy)]
 enum Cell {
@@ -149,9 +141,7 @@ fn cast_package_with_cells(
                         ExprKind::Cast {
                             expr: constant,
                             target: types[column].data_type().clone(),
-                            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                            allow_throw_exception: ALLOW,
-                            array_failure_mode: None,
+                            cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                         },
                     )
                     .unwrap(),
@@ -252,11 +242,7 @@ fn cast_package_with_cells(
                 statement_constant_policy: policy(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
-                parameters: SemanticParameters::try_new([(
-                    ALLOW.id,
-                    SemanticParameterValue::AllowThrowException(false),
-                )])
-                .unwrap(),
+                parameters: SemanticParameters::default(),
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),

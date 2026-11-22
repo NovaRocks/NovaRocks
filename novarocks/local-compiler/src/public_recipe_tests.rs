@@ -151,9 +151,11 @@ fn arithmetic_fixture(
         rand_request: None,
         rand_definitions: vec![],
         constant_policy: options().constants,
-        // The parent package helper's flag installs parameter 7 only. It does
-        // not alter the expression, operation, target or result declaration.
-        carrier_cast: true,
+        parameters: SemanticParameters::try_new([(
+            novarocks_type_contract::SemanticParameterId::new(7),
+            novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
+        )])
+        .unwrap(),
     })
 }
 
@@ -244,10 +246,10 @@ fn public_null_safe_recipe_equals_its_separate_frozen_program_recipe() {
 }
 
 #[test]
-fn public_cast_recipe_equals_frozen_program_recipe_including_policy_and_allow() {
+fn public_cast_recipe_equals_frozen_program_recipe_including_conversion_mode() {
     let functions = functions();
     let input = FunctionValueType::new(DataType::Int64, false);
-    let result = FunctionValueType::new(DataType::Float64, true);
+    let result = FunctionValueType::new(DataType::Float64, false);
     let program = compile(
         package(
             &functions,
@@ -270,9 +272,7 @@ fn public_cast_recipe_equals_frozen_program_recipe_including_policy_and_allow() 
         CastOperation::Carrier,
         &input,
         &result,
-        DecimalOverflowPolicy::ReportError,
-        true,
-        None,
+        novarocks_type_contract::TrinoCastMode::Implicit,
         &Control,
     )
     .unwrap();
@@ -343,7 +343,7 @@ fn public_arithmetic_recipe_equals_frozen_program_recipe_for_every_operator() {
 }
 
 #[test]
-fn public_wrappers_preserve_each_family_unsupported_and_type_mismatch() {
+fn public_wrappers_preserve_each_family_refusal() {
     use ProgramPrimitiveError as P;
     let integer = FunctionValueType::new(DataType::Int64, false);
     let nullable_integer = FunctionValueType::new(DataType::Int64, true);
@@ -371,12 +371,10 @@ fn public_wrappers_preserve_each_family_unsupported_and_type_mismatch() {
             CastOperation::Carrier,
             &date,
             &tiny,
-            DecimalOverflowPolicy::ReportError,
-            true,
-            None,
+            novarocks_type_contract::TrinoCastMode::Implicit,
             &Control
         ),
-        Err(P::Cast(CastPrepareError::Unsupported))
+        Err(P::Cast(CastPrepareError::Illegal))
     );
     assert_eq!(
         prepare_arithmetic_node(
@@ -403,9 +401,7 @@ fn public_wrappers_preserve_each_family_unsupported_and_type_mismatch() {
             CastOperation::Carrier,
             &nullable_integer,
             &integer,
-            DecimalOverflowPolicy::ReportError,
-            true,
-            None,
+            novarocks_type_contract::TrinoCastMode::Implicit,
             &Control
         ),
         Err(P::Cast(CastPrepareError::TypeMismatch))
@@ -512,9 +508,7 @@ fn frozen_program_refusals_keep_the_exact_public_wrapper_refusal() {
             CastOperation::Carrier,
             &source,
             &result,
-            DecimalOverflowPolicy::ReportError,
-            true,
-            None,
+            novarocks_type_contract::TrinoCastMode::Implicit,
             &Control
         )
         .unwrap_err()
@@ -605,9 +599,7 @@ fn each_public_family_and_checked_expression_program_keep_original_control_cause
             CastOperation::Carrier,
             &input,
             &output,
-            DecimalOverflowPolicy::ReportError,
-            true,
-            None,
+            novarocks_type_contract::TrinoCastMode::Implicit,
             c,
         )
     });
@@ -705,7 +697,7 @@ fn actual_arithmetic_type_mismatch_is_not_a_capability_refusal_or_invalid_reques
 
 #[test]
 fn explicit_array_cast_modes_match_public_recipes_and_remain_distinct() {
-    use novarocks_type_contract::ArrayCastFailureMode as ArrayMode;
+    use novarocks_type_contract::TrinoCastMode as ArrayMode;
     let functions = functions();
     let list = |item| {
         FunctionValueType::new(
@@ -720,10 +712,10 @@ fn explicit_array_cast_modes_match_public_recipes_and_remain_distinct() {
     let source = list(DataType::Int32);
     let target = list(DataType::Int64);
     let mut recipes = vec![];
-    for mode in [Some(ArrayMode::ReportError), Some(ArrayMode::OutputNull)] {
+    for mode in [ArrayMode::Explicit, ArrayMode::Try] {
         let fixture = fixture(
             &functions,
-            Shape::CarrierCast(mode),
+            Shape::CarrierCast(Some(mode)),
             Mode::Project,
             source.clone(),
             target.clone(),
@@ -732,17 +724,9 @@ fn explicit_array_cast_modes_match_public_recipes_and_remain_distinct() {
         )
         .unwrap();
         let program = compile(package(&functions, fixture), &functions, &Control).unwrap();
-        let direct = prepare_cast_node(
-            CastOperation::Carrier,
-            &source,
-            &target,
-            DecimalOverflowPolicy::ReportError,
-            true,
-            mode,
-            &Control,
-        )
-        .unwrap();
-        assert_eq!(direct.array_failure_mode(), mode);
+        let direct =
+            prepare_cast_node(CastOperation::Carrier, &source, &target, mode, &Control).unwrap();
+        assert_eq!(direct.cast_mode(), Some(mode));
         assert_eq!(
             Some(&direct),
             unit(&program).recipes().cast(occurrence(&program))
@@ -755,20 +739,16 @@ fn explicit_array_cast_modes_match_public_recipes_and_remain_distinct() {
         CastOperation::Carrier,
         &identity_source,
         &identity_source,
-        DecimalOverflowPolicy::ReportError,
-        true,
-        None,
+        novarocks_type_contract::TrinoCastMode::Implicit,
         &Control,
     )
     .unwrap();
-    for mode in [ArrayMode::ReportError, ArrayMode::OutputNull] {
+    for mode in [ArrayMode::Explicit, ArrayMode::Try] {
         let explicit = prepare_cast_node(
             CastOperation::Carrier,
             &identity_source,
             &identity_source,
-            DecimalOverflowPolicy::ReportError,
-            true,
-            Some(mode),
+            mode,
             &Control,
         )
         .unwrap();
@@ -779,7 +759,7 @@ fn explicit_array_cast_modes_match_public_recipes_and_remain_distinct() {
 #[test]
 fn explicit_json_text_public_recipes_preserve_required_child_contracts() {
     use novarocks_type_contract::{
-        ArrayCastFailureMode, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        TrinoCastMode, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
         ValueTypeStorageLifetime,
     };
     let storage = ValueTypeStorageLifetime::pure();
@@ -810,45 +790,19 @@ fn explicit_json_text_public_recipes_preserve_required_child_contracts() {
             true,
         )
     };
-    for mode in [
-        ArrayCastFailureMode::ReportError,
-        ArrayCastFailureMode::OutputNull,
-    ] {
+    for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
         assert_eq!(
-            prepare_cast_node(
-                CastOperation::Carrier,
-                &json,
-                &text(false),
-                DecimalOverflowPolicy::ReportError,
-                true,
-                Some(mode),
-                &Control
-            ),
+            prepare_cast_node(CastOperation::Carrier, &json, &text(false), mode, &Control),
             Err(ProgramPrimitiveError::Cast(CastPrepareError::TypeMismatch))
         );
         assert_eq!(
-            prepare_cast_node(
-                CastOperation::Carrier,
-                &text(true),
-                &json,
-                DecimalOverflowPolicy::ReportError,
-                true,
-                Some(mode),
-                &Control
-            ),
+            prepare_cast_node(CastOperation::Carrier, &text(true), &json, mode, &Control),
             Err(ProgramPrimitiveError::Cast(CastPrepareError::TypeMismatch))
         );
         for (source, result) in [(json.clone(), text(true)), (text(false), json.clone())] {
-            let direct = prepare_cast_node(
-                CastOperation::Carrier,
-                &source,
-                &result,
-                DecimalOverflowPolicy::ReportError,
-                true,
-                Some(mode),
-                &Control,
-            )
-            .unwrap();
+            let direct =
+                prepare_cast_node(CastOperation::Carrier, &source, &result, mode, &Control)
+                    .unwrap();
             let functions = functions();
             let fixture = fixture(
                 &functions,

@@ -22,13 +22,13 @@
 -- 3. These values cannot represent valid DATETIME and must return NULL.
 
 -- query 1
-select cast(CAST('-18446744073709551494' AS LARGEINT) AS DATETIME);
+select cast(CAST('-18446744073709551494' AS LARGEINT) AS TIMESTAMP(6));
 
 -- query 2
-select cast(0 AS DATETIME);
+select cast(0 AS TIMESTAMP(6));
 
 -- query 3
-select cast(1 AS DATETIME);
+select cast(1 AS TIMESTAMP(6));
 
 -- query 4
-select cast(CAST('18446744073709551615' AS LARGEINT) AS DATETIME);
+select cast(CAST('18446744073709551615' AS LARGEINT) AS TIMESTAMP(6));

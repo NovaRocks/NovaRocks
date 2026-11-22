@@ -21,7 +21,6 @@ use crate::analysis::TypedExpr;
 use crate::analyze_error::AnalyzeError;
 
 use super::AnalyzerContext;
-use super::resolve_expr::resolved_scalar_call_at;
 use super::scope::AnalyzerScope;
 
 /// The pinned AstBuilder facts for JSON_QUERY(input, 'path') without clauses.
@@ -80,7 +79,7 @@ impl AnalyzerContext<'_> {
             .iter()
             .flat_map(|member| [&member.key, &member.value])
             .collect::<Vec<_>>();
-        self.analyze_json_constructor_call("json_object", &arguments, node.span, scope)
+        self.analyze_json_scalar_call("json_object", &arguments, node.span, scope)
     }
 
     pub(super) fn analyze_json_array_syntax(
@@ -99,7 +98,7 @@ impl AnalyzerContext<'_> {
             .iter()
             .map(|element| &element.value)
             .collect::<Vec<_>>();
-        self.analyze_json_constructor_call("json_array", &arguments, node.span, scope)
+        self.analyze_json_scalar_call("json_array", &arguments, node.span, scope)
     }
 
     /// Enter the original scalar-function analysis owner, including its arity,
@@ -107,7 +106,7 @@ impl AnalyzerContext<'_> {
     /// Child syntax keeps its actual original occurrence, including the pointer
     /// identity used by source constants and signed write assignments. No SQL
     /// text or selected binding is manufactured by this typed lowering.
-    fn analyze_json_constructor_call(
+    fn analyze_json_scalar_call(
         &self,
         name: &'static str,
         arguments: &[&ast::Expr],
@@ -142,22 +141,17 @@ impl AnalyzerContext<'_> {
         }
 
         let invocation = &node.path_invocation;
-        let input = self.analyze_expr(&invocation.input_expression, scope)?;
         // JsonPathString already owns the original StringLiteral's decoded
         // payload and location. Reuse the ordinary literal analyzer unchanged.
         let path = ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::String(invocation.json_path.value.clone()),
             span: invocation.json_path.span,
         });
-        let path = self.analyze_expr(&path, scope)?;
-        resolved_scalar_call_at(
-            self.function_catalog,
+        self.analyze_json_scalar_call(
             "json_query",
-            vec![input, path],
+            &[&invocation.input_expression, &path],
             invocation.json_path.span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
+            scope,
         )
     }
 }
@@ -299,24 +293,53 @@ mod tests {
             }
             (
                 ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: actual_mode,
                     expr: actual,
                     target: actual_target,
                     decimal_overflow_policy: actual_policy,
                 },
                 ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: expected_mode,
                     expr: expected,
                     target: expected_target,
                     decimal_overflow_policy: expected_policy,
                 },
             ) => {
+                assert_eq!(actual_mode, expected_mode);
                 assert_eq!(actual_target, expected_target);
                 assert_eq!(actual_policy, expected_policy);
                 assert_same_typed(actual, expected);
             }
             _ => panic!("unexpected argument kinds: {actual:?} versus {expected:?}"),
         }
+    }
+
+    fn assert_bound_json_path(argument: &TypedExpr, path: &str) {
+        use novarocks_type_contract::{CharacterKind, CharacterType, TrinoCastMode, ValueKind};
+        let ExprKind::Cast {
+            cast_mode,
+            expr,
+            target,
+            ..
+        } = &argument.kind
+        else {
+            panic!("expected the selected VARCHAR parameter conversion");
+        };
+        assert_eq!(*cast_mode, Some(TrinoCastMode::Implicit));
+        assert_eq!(target, &DataType::Utf8);
+        assert_eq!(
+            argument.value_type,
+            FunctionValueType::new(DataType::Utf8, false)
+        );
+        assert_eq!(
+            expr.value_type.value_type().kind(),
+            &ValueKind::BoundedCharacter(
+                CharacterType::new(CharacterKind::Varchar, path.chars().count() as u32).unwrap()
+            )
+        );
+        assert!(
+            matches!(&expr.kind, ExprKind::Literal(LiteralValue::String(value)) if value == path)
+        );
     }
 
     #[test]
@@ -358,13 +381,7 @@ mod tests {
                     assert!(
                         matches!(args[0].kind, ExprKind::ColumnRef { column_id, .. } if column_id == input_id)
                     );
-                    assert_eq!(
-                        args[1].value_type,
-                        FunctionValueType::new(DataType::Utf8, false)
-                    );
-                    assert!(
-                        matches!(&args[1].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "$.a.b")
-                    );
+                    assert_bound_json_path(&args[1], "$.a.b");
                     for (arg, selected) in args.iter().zip(&binding.selected.argument_types) {
                         assert_eq!(
                             selected,
@@ -403,9 +420,7 @@ mod tests {
             panic!("scalar call")
         };
         assert_same_typed(&args[0], &input_before);
-        assert!(
-            matches!(&args[1].kind, ExprKind::Literal(LiteralValue::String(value)) if value == path)
-        );
+        assert_bound_json_path(&args[1], path);
     }
 
     fn non_plain_profiles() -> Vec<(&'static str, ast::JsonQuery)> {
@@ -976,209 +991,6 @@ mod tests {
         }
     }
 
-    fn projection_syntax(query: &ast::Query) -> &ast::Expr {
-        let ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("SELECT fixture")
-        };
-        let [ast::SelectItem::SingleColumn(projection_column)] = select.projection.as_slice()
-        else {
-            panic!("one projection fixture")
-        };
-        assert!(projection_column.alias.is_none(), "anonymous projection");
-        &projection_column.expression
-    }
-
-    #[test]
-    fn object_original_children_keep_constant_backing_ordinal_and_write_assignment_loan() {
-        use crate::compiler::SqlWriteAssignmentSite;
-        use crate::compiler::materialized_values::MaterializedSourceBorrow;
-        use arrow::array::{Array, StringArray};
-        use novarocks_functions::ConstantPool;
-        use novarocks_type_contract::CompilePhase;
-        use std::{borrow::Cow, sync::Arc};
-
-        let control = SqlCompileControl::unbounded();
-        let policy = crate::constant::test_constant_policy();
-        let constant_type = FunctionValueType::new(DataType::Utf8, false);
-        let field = Arc::new(arrow::datatypes::Field::new(
-            "original_json_input",
-            DataType::Utf8,
-            false,
-        ));
-        let pool = ConstantPool::try_new(
-            field.clone(),
-            constant_type,
-            StringArray::from(vec!["unused ordinal", "{\"retained\":true}"]).to_data(),
-            policy,
-            CompilePhase::Validate,
-            &control,
-        )
-        .unwrap();
-        let value = pool.value(1).unwrap();
-        let placeholder = ast::Expr::Identifier(build::ident_at(
-            "only_materialized_source_can_resolve",
-            false,
-            Span::new(40, 49),
-        ));
-        let assigned = ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Long {
-                spelling: "1".into(),
-                parsed_value: 1,
-            },
-            span: Span::new(65, 66),
-        });
-        let node = object(vec![
-            (build::string("materialized"), placeholder.clone()),
-            (build::string("assigned"), assigned.clone()),
-        ]);
-        let object_span = node.span;
-        let actual_query = projection_query(
-            ast::Expr::JsonObject(novarocks_parser::ast::AstBox::new(node)),
-            vec![],
-        );
-        let expected_query = projection_query(
-            ordinary_constructor(
-                "json_object",
-                vec![
-                    build::string("materialized"),
-                    placeholder,
-                    build::string("assigned"),
-                    assigned,
-                ],
-                object_span,
-            ),
-            vec![],
-        );
-        let ast::Expr::JsonObject(actual_node) = projection_syntax(&actual_query) else {
-            panic!("object fixture")
-        };
-        let ast::Expr::FunctionCall(expected_node) = projection_syntax(&expected_query) else {
-            panic!("ordinary fixture")
-        };
-        let assignment = SqlWriteAssignmentSite::try_new(
-            0,
-            FunctionValueType::new(DataType::Int64, false),
-            None,
-            &control,
-        )
-        .unwrap()
-        .with_source_span(Span::new(65, 66));
-        let mut actual_source = MaterializedSourceBorrow::empty(&actual_query);
-        actual_source
-            .insert_context_constant(&actual_node.members[0].value, value.clone(), &control)
-            .unwrap();
-        actual_source
-            .insert_write_assignment(
-                &actual_node.members[1].value,
-                Cow::Owned(assignment.clone()),
-                &control,
-            )
-            .unwrap();
-        let mut expected_source = MaterializedSourceBorrow::empty(&expected_query);
-        expected_source
-            .insert_context_constant(&expected_node.arguments[1].value, value.clone(), &control)
-            .unwrap();
-        expected_source
-            .insert_write_assignment(
-                &expected_node.arguments[3].value,
-                Cow::Owned(assignment),
-                &control,
-            )
-            .unwrap();
-
-        let mut actual_context = context(&control);
-        actual_context.materialized_values = Some(actual_source.view());
-        let actual_scope = actual_context.new_scope();
-        let actual = actual_context
-            .analyze_expr(projection_syntax(&actual_query), &actual_scope)
-            .unwrap();
-        let mut expected_context = context(&control);
-        expected_context.materialized_values = Some(expected_source.view());
-        let expected_scope = expected_context.new_scope();
-        let expected = expected_context
-            .analyze_expr(projection_syntax(&expected_query), &expected_scope)
-            .unwrap();
-        assert_same_typed(&actual, &expected);
-        let ExprKind::FunctionCall { args, .. } = &actual.kind else {
-            panic!("scalar call")
-        };
-        let ExprKind::Constant(retained) = &args[1].kind else {
-            panic!("original constant must survive")
-        };
-        assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
-        assert_eq!(retained.ordinal(), 1);
-        assert_eq!(retained.field(), field.as_ref());
-        assert_eq!(retained.value_type(), value.value_type());
-        assert_eq!(args[3].value_type.data_type(), &DataType::Int64);
-        assert!(matches!(args[3].kind, ExprKind::Cast { .. }));
-        // Equal source text at the same span is deliberately not this loan.
-        assert!(
-            actual_source
-                .view()
-                .constant_at(&actual_node.members[0].value.clone())
-                .is_none()
-        );
-
-        // An unavailable array implementation must not hide a lost original
-        // constant loan behind an earlier UnknownColumn from a cloned child.
-        let array = array(
-            vec![ast::Expr::Identifier(build::ident(
-                "array_materialized_input",
-                false,
-            ))],
-            true,
-        );
-        let array_span = array.span;
-        let array_query = projection_query(
-            ast::Expr::JsonArray(novarocks_parser::ast::AstBox::new(array)),
-            vec![],
-        );
-        let ordinary_query = projection_query(
-            ordinary_constructor(
-                "json_array",
-                vec![ast::Expr::Identifier(build::ident(
-                    "array_materialized_input",
-                    false,
-                ))],
-                array_span,
-            ),
-            vec![],
-        );
-        let ast::Expr::JsonArray(array) = projection_syntax(&array_query) else {
-            panic!("array fixture")
-        };
-        let ast::Expr::FunctionCall(ordinary) = projection_syntax(&ordinary_query) else {
-            panic!("ordinary fixture")
-        };
-        let mut array_source = MaterializedSourceBorrow::empty(&array_query);
-        array_source
-            .insert_context_constant(&array.elements[0].value, value.clone(), &control)
-            .unwrap();
-        let mut ordinary_source = MaterializedSourceBorrow::empty(&ordinary_query);
-        ordinary_source
-            .insert_context_constant(&ordinary.arguments[0].value, value, &control)
-            .unwrap();
-        let mut array_context = context(&control);
-        array_context.materialized_values = Some(array_source.view());
-        let array_scope = array_context.new_scope();
-        let actual = array_context
-            .analyze_expr(projection_syntax(&array_query), &array_scope)
-            .unwrap_err();
-        let mut ordinary_context = context(&control);
-        ordinary_context.materialized_values = Some(ordinary_source.view());
-        let ordinary_scope = ordinary_context.new_scope();
-        let expected = ordinary_context
-            .analyze_expr(projection_syntax(&ordinary_query), &ordinary_scope)
-            .unwrap_err();
-        assert_same_refusal(&actual, &expected);
-        assert_eq!(actual.kind(), AnalyzeErrorKind::UnsupportedExpression);
-        assert!(
-            actual
-                .message()
-                .contains("no admitted selected scalar implementation")
-        );
-    }
-
     #[test]
     fn constructor_dispatch_keeps_the_original_request_cancellation() {
         struct Cancelled;
@@ -1328,6 +1140,21 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.original.resolve_scalar_binding(name, args, control)
         }
+        fn finish_scalar_binding(
+            &self,
+            function: &novarocks_functions::FunctionId,
+            overload: &novarocks_functions::FunctionOverloadId,
+            request: novarocks_functions::FunctionBindingRequest<'_>,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<
+            novarocks_functions::ResolvedFunctionBinding,
+            novarocks_functions::FunctionBindingError,
+        > {
+            self.scalar_resolutions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.original
+                .finish_scalar_binding(function, overload, request, control)
+        }
         fn contains_aggregate(&self, name: &str) -> bool {
             self.original.contains_aggregate(name)
         }
@@ -1414,7 +1241,11 @@ mod tests {
                 "the observation must see actual child resolution"
             );
             if !quoted {
-                assert_eq!(direct.kind(), AnalyzeErrorKind::UnavailableImplementation);
+                assert_eq!(
+                    direct.kind(),
+                    AnalyzeErrorKind::UnavailableImplementation,
+                    "{direct}"
+                );
             }
         }
     }

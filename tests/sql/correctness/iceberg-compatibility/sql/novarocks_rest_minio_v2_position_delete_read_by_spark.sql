@@ -25,7 +25,7 @@ CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 -- query 2
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0} (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   score INT
 ) WITH (partitioning = ARRAY['region'], format_version = 2);
 

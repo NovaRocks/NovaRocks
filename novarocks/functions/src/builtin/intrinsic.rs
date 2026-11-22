@@ -45,6 +45,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
+        super::array_element_at_owner::SUBSCRIPT_NAME,
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
         "__json_canonical_key",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
@@ -1023,6 +1027,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     (
         "truncate",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "try",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "try_variant_get",

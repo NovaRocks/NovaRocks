@@ -205,7 +205,7 @@ fn numeric_unary_public_transport_original_and_unchanged_nested_types_use_actual
 
 fn assert_decimal_float32_source_output(scale: i8) {
     let control = SqlCompileControl::unbounded();
-    let sql = "SELECT CAST(k AS FLOAT) AS original_cast FROM fixture";
+    let sql = "SELECT CAST(k AS REAL) AS original_cast FROM fixture";
     let dtype = DataType::Decimal128(38, scale);
     // The shared connector source authors a nonnullable input column.
     let before = nonnull_source(sql, dtype.clone());
@@ -219,8 +219,8 @@ fn assert_decimal_float32_source_output(scale: i8) {
     assert_eq!(original.fields(), original_port.fields.as_ref());
     assert_eq!(original.fields().len(), 1);
     assert_eq!(original.fields()[0].ty.data_type(), &DataType::Float32);
-    assert!(original.fields()[0].ty.nullable());
-    assert!(computed.fields[0].ty.nullable());
+    assert!(!original.fields()[0].ty.nullable());
+    assert!(!computed.fields[0].ty.nullable());
     assert_eq!(computed.output, original.original_port().output);
 
     let candidate = CompletedPhysicalPlanCandidate::for_sql_program(source, &control).unwrap();
@@ -228,27 +228,27 @@ fn assert_decimal_float32_source_output(scale: i8) {
         OutputContract::from_completed_candidate(QueryExecutionKind::Read, &candidate).unwrap();
     assert_eq!(output.fields()[0].name(), "original_cast");
     assert_eq!(output.fields()[0].data_type(), &DataType::Float32);
-    assert!(output.fields()[0].nullable());
+    assert!(!output.fields()[0].nullable());
 }
 
 #[test]
-fn decimal_float32_sql_explicit_cast_negative_scale_output_declaration() {
-    assert_decimal_float32_source_output(-38);
+fn decimal_real_sql_explicit_cast_fractional_output_declaration() {
+    assert_decimal_float32_source_output(2);
 }
 
 #[test]
-fn decimal_float32_sql_explicit_cast_zero_scale_output_declaration() {
+fn decimal_real_sql_explicit_cast_zero_scale_output_declaration() {
     assert_decimal_float32_source_output(0);
 }
 
 #[test]
-fn decimal_float32_sql_explicit_cast_wide_literal_output_declaration() {
+fn decimal_real_sql_explicit_cast_boundary_literal_output_declaration() {
     for prefix in ["", "-"] {
-        let literal = "4000000000000000000000000000000000000000.0";
-        let sql = format!("SELECT CAST({prefix}{literal} AS FLOAT) AS wide_literal");
+        let literal = "DECIMAL '40000000000000000000000000000000000000'";
+        let sql = format!("SELECT CAST({prefix}{literal} AS REAL) AS boundary_literal");
         let source = nonnull_source(&sql, DataType::Int8);
         let original = source.original_public_result_declaration().unwrap();
         assert_eq!(original.fields()[0].ty.data_type(), &DataType::Float32);
-        assert!(original.fields()[0].ty.nullable());
+        assert!(!original.fields()[0].ty.nullable());
     }
 }

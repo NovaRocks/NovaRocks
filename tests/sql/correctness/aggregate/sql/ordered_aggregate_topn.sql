@@ -40,11 +40,11 @@ create table all_t0 (
     c4 bigint,
     c5 largeint,
     c6 date,
-    c7 datetime,
-    c8 string,
-    c9 string,
+    c7 TIMESTAMP(6),
+    c8 VARCHAR,
+    c9 VARCHAR,
     c10 char(100),
-    c11 float,
+    c11 REAL,
     c12 double,
     c13 tinyint NOT NULL,
     c14 smallint NOT NULL,
@@ -52,11 +52,11 @@ create table all_t0 (
     c16 bigint NOT NULL,
     c17 largeint NOT NULL,
     c18 date NOT NULL,
-    c19 datetime NOT NULL,
-    c20 string NOT NULL,
-    c21 string NOT NULL,
+    c19 TIMESTAMP(6) NOT NULL,
+    c20 VARCHAR NOT NULL,
+    c21 VARCHAR NOT NULL,
     c22 char(100) NOT NULL,
-    c23 float NOT NULL,
+    c23 REAL NOT NULL,
     c24 double NOT NULL
 ) WITH (format_version = 3);
 
@@ -89,22 +89,22 @@ SET SESSION group_concat_max_len = 65535;
 USE ${case_db};
 WITH result AS (
     SELECT c1, c2, c3, COUNT() AS cnt FROM all_t0 GROUP BY c1, c2, c3 ORDER BY c1, c2, c3 LIMIT 100
-) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;
+) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN))) AS result_hash FROM result;
 
 -- query 9
 USE ${case_db};
 WITH result AS (
     SELECT c6, c7, c8, COUNT() AS cnt FROM all_t0 GROUP BY c6, c7, c8 ORDER BY c6, c7, c8 LIMIT 100
-) SELECT 'Test Case 40' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c6 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c7 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(c8 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;
+) SELECT 'Test Case 40' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c6 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c7 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(c8 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN))) AS result_hash FROM result;
 
 -- query 10
 USE ${case_db};
 WITH result AS (
     SELECT c13, c14, c15, COUNT() AS cnt FROM all_t0 GROUP BY c13, c14, c15 ORDER BY c13, c14, c15 LIMIT 100
-) SELECT 'Test Case 42' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c13 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c14 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c15 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;
+) SELECT 'Test Case 42' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c13 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c14 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c15 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN))) AS result_hash FROM result;
 
 -- query 11
 USE ${case_db};
 WITH result AS (
     SELECT c9, COUNT() AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100
-) SELECT 'Test Case 51' AS test_name, MD5(GROUP_CONCAT(CAST(c9 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;
+) SELECT 'Test Case 51' AS test_name, MD5(GROUP_CONCAT(CAST(c9 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS VARCHAR) AS BOOLEAN))) AS result_hash FROM result;

@@ -44,8 +44,8 @@ CREATE SCHEMA mvsc_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.orders (
-  region STRING,
-  channel STRING,
+  region VARCHAR,
+  channel VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 

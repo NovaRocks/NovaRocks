@@ -160,6 +160,7 @@ pub enum SqlType {
         scale: i8,
     },
     String,
+    BoundedCharacter(novarocks_type_contract::CharacterType),
     Json,
     Binary,
     Bitmap,

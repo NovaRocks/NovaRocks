@@ -2286,40 +2286,29 @@ mod tests {
     }
 
     #[test]
-    fn completed_casts_freeze_the_exact_root_allow_value_independent_of_standard_arithmetic() {
+    fn completed_casts_and_standard_arithmetic_do_not_consume_legacy_root_modes() {
         use novarocks_expression_contract::ExprKind;
-        use novarocks_type_contract::{
-            DecimalOverflowPolicy::{OutputNull, ReportError},
-            OperatorFunction, SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
-        };
+        use novarocks_type_contract::{OperatorFunction, TrinoCastMode};
+
         let ordinary =
             "SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders";
-        for (mode, sql, expected_allow, expected_policy) in [
-            ("32", ordinary, false, OutputNull),
-            ("ALLOW_THROW_EXCEPTION", ordinary, true, OutputNull),
-            ("ERROR_IF_OVERFLOW", ordinary, false, ReportError),
-            (
-                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
-                ordinary,
-                true,
-                ReportError,
-            ),
+        for (mode, sql) in [
+            ("32", ordinary),
+            ("ALLOW_THROW_EXCEPTION", ordinary),
+            ("ERROR_IF_OVERFLOW", ordinary),
+            ("ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW", ordinary),
             (
                 "ALLOW_THROW_EXCEPTION",
                 "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
-                false,
-                ReportError,
             ),
             (
                 "ERROR_IF_OVERFLOW",
                 "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
-                true,
-                OutputNull,
             ),
         ] {
             let completed = complete_root_intrinsic_fixture(sql, mode);
             let plan = completed.plan();
-            assert_eq!(plan.parameters().entries().len(), 1);
+            assert!(plan.parameters().entries().is_empty());
             let mut arithmetic = 0;
             let mut casts = 0;
             for fragment in plan.fragments().values() {
@@ -2329,41 +2318,26 @@ mod tests {
                     .filter_map(|node| node.expressions.as_ref())
                     .flat_map(|unit| unit.definitions())
                 {
-                    let (reference, policy) = match &expression.kind {
+                    assert!(
+                        expression
+                            .kind
+                            .intrinsic_parameter_references()
+                            .next()
+                            .is_none()
+                    );
+                    match &expression.kind {
                         ExprKind::FunctionCall { function, .. }
                             if OperatorFunction::from_function_id(&function.function_id)
                                 == Some(OperatorFunction::Add) =>
                         {
                             arithmetic += 1;
-                            assert!(
-                                expression
-                                    .kind
-                                    .intrinsic_parameter_references()
-                                    .next()
-                                    .is_none()
-                            );
-                            continue;
                         }
                         ExprKind::Cast {
-                            allow_throw_exception,
-                            decimal_overflow_policy,
+                            cast_mode: TrinoCastMode::Explicit,
                             ..
-                        } => {
-                            casts += 1;
-                            (*allow_throw_exception, *decimal_overflow_policy)
-                        }
-                        _ => continue,
-                    };
-                    assert_eq!(reference.id, SemanticParameterId::new(0));
-                    assert_eq!(
-                        reference.expected_key,
-                        SemanticParameterKey::AllowThrowException
-                    );
-                    assert_eq!(
-                        plan.parameters().require(reference).unwrap(),
-                        &SemanticParameterValue::AllowThrowException(expected_allow),
-                    );
-                    assert_eq!(policy, expected_policy);
+                        } => casts += 1,
+                        _ => {}
+                    }
                 }
             }
             assert!(arithmetic > 0, "column arithmetic must not be folded away");
@@ -2372,17 +2346,16 @@ mod tests {
     }
 
     #[test]
-    fn completed_derived_cast_inherits_root_allow_ref_and_decimal_policy() {
+    fn completed_derived_cast_keeps_its_mode_without_a_legacy_parameter() {
         use novarocks_expression_contract::ExprKind;
-        use novarocks_type_contract::{
-            DecimalOverflowPolicy::OutputNull, OperatorFunction, SemanticParameterValue,
-        };
+        use novarocks_type_contract::{OperatorFunction, TrinoCastMode};
+
         let completed = complete_root_intrinsic_fixture(
             "SELECT x + 1 AS a FROM (SELECT CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
             "ALLOW_THROW_EXCEPTION",
         );
         let plan = completed.plan();
-        assert_eq!(plan.parameters().entries().len(), 1);
+        assert!(plan.parameters().entries().is_empty());
         let mut saw_root_arithmetic = false;
         let mut saw_nested_cast = false;
         for fragment in plan.fragments().values() {
@@ -2392,30 +2365,26 @@ mod tests {
                 .filter_map(|node| node.expressions.as_ref())
                 .flat_map(|unit| unit.definitions())
             {
-                for reference in expression.kind.intrinsic_parameter_references() {
-                    assert_eq!(
-                        plan.parameters().require(*reference).unwrap(),
-                        &SemanticParameterValue::AllowThrowException(true),
-                    );
-                }
+                assert!(
+                    expression
+                        .kind
+                        .intrinsic_parameter_references()
+                        .next()
+                        .is_none()
+                );
                 match &expression.kind {
                     ExprKind::FunctionCall { function, .. }
                         if OperatorFunction::from_function_id(&function.function_id)
                             == Some(OperatorFunction::Add) =>
                     {
                         saw_root_arithmetic = true;
-                        assert!(
-                            expression
-                                .kind
-                                .intrinsic_parameter_references()
-                                .next()
-                                .is_none()
-                        );
                     }
                     ExprKind::Cast {
-                        decimal_overflow_policy: OutputNull,
+                        cast_mode: TrinoCastMode::Explicit,
                         ..
-                    } => saw_nested_cast = true,
+                    } => {
+                        saw_nested_cast = true;
+                    }
                     _ => {}
                 }
             }
@@ -4180,7 +4149,7 @@ mod tests {
                 V::String,
             ),
             (
-                "select coalesce(json_object('k': 1), 'plain') as j",
+                "select coalesce(cast(json_object('k': 1) as varchar), 'plain') as j",
                 D::Plain,
                 V::String,
             ),

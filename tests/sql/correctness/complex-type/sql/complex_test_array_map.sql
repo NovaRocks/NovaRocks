@@ -71,23 +71,23 @@ USE ${case_db};
 INSERT INTO t1 (k1, c1)
 VALUES 
 ROW(1, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
+    x -> CAST(x AS VARCHAR),
     ARRAY_GENERATE(1, 1000)
 )),
 ROW(2, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
+    x -> CAST(x AS VARCHAR),
     ARRAY_GENERATE(1, 1000)
 )),
 ROW(3, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
+    x -> CAST(x AS VARCHAR),
     ARRAY_GENERATE(1, 1000)
 )),
 ROW(4, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
+    x -> CAST(x AS VARCHAR),
     ARRAY_GENERATE(1, 1000)
 )),
 ROW(5, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
+    x -> CAST(x AS VARCHAR),
     ARRAY_GENERATE(1, 1000)
 ));
 

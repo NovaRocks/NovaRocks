@@ -96,7 +96,9 @@ pub(crate) fn iceberg_type(
             )
             .map_err(|error| format!("invalid Iceberg DECIMAL({precision},{scale}): {error}"))
         }
-        ConnectorDataType::String | ConnectorDataType::Json => primitive(PrimitiveType::String),
+        ConnectorDataType::String
+        | ConnectorDataType::BoundedCharacter(_)
+        | ConnectorDataType::Json => primitive(PrimitiveType::String),
         ConnectorDataType::Binary | ConnectorDataType::Bitmap | ConnectorDataType::Hll => {
             primitive(PrimitiveType::Binary)
         }
