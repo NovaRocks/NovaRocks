@@ -271,9 +271,9 @@ impl RowFilterJudge for Judge {
 
     fn file_verdict(&self, _filter: &Predicate, file: &CandidateFile<'_>) -> FileVerdict {
         match file.file.file_path() {
-            path if Some(path) == self.all => FileVerdict::AllRows,
-            path if Some(path) == self.some => FileVerdict::SomeRows,
-            _ => FileVerdict::NoRows,
+            path if Some(path) == self.all => FileVerdict::All,
+            path if Some(path) == self.some => FileVerdict::Partial,
+            _ => FileVerdict::None,
         }
     }
 }

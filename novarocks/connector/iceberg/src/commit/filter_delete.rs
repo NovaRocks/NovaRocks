@@ -38,9 +38,9 @@ use super::staging::{PreparedChange, Preparer, StagedView};
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileVerdict {
-    AllRows,
-    SomeRows,
-    NoRows,
+    All,
+    Partial,
+    None,
 }
 
 /// One judge evaluates the same frozen row predicate at two levels.
@@ -69,7 +69,7 @@ impl RowFilterJudge for AlwaysTrue {
     }
 
     fn file_verdict(&self, _filter: &Predicate, _file: &CandidateFile<'_>) -> FileVerdict {
-        FileVerdict::AllRows
+        FileVerdict::All
     }
 }
 
@@ -126,7 +126,7 @@ impl Preparer for FilterDeletePreparer {
                             file,
                         };
                         match self.judge.file_verdict(&self.filter, &candidate) {
-                            FileVerdict::AllRows => {
+                            FileVerdict::All => {
                                 let entry = LocatedEntry::from_bound(index, &entry)?;
                                 let identity = entry.frozen.identity().clone();
                                 match removals.entry(identity) {
@@ -138,14 +138,14 @@ impl Preparer for FilterDeletePreparer {
                                     }
                                 }
                             }
-                            FileVerdict::SomeRows if file.content_type() == DataContentType::Data => {
+                            FileVerdict::Partial if file.content_type() == DataContentType::Data => {
                                 return Err(super::new_manifests::commit_validation_error(format!(
                                     "Cannot delete file where some, but not all, rows match filter {}: {}",
                                     self.filter,
                                     file.file_path(),
                                 )));
                             }
-                            FileVerdict::SomeRows | FileVerdict::NoRows => {}
+                            FileVerdict::Partial | FileVerdict::None => {}
                         }
                         Ok(())
                     },
