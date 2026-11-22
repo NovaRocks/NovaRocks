@@ -62,6 +62,12 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
+pub(super) fn trino_effects() -> FunctionEffectDeclaration {
+    let mut result = effects();
+    result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    result
+}
+
 pub(super) fn definition(
     name: &str,
     declaration: FunctionBindingDeclaration,
@@ -78,6 +84,7 @@ pub(super) fn definition(
 
 pub(super) struct StringPadOwner {
     operation: StringPadOp,
+    trino: bool,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -94,10 +101,20 @@ impl StringPadOwner {
                 value: name.into(),
             })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let trino = trino_effects();
+        let active = declaration
+            .overloads()
+            .first()
+            .and_then(|overload| overload.effects.as_ref());
+        let uses_trino = active == Some(&trino);
+        let expected = if uses_trino { trino } else { effects() };
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || if uses_trino {
+                !(2..=3).contains(&declaration.overloads().len())
+            } else {
+                declaration.overloads().len() != 1
+            }
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -120,6 +137,7 @@ impl StringPadOwner {
             .collect();
         Ok(Self {
             operation,
+            trino: uses_trino,
             resolver: Arc::new(resolver),
             declaration,
             implementations,
@@ -127,7 +145,11 @@ impl StringPadOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = if self.trino {
+            trino_effects()
+        } else {
+            effects()
+        };
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -196,13 +218,14 @@ impl PureFunctionMetadataOwner for StringPadOwner {
         let result = (|| {
             super::string_pad::check_count(selected.argument_types.len(), logical_argument_count)
                 .map_err(|_| unavailable())?;
-            for (index, ty) in selected.argument_types.iter().enumerate() {
-                super::string_pad::check_argument(index, ty).map_err(|_| unavailable())?;
-                work.step()?;
-            }
             let crate::FunctionResultType::Scalar(target) = &selected.result_type else {
                 return Err(unavailable());
             };
+            for (index, ty) in selected.argument_types.iter().enumerate() {
+                super::string_pad::check_argument(index, ty, target.data_type())
+                    .map_err(|_| unavailable())?;
+                work.step()?;
+            }
             super::string_pad::check_result(target).map_err(|_| unavailable())?;
             Ok(())
         })();

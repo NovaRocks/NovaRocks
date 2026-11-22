@@ -16,16 +16,17 @@
 // under the License.
 
 //! Original SPLIT computation shared by full-array v1 and selected calls.
+use super::string_substring::StringIntegerArray;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallContract,
+    FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallContract,
     ScalarCallInput, SelectedValues, Selection,
 };
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{Array, ArrayRef, StringArray};
-use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use arrow_schema::{DataType, FieldRef};
+use novarocks_type_contract::{FunctionIntrinsicRowError, ValueLogicalType};
 use std::sync::Arc;
 #[derive(Clone, Copy, Debug)]
 pub enum Observation {
@@ -101,13 +102,20 @@ fn evaluate_rows(
     right: &StringArray,
     selection: Selection<'_>,
     mut address: impl FnMut(usize, usize) -> (usize, usize),
+    limit: impl Fn(usize, usize) -> Result<Option<i64>, KernelFailure>,
+    trino: bool,
+    result_field: Option<&FieldRef>,
     observe: &mut impl FnMut(Observation) -> Result<(), KernelFailure>,
-) -> Result<ArrayRef, KernelFailure> {
+) -> Result<(ArrayRef, Box<[RowDataError]>), KernelFailure> {
     observe(Observation::OpaqueBoundary)?;
     let value_builder = StringBuilder::new();
     let mut list_builder = ListBuilder::new(value_builder);
+    if let Some(field) = result_field {
+        list_builder = list_builder.with_field(Arc::clone(field));
+    }
     let mut child_offset = 0i32;
     let mut byte_offset = 0i32;
+    let mut errors = Vec::new();
     observe(Observation::OpaqueBoundary)?;
     for (ordinal, batch_row) in selection.iter().enumerate() {
         let (row, delimiter_row) = address(ordinal, batch_row);
@@ -124,6 +132,39 @@ fn evaluate_rows(
         let mut row_children = 0usize;
         let haystack = left.value(row);
         let delimiter = right.value(delimiter_row);
+        let Some(limit) = limit(ordinal, batch_row)? else {
+            observe(Observation::OpaqueBoundary)?;
+            list_builder.append(false);
+            observe(Observation::OpaqueBoundary)?;
+            continue;
+        };
+        if trino {
+            let error = if limit <= 0 {
+                Some("Limit must be positive")
+            } else if limit > i64::from(i32::MAX) {
+                Some("Limit is too large")
+            } else if delimiter.is_empty() {
+                Some("The delimiter may not be the empty string")
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                observe(Observation::OpaqueBoundary)?;
+                errors
+                    .try_reserve(1)
+                    .map_err(|_| KernelFailure::ResourceExhausted)?;
+                errors.push(RowDataError::with_reason(
+                    ordinal,
+                    crate::DataFailureReason::Domain(
+                        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                    ),
+                    error,
+                ));
+                list_builder.append(false);
+                observe(Observation::OpaqueBoundary)?;
+                continue;
+            }
+        }
         if delimiter.is_empty() {
             for ch in haystack.chars() {
                 observe(Observation::Step)?;
@@ -145,7 +186,7 @@ fn evaluate_rows(
             continue;
         }
         let mut start = 0usize;
-        loop {
+        while row_children + 1 < limit as usize {
             observe(Observation::OpaqueBoundary)?;
             let found = haystack[start..].find(delimiter);
             observe(Observation::OpaqueBoundary)?;
@@ -179,7 +220,7 @@ fn evaluate_rows(
     observe(Observation::OpaqueBoundary)?;
     let result = Arc::new(list_builder.finish()) as ArrayRef;
     observe(Observation::OpaqueBoundary)?;
-    Ok(result)
+    Ok((result, errors.into_boxed_slice()))
 }
 pub fn evaluate_required(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, KernelFailure> {
     let (left, right) = sources(left.as_ref(), right.as_ref())?;
@@ -191,8 +232,12 @@ pub fn evaluate_required(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, 
         right,
         Selection::all(left.len()),
         |_, row| (row, row),
+        |_, _| Ok(Some(i64::from(i32::MAX))),
+        false,
+        None,
         &mut |_| Ok(()),
     )
+    .map(|(result, _)| result)
 }
 pub fn evaluate_observed(
     left: &dyn Array,
@@ -202,24 +247,41 @@ pub fn evaluate_observed(
     observe: &mut impl FnMut(Observation) -> Result<(), KernelFailure>,
 ) -> Result<ArrayRef, KernelFailure> {
     let (left, right) = sources(left, right)?;
-    evaluate_rows(left, right, selection, address, observe)
+    evaluate_rows(
+        left,
+        right,
+        selection,
+        address,
+        |_, _| Ok(Some(i64::from(i32::MAX))),
+        false,
+        None,
+        observe,
+    )
+    .map(|(result, _)| result)
 }
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
     mut step: impl FnMut() -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
     let types = &contract.selected().argument_types;
-    if types.len() != 2 {
-        return Err(invalid("split requires its two exact checked arguments"));
+    if !matches!(types.len(), 2 | 3) {
+        return Err(invalid(
+            "split requires two text arguments and an optional limit",
+        ));
     }
     let mut nullable = false;
-    for ty in types.iter() {
+    for (index, ty) in types.iter().enumerate() {
         step()?;
         let FunctionArgumentType::Value(source) = ty else {
             return Err(invalid("split requires value arguments"));
         };
         if source.logical_type() != ValueLogicalType::Physical
-            || source.data_type() != &DataType::Utf8
+            || source.data_type()
+                != if index < 2 {
+                    &DataType::Utf8
+                } else {
+                    &DataType::Int64
+                }
         {
             return Err(invalid("split requires its exact Physical Utf8 arguments"));
         }
@@ -272,7 +334,7 @@ pub(super) fn evaluate<'a>(
     let mut work = EvaluationCheckpoints::new(control);
     let result = (|| {
         validate_profile(input.contract(), || work.step())?;
-        if input.arguments().len() != 2 {
+        if input.arguments().len() != input.contract().selected().argument_types.len() {
             return Err(invalid("split selected argument arity differs"));
         }
         let selection = input.selection();
@@ -298,9 +360,21 @@ pub(super) fn evaluate<'a>(
                 }
             }
         }
-        let out = evaluate_observed(
+        let (left, right) = sources(
             input.arguments()[0].array().as_ref(),
             input.arguments()[1].array().as_ref(),
+        )?;
+        let limit = input.arguments().get(2);
+        let limits = limit
+            .map(|arg| StringIntegerArray::read(arg.array().as_ref()))
+            .transpose()?;
+        let trino = input.contract().effects().own_row_error == FunctionIntrinsicRowError::MayRaise;
+        let DataType::List(field) = input.contract().result_type().data_type() else {
+            return Err(invalid("split requires a checked list result"));
+        };
+        let (out, errors) = evaluate_rows(
+            left,
+            right,
             selection,
             |ordinal, row| {
                 (
@@ -308,6 +382,15 @@ pub(super) fn evaluate<'a>(
                     input.arguments()[1].value_row(ordinal, row),
                 )
             },
+            |ordinal, row| {
+                let Some((limit, limits)) = limit.zip(limits.as_ref()) else {
+                    return Ok(Some(i64::from(i32::MAX)));
+                };
+                let row = limit.value_row(ordinal, row);
+                Ok(limit.array().is_valid(row).then(|| limits.value(row)))
+            },
+            trino,
+            Some(field),
             &mut |event| match event {
                 Observation::Step => work.step(),
                 Observation::OpaqueBoundary => work.flush(),
@@ -317,7 +400,7 @@ pub(super) fn evaluate<'a>(
             selection,
             input.contract().result_type().data_type(),
             out,
-            Box::default(),
+            errors,
             || work.step(),
         )
     })();

@@ -21,7 +21,10 @@ use crate::{
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{Array, ArrayRef, Int32Array, StringArray, builder::Int32Builder};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray,
+    builder::{Int32Builder, StringBuilder},
+};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;
@@ -30,6 +33,8 @@ pub(super) enum StringMeasureOp {
     Ascii,
     Bytes,
     Characters,
+    Chr,
+    Codepoint,
 }
 #[derive(Debug)]
 enum MeasureFailure {
@@ -101,6 +106,11 @@ fn original_value(
                 }
             }
             text.chars().count() as i64
+        }
+        StringMeasureOp::Chr | StringMeasureOp::Codepoint => {
+            return Err(invalid(
+                "legacy string measurement cannot compute a Unicode codepoint",
+            ));
         }
     })
 }
@@ -178,20 +188,178 @@ pub(super) fn check_types(
     source: &crate::FunctionValueType,
     target: &crate::FunctionValueType,
 ) -> Result<(), StaticProfileFailure> {
-    let nullable = if op == StringMeasureOp::Ascii {
-        true
-    } else {
-        source.nullable()
+    let (source_matches, target_carrier, nullable) = match op {
+        StringMeasureOp::Chr => (source.data_type() == &DataType::Int64, DataType::Utf8, true),
+        StringMeasureOp::Codepoint => {
+            (source.data_type() == &DataType::Utf8, DataType::Int32, true)
+        }
+        StringMeasureOp::Bytes if target.data_type() == &DataType::Int64 => (
+            matches!(source.data_type(), DataType::Utf8 | DataType::Binary),
+            DataType::Int64,
+            source.nullable(),
+        ),
+        _ => (
+            source.data_type() == &DataType::Utf8,
+            DataType::Int32,
+            op == StringMeasureOp::Ascii || source.nullable(),
+        ),
     };
     if source.logical_type() != ValueLogicalType::Physical
-        || source.data_type() != &DataType::Utf8
+        || !source_matches
         || target.logical_type() != ValueLogicalType::Physical
-        || target.data_type() != &DataType::Int32
+        || target.data_type() != &target_carrier
         || target.nullable() != nullable
     {
         return Err(StaticProfileFailure::Type);
     }
     Ok(())
+}
+
+fn evaluate_trino_measurement<'a>(
+    op: StringMeasureOp,
+    input: ScalarCallInput<'_, 'a>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    let mut work = EvaluationCheckpoints::new(control);
+    let result = (|| {
+        let argument = &input.arguments()[0];
+        let array = argument.array();
+        let selection = input.selection();
+        let mut errors = Vec::new();
+        let output: ArrayRef = match op {
+            StringMeasureOp::Bytes => {
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(selection.len())
+                    .map_err(|_| KernelFailure::ResourceExhausted)?;
+                match array.data_type() {
+                    DataType::Utf8 => {
+                        let strings = array
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| internal("length selected source is not Utf8"))?;
+                        let mut observed = Some(EvaluationCheckpoints::new(control));
+                        compute_rows(
+                            StringMeasureOp::Characters,
+                            strings,
+                            |ordinal, batch| argument.value_row(ordinal, batch),
+                            selection,
+                            Some(true),
+                            &mut observed,
+                            |value| {
+                                values.push(value);
+                                Ok(())
+                            },
+                        )?;
+                        observed.take().unwrap().finish()?;
+                    }
+                    DataType::Binary => {
+                        let binaries = array
+                            .as_any()
+                            .downcast_ref::<BinaryArray>()
+                            .ok_or_else(|| internal("length selected source is not Binary"))?;
+                        for (ordinal, batch) in selection.iter().enumerate() {
+                            let row = argument.value_row(ordinal, batch);
+                            if row >= binaries.len() {
+                                return Err(internal(
+                                    "length selected byte address is out of bounds",
+                                ));
+                            }
+                            values.push(
+                                binaries
+                                    .is_valid(row)
+                                    .then(|| binaries.value(row).len() as i64),
+                            );
+                            work.step()?;
+                        }
+                    }
+                    _ => return Err(invalid("length differs from its checked carrier")),
+                }
+                Arc::new(Int64Array::from(values))
+            }
+            StringMeasureOp::Chr => {
+                let positions = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| internal("chr selected source is not Int64"))?;
+                let bytes = selection
+                    .len()
+                    .checked_mul(4)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+                let mut strings = StringBuilder::with_capacity(selection.len(), bytes);
+                for (ordinal, batch) in selection.iter().enumerate() {
+                    let row = argument.value_row(ordinal, batch);
+                    if row >= positions.len() {
+                        return Err(internal("chr selected address is out of bounds"));
+                    }
+                    if positions.is_null(row) {
+                        strings.append_null();
+                    } else if let Some(ch) = unicode_scalar(positions.value(row)) {
+                        let mut encoded = [0u8; 4];
+                        strings.append_value(ch.encode_utf8(&mut encoded));
+                    } else {
+                        errors
+                            .try_reserve(1)
+                            .map_err(|_| KernelFailure::ResourceExhausted)?;
+                        errors.push(crate::RowDataError::with_reason(ordinal,
+                        crate::DataFailureReason::Domain(novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT), "Not a valid Unicode code point"));
+                        strings.append_null();
+                    }
+                    work.step()?;
+                }
+                Arc::new(strings.finish())
+            }
+            StringMeasureOp::Codepoint => {
+                let strings = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| internal("codepoint selected source is not Utf8"))?;
+                output_capacity(selection.len())?;
+                let mut values = Int32Builder::with_capacity(selection.len());
+                for (ordinal, batch) in selection.iter().enumerate() {
+                    let row = argument.value_row(ordinal, batch);
+                    if row >= strings.len() {
+                        return Err(internal("codepoint selected address is out of bounds"));
+                    }
+                    if strings.is_null(row) {
+                        values.append_null();
+                    } else if let Some(value) = single_codepoint(strings.value(row)) {
+                        values.append_value(value);
+                    } else {
+                        errors
+                            .try_reserve(1)
+                            .map_err(|_| KernelFailure::ResourceExhausted)?;
+                        errors.push(crate::RowDataError::with_reason(ordinal,
+                        crate::DataFailureReason::Domain(novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT), "Input string must be a single character string"));
+                        values.append_null();
+                    }
+                    work.step()?;
+                }
+                Arc::new(values.finish())
+            }
+            _ => return Err(invalid("unexpected Trino string measurement operation")),
+        };
+        work.flush()?;
+        SelectedValues::try_new_observed(
+            selection,
+            input.contract().result_type().data_type(),
+            output,
+            errors.into_boxed_slice(),
+            || work.step(),
+        )
+    })();
+    work.finish_result(result)
+}
+
+fn unicode_scalar(value: i64) -> Option<char> {
+    u32::try_from(value).ok().and_then(char::from_u32)
+}
+
+fn single_codepoint(text: &str) -> Option<i32> {
+    let mut characters = text.chars();
+    let first = characters.next()?;
+    characters.next().is_none().then_some(first as i32)
 }
 
 pub(super) fn evaluate_string_measure<'a>(
@@ -208,6 +376,11 @@ pub(super) fn evaluate_string_measure<'a>(
     let argument = &input.arguments()[0];
     let target = input.contract().result_type();
     check_types(op, source, target).map_err(|error| invalid(error.message()))?;
+    if matches!(op, StringMeasureOp::Chr | StringMeasureOp::Codepoint)
+        || (op == StringMeasureOp::Bytes && target.data_type() == &DataType::Int64)
+    {
+        return evaluate_trino_measurement(op, input, control);
+    }
     if argument.array().data_type() != &DataType::Utf8 {
         return Err(internal(
             "string measurement carrier differs from its checked argument",

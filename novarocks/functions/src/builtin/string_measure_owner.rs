@@ -45,6 +45,8 @@ pub(super) fn operation(name: &str) -> Option<StringMeasureOp> {
         "ascii" => Some(StringMeasureOp::Ascii),
         "length" => Some(StringMeasureOp::Bytes),
         "char_length" => Some(StringMeasureOp::Characters),
+        "chr" => Some(StringMeasureOp::Chr),
+        "codepoint" => Some(StringMeasureOp::Codepoint),
         _ => None,
     }
 }
@@ -61,6 +63,21 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),
+    }
+}
+
+pub(super) fn codepoint_effects() -> FunctionEffectDeclaration {
+    let mut result = effects();
+    result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    result
+}
+
+impl StringMeasureOp {
+    fn effects(self) -> FunctionEffectDeclaration {
+        match self {
+            Self::Chr | Self::Codepoint => codepoint_effects(),
+            _ => effects(),
+        }
     }
 }
 
@@ -96,10 +113,14 @@ impl StringMeasureOwner {
                 value: name.into(),
             })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let expected = operation.effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || if name == "length" {
+                !(1..=3).contains(&declaration.overloads().len())
+            } else {
+                declaration.overloads().len() != 1
+            }
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -129,7 +150,7 @@ impl StringMeasureOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = self.operation.effects();
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,

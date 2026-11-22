@@ -96,7 +96,7 @@ impl StringSubstringOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 2
+            || !matches!(declaration.overloads().len(), 2 | 4 | 6)
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })

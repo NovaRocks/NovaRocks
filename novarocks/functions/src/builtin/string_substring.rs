@@ -23,7 +23,7 @@ use crate::{
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{Array, ArrayRef, Int32Array, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
@@ -67,22 +67,22 @@ fn observe_char(
 
 fn substring_span<'a>(
     text: &'a str,
-    position: i32,
-    length: Option<i32>,
+    position: i64,
+    length: Option<i64>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<&'a str, KernelFailure> {
     if position == 0 || length.is_some_and(|n| n <= 0) {
         return Ok("");
     }
     let start = if position > 0 {
-        (i64::from(position) - 1) as usize
+        (position - 1) as usize
     } else {
         let mut count = 0usize;
         for character in text.chars() {
             count += 1;
             observe_char(character, work)?;
         }
-        let distance = (-i64::from(position)) as usize;
+        let distance = position.unsigned_abs() as usize;
         if distance > count {
             return Ok("");
         }
@@ -102,6 +102,51 @@ fn substring_span<'a>(
     Ok(start_byte.map_or("", |byte| &text[byte..]))
 }
 
+fn binary_span(bytes: &[u8], position: i64, length: Option<i64>) -> &[u8] {
+    if position == 0 || length.is_some_and(|n| n <= 0) {
+        return &[];
+    }
+    let start = if position > 0 {
+        (position - 1) as usize
+    } else if let Some(index) = bytes.len().checked_sub(position.unsigned_abs() as usize) {
+        index
+    } else {
+        return &[];
+    };
+    let Some(suffix) = bytes.get(start..) else {
+        return &[];
+    };
+    let count = length.map_or(suffix.len(), |length| (length as usize).min(suffix.len()));
+    &suffix[..count]
+}
+
+pub(super) enum StringIntegerArray<'a> {
+    Integer(&'a Int32Array),
+    Bigint(&'a Int64Array),
+}
+
+impl<'a> StringIntegerArray<'a> {
+    pub(super) fn read(array: &'a dyn Array) -> Result<Self, KernelFailure> {
+        let array = array.as_any();
+        if let Some(values) = array.downcast_ref::<Int64Array>() {
+            Ok(Self::Bigint(values))
+        } else if let Some(values) = array.downcast_ref::<Int32Array>() {
+            Ok(Self::Integer(values))
+        } else {
+            Err(internal(
+                "selected string argument is not an integer carrier",
+            ))
+        }
+    }
+
+    pub(super) fn value(&self, row: usize) -> i64 {
+        match self {
+            Self::Integer(array) => i64::from(array.value(row)),
+            Self::Bigint(array) => array.value(row),
+        }
+    }
+}
+
 pub(super) fn evaluate_string_substring<'a>(
     _op: StringSubstringOp,
     input: ScalarCallInput<'_, 'a>,
@@ -117,16 +162,35 @@ pub(super) fn evaluate_string_substring<'a>(
                 "substring requires its exact two or three checked arguments",
             ));
         }
+        let [
+            FunctionArgumentType::Value(source),
+            FunctionArgumentType::Value(start),
+            ..,
+        ] = types
+        else {
+            return Err(invalid("substring requires checked source and position"));
+        };
+        let binary = source.data_type() == &DataType::Binary;
+        let index_type = start.data_type();
+        if !matches!(index_type, DataType::Int32 | DataType::Int64)
+            || (binary && index_type != &DataType::Int64)
+        {
+            return Err(invalid(
+                "substring position must match the selected integer profile",
+            ));
+        }
         for (index, ty) in types.iter().enumerate() {
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("substring requires value arguments"));
             };
             if ty.logical_type() != ValueLogicalType::Physical
-                || *ty.data_type()
-                    != if index == 0 {
-                        DataType::Utf8
+                || ty.data_type()
+                    != if index == 0 && binary {
+                        &DataType::Binary
+                    } else if index == 0 {
+                        &DataType::Utf8
                     } else {
-                        DataType::Int32
+                        index_type
                     }
             {
                 return Err(invalid(
@@ -137,38 +201,40 @@ pub(super) fn evaluate_string_substring<'a>(
         }
         let target = input.contract().result_type();
         if target.logical_type() != ValueLogicalType::Physical
-            || target.data_type() != &DataType::Utf8
-            || !target.nullable()
+            || target.data_type() != source.data_type()
         {
             return Err(invalid(
                 "substring differs from its exact installed result profile",
             ));
         }
-        let strings = arguments[0]
-            .array()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| internal("substring selected source is not Utf8"))?;
-        let starts = arguments[1]
-            .array()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or_else(|| internal("substring selected position is not Int32"))?;
-        let lengths = if arguments.len() == 3 {
+        let source = arguments[0].array().as_any();
+        let strings = if binary {
+            None
+        } else {
             Some(
-                arguments[2]
-                    .array()
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| internal("substring selected length is not Int32"))?,
+                source
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| internal("substring selected source is not Utf8"))?,
+            )
+        };
+        let binaries = if binary {
+            Some(
+                source
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| internal("substring selected source is not Binary"))?,
             )
         } else {
             None
         };
+        let starts = StringIntegerArray::read(arguments[1].array().as_ref())?;
+        let lengths = arguments
+            .get(2)
+            .map(|arg| StringIntegerArray::read(arg.array().as_ref()))
+            .transpose()?;
         let row_span = |ordinal,
                         batch_row,
                         work: &mut EvaluationCheckpoints<'_>|
-         -> Result<Option<&str>, KernelFailure> {
+         -> Result<Option<&[u8]>, KernelFailure> {
             let mut rows = [0usize; 3];
             let mut is_null = false;
             for (index, argument) in arguments.iter().enumerate() {
@@ -193,13 +259,16 @@ pub(super) fn evaluate_string_substring<'a>(
             if is_null {
                 return Ok(None);
             }
-            substring_span(
-                strings.value(rows[0]),
-                starts.value(rows[1]),
-                lengths.map(|array| array.value(rows[2])),
-                work,
-            )
-            .map(Some)
+            let start = starts.value(rows[1]);
+            let length = lengths.as_ref().map(|array| array.value(rows[2]));
+            if let Some(strings) = strings {
+                substring_span(strings.value(rows[0]), start, length, work)
+                    .map(|text| Some(text.as_bytes()))
+            } else if let Some(binaries) = binaries {
+                Ok(Some(binary_span(binaries.value(rows[0]), start, length)))
+            } else {
+                Err(internal("substring has no prepared source carrier"))
+            }
         };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
@@ -237,8 +306,8 @@ pub(super) fn evaluate_string_substring<'a>(
                     if span.len() > total - bytes.len() {
                         return Err(internal("substring exceeded its measured output extent"));
                     }
-                    for byte in span.bytes() {
-                        bytes.push(byte);
+                    for byte in span {
+                        bytes.push(*byte);
                         work.step()?;
                     }
                     validity.append(true);
@@ -253,11 +322,14 @@ pub(super) fn evaluate_string_substring<'a>(
             ));
         }
         work.flush()?;
-        let array = Arc::new(StringArray::new(
-            OffsetBuffer::new(offsets.into()),
-            Buffer::from(bytes),
-            has_null.then(|| NullBuffer::new(validity.finish())),
-        )) as ArrayRef;
+        let offsets = OffsetBuffer::new(offsets.into());
+        let bytes = Buffer::from(bytes);
+        let nulls = has_null.then(|| NullBuffer::new(validity.finish()));
+        let array = if binary {
+            Arc::new(BinaryArray::new(offsets, bytes, nulls)) as ArrayRef
+        } else {
+            Arc::new(StringArray::new(offsets, bytes, nulls)) as ArrayRef
+        };
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,

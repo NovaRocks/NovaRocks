@@ -24,7 +24,7 @@ use crate::{
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{Array, ArrayRef, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
@@ -74,20 +74,29 @@ pub(super) fn evaluate_string_reverse<'a>(
         };
         let target = input.contract().result_type();
         if source.logical_type() != ValueLogicalType::Physical
-            || source.data_type() != &DataType::Utf8
+            || !matches!(source.data_type(), DataType::Utf8 | DataType::Binary)
             || target.logical_type() != ValueLogicalType::Physical
-            || target.data_type() != &DataType::Utf8
-            || !target.nullable()
+            || target.data_type() != source.data_type()
         {
             return Err(invalid(
                 "string reversal differs from its exact installed profile",
             ));
         }
-        let values = argument
-            .array()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| internal("string reversal selected carrier is not Utf8"))?;
+        let values = argument.array();
+        let strings = values.as_any().downcast_ref::<StringArray>();
+        let binaries = values.as_any().downcast_ref::<BinaryArray>();
+        let binary = source.data_type() == &DataType::Binary;
+        if (binary && binaries.is_none()) || (!binary && strings.is_none()) {
+            return Err(internal(
+                "reversal selected carrier differs from its checked type",
+            ));
+        }
+        let value_bytes = |row| {
+            strings
+                .map(|strings| strings.value(row).as_bytes())
+                .or_else(|| binaries.map(|binaries| binaries.value(row)))
+                .ok_or_else(|| internal("reversal has no selected carrier"))
+        };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
         let mut output_bytes = 0usize;
@@ -107,7 +116,7 @@ pub(super) fn evaluate_string_reverse<'a>(
                 }
                 continue;
             }
-            let selected = values.value(row);
+            let selected = value_bytes(row)?;
             output_bytes = output_bytes
                 .checked_add(selected.len())
                 .ok_or(KernelFailure::ResourceExhausted)?;
@@ -134,20 +143,25 @@ pub(super) fn evaluate_string_reverse<'a>(
                 has_null = true;
                 validity.append(false);
             } else {
-                let selected = values.value(row);
+                let selected = value_bytes(row)?;
                 if selected.len() > output_bytes - bytes.len() {
                     return Err(internal(
                         "string reversal exceeded its measured output extent",
                     ));
                 }
-                // ONE original v1 renderer retains Unicode scalar (not grapheme)
-                // reversal. Its String allocation/collect internals are opaque;
-                // observing the rendered bytes preserves the original callback
-                // sequence without creating a second reversal algorithm.
-                let rendered = crate::string_reverse_shared::reverse_utf8(selected);
-                for byte in rendered.bytes() {
-                    bytes.push(byte);
-                    work.step()?;
+                if let Some(strings) = strings {
+                    for character in strings.value(row).chars().rev() {
+                        let mut encoded = [0; 4];
+                        for byte in character.encode_utf8(&mut encoded).bytes() {
+                            bytes.push(byte);
+                            work.step()?;
+                        }
+                    }
+                } else {
+                    for byte in selected.iter().rev() {
+                        bytes.push(*byte);
+                        work.step()?;
+                    }
                 }
                 validity.append(true);
             }
@@ -160,11 +174,14 @@ pub(super) fn evaluate_string_reverse<'a>(
             ));
         }
         work.flush()?;
-        let array = Arc::new(StringArray::new(
-            OffsetBuffer::new(offsets.into()),
-            Buffer::from(bytes),
-            has_null.then(|| NullBuffer::new(validity.finish())),
-        )) as ArrayRef;
+        let offsets = OffsetBuffer::new(offsets.into());
+        let bytes = Buffer::from(bytes);
+        let nulls = has_null.then(|| NullBuffer::new(validity.finish()));
+        let array: ArrayRef = if binary {
+            Arc::new(BinaryArray::new(offsets, bytes, nulls))
+        } else {
+            Arc::new(StringArray::new(offsets, bytes, nulls))
+        };
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,

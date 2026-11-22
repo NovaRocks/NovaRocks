@@ -25,13 +25,13 @@ use crate::{
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{Array, ArrayRef, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{FunctionIntrinsicRowError, ValueLogicalType};
 use std::{alloc::Layout, sync::Arc};
 
-use super::string_concat_core::{concat_length_observed, emit_concat_observed};
+use super::string_concat_core::{ConcatLength, concat_length_observed, emit_concat_observed};
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -54,12 +54,15 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 
-fn carrier<'a>(argument: EvaluatedArgument<'a>) -> Result<&'a StringArray, KernelFailure> {
-    argument
-        .array()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| internal("concat selected carrier is not Utf8"))
+fn value_bytes<'a>(argument: EvaluatedArgument<'a>, row: usize) -> Result<&'a [u8], KernelFailure> {
+    let array = argument.array().as_any();
+    if let Some(array) = array.downcast_ref::<StringArray>() {
+        Ok(array.value(row).as_bytes())
+    } else if let Some(array) = array.downcast_ref::<BinaryArray>() {
+        Ok(array.value(row))
+    } else {
+        Err(internal("concat selected carrier is not Utf8 or Binary"))
+    }
 }
 
 fn row_length(
@@ -67,7 +70,7 @@ fn row_length(
     ordinal: usize,
     batch_row: usize,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<usize>, KernelFailure> {
+) -> Result<ConcatLength, KernelFailure> {
     let mut context = (input, ordinal, batch_row, work);
     concat_length_observed(input.arguments().len(), &mut context, |context, index| {
         let argument = context.0.arguments()[index];
@@ -76,7 +79,7 @@ fn row_length(
         else {
             return Err(invalid("concat requires only checked value arguments"));
         };
-        let values = carrier(argument)?;
+        let values = argument.array();
         let row = argument.value_row(context.1, context.2);
         context.3.step()?;
         if row >= values.len() {
@@ -90,7 +93,7 @@ fn row_length(
             }
             Ok(None)
         } else {
-            Ok(Some(values.value(row)))
+            value_bytes(argument, row).map(Some)
         }
     })
 }
@@ -104,10 +107,12 @@ pub(super) fn evaluate_string_concat<'a>(
     let result = (|| {
         let selected = input.contract().selected();
         let target = input.contract().result_type();
-        if input.arguments().is_empty()
+        let trino = input.contract().effects().own_row_error == FunctionIntrinsicRowError::MayRaise;
+        let min_arity = if trino { 2 } else { 1 };
+        if input.arguments().len() < min_arity
             || selected.argument_types.len() != input.arguments().len()
             || target.logical_type() != ValueLogicalType::Physical
-            || target.data_type() != &DataType::Utf8
+            || !matches!(target.data_type(), DataType::Utf8 | DataType::Binary)
             || !target.nullable()
         {
             return Err(invalid(
@@ -119,20 +124,25 @@ pub(super) fn evaluate_string_concat<'a>(
                 return Err(invalid("concat requires only checked value arguments"));
             };
             if source.logical_type() != ValueLogicalType::Physical
-                || source.data_type() != &DataType::Utf8
+                || source.data_type() != target.data_type()
             {
                 return Err(invalid(
                     "concat selected source is outside its installed profile",
                 ));
             }
-            carrier(*argument)?;
+            if argument.array().data_type() != source.data_type() {
+                return Err(internal(
+                    "concat selected carrier differs from its checked type",
+                ));
+            }
             work.step()?;
         }
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
         let mut output_bytes = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            if let Some(length) = row_length(&input, ordinal, batch_row, &mut work)? {
+            if let ConcatLength::Value(length) = row_length(&input, ordinal, batch_row, &mut work)?
+            {
                 output_bytes = output_bytes
                     .checked_add(length)
                     .ok_or(KernelFailure::ResourceExhausted)?;
@@ -155,13 +165,20 @@ pub(super) fn evaluate_string_concat<'a>(
         work.flush()?;
         offsets.push(0i32);
         let mut has_null = false;
+        let mut errors = Vec::new();
         for (ordinal, batch_row) in selection.iter().enumerate() {
             match row_length(&input, ordinal, batch_row, &mut work)? {
-                None => {
+                length @ (ConcatLength::Null | ConcatLength::TooLong) => {
+                    if trino && let Some(error) = length.data_error(ordinal) {
+                        errors
+                            .try_reserve(1)
+                            .map_err(|_| KernelFailure::ResourceExhausted)?;
+                        errors.push(error);
+                    }
                     has_null = true;
                     validity.append(false);
                 }
-                Some(length) => {
+                ConcatLength::Value(length) => {
                     if length > output_bytes - bytes.len() {
                         return Err(internal("concat exceeded its measured output extent"));
                     }
@@ -171,12 +188,11 @@ pub(super) fn evaluate_string_concat<'a>(
                         &mut context,
                         |context, index| {
                             let argument = context.0.arguments()[index];
-                            let values = carrier(argument)?;
-                            Ok(values.value(argument.value_row(context.1, context.2)))
+                            value_bytes(argument, argument.value_row(context.1, context.2))
                         },
                         |context, text| {
-                            for byte in text.bytes() {
-                                context.3.push(byte);
+                            for byte in text {
+                                context.3.push(*byte);
                                 context.4.step()?;
                             }
                             Ok(())
@@ -193,17 +209,20 @@ pub(super) fn evaluate_string_concat<'a>(
             return Err(internal("concat differs from its measured output extent"));
         }
         work.flush()?;
-        let array = Arc::new(StringArray::new(
-            OffsetBuffer::new(offsets.into()),
-            Buffer::from(bytes),
-            has_null.then(|| NullBuffer::new(validity.finish())),
-        )) as ArrayRef;
+        let offsets = OffsetBuffer::new(offsets.into());
+        let bytes = Buffer::from(bytes);
+        let nulls = has_null.then(|| NullBuffer::new(validity.finish()));
+        let array: ArrayRef = if target.data_type() == &DataType::Binary {
+            Arc::new(BinaryArray::new(offsets, bytes, nulls))
+        } else {
+            Arc::new(StringArray::new(offsets, bytes, nulls))
+        };
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
             target.data_type(),
             array,
-            Box::default(),
+            errors.into_boxed_slice(),
             || work.step(),
         )
     })();

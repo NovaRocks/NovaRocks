@@ -25,10 +25,10 @@ use crate::{
     kernel_input::EvaluationCheckpoints,
     string_repeat_pad_core::{self, CyclicCharacters, PadProjection, SourceCharacters},
 };
-use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{FunctionIntrinsicRowError, ValueLogicalType};
 use std::{alloc::Layout, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,16 +226,17 @@ pub(super) fn check_count(types: usize, arguments: usize) -> Result<(), StaticPr
 pub(super) fn check_argument(
     index: usize,
     ty: &FunctionArgumentType,
+    value_carrier: &DataType,
 ) -> Result<(), StaticProfileFailure> {
     let FunctionArgumentType::Value(ty) = ty else {
         return Err(StaticProfileFailure::Value);
     };
     if ty.logical_type() != ValueLogicalType::Physical
-        || *ty.data_type()
+        || ty.data_type()
             != if index != 1 {
-                DataType::Utf8
+                value_carrier
             } else {
-                DataType::Int64
+                &DataType::Int64
             }
     {
         return Err(StaticProfileFailure::Source);
@@ -244,12 +245,66 @@ pub(super) fn check_argument(
 }
 pub(super) fn check_result(target: &crate::FunctionValueType) -> Result<(), StaticProfileFailure> {
     if target.logical_type() != ValueLogicalType::Physical
-        || target.data_type() != &DataType::Utf8
+        || !matches!(target.data_type(), DataType::Utf8 | DataType::Binary)
         || !target.nullable()
     {
         return Err(StaticProfileFailure::Result);
     }
     Ok(())
+}
+
+enum PadRow<'a> {
+    Text { source: &'a str, fill: &'a str },
+    Binary { source: &'a [u8], fill: &'a [u8] },
+}
+
+impl PadRow<'_> {
+    fn empty_fill(&self) -> bool {
+        match self {
+            Self::Text { fill, .. } => fill.is_empty(),
+            Self::Binary { fill, .. } => fill.is_empty(),
+        }
+    }
+
+    fn render(
+        &self,
+        length: i64,
+        left: bool,
+        trino: bool,
+        mut projection: CompactPadProjection<'_, '_>,
+    ) -> Result<Option<usize>, KernelFailure> {
+        match *self {
+            Self::Text { source, fill } => string_repeat_pad_core::pad_into_with_limit(
+                source,
+                length,
+                || fill,
+                left,
+                (!trino).then_some(string_repeat_pad_core::MAX_STRING_BYTES),
+                projection,
+            ),
+            Self::Binary { source, fill } => {
+                let length = usize::try_from(length)
+                    .map_err(|_| internal("binary padding received an invalid checked length"))?;
+                if length <= source.len() {
+                    for byte in &source[..length] {
+                        projection.push(*byte)?;
+                    }
+                } else {
+                    let padding = fill.iter().cycle().take(length - source.len());
+                    if left {
+                        for byte in padding.chain(source) {
+                            projection.push(*byte)?;
+                        }
+                    } else {
+                        for byte in source.iter().chain(padding) {
+                            projection.push(*byte)?;
+                        }
+                    }
+                }
+                Ok(Some(projection.extent))
+            }
+        }
+    }
 }
 
 pub(super) fn evaluate_string_pad<'a>(
@@ -263,71 +318,96 @@ pub(super) fn evaluate_string_pad<'a>(
         let types = input.contract().selected().argument_types.as_ref();
         let arguments = input.arguments();
         check_count(types.len(), arguments.len()).map_err(|error| invalid(error.message()))?;
-        for (index, ty) in types.iter().enumerate() {
-            check_argument(index, ty).map_err(|error| invalid(error.message()))?;
-            work.step()?;
-        }
         let target = input.contract().result_type();
         check_result(target).map_err(|error| invalid(error.message()))?;
-        let strings = arguments[0]
-            .array()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| internal("lpad/rpad selected source is not Utf8"))?;
+        for (index, ty) in types.iter().enumerate() {
+            check_argument(index, ty, target.data_type())
+                .map_err(|error| invalid(error.message()))?;
+            work.step()?;
+        }
+        let trino = input.contract().effects().own_row_error == FunctionIntrinsicRowError::MayRaise;
+        let binary = target.data_type() == &DataType::Binary;
         let lengths = arguments[1]
             .array()
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| internal("lpad/rpad selected length is not Int64"))?;
-        let pads = arguments[2]
-            .array()
-            .as_any()
+        let source = arguments[0].array().as_any();
+        let fill = arguments[2].array().as_any();
+        let texts = source
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| internal("lpad/rpad selected padding is not Utf8"))?;
-        let selected_plan = |ordinal,
-                             batch_row,
-                             work: &mut EvaluationCheckpoints<'_>|
-         -> Result<Option<(&str, i64, usize)>, KernelFailure> {
-            let mut rows = [0usize; 3];
-            let mut is_null = false;
-            for (index, argument) in arguments.iter().enumerate() {
-                let row = argument.value_row(ordinal, batch_row);
-                rows[index] = row;
-                work.step()?;
-                if row >= argument.array().len() {
-                    return Err(internal("lpad/rpad selected argument row is out of bounds"));
-                }
-                if argument.array().is_null(row) {
-                    let FunctionArgumentType::Value(ty) = &types[index] else {
-                        return Err(invalid("lpad/rpad requires value arguments"));
-                    };
-                    if !ty.nullable() {
-                        return Err(internal(
-                            "lpad/rpad non-null argument contains selected SQL NULL",
-                        ));
+            .zip(fill.downcast_ref::<StringArray>());
+        let binaries = source
+            .downcast_ref::<BinaryArray>()
+            .zip(fill.downcast_ref::<BinaryArray>());
+        if (binary && (!trino || binaries.is_none())) || (!binary && texts.is_none()) {
+            return Err(internal(
+                "lpad/rpad selected carriers differ from their checked types",
+            ));
+        }
+        let left = op == StringPadOp::Left;
+        let selected_plan =
+            |ordinal,
+             batch_row,
+             work: &mut EvaluationCheckpoints<'_>|
+             -> Result<Result<Option<(PadRow<'_>, i64)>, &'static str>, KernelFailure> {
+                let mut rows = [0usize; 3];
+                let mut is_null = false;
+                for (index, argument) in arguments.iter().enumerate() {
+                    let row = argument.value_row(ordinal, batch_row);
+                    rows[index] = row;
+                    work.step()?;
+                    if row >= argument.array().len() {
+                        return Err(internal("lpad/rpad selected argument row is out of bounds"));
                     }
-                    is_null = true;
+                    if argument.array().is_null(row) {
+                        let FunctionArgumentType::Value(ty) = &types[index] else {
+                            return Err(invalid("lpad/rpad requires value arguments"));
+                        };
+                        if !ty.nullable() {
+                            return Err(internal(
+                                "lpad/rpad non-null argument contains selected SQL NULL",
+                            ));
+                        }
+                        is_null = true;
+                    }
                 }
-            }
-            if is_null {
-                return Ok(None);
-            }
-            Ok(Some((
-                strings.value(rows[0]),
-                lengths.value(rows[1]),
-                rows[2],
-            )))
-        };
+                if is_null {
+                    return Ok(Ok(None));
+                }
+                let length = lengths.value(rows[1]);
+                let row = if let Some((strings, pads)) = texts {
+                    PadRow::Text {
+                        source: strings.value(rows[0]),
+                        fill: pads.value(rows[2]),
+                    }
+                } else if let Some((binaries, pads)) = binaries {
+                    PadRow::Binary {
+                        source: binaries.value(rows[0]),
+                        fill: pads.value(rows[2]),
+                    }
+                } else {
+                    return Err(internal("lpad/rpad did not prepare a value carrier"));
+                };
+                if trino {
+                    if !(0..=i64::from(i32::MAX)).contains(&length) {
+                        return Ok(Err("Target length must be in the range [0..2147483647]"));
+                    }
+                    if row.empty_fill() {
+                        return Ok(Err("Padding must not be empty"));
+                    }
+                }
+                Ok(Ok(Some((row, length))))
+            };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            if let Some((text, count, pad_row)) = selected_plan(ordinal, batch_row, &mut work)?
-                && let Some(extent) = string_repeat_pad_core::pad_into(
-                    text,
+            if let Ok(Some((row, count))) = selected_plan(ordinal, batch_row, &mut work)?
+                && let Some(extent) = row.render(
                     count,
-                    || pads.value(pad_row),
-                    op == StringPadOp::Left,
+                    left,
+                    trino,
                     CompactPadProjection {
                         bytes: None,
                         total: 0,
@@ -357,34 +437,47 @@ pub(super) fn evaluate_string_pad<'a>(
         work.flush()?;
         offsets.push(0i32);
         let mut has_null = false;
+        let mut errors = Vec::new();
         for (ordinal, batch_row) in selection.iter().enumerate() {
             let measured = match selected_plan(ordinal, batch_row, &mut work)? {
-                None => None,
-                Some((text, count, pad_row)) => string_repeat_pad_core::pad_into(
-                    text,
-                    count,
-                    || pads.value(pad_row),
-                    op == StringPadOp::Left,
-                    CompactPadProjection {
-                        bytes: None,
-                        total: 0,
-                        extent: 0,
-                        work: &mut work,
-                    },
-                )?
-                .map(|extent| (text, count, pad_row, extent)),
+                Ok(None) => None,
+                Err(message) => {
+                    errors
+                        .try_reserve(1)
+                        .map_err(|_| KernelFailure::ResourceExhausted)?;
+                    errors.push(crate::RowDataError::with_reason(
+                        ordinal,
+                        crate::DataFailureReason::Domain(
+                            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                        ),
+                        message,
+                    ));
+                    None
+                }
+                Ok(Some((row, count))) => row
+                    .render(
+                        count,
+                        left,
+                        trino,
+                        CompactPadProjection {
+                            bytes: None,
+                            total: 0,
+                            extent: 0,
+                            work: &mut work,
+                        },
+                    )?
+                    .map(|extent| (row, count, extent)),
             };
             match measured {
                 None => {
                     has_null = true;
                     validity.append(false);
                 }
-                Some((text, count, pad_row, extent)) => {
-                    let written = string_repeat_pad_core::pad_into(
-                        text,
+                Some((row, count, extent)) => {
+                    let written = row.render(
                         count,
-                        || pads.value(pad_row),
-                        op == StringPadOp::Left,
+                        left,
+                        trino,
                         CompactPadProjection {
                             bytes: Some(&mut bytes),
                             total,
@@ -409,17 +502,20 @@ pub(super) fn evaluate_string_pad<'a>(
             ));
         }
         work.flush()?;
-        let array = Arc::new(StringArray::new(
-            OffsetBuffer::new(offsets.into()),
-            Buffer::from(bytes),
-            has_null.then(|| NullBuffer::new(validity.finish())),
-        )) as ArrayRef;
+        let offsets = OffsetBuffer::new(offsets.into());
+        let bytes = Buffer::from(bytes);
+        let nulls = has_null.then(|| NullBuffer::new(validity.finish()));
+        let array: ArrayRef = if binary {
+            Arc::new(BinaryArray::new(offsets, bytes, nulls))
+        } else {
+            Arc::new(StringArray::new(offsets, bytes, nulls))
+        };
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
             target.data_type(),
             array,
-            Box::default(),
+            errors.into_boxed_slice(),
             || work.step(),
         )
     })();

@@ -35,6 +35,7 @@ use std::{alloc::Layout, sync::Arc};
 pub(super) enum StringLocateOp {
     Locate,
     Instr,
+    Strpos,
 }
 
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
@@ -121,6 +122,69 @@ fn locate(
         .map_err(|_| internal("locate result exceeds Utf8 representation"))
 }
 
+fn strpos(
+    haystack: &str,
+    needle: &str,
+    instance: u64,
+    reverse: bool,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<i64, KernelFailure> {
+    if needle.is_empty() {
+        return Ok(1);
+    }
+    if instance > haystack.len() as u64 {
+        return Ok(0);
+    }
+    let mut range = 0..haystack.len();
+    let mut matched = 0;
+    while matched < instance {
+        let part = &haystack[range.clone()];
+        work.flush()?;
+        let found = if reverse {
+            part.rfind(needle)
+        } else {
+            part.find(needle)
+        };
+        work.flush()?;
+        let Some(found) = found else {
+            return Ok(0);
+        };
+        let start = range.start + found;
+        matched += 1;
+        if matched == instance {
+            let mut position = 1;
+            for character in haystack[..start].chars() {
+                observe_char(character, work)?;
+                position += 1;
+            }
+            return Ok(position);
+        }
+        // Resume at the next candidate boundary, including overlapping matches.
+        let remaining = if reverse {
+            let end = start + needle.len();
+            haystack[..end]
+                .char_indices()
+                .next_back()
+                .map(|(byte, _)| byte)
+        } else {
+            haystack[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(byte, _)| start + byte)
+        };
+        let Some(boundary) = remaining else {
+            return Ok(0);
+        };
+        if reverse {
+            range.end = boundary;
+        } else {
+            range.start = boundary;
+        }
+        work.step()?;
+    }
+    Ok(0)
+}
+
 pub(super) fn evaluate_string_locate<'a>(
     op: StringLocateOp,
     input: ScalarCallInput<'_, 'a>,
@@ -133,7 +197,7 @@ pub(super) fn evaluate_string_locate<'a>(
         let args = input.arguments();
         let valid_arity = match op {
             StringLocateOp::Instr => types.len() == 2,
-            StringLocateOp::Locate => matches!(types.len(), 2 | 3),
+            StringLocateOp::Locate | StringLocateOp::Strpos => matches!(types.len(), 2 | 3),
         };
         if !valid_arity || types.len() != args.len() {
             return Err(invalid(
@@ -159,9 +223,15 @@ pub(super) fn evaluate_string_locate<'a>(
             work.step()?;
         }
         let target = input.contract().result_type();
+        let is_strpos = op == StringLocateOp::Strpos;
+        let result_carrier = if is_strpos {
+            DataType::Int64
+        } else {
+            DataType::Int32
+        };
         if target.logical_type() != ValueLogicalType::Physical
-            || target.data_type() != &DataType::Int32
-            || !target.nullable()
+            || target.data_type() != &result_carrier
+            || (!is_strpos && !target.nullable())
         {
             return Err(invalid(
                 "locate/instr differs from its installed result profile",
@@ -169,7 +239,7 @@ pub(super) fn evaluate_string_locate<'a>(
         }
         let (haystack_index, needle_index) = match op {
             StringLocateOp::Locate => (1, 0),
-            StringLocateOp::Instr => (0, 1),
+            StringLocateOp::Instr | StringLocateOp::Strpos => (0, 1),
         };
         let haystacks = args[haystack_index]
             .array()
@@ -194,13 +264,24 @@ pub(super) fn evaluate_string_locate<'a>(
         };
         let selection = input.selection();
         output_capacity(selection.len())?;
+        if is_strpos {
+            Layout::array::<i64>(selection.len()).map_err(|_| KernelFailure::ResourceExhausted)?;
+        }
         work.flush()?;
         let mut values = Vec::new();
-        values
-            .try_reserve_exact(selection.len())
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut wide_values = Vec::new();
+        if is_strpos {
+            wide_values
+                .try_reserve_exact(selection.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+        } else {
+            values
+                .try_reserve_exact(selection.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+        }
         work.flush()?;
         let mut validity = BooleanBufferBuilder::new(selection.len());
+        let mut errors = Vec::new();
         work.flush()?;
         let mut has_null = false;
         for (ordinal, batch_row) in selection.iter().enumerate() {
@@ -225,33 +306,58 @@ pub(super) fn evaluate_string_locate<'a>(
                     is_null = true;
                 }
             }
-            if is_null {
-                values.push(0);
-                validity.append(false);
-                has_null = true;
+            let value = if is_null {
+                None
             } else {
                 let start = starts.map_or(1, |array| array.value(rows[2]));
-                values.push(locate(
-                    haystacks.value(rows[haystack_index]),
-                    needles.value(rows[needle_index]),
-                    start,
-                    &mut work,
-                )?);
-                validity.append(true);
+                let haystack = haystacks.value(rows[haystack_index]);
+                let needle = needles.value(rows[needle_index]);
+                if !is_strpos {
+                    Some(i64::from(locate(haystack, needle, start, &mut work)?))
+                } else if let Some(instance) = start.checked_abs().filter(|value| *value != 0) {
+                    Some(strpos(
+                        haystack,
+                        needle,
+                        instance as u64,
+                        start < 0,
+                        &mut work,
+                    )?)
+                } else {
+                    errors
+                        .try_reserve(1)
+                        .map_err(|_| KernelFailure::ResourceExhausted)?;
+                    errors.push(crate::RowDataError::with_reason(
+                        ordinal,
+                        crate::DataFailureReason::Domain(
+                            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                        ),
+                        "'instance' must be a positive or negative number.",
+                    ));
+                    None
+                }
+            };
+            if is_strpos {
+                wide_values.push(value.unwrap_or(0));
+            } else {
+                values.push(value.unwrap_or(0) as i32);
             }
+            validity.append(value.is_some());
+            has_null |= value.is_none();
             work.step()?;
         }
         work.flush()?;
-        let array = Arc::new(Int32Array::new(
-            values.into(),
-            has_null.then(|| NullBuffer::new(validity.finish())),
-        )) as ArrayRef;
+        let nulls = has_null.then(|| NullBuffer::new(validity.finish()));
+        let array = if is_strpos {
+            Arc::new(Int64Array::new(wide_values.into(), nulls)) as ArrayRef
+        } else {
+            Arc::new(Int32Array::new(values.into(), nulls)) as ArrayRef
+        };
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
             target.data_type(),
             array,
-            Box::default(),
+            errors.into_boxed_slice(),
             || work.step(),
         )
     })();

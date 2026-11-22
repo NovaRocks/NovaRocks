@@ -40,6 +40,7 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ConcatKind {
     String,
+    TrinoScalar,
     Array,
     Append,
     Prepend,
@@ -53,6 +54,10 @@ impl ConcatKind {
             _ => None,
         }
     }
+
+    fn scalar(self) -> bool {
+        matches!(self, Self::String | Self::TrinoScalar)
+    }
 }
 
 pub(super) fn overload_kind(name: &str, signature: &str) -> Option<ConcatKind> {
@@ -60,6 +65,13 @@ pub(super) fn overload_kind(name: &str, signature: &str) -> Option<ConcatKind> {
         "concat" if signature.starts_with("(list<any<T>>,any<T>)") => Some(ConcatKind::Append),
         "concat" if signature.starts_with("(any<T>,list<any<T>>)") => Some(ConcatKind::Prepend),
         "concat" if signature.starts_with("(list<") => Some(ConcatKind::Array),
+        "concat"
+            if ["(varchar(", "(char(", "(binary"]
+                .into_iter()
+                .any(|prefix| signature.starts_with(prefix)) =>
+        {
+            Some(ConcatKind::TrinoScalar)
+        }
         _ => operation(name),
     }
 }
@@ -71,13 +83,13 @@ pub(super) fn operation(name: &str) -> Option<ConcatKind> {
     }
 }
 
-/// Concatenation is strict and stateless. Array calls with one non-null
-/// argument report a row error.
+/// Concatenation is strict and stateless. Array arity and the Trino scalar
+/// output boundary can report row errors.
 pub(super) fn effects(kind: ConcatKind) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: match kind {
-            ConcatKind::Array => FunctionIntrinsicRowError::MayRaise,
+            ConcatKind::Array | ConcatKind::TrinoScalar => FunctionIntrinsicRowError::MayRaise,
             _ => FunctionIntrinsicRowError::NoRowError,
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
@@ -177,7 +189,7 @@ impl ConcatOwner {
 
     fn call_effects(kind: ConcatKind, scope: CallProofScope, arguments: usize) -> CallEffects {
         let base = effects(kind);
-        let own_row_error = if arguments == 1 {
+        let own_row_error = if matches!(kind, ConcatKind::TrinoScalar) || arguments == 1 {
             base.own_row_error
         } else {
             FunctionIntrinsicRowError::NoRowError
@@ -313,14 +325,16 @@ impl PreparedScalarKernel for PreparedConcat {
 
     fn instance_retained_upper_bound(&self) -> usize {
         match self.kind {
-            ConcatKind::String => std::mem::size_of::<StringConcatInstance>(),
+            ConcatKind::String | ConcatKind::TrinoScalar => {
+                std::mem::size_of::<StringConcatInstance>()
+            }
             _ => std::mem::size_of::<ArrayConcatInstance>(),
         }
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
         Ok(match self.kind {
-            ConcatKind::String => Box::new(StringConcatInstance),
+            ConcatKind::String | ConcatKind::TrinoScalar => Box::new(StringConcatInstance),
             kind => Box::new(ArrayConcatInstance(kind)),
         })
     }
@@ -513,7 +527,7 @@ impl ConcatOwner {
             })?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
-            if !matches!(kind, ConcatKind::String) {
+            if !kind.scalar() {
                 super::array_concat::validate_profile(&contract, kind.element(), || {
                     work.step().map_err(compile_failure)
                 })?;
