@@ -544,3 +544,113 @@ fn decode_contract(detail: impl std::fmt::Display) -> KernelFailure {
 #[cfg(test)]
 #[path = "string_url_decode_tests.rs"]
 mod tests;
+
+#[derive(Clone, Copy)]
+pub(super) enum TrinoUrlDecode {
+    Form,
+    UriComponent,
+}
+
+impl TrinoUrlDecode {
+    pub(super) fn decode(
+        self,
+        input: &str,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Result<String, &'static str>, KernelFailure> {
+        let mut output = String::new();
+        work.flush()?;
+        output
+            .try_reserve_exact(input.len())
+            .map_err(|source| super::string_failure::reservation::<u8>(input.len(), source))?;
+        let mut remaining = input;
+        while let Some(ch) = remaining.chars().next() {
+            work.step()?;
+            if ch == '%' {
+                let (decoded, consumed) = match decode_escape(remaining, work)? {
+                    Ok(value) => value,
+                    Err(error) => return Ok(Err(error)),
+                };
+                output.push(decoded);
+                remaining = &remaining[consumed..];
+            } else {
+                let ch = if matches!(self, Self::Form) && ch == '+' {
+                    ' '
+                } else {
+                    ch
+                };
+                output.push(ch);
+                remaining = &remaining[ch.len_utf8()..];
+            }
+        }
+        Ok(Ok(output))
+    }
+}
+
+fn decode_escape(
+    input: &str,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Result<(char, usize), &'static str>, KernelFailure> {
+    let mut decoded = [0; 4];
+    let mut boundaries = [0; 4];
+    let mut length = 0;
+    let mut consumed = 0;
+    let mut expected = 1;
+    while length < expected && input[consumed..].starts_with('%') {
+        work.step()?;
+        let mut chars = input[consumed + 1..].chars();
+        let (Some(left), Some(right)) = (chars.next(), chars.next()) else {
+            return Ok(Err("URLDecoder: incomplete trailing escape (%) pattern"));
+        };
+        if !left.is_ascii() || !right.is_ascii() {
+            return Ok(Err(
+                "URLDecoder: illegal hexadecimal digit in escape (%) pattern",
+            ));
+        }
+        let (Some(high), Some(low)) = (
+            hex((left as u8).to_ascii_uppercase()),
+            hex((right as u8).to_ascii_uppercase()),
+        ) else {
+            return Ok(Err(
+                "URLDecoder: illegal hexadecimal digit in escape (%) pattern",
+            ));
+        };
+        let byte = high * 16 + low;
+        if length == 0 {
+            expected = match byte {
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => 1,
+            };
+        }
+        consumed += 1 + left.len_utf8() + right.len_utf8();
+        decoded[length] = byte;
+        boundaries[length] = consumed;
+        length += 1;
+    }
+    let text = &decoded[..length];
+    match std::str::from_utf8(text) {
+        Ok(value) => Ok(Ok((
+            value
+                .chars()
+                .next()
+                .expect("an escape decodes at least one byte"),
+            consumed,
+        ))),
+        Err(error) => {
+            // Java UTF-8 consumes an entire encoded surrogate, or its available
+            // continuation prefix, as a single malformed sequence.
+            let malformed =
+                if length >= 2 && decoded[0] == 0xed && (0xa0..=0xbf).contains(&decoded[1]) {
+                    if length == 3 && (0x80..=0xbf).contains(&decoded[2]) {
+                        3
+                    } else {
+                        2
+                    }
+                } else {
+                    error.error_len().unwrap_or(length)
+                };
+            Ok(Ok(('\u{fffd}', boundaries[malformed - 1])))
+        }
+    }
+}

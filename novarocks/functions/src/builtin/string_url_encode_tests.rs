@@ -729,3 +729,23 @@ fn required_url_encoding_shares_oracles_and_exact_scalar_broadcast() {
         vec![Some("%2F%2B"), None, Some("")]
     );
 }
+
+#[test]
+fn url_encode_trino_form_matches_trino_escape_bytes() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    let values: ArrayRef = Arc::new(StringArray::from(vec![Some("a b~*%+中"), Some(""), None]));
+    let encoded = build_encoded(
+        EvaluatedArgument::Column(&values),
+        Selection::all(3),
+        true,
+        Encoding::Form,
+        &mut work,
+    )
+    .unwrap();
+    let encoded = encoded.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        encoded.iter().collect::<Vec<_>>(),
+        [Some("a+b%7E*%25%2B%E4%B8%AD"), Some(""), None],
+    );
+}

@@ -466,3 +466,112 @@ fn string_parse_url_output_representation_gates_do_not_claim_funding() {
     assert!(output_capacity(0, i32::MAX as usize + 1).is_err());
     assert!(output_capacity(0, 0).is_ok());
 }
+
+#[test]
+fn parse_url_trino_preserves_raw_components_and_parameter_order() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    let url = "HTTP://ExAmPle.test:80/a/../b?%71=first+name&q=second%26name&q=third#c%2B+d";
+    let result = |part, key, work: &mut EvaluationCheckpoints<'_>| {
+        url_text_part(part, url, key, work)
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(result(TrinoUrlPart::Protocol, None, &mut work), "HTTP");
+    assert_eq!(result(TrinoUrlPart::Host, None, &mut work), "ExAmPle.test");
+    assert_eq!(result(TrinoUrlPart::Path, None, &mut work), "/a/../b");
+    assert_eq!(result(TrinoUrlPart::Fragment, None, &mut work), "c++d");
+    assert_eq!(
+        result(TrinoUrlPart::Parameter, Some("%71"), &mut work),
+        "first name"
+    );
+    assert_eq!(
+        result(TrinoUrlPart::Parameter, Some("q"), &mut work),
+        "second&name"
+    );
+    assert_eq!(
+        TrinoUri::parse(url, &mut work).unwrap().unwrap().port,
+        Some(80)
+    );
+    assert_eq!(
+        TrinoUri::parse("a?q=1", &mut work).unwrap().unwrap().port,
+        None
+    );
+}
+
+#[test]
+fn parse_url_trino_distinguishes_empty_absent_and_invalid_components() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    for (source, host, port, path) in [
+        ("///", "", None, "/"),
+        ("mailto:me@example.com?subject=Hi", "", None, ""),
+        ("http://a_b:7/", "", None, "/"),
+        ("http://a:2147483648/", "", None, "/"),
+        ("http://a:65536/", "a", Some(65536), "/"),
+        ("http://[fe80::1%eth0]/", "[fe80::1%eth0]", None, "/"),
+        (
+            "http://[::ffff:192.001.001.1]/",
+            "[::ffff:192.001.001.1]",
+            None,
+            "/",
+        ),
+    ] {
+        let parsed = TrinoUri::parse(source, &mut work).unwrap().unwrap();
+        assert_eq!(parsed.port, port, "{source}");
+        assert_eq!(parsed.text(TrinoUrlPart::Host), host, "{source}");
+        assert_eq!(parsed.text(TrinoUrlPart::Path), path, "{source}");
+    }
+    for source in ["//", "http:", "http://[v1.z]/", "/a[b]", "/a?q=%"] {
+        assert!(
+            TrinoUri::parse(source, &mut work).unwrap().is_none(),
+            "{source}"
+        );
+    }
+    for (key, value) in [("a", Some("")), ("q", Some("")), ("missing", None)] {
+        assert_eq!(
+            TrinoUri::parse("/a?a&q=&q=after", &mut work)
+                .unwrap()
+                .unwrap()
+                .raw_parameter(key, &mut work)
+                .unwrap(),
+            value
+        );
+    }
+    assert_eq!(
+        url_text_part(TrinoUrlPart::Query, "/a?q=[a%20b]+", None, &mut work)
+            .unwrap()
+            .unwrap(),
+        Some("q=[a b]+".into())
+    );
+}
+
+#[test]
+fn url_decode_trino_form_keeps_java_replacement_and_escape_rules() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    for (source, value) in [
+        ("%4a+%e4%b8%ad", "J 中"),
+        ("%ED%A0%80", "\u{fffd}"),
+        ("%ED%A0%41", "\u{fffd}A"),
+        ("%E0%80%80", "\u{fffd}\u{fffd}\u{fffd}"),
+        ("%F0%9F%98%80", "😀"),
+    ] {
+        assert_eq!(
+            TrinoUrlDecode::Form
+                .decode(source, &mut work)
+                .unwrap()
+                .unwrap(),
+            value
+        );
+    }
+    for source in ["%0", "%+1", "%ＡＦ", "%GG"] {
+        assert!(
+            TrinoUrlDecode::Form
+                .decode(source, &mut work)
+                .unwrap()
+                .is_err()
+        );
+    }
+}
