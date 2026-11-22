@@ -157,7 +157,7 @@ SELECT
     id,
     decimal_map_50,
     cardinality(decimal_map_50) as map_size,
-    decimal_map_50['price'] as price_value,
+    element_at(decimal_map_50, 'price') as price_value,
     MAP_KEYS(decimal_map_50) as all_keys,
     MAP_VALUES(decimal_map_50) as all_values
 FROM ${case_db}.decimal_map_test
@@ -170,8 +170,8 @@ SELECT
     id,
     decimal_map_76,
     cardinality(decimal_map_76) as map_size,
-    decimal_map_76['large_num1'] as large_value1,
-    decimal_map_76['negative'] as negative_value
+    element_at(decimal_map_76, 'large_num1') as large_value1,
+    element_at(decimal_map_76, 'negative') as negative_value
 FROM ${case_db}.decimal_map_test
 WHERE cardinality(decimal_map_76) > 0
 ORDER BY id;
@@ -183,7 +183,7 @@ SELECT
     id,
     key_decimal_map,
     cardinality(key_decimal_map) as map_size,
-    key_decimal_map[1234567890123456789012345678.1234567890] as value_for_key,
+    element_at(key_decimal_map, 1234567890123456789012345678.1234567890) as value_for_key,
     MAP_KEYS(key_decimal_map) as decimal_keys
 FROM ${case_db}.decimal_map_test
 WHERE cardinality(key_decimal_map) > 0
@@ -246,7 +246,7 @@ SELECT
     portfolio[1].quantity as first_quantity,
     portfolio[1].price as first_price,
     portfolio[1].quantity * portfolio[1].price as first_total_value,
-    portfolio[1].metadata['daily_change'] as first_daily_change
+    element_at(portfolio[1].metadata, 'daily_change') as first_daily_change
 FROM ${case_db}.complex_nested_test
 ORDER BY id;
 
@@ -256,10 +256,10 @@ SELECT
     'Test11_RISK_METRICS_ANALYSIS' as test_name,
     id,
     cardinality(risk_metrics) as metrics_count,
-    CARDINALITY(risk_metrics['volatility']) as volatility_points,
-    risk_metrics['volatility'][1] as first_volatility
+    CARDINALITY(element_at(risk_metrics, 'volatility')) as volatility_points,
+    element_at(risk_metrics, 'volatility')[1] as first_volatility
 FROM ${case_db}.complex_nested_test
-WHERE risk_metrics['volatility'] IS NOT NULL
+WHERE element_at(risk_metrics, 'volatility') IS NOT NULL
 ORDER BY id;
 
 -- query 12

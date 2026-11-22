@@ -54,7 +54,7 @@ insert into ${case_db}.sc2 values ROW(5, MAP(ARRAY[5], ARRAY[MAP(ARRAY[50], ARRA
 select st1.s1, st2.sa2 from ${case_db}.sc2;
 
 -- query 3
-select st1.sm2[10], cardinality(map1[3][30]), st2.sa2[1]  from ${case_db}.sc2;
+select element_at(st1.sm2, 10), cardinality(element_at(element_at(map1, 3), 30)), st2.sa2[1]  from ${case_db}.sc2;
 
 -- query 4
 select st2.ss3.sss1, st2.ss3.sss2.ssss2, st2.ss3 from ${case_db}.sc2;
@@ -72,7 +72,7 @@ select st1.sm2, map_keys(map1) from ${case_db}.t1 join ${case_db}.sc2 on ${case_
 select * from ${case_db}.sc2 union all select * from ${case_db}.sc2;
 
 -- query 9
-select x1.st1.sm2, x1.st2.ss3 from ${case_db}.sc2 x1 union all select x2.st1.sm3[10], x2.st2.ss3 from ${case_db}.sc2 x2;
+select x1.st1.sm2, x1.st2.ss3 from ${case_db}.sc2 x1 union all select element_at(x2.st1.sm3, 10), x2.st2.ss3 from ${case_db}.sc2 x2;
 
 -- query 10
 select x.st2.ss3 from (select * from ${case_db}.sc2 union all select * from ${case_db}.sc2) x;

@@ -75,7 +75,7 @@ select cardinality(m1) from ${case_db}.sc3 where m1[1] = 12;
 select cardinality(m1), map_values(m1) from ${case_db}.sc3 where m1[2] = 23;
 
 -- query 15
-select cardinality(m1), m1[3] from ${case_db}.sc3 where m1[2] = 23;
+select cardinality(m1), element_at(m1, 3) from ${case_db}.sc3 where m1[2] = 23;
 
 -- query 16
 select cardinality(m1) from ${case_db}.sc3 where m1[1] = 12;

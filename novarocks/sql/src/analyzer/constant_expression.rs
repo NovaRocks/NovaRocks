@@ -309,10 +309,6 @@ impl super::AnalyzerContext<'_> {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "A prepared constant retains its original SQL input environment."
-)]
 fn prepare_typed(
     expression: TypedExpr,
     target: RequiredConstantTarget,

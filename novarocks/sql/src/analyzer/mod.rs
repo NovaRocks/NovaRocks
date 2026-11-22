@@ -293,6 +293,10 @@ pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Analysis receives the original statement inputs, assignments, and table arguments."
+)]
 pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,

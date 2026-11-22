@@ -18,7 +18,7 @@
 -- @order_sensitive=true
 -- @tags=complex,map
 -- Test Objective:
--- Regression for the map higher-order functions map_apply / transform_keys /
+-- Regression for the map higher-order functions transform_keys and
 -- transform_values. Their (key, value) lambda parameters must bind as lambda
 -- slots (LambdaParamRef), not as freshly-minted scope columns. The latter
 -- produced a phantom ColumnId for each parameter, which the ColumnId-binding
@@ -32,8 +32,8 @@
 
 -- query 1
 -- transform_keys: rewrite keys, values pass through.
-SELECT transform_keys((k, v) -> k + 100, MAP(ARRAY[1, 2], ARRAY[10, 20])) AS keyed;
+SELECT transform_keys(MAP(ARRAY[1, 2], ARRAY[10, 20]), (k, v) -> k + 100) AS keyed;
 
 -- query 2
 -- transform_values: rewrite values, keys pass through.
-SELECT transform_values((k, v) -> v * 2, MAP(ARRAY[1, 2], ARRAY[10, 20])) AS valued;
+SELECT transform_values(MAP(ARRAY[1, 2], ARRAY[10, 20]), (k, v) -> v * 2) AS valued;

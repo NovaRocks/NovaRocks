@@ -19,7 +19,7 @@
 -- Test Objective:
 -- Validate JOIN correctness for MAP-typed columns across all join types.
 -- Covers: INNER, LEFT/RIGHT/FULL OUTER, EXISTS/NOT EXISTS, IN/NOT IN subqueries,
--- NULL-safe equal (<=>), and map_apply expressions in join predicates.
+-- NULL-safe equality and map transformations in join predicates.
 -- MAP value types include: simple (int→string), nested array, nested map, and struct.
 -- Also verifies FE rejects unsupported MAP comparisons (cross-type, JSON, non-equality).
 
@@ -213,18 +213,19 @@ SELECT pk, map1 NOT IN (SELECT map0 FROM ${case_db}.map_test s) AS membership FR
 -- query 29
 SELECT pk, map5 NOT IN (SELECT map5 FROM ${case_db}.map_test s) AS membership FROM ${case_db}.map_test ORDER BY pk;
 
--- ========== map_apply in join predicate ==========
+-- ========== Map transformations in join predicates ==========
 
 -- query 30
 SELECT t.map2, s.map2
 FROM ${case_db}.map_test t JOIN ${case_db}.map_test s
-  ON transform_values((k,v) -> cardinality(v), transform_keys((k,v) -> k+1, s.map2)) = transform_values((k,v) -> cardinality(v), transform_keys((k,v) -> k+1, t.map2))
+  ON transform_values(transform_keys(s.map2, (k, v) -> k + 1), (k, v) -> cardinality(v))
+     = transform_values(transform_keys(t.map2, (k, v) -> k + 1), (k, v) -> cardinality(v))
 ORDER BY t.pk;
 
 -- query 31
 SELECT t.map2, s.map2
 FROM ${case_db}.map_test t JOIN ${case_db}.map_test s
-  ON transform_keys((k,v) -> k+1, s.map2) = transform_keys((k,v) -> k+1, t.map2)
+  ON transform_keys(s.map2, (k, v) -> k + 1) = transform_keys(t.map2, (k, v) -> k + 1)
 ORDER BY t.pk;
 
 -- query 32

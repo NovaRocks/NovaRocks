@@ -78,7 +78,7 @@ select map_agg(c1, c3)[4] from t1;
 
 -- query 10
 USE ${case_db};
-select map_agg(c1, c3)[5] from t1;
+select element_at(map_agg(c1, c3), 5) from t1;
 
 -- query 11
 USE ${case_db};
@@ -150,7 +150,7 @@ select map_agg(c1, c3)[4] from t1;
 
 -- query 28
 USE ${case_db};
-select map_agg(c1, c3)[5] from t1;
+select element_at(map_agg(c1, c3), 5) from t1;
 
 -- query 29
 USE ${case_db};

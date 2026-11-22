@@ -247,7 +247,7 @@ select cast(percentile_approx_weighted(c12[1], c1, 0.5) as int) from t1;
 
 -- query 50
 USE ${case_db};
-select cast(percentile_approx_weighted(c12[2], c1, 0.5) as int) from t1;
+select cast(percentile_approx_weighted(element_at(c12, 2), c1, 0.5) as int) from t1;
 
 -- query 51
 USE ${case_db};
@@ -436,7 +436,7 @@ select cast(percentile_approx_weighted(c12[1], c1, 0.5) as int) from t1;
 
 -- query 96
 USE ${case_db};
-select cast(percentile_approx_weighted(c12[2], c1, 0.5) as int) from t1;
+select cast(percentile_approx_weighted(element_at(c12, 2), c1, 0.5) as int) from t1;
 
 -- query 97
 USE ${case_db};
