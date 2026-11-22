@@ -34,7 +34,7 @@ fn aggregates(
     plan: &PhysicalPlan,
 ) -> impl Iterator<Item = (&Fragment, &PhysicalNode, &[AggregateCall])> {
     plan.fragments().values().flat_map(|fragment| {
-        fragment.nodes().values().filter_map(|node| {
+        fragment.nodes().values().filter_map(move |node| {
             let NodeKind::Aggregate { calls, .. } = &node.kind else {
                 return None;
             };
