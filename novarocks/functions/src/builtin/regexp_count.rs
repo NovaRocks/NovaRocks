@@ -28,6 +28,9 @@ use arrow_schema::DataType;
 use regex::Regex;
 use std::{alloc::Layout, sync::Arc};
 
+#[cfg(test)]
+mod f10;
+
 /// Exact source-to-error projection from the frozen caller contract.
 /// This flag is not a KnownConstant test or a request to inspect an AST.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
