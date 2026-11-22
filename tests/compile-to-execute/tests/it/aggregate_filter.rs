@@ -345,9 +345,25 @@ fn filtered_distinct_and_its_sibling_update_after_a_single_gather() {
         node.required_inputs[0].distribution,
         Distribution::Singleton
     );
-    let input = &fragment.nodes()[&node.inputs[0]];
-    assert!(matches!(&input.kind, NodeKind::ExchangeSource { edge, .. }
-        if plan.edges()[edge].partitioning.destination == Distribution::Singleton));
+    let mut input = &fragment.nodes()[&node.inputs[0]];
+    while matches!(input.kind, NodeKind::Project { .. }) {
+        let [child] = input.inputs.as_ref() else {
+            panic!("the aggregate's input Project is unary");
+        };
+        input = &fragment.nodes()[child];
+    }
+    let NodeKind::ExchangeSource { edge, .. } = &input.kind else {
+        panic!("the Single aggregate receives a gathered distributed input");
+    };
+    let edge = &plan.edges()[edge];
+    assert_eq!(edge.partitioning.destination, Distribution::Singleton);
+    let producer = &plan.fragments()[&edge.source.fragment];
+    assert_eq!(
+        producer.nodes()[&producer.root()]
+            .output_properties
+            .distribution,
+        Distribution::Unconstrained,
+    );
     let ProgramNodeKind::Aggregate { functions, .. } =
         local_aggregate(&programs[&fragment.id()], node).kind()
     else {
