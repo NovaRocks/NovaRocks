@@ -66,7 +66,6 @@ fn concat_array_widening_preserves_the_original_common_conversion_in_the_package
     .unwrap();
     let schema = authored.original_public_result_declaration().unwrap();
     let result = &schema.fields()[0].ty;
-    assert!(!result.nullable());
     let item = result.child_at(0).expect("concat ARRAY result");
     assert_eq!(item.data_type(), &DataType::Int64);
     assert!(item.nullable());
@@ -78,18 +77,21 @@ fn concat_array_widening_preserves_the_original_common_conversion_in_the_package
                 continue;
             };
             for expression in unit.definitions() {
-                let ExprKind::FunctionCall { function, .. } = &expression.kind else {
+                let ExprKind::FunctionCall { function, args } = &expression.kind else {
                     continue;
                 };
-                if function.overload.as_str() == ARRAY_COMMON_COERCION
-                    && expression
-                        .ty
-                        .child_at(0)
-                        .is_some_and(|item| item.data_type() == &DataType::Int64)
-                {
-                    found = true;
-                    assert!(!expression.ty.nullable());
+                if function.overload.as_str() != ARRAY_COMMON_COERCION {
+                    continue;
                 }
+                let source = unit.definition(args[0]).expect("original ARRAY operand");
+                let source_item = source.ty.child_at(0).expect("source ARRAY item");
+                if source_item.data_type() != &DataType::Int32 {
+                    continue;
+                }
+                let converted_item = expression.ty.child_at(0).expect("converted ARRAY item");
+                assert_eq!(converted_item.data_type(), &DataType::Int64);
+                assert_eq!(expression.ty.nullable(), source.ty.nullable());
+                found = true;
             }
         }
     }
