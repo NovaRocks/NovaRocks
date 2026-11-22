@@ -37,7 +37,8 @@ shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-public
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_optimize_default_spec.py" evolve '${iceberg_rest_uri}' '${uuid0}' 'ns_${uuid0}.rows_under_test'
 -- @expect_trino_error=ICEBERG_COMMIT_ERROR,EXTERNAL
--- @expect_error=Default partition spec id does not match
+-- The base table starts with spec 0 and the single Spark evolution creates spec 1.
+-- @expect_error=Failed to commit the transaction during optimize: CatalogCommitConflicts, context: { expected: 0, found: 1 } => Requirement failed: Default partition spec id does not match
 ALTER TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.rows_under_test EXECUTE optimize;
 
 -- query 4

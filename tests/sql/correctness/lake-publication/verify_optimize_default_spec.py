@@ -53,7 +53,7 @@ def evolve(uri, table, evidence):
     metadata = load_metadata(uri, table)
     changed = assignment(metadata)
     if (changed["head"] != original["head"] or changed["snapshots"] != original["snapshots"]
-            or changed["default"] == original["default"]
+            or (original["default"], changed["default"]) != (0, 1)
             or original["default"] not in {spec["spec-id"] for spec in metadata["partition-specs"]}):
         raise RuntimeError(f"expected metadata-only evolution retaining the old spec: {original}, {changed}")
     with (evidence / "spec-evolution.json").open("x") as saved:
