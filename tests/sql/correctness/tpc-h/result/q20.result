@@ -1,5 +1,5 @@
 -- query 1
--- legacy
+-- types	varchar	varchar
 s_name	s_address
 Supplier#000000203	wvdhblw9JkIe52z0gnGSDrDBsMsI3Aidqk
 Supplier#000000230	TgT146Clu9ODbYYBx4Wd8oe
@@ -21,7 +21,7 @@ Supplier#000001270	KCFX9tQ sql2ed6fy
 Supplier#000001533	kPJJrNAF8d85BDu8L8
 Supplier#000001596	HBhVIq44Ayc8uf
 Supplier#000001743	z6LShIN5U71h2wxKr,NzNpbLzyvu21glBlMoWj
-Supplier#000001810	Njhy11HtKe lgtid0bI05kw mLkQxcFvqV8AtI3 
+Supplier#000001810	"Njhy11HtKe lgtid0bI05kw mLkQxcFvqV8AtI3 "
 Supplier#000001823	Whl3blLj9o29SyPJk ZJ7pXPL9uAvvOadEvIkd1
 Supplier#000001854	e161D2fCjS51q ,b7hHM3UK1wf1I7G
 Supplier#000001884	9 DQynTCKNx1,hTiMBYVmwlg8KWs,U
@@ -88,7 +88,7 @@ Supplier#000004773	l bLnfPKIIlBWC8czckJ20HGUh0
 Supplier#000004777	SW3Z2kGqWSlYxqkpXJb3a9MkZFtrQ,h09
 Supplier#000004803	w7bQ4PCqVCZjaAtb
 Supplier#000004841	5fI2WUviQ30OLcvqZ
-Supplier#000004863	lK3WbF5Zi21qYJ3GYR,wj 
+Supplier#000004863	"lK3WbF5Zi21qYJ3GYR,wj "
 Supplier#000004881	cq9O84kVGKZ4FuPauZWuZcuio1psUq
 Supplier#000004892	QSwl0pUwGhVMWbV8CH,jj8jsX,FAzGapT
 Supplier#000005054	KJ34,rOzK2NUiznv
@@ -97,7 +97,7 @@ Supplier#000005098	AfuGe4l9jVsZSRUuuIAUQ7q9uREXFTT
 Supplier#000005132	Z0t9cqKCy6ZugNI73N6EjPd1P0hwjGzH
 Supplier#000005203	8uIpv041PoCb034MOB LeEzbtOgqY51aK
 Supplier#000005214	FpKoJu0V7zK7eiMtEgVCgdQ
-Supplier#000005324	BH2OtHA997bh6QOs351YE 
+Supplier#000005324	"BH2OtHA997bh6QOs351YE "
 Supplier#000005328	qKN,R5,XAFQamNkEbPrM7us ,5X LWn
 Supplier#000005356	dpdqrSpkO,PRgOYT9Dfx2iTUewB5G1Et
 Supplier#000005411	f6zhj5JRnAr
@@ -142,7 +142,7 @@ Supplier#000007184	AKfsS0cnFq64dK
 Supplier#000007204	oYlakHfCcD,V7m8e4hVEW7Dn4kpPEou2yZdFIP
 Supplier#000007273	jpW05hgHIR1ax0pkU93nbvDrYsXhA
 Supplier#000007281	sDqiFy Lfa9G5sLhA1mw7fuUSFB
-Supplier#000007380	MRgHoeIsZf1lA 
+Supplier#000007380	"MRgHoeIsZf1lA "
 Supplier#000007435	xPZenvNfjvw fnSNYUUTW6f
 Supplier#000007445	TySK7rEzzGe4gB6u,,4CSDM0iTx
 Supplier#000007510	ixO6595C3ZwVRbBzPW1Pu

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SQL analysis preserves exact LARGEINT conversion, typing, and control boundaries.
+//! SQL analysis reports the retired LARGEINT declaration with its original source context.
 
 use super::*;
 use arrow::datatypes::DataType;
@@ -67,67 +67,47 @@ fn analyze_largeint_cast(
     ))
 }
 
-#[test]
-fn public_numeric_largeint_cast_accepts_all_five_new_source_types() {
-    // B8c-6 installs these conversions; the prior Decimal refusal is retired.
-    for source in [
-        DataType::Decimal128(38, 15),
-        DataType::Decimal256(50, 15),
-        DataType::Float32,
-        DataType::Float64,
-        DataType::Boolean,
-    ] {
-        assert!(
-            analyze_largeint_cast(
-                "SELECT CAST(v AS LARGEINT) FROM t",
-                source.clone(),
-                SqlCompileControl::unbounded(),
-            )
-            .is_ok(),
-            "the exact {source:?} -> LARGEINT conversion must bind"
-        );
-    }
-}
-
-#[test]
-fn public_largeint_cast_preserves_null_and_other_conversion_paths() {
-    for sql in [
-        "SELECT CAST(NULL AS LARGEINT)",
-        "SELECT CAST(CAST(NULL AS DECIMAL(38,15)) AS LARGEINT)",
-    ] {
-        assert!(
-            analyze_largeint_cast(
-                sql,
-                DataType::Decimal128(38, 15),
-                SqlCompileControl::unbounded(),
-            )
-            .is_ok(),
-            "typed SQL NULL must keep its existing conversion path: {sql}"
-        );
-    }
-    assert!(
-        analyze_largeint_cast(
-            "SELECT CAST(v AS LARGEINT) FROM t",
-            DataType::Int64,
-            SqlCompileControl::unbounded(),
-        )
-        .is_ok(),
-        "the installed signed-integer conversion remains available"
-    );
-    let error = match analyze_largeint_cast(
-        "SELECT CAST(v AS LARGEINT) FROM t",
-        DataType::Binary,
-        SqlCompileControl::unbounded(),
-    ) {
+fn assert_retired_largeint_target(sql: &str, source: DataType) {
+    let error = match analyze_largeint_cast(sql, source, SqlCompileControl::unbounded()) {
         Err(SqlCompileError::Analyze(error)) => error,
-        Err(error) => panic!("expected existing type error, got {error:?}"),
-        Ok(_) => panic!("invalid binary conversion was accepted"),
+        Err(error) => panic!("expected a retired type error, got {error:?}"),
+        Ok(_) => panic!("a retired LARGEINT conversion was accepted: {sql}"),
     };
     assert_eq!(
         error.kind(),
         crate::analyze_error::AnalyzeErrorKind::TypeMismatch
     );
     assert_eq!(error.code().as_str(), "sql.analyze.type_mismatch");
+    let start = sql.find("LARGEINT").unwrap();
+    assert_eq!(
+        error.span(),
+        Some(novarocks_parser::Span::new(start, start + 8))
+    );
+}
+
+#[test]
+fn public_numeric_largeint_cast_reports_the_retired_target_for_each_source() {
+    for source in [
+        DataType::Decimal128(38, 15),
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Boolean,
+        DataType::Int64,
+        DataType::Binary,
+    ] {
+        assert_retired_largeint_target("SELECT CAST(v AS LARGEINT) FROM t", source);
+    }
+}
+
+#[test]
+fn sql_null_and_try_cast_keep_the_same_retired_largeint_diagnostic() {
+    for sql in [
+        "SELECT CAST(NULL AS LARGEINT)",
+        "SELECT CAST(CAST(NULL AS DECIMAL(38,15)) AS LARGEINT)",
+        "SELECT TRY_CAST(NULL AS LARGEINT)",
+    ] {
+        assert_retired_largeint_target(sql, DataType::Decimal128(38, 15));
+    }
 }
 
 #[test]

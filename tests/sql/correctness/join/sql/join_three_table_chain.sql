@@ -29,7 +29,7 @@ DROP TABLE IF EXISTS ${case_db}.t_join_chain_b;
 DROP TABLE IF EXISTS ${case_db}.t_join_chain_c;
 CREATE TABLE ${case_db}.t_join_chain_a (
   id INT,
-  av STRING
+  av VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_chain_b (
   id INT,
@@ -37,7 +37,7 @@ CREATE TABLE ${case_db}.t_join_chain_b (
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_chain_c (
   mid INT,
-  cv STRING
+  cv VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_chain_a VALUES
   ROW(1, 'A1'),

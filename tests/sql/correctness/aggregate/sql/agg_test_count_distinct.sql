@@ -29,11 +29,11 @@ USE ${case_db};
 CREATE TABLE "test_cc" (
   "v1" varchar(65533),
   "v2" varchar(65533),
-  "v3" datetime,
+  "v3" TIMESTAMP(6),
   "v4" int ,
   "v5" decimal(32, 2) ,
   "v6" array<int> ,
-  "v7" ROW(a bigint(20), b char(20))
+  "v7" ROW(a BIGINT, b char(20))
 ) WITH (format_version = 3);
 
 -- query 3

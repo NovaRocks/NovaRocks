@@ -717,39 +717,45 @@ fn decimal_defaults_reject_precision_or_scale_mismatch() {
 
 #[test]
 fn supported_temporal_defaults_keep_their_original_supported_values() {
-    for (data_type, default, expected) in [
+    for (data_type, default, expected_type, expected) in [
         (
             DataType::Date32,
             ColumnDefault::Date {
                 days_since_epoch: 1,
             },
+            Some("DATE"),
             "1970-01-02",
         ),
         (
             DataType::Timestamp(TimeUnit::Microsecond, None),
             ColumnDefault::TimestampMicros {
-                micros_since_epoch: 1_000_000,
+                micros_since_epoch: 1_123_456,
             },
-            "1970-01-01 00:00:01",
+            Some("TIMESTAMP"),
+            "1970-01-01 00:00:01.123456",
         ),
         (
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             ColumnDefault::TimestampNanos {
                 nanos_since_epoch: 1_123_456_789,
             },
+            None,
             "1970-01-01 00:00:01.123456789",
         ),
     ] {
         let mut temporal = column("t", data_type);
         temporal.write_default = Some(default);
-        let ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::String(actual),
-            ..
-        }) = omitted_insert_expr(&temporal).unwrap()
-        else {
+        let ast::Expr::Literal(literal) = omitted_insert_expr(&temporal).unwrap() else {
             panic!("expected temporal default literal");
         };
-        assert_eq!(actual, expected);
+        match (expected_type, literal.kind) {
+            (Some(type_name), ast::LiteralKind::Generic(actual)) => {
+                assert_eq!(actual.type_name, type_name);
+                assert_eq!(actual.value, expected);
+            }
+            (None, ast::LiteralKind::String(actual)) => assert_eq!(actual, expected),
+            _ => panic!("unexpected temporal default literal declaration"),
+        }
     }
 }
 
@@ -881,7 +887,7 @@ fn source_filters_aliases_distinct_and_general_query_controls_are_retained() {
 }
 
 #[test]
-fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
+fn literal_target_casts_preserve_the_source_and_reject_retired_sql_types() {
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
     for (domain, source, target_name) in [
         (ValueLogicalType::Bitmap, "CAST(NULL AS BITMAP)", "BITMAP"),
@@ -896,15 +902,21 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
             original_call,
             &novarocks_parser::parser::parse_expression(source).unwrap(),
         ));
-        analyze_shaped_query(query)
-            .expect("the actual compiler must accept the original complete opaque cast");
-        let error =
-            analyze_shaped_query(parse_query(&format!("SELECT CAST(X'00' AS {target_name})")))
-                .unwrap_err();
-        assert!(
-            error.to_string().contains("no matching declared overload"),
-            "{error}"
-        );
+        for source in [
+            query,
+            parse_query(&format!("SELECT CAST(X'00' AS {target_name})")),
+        ] {
+            let novarocks_sql::compiler::SqlCompileError::Analyze(error) =
+                analyze_shaped_query(source).expect_err("retired SQL type")
+            else {
+                panic!("expected typed SQL analysis error");
+            };
+            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
+            assert_eq!(
+                error.message(),
+                format!("Unknown type: {}", target_name.to_ascii_lowercase())
+            );
+        }
     }
 }
 

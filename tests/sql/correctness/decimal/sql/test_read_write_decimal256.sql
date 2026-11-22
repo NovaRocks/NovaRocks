@@ -703,7 +703,7 @@ INSERT INTO ${case_db}.decimal_test_p50_s10_both_overflow SELECT (- (DECIMAL '12
 CREATE TABLE ${case_db}.decimal_append_test_p39_s0 (
     user_id varchar(42) NOT NULL,
     asset_id varchar(42) NOT NULL,
-    timestamp datetime NOT NULL,
+    timestamp TIMESTAMP(6) NOT NULL,
     shop_id int NOT NULL,
     day_bucket DATE NOT NULL,
     value DECIMAL(38,0) NOT NULL

@@ -36,7 +36,7 @@ CREATE TABLE imv_afj_cut_${uuid0}.ns_${uuid0}.fact (
 ) WITH (format_version = 3);
 CREATE TABLE imv_afj_cut_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO imv_afj_cut_${uuid0}.ns_${uuid0}.dim VALUES
   ROW(10, 'east'),

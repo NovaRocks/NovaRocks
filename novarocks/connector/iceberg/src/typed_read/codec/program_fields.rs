@@ -33,7 +33,9 @@ use crate::typed_read::{
 };
 use arrow::datatypes::{DataType, Field, FieldRef};
 use novarocks_connector_contract::{ConnectorReadPublicFacts, PureProviderCompileError};
-use novarocks_spi::connector::read_stack::ConnectorReadPublicSchema;
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadPublicSchema, ConnectorTableHandle, SchemaTableName,
+};
 use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorFieldPath,
 };
@@ -46,6 +48,14 @@ use std::{collections::BTreeMap, sync::Arc};
 type Failure = PureProviderCompileError<ConnectorCodecError>;
 mod typed_compare;
 mod typed_source;
+
+fn sql_table_name(relation: &IcebergRuntimeRelation) -> Option<&SchemaTableName> {
+    match relation {
+        IcebergRuntimeRelation::Table(table) => Some(table.schema_table_name()),
+        IcebergRuntimeRelation::ChangeWindow(window) => Some(window.schema_table_name()),
+        _ => None,
+    }
+}
 
 /// Complete-input correspondence only. Public source properties/coverage and
 /// unsupported relation kinds are also checked by the enclosing source owner.
@@ -608,6 +618,17 @@ fn compare_public(
         .last()
         .copied()
         .unwrap_or(column.base_field_id());
+    if let (Some(table), Some(declaration)) = (sql_table_name(relation), declaration)
+        && let Some(field) = crate::schema_mapping::nominal_declaration::retired_largeint_field(
+            declaration,
+            nominals,
+            &mut || work.step(),
+        )?
+    {
+        return Err(source_error(
+            crate::schema_mapping::nominal_declaration::retired_largeint_error(table, field),
+        ));
+    }
     typed_compare::value(
         &value_declaration,
         actual.value_type(),
@@ -1148,7 +1169,7 @@ mod tests {
             .map(|id| IcebergColumnHandle::base_column_of(&schema, id).unwrap())
             .collect::<Vec<_>>();
         let relation = IcebergRuntimeRelation::Table(table(&schema, BTreeMap::new()));
-        let original = public(
+        let unprojected = public(
             arrow.fields().iter().cloned().collect(),
             vec![
                 ValueLogicalType::Uuid,
@@ -1158,10 +1179,40 @@ mod tests {
                 ValueLogicalType::Physical,
             ],
         );
+        use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let storage = ValueTypeStorageLifetime::pure();
+        let mut request = |_| Ok(());
+        let mut observe = |_| Ok(());
+        let mut creation =
+            ConnectorReadSchemaCreation::new(storage.clone(), &mut request, &mut observe);
+        let (execution, source) = public_read_schema(
+            &relation,
+            &columns.iter().collect::<Vec<_>>(),
+            crate::typed_read::runtime::IcebergReadLayout::Offsets,
+            &mut creation,
+        )
+        .unwrap()
+        .into_typed_parts()
+        .unwrap();
+        assert_eq!(execution.binding(2).unwrap().data_type(), &DataType::Binary);
+        assert_eq!(
+            source.shape().schema().field(2).data_type(),
+            &DataType::FixedSizeBinary(16)
+        );
+        let original = ConnectorReadPublicFacts::try_new_typed(
+            unprojected.source().clone(),
+            None,
+            execution,
+            source,
+            storage,
+        )
+        .unwrap();
         assert_eq!(original.logical_types()[0], ValueLogicalType::Uuid);
         assert_eq!(original.logical_types()[1], ValueLogicalType::Variant);
         assert_eq!(original.logical_types()[2], ValueLogicalType::Physical);
         run(&relation, &columns, &original, &Control::default()).unwrap();
+        rejected(&relation, &columns, &unprojected);
         // Same physical shape and complete value declaration cannot repair a
         // changed known source attribute. Empty is not the SDK's absent key.
         let mut variant_attrs = arrow.fields()[1].metadata().clone();
@@ -1225,6 +1276,63 @@ mod tests {
             &columns,
             &public(arrow.fields().iter().cloned().collect(), logical),
         );
+    }
+
+    #[test]
+    fn selected_nominal_largeint_is_retired_by_frozen_field_identity() {
+        use crate::iceberg::spec::StructType;
+        use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
+        let schema = schema(vec![NestedField::optional(
+            1,
+            "pair",
+            Type::Struct(StructType::new(vec![
+                Arc::new(NestedField::required(
+                    2,
+                    "legacy",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "raw",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+            ])),
+        )]);
+        let table = table(&schema, BTreeMap::new())
+            .with_nominal_declarations(BTreeMap::from([(2, NominalSourceDomain::LargeInt)]))
+            .unwrap();
+        let relation = IcebergRuntimeRelation::Table(table);
+        let pair = IcebergColumnHandle::base_column_of(&schema, 1).unwrap();
+        let legacy = pair.dereference(&[2]).unwrap();
+        let raw = pair.dereference(&[3]).unwrap();
+        let mut request = |_| Ok(());
+        let mut observe = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut observe,
+        );
+        let mut publish = |column| {
+            public_read_schema(
+                &relation,
+                &[column],
+                crate::typed_read::runtime::IcebergReadLayout::Offsets,
+                &mut creation,
+            )
+        };
+        let schema = publish(&raw).unwrap();
+        assert_eq!(schema.schema().field(0).data_type(), &DataType::Binary);
+        for selected in [&legacy, &pair] {
+            let error = publish(selected).unwrap_err();
+            let PureProviderCompileError::Provider(error) = error else {
+                panic!("expected typed provider rejection");
+            };
+            assert_eq!(
+                error.kind(),
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported
+            );
+            assert!(error.message().contains("db.events field legacy (ID 2)"));
+        }
     }
 
     #[test]

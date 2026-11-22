@@ -26,7 +26,7 @@
 -- 3. Group by key and assert ordered group_concat outputs.
 CREATE TABLE ${case_db}.t_agg_group_concat_distinct_grouped (
     k INT,
-    s STRING
+    s VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_distinct_grouped VALUES

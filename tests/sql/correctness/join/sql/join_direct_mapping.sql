@@ -79,14 +79,14 @@ CREATE TABLE ${case_db}.t1 (
     c_int_null int ,
     c_bigint bigint,
     c_bigint_null bigint ,
-    c_float float,
-    c_float_null float ,
+    c_float REAL,
+    c_float_null REAL ,
     c_double double,
     c_double_null double ,
     c_date date,
     c_date_null date ,
-    c_datetime datetime,
-    c_datetime_null datetime
+    c_datetime TIMESTAMP(6),
+    c_datetime_null TIMESTAMP(6)
 ) WITH (format_version = 3);
 
 -- query 11

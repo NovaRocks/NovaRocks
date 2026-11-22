@@ -376,6 +376,7 @@ pub enum ConnectorDataType {
     Double,
     Decimal { precision: u8, scale: i8 },
     String,
+    BoundedCharacter(novarocks_type_contract::CharacterType),
     Binary,
     Json,
     Bitmap,

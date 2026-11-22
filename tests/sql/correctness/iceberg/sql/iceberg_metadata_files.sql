@@ -24,7 +24,7 @@ CREATE SCHEMA iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}.t_${uuid0} (id INT, region STRING, v INT) WITH (partitioning = ARRAY['region'], format_version = 3);
+CREATE TABLE iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}.t_${uuid0} (id INT, region VARCHAR, v INT) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 3
 -- @skip_result_check=true

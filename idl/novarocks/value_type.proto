@@ -46,6 +46,7 @@ message ScalarValue {
   optional TimeUnit time_unit = 5;
   optional string timezone = 6;
   optional IntervalUnit interval_unit = 7;
+  optional uint32 character_length = 8;
 }
 
 enum ScalarKind {
@@ -77,6 +78,8 @@ enum ScalarKind {
   SCALAR_KIND_DECIMAL64 = 25;
   SCALAR_KIND_DECIMAL128 = 26;
   SCALAR_KIND_DECIMAL256 = 27;
+  SCALAR_KIND_CHAR = 28;
+  SCALAR_KIND_VARCHAR = 29;
 }
 
 enum NominalValue {

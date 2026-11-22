@@ -34,7 +34,7 @@ pub(super) fn value(
     work.step()?;
     match source {
         Type::Primitive(_) | Type::Variant(_) => {
-            let (expected, domain) = match source {
+            let (source_layout, domain) = match source {
                 Type::Primitive(primitive) => (
                     crate::schema_mapping::typed_value::primitive_layout(primitive, integer)
                         .map_err(|cause| match cause {
@@ -59,6 +59,18 @@ pub(super) fn value(
                 }
                 _ => unreachable!("scalar source arm"),
             };
+            let raw_fixed = match source {
+                Type::Primitive(primitive) => {
+                    crate::schema_mapping::typed_value::plain_fixed_width(primitive, domain)
+                        .is_some()
+                }
+                _ => false,
+            };
+            let expected = if raw_fixed {
+                DataType::Binary
+            } else {
+                source_layout
+            };
             let same_kind = match (domain, actual.kind()) {
                 (ValueLogicalType::Physical, ValueKind::String) => expected == DataType::Utf8,
                 (ValueLogicalType::Physical, ValueKind::Binary) => expected == DataType::Binary,
@@ -67,7 +79,12 @@ pub(super) fn value(
                 _ => false,
             };
             work.step()?;
-            if !same_kind || layout != &read_layout.byte_carrier(&expected, domain) {
+            let expected_layout = if raw_fixed {
+                expected
+            } else {
+                read_layout.byte_carrier(&expected, domain)
+            };
+            if !same_kind || layout != &expected_layout {
                 return Err(invalid(
                     "public execution value differs from its explicit Iceberg source domain/layout",
                 ));

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact IF/COALESCE owners prepare control contracts, never ordinary kernels.
+//! Exact scalar control owners prepare control contracts, never ordinary kernels.
 
 use super::{binding_control, catalogue::BuiltinScalarResolver};
 use crate::{
@@ -36,6 +36,7 @@ use std::sync::Arc;
 pub(super) enum ControlOperation {
     If,
     Coalesce,
+    Try,
 }
 
 /// Only registration interprets the installed names. Prepared contracts retain
@@ -44,6 +45,7 @@ pub(super) fn operation(name: &str) -> Option<ControlOperation> {
     match name {
         "if" => Some(ControlOperation::If),
         "coalesce" | "ifnull" => Some(ControlOperation::Coalesce),
+        "try" => Some(ControlOperation::Try),
         _ => None,
     }
 }
@@ -57,6 +59,7 @@ pub(super) fn effects(operation: ControlOperation) -> FunctionEffectDeclaration 
         argument_control: match operation {
             ControlOperation::If => ArgumentControl::If,
             ControlOperation::Coalesce => ArgumentControl::Coalesce,
+            ControlOperation::Try => ArgumentControl::Try,
         },
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
@@ -72,7 +75,7 @@ pub(super) fn definition(
     let owner = Arc::new(ControlOwner::new(name, declaration, resolver)?);
     FunctionDefinition::try_new_pure_control(name, FunctionVisibility::Public, owner).map_err(
         |error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin IF/COALESCE pure control owner",
+            subject: "builtin scalar pure control owner",
             value: error.to_string().into(),
         },
     )
@@ -104,7 +107,7 @@ impl ControlOwner {
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "builtin IF/COALESCE control declaration",
+                subject: "builtin scalar control declaration",
                 value: declaration.function_id().as_str().into(),
             });
         }
@@ -239,7 +242,7 @@ impl ControlOwner {
                     && input.proof_scope != input.context.proof_scope())
             {
                 return Err(FunctionBindingError::InvalidBinding(
-                    "IF/COALESCE requires no environment and its exact proof scope".into(),
+                    "Scalar control requires no environment and its exact proof scope".into(),
                 ));
             }
             if input.request.arguments.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
@@ -256,6 +259,7 @@ impl ControlOwner {
                 || match self.operation {
                     ControlOperation::If => arity != 3,
                     ControlOperation::Coalesce => arity == 0,
+                    ControlOperation::Try => arity != 1,
                 }
             {
                 return Err(FunctionBindingError::NoMatchingOverload);

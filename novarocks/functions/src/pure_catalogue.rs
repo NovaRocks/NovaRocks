@@ -171,6 +171,7 @@ impl PureKernelAbi {
                         base.argument_control,
                         ArgumentControl::If
                             | ArgumentControl::Coalesce
+                            | ArgumentControl::Try
                             | ArgumentControl::SimpleCase
                             | ArgumentControl::SearchedCase
                             | ArgumentControl::TemporalSource(_)

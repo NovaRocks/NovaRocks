@@ -40,7 +40,14 @@ pub(crate) fn table(
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     creation.work(1)?;
     let document = super::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
-    table_from_document(&document, declaration, pseudo_columns, None, creation)
+    table_from_document(
+        &document,
+        declaration,
+        pseudo_columns,
+        None,
+        false,
+        creation,
+    )
 }
 
 /// Reuse the same validated document for catalog schema and planning facts.
@@ -52,7 +59,31 @@ pub(crate) fn table_with_document(
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     creation.work(1)?;
-    table_from_document(document, declaration, pseudo_columns, mutation, creation)
+    table_from_document(
+        document,
+        declaration,
+        pseudo_columns,
+        mutation,
+        false,
+        creation,
+    )
+}
+
+pub(crate) fn table_read_projection(
+    document: &super::nominal_declaration::TableNominalDocument,
+    declaration: &Schema,
+    pseudo_columns: &[String],
+    mutation: Option<&crate::typed_read::schema_binding::MutationMetadataSchema>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<ConnectorReadExecutionSchema, Failure> {
+    table_from_document(
+        document,
+        declaration,
+        pseudo_columns,
+        mutation,
+        true,
+        creation,
+    )
 }
 
 fn table_from_document(
@@ -60,6 +91,7 @@ fn table_from_document(
     declaration: &Schema,
     pseudo_columns: &[String],
     mutation: Option<&crate::typed_read::schema_binding::MutationMetadataSchema>,
+    project_read: bool,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     let integers = crate::scalar_integer_domain::of_schema(declaration, &document.integers)?;
@@ -77,14 +109,19 @@ fn table_from_document(
     let mut fields = creation.reserve(count)?;
     let mut bindings = creation.reserve(count)?;
     for field in declaration.as_struct().fields() {
-        let value = super::typed_value::from_field(
-            field,
-            !field.required,
-            nominals,
-            integers.get(&field.id).copied(),
-            crate::typed_read::runtime::IcebergReadLayout::Offsets,
-            creation,
-        )?
+        let integer = integers.get(&field.id).copied();
+        let value = if project_read {
+            super::typed_value::from_field(
+                field,
+                !field.required,
+                nominals,
+                integer,
+                crate::typed_read::runtime::IcebergReadLayout::Offsets,
+                creation,
+            )?
+        } else {
+            super::typed_value::from_storage_field(field, nominals, integer, creation)?
+        }
         .binding;
         let name = creation.text(&field.name)?;
         creation.work(1)?;

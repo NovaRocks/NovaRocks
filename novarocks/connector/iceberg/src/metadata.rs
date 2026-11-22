@@ -1579,6 +1579,26 @@ pub(crate) fn build_table_metadata(
         &metadata.uuid().to_string(),
         projected_snapshot,
     )?;
+    let read_projection = if payload.metadata_table_type.is_none()
+        && crate::schema_mapping::typed_value::contains_plain_fixed(
+            definition_schema.as_struct().fields(),
+            &nominal_document.nominals,
+            creation,
+        )? {
+        Some(crate::schema_mapping::catalog_value::table_read_projection(
+            &nominal_document,
+            &definition_schema,
+            &payload.metadata_columns,
+            mutation_metadata.as_ref(),
+            creation,
+        )?)
+    } else {
+        None
+    };
+    let (execution_schema, original_schema) = match read_projection {
+        Some(read) => (read, Some(execution_schema)),
+        None => (execution_schema, None),
+    };
     let observed_source = creation.arc(
         crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts {
             access: Arc::new(crate::loaded_table::IcebergAttemptTableAccess::freeze(loaded.clone())),
@@ -1595,7 +1615,7 @@ pub(crate) fn build_table_metadata(
             observed_source,
             creation,
         )?;
-    ConnectorTableMetadata::try_new_typed(
+    ConnectorTableMetadata::try_new_with_read_projection(
         novarocks_spi::connector::ConnectorTableMetadataHeader {
             identity: ConnectorTableIdentity {
                 instance_id: descriptor.instance_id.clone(),
@@ -1619,6 +1639,7 @@ pub(crate) fn build_table_metadata(
         },
         schema,
         execution_schema,
+        original_schema.as_ref(),
         creation,
     )
     .map(|metadata| metadata.with_source_read_facts(source_facts))

@@ -100,7 +100,7 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
         4 => ExprKind::Cast {
             expr: boxed(child),
             target: DataType::Int64,
-            array_failure_mode: None,
+            cast_mode: None,
             decimal_overflow_policy: policy,
         },
         5 => ExprKind::IsNull {
@@ -294,7 +294,7 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
             ExprKind::Cast {
                 expr,
                 target: DataType::Int64,
-                array_failure_mode: None,
+                cast_mode: None,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             },
             4,

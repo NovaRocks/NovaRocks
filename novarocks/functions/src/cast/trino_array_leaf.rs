@@ -407,7 +407,7 @@ fn valid_common_decimal(
 
 /// Exact coefficient conversion shared by signed-to-decimal and rescale leaves.
 /// The original scalar array/NULL/policy authors are intentionally not invoked.
-fn rescale_coefficient(
+pub(super) fn rescale_coefficient(
     value: i128,
     source_scale: u8,
     target_precision: u8,

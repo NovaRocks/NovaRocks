@@ -24,7 +24,7 @@ USE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 CREATE TABLE payment (
   id INT,
   created_at DATE,
-  status STRING
+  status VARCHAR
 );
 CREATE TABLE txn (
   id INT,
@@ -32,18 +32,18 @@ CREATE TABLE txn (
   payment_id INT
 );
 INSERT INTO payment VALUES
-  ROW(1, '2025-01-01', 'COMPLETED'),
-  ROW(2, '2025-01-02', 'PENDING'),
-  ROW(3, '2025-01-03', 'FAILED'),
-  ROW(4, '2025-01-04', 'COMPLETED'),
-  ROW(5, '2025-01-05', 'REFUNDED');
+  ROW(1, DATE '2025-01-01', 'COMPLETED'),
+  ROW(2, DATE '2025-01-02', 'PENDING'),
+  ROW(3, DATE '2025-01-03', 'FAILED'),
+  ROW(4, DATE '2025-01-04', 'COMPLETED'),
+  ROW(5, DATE '2025-01-05', 'REFUNDED');
 INSERT INTO txn VALUES
-  ROW(101, '2025-01-01', 1),
-  ROW(102, '2025-01-02', 2),
-  ROW(103, '2025-01-03', 3),
-  ROW(104, '2025-01-04', 4),
-  ROW(105, '2025-01-05', 5),
-  ROW(106, '2025-01-06', 1);
+  ROW(101, DATE '2025-01-01', 1),
+  ROW(102, DATE '2025-01-02', 2),
+  ROW(103, DATE '2025-01-03', 3),
+  ROW(104, DATE '2025-01-04', 4),
+  ROW(105, DATE '2025-01-05', 5),
+  ROW(106, DATE '2025-01-06', 1);
 ALTER TABLE payment SET PROPERTIES extra_properties = MAP(ARRAY['unique_constraints'], ARRAY['id']);
 ALTER TABLE txn SET PROPERTIES extra_properties = MAP(ARRAY['foreign_key_constraints'], ARRAY['(payment_id) REFERENCES payment(id)']);
 SET SESSION enable_ukfk_opt = false;

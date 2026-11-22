@@ -34,7 +34,7 @@ CREATE TABLE test_array_intersect (
     array_int ARRAY<INT>,
     array_bigint ARRAY<BIGINT>,
     array_largeint ARRAY<DECIMAL(38, 0)>,
-    array_float ARRAY<FLOAT>,
+    array_float ARRAY<REAL>,
     array_double ARRAY<DOUBLE>,
     array_decimalv2 ARRAY<DECIMAL(27, 9)>,
     array_decimal32 ARRAY<DECIMAL(10, 2)>,
@@ -42,7 +42,7 @@ CREATE TABLE test_array_intersect (
     array_decimal128 ARRAY<DECIMAL(27, 9)>,
     array_varchar ARRAY<VARCHAR(50)>,
     array_date ARRAY<DATE>,
-    array_datetime ARRAY<DATETIME>
+    array_datetime ARRAY<TIMESTAMP(6)>
 ) WITH (format_version = 3);
 
 -- query 3
@@ -53,16 +53,16 @@ ROW(1, [true, false], [1, 2, 3], [100, 200, 300], [1000, 2000, 3000], [10000, 20
  [CAST('123456789012345678901234567890' AS DECIMAL(38,0)), CAST('123456789012345678901234567891' AS DECIMAL(38,0))], [1.1, 2.2, 3.3],
  [10.11, 20.22, 30.33], [123.45, 456.78, 789.01], [123.45, 890.12], [1234.5678, 2345.6789],
  [1234567890.123456789, 3344556677.889900112], ['apple', 'banana', 'cherry'], 
- ['2025-01-01', '2025-01-08'], ['2025-01-01 12:00:00', '2025-01-08 19:00:00']),
+ [DATE '2025-01-01', DATE '2025-01-08'], [TIMESTAMP '2025-01-01 12:00:00.000000', TIMESTAMP '2025-01-08 19:00:00.000000']),
 ROW(2, [false], [5, 6, 7], [400, 500, 600], [4000, 5000, 6000], [40000, 50000, 60000],
  [CAST('123456789012345678901234567892' AS DECIMAL(38,0)), CAST('123456789012345678901234567893' AS DECIMAL(38,0))], [4.4, 5.5, 6.6],
  [40.44, 50.55, 60.66], [987.65, 543.21, 123.45], [567.89, 234.56], [9876.5432, 1234.5678],
  [9876543210.987654321, 1122334455.667788990], ['grape', 'melon', 'pear'], 
- ['2025-01-02', '2025-01-09'], ['2025-01-02 13:00:00', '2025-01-09 20:00:00']),
+ [DATE '2025-01-02', DATE '2025-01-09'], [TIMESTAMP '2025-01-02 13:00:00.000000', TIMESTAMP '2025-01-09 20:00:00.000000']),
 ROW(3, [true, true], [8, 9], [700, 800], [7000, 8000], [70000, 80000],
  [CAST('123456789012345678901234567894' AS DECIMAL(38,0))], [7.7, 8.8], [70.77, 80.88], [246.80, 369.12],
  [678.90, 987.65], [3456.7890, 4567.8901], [4567890123.456789012], 
- ['peach', 'plum'], ['2025-01-03'], ['2025-01-03 14:00:00']);
+ ['peach', 'plum'], [DATE '2025-01-03'], [TIMESTAMP '2025-01-03 14:00:00.000000']);
 
 -- query 4
 USE ${case_db};
@@ -118,11 +118,11 @@ SELECT id, array_intersect(array_varchar, ['apple', 'banana', 'cherry']) AS inte
 
 -- query 17
 USE ${case_db};
-SELECT id, array_intersect(array_date, ['2025-01-01', '2025-01-08']) AS intersect_date FROM test_array_intersect order by id;
+SELECT id, array_intersect(array_date, [DATE '2025-01-01', DATE '2025-01-08']) AS intersect_date FROM test_array_intersect order by id;
 
 -- query 18
 USE ${case_db};
-SELECT id, array_intersect(array_datetime, ['2025-01-01 12:00:00', '2025-01-08 19:00:00']) AS intersect_datetime FROM test_array_intersect order by id;
+SELECT id, array_intersect(array_datetime, [TIMESTAMP '2025-01-01 12:00:00.000000', TIMESTAMP '2025-01-08 19:00:00.000000']) AS intersect_datetime FROM test_array_intersect order by id;
 
 -- query 19
 -- @skip_result_check=true

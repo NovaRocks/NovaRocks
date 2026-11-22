@@ -47,7 +47,7 @@ pub use required_constant::{
 mod captured_catalog;
 mod dml_catalog;
 mod write_assignment;
-pub use write_assignment::{SqlWriteAssignmentSite, SqlWriteAssignments, SqlWriteLiteralContext};
+pub use write_assignment::{SqlWriteAssignmentSite, SqlWriteAssignments};
 mod logical_explain;
 mod scalar_presence_catalog;
 pub use crate::planner::distributed::build::{
@@ -3063,7 +3063,7 @@ mod tests {
             );
             // JSON objects cast to VARCHAR are admitted with the complete
             // target schema; actual object values must fail with Data9 at runtime.
-            let mut array_cast_count = 0;
+            let mut json_text_cast_count = 0;
             for unit in plan
                 .plan()
                 .fragments()
@@ -3074,33 +3074,36 @@ mod tests {
                 for expression in unit.definitions() {
                     if let novarocks_expression_contract::ExprKind::Cast {
                         expr,
-                        array_failure_mode: Some(mode),
+                        cast_mode: mode,
                         target,
                         ..
                     } = &expression.kind
                     {
-                        array_cast_count += 1;
-                        assert_eq!(
-                            *mode,
-                            novarocks_type_contract::ArrayCastFailureMode::ReportError
-                        );
-                        assert_eq!(target, expression.ty.data_type());
                         let source = unit.definition(*expr).expect("original CAST operand");
+                        let source_leaf =
+                            source.ty.child_at(0).unwrap_or_else(|| source.ty.clone());
+                        if source_leaf.logical_type()
+                            != novarocks_type_contract::ValueLogicalType::Json
+                            || expression.ty == source.ty
+                        {
+                            continue;
+                        }
+                        let result_leaf = expression
+                            .ty
+                            .child_at(0)
+                            .unwrap_or_else(|| expression.ty.clone());
+                        json_text_cast_count += 1;
+                        assert_eq!(*mode, novarocks_type_contract::TrinoCastMode::Explicit);
+                        assert_eq!(target, expression.ty.data_type());
                         assert_eq!(
-                            source.ty.child_at(0).unwrap().logical_type(),
-                            novarocks_type_contract::ValueLogicalType::Json
-                        );
-                        assert_eq!(
-                            expression.ty.child_at(0).unwrap().logical_type(),
+                            result_leaf.logical_type(),
                             novarocks_type_contract::ValueLogicalType::Physical
                         );
-                        assert_ne!(source.ty, expression.ty);
+                        assert_eq!(result_leaf.data_type(), &DataType::Utf8);
                     }
                 }
             }
-            if sql.contains("array<varchar>") {
-                assert!(array_cast_count >= 1);
-            }
+            assert_eq!(json_text_cast_count, 1, "{sql}");
             let mut aggregate_count = 0;
             for fragment in plan.plan().fragments().values() {
                 for node in fragment.nodes().values() {
@@ -3638,7 +3641,7 @@ mod tests {
     }
 
     #[test]
-    fn analyzed_root_allow_mode_freezes_only_the_numeric_fold_eligibility() {
+    fn strict_cast_overflow_survives_folding_in_each_legacy_session_mode() {
         for (session_mode, sql, disabled) in [
             ("32", "SELECT CAST(1000 AS DECIMAL(3,0))", false),
             (
@@ -3685,7 +3688,10 @@ mod tests {
                 matches!(&node.kind, PhysicalPlanKind::Project(project) if project.items.iter().any(|item| matches!(item.expr.kind, ExprKind::Cast { .. })))
                     || node.children.iter().any(projection_retains_cast)
             }
-            assert_eq!(projection_retains_cast(&physical), disabled);
+            assert!(
+                projection_retains_cast(&physical),
+                "{sql} in session {session_mode}"
+            );
         }
     }
 }

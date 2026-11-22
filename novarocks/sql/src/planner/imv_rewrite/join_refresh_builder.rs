@@ -1117,7 +1117,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
     };
     TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(case),
             target: DataType::Int8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1385,7 +1385,7 @@ fn project_item_for_mapping(
                     validate_input_column(input_columns, &desc.action_column)?;
                     TypedExpr {
                         kind: ExprKind::Cast {
-                            array_failure_mode: None,
+                            cast_mode: None,
                             expr: novarocks_parser::ast::AstBox::new(column_ref(
                                 &desc.action_column,
                             )),
@@ -1401,7 +1401,7 @@ fn project_item_for_mapping(
                 }
                 JoinApplyActionProjection::ConstantInsert => TypedExpr {
                     kind: ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: None,
                         expr: novarocks_parser::ast::AstBox::new(int_literal(
                             i64::from(crate::common::CHANGE_OP_INSERT),
                             DataType::Int8,

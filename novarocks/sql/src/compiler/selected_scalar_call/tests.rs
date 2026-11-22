@@ -55,8 +55,8 @@ fn comparison_conversions_keep_each_side_nullability_and_late_output_null_policy
                     assert_eq!(step.target(), &target);
                     assert_eq!(step.target().nullable(), source.nullable());
                     assert_eq!(
-                        step.decimal_overflow_policy(),
-                        DecimalOverflowPolicy::OutputNull
+                        step.cast_mode(),
+                        novarocks_type_contract::TrinoCastMode::Implicit
                     );
                 }
                 PlannedConversion::ValueConversion { .. } => {
@@ -70,7 +70,8 @@ fn comparison_conversions_keep_each_side_nullability_and_late_output_null_policy
 #[test]
 fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
     use arrow::datatypes::Field;
-    use novarocks_type_contract::ArrayCastFailureMode;
+    use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
+    use novarocks_type_contract::TrinoCastMode;
     let control = crate::compiler::SqlCompileControl::unbounded();
     let catalog = crate::functions::builtin_sql_function_catalog();
     let ty = FunctionValueType::new(
@@ -89,10 +90,7 @@ fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
         .unwrap(),
         PlannedConversion::Identity
     ));
-    for mode in [
-        ArrayCastFailureMode::ReportError,
-        ArrayCastFailureMode::OutputNull,
-    ] {
+    for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
         let PlannedConversion::Carrier(step) = plan_conversion(
             catalog,
             &ty,
@@ -105,17 +103,17 @@ fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
             panic!("explicit boundary must not become identity")
         };
         assert_eq!(step.target(), &ty);
-        assert_eq!(step.array_failure_mode(), Some(mode));
+        assert_eq!(step.cast_mode(), mode);
+        let recipe = PreparedCastRecipe::try_new_trino(&ty, step.target(), mode, &control).unwrap();
+        assert_eq!(recipe.cast_mode(), Some(mode));
         assert!(matches!(
-            plan_conversion(
-                catalog,
+            PreparedCastRecipe::try_new_trino(
                 &ty,
                 &FunctionValueType::new(DataType::Int32, true),
-                DecimalOverflowPolicy::OutputNull,
-                Some(mode),
-                &control
+                mode,
+                &control,
             ),
-            Err(FunctionBindingError::InvalidBinding(_))
+            Err(CastPrepareError::Illegal)
         ));
     }
 }

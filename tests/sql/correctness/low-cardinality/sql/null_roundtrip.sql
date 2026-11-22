@@ -20,7 +20,7 @@
 -- GROUP BY keeps a NULL group with the correct count.
 CREATE TABLE ${case_db}.dict_null_t (
   k INT,
-  s STRING
+  s VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.dict_null_t VALUES
   ROW(1, 'a'), ROW(2, NULL), ROW(3, 'a'), ROW(4, NULL), ROW(5, 'b');

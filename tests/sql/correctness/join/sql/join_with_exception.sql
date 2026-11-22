@@ -28,19 +28,19 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0 (
-  "c0" int(11),
+  "c0" INTEGER,
   "c1" varchar(20),
   "c2" varchar(200),
-  "c3" int(11)
+  "c3" INTEGER
 ) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-  "c0" int(11),
+  "c0" INTEGER,
   "c1" varchar(20),
   "c2" varchar(200),
-  "c3" int(11)
+  "c3" INTEGER
 ) WITH (format_version = 3);
 
 -- query 3

@@ -25,11 +25,11 @@ DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_target ;
 DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_source ;
 CREATE TABLE ${case_db}.sqlx2_mor_update_target (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 CREATE TABLE ${case_db}.sqlx2_mor_update_source (
   id BIGINT,
-  new_v STRING
+  new_v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES ROW(1, 'a');
 INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES ROW(1, 'x'), ROW(1, 'y');

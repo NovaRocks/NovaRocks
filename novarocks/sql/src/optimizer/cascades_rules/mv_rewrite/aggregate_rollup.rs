@@ -103,7 +103,7 @@ fn norm_agg(
         distinct: call.distinct,
         binding: Some(call.source.binding().clone()),
         decimal_overflow_policy: None,
-        array_failure_mode: None,
+        cast_mode: None,
         argument_order: NormArgumentOrder::Ordered,
         order_by,
         args,

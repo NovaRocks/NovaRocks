@@ -24,11 +24,11 @@ DROP TABLE IF EXISTS ${case_db}.t_datetime_literal_src;
 DROP TABLE IF EXISTS ${case_db}.t_datetime_literal_sink;
 CREATE TABLE ${case_db}.t_datetime_literal_src (
   id BIGINT,
-  raw_dt STRING
+  raw_dt VARCHAR
 );
 CREATE TABLE ${case_db}.t_datetime_literal_sink (
   id BIGINT,
-  dt DATETIME
+  dt TIMESTAMP(6)
 );
 INSERT INTO ${case_db}.t_datetime_literal_src VALUES
   ROW(1, '2024-02-29 12:34:56'),
@@ -36,7 +36,8 @@ INSERT INTO ${case_db}.t_datetime_literal_src VALUES
   ROW(3, 'not-a-datetime'),
   ROW(4, NULL);
 INSERT INTO ${case_db}.t_datetime_literal_sink
-SELECT id, CASE WHEN (raw_dt IS NULL) THEN NULL WHEN (raw_dt = '2024-02-29 12:34:56') THEN CAST('2024-02-29 12:34:56' AS TIMESTAMP) ELSE NULL END AS dt FROM ${case_db}.t_datetime_literal_src;
+SELECT id, TRY_CAST(raw_dt AS TIMESTAMP(6)) AS dt
+FROM ${case_db}.t_datetime_literal_src;
 SELECT
   id,
   dt,

@@ -23,7 +23,7 @@
 -- 3. Validate SUM aggregate on positive and negative values.
 DROP TABLE IF EXISTS ${case_db}.t_metrics;
 CREATE TABLE ${case_db}.t_metrics (
-  grp STRING,
+  grp VARCHAR,
   v BIGINT
 );
 INSERT INTO ${case_db}.t_metrics VALUES

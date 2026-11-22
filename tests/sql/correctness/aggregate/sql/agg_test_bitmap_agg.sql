@@ -33,7 +33,7 @@ CREATE TABLE t1 (
     c4 int,
     c5 bigint,
     c6 largeint,
-    c7 string
+    c7 VARCHAR
     ) WITH (format_version = 3);
 
 -- query 3

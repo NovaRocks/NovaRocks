@@ -266,35 +266,35 @@ fn intrinsic_runtime_description(
         pool,
         ordinal: source.ordinal(),
     };
-    use novarocks_expression_contract::{ExprKind, RootScope};
+    use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
     use novarocks_type_contract::{CompileCheckpoints, CompilePhase, EvaluationDemand};
     let literal = fragment
         .unit(node)
         .unwrap()
         .add(None, ty.clone(), ExprKind::Constant(reference))
         .unwrap();
-    let cast = fragment
+    let sum = fragment
         .unit(node)
         .unwrap()
         .add(
             None,
             ty.clone(),
-            ExprKind::Cast {
-                array_failure_mode: None,
-                expr: literal,
-                target: DataType::Int64,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: SemanticParameterRef {
+            ExprKind::Binary {
+                op: BinaryOperator::Add,
+                left: literal,
+                right: literal,
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                allow_throw_exception: Some(SemanticParameterRef {
                     id: SemanticParameterId::new(u32::MAX),
                     expected_key: SemanticParameterKey::AllowThrowException,
-                },
+                }),
             },
         )
         .unwrap();
-    let cast = fragment
+    let sum = fragment
         .unit(node)
         .unwrap()
-        .root(cast, EvaluationDemand::Value, RootScope::AllPorts)
+        .root(sum, EvaluationDemand::Value, RootScope::AllPorts)
         .unwrap();
     let value = fragment
         .add_value(
@@ -306,7 +306,7 @@ fn intrinsic_runtime_description(
         )
         .unwrap();
     fragment
-        .add_values(node, Box::from([Box::from([cast])]), Box::from([value]))
+        .add_values(node, Box::from([Box::from([sum])]), Box::from([value]))
         .unwrap();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let ports = fragment.node_ports(node).unwrap();

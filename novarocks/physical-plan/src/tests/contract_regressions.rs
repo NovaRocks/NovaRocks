@@ -3254,16 +3254,9 @@ fn grouped_writer_fragment_with_sources(
                     finish,
                     ty,
                     ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                         expr: literal,
                         target: DataType::Utf8,
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
-                            id: novarocks_type_contract::SemanticParameterId::new(0),
-                            expected_key:
-                                novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                        },
                     },
                 )
                 .unwrap()

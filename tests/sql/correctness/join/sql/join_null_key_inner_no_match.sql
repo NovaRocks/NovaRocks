@@ -28,11 +28,11 @@ DROP TABLE IF EXISTS ${case_db}.t_join_null_key_inner_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_null_key_inner_r;
 CREATE TABLE ${case_db}.t_join_null_key_inner_l (
   k INT,
-  vl STRING
+  vl VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_null_key_inner_r (
   k INT,
-  vr STRING
+  vr VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_null_key_inner_l VALUES
   ROW(NULL, 'LN'),

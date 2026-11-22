@@ -1,0 +1,9 @@
+-- query 1
+-- types	boolean	boolean	boolean
+unpadded	padded	padded_with_escape
+false	true	true
+
+-- query 2
+-- types	boolean	boolean
+fixed_width	varying_width
+true	true

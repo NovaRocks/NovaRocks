@@ -15,26 +15,52 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- @order_sensitive=true
--- @tags=project,cast,boolean,varchar
--- Test Objective:
--- 1. Validate StarRocks-compatible semantics for CAST(VARCHAR AS BOOLEAN) on numeric strings.
--- 2. Ensure IF condition behavior matches FE/BE semantics when condition is VARCHAR.
--- Test Flow:
--- 1. Cast signed/space-prefixed numeric strings to BOOLEAN.
--- 2. Assert invalid and overflow VARCHAR values become NULL.
--- 3. Verify IF(condition, then, else) follows the same boolean conversion results.
-SELECT
-  CAST('2' AS BOOLEAN) AS cast_two,
-  CAST('-1' AS BOOLEAN) AS cast_minus_one,
-  CAST('+0' AS BOOLEAN) AS cast_plus_zero,
-  CAST('false' AS BOOLEAN) AS cast_false,
-  CAST('TRUE' AS BOOLEAN) AS cast_true_upper,
-  CAST('t' AS BOOLEAN) IS NULL AS cast_t_is_null,
-  CAST('2147483648' AS BOOLEAN) IS NULL AS cast_i32_overflow_is_null,
-  CAST(' 2' AS BOOLEAN) AS cast_space_two,
-  IF('2', 1, 0) AS if_two,
-  IF('-1', 1, 0) AS if_minus_one,
-  IF('+0', 1, 0) AS if_plus_zero,
-  IF('t', 1, 0) AS if_t,
-  IF(' 2', 1, 0) AS if_space_two;
+-- Only the admitted VARCHAR boolean spellings yield values.
+
+-- query 1
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('2' AS BOOLEAN);
+
+-- query 2
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('-1' AS BOOLEAN);
+
+-- query 3
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('+0' AS BOOLEAN);
+
+-- query 4
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('2147483648' AS BOOLEAN);
+
+-- query 5
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST(' 2' AS BOOLEAN);
+
+-- query 6
+SELECT TRY_CAST('2' AS BOOLEAN), TRY_CAST('-1' AS BOOLEAN), TRY_CAST('+0' AS BOOLEAN), CAST('false' AS BOOLEAN), CAST('TRUE' AS BOOLEAN), CAST('t' AS BOOLEAN), TRY_CAST('2147483648' AS BOOLEAN), TRY_CAST(' 2' AS BOOLEAN);
+
+-- query 7
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT IF('2', 1, 0);
+
+-- query 8
+SELECT IF(NULL, 1, 0);
+
+-- query 9
+SELECT IF(CAST('t' AS BOOLEAN), 1, 0),IF(CAST('false' AS BOOLEAN),1,0),IF(TRY_CAST('2' AS BOOLEAN),1,0);
+
+-- query 10
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT 1 WHERE 1;
+
+-- query 11
+SELECT 1 WHERE NULL;
+
+-- query 12
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT COUNT(*) HAVING 1;
+
+-- query 13
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT * FROM (VALUES 1) l JOIN (VALUES 2) r ON 1;

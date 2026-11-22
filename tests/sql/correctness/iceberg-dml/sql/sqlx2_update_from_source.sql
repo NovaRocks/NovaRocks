@@ -25,11 +25,11 @@ DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_target ;
 DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_source ;
 CREATE TABLE ${case_db}.sqlx2_update_from_target (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.sqlx2_update_from_source (
   id BIGINT,
-  new_v STRING
+  new_v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.sqlx2_update_from_target VALUES ROW(1, 'a'), ROW(2, 'b');
 INSERT INTO ${case_db}.sqlx2_update_from_source VALUES ROW(2, 'bb');

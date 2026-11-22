@@ -15,36 +15,28 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Test Objective: freeze exact mixed Decimal/LARGEINT Add/Sub with VARCHAR output.
+-- Retired declarations fail before a cast, calculation, or table write.
+
 -- query 1
--- @skip_result_check=true
-CREATE TABLE ${case_db}.decimal_largeint_pair (id INT, d DECIMAL(38,15), n LARGEINT) WITH (format_version = 3);
-INSERT INTO ${case_db}.decimal_largeint_pair VALUES ROW(1, DECIMAL '1.250000000000000', CAST('170141183460469231731687303715884105727' AS LARGEINT)), ROW(2, (- (DECIMAL '1.250000000000000')), CAST('-170141183460469231731687303715884105728' AS LARGEINT)), ROW(3, NULL, 1), ROW(4, DECIMAL '1.250000000000000', NULL);
+-- @expect_trino_error=TYPE_NOT_FOUND,USER_ERROR
+CREATE TABLE ${case_db}.retired_n (id INTEGER, d DECIMAL(38,15), n LARGEINT) WITH (format_version = 3);
 
 -- query 2
-SELECT id,CAST(d+n AS VARCHAR) AS add_forward,CAST(n+d AS VARCHAR) AS add_reverse,
-CAST(d-n AS VARCHAR) AS sub_forward,CAST(n-d AS VARCHAR) AS sub_reverse
-FROM ${case_db}.decimal_largeint_pair ORDER BY id;
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(DECIMAL '1.25' AS DECIMAL(38,15)) + CAST('170141183460469231731687303715884105727' AS LARGEINT);
 
 -- query 3
-SELECT CAST((CAST(DECIMAL '0.000000000000000000000000000000000001' AS DECIMAL(38, 36)) + CAST('170141183460469231731687303715884105727' AS LARGEINT)) AS VARCHAR) AS precision76, CAST((CAST((- (DECIMAL '0.000000000000000000000000000000000001')) AS DECIMAL(38, 36)) + CAST('-170141183460469231731687303715884105728' AS LARGEINT)) AS VARCHAR) AS negative76;
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(DECIMAL '1.25' AS DECIMAL(38,15)) - CAST('-170141183460469231731687303715884105728' AS LARGEINT);
 
 -- query 4
--- @expect_error=no frozen result rule
-SELECT CAST(0 AS DECIMAL(38,37)) + CAST(1 AS LARGEINT);
-
--- query 5
--- @expect_error=no frozen result rule
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 SELECT CAST(1 AS DECIMAL(38,15)) * CAST(1 AS LARGEINT);
 
--- query 6
--- @expect_error=no frozen result rule
+-- query 5
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 SELECT CAST(1 AS DECIMAL(38,15)) / CAST(1 AS LARGEINT);
 
--- query 7
--- @expect_error=no frozen result rule
+-- query 6
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
 SELECT CAST(1 AS DECIMAL(38,15)) % CAST(1 AS LARGEINT);
-
--- query 8
--- @skip_result_check=true
-DROP TABLE ${case_db}.decimal_largeint_pair;

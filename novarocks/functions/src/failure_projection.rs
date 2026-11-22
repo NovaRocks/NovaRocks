@@ -479,7 +479,7 @@ impl FailureProjection for crate::CastPrepareError {
                 FailureClass::Unsupported,
                 novarocks_function_contract::kernel_failure::UNSUPPORTED_CAST,
             ),
-            Self::TypeMismatch => fact(FailureClass::Invariant, 607),
+            Self::Illegal | Self::TypeMismatch => fact(FailureClass::Invariant, 607),
         }
     }
 }

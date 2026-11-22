@@ -397,8 +397,39 @@ impl AnalyzerScope {
         name: &str,
         span: Span,
     ) -> Result<(ColumnId, FunctionValueType), AnalyzeError> {
-        self.resolve_value_type(qualifier, name)
-            .map_err(|message| AnalyzeError::unknown_column(message, span))
+        let (id, value) = self
+            .resolve_value_type(qualifier, name)
+            .map_err(|message| AnalyzeError::unknown_column(message, span))?;
+        self.check_read_column(id, &[], span)?;
+        Ok((id, value))
+    }
+
+    pub(super) fn check_read_column(
+        &self,
+        id: ColumnId,
+        requested_path: &[&novarocks_parser::ast::Ident],
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
+        let factory = self.factory.borrow();
+        if let Some((table, retired)) = factory.retired_read_fields(id).iter().find(|(_, field)| {
+            field
+                .field_path
+                .iter()
+                .skip(1)
+                .zip(requested_path)
+                .all(|(field, requested)| field.eq_ignore_ascii_case(&requested.value))
+        }) {
+            return Err(AnalyzeError::unsupported_expression(
+                format!(
+                    "Field {} (ID {}) uses retired SQL type {} in table {table}; migrate the field to a supported type",
+                    retired.field_path.join("."),
+                    retired.field_id,
+                    retired.sql_type,
+                ),
+                span,
+            ));
+        }
+        Ok(())
     }
 
     /// Register Iceberg V3 row-lineage reserved pseudo-columns. Unlike
@@ -587,119 +618,21 @@ impl AnalyzerScope {
             .filter(move |(q, _, _, _, _)| q.as_deref() == Some(q_lower.as_str()))
     }
 
-    /// Register `COALESCE(left.col, right.col)` for every USING column.
-    ///
-    /// For FULL OUTER JOIN with USING, the joined column is the merge of
-    /// both sides: either side can be NULL-padded when the other side
-    /// has no match. The standard SQL output column is COALESCE of both
-    /// sides. We register that as a synthetic expression so that
-    /// unqualified references in projection / ORDER BY / WHERE pick up
-    /// the merged value instead of one side's potentially-null binding.
-    ///
-    /// `left_qual` / `right_qual` are the table qualifiers for the two
-    /// USING-side columns. `dt` / `nullable` describe the joined output.
-    ///
-    /// Currently unused — the call site in `resolve_from.rs` skips the
-    /// FULL OUTER USING transform because the BE-side FULL OUTER hash
-    /// join drops the surviving-side columns when the SELECT projection
-    /// references them via a COALESCE-wrapped scope. Once that BE bug is
-    /// fixed, re-enable the call site to make `SELECT *` over
-    /// `FULL OUTER ... USING(...)` produce a single merged column.
-    #[allow(dead_code)]
-    /// Remove any synthetic computed column (e.g. a FULL OUTER USING
-    /// COALESCE) registered for `name`. Used when a later non-FULL-OUTER
-    /// USING join changes which side owns the merged column, invalidating
-    /// the prior COALESCE chain.
-    pub(super) fn clear_computed_column(&mut self, name: &str) {
-        self.computed_columns.remove(&name.to_lowercase());
-    }
-
-    pub(super) fn register_full_outer_using_coalesce(
+    /// Publish the common USING expression under its unqualified output name.
+    /// Qualified source columns used by the join remain available by their
+    /// original IDs in the join condition and merged expression.
+    pub(super) fn publish_using_columns(
         &mut self,
-        function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-        using_cols: &[String],
-        left_qual: &str,
-        right_qual: &str,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        constant_policy: novarocks_functions::ConstantPolicy,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), crate::analyze_error::AnalyzeError> {
-        use crate::analysis::{ExprKind, TypedExpr};
-        for col in using_cols {
-            let col_lower = col.to_lowercase();
-            let Some((left_id, dt)) = self
-                .qualified
-                .get(&(left_qual.to_lowercase(), col_lower.clone()))
-            else {
-                continue;
-            };
-            let left_id = *left_id;
-            let dt = dt.clone();
-
-            // Each side keeps its own type. A USING column may be declared
-            // differently on the two sides -- TINYINT against INT is what the
-            // clause exists to join -- and giving the right reference the
-            // left's type would describe a column that is not there.
-            let (right_id, right_dt) = self
-                .qualified
-                .get(&(right_qual.to_lowercase(), col_lower.clone()))
-                .map_or((ColumnId::UNSET, dt.clone()), |(id, right_dt)| {
-                    (*id, right_dt.clone())
-                });
-
-            // For chained FULL OUTER USING, the "left" of the new COALESCE
-            // is the previous COALESCE expression so that
-            // `(t1 FULL OUTER t2) FULL OUTER t3 USING(k1)` evaluates to
-            // `COALESCE(COALESCE(t1.k1, t2.k1), t3.k1)`. Without this, the
-            // second join overwrites the first's mapping and the inner
-            // table's value is lost on outer rows.
-            let left_ref = self
-                .computed_columns
-                .get(&col_lower)
-                .cloned()
-                .unwrap_or(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: left_id,
-                        qualifier: Some(left_qual.to_string()),
-                        column: col_lower.clone(),
-                    },
-                    value_type: super::helpers::with_nullability(dt.clone(), true),
-                });
-            let right_ref = TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: right_id,
-                    qualifier: Some(right_qual.to_string()),
-                    column: col_lower.clone(),
-                },
-                value_type: super::helpers::with_nullability(right_dt, true),
-            };
-            // Bind the merged column the way any other call is bound: the
-            // overload is chosen from the two sides' own types, each argument
-            // is converted to what that overload takes, and the result is the
-            // type the overload produces. Naming a type here instead would
-            // leave the plan stating a call it does not make.
-            let bound = super::resolve_expr::bind_scalar_function_call_with_catalog(
-                function_catalog,
-                "coalesce",
-                vec![left_ref, right_ref],
-                decimal_overflow_policy,
-                constant_policy,
-                control,
-            )?;
-            let value_type = super::helpers::with_nullability(bound.value_type().clone(), true);
-            let coalesce = TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    volatility: crate::functions::builtin_function_volatility("coalesce"),
-                    name: "coalesce".to_string(),
-                    binding: bound.binding,
-                    args: (bound.args).into(),
-                    distinct: false,
-                },
-                value_type,
-            };
-            self.computed_columns.insert(col_lower, coalesce);
+        outputs: Vec<(String, ColumnId, ColumnId, crate::analysis::TypedExpr)>,
+    ) {
+        for ((name, left_id, right_id, expr), entry) in outputs.into_iter().zip(&mut self.ordered) {
+            let key = name.to_lowercase();
+            self.canonical_qualifier.remove(&key);
+            self.qualified
+                .retain(|_, (id, _)| *id != left_id && *id != right_id);
+            entry.0 = None;
+            self.computed_columns.insert(key, expr);
         }
-        Ok(())
     }
 
     /// Apply USING-clause column deduplication and reordering.
@@ -719,8 +652,7 @@ impl AnalyzerScope {
     /// `prefer_right` selects which side's entry survives the dedup:
     /// false → keep the left (first) occurrence, used for INNER / LEFT /
     /// FULL OUTER joins where the left side is the primary qualifier
-    /// (FULL OUTER additionally needs `register_full_outer_using_coalesce`
-    /// to provide the COALESCE expression); true → keep the right
+    /// true → keep the right
     /// occurrence, used for RIGHT joins.
     pub(super) fn apply_using_layout(&mut self, using_cols: &[String], prefer_right: bool) {
         if using_cols.is_empty() {

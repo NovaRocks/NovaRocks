@@ -1,5 +1,5 @@
 -- query 1
--- types	bigint	bigint	varchar
+-- types	bigint	bigint	varchar(1)
 id	x	y
 1	1	a
 1	2	NULL

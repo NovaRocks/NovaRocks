@@ -24,16 +24,16 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}."t_decimal_overflow" (
-  "c_id" int(11) NOT NULL,
-  "c_d32" decimal32(9,3) NOT NULL,
-  "c_d64" decimal64(18,5) NOT NULL,
-  "c_d128" decimal128(38,7) NOT NULL
+  "c_id" INTEGER NOT NULL,
+  "c_d32" DECIMAL(9,3) NOT NULL,
+  "c_d64" DECIMAL(18,5) NOT NULL,
+  "c_d128" DECIMAL(38,7) NOT NULL
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}."avg_test" (
   "c0" bigint,
   "c1" array<int>,
   "c2" bigint,
-  "c3" int(11)
+  "c3" INTEGER
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}."t_decimal_overflow" (c_id, c_d32, c_d64, c_d128) VALUES ROW(1, DECIMAL '999999.99', DECIMAL '9999999999999.99999', DECIMAL '9999999999999999999999999999999.9999999'), ROW(2, (- (DECIMAL '999999.99')), (- (DECIMAL '9999999999999.99999')), (- (DECIMAL '9999999999999999999999999999999.9999999')));
 insert into ${case_db}.avg_test values ROW(1, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 123456789, 1);

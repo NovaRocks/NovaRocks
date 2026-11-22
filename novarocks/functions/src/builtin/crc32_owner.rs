@@ -549,8 +549,6 @@ mod tests {
         let uses = [Some(ExpressionUseId::new(42))];
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap(),
             FunctionValueType::new(DataType::Null, true),
         ] {
             let raw = [argument(source.clone())];
@@ -595,6 +593,8 @@ mod tests {
             FunctionValueType::new(DataType::Binary, true),
             FunctionValueType::new(DataType::LargeBinary, true),
             FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap(),
             FunctionValueType::new(DataType::FixedSizeBinary(16), true),
             FunctionValueType::try_with_logical_type(
                 DataType::FixedSizeBinary(16),

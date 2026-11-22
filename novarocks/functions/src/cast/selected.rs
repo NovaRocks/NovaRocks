@@ -59,7 +59,7 @@ pub(super) fn evaluate<'a>(
         // extent before producing text. This is not a host memory grant.
         let variable_text = *ty == &DataType::Utf8
             && (*recipe.source_type().data_type() == DataType::Binary
-                || matches!(recipe.body, CastBody::ArrayJson(_)));
+                || matches!(recipe.body, CastBody::ArrayJson(_) | CastBody::Trino(_)));
         if *ty == &DataType::Utf8 && !variable_text {
             selection
                 .len()

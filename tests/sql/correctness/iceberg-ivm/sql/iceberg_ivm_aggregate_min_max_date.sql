@@ -32,7 +32,7 @@ CREATE CATALOG ice_ivm_minmax_date_db_${uuid0} USING iceberg WITH ("iceberg.cata
 CREATE SCHEMA ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0}.events (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   event_date DATE
 ) WITH (format_version = 3);
 USE ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0};
@@ -41,11 +41,11 @@ USE ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0};
 -- @skip_result_check=true
 -- 5 rows in 'east' spread across one calendar year.
 INSERT INTO ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0}.events VALUES
-  ROW(1, 'east', '2026-01-15'),
-  ROW(2, 'east', '2026-03-22'),
-  ROW(3, 'east', '2026-06-30'),
-  ROW(4, 'east', '2026-09-10'),
-  ROW(5, 'east', '2026-12-25');
+  ROW(1, 'east', DATE '2026-01-15'),
+  ROW(2, 'east', DATE '2026-03-22'),
+  ROW(3, 'east', DATE '2026-06-30'),
+  ROW(4, 'east', DATE '2026-09-10'),
+  ROW(5, 'east', DATE '2026-12-25');
 CREATE MATERIALIZED VIEW date_mv_${uuid0} AS SELECT region,
        MIN(event_date) AS mn,
        MAX(event_date) AS mx,
@@ -115,7 +115,7 @@ ORDER BY region;
 -- query 11
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW date_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS date_mv_${uuid0};
 DROP TABLE ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0}.events ;
 DROP SCHEMA ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_minmax_date_db_${uuid0};

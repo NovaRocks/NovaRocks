@@ -34,7 +34,7 @@ INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0
 
 -- query 4
 -- @skip_result_check=true
-ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} ADD COLUMN c STRING;
+ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} ADD COLUMN c VARCHAR;
 
 -- query 5
 -- @skip_result_check=true

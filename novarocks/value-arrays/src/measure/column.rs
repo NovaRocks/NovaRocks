@@ -37,7 +37,7 @@ pub(super) enum Shape {
     Boolean,
     Fixed(usize),
     Bytes {
-        source: ByteLayout,
+        source: ByteInput,
         target: ByteLayout,
     },
     Dictionary(ByteLayout),
@@ -45,6 +45,19 @@ pub(super) enum Shape {
     List(usize),
     FixedList(usize),
     Map,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ByteInput {
+    Variable(ByteLayout),
+    Fixed,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SourcePolicy {
+    pub(super) constant: bool,
+    pub(super) borrow: bool,
+    pub(super) project_fixed_binary: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -96,8 +109,7 @@ impl Column {
     pub(super) fn new<E>(
         source: &ArrayRef,
         target: &DataType,
-        constant: bool,
-        borrow: bool,
+        policy: SourcePolicy,
         growth: &mut Growth<'_, E>,
         work: &mut Work<'_, E>,
         depth: usize,
@@ -116,8 +128,12 @@ impl Column {
             StructuralRef::Leaf | StructuralRef::Union { .. } => 0,
         };
         let mut children = allocate(child_count, growth)?;
+        let child_policy = SourcePolicy {
+            constant: false,
+            ..policy
+        };
         let mut child = |source: &ArrayRef, target: &DataType| {
-            Self::new(source, target, false, borrow, growth, work, depth + 1)
+            Self::new(source, target, child_policy, growth, work, depth + 1)
         };
         let shape = match (structural, target) {
             (
@@ -173,14 +189,14 @@ impl Column {
                 children.push(value);
                 Shape::Map
             }
-            (StructuralRef::Leaf, target) => leaf(source, target)?,
+            (StructuralRef::Leaf, target) => leaf(source, target, policy.project_fixed_binary)?,
             _ => return Err(layout().into()),
         };
         Ok(Self {
             source: Arc::clone(source),
             target: target.clone(),
-            constant,
-            borrow,
+            constant: policy.constant,
+            borrow: policy.borrow,
             shape,
             children,
             committed: Facts::default(),
@@ -277,8 +293,13 @@ impl Column {
         if let Some(row) = row {
             match self.shape {
                 Shape::Bytes { source, target } => {
-                    let source = self.byte_source(source)?;
-                    if let Some(span) = source.span(row)? {
+                    let span = match source {
+                        ByteInput::Variable(source) => self.byte_source(source)?.span(row)?,
+                        ByteInput::Fixed => {
+                            arrow_raw::fixed_binary_span(self.source.as_ref(), row)?
+                        }
+                    };
+                    if let Some(span) = span {
                         let (bytes, region) = match span {
                             ByteSpan::Inline(bytes) => (bytes.len(), false),
                             ByteSpan::Region { len, .. } => (len, true),
@@ -515,8 +536,23 @@ impl Column {
     }
 }
 
-fn leaf(source: &ArrayRef, target: &DataType) -> Result<Shape, ValueError> {
+fn leaf(
+    source: &ArrayRef,
+    target: &DataType,
+    project_fixed_binary: bool,
+) -> Result<Shape, ValueError> {
     let source_type = source.data_type();
+    if project_fixed_binary
+        && matches!(
+            (source_type, target),
+            (DataType::FixedSizeBinary(_), DataType::Binary)
+        )
+    {
+        return Ok(Shape::Bytes {
+            source: ByteInput::Fixed,
+            target: ByteLayout::Binary,
+        });
+    }
     let source_layout = match source_type {
         DataType::Dictionary(keys, values) => {
             let value_layout = ByteLayout::from_data_type(values).ok_or_else(layout)?;
@@ -534,7 +570,10 @@ fn leaf(source: &ArrayRef, target: &DataType) -> Result<Shape, ValueError> {
     if let (Some(source), Some(target)) = (source_layout, ByteLayout::from_data_type(target))
         && source.is_utf8() == target.is_utf8()
     {
-        return Ok(Shape::Bytes { source, target });
+        return Ok(Shape::Bytes {
+            source: ByteInput::Variable(source),
+            target,
+        });
     }
     if source_type != target {
         return Err(layout());

@@ -1,29 +1,29 @@
 -- query 4
--- legacy
+-- types	integer	boolean	boolean	boolean
 pk	forward_overlap	reverse_overlap	float32_overlap
-1	1	1	1
-2	1	1	1
-3	0	0	0
+1	true	true	true
+2	true	true	true
+3	false	false	false
 4	NULL	NULL	NULL
 
 -- query 5
--- legacy
+-- types	integer	array(varchar)	array(varchar)
 pk	forward_intersection	reverse_intersection
-1	["1970-01-01 00:00:00"]	["1970-01-01 00:00:00"]
+1	["1970-01-01 00:00:00.000000"]	["1970-01-01 00:00:00.000000"]
 2	[]	[]
 3	[]	[]
 4	NULL	NULL
 
 -- query 6
--- legacy
+-- types	integer	boolean
 pk	spelling_overlap
-1	0
-2	0
-3	0
+1	false
+2	false
+3	false
 4	NULL
 
 -- query 7
--- legacy
+-- types	integer	array(varchar)
 pk	spelling_intersection
 1	[]
 2	[]
@@ -33,9 +33,9 @@ pk	spelling_intersection
 -- query 8
 -- types	varchar	varchar
 float_text	datetime_text
-10	1970-01-01 00:00:00
+1.0E1	1970-01-01 00:00:00.000000
 
 -- query 9
--- legacy
+-- types	boolean	boolean	boolean
 nested_overlap	nested_reverse	nested_spelling
-1	1	0
+true	true	false

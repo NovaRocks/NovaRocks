@@ -229,6 +229,30 @@ impl OwnedValue {
         )?;
         Ok((array, Some(owner)))
     }
+    fn catch_try_row_errors(
+        self,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Self, KernelFailure> {
+        Ok(match self {
+            Self::Selected(array, errors) if !errors.is_empty() => {
+                let mut retained = errors.into_vec();
+                let mut survivors = 0;
+                for ordinal in 0..retained.len() {
+                    work.step()?;
+                    if !try_catches(&retained[ordinal]) {
+                        retained.swap(survivors, ordinal);
+                        survivors += 1;
+                    }
+                }
+                retained.truncate(survivors);
+                Self::Selected(array, retained.into_boxed_slice())
+            }
+            Self::Continued(value, owner) => value
+                .catch_try_row_errors(work)?
+                .with_continuation(Some(owner)),
+            value => value,
+        })
+    }
     fn from_materialized(output: MaterializedValue<'_>) -> Self {
         let MaterializedValue {
             value,
@@ -241,6 +265,23 @@ impl OwnedValue {
         Self::Selected(array, errors)
     }
 }
+fn try_catches(error: &RowDataError) -> bool {
+    use novarocks_failure_contract::{FailureProjection, kernel_reason::*};
+
+    matches!(
+        error.failure_fact().reason(),
+        DIVISION_BY_ZERO
+            | INVALID_CAST_ARGUMENT
+            | INVALID_FUNCTION_ARGUMENT
+            | NUMERIC_OUT_OF_RANGE
+            | INVALID_JSON_LITERAL
+            | JSON_INPUT_CONVERSION_ERROR
+            | JSON_OUTPUT_CONVERSION_ERROR
+            | JSON_VALUE_RESULT_ERROR
+            | PATH_EVALUATION_ERROR
+    )
+}
+
 struct Child {
     // Compact parent positions, distinct from original batch rows.
     ordinals: Vec<usize>,
@@ -1412,6 +1453,12 @@ fn complete_node<'a, R, K: Ord + Clone>(
                         .take()
                         .ok_or_else(|| internal("missing temporal continuation at completion"))?;
                     state.finish(shape, &mut frame.errors, local_selection, work)?
+                }
+                PreparedPureKernel::ControlIntrinsic(_) if shape == ControlShape::Try => {
+                    let [child] = std::mem::take(&mut frame.children)
+                        .try_into()
+                        .map_err(|_| invalid("TRY requires its original body"))?;
+                    child.value.catch_try_row_errors(work)?
                 }
                 PreparedPureKernel::ControlIntrinsic(_) => {
                     if shape == ControlShape::If {

@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
-use novarocks_expression_contract::{BinaryOperator, ExprKind};
+use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::ExprKind;
 use novarocks_physical_plan::{HashJoinCondition, NodeKind};
-use novarocks_sql_testkit::sql_source;
-use novarocks_type_contract::{JoinKeyMatch, OperatorFunction};
+use novarocks_sql::analyze_error::AnalyzeErrorKind;
+use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
+use novarocks_sql_testkit::{sql_source, try_sql_source_with_declared_fields};
+use novarocks_type_contract::{JoinKeyMatch, OperatorFunction, TrinoCastMode};
 
 use super::fixtures::expression_sources;
 
@@ -46,27 +48,36 @@ fn numeric_operators_preserve_explicit_selected_width_and_expression_identity() 
 }
 
 #[test]
-fn numeric_operators_retain_the_legacy_numeric_cast_for_explicit_text_predicates() {
-    let source = sql_source("SELECT k > 5 FROM fixture", DataType::Utf8);
+fn numeric_comparison_requires_an_explicit_text_to_integer_cast() {
+    let rejected = try_sql_source_with_declared_fields(
+        "SELECT k > 5 FROM fixture",
+        &[Field::new("k", DataType::Utf8, true)],
+    );
+    assert!(matches!(
+        rejected,
+        Err(SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)))
+            if error.kind() == AnalyzeErrorKind::TypeMismatch
+    ));
+
+    let source = sql_source("SELECT CAST(k AS INTEGER) > 5 FROM fixture", DataType::Utf8);
     assert!(expression_sources(&source).any(|(_, node, expression)| {
-        let ExprKind::Binary {
-            left,
-            op: BinaryOperator::Gt,
-            ..
-        } = &expression.kind
-        else {
+        let ExprKind::FunctionCall { function, args } = &expression.kind else {
             return false;
         };
+        if function.function_id != OperatorFunction::GreaterThan.function_id() {
+            return false;
+        }
         let converted = node
             .expressions
             .as_ref()
             .unwrap()
-            .definition(*left)
+            .definition(args[0])
             .unwrap();
         matches!(
             &converted.kind,
             ExprKind::Cast {
                 target: DataType::Int32,
+                cast_mode: TrinoCastMode::Explicit,
                 ..
             }
         )

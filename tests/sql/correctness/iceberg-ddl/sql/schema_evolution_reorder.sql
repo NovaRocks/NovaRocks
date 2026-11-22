@@ -51,7 +51,7 @@ SELECT a, b, c FROM reorder_top ORDER BY a;
 DROP TABLE IF EXISTS reorder_nested;
 CREATE TABLE reorder_nested (
   id INT,
-  address ROW(street STRING, city STRING, zip INT)
+  address ROW(street VARCHAR, city VARCHAR, zip INT)
 ) WITH (format_version = 2);
 
 -- query 8

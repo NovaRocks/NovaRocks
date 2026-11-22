@@ -1,5 +1,5 @@
 -- query 2
--- types	integer	varchar
+-- types	integer	varchar(1)
 a	b
 NULL	NULL
 NULL	x

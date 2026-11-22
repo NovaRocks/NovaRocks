@@ -79,3 +79,57 @@ fn all_output_columns_share_one_complete_prefix_and_a_wide_row_can_progress() {
     assert_eq!(text.value(1), "last");
     assert!(cursor.next_page(&context).unwrap().is_none());
 }
+
+#[test]
+fn fixed_byte_projection_preserves_selected_bytes_and_nulls_after_binding() {
+    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use arrow::array::{BinaryArray, FixedSizeBinaryArray};
+
+    let runtime = tokio_runtime();
+    let context = read_context(&runtime);
+    let frozen = Schema::builder()
+        .with_fields(vec![Arc::new(NestedField::optional(
+            7,
+            "bytes",
+            Type::Primitive(PrimitiveType::Fixed(4)),
+        ))])
+        .build()
+        .unwrap();
+    let bound = crate::typed_read::schema_binding::annotated_read_schema(&frozen).unwrap();
+    let target = super::super::output_carrier(
+        bound.field(0),
+        super::super::IcebergReadLayout::Offsets,
+        &Default::default(),
+        &frozen,
+    )
+    .unwrap();
+    assert_eq!(target, DataType::Binary);
+    let fixed: ArrayRef = Arc::new(
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [
+                Some([88, 88, 88, 88]),
+                Some([0, 255, 128, 34]),
+                None,
+                Some([1, 2, 3, 4]),
+            ]
+            .into_iter(),
+            4,
+        )
+        .unwrap()
+        .slice(1, 3),
+    );
+    let columns = [OutputColumn::new(&fixed, &target).with_fixed_binary_projection()];
+    let mut cursor = crate::typed_read::output::OutputCursor::new(
+        &columns,
+        OutputRows::SharedSelected(Arc::from([2, 1, 0])),
+        &context,
+    )
+    .unwrap();
+    let page = cursor.next_page(&context).unwrap().unwrap();
+    let (_, columns) = page.into_columns().unwrap();
+    let array = columns[0].as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(array.value(0), &[1, 2, 3, 4]);
+    assert!(array.is_null(1));
+    assert_eq!(array.value(2), &[0, 255, 128, 34]);
+    assert!(cursor.next_page(&context).unwrap().is_none());
+}

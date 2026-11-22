@@ -37,8 +37,8 @@ ORDER BY part, id;
 
 -- query 3
 -- @order_sensitive=true
-SELECT id, CAST(c_decimal AS STRING) AS c_decimal, HEX(c_binary) AS c_binary_hex,
-       CAST(c_date AS STRING) AS c_date, CAST(c_timestamp AS STRING) AS c_timestamp
+SELECT id, CAST(c_decimal AS VARCHAR) AS c_decimal, HEX(c_binary) AS c_binary_hex,
+       CAST(c_date AS VARCHAR) AS c_date, CAST(c_timestamp AS VARCHAR) AS c_timestamp
 FROM paimon_${suite_uuid0}.fixture.type_matrix
 ORDER BY id;
 

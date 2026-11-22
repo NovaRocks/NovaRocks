@@ -33,7 +33,7 @@ CREATE TABLE ice_ivm_join_a11_drop_${uuid0}.ns_${uuid0}.join_left_${uuid0} (
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_join_a11_drop_${uuid0}.ns_${uuid0}.join_right_${uuid0} (
   rid INT NOT NULL,
-  label STRING
+  label VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_join_a11_drop_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES
   ROW(1, 10, 100),

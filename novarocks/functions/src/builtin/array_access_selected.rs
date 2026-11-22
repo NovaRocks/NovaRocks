@@ -33,6 +33,7 @@ use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{alloc::Layout, cell::RefCell};
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
+    strict: bool,
     mut observe: impl FnMut() -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
     let [
@@ -47,7 +48,11 @@ pub(super) fn validate_profile(
     observe()?;
     if list.logical_type() != ValueLogicalType::Physical
         || index.logical_type() != ValueLogicalType::Physical
-        || !matches!(index.data_type(), DataType::Int32 | DataType::Int64)
+        || if strict {
+            index.data_type() != &DataType::Int64
+        } else {
+            !matches!(index.data_type(), DataType::Int32 | DataType::Int64)
+        }
     {
         return Err(invalid(
             "array element access requires a Physical List and the selected Int32/Int64 index profile",
@@ -63,7 +68,8 @@ pub(super) fn validate_profile(
         .child_type_at(0)
         .ok_or_else(|| invalid("array element access has an invalid frozen child identity"))?;
     let target = contract.result_type();
-    if !target.nullable()
+    let nullable = !strict || list.nullable() || index.nullable() || item.nullable();
+    if target.nullable() != nullable
         || !FunctionValueType::borrowed_value_domains_equal_observed(
             target.value_type(),
             item,
@@ -83,12 +89,13 @@ pub(super) fn validate_profile(
 }
 pub(super) fn evaluate<'a>(
     input: ScalarCallInput<'_, 'a>,
+    strict: bool,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
     let work = RefCell::new(EvaluationCheckpoints::new(control));
     let result = (|| {
-        validate_profile(input.contract(), || work.borrow_mut().step())?;
+        validate_profile(input.contract(), strict, || work.borrow_mut().step())?;
         let target = input.contract().result_type();
         let selection = input.selection();
         let [list, index] = input.arguments() else {
@@ -103,13 +110,16 @@ pub(super) fn evaluate<'a>(
             CollectionObservation::Step => work.borrow_mut().step(),
             CollectionObservation::OpaqueBoundary => work.borrow_mut().flush(),
         };
-        let inputs =
+        let inputs = if strict {
+            ArrayAccessInputs::strict(list.array().clone(), normalized_index)?
+        } else {
             ArrayAccessInputs::new(list.array().clone(), normalized_index, None, &mut observer)
                 .map_err(|error| match error {
                     AccessFailure::Control(cause) => cause,
                     AccessFailure::Operation(cause) => cause,
-                })?;
-        let values = lookup_observed(
+                })?
+        };
+        let (values, row_errors) = lookup_observed(
             &inputs,
             selection,
             |ordinal, row| {
@@ -146,7 +156,7 @@ pub(super) fn evaluate<'a>(
             AccessFailure::Control(cause) => cause,
             AccessFailure::Operation(cause) => cause,
         })?;
-        SelectedValues::try_new(selection, target.data_type(), values, Box::default())
+        SelectedValues::try_new(selection, target.data_type(), values, row_errors)
             .map_err(|_| internal("array element compact output violates its frozen contract"))
     })();
     work.into_inner().finish_result(result)

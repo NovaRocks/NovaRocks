@@ -1357,7 +1357,7 @@ mod tests {
         let target = DataType::Decimal128(2, 0);
         TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(value),
                 target: target.clone(),
                 decimal_overflow_policy: policy,

@@ -39,7 +39,7 @@ impl PreparedNullSafeComparisonRecipe {
             validate_type_observed(right, &mut work).map_err(ComparisonPrepareError::Kernel)?;
             let same_root = left.logical_type() == right.logical_type();
             work.step()?;
-            if !same_root {
+            if !same_root || char_declaration(left) != char_declaration(right) {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
             if left.logical_type() != ValueLogicalType::Physical {

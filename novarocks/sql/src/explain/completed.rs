@@ -1826,7 +1826,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 if novarocks_type_contract::OperatorFunction::from_function_id(
                     &function.function_id,
                 )
-                .is_some() =>
+                .is_some_and(|operator| operator.is_infix()) =>
             {
                 let [left, right] = args.as_ref() else {
                     return Err(fmt::Error);

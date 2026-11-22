@@ -38,7 +38,7 @@ CREATE SCHEMA mvsc_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.readings (
-  sensor STRING,
+  sensor VARCHAR,
   value BIGINT
 ) WITH (format_version = 3);
 -- A source without any snapshot has no exact read point. Leave a current

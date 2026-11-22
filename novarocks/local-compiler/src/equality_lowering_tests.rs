@@ -110,7 +110,7 @@ fn options() -> LocalCompileOptions {
 enum Shape {
     Binary(BinaryOperator),
     SimpleCase,
-    CarrierCast(Option<novarocks_type_contract::ArrayCastFailureMode>),
+    CarrierCast(Option<novarocks_type_contract::TrinoCastMode>),
 }
 #[derive(Clone, Copy)]
 enum Mode {
@@ -279,7 +279,7 @@ struct Fixture {
     rand_request: Option<FunctionBindingRequest<'static>>,
     rand_definitions: Vec<ExprId>,
     constant_policy: ConstantPolicy,
-    carrier_cast: bool,
+    parameters: SemanticParameters,
 }
 fn input_constant(
     pools: &mut novarocks_physical_plan::ConstantPools,
@@ -386,17 +386,11 @@ fn fixture(
                 vec![a, b],
             )
         }
-        Shape::CarrierCast(array_failure_mode) => (
+        Shape::CarrierCast(cast_mode) => (
             ExprKind::Cast {
                 expr: a,
                 target: right.data_type().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
-                    id: novarocks_type_contract::SemanticParameterId::new(7),
-                    expected_key:
-                        novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                },
-                array_failure_mode,
+                cast_mode: cast_mode.unwrap_or(novarocks_type_contract::TrinoCastMode::Implicit),
             },
             right.clone(),
             vec![a],
@@ -545,19 +539,10 @@ fn fixture(
         rand_request,
         rand_definitions,
         constant_policy: options().constants,
-        carrier_cast: matches!(shape, Shape::CarrierCast(_)),
+        parameters: SemanticParameters::default(),
     })
 }
 fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
-    let parameters = SemanticParameters::try_new(if fixture.carrier_cast {
-        vec![(
-            novarocks_type_contract::SemanticParameterId::new(7),
-            novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
-        )]
-    } else {
-        vec![]
-    })
-    .unwrap();
     let constants = fixture.constants.clone();
     let _ = (
         functions,
@@ -596,7 +581,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
                 statement_constant_policy: fixture.constant_policy,
                 cuts: FragmentCuts::default(),
                 result: Some(result),
-                parameters,
+                parameters: fixture.parameters,
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
@@ -1096,39 +1081,51 @@ fn actual_fragment_compilation_preserves_primitive_capability_refusals() {
             ))
         ));
     }
-    let source = package(
-        &functions,
-        fixture(
+    use arrow_schema::TimeUnit;
+    use novarocks_functions::CastPrepareError;
+    use novarocks_type_contract::TrinoCastMode;
+
+    for (left, right, expected) in [
+        (DataType::Date32, DataType::Int8, CastPrepareError::Illegal),
+        (
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            CastPrepareError::Unsupported,
+        ),
+    ] {
+        let source = package(
             &functions,
-            Shape::CarrierCast(None),
-            Mode::Project,
-            FunctionValueType::new(DataType::Date32, true),
-            FunctionValueType::new(DataType::Int8, true),
-            OutputClaim::Accurate,
-            None,
-        )
-        .unwrap(),
-    );
-    let error = compile(source, &functions, &Control).unwrap_err();
-    assert!(
-        error.is_unsupported(),
-        "actual cast capability refusal must reach the public category: {error}"
-    );
-    let FragmentCompileError::Owner {
-        error,
-        phase: "expressions",
-    } = error
-    else {
-        panic!("expected original cast owner");
-    };
-    assert!(matches!(
-        error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
-        Some(crate::expressions::ExpressionLoweringError::Unit(
-            novarocks_expression::ExprCompileError::Cast(
-                novarocks_functions::CastPrepareError::Unsupported
+            fixture(
+                &functions,
+                Shape::CarrierCast(Some(TrinoCastMode::Explicit)),
+                Mode::Project,
+                FunctionValueType::new(left, true),
+                FunctionValueType::new(right, true),
+                OutputClaim::Accurate,
+                None,
             )
-        ))
-    ));
+            .unwrap(),
+        );
+        let error = compile(source, &functions, &Control).unwrap_err();
+        assert_eq!(
+            error.is_unsupported(),
+            expected == CastPrepareError::Unsupported,
+            "actual cast refusal must reach its public category: {error}"
+        );
+        let FragmentCompileError::Owner {
+            error,
+            phase: "expressions",
+        } = error
+        else {
+            panic!("expected original cast owner");
+        };
+        assert!(matches!(
+            error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+            Some(crate::expressions::ExpressionLoweringError::Unit(
+                novarocks_expression::ExprCompileError::Cast(actual)
+            )) if actual == &expected
+        ));
+    }
 }
 
 #[test]

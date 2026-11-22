@@ -342,6 +342,7 @@ fn call_inapplicability(
             ArgumentControl::Eager
             | ArgumentControl::If
             | ArgumentControl::Coalesce
+            | ArgumentControl::Try
             | ArgumentControl::NoArguments => None,
             _ => Some(CallInapplicability::ArgumentControl),
         });

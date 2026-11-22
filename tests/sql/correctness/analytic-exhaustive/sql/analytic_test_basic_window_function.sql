@@ -24,10 +24,10 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0 (
-    "v1" int(11) ,
-    "v2" int(11) ,
-    "v3" int(11) NOT NULL,
-    "v4" int(11)
+    "v1" INTEGER ,
+    "v2" INTEGER ,
+    "v3" INTEGER NOT NULL,
+    "v4" INTEGER
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t0 (v1, v2, v3, v4) values
@@ -103,15 +103,15 @@ INSERT INTO ${case_db}.t0 (v1, v2, v3, v4) values
 -- This point for v1, value `1` and `NULL` are not an integer multiple of chunk_size
 
 CREATE TABLE ${case_db}.t1 (
-    "v1" decimal64(18,5) ,
-    "v2" decimal64(18,5) ,
-    "v3" decimal64(18,5) NOT NULL,
-    "v4" decimal64(18,5) ,
-    "v5" decimal64(18,5) NOT NULL,
-    "v6" decimal64(18,5) NOT NULL,
-    "v7" decimal64(18,5) NOT NULL,
-    "v8" decimal64(18,5) NOT NULL,
-    "v9" decimal64(18,5) NOT NULL
+    "v1" DECIMAL(18,5) ,
+    "v2" DECIMAL(18,5) ,
+    "v3" DECIMAL(18,5) NOT NULL,
+    "v4" DECIMAL(18,5) ,
+    "v5" DECIMAL(18,5) NOT NULL,
+    "v6" DECIMAL(18,5) NOT NULL,
+    "v7" DECIMAL(18,5) NOT NULL,
+    "v8" DECIMAL(18,5) NOT NULL,
+    "v9" DECIMAL(18,5) NOT NULL
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t1 (v1, v2, v3, v4, v5, v6, v7, v8, v9)

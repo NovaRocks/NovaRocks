@@ -38,10 +38,7 @@ use novarocks_physical_plan::{
     ConstantPools, FragmentBuilder, FragmentId, NodeId, ResultField, ResultPort, ValueDef, ValueId,
     ValueOrigin,
 };
-use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, FunctionValueType, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
-};
+use novarocks_type_contract::{EvaluationDemand, FunctionValueType, SemanticParameters};
 use std::{collections::BTreeMap, sync::Arc};
 
 // This is the original Column/Bare branch: an empty Values node, the
@@ -99,10 +96,6 @@ fn identity_cast_program(ty: FunctionValueType) -> Arc<LocalProgram> {
             Box::from([columns[0].0, columns[1].0, columns[2].0]),
         )
         .unwrap();
-    let allow_throw_exception = SemanticParameterRef {
-        id: SemanticParameterId::new(u32::MAX),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
     let unit = builder.unit(output).unwrap();
     let child = unit
         .add(None, ty.clone(), ExprKind::Value(columns[0].0))
@@ -112,11 +105,9 @@ fn identity_cast_program(ty: FunctionValueType) -> Arc<LocalProgram> {
             None,
             ty.clone(),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                 expr: child,
                 target: ty.data_type().clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception,
             },
         )
         .unwrap();
@@ -146,18 +137,13 @@ fn identity_cast_program(ty: FunctionValueType) -> Arc<LocalProgram> {
             ty,
         }]),
     };
-    let parameters = SemanticParameters::try_new([(
-        allow_throw_exception.id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
     compile_checked_fragment_with_parameters(
         &functions,
         builder,
         output,
         &BTreeMap::new(),
         result,
-        parameters,
+        SemanticParameters::default(),
         constants,
     )
 }
@@ -199,10 +185,9 @@ fn identity_cast_keeps_a_required_child_binding_and_permissive_source_carrier() 
                 let recipe = unit.recipes().cast(id).unwrap();
                 assert_eq!(recipe.operation(), CastOperation::Carrier);
                 assert_eq!(
-                    recipe.decimal_overflow_policy(),
-                    DecimalOverflowPolicy::OutputNull
+                    recipe.cast_mode(),
+                    Some(novarocks_type_contract::TrinoCastMode::Implicit)
                 );
-                assert!(!recipe.allow_throw_exception());
                 count += usize::from(recipe.source_type() == &ty && recipe.result_type() == &ty);
             }
         }

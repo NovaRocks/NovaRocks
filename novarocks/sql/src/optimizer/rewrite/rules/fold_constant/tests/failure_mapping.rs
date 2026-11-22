@@ -56,7 +56,7 @@ fn preparation_failures_never_become_optional_fold_misses() {
     );
     let root = fixture.intern(
         ScalarNode::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             child: invalid,
             target: DataType::Int8,
             decimal_overflow_policy: OutputNull,

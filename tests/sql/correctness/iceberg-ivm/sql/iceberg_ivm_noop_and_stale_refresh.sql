@@ -31,7 +31,7 @@ CREATE SCHEMA ice_ivm_noop_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_noop_${uuid0}.ns_${uuid0}.orders (
   order_id INT,
   amount BIGINT,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_noop_${uuid0}.ns_${uuid0}.orders VALUES
   ROW(1, 10, 'east'),

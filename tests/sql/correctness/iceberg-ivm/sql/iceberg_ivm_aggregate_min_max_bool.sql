@@ -31,7 +31,7 @@ CREATE CATALOG ice_ivm_mmbool_db_${uuid0} USING iceberg WITH ("iceberg.catalog.t
 CREATE SCHEMA ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   flag BOOLEAN
 ) WITH (format_version = 3);
 USE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};

@@ -20,10 +20,10 @@
 -- Object member order differs, and a duplicate RHS occurrence cannot multiply rows.
 CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
-CREATE TABLE json_mark_probe (id BIGINT, txt STRING);
-CREATE TABLE json_mark_rhs (txt STRING);
-INSERT INTO json_mark_probe SELECT generate_series, CONCAT('{"a":',CAST(generate_series AS STRING),',"b":1}') FROM TABLE(generate_series(0,12));
-INSERT INTO json_mark_rhs SELECT CONCAT('{"b":1,"a":',CAST(generate_series AS STRING),'}') FROM TABLE(generate_series(0,8));
+CREATE TABLE json_mark_probe (id BIGINT, txt VARCHAR);
+CREATE TABLE json_mark_rhs (txt VARCHAR);
+INSERT INTO json_mark_probe SELECT generate_series, CONCAT('{"a":',CAST(generate_series AS VARCHAR),',"b":1}') FROM TABLE(generate_series(0,12));
+INSERT INTO json_mark_rhs SELECT CONCAT('{"b":1,"a":',CAST(generate_series AS VARCHAR),'}') FROM TABLE(generate_series(0,8));
 INSERT INTO json_mark_rhs VALUES ROW(NULL),ROW('{"b":1,"a":0}');
 -- q16 oracle: 9 TRUE, 4 NULL, one output for each probe occurrence.
 SELECT id, parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs) AS included FROM json_mark_probe ORDER BY id;
@@ -35,7 +35,7 @@ SELECT parse_json(NULL) IN (SELECT parse_json(txt) FROM json_mark_rhs WHERE FALS
 SELECT parse_json('null') IN (SELECT parse_json('null')) AS json_null, parse_json(NULL) IN (SELECT parse_json('null')) AS sql_null;
 -- OR operands are value-form; direct top-level JSON membership stays rejected.
 SELECT id FROM json_mark_probe WHERE id=0 OR parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs) ORDER BY id;
-SELECT MAX(id) AS hi FROM json_mark_probe HAVING FALSE OR parse_json(CAST(MAX(id) AS STRING)) IN (SELECT parse_json('12'));
+SELECT MAX(id) AS hi FROM json_mark_probe HAVING FALSE OR parse_json(CAST(MAX(id) AS VARCHAR)) IN (SELECT parse_json('12'));
 -- @expect_error=[sql.analyze.unsupported_query_shape]
 SELECT id FROM json_mark_probe WHERE parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs);
 -- @expect_error=[sql.analyze.unsupported_query_shape]

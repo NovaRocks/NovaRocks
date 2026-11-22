@@ -33,7 +33,7 @@ CREATE TABLE ${case_db}.t_join_left_outer_residual_nullable_l (
 CREATE TABLE ${case_db}.t_join_left_outer_residual_nullable_r (
   id INT,
   rv INT,
-  flag STRING
+  flag VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_left_outer_residual_nullable_l VALUES
   ROW(1, 5),

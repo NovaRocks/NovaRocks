@@ -279,34 +279,25 @@ pub fn ordinary_union_source(
         e => SqlCompileError::Compilation(e.to_string()),
     })
 }
-/// Original independent MIN state channel: producer negation can gain NULL,
+/// Original independent MIN state channel: the producer can yield NULL,
 /// while merge's OWN literal source remains a complete non-null constant.
 pub fn ordinary_extrema_constant_state_source_for_test(
     maximum: bool,
     control: &dyn PureCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let name = if maximum { "max" } else { "min" };
-    // The Int64 syntax value is narrowed before negation. The cast's
-    // possible successful NULL flows through the negation and widening cast.
+    // The out-of-range Int64 becomes NULL at TRY_CAST. The nullable result
+    // flows through strict negation and the widening cast.
     // Independent CV2/CV3 sources retain their complete Int64 declaration.
-    let narrow_input = TypedExpr {
-        kind: ExprKind::Cast {
-            array_failure_mode: None,
-            expr: novarocks_parser::ast::AstBox::new(integer(i64::from(i8::MIN))),
-            target: DataType::Int8,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
-    };
-    let narrow_minus = crate::analyzer::negation_for_test(narrow_input, control)?;
+    let narrow_minus = nullable_narrow_negation(control)?;
     let minus = TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
             expr: novarocks_parser::ast::AstBox::new(narrow_minus),
             target: DataType::Int64,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
     };
     let contributions = union(local(name, vec![minus]), local(name, vec![integer(2)]));
     let source = merge(
@@ -337,23 +328,29 @@ pub fn ordinary_extrema_constant_state_source_for_test(
         .finish_observed(control)
         .map_err(|e| SqlCompileError::Compilation(e.to_string()))
 }
+fn nullable_narrow_negation(
+    control: &dyn PureCompileControl,
+) -> Result<TypedExpr, SqlCompileError> {
+    let narrow_input = TypedExpr {
+        kind: ExprKind::Cast {
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Try),
+            expr: novarocks_parser::ast::AstBox::new(integer(i64::from(i8::MAX) + 1)),
+            target: DataType::Int8,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        },
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, true),
+    };
+    Ok(crate::analyzer::negation_for_test(narrow_input, control)?)
+}
+
 /// A checked typed physical construction fixture, NOT optimizer-produced SQL.
 /// One original aggregate update source is moved/borrowed across its phases.
 pub fn ordered_array_state_source_for_test(
     intermediate: bool,
     control: &dyn PureCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
-    let narrow_input = TypedExpr {
-        kind: ExprKind::Cast {
-            array_failure_mode: None,
-            expr: novarocks_parser::ast::AstBox::new(integer(i64::from(i8::MIN))),
-            target: DataType::Int8,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
-    };
     let order = SortItem {
-        expr: crate::analyzer::negation_for_test(narrow_input, control)?,
+        expr: nullable_narrow_negation(control)?,
         asc: true,
         nulls_first: true,
     };

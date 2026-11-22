@@ -757,7 +757,7 @@ fn window_and_table_journals_keep_none_elision_and_typed_null_source_policy() {
         },
         TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(literal.clone()),
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

@@ -30,7 +30,7 @@ CREATE TABLE ${case_db}.t_join_cross_a (
   id INT
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_cross_b (
-  c STRING
+  c VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_cross_a VALUES
   ROW(1),

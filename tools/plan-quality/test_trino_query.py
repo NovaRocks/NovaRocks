@@ -48,14 +48,14 @@ class ToolTests(unittest.TestCase):
             output = agg.run_novarocks(endpoint,sql,5,"tpch",artifact_receipt=str(receipt),nr_catalog="ice")
             self.assertEqual(output,"PLAN FRAGMENT 0\n  HASH AGGREGATE (LOCAL)\n")
             captured = json.loads(capture.read_text())
-            self.assertEqual(captured["sql"],"EXPLAIN VERBOSE SELECT 'a;b';")
+            self.assertEqual(captured["sql"],"EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 'a;b';")
             self.assertEqual(captured["args"], ["--host","127.0.0.1","--port","8088","--user","root","--time-zone","UTC","--timeout-secs","5","--mode","text-column","--catalog","ice","--schema","tpch"])
             rf_output = rf.run_novarocks(rf.Endpoint("nr","127.0.0.1","8088","root"),
                                          "-- input comment\nSELECT 'a;b';",5,
                                          artifact_receipt=str(receipt))
             self.assertEqual(rf_output,output)
             captured = json.loads(capture.read_text())
-            self.assertEqual(captured["sql"],"EXPLAIN VERBOSE SELECT 'a;b';")
+            self.assertEqual(captured["sql"],"EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 'a;b';")
             tool.write_text("changed")
             with self.assertRaisesRegex(RuntimeError,"binding failed"):
                 trino_query.run_text_column(endpoint,sql,5,"tpch",receipt=receipt)
@@ -74,9 +74,11 @@ class ToolTests(unittest.TestCase):
             typed.assert_called_once(); mysql.assert_not_called()
             agg.collect_case(agg.Endpoint("fe","f","9","u","fe"),"tpc-h/q1",Path(directory),10)
             mysql.assert_called_once()
+            self.assertTrue(mysql.call_args.args[1].startswith("EXPLAIN VERBOSE "))
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(rf,"run_text_column",return_value="runtime filter\n") as typed, mock.patch.object(rf,"run_mysql",return_value="runtime filter\n") as mysql:
             rf.collect_case("tpc-h/q1",[rf.Endpoint("fe","f","9","u"),rf.Endpoint("nr","n","8","u")],Path(directory),10,artifact_receipt="receipt")
             typed.assert_called_once(); mysql.assert_called_once()
+            self.assertTrue(mysql.call_args.args[1].startswith("EXPLAIN VERBOSE "))
 
     def test_external_fe_mysql_arguments_are_unchanged(self):
         completed = mock.Mock(returncode=0,stdout="original\n")

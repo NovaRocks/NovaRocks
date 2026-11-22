@@ -87,7 +87,6 @@ impl SqlWriteAssignmentSite {
 #[derive(Clone, Debug)]
 pub struct SqlWriteAssignments {
     sites: Box<[SqlWriteAssignmentSite]>,
-    literal_contexts: Box<[SqlWriteLiteralContext]>,
 }
 impl SqlWriteAssignments {
     pub fn try_new(
@@ -102,10 +101,7 @@ impl SqlWriteAssignments {
                 ));
             }
         }
-        Ok(Self {
-            sites,
-            literal_contexts: Box::default(),
-        })
+        Ok(Self { sites })
     }
     pub fn sites(&self) -> &[SqlWriteAssignmentSite] {
         &self.sites
@@ -142,47 +138,5 @@ impl SqlWriteAssignments {
             }
         }
         Ok(())
-    }
-}
-
-/// A producer-authored literal occurrence in the actual source query. The path
-/// grammar is the existing expression-constant grammar; this is no lookup by
-/// field name and gives no context to arbitrary CTEs or function arguments.
-#[derive(Clone, Debug)]
-pub struct SqlWriteLiteralContext {
-    pub(crate) body_path: Box<[super::SqlConstantQueryStep]>,
-    pub(crate) site: super::SqlConstantExpressionSite,
-    pub(crate) output_ordinal: usize,
-    pub(crate) assignment_before_common_type: bool,
-}
-impl SqlWriteLiteralContext {
-    pub fn new(
-        body_path: Vec<super::SqlConstantQueryStep>,
-        site: super::SqlConstantExpressionSite,
-        output_ordinal: usize,
-    ) -> Self {
-        Self {
-            body_path: body_path.into_boxed_slice(),
-            site,
-            output_ordinal,
-            assignment_before_common_type: false,
-        }
-    }
-
-    /// Apply an eligible INSERT cell's ordinary assignment before VALUES or
-    /// UNION ALL infers a common type. Required checks and Fixed byte
-    /// normalization remain with the selected write construction.
-    pub fn with_source_assignment(mut self) -> Self {
-        self.assignment_before_common_type = true;
-        self
-    }
-}
-impl SqlWriteAssignments {
-    pub fn with_literal_contexts(mut self, contexts: Box<[SqlWriteLiteralContext]>) -> Self {
-        self.literal_contexts = contexts;
-        self
-    }
-    pub(crate) fn literal_contexts(&self) -> &[SqlWriteLiteralContext] {
-        &self.literal_contexts
     }
 }

@@ -70,6 +70,11 @@ const INVALID_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const INVALID_TYPE_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.invalid_type_argument"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INVALID_ANALYZE_PROPERTY: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.invalid_analyze_property"),
     phase: ErrorPhase::Analyze,
@@ -148,6 +153,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     TYPE_MISMATCH,
     INVALID_LITERAL,
     INVALID_ARGUMENT,
+    INVALID_TYPE_ARGUMENT,
     INVALID_ANALYZE_PROPERTY,
     TOO_MANY_ARGUMENTS,
     INVALID_QUERY_SHAPE,
@@ -175,6 +181,7 @@ pub enum AnalyzeErrorKind {
     TypeMismatch,
     InvalidLiteral,
     InvalidArgument,
+    InvalidTypeArgument,
     InvalidAnalyzeProperty,
     TooManyArguments,
     InvalidQueryShape,
@@ -204,6 +211,7 @@ impl AnalyzeErrorKind {
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
+            Self::InvalidTypeArgument => INVALID_TYPE_ARGUMENT,
             Self::InvalidAnalyzeProperty => INVALID_ANALYZE_PROPERTY,
             Self::TooManyArguments => TOO_MANY_ARGUMENTS,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
@@ -342,15 +350,6 @@ impl AnalyzeError {
         )
     }
 
-    pub(crate) fn view_cast_preparation(error: novarocks_functions::CastPrepareError) -> Self {
-        if let Some(control) = error.control_error() {
-            return Self::control(control);
-        }
-        Self::control(novarocks_type_contract::CompileControlError::Source(
-            novarocks_failure_contract::SharedFailureCause::new(error),
-        ))
-    }
-
     pub(crate) fn invalid_view_from_analysis(
         view: &str,
         cause: AnalyzeError,
@@ -401,6 +400,32 @@ impl AnalyzeError {
                 definition,
                 source_sql,
                 parser_error: Some(parser_error),
+            },
+        )));
+        error
+    }
+
+    pub fn stored_definition_retired_type(
+        definition: StoredDefinition,
+        source_sql: std::sync::Arc<str>,
+        type_span: Span,
+        type_name: &str,
+    ) -> Self {
+        let location = type_span.to_user_error_location(&source_sql);
+        let mut error = Self::invalid_view(
+            format!(
+                "Materialized view '{}' must be rebuilt: stored SQL uses retired type {type_name} at {}:{}",
+                definition.name(),
+                location.line(),
+                location.column(),
+            ),
+            None,
+        );
+        error.view_cause = Some(Box::new(StoredDefinitionCause::Source(
+            StoredDefinitionSourceCause {
+                definition,
+                source_sql,
+                parser_error: None,
             },
         )));
         error
@@ -524,20 +549,6 @@ impl AnalyzeError {
         Self::at(AnalyzeErrorKind::TypeMismatch, message, span)
     }
 
-    /// Keep semantic binding context independent of the originating facts.
-    pub(crate) fn type_mismatch_source<E>(cause: E, span: Span) -> Self
-    where
-        E: std::error::Error
-            + novarocks_failure_contract::OuterFailureProjection
-            + Send
-            + Sync
-            + 'static,
-    {
-        let mut error = Self::domain_source(cause);
-        error.kind = AnalyzeErrorKind::TypeMismatch;
-        error.span = Some(span);
-        error
-    }
     pub(crate) fn domain_source<E>(cause: E) -> Self
     where
         E: std::error::Error
@@ -584,6 +595,10 @@ impl AnalyzeError {
 
     pub fn too_many_arguments(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::TooManyArguments, message, span)
+    }
+
+    pub fn invalid_type_argument(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::InvalidTypeArgument, message, span)
     }
 
     pub fn invalid_argument(message: impl Into<String>, span: Span) -> Self {
@@ -679,6 +694,21 @@ impl AnalyzeError {
                     view_cause: None,
                 }
             }
+            error @ (novarocks_functions::FunctionBindingError::UnknownFunction
+            | novarocks_functions::FunctionBindingError::HiddenFunction
+            | novarocks_functions::FunctionBindingError::NoMatchingOverload
+            | novarocks_functions::FunctionBindingError::AmbiguousOverload) => Self {
+                kind: if error == novarocks_functions::FunctionBindingError::AmbiguousOverload {
+                    AnalyzeErrorKind::AmbiguousFunctionCall
+                } else {
+                    AnalyzeErrorKind::UnknownFunction
+                },
+                message: error.to_string(),
+                span: None,
+                control: None,
+                source: None,
+                view_cause: None,
+            },
             error => Self::internal(error.to_string()),
         }
     }
@@ -697,7 +727,10 @@ impl AnalyzeError {
             self
         } else if matches!(
             self.kind,
-            AnalyzeErrorKind::UnavailableImplementation | AnalyzeErrorKind::UnsupportedExpression
+            AnalyzeErrorKind::UnavailableImplementation
+                | AnalyzeErrorKind::UnsupportedExpression
+                | AnalyzeErrorKind::UnknownFunction
+                | AnalyzeErrorKind::AmbiguousFunctionCall
         ) {
             Self {
                 span: Some(span),
@@ -805,7 +838,7 @@ mod tests {
         )
         .unwrap_err();
         let fact = cause.failure_fact();
-        let error = AnalyzeError::type_mismatch_source(cause, Span::new(7, 8));
+        let error = AnalyzeError::domain_source(cause).at_type_mismatch(Span::new(7, 8));
         let cloned = error.clone().at_invalid_argument(Span::new(9, 10));
         assert_eq!(error.source_failure(), cloned.source_failure());
         assert_eq!(cloned.source_failure().unwrap().failure_fact(), fact);
@@ -881,6 +914,7 @@ mod tests {
                 "sql.analyze.type_mismatch",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.invalid_argument",
+                "sql.analyze.invalid_type_argument",
                 "sql.analyze.invalid_analyze_property",
                 "sql.analyze.too_many_arguments",
                 "sql.analyze.invalid_query_shape",

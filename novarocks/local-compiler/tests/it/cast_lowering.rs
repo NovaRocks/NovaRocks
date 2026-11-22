@@ -16,9 +16,9 @@
 // under the License.
 
 use super::fragment_fixture::{compile, numeric_catalogue, options, package};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, TimeUnit};
 use novarocks_constant_contract::ConstantPools;
-use novarocks_expression::testkit::{HarnessControl, checked_constants};
+use novarocks_expression::testkit::checked_constants;
 use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
 use novarocks_functions::PureEngineFunctionCatalog;
 use novarocks_local_compiler::FragmentCompileError;
@@ -28,23 +28,14 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
-    PureCompileControl, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    SemanticParameterValue, SemanticParameters,
+    PureCompileControl, SemanticParameters, TrinoCastMode,
 };
 use std::sync::{Arc, Mutex};
-
-fn allow_ref() -> SemanticParameterRef {
-    SemanticParameterRef {
-        id: SemanticParameterId::new(u32::MAX),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    }
-}
 
 fn cast_fixture(
     source_type: FunctionValueType,
     result_type: FunctionValueType,
-    policy: DecimalOverflowPolicy,
-    allow: bool,
+    cast_mode: TrinoCastMode,
 ) -> (PureEngineFunctionCatalog, Arc<FragmentPackage>) {
     let mut source_pools = ConstantPools::empty();
     let constants = options().constants;
@@ -87,11 +78,9 @@ fn cast_fixture(
                     None,
                     ty.clone(),
                     ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: TrinoCastMode::Explicit,
                         expr: exact,
                         target: DataType::Float32,
-                        decimal_overflow_policy: policy,
-                        allow_throw_exception: allow_ref(),
                     },
                 )
                 .unwrap()
@@ -154,11 +143,9 @@ fn cast_fixture(
             None,
             result_type.clone(),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode,
                 expr: child,
                 target: result_type.data_type().clone(),
-                decimal_overflow_policy: policy,
-                allow_throw_exception: allow_ref(),
             },
         )
         .unwrap();
@@ -191,11 +178,6 @@ fn cast_fixture(
         value,
         ty: result_type,
     }]);
-    let parameters = SemanticParameters::try_new([(
-        allow_ref().id,
-        SemanticParameterValue::AllowThrowException(allow),
-    )])
-    .unwrap();
     (
         numeric_catalogue(),
         package(
@@ -203,7 +185,7 @@ fn cast_fixture(
             builder,
             output_node,
             fields,
-            parameters,
+            SemanticParameters::default(),
             source_pools,
             constants,
         ),
@@ -358,82 +340,70 @@ impl PureCompileControl for CompileCallbacks {
 }
 
 #[test]
-fn date_float_actual_compiler_every_compile_control_refusal_keeps_typed_cause() {
-    for target in [DataType::Float32, DataType::Float64] {
-        let (functions, package) = cast_fixture(
-            FunctionValueType::new(DataType::Date32, true),
-            FunctionValueType::new(target, true),
-            DecimalOverflowPolicy::ReportError,
+fn standard_cast_compile_preserves_control_before_success_and_refusal() {
+    let list =
+        |nullable| DataType::List(Arc::new(Field::new("element", DataType::Int32, nullable)));
+    for (source, target, source_nullable, target_nullable, cast_mode, valid) in [
+        (
+            DataType::Date32,
+            DataType::Utf8,
             true,
-        );
-        let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
-        compile(&functions, package.clone(), &recorder).unwrap();
-        let trace = recorder.trace();
-        assert!(!trace.is_empty());
-        for at in 1..=trace.len() {
-            for cause in [
-                CompileControlError::Cancelled,
-                CompileControlError::DeadlineExceeded,
-                CompileControlError::ResourceExhausted,
-            ] {
-                let control = CompileCallbacks::new(cause.clone(), at);
-                assert!(
-                    matches!(compile(&functions,package.clone(),&control),Err(FragmentCompileError::Control(error)) if error==cause)
-                );
-                assert_eq!(control.trace(), trace[..at]);
-            }
-        }
-    }
-}
-
-#[test]
-fn float_date_actual_compiler_all_three_compile_causes_preserve_real_callback_prefix() {
-    for source in [DataType::Float32, DataType::Float64] {
-        let (functions, package) = cast_fixture(
-            FunctionValueType::new(source, false),
-            FunctionValueType::new(DataType::Date32, false),
-            DecimalOverflowPolicy::ReportError,
             true,
-        );
-        let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
-        compile(&functions, package.clone(), &recorder).unwrap();
-        let trace = recorder.trace();
-        assert!(!trace.is_empty());
-        for at in 1..=trace.len() {
-            for cause in [
-                CompileControlError::Cancelled,
-                CompileControlError::DeadlineExceeded,
-                CompileControlError::ResourceExhausted,
-            ] {
-                let control = CompileCallbacks::new(cause.clone(), at);
-                assert!(
-                    matches!(compile(&functions,package.clone(),&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
-                );
-                assert_eq!(control.trace(), trace[..at]);
-            }
-        }
-    }
-}
-
-#[test]
-fn float_cast_compile_three_primary_causes_preserve_success_and_ordinary_false_allow_tail() {
-    for valid in [true, false] {
-        let (functions, package) = cast_fixture(
-            FunctionValueType::new(DataType::Float64, false),
-            FunctionValueType::new(DataType::Int8, valid),
-            DecimalOverflowPolicy::ReportError,
+            TrinoCastMode::Explicit,
+            true,
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Utf8,
+            true,
+            true,
+            TrinoCastMode::Explicit,
+            true,
+        ),
+        (
+            DataType::Float32,
+            DataType::Int8,
             false,
+            false,
+            TrinoCastMode::Explicit,
+            true,
+        ),
+        (
+            DataType::Float64,
+            DataType::Int8,
+            false,
+            true,
+            TrinoCastMode::Try,
+            true,
+        ),
+        (
+            DataType::Int64,
+            DataType::Int8,
+            false,
+            false,
+            TrinoCastMode::Try,
+            false,
+        ),
+        (
+            DataType::List(Arc::new(Field::new("item", DataType::Null, true))),
+            list(false),
+            true,
+            true,
+            TrinoCastMode::Explicit,
+            false,
+        ),
+    ] {
+        let (functions, package) = cast_fixture(
+            FunctionValueType::new(source, source_nullable),
+            FunctionValueType::new(target, target_nullable),
+            cast_mode,
         );
-        assert!(matches!(
-            package.parameters().require(allow_ref()).unwrap(),
-            SemanticParameterValue::AllowThrowException(false)
-        ));
         let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
         let result = compile(&functions, package.clone(), &recorder);
-        assert_eq!(result.is_ok(), valid);
+        assert_eq!(result.is_ok(), valid, "{result:?}");
         if let Err(error) = result {
             assert!(!matches!(error, FragmentCompileError::Control(_)));
-            assert!(error.to_string().contains("successful-NULL"));
+            assert!(error.to_string().contains("successful-NULL"), "{error}");
         }
         let trace = recorder.trace();
         assert!(!trace.is_empty());
@@ -448,58 +418,6 @@ fn float_cast_compile_three_primary_causes_preserve_success_and_ordinary_false_a
                     matches!(compile(&functions, package.clone(), &refusal), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );
                 assert_eq!(refusal.trace(), trace[..stop_at]);
-            }
-        }
-    }
-}
-
-#[test]
-fn observed_list_cast_actual_compiler_nonnullable_child_is_explicit_unsupported_shape_even_empty() {
-    let source = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
-    let target = DataType::List(Arc::new(Field::new("element", DataType::Int32, false)));
-    let (functions, package) = cast_fixture(
-        FunctionValueType::new(source, true),
-        FunctionValueType::new(target, true),
-        DecimalOverflowPolicy::OutputNull,
-        false,
-    );
-    let error = compile(&functions, package, &HarnessControl).unwrap_err();
-    assert!(
-        error.to_string().contains("implemented exact Physical"),
-        "{error}"
-    );
-    assert!(!matches!(error, FragmentCompileError::Control(_)));
-}
-
-#[test]
-fn cast_compile_preserves_all_original_refusals_and_observes_ordinary_narrowing_rejection_tail() {
-    for valid in [true, false] {
-        let (functions, package) = cast_fixture(
-            FunctionValueType::new(DataType::Int64, false),
-            FunctionValueType::new(DataType::Int8, valid),
-            DecimalOverflowPolicy::ReportError,
-            true,
-        );
-        assert!(matches!(
-            package.parameters().require(allow_ref()).unwrap(),
-            SemanticParameterValue::AllowThrowException(true)
-        ));
-        let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
-        let result = compile(&functions, package.clone(), &recorder);
-        assert_eq!(result.is_ok(), valid);
-        let trace = recorder.trace();
-        assert!(!trace.is_empty());
-        for stop_at in 1..=trace.len() {
-            for cause in [
-                CompileControlError::Cancelled,
-                CompileControlError::DeadlineExceeded,
-                CompileControlError::ResourceExhausted,
-            ] {
-                let control = CompileCallbacks::new(cause.clone(), stop_at);
-                assert!(
-                    matches!(compile(&functions, package.clone(), &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
-                );
-                assert_eq!(control.trace(), trace[..stop_at]);
             }
         }
     }

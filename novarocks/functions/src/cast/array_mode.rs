@@ -39,6 +39,7 @@ fn recipe(
         result: result.clone(),
         body,
         array_child: child,
+        trino_mode: None,
         decimal_overflow_policy: policy,
         allow_throw_exception: allow,
         array_failure_mode: mode,
@@ -514,15 +515,11 @@ struct ConversionFailure(trino_array_leaf::LeafError);
 impl fmt::Display for ConversionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self.0 {
-            trino_array_leaf::LeafError::InvalidCastArgument => {
-                "Invalid array element cast argument"
-            }
+            trino_array_leaf::LeafError::InvalidCastArgument => "Invalid cast argument",
             trino_array_leaf::LeafError::NumericOutOfRange => {
-                "Array element cast is outside the numeric range"
+                "Cast value is outside the target numeric range"
             }
-            trino_array_leaf::LeafError::TypeMismatch => {
-                "Array element differs from its frozen type"
-            }
+            trino_array_leaf::LeafError::TypeMismatch => "Cast input differs from its frozen type",
         })
     }
 }
@@ -701,7 +698,26 @@ pub(super) fn evaluate_json(
         .value(row);
     Ok(
         match super::array_json::convert_non_null_observed(operation, raw, work) {
-            Ok(Some(text)) => CastRowResult::Text(text),
+            Ok(Some(text)) => {
+                if recipe.trino_mode.is_some()
+                    && operation == super::array_json::Operation::JsonToVarchar
+                    && let novarocks_type_contract::ValueKind::BoundedCharacter(character) =
+                        recipe.result.value_type().kind()
+                {
+                    let mut count = 0;
+                    for _ in text.chars() {
+                        work.step()?;
+                        count += 1;
+                        if count > character.length() {
+                            return Ok(CastRowResult::RowError(RowDataError::from_domain(
+                                ordinal,
+                                super::array_json::InvalidCast,
+                            )?));
+                        }
+                    }
+                }
+                CastRowResult::Text(text)
+            }
             Ok(None) => CastRowResult::Null,
             Err(super::array_json::LeafError::Outer(cause)) => return Err(cause),
             Err(super::array_json::LeafError::Conversion(cause)) => {

@@ -270,6 +270,10 @@ fn scalar_selection_error(
                 error,
                 FunctionBindingError::UnavailableImplementation(_)
                     | FunctionBindingError::VariantTargetType(_)
+                    | FunctionBindingError::UnknownFunction
+                    | FunctionBindingError::HiddenFunction
+                    | FunctionBindingError::NoMatchingOverload
+                    | FunctionBindingError::AmbiguousOverload
             ) =>
         {
             let arg_types: Vec<_> = args.iter().map(|arg| arg.value_type.data_type()).collect();
@@ -433,7 +437,7 @@ fn cast_expression(source: TypedExpr, conversion: CarrierConversion) -> TypedExp
             expr: ast::AstBox::new(source),
             target: conversion.target.data_type().clone(),
             decimal_overflow_policy: conversion.decimal_overflow_policy,
-            array_failure_mode: None,
+            cast_mode: conversion.mode,
         },
         value_type: conversion.target,
     }

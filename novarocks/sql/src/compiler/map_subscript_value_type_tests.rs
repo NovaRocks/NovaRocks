@@ -20,33 +20,43 @@
 use super::*;
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
+use novarocks_result_contract::{CharacterKind, CharacterType, NativeRenderType, RenderTimeUnit};
 use novarocks_type_contract::ValueLogicalType;
 
 #[test]
-fn public_sql_map_subscript_preserves_largeint_key_identity() {
-    // The lookup must retain the complete LargeInt key/value declarations.
-    // Installed map_agg supplies those same declarations without depending on
-    // the unavailable scalar map constructor; keep all lookup/nullability oracles.
-    for (sql, carrier, domain) in [
+fn public_sql_map_subscript_widens_integer_probe_and_preserves_value_declaration() {
+    // The input map already has the common BIGINT key type. Its value
+    // declaration must survive INTEGER probes, NULL probes and aliases.
+    let decimal = NativeRenderType::Decimal {
+        bits: 128,
+        precision: 19,
+        scale: 0,
+    };
+    for (sql, carrier, native_type) in [
         (
-            "SELECT map_agg(CAST('11111' AS LARGEINT), CAST('2024-09-01 18:00:00' AS DATETIME))[11111]",
+            "SELECT map_agg(BIGINT '11111', CAST('2024-09-01 18:00:00' AS TIMESTAMP(6)))[11111]",
             DataType::Timestamp(TimeUnit::Microsecond, None),
-            ValueLogicalType::Physical,
+            NativeRenderType::Timestamp {
+                unit: RenderTimeUnit::Microsecond,
+                timezone: None,
+            },
         ),
         (
-            "SELECT map_agg(CAST('11111' AS LARGEINT), CAST('9223372036854775808' AS LARGEINT))[11111]",
-            DataType::FixedSizeBinary(16),
-            ValueLogicalType::LargeInt,
+            "SELECT map_agg(BIGINT '11111', DECIMAL '9223372036854775808')[11111]",
+            DataType::Decimal128(19, 0),
+            decimal.clone(),
         ),
         (
-            "SELECT map_agg(CAST('11111' AS LARGEINT), CAST('9223372036854775808' AS LARGEINT))[NULL]",
-            DataType::FixedSizeBinary(16),
-            ValueLogicalType::LargeInt,
+            "SELECT map_agg(BIGINT '11111', DECIMAL '9223372036854775808')[NULL]",
+            DataType::Decimal128(19, 0),
+            decimal,
         ),
         (
-            "SELECT m[k] FROM (SELECT map_agg(CAST('11111' AS LARGEINT), 'selected') AS m, 11111 AS k) q",
+            "SELECT m[k] FROM (SELECT map_agg(BIGINT '11111', 'selected') AS m, 11111 AS k) q",
             DataType::Utf8,
-            ValueLogicalType::Physical,
+            NativeRenderType::BoundedCharacter(
+                CharacterType::new(CharacterKind::Varchar, 8).unwrap(),
+            ),
         ),
     ] {
         let request = SqlFinalPlanCompileRequest::new(
@@ -84,7 +94,11 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
         let result = completed.plan().result_port().unwrap();
         assert_eq!(result.fields.len(), 1, "{sql}");
         assert_eq!(result.fields[0].ty.data_type(), &carrier, "{sql}");
-        assert_eq!(result.fields[0].ty.logical_type(), domain, "{sql}");
+        assert_eq!(
+            result.fields[0].ty.logical_type(),
+            ValueLogicalType::Physical,
+            "{sql}"
+        );
         assert!(result.fields[0].ty.nullable(), "missing lookup key: {sql}");
         let render = crate::compiler::root_render_type::client_render_schema(
             completed.plan(),
@@ -95,19 +109,9 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
                     variant_binary: true,
                 },
             ),
-        );
-        if domain == ValueLogicalType::LargeInt {
-            assert_eq!(
-                render.unwrap_err(),
-                crate::compiler::ClientRenderSchemaError::UnsupportedClientType {
-                    column: "_col0".to_owned(),
-                    native_type: novarocks_result_contract::NativeRenderType::LargeInt,
-                },
-                "{sql}"
-            );
-        } else {
-            render.unwrap_or_else(|error| panic!("client render declaration for {sql}: {error}"));
-        }
+        )
+        .unwrap_or_else(|error| panic!("client render declaration for {sql}: {error}"));
+        assert_eq!(render.columns()[0].field.native_type, native_type, "{sql}");
         novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
     }
 }

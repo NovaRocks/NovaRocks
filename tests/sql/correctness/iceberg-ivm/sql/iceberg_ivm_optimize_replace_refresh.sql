@@ -30,7 +30,7 @@ CREATE CATALOG ice_ivm_opt_replace_${uuid0} USING iceberg WITH ("iceberg.catalog
 CREATE SCHEMA ice_ivm_opt_replace_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_opt_replace_${uuid0}.ns_${uuid0}.fact (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 USE ice_ivm_opt_replace_${uuid0}.ns_${uuid0};

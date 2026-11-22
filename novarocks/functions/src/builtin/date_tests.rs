@@ -647,9 +647,8 @@ fn date_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources
                 .prepare_scalar(stale, canonical, crate::binding_test_control())
                 .is_err()
         );
-        // These have no installed date source profile. Timestamp units/zones
-        // and nominal text anchors may legitimately resolve through coercion;
-        // rejection below concerns canonical body inputs, not those requests.
+        // These have no installed date source profile. A timestamp may
+        // widen its precision before entering the canonical body.
         for source in [
             FunctionValueType::new(DataType::Binary, true),
             FunctionValueType::from_legacy_declared_projection(
@@ -666,10 +665,7 @@ fn date_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources
                     .is_err()
             );
         }
-        let raw = source(
-            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
-            true,
-        );
+        let raw = source(DataType::Timestamp(TimeUnit::Second, None), true);
         let raw_arguments = [FunctionArgument::Value {
             value_type: raw.clone(),
             constant: None,

@@ -27,7 +27,7 @@
 CREATE SCHEMA iceberg_cat_${suite_uuid0}.trc_opt_${uuid0};
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows (k BIGINT);
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows (k BIGINT);
-CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows (k BIGINT, p STRING) WITH (partitioning = ARRAY['p']);
+CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows (k BIGINT, p VARCHAR) WITH (partitioning = ARRAY['p']);
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows (k BIGINT) WITH (format_version = 2);
 CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows (k BIGINT) WITH (format_version = 3);
 

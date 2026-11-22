@@ -123,7 +123,7 @@ fn folds_decimal_multiplication_and_checked_rounding_cast_with_exact_coefficient
     compile(
         "SELECT CAST(1.25 AS DECIMAL(10,2)) * CAST(4.00 AS DECIMAL(10,2)),
         CAST(CAST(99999.999 AS DECIMAL(8,3)) AS DECIMAL(8,2)),
-        CAST(CAST(99999.999 AS DECIMAL(8,3)) AS DECIMAL(7,2))",
+        TRY_CAST(CAST(99999.999 AS DECIMAL(8,3)) AS DECIMAL(7,2))",
         &probe,
     );
     let receipts = probe.receipts.lock().unwrap();
@@ -257,10 +257,36 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
 }
 
 #[test]
-fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
+fn public_sql_map_key_transition_reports_uninstalled_conversion_during_analysis() {
+    use novarocks_sql::analyze_error::AnalyzeErrorKind;
+    use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
+
+    let probe = Arc::new(FoldProbe::default());
+    let error = compile_table_free(
+        "SELECT map_agg(CAST(1 AS INTEGER),'one')[1e0]",
+        session(Default::default(), true),
+        &probe.control(),
+    )
+    .unwrap_err();
+    let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = error else {
+        panic!("expected a typed analysis error: {error}");
+    };
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+    assert!(error.message().contains("Cannot cast Map"));
+    assert!(error.span().is_some());
+}
+
+#[test]
+fn public_sql_map_float_probe_keeps_nullable_try_cast_before_optional_folding() {
     for (sql, null_index) in [
-        ("SELECT map_agg(CAST(1 AS INT),'one')[1e0]", false),
-        ("SELECT map_agg(CAST(1 AS INT),'one')[1e100]", true),
+        (
+            "SELECT map_agg(CAST(1 AS INT),'one')[TRY_CAST(1e0 AS INTEGER)]",
+            false,
+        ),
+        (
+            "SELECT map_agg(CAST(1 AS INT),'one')[TRY_CAST(1e100 AS INTEGER)]",
+            true,
+        ),
     ] {
         let probe = Arc::new(FoldProbe::default());
         let owner = compile(sql, &probe);
@@ -271,7 +297,7 @@ fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
                 ExprKind::Cast {
                     expr,
                     target: DataType::Int32,
-                    ..
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Try,
                 } if receipt.unit.definition(*expr).unwrap().ty.data_type()
                     == &DataType::Float64 =>
                 {
@@ -279,7 +305,7 @@ fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
                 }
                 _ => None,
             })
-            .expect("the original float CAST reaches optional folding");
+            .expect("the original float TRY_CAST reaches optional folding");
         assert_eq!(receipt.root().ty.logical_type(), ValueLogicalType::Physical);
         assert!(receipt.root().ty.nullable());
         assert!(!receipt.constant(argument).value_type().nullable());

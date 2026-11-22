@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, SemanticParameterKey, SemanticParameterValue};
+use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
 
 fn assert_selection(
     captured: &crate::binding::CapturedLogicalCallArguments,
@@ -60,16 +60,25 @@ fn assert_selection(
 
 #[test]
 fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are_distinct() {
-    for (final_type, decimal) in [
-        (DataType::Utf8, DecimalOverflowPolicy::ReportError),
-        (DataType::LargeUtf8, DecimalOverflowPolicy::OutputNull),
+    for (wrapped, decimal) in [
+        (false, DecimalOverflowPolicy::ReportError),
+        (true, DecimalOverflowPolicy::OutputNull),
     ] {
         let input = selected_json();
         let ExprKind::Constant(original) = &input.kind else {
             unreachable!()
         };
-        let final_type = ValueType::new(final_type, false);
-        let owner = finish(cast(input.clone(), final_type.clone(), decimal));
+        let final_type = if wrapped {
+            bounded_varchar()
+        } else {
+            ValueType::new(DataType::Utf8, false)
+        };
+        let expression = if wrapped {
+            cast_to_bounded_varchar(input.clone(), decimal)
+        } else {
+            cast(input.clone(), final_type.clone(), decimal)
+        };
+        let owner = finish(expression);
         let (fragment, unit_node, source) = conversion(&owner);
         let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
         let selected = receipt
@@ -139,32 +148,19 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
                 .ty,
             final_type
         );
-        if *final_type.data_type() == DataType::LargeUtf8 {
+        if wrapped {
             let wrapper = unit_node.expressions.as_ref().unwrap().definitions().iter().find(|expression|
-                matches!(&expression.kind, ContractExprKind::Cast { expr, .. } if *expr == source.id)).expect("separate same-domain carrier CAST");
+                matches!(&expression.kind, ContractExprKind::Cast { expr, .. } if *expr == source.id)).expect("separate bounded VARCHAR CAST");
             let ContractExprKind::Cast {
-                target,
-                decimal_overflow_policy,
-                allow_throw_exception,
-                ..
+                target, cast_mode, ..
             } = &wrapper.kind
             else {
                 unreachable!()
             };
-            assert_eq!(target, &DataType::LargeUtf8);
-            assert_eq!(*decimal_overflow_policy, decimal);
+            assert_eq!(target, &DataType::Utf8);
+            assert_eq!(*cast_mode, TrinoCastMode::Explicit);
             assert_eq!(wrapper.ty, final_type);
             assert_ne!(wrapper.id, source.id);
-            assert_eq!(
-                allow_throw_exception.expected_key,
-                SemanticParameterKey::AllowThrowException
-            );
-            // finish() explicitly supplies false to the original visitor;
-            // this is that authored statement fact, not a session default.
-            assert_eq!(
-                owner.plan().parameters().get(allow_throw_exception.id),
-                Some(&SemanticParameterValue::AllowThrowException(false))
-            );
             assert!(matches!(
                 loan(&owner, fragment, unit_node, wrapper, &Control::default()),
                 Err(SqlSourceJournalError::MissingEntry)

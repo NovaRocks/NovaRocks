@@ -1329,8 +1329,12 @@ fn try_partition_only_page_source(
         match column.source() {
             IcebergColumnSource::IdentityPartitionConstant(value) => {
                 let array = constant_column(value.as_ref(), column.target(), 1)?;
-                let target =
-                    output_carrier(column.target(), relation.output_layout, &relation.nominals)?;
+                let target = output_carrier(
+                    column.target(),
+                    relation.output_layout,
+                    &relation.nominals,
+                    &relation.table_schema,
+                )?;
                 constants.push((array, target));
             }
             IcebergColumnSource::Physical { .. }
@@ -1380,7 +1384,9 @@ impl IcebergPartitionOnlyPageSource {
         let columns = self
             .constants
             .iter()
-            .map(|(array, target)| OutputColumn::constant(array, target))
+            .map(|(array, target)| {
+                OutputColumn::constant(array, target).with_fixed_binary_projection()
+            })
             .collect::<Vec<_>>();
         let projected = self
             .output_projection
@@ -1658,7 +1664,14 @@ impl IcebergParquetPageSource {
             .fields()
             .iter()
             .take(self.prefix_len)
-            .map(|field| output_carrier(field, self.output_layout, &self.nominals))
+            .map(|field| {
+                output_carrier(
+                    field,
+                    self.output_layout,
+                    &self.nominals,
+                    &self.table_schema,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let checks = self.build_predicate_checks()?;
 
@@ -2380,11 +2393,12 @@ impl IcebergParquetPageSource {
                     }
                     _ => target,
                 };
-                if source.constant {
+                let column = if source.constant {
                     OutputColumn::constant(&source.array, target)
                 } else {
                     OutputColumn::new(&source.array, target)
-                }
+                };
+                column.with_fixed_binary_projection()
             })
             .collect::<Vec<_>>();
         let projected = self
@@ -2407,14 +2421,12 @@ fn output_carrier(
     field: &Field,
     layout: IcebergReadLayout,
     nominals: &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
+    table_schema: &Schema,
 ) -> Result<arrow::datatypes::DataType, ConnectorError> {
     use arrow::datatypes::{DataType, FieldRef};
     use novarocks_type_contract::ValueLogicalType;
-    if layout == IcebergReadLayout::Offsets {
-        return Ok(field.data_type().clone());
-    }
     let child = |field: &FieldRef| {
-        let carrier = output_carrier(field, layout, nominals)?;
+        let carrier = output_carrier(field, layout, nominals, table_schema)?;
         Ok::<_, ConnectorError>(if &carrier == field.data_type() {
             Arc::clone(field)
         } else {
@@ -2436,7 +2448,23 @@ fn output_carrier(
             let domain = id
                 .and_then(|id| nominals.get(&id))
                 .map_or(ValueLogicalType::Physical, |domain| domain.logical_type());
-            layout.byte_carrier(ty, domain)
+            let original = id.and_then(|id| table_schema.field_by_id(id));
+            if let Some(storage) = original
+                && let crate::iceberg::spec::Type::Primitive(primitive) =
+                    storage.field_type.as_ref()
+                && let Some(width) =
+                    crate::schema_mapping::typed_value::plain_fixed_width(primitive, domain)
+            {
+                if ty != &DataType::FixedSizeBinary(width) {
+                    return Err(corrupt(format!(
+                        "Iceberg field ID {} requires fixed byte width {width}",
+                        storage.id,
+                    )));
+                }
+                DataType::Binary
+            } else {
+                layout.byte_carrier(ty, domain)
+            }
         }
     })
 }

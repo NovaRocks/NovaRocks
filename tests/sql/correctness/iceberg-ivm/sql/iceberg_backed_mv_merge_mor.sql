@@ -40,7 +40,7 @@ CREATE CATALOG mv_merge_mor_ice_${uuid0} USING iceberg WITH ("iceberg.catalog.ty
 CREATE SCHEMA mv_merge_mor_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_merge_mor_ice_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
-  status STRING,
+  status VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO mv_merge_mor_ice_${uuid0}.ns_${uuid0}.orders VALUES
@@ -48,7 +48,7 @@ INSERT INTO mv_merge_mor_ice_${uuid0}.ns_${uuid0}.orders VALUES
   ROW(2, 'open', 20);
 CREATE TABLE mv_merge_mor_ice_${uuid0}.ns_${uuid0}.staging (
   id BIGINT NOT NULL,
-  status STRING,
+  status VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO mv_merge_mor_ice_${uuid0}.ns_${uuid0}.staging VALUES

@@ -40,7 +40,7 @@ CREATE TABLE ice_ivm_pjagg_${uuid0}.ns_${uuid0}.fact (
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_pjagg_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 USE ice_ivm_pjagg_${uuid0}.ns_${uuid0};
 

@@ -138,6 +138,18 @@ pub(super) fn publish(
         } else {
             nominal.unwrap_or(&empty)
         };
+        if let Some(table) = sql_table_name(relation)
+            && let Some(field) = crate::schema_mapping::nominal_declaration::retired_largeint_field(
+                source,
+                column_nominals,
+                &mut || creation.work(1),
+            )?
+        {
+            return Err(
+                crate::schema_mapping::nominal_declaration::retired_largeint_error(table, field)
+                    .into(),
+            );
+        }
         let declared = crate::schema_mapping::typed_value::from_field(
             source,
             column.nullable(),

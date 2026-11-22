@@ -80,6 +80,7 @@ pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, Unsuppor
         }
         Expr::NullIf(node) => ("nullif", vec![&node.first, &node.second]),
         Expr::Coalesce(node) => ("coalesce", node.operands.iter().collect()),
+        Expr::Try(node) => ("try", vec![&node.inner]),
         Expr::Trim(node) => {
             if node.trim_character.is_some() {
                 return Err(UnsupportedCallSyntax::new(

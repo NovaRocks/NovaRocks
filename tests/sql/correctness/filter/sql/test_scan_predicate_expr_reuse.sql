@@ -29,10 +29,10 @@ CREATE TABLE t (
     v1 BIGINT NOT NULL,
     v2 BIGINT ,
     v3 BIGINT ,
-    v4 ARRAY<STRING>
+    v4 ARRAY<VARCHAR>
 ) WITH (format_version = 3);
 INSERT INTO t SELECT generate_series, generate_series, generate_series,
-    array_repeat(CAST(generate_series AS STRING), 5)
+    array_repeat(CAST(generate_series AS VARCHAR), 5)
 FROM TABLE(generate_series(1, 100));
 SELECT * FROM t WHERE v1 = 10 AND v2 = v3;
 

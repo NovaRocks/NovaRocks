@@ -28,6 +28,7 @@ sql.admit.insert_unsupported_form	Admit
 sql.admit.invalid_analyze_property	Admit
 sql.admit.invalid_branch_property	Admit
 sql.admit.invalid_catalog_property	Admit
+sql.admit.invalid_default_column_value	Admit
 sql.admit.invalid_materialized_view_property	Admit
 sql.admit.invalid_schema_property	Admit
 sql.admit.invalid_session_property	Admit
@@ -46,6 +47,7 @@ sql.admit.session_global_scope_unsupported	Admit
 sql.admit.session_transaction_unsupported	Admit
 sql.admit.table_already_exists	Admit
 sql.admit.table_procedure_not_found	Admit
+sql.admit.unknown_type	Admit
 sql.admit.unsupported_statement	Admit
 sql.admit.update_unsupported_form	Admit
 sql.analyze.ambiguous_function_call	Analyze
@@ -55,6 +57,7 @@ sql.analyze.invalid_analyze_property	Analyze
 sql.analyze.invalid_argument	Analyze
 sql.analyze.invalid_literal	Analyze
 sql.analyze.invalid_query_shape	Analyze
+sql.analyze.invalid_type_argument	Analyze
 sql.analyze.invalid_view	Analyze
 sql.analyze.mismatched_column_aliases	Analyze
 sql.analyze.missing_column_name	Analyze

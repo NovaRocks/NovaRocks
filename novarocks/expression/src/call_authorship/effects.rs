@@ -704,9 +704,8 @@ fn own_effects(
         ExprKind::Cast {
             expr,
             target,
-            decimal_overflow_policy,
-            allow_throw_exception,
-            array_failure_mode,
+            cast_mode,
+            ..
         } => {
             if !arrow_data_types_exact_with_profile_observed::<CallAuthorError>(
                 target,
@@ -719,14 +718,10 @@ fn own_effects(
                 ));
             }
             let child = definition(unit, *expr)?;
-            let allow = allow(*allow_throw_exception, inputs.environment.parameters)?;
-            let recipe = PreparedCastRecipe::try_new(
-                novarocks_functions::CastOperation::Carrier,
+            let recipe = PreparedCastRecipe::try_new_trino(
                 &child.ty,
                 &source.ty,
-                *decimal_overflow_policy,
-                allow,
-                *array_failure_mode,
+                *cast_mode,
                 work.control(),
             )
             .map_err(|error| {

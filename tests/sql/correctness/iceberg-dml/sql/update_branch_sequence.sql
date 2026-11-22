@@ -23,7 +23,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_update_ref_sequence (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.update.mode'], ARRAY['copy-on-write']));
+CREATE TABLE ${case_db}.t_update_ref_sequence (id BIGINT, v VARCHAR) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.update.mode'], ARRAY['copy-on-write']));
 INSERT INTO ${case_db}.t_update_ref_sequence VALUES ROW(1, 'a'), ROW(2, 'b');
 CREATE BRANCH dev IN TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_update_ref_sequence;
 INSERT INTO ${case_db}.t_update_ref_sequence @dev VALUES (3, 'dev');

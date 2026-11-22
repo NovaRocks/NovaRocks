@@ -20,8 +20,8 @@
 -- semantics, including NULL group handling.
 CREATE TABLE ${case_db}.dict_agg_fastpath_t (
   k INT,
-  status STRING,
-  region STRING,
+  status VARCHAR,
+  region VARCHAR,
   v INT
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.dict_agg_fastpath_t VALUES

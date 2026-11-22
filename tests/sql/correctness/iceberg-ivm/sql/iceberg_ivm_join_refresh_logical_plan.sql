@@ -28,12 +28,12 @@ CREATE CATALOG ice_ivm_join_logical_${uuid0} USING iceberg WITH ("iceberg.catalo
 CREATE SCHEMA ice_ivm_join_logical_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_left_${uuid0} (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_right_${uuid0} (
   id BIGINT NOT NULL,
-  category STRING
+  category VARCHAR
 ) WITH (format_version = 3);
 USE ice_ivm_join_logical_${uuid0}.ns_${uuid0};
 

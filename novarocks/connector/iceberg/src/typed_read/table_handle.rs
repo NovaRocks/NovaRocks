@@ -29,8 +29,8 @@ use std::sync::Arc;
 use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES};
 use novarocks_spi::connector::read_stack::{
-    ConnectorExpression, ConnectorTableHandle, ConnectorTransactionHandle, Constraint,
-    ConstraintApplicationResult, Domain, LimitApplicationResult, OrderedAssignments,
+    ConnectorExpression, ConnectorTableHandle, ConnectorTransactionHandle, ConnectorValueType,
+    Constraint, ConstraintApplicationResult, Domain, LimitApplicationResult, OrderedAssignments,
     ProjectionApplicationResult, SchemaTableName, TupleDomain,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
@@ -673,6 +673,20 @@ impl IcebergTableHandle {
                 remaining.insert(column.clone(), domain.clone());
                 continue;
             }
+            // A SQL byte string of any length can be compared with a
+            // projected Fixed value. Iceberg's manifest domain instead uses
+            // its exact fixed-width type, including identity partitions.
+            if domain.value_type() == ConnectorValueType::Varbinary
+                && matches!(
+                    super::column_handle::parse_type(column.type_json(), "type_json")?,
+                    crate::iceberg::spec::Type::Primitive(
+                        crate::iceberg::spec::PrimitiveType::Fixed(_)
+                    )
+                )
+            {
+                remaining.insert(column.clone(), domain.clone());
+                continue;
+            }
             if identity_partition_ids.contains(&column.base_field_id()) {
                 enforced.insert(column.clone(), domain.clone());
             } else {
@@ -1182,6 +1196,38 @@ pub(super) mod tests {
         assert!(result.handle().unenforced_predicate().is_all());
         let remaining = result.remaining_filter().columns().collect::<Vec<_>>();
         assert_eq!(remaining, vec![&info, &city]);
+    }
+
+    #[test]
+    fn fixed_storage_keeps_varbinary_comparisons_in_the_engine() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_spi::connector::read_stack::ConnectorValue;
+
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "key",
+                Type::Primitive(PrimitiveType::Fixed(4)),
+            ))])
+            .build()
+            .unwrap();
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("key", "key_partition", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let handle =
+            IcebergTableHandle::try_new(table_handle_params(&schema, Some(&spec))).unwrap();
+        let column = IcebergColumnHandle::base_column_of(&schema, 1).unwrap();
+        let domain = Domain::single_value(ConnectorValue::Varbinary(Arc::from([1, 2, 3]))).unwrap();
+        let summary = TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])).unwrap();
+        let result = handle
+            .apply_filter(&Constraint::of_summary(summary.clone()))
+            .unwrap();
+        assert!(result.handle().enforced_predicate().is_all());
+        assert!(result.handle().unenforced_predicate().is_all());
+        assert_eq!(result.remaining_filter(), &summary);
     }
 
     #[test]

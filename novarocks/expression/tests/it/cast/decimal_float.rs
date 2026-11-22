@@ -15,237 +15,259 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual LocalCompiler -> checked CompiledFixture -> Frame with independent IEEE bits.
-//! Fixed corpus tables replace the removed evaluator/reference calculator.
+//! Decimal-to-floating CAST at the real compiled expression boundary.
+
 use super::*;
-use arrow::array::{Decimal128Array, Decimal256Array, Float64Array};
-use novarocks_expression::EvaluationInput;
-use novarocks_expression::testkit::PassThroughCallHost;
-use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
+use arrow::array::Decimal128Array;
+use novarocks_expression::{
+    CallAuthorError, CapabilityRefusal, EvaluationInput, ExprEvaluationFailure,
+    testkit::{
+        PassThroughCallHost,
+        numeric_fixtures::{cast_fixture_in_mode, compiled_cast},
+    },
+};
+use novarocks_functions::{CastPrepareError, ScalarInvocationActivation, ScalarInvocationScope};
+use novarocks_type_contract::TrinoCastMode;
 
-// Pure type/data construction only; this helper never evaluates a CAST.
-fn input(wide: bool, p: u8, s: i8, raw: Vec<Option<i128>>) -> ArrayRef {
-    if wide {
-        Arc::new(
-            Decimal256Array::from(
-                raw.into_iter()
-                    .map(|x| x.map(arrow::datatypes::i256::from_i128))
-                    .collect::<Vec<_>>(),
-            )
-            .with_precision_and_scale(p, s)
+fn decimals(precision: u8, scale: i8, coefficients: Vec<Option<i128>>) -> ArrayRef {
+    Arc::new(
+        Decimal128Array::from(coefficients)
+            .with_precision_and_scale(precision, scale)
             .unwrap(),
-        )
-    } else {
-        Arc::new(
-            Decimal128Array::from(raw)
-                .with_precision_and_scale(p, s)
-                .unwrap(),
-        )
-    }
+    )
 }
 
-// Mathematical worksheet: raw1, raw0, raw-1, rawMAX, at the profile's scale.
-// Raw r denotes r*10^-scale; precision is a frozen declaration and does not
-// silently trim full physical carrier payloads supplied by this corpus.
-// The independent integer-rational IEEE worksheet is retained with the draft.
-// Float64 entries preserve the historical sequence of binary64 rounding,
-// rather than claiming correctly rounded exact decimal-to-binary conversion.
-// MAX first rounds to 2^127. Scale38 uses P38=0x47d2ced32a16a1b1 and its
-// rounded reciprocal 0x380b38fb9daa78e4. Scale76's standard powi witness is
-// P76=0x4fb61bcca7119917, one ULP above nearest exact 10^76. Reciprocal and
-// final multiply/divide are separately rounded. Every listed output is finite.
-fn expected_bits(wide: bool, scale: i8) -> [Option<u64>; 4] {
-    match (wide, scale) {
-        (false, -38) => [
-            Some(0x47d2ced32a16a1b1),
-            Some(0),
-            Some(0xc7d2ced32a16a1b1),
-            Some(0x4fc2ced32a16a1b1),
-        ],
-        (false, -3) | (true, -3) => [
-            Some(0x408f400000000000),
-            Some(0),
-            Some(0xc08f400000000000),
-            Some(0x487f400000000000),
-        ],
-        (false, 0) | (true, 0) => [
-            Some(0x3ff0000000000000),
-            Some(0),
-            Some(0xbff0000000000000),
-            Some(0x47e0000000000000),
-        ],
-        (false, 1) | (true, 1) => [
-            Some(0x3fb999999999999a),
-            Some(0),
-            Some(0xbfb999999999999a),
-            Some(0x47a999999999999a),
-        ],
-        (false, 38) => [
-            Some(0x380b38fb9daa78e4),
-            Some(0),
-            Some(0xb80b38fb9daa78e4),
-            Some(0x3ffb38fb9daa78e4),
-        ],
-        (true, -76) => [
-            Some(0x4fb61bcca7119917),
-            Some(0),
-            Some(0xcfb61bcca7119917),
-            Some(0x57a61bcca7119917),
-        ],
-        (true, 76) => [
-            Some(0x3027288e1271f512),
-            Some(0),
-            Some(0xb027288e1271f512),
-            Some(0x3817288e1271f512),
-        ],
-        _ => panic!("the fixed corpus must have an explicit handwritten IEEE table"),
-    }
-}
-fn assert_bits(array: &ArrayRef, expected: &[Option<u64>]) {
-    assert_eq!(array.data_type(), &DataType::Float64);
-    let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
-    let actual = (0..array.len())
-        .map(|row| (!array.is_null(row)).then(|| array.value(row).to_bits()))
-        .collect::<Vec<_>>();
-    assert_eq!(actual, expected);
-}
-fn batch(program: &CompiledFixture, a: ArrayRef) -> RecordBatch {
-    let len = a.len();
+fn batch(program: &CompiledFixture, source: ArrayRef) -> RecordBatch {
+    let rows = source.len();
     RecordBatch::try_new(
         program.input_schema().clone(),
         vec![
-            a,
-            Arc::new(Int64Array::from(vec![42; len])),
-            Arc::new(BooleanArray::from(vec![true; len])),
+            source,
+            Arc::new(Int64Array::from(vec![42; rows])),
+            Arc::new(BooleanArray::from(vec![true; rows])),
         ],
     )
     .unwrap()
 }
-fn full(wide: bool) {
-    for p in [1, if wide { 76 } else { 38 }] {
-        // Retain the original physical precision/scale domain and repeated
-        // precision-one scale1 profile; these are not inferred from displays.
-        let max_scale = if wide { 76 } else { 38 };
-        for scale in [-max_scale, -3, 0, 1, p as i8] {
-            for nullable in [false, true] {
-                for policy in [
-                    DecimalOverflowPolicy::OutputNull,
-                    DecimalOverflowPolicy::ReportError,
-                ] {
-                    for allow in [false, true] {
-                        let a = input(
-                            wide,
-                            p,
-                            scale,
-                            if nullable {
-                                vec![Some(0), Some(1), None, Some(-1), Some(i128::MAX)]
-                            } else {
-                                vec![Some(0), Some(1), Some(0), Some(-1), Some(i128::MAX)]
-                            },
-                        )
-                        .slice(1, 4);
-                        let mut expected = expected_bits(wide, scale);
-                        if nullable {
-                            expected[1] = None;
-                        }
-                        let program = compiled(
-                            FunctionValueType::new(a.data_type().clone(), nullable),
-                            FunctionValueType::new(DataType::Float64, nullable),
-                            Source::Column,
-                            Wrap::Bare,
-                            policy,
-                            allow,
-                        );
-                        let b = batch(&program, a.clone());
-                        let rows = [0, 1, 3];
-                        let selected = Selection::try_sparse(4, &rows).unwrap();
-                        let out = instance(&program)
-                            .evaluate(
-                                EvaluationInput::Batch {
-                                    batch: &b,
-                                    source: None,
-                                },
-                                ScalarInvocationScope::new(selected, selected),
-                                ScalarInvocationActivation::Activated,
-                                &Control,
-                                &mut PassThroughCallHost,
-                            )
-                            .unwrap();
-                        assert_eq!(out.selection(), selected);
-                        assert_bits(out.values(), &[expected[0], expected[1], expected[3]]);
-                        assert!(out.errors().is_empty());
-                        // Full selection also covers raw-1, including wide
-                        // Float32 -infinity and negative-underflow-zero cases.
-                        let all = instance(&program)
-                            .evaluate(
-                                EvaluationInput::Batch {
-                                    batch: &b,
-                                    source: None,
-                                },
-                                ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
-                                ScalarInvocationActivation::Activated,
-                                &Control,
-                                &mut PassThroughCallHost,
-                            )
-                            .unwrap();
-                        assert_eq!(all.selection(), Selection::all(4));
-                        assert_bits(all.values(), &expected);
-                        assert!(all.errors().is_empty());
-                        let empty_selected = Selection::try_sparse(4, &[]).unwrap();
-                        let empty = instance(&program)
-                            .evaluate(
-                                EvaluationInput::Batch {
-                                    batch: &b,
-                                    source: None,
-                                },
-                                ScalarInvocationScope::new(empty_selected, empty_selected),
-                                ScalarInvocationActivation::Activated,
-                                &Control,
-                                &mut PassThroughCallHost,
-                            )
-                            .unwrap();
-                        assert_eq!(empty.selection(), empty_selected);
-                        assert_eq!(empty.values().data_type(), &DataType::Float64);
-                        assert_eq!(empty.values().len(), 0);
-                        assert!(empty.errors().is_empty());
-                        let constant = compiled(
-                            FunctionValueType::new(a.data_type().clone(), false),
-                            FunctionValueType::new(DataType::Float64, false),
-                            Source::Constant,
-                            Wrap::Bare,
-                            policy,
-                            allow,
-                        );
-                        let cb = batch(&constant, input(wide, p, scale, vec![Some(0); 4]));
-                        let out = instance(&constant)
-                            .evaluate(
-                                EvaluationInput::Batch {
-                                    batch: &cb,
-                                    source: None,
-                                },
-                                ScalarInvocationScope::new(selected, selected),
-                                ScalarInvocationActivation::Activated,
-                                &Control,
-                                &mut PassThroughCallHost,
-                            )
-                            .unwrap();
-                        assert_eq!(out.selection(), selected);
-                        // The genuine compiled fixture authors raw1, so its
-                        // fixed expected bit is the first entry of this table.
-                        assert_bits(out.values(), &[expected_bits(wide, scale)[0]; 3]);
-                        assert!(out.errors().is_empty());
-                    }
-                }
+
+fn assert_bits(array: &ArrayRef, target: &DataType, expected: &[Option<u64>]) {
+    assert_eq!(array.data_type(), target);
+    let bits: Vec<Option<u64>> = match target {
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .iter()
+            .map(|value| value.map(|value| u64::from(value.to_bits())))
+            .collect(),
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .iter()
+            .map(|value| value.map(f64::to_bits))
+            .collect(),
+        _ => unreachable!("only REAL and DOUBLE are tested here"),
+    };
+    assert_eq!(bits, expected);
+}
+
+fn compare(target: DataType, precision: u8, scale: i8, last_coefficient: i128, bits: [u64; 3]) {
+    let [positive, negative, last] = bits;
+    for source_nullable in [false, true] {
+        let null_or_zero = (!source_nullable).then_some(0);
+        let values = decimals(
+            precision,
+            scale,
+            vec![
+                Some(0),
+                Some(1),
+                null_or_zero,
+                Some(-1),
+                Some(last_coefficient),
+            ],
+        )
+        .slice(1, 4);
+        let expected = [
+            Some(positive),
+            null_or_zero.map(|_| 0),
+            Some(negative),
+            Some(last),
+        ];
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+            let program = compiled_cast(
+                FunctionValueType::new(values.data_type().clone(), source_nullable),
+                FunctionValueType::new(
+                    target.clone(),
+                    source_nullable || mode == TrinoCastMode::Try,
+                ),
+                Source::Column,
+                Wrap::Bare,
+                mode,
+                false,
+            );
+            let data = batch(&program, values.clone());
+            for rows in [&[0, 1, 2, 3][..], &[0, 1, 3], &[]] {
+                let selected = Selection::try_sparse(4, rows).unwrap();
+                let out = instance(&program)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None,
+                        },
+                        ScalarInvocationScope::new(selected, selected),
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost,
+                    )
+                    .unwrap();
+                assert_eq!(out.selection(), selected);
+                assert_bits(
+                    out.values(),
+                    &target,
+                    &rows.iter().map(|&row| expected[row]).collect::<Vec<_>>(),
+                );
+                assert!(out.errors().is_empty());
             }
+
+            let constant = compiled_cast(
+                FunctionValueType::new(values.data_type().clone(), false),
+                FunctionValueType::new(target.clone(), mode == TrinoCastMode::Try),
+                Source::Constant,
+                Wrap::Bare,
+                mode,
+                false,
+            );
+            let data = batch(&constant, decimals(precision, scale, vec![Some(0); 4]));
+            let selected = Selection::try_sparse(4, &[0, 1, 3]).unwrap();
+            let out = instance(&constant)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(selected, selected),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
+            assert_eq!(out.selection(), selected);
+            // The compiled decimal constant has coefficient 1 at the original scale.
+            assert_bits(out.values(), &target, &[Some(positive); 3]);
+            assert!(out.errors().is_empty());
         }
     }
 }
 
+const MAX_DECIMAL38: i128 = 10_i128.pow(38) - 1;
+
 #[test]
 fn decimal_float_actual_compiler_decimal128_float64() {
-    full(false);
+    // 2^53 + 1 is the exact midpoint between consecutive binary64 integers.
+    compare(
+        DataType::Float64,
+        38,
+        0,
+        9_007_199_254_740_993,
+        [0x3ff0000000000000, 0xbff0000000000000, 0x4340000000000000],
+    );
+    compare(
+        DataType::Float64,
+        1,
+        1,
+        9,
+        [0x3fb999999999999a, 0xbfb999999999999a, 0x3feccccccccccccd],
+    );
+    // A scale-38 coefficient of 1 is 1e-38; the maximal coefficient rounds to 1.
+    compare(
+        DataType::Float64,
+        38,
+        38,
+        MAX_DECIMAL38,
+        [0x380b38fb9daa78e4, 0xb80b38fb9daa78e4, 0x3ff0000000000000],
+    );
 }
+
 #[test]
-fn decimal_float_actual_compiler_decimal256_float64() {
-    full(true);
+fn decimal_float32_actual_compiler_decimal128_float32() {
+    // 2^24 + 1 is the exact midpoint between consecutive binary32 integers.
+    compare(
+        DataType::Float32,
+        38,
+        0,
+        16_777_217,
+        [0x3f800000, 0xbf800000, 0x4b800000],
+    );
+    compare(
+        DataType::Float32,
+        1,
+        1,
+        9,
+        [0x3dcccccd, 0xbdcccccd, 0x3f666666],
+    );
+    // Both signs of 1e-38 round to a binary32 subnormal.
+    compare(
+        DataType::Float32,
+        38,
+        38,
+        MAX_DECIMAL38,
+        [0x006ce3ee, 0x806ce3ee, 0x3f800000],
+    );
+}
+
+#[test]
+fn decimal_float_actual_compiler_rejects_retired_and_malformed_decimals() {
+    let retired = DataType::Decimal256(76, 0);
+    let malformed = decimals(1, 0, vec![Some(i128::MAX)]);
+    for target in [DataType::Float32, DataType::Float64] {
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+            let result = FunctionValueType::new(target.clone(), true);
+            let error = match cast_fixture_in_mode(
+                FunctionValueType::new(retired.clone(), true),
+                result.clone(),
+                Source::Column,
+                Wrap::Bare,
+                mode,
+                false,
+            ) {
+                Ok(_) => panic!("retired Decimal256 conversion was admitted"),
+                Err(error) => error,
+            };
+            let CallAuthorError::Capability(CapabilityRefusal::Primitive { source, .. }) = error
+            else {
+                panic!("expected a typed CAST refusal, got {error:?}");
+            };
+            assert_eq!(
+                source.downcast_ref::<CastPrepareError>(),
+                Some(&CastPrepareError::Illegal)
+            );
+
+            let program = compiled_cast(
+                FunctionValueType::new(malformed.data_type().clone(), true),
+                result,
+                Source::Column,
+                Wrap::Bare,
+                mode,
+                false,
+            );
+            let data = batch(&program, malformed.clone());
+            let selected = Selection::all(1);
+            assert!(matches!(
+                instance(&program).evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(selected, selected),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                ),
+                Err(ExprEvaluationFailure::Kernel(
+                    KernelFailure::InvalidProgram(_)
+                ))
+            ));
+        }
+    }
 }

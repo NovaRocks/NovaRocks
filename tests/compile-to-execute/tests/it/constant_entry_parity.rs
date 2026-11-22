@@ -21,7 +21,7 @@
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array,
-        Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, new_null_array,
+        Int32Array, Int64Array, StringArray,
     },
     datatypes::{DataType, Schema},
     record_batch::{RecordBatch, RecordBatchOptions},
@@ -46,8 +46,7 @@ use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId, OperatorFunction,
-    PureCompileControl, ValueLogicalType,
+    CompileControlError, CompilePhase, ExpressionUseId, OperatorFunction, PureCompileControl,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -437,7 +436,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         (
             "CAST(42 AS TINYINT)",
             Family::Carrier,
-            true,
+            false,
             Arc::new(Int8Array::from(vec![42])),
         ),
         (
@@ -471,6 +470,12 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
                 matches!(fixture.kind(at), StaticExprKind::Constant(_)),
                 "T1 uses one actual node over constant leaves: {expression}"
             );
+            if matches!(family, Family::Call("builtin.scalar/upper/v1")) {
+                assert_eq!(
+                    fixture.ty(at).value_type().kind(),
+                    &novarocks_type_contract::ValueKind::String
+                );
+            }
         }
         fixture.assert_both(&functions, FoldOutcome::Folded, Expected::Value(expected));
     }
@@ -494,7 +499,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         (
             "CAST('-0' AS DOUBLE) * 1e0",
             Family::Operator(OperatorFunction::Multiply),
-            true,
+            false,
             FoldOutcome::Folded,
             float(-0.0),
         ),
@@ -574,10 +579,10 @@ fn constant_entry_heterogeneous_comparisons_replay_actual_sql_conversion_order()
     let functions = installed_builtin_owner_catalogue();
     let cases = [
         (
-            "CAST('1970-01-02' AS DATE) < CAST('1970-01-03 00:00:00' AS DATETIME)",
+            "CAST('1970-01-02' AS DATE) < CAST('1970-01-03 00:00:00' AS TIMESTAMP(6))",
             DataType::Date32,
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-            // DATETIME is outside the rule's result-literal domain.
+            // The timestamp value is outside the rule's result-literal domain.
             FoldOutcome::Kept,
         ),
         (
@@ -626,83 +631,15 @@ fn constant_entry_heterogeneous_comparisons_replay_actual_sql_conversion_order()
 }
 
 #[test]
-fn constant_entry_actual_largeint_conversion_then_carrier_tail_preserves_value_and_null() {
-    let functions = installed_builtin_owner_catalogue();
-    // LARGEINT -> signed widths is a direct value conversion, so it cannot
-    // honestly stand in for a conversion+tail. The actual SQL author explicitly
-    // composes LARGEINT -> BIGINT -> DATETIME (see conversion_intermediate_type).
-    // Both operands exceed i64::MAX, so explicit text -> LARGEINT supplies
-    // their original exact nominal domain. Their independently fixed difference
-    // remains 20200102030405; no ordinary out-of-range literal is admitted.
-    for (expression, expected) in [
-        (
-            "CAST(CAST('9223392236956806213' AS LARGEINT) - CAST('9223372036854775808' AS LARGEINT) AS DATETIME)".to_owned(),
-            Some(1_577_934_245_000_000_i64),
-        ),
-        (format!("CAST(CAST('{}' AS LARGEINT) AS DATETIME)", i128::MAX), None),
-    ] {
-        let fixture = Fixture::compile(&expression, Family::Carrier, "32", &functions);
-        let tail = fixture.occurrence;
-        let StaticExprKind::PreparedCast {
-            operation: CastOperation::Carrier,
-            decimal_overflow_policy,
-            allow_throw_exception,
-            ..
-        } = fixture.kind(tail) else {
-            panic!("actual carrier tail required")
-        };
-        let args = fixture.args(tail);
-        let [conversion] = args.as_slice() else {
-            panic!("unary carrier tail")
-        };
-        let call = fixture.call(*conversion).call_contract();
-        assert_eq!(call.function_id().as_str(), "builtin.scalar/value_domain_conversion/v1");
-        assert!(call.selected().overload.as_str().ends_with("largeint_to_signed_null_overflow/v1"));
-        let args = fixture.args(*conversion);
-        let [source] = args.as_slice() else {
-            panic!("unary value conversion")
-        };
-        assert_eq!(fixture.ty(*source).data_type(), &DataType::FixedSizeBinary(16));
-        assert_eq!(
-            fixture.ty(*source).logical_type(),
-            ValueLogicalType::LargeInt,
-            "fixed binary alone never grants LARGEINT identity"
-        );
-        assert_eq!(fixture.ty(*conversion).data_type(), &DataType::Int64);
-        assert!(fixture.ty(*conversion).nullable());
-        assert_eq!(
-            fixture.ty(tail).data_type(),
-            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        );
-        assert!(fixture.ty(tail).nullable());
-        assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
-        assert!(!*allow_throw_exception);
-        // The overflowing LARGEINT conversion yields a typed NULL in the
-        // enabled plan. A representable input retains the DATETIME tail.
-        let outcome = if expected.is_none() {
-            FoldOutcome::Folded
-        } else {
-            FoldOutcome::Kept
-        };
-        fixture.assert_both(
-            &functions,
-            outcome,
-            Expected::Value(Arc::new(TimestampMicrosecondArray::from(vec![expected]))),
-        );
-    }
-}
-
-#[test]
 fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_error_contract() {
-    use DecimalOverflowPolicy::{OutputNull, ReportError};
     use OperatorFunction::{Add, Multiply};
     let functions = installed_builtin_owner_catalogue();
     let max = 10_i128.pow(38) - 1;
-    for (policy, allow, mode) in [
-        (OutputNull, false, "32"),
-        (OutputNull, true, "ALLOW_THROW_EXCEPTION"),
-        (ReportError, false, "ERROR_IF_OVERFLOW"),
-        (ReportError, true, "ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION"),
+    for mode in [
+        "32",
+        "ALLOW_THROW_EXCEPTION",
+        "ERROR_IF_OVERFLOW",
+        "ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION",
     ] {
         for (operator, rhs) in [(Add, 1), (Multiply, 2)] {
             let symbol = operator.sql();
@@ -733,36 +670,19 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
         );
         let StaticExprKind::PreparedCast {
             operation: CastOperation::Carrier,
-            decimal_overflow_policy,
-            allow_throw_exception,
+            cast_mode,
             ..
         } = fixture.kind(fixture.occurrence)
         else {
             panic!("actual decimal carrier cast")
         };
-        assert_eq!(
-            (*decimal_overflow_policy, *allow_throw_exception),
-            (policy, allow)
-        );
+        assert_eq!(*cast_mode, novarocks_type_contract::TrinoCastMode::Explicit);
         assert_eq!(
             fixture.ty(fixture.occurrence).data_type(),
             &DataType::Decimal128(4, 1)
         );
-        // Root nullability is authored by SQL and checked against the program
-        // in Fixture::compile; unlike arithmetic, do not invent nullable=true
-        // for checked modes whose source declaration may already be non-null.
-        let expected = if policy == ReportError || allow {
-            Expected::RowError(
-                "Expr evaluate meet error: The numeric type cast involving decimal overflows",
-            )
-        } else {
-            Expected::Value(new_null_array(&DataType::Decimal128(4, 1), 1))
-        };
-        let outcome = if matches!(expected, Expected::RowError(_)) {
-            FoldOutcome::Kept
-        } else {
-            FoldOutcome::Folded
-        };
+        let expected = Expected::RowError("Cast value is outside the target numeric range");
+        let outcome = FoldOutcome::Kept;
         fixture.assert_both(&functions, outcome, expected);
     }
 }

@@ -112,7 +112,8 @@ pub fn grouped_state_topn_key_supported(
 /// Revision 34 declares each hash key match relation and retires the
 /// decimal-to-double promotion parameter.
 /// Revision 35 retires the TableExecute connector relation.
-pub const PLAN_CONTRACT_REVISION: u32 = 35;
+/// Revision 36 freezes Trino cast modes, guarded TRY, and bounded character types.
+pub const PLAN_CONTRACT_REVISION: u32 = 36;
 
 #[cfg(test)]
 mod tests;

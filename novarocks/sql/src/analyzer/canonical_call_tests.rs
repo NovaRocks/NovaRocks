@@ -199,7 +199,7 @@ fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_
                 let date = &call(expression).2[0];
                 if carrier != target {
                     let ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: None,
                         expr,
                         target: cast_target,
                         decimal_overflow_policy,
@@ -325,8 +325,7 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
             "__array_literal",
             &[
                 FunctionValueType::new(DataType::Int16, nullable),
-                // The original explicit SQL CAST permits NULL.
-                FunctionValueType::new(DataType::Int16, true),
+                FunctionValueType::new(DataType::Int16, false),
             ],
             &FunctionValueType::new(
                 DataType::List(Arc::new(Field::new("item", DataType::Int16, true))),
@@ -334,38 +333,32 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
             ),
         );
         let coercion = &call(first).2[0];
-        let ExprKind::FunctionCall { binding, args, .. } = &coercion.kind else {
+        let ExprKind::Cast {
+            expr: original,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            target: DataType::Int16,
+            ..
+        } = &coercion.kind
+        else {
             panic!("ordered common width conversion");
         };
-        assert_eq!(
-            binding.function_id.as_str(),
-            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
-        );
-        assert_eq!(
-            binding.selected.overload.as_str(),
-            novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
-        );
         assert_eq!(
             coercion.value_type,
             FunctionValueType::new(DataType::Int16, nullable)
         );
-        assert_eq!(binding.result_constraint(), Some(&coercion.value_type));
-        assert!(matches!(
-            binding.result_constraint_origin(),
-            crate::binding::SqlResultConstraintOrigin::ArrayCommonCoercion
-        ));
-        assert_eq!(args.len(), 1);
         assert_eq!(
-            args[0].value_type,
+            original.value_type,
             FunctionValueType::new(DataType::Int8, nullable)
         );
-        assert_eq!(
-            binding.selected.argument_types.as_ref(),
-            &[novarocks_functions::FunctionArgumentType::Value(
-                args[0].value_type.clone()
-            )]
-        );
-        assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
+        assert!(matches!(original.kind, ExprKind::ColumnRef { .. }));
+        let explicit = &call(first).2[1];
+        assert!(matches!(
+            explicit.kind,
+            ExprKind::Cast {
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                ..
+            }
+        ));
         let second = project(&query, 1);
         assert_bound(
             second,
@@ -541,7 +534,7 @@ fn canonical_resolved_helper_materializes_text_and_preserves_success_error_contr
                 &FunctionValueType::new(DataType::Date32, true),
             );
             let ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,

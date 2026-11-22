@@ -154,7 +154,11 @@ pub fn byte_view_to_offsets_projection(
             return true;
         }
         match (source, target, value.kind()) {
-            (DataType::Utf8View, DataType::Utf8, ValueKind::String)
+            (
+                DataType::Utf8View,
+                DataType::Utf8,
+                ValueKind::String | ValueKind::BoundedCharacter(_),
+            )
             | (DataType::BinaryView, DataType::Binary, ValueKind::Binary) => true,
             (DataType::List(source), DataType::List(target), ValueKind::List(child))
             | (DataType::LargeList(source), DataType::LargeList(target), ValueKind::List(child)) => {

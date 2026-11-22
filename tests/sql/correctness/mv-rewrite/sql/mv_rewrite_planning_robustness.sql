@@ -49,7 +49,7 @@ CREATE SCHEMA mvrw_${uuid0}.ns2_${uuid0};
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.sales_data (
   customer_id BIGINT,
   order_id BIGINT,
-  category_l1 STRING,
+  category_l1 VARCHAR,
   sales_amount BIGINT
 ) WITH (format_version = 3);
 
@@ -133,8 +133,8 @@ FROM mvrw_${uuid0}.ns_${uuid0}.sales_data GROUP BY category_l1 ORDER BY category
 -- partitioned base table as rewrite source
 -- @skip_result_check=true
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.part_sales (
-  region STRING,
-  day STRING,
+  region VARCHAR,
+  day VARCHAR,
   amount BIGINT
 ) WITH (partitioning = ARRAY['region'], format_version = 3);
 

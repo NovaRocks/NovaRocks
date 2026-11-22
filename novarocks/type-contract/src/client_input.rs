@@ -136,6 +136,7 @@ fn matches_field(
     *nodes -= 1;
     match (&field.native_type, value.kind()) {
         (N::String, ValueKind::String) | (N::Binary, ValueKind::Binary) => true,
+        (N::BoundedCharacter(render), ValueKind::BoundedCharacter(input)) => render == input,
         (N::Json, ValueKind::Nominal(V::Json))
         | (N::Variant, ValueKind::Nominal(V::Variant))
         | (N::LargeInt, ValueKind::Nominal(V::LargeInt))

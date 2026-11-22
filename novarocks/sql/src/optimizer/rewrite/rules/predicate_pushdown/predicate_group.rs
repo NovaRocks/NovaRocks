@@ -263,13 +263,13 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             canonical_expr_list_key(arena, args)
         ),
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => {
             format!(
-                "Cast({},{target:?},{decimal_overflow_policy:?},{array_failure_mode:?})",
+                "Cast({},{target:?},{decimal_overflow_policy:?},{cast_mode:?})",
                 canonical_expr_key(arena, *child)
             )
         }

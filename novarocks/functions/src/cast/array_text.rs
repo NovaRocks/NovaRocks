@@ -39,7 +39,10 @@ impl novarocks_failure_contract::FailureProjection for InvalidInteger {
 // JDK Long.parseLong uses Character.digit(char), so supplementary Unicode
 // digits are rejected. Unicode UAX44 supplies contiguous ascending Nd ranges;
 // ICU owns their actual data. No normalization or Rust Unicode trim applies.
-fn digit(ch: char, work: &mut EvaluationCheckpoints<'_>) -> Result<Option<i64>, KernelFailure> {
+pub(super) fn digit(
+    ch: char,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<i64>, KernelFailure> {
     if ch.is_ascii_digit() {
         return Ok(Some(i64::from(ch as u8 - b'0')));
     }
@@ -58,7 +61,10 @@ fn digit(ch: char, work: &mut EvaluationCheckpoints<'_>) -> Result<Option<i64>, 
     }
     Err(internal("Unicode decimal digit has no property range"))
 }
-fn parse(value: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Option<i32>, KernelFailure> {
+pub(super) fn parse_integer(
+    value: &str,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<i64>, KernelFailure> {
     let bytes = value.as_bytes();
     let (mut start, mut end) = (0, bytes.len());
     while start < end && bytes[start] <= 0x20 {
@@ -92,12 +98,11 @@ fn parse(value: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Option<i32
         };
         value = next;
     }
-    let value = if negative {
+    Ok(if negative {
         Some(value)
     } else {
         value.checked_neg()
-    };
-    Ok(value.and_then(|n| i32::try_from(n).ok()))
+    })
 }
 fn value_slice(bytes: &[u8], start: usize, end: usize) -> Result<&str, KernelFailure> {
     std::str::from_utf8(&bytes[start..end])
@@ -126,11 +131,13 @@ pub(super) fn evaluate_row(
         .downcast_ref::<StringArray>()
         .expect("checked text carrier")
         .value(row);
-    Ok(match parse(value, work)? {
-        Some(value) => CastRowResult::Signed(i64::from(value)),
-        None => {
-            work.flush()?;
-            CastRowResult::RowError(RowDataError::from_domain(ordinal, InvalidInteger)?)
-        }
-    })
+    Ok(
+        match parse_integer(value, work)?.and_then(|value| i32::try_from(value).ok()) {
+            Some(value) => CastRowResult::Signed(i64::from(value)),
+            None => {
+                work.flush()?;
+                CastRowResult::RowError(RowDataError::from_domain(ordinal, InvalidInteger)?)
+            }
+        },
+    )
 }

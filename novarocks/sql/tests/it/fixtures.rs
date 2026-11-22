@@ -296,6 +296,19 @@ pub(super) mod table_parent {
         > {
             self.inner.resolve_scalar_binding(name, arguments, control)
         }
+        fn finish_scalar_binding(
+            &self,
+            function: &novarocks_functions::FunctionId,
+            overload: &novarocks_functions::FunctionOverloadId,
+            request: novarocks_functions::FunctionBindingRequest<'_>,
+            control: &dyn PureCompileControl,
+        ) -> Result<
+            novarocks_functions::ResolvedFunctionBinding,
+            novarocks_functions::FunctionBindingError,
+        > {
+            self.inner
+                .finish_scalar_binding(function, overload, request, control)
+        }
         fn resolve_scalar_binding_with_expected_result(
             &self,
             name: &str,

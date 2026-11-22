@@ -32,7 +32,7 @@ CREATE SCHEMA ice_ivm_row_lineage_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_row_lineage_${uuid0}.ns_${uuid0}.orders_${uuid0} (
   id INT NOT NULL,
   amount BIGINT,
-  customer STRING
+  customer VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_row_lineage_${uuid0}.ns_${uuid0}.orders_${uuid0} VALUES
   ROW(1, 100, 'Alice'),

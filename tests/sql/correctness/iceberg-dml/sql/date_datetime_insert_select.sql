@@ -25,16 +25,16 @@ DROP TABLE IF EXISTS ${case_db}.t_temporal_insert_sink;
 CREATE TABLE ${case_db}.t_temporal_insert_src (
   id BIGINT,
   d DATE,
-  dt DATETIME
+  dt TIMESTAMP(6)
 );
 CREATE TABLE ${case_db}.t_temporal_insert_sink (
   id BIGINT,
   d DATE,
-  dt DATETIME
+  dt TIMESTAMP(6)
 );
 INSERT INTO ${case_db}.t_temporal_insert_src VALUES
-  ROW(1, '1970-01-01', '1970-01-01 00:00:00'),
-  ROW(2, '2024-02-29', '2024-02-29 23:59:59'),
+  ROW(1, DATE '1970-01-01', TIMESTAMP '1970-01-01 00:00:00'),
+  ROW(2, DATE '2024-02-29', TIMESTAMP '2024-02-29 23:59:59'),
   ROW(3, NULL, NULL);
 INSERT INTO ${case_db}.t_temporal_insert_sink
 SELECT id, d, dt

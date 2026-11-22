@@ -40,7 +40,7 @@ CREATE CATALOG mv_hidden_pk_delete_ice_${uuid0} USING iceberg WITH ("iceberg.cat
 CREATE SCHEMA mv_hidden_pk_delete_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_hidden_pk_delete_ice_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
-  customer STRING,
+  customer VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO mv_hidden_pk_delete_ice_${uuid0}.ns_${uuid0}.orders VALUES

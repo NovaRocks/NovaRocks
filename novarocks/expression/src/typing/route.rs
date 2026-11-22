@@ -28,7 +28,7 @@ pub fn scalar_typing_route(name: &str) -> ScalarTypingRoute {
         // SQL-specific rewrites or validation.
         "strpos" | "normalize" | "element_at" | "__array_element_at" | "__map_element_at" | "typeof" | "array_length" | "cardinality"
          | "array_sortby" | "concat" | "array_generate"
-       | "array_flatten"  | "date_trunc" | "if" | "variant_get" | "try_variant_get" | "named_struct"
+       | "array_flatten"  | "date_trunc" | "variant_get" | "try_variant_get" | "named_struct"
        | "array_concat" | "map" | "arrays_overlap"
        | "array_contains_seq" | "map_size" | "map_keys" | "map_values" | "array_min"
        | "array_max" | "__array_struct_subfield" | "translate"

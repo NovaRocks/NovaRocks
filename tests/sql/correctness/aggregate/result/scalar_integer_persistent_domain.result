@@ -38,12 +38,12 @@ tinyint	int	2	0
 tiny_type	widened_sum	tiny_count
 tinyint	-1	2
 
--- query 10
+-- query 11
 -- types	varchar	bigint	bigint
 tiny_type	tiny_sum	tiny_count
 tinyint	-1	2
 
--- query 11
+-- query 12
 -- types	varchar	bigint
 wide_type	wide_count
 bigint	0

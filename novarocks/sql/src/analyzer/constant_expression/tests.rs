@@ -35,6 +35,16 @@ impl SqlCatalogSnapshot for NoRelations {
         self
     }
 }
+fn validate_target(
+    source: &FunctionValueType,
+    target: RequiredConstantTarget,
+    span: Span,
+) -> Result<(), AnalyzeError> {
+    let control = SqlCompileControl::unbounded();
+    let result = required_target_value_type(source, target, &control)?;
+    validate_implicit_target(source, &result, target, span, &control)
+}
+
 fn syntax(
     sql: &str,
     target: RequiredConstantTarget,
@@ -112,9 +122,8 @@ fn required_constant_implicit_targets_do_not_use_general_cast_admission() {
         );
         assert_eq!(error.span(), Some(Span::new(0, sql.len())), "{sql}");
     }
-    // A declared JSON cast alone does not validate text or author a nominal
-    // JSON value. Preserve the ordinary analyzer's String result here.
-    let text = syntax("CAST('1' AS json)", Varchar).unwrap();
+    assert!(syntax("CAST('1' AS json)", Varchar).is_err());
+    let text = syntax("CAST(CAST('1' AS json) AS VARCHAR)", Varchar).unwrap();
     assert!(matches!(
         text.value_type().value_type().kind(),
         ValueKind::String
@@ -281,7 +290,7 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
     );
     assert!(
-        validate_implicit_target(
+        validate_target(
             &encoded_integer,
             RequiredConstantTarget::Integer,
             Span::new(0, 0)
@@ -293,7 +302,7 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
     );
     assert!(
-        validate_implicit_target(
+        validate_target(
             &encoded_string,
             RequiredConstantTarget::Varchar,
             Span::new(0, 0)
@@ -302,19 +311,19 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
     );
     let nominal_json = binding(ValueKind::Nominal(ValueLogicalType::Json), DataType::Utf8);
     assert!(
-        validate_implicit_target(
+        validate_target(
             &nominal_json,
             RequiredConstantTarget::Varchar,
             Span::new(0, 0)
         )
         .is_err()
     );
-    for data_type in [DataType::Decimal32(4, 1), DataType::Decimal64(10, 2)] {
-        let source = binding(ValueKind::Scalar(data_type.clone()), data_type);
-        assert!(
-            validate_implicit_target(&source, RequiredConstantTarget::Double, Span::new(0, 0))
-                .is_ok()
+    for data_type in [DataType::Decimal128(4, 1), DataType::Decimal128(10, 2)] {
+        let source = binding(
+            ValueKind::Scalar(data_type.clone()),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type)),
         );
+        assert!(validate_target(&source, RequiredConstantTarget::Double, Span::new(0, 0)).is_ok());
     }
 }
 
@@ -385,7 +394,7 @@ fn required_array_varchar_identity_keeps_the_complete_original_binding() {
                 ))),
                 root_nullable,
             );
-            validate_implicit_target(
+            validate_target(
                 &original,
                 RequiredConstantTarget::ArrayVarchar,
                 Span::new(7, 17),
@@ -447,7 +456,7 @@ fn required_array_target_checks_semantic_children_before_carrier_casts() {
         .unwrap();
         let original = FunctionValueType::try_from_value(value, layout).unwrap();
         assert!(
-            validate_implicit_target(
+            validate_target(
                 &original,
                 RequiredConstantTarget::ArrayVarchar,
                 Span::new(7, 17),
