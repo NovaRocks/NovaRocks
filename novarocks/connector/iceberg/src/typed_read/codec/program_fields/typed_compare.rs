@@ -28,7 +28,7 @@ pub(super) fn value(
     nominal: Option<ValueLogicalType>,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
     nominals: &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
-    read_layout: crate::typed_read::runtime::IcebergReadLayout,
+    projection: crate::typed_read::runtime::IcebergReadProjection,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
     work.step()?;
@@ -66,7 +66,8 @@ pub(super) fn value(
                 }
                 _ => false,
             };
-            let expected = if raw_fixed {
+            let projected_fixed = raw_fixed && projection.projects_fixed_as_binary();
+            let expected = if projected_fixed {
                 DataType::Binary
             } else {
                 source_layout
@@ -82,7 +83,7 @@ pub(super) fn value(
             let expected_layout = if raw_fixed {
                 expected
             } else {
-                read_layout.byte_carrier(&expected, domain)
+                projection.byte_carrier(&expected, domain)
             };
             if !same_kind || layout != &expected_layout {
                 return Err(invalid(
@@ -123,7 +124,7 @@ pub(super) fn value(
                     nominals.get(&source.id).map(|domain| domain.logical_type()),
                     None,
                     nominals,
-                    read_layout,
+                    projection,
                     work,
                 )?;
             }
@@ -153,7 +154,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
-                read_layout,
+                projection,
                 work,
             )?;
         }
@@ -193,7 +194,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
-                read_layout,
+                projection,
                 work,
             )?;
             self::value(
@@ -205,7 +206,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
-                read_layout,
+                projection,
                 work,
             )?;
         }

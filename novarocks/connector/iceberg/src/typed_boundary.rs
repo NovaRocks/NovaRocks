@@ -1715,7 +1715,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         name.table_name()
                     )));
                 }
-                let files = IcebergPinnedDataFileSet::try_new(pinned.files())?;
+                let files = IcebergPinnedDataFileSet::for_data_rewrite(pinned.files())?;
                 if files.len() != pinned.files().len() {
                     return Err(invalid(
                         "iceberg pinned read was offered the same data file more than once",
@@ -1870,7 +1870,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 name.table_name()
             )));
         }
-        let files = IcebergPinnedDataFileSet::try_new(pinned.files())?;
+        let files = IcebergPinnedDataFileSet::for_data_rewrite(pinned.files())?;
         if files.len() != pinned.files().len() {
             return Err(invalid(
                 "iceberg pinned read was offered the same data file more than once",

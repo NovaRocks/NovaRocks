@@ -19,6 +19,7 @@
 //! as the read author. Format annotations contribute no execution semantics.
 use crate::iceberg::spec::{Schema, TableMetadata, Type};
 use crate::typed_read::IcebergMetadataColumn;
+use crate::typed_read::runtime::{IcebergReadLayout, IcebergReadProjection};
 use arrow::datatypes::{Field, Schema as ArrowSchema};
 use novarocks_connector_contract::{
     ConnectorError, ConnectorErrorKind, ConnectorReadExecutionSchema, PureProviderCompileError,
@@ -116,7 +117,7 @@ fn table_from_document(
                 !field.required,
                 nominals,
                 integer,
-                crate::typed_read::runtime::IcebergReadLayout::Offsets,
+                IcebergReadProjection::Sql(IcebergReadLayout::Offsets),
                 creation,
             )?
         } else {

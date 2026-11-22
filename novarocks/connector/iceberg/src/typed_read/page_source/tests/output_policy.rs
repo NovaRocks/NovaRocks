@@ -98,12 +98,20 @@ fn fixed_byte_projection_preserves_selected_bytes_and_nulls_after_binding() {
     let bound = crate::typed_read::schema_binding::annotated_read_schema(&frozen).unwrap();
     let target = super::super::output_carrier(
         bound.field(0),
-        super::super::IcebergReadLayout::Offsets,
+        super::super::IcebergReadProjection::Sql(super::super::IcebergReadLayout::Offsets),
         &Default::default(),
         &frozen,
     )
     .unwrap();
     assert_eq!(target, DataType::Binary);
+    let storage_target = super::super::output_carrier(
+        bound.field(0),
+        super::super::IcebergReadProjection::DataRewrite,
+        &Default::default(),
+        &frozen,
+    )
+    .unwrap();
+    assert_eq!(storage_target, DataType::FixedSizeBinary(4));
     let fixed: ArrayRef = Arc::new(
         FixedSizeBinaryArray::try_from_sparse_iter_with_size(
             [
@@ -132,4 +140,21 @@ fn fixed_byte_projection_preserves_selected_bytes_and_nulls_after_binding() {
     assert!(array.is_null(1));
     assert_eq!(array.value(2), &[0, 255, 128, 34]);
     assert!(cursor.next_page(&context).unwrap().is_none());
+
+    let columns = [OutputColumn::new(&fixed, &storage_target)];
+    let mut cursor = crate::typed_read::output::OutputCursor::new(
+        &columns,
+        OutputRows::SharedSelected(Arc::from([2, 1, 0])),
+        &context,
+    )
+    .unwrap();
+    let page = cursor.next_page(&context).unwrap().unwrap();
+    let (_, columns) = page.into_columns().unwrap();
+    let array = columns[0]
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(array.value(0), &[1, 2, 3, 4]);
+    assert!(array.is_null(1));
+    assert_eq!(array.value(2), &[0, 255, 128, 34]);
 }

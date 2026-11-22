@@ -155,7 +155,7 @@ pub(super) fn publish(
             column.nullable(),
             column_nominals,
             column.scalar_integer_domain(),
-            layout,
+            relation.read_projection(layout),
             creation,
         )?;
         let source_name = creation.text(&source.name)?;

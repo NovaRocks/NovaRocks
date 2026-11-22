@@ -19,7 +19,7 @@
 //! an outward format projection and supply none of these semantic decisions.
 
 use crate::iceberg::spec::{PrimitiveType, Type};
-use crate::typed_read::runtime::IcebergReadLayout;
+use crate::typed_read::runtime::IcebergReadProjection;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_connector_contract::{ConnectorError, ConnectorErrorKind, PureProviderCompileError};
 use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
@@ -29,9 +29,9 @@ use novarocks_type_contract::{
 use std::sync::Arc;
 
 pub(crate) type Failure = PureProviderCompileError<ConnectorError>;
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 enum DeclarationPurpose {
-    Read(IcebergReadLayout),
+    Read(IcebergReadProjection),
     Storage,
     CanonicalWriteInput,
 }
@@ -123,7 +123,7 @@ pub(crate) fn from_field(
     nullable: bool,
     nominals: &super::nominal_declaration::NominalSourceDeclarations,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
-    layout: IcebergReadLayout,
+    projection: IcebergReadProjection,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<DeclaredValue, Failure> {
     from_declaration_with_nominals(
@@ -132,7 +132,7 @@ pub(crate) fn from_field(
         nominals.get(&field.id).map(|domain| domain.logical_type()),
         integer,
         nominals,
-        DeclarationPurpose::Read(layout),
+        DeclarationPurpose::Read(projection),
         creation,
     )
 }
@@ -262,7 +262,12 @@ fn author(
                 Type::Primitive(primitive) => plain_fixed_width(primitive, domain).is_some(),
                 _ => false,
             };
-            let data_type = if raw_fixed && purpose != DeclarationPurpose::Storage {
+            let projects_fixed_as_binary = match purpose {
+                DeclarationPurpose::Read(projection) => projection.projects_fixed_as_binary(),
+                DeclarationPurpose::Storage => false,
+                DeclarationPurpose::CanonicalWriteInput => true,
+            };
+            let data_type = if raw_fixed && projects_fixed_as_binary {
                 DataType::Binary
             } else {
                 source.clone()
@@ -276,8 +281,8 @@ fn author(
                 domain => ValueKind::Nominal(domain),
             };
             let layout = match purpose {
-                DeclarationPurpose::Read(layout) if !raw_fixed => {
-                    layout.byte_carrier(&data_type, domain)
+                DeclarationPurpose::Read(projection) if !raw_fixed => {
+                    projection.byte_carrier(&data_type, domain)
                 }
                 _ => data_type.clone(),
             };

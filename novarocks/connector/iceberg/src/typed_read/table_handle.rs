@@ -92,6 +92,7 @@ pub const MAX_PINNED_DATA_FILES: usize = 4096;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergPinnedDataFileSet {
     paths: BTreeSet<Arc<str>>,
+    data_rewrite: bool,
 }
 
 impl IcebergPinnedDataFileSet {
@@ -119,7 +120,18 @@ impl IcebergPinnedDataFileSet {
                 ));
             }
         }
-        Ok(Self { paths: set })
+        Ok(Self {
+            paths: set,
+            data_rewrite: false,
+        })
+    }
+
+    pub(crate) fn for_data_rewrite<P: AsRef<str>>(
+        paths: impl IntoIterator<Item = P>,
+    ) -> Result<Self, ConnectorError> {
+        let mut files = Self::try_new(paths)?;
+        files.data_rewrite = true;
+        Ok(files)
     }
 
     pub const fn paths(&self) -> &BTreeSet<Arc<str>> {
@@ -138,14 +150,27 @@ impl IcebergPinnedDataFileSet {
         self.paths.is_empty()
     }
 
-    fn to_proto(&self) -> dto::IcebergPinnedDataFileSet {
+    pub(crate) fn to_proto(&self) -> dto::IcebergPinnedDataFileSet {
+        use dto::IcebergPinnedDataReadPurpose;
         dto::IcebergPinnedDataFileSet {
             paths: self.paths.iter().map(|path| path.to_string()).collect(),
+            purpose: if self.data_rewrite {
+                IcebergPinnedDataReadPurpose::DataRewrite as i32
+            } else {
+                IcebergPinnedDataReadPurpose::Query as i32
+            },
         }
     }
 
-    fn from_proto(raw: &dto::IcebergPinnedDataFileSet) -> Result<Self, ConnectorError> {
-        Self::try_new(&raw.paths)
+    pub(crate) fn from_proto(raw: &dto::IcebergPinnedDataFileSet) -> Result<Self, ConnectorError> {
+        use dto::IcebergPinnedDataReadPurpose;
+        match IcebergPinnedDataReadPurpose::try_from(raw.purpose) {
+            Ok(IcebergPinnedDataReadPurpose::Query) => Self::try_new(&raw.paths),
+            Ok(IcebergPinnedDataReadPurpose::DataRewrite) => Self::for_data_rewrite(&raw.paths),
+            _ => Err(invalid(
+                "iceberg pinned data file set requires a known read purpose",
+            )),
+        }
     }
 }
 
@@ -456,6 +481,11 @@ impl IcebergTableHandle {
     /// The exact file set this read is restricted to, when it has one.
     pub const fn pinned_data_files(&self) -> Option<&IcebergPinnedDataFileSet> {
         self.pinned_data_files.as_ref()
+    }
+
+    pub(crate) fn is_data_rewrite_read(&self) -> bool {
+        self.pinned_data_files()
+            .is_some_and(|files| files.data_rewrite)
     }
 
     /// Whether planning may narrow this read at all.

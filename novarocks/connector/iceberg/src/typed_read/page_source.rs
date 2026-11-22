@@ -217,7 +217,7 @@ fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> 
     }
 }
 
-use super::runtime::IcebergReadLayout;
+use super::runtime::{IcebergReadLayout, IcebergReadProjection};
 use super::schema_binding::{
     IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest, IcebergSplitFacts,
     bind_decoder_columns, bind_scan_columns,
@@ -758,7 +758,7 @@ impl ParquetFooterCache {
 /// directly instead of forcing one relation to impersonate the other.
 #[derive(Clone, Debug)]
 pub struct IcebergReadRelation {
-    output_layout: IcebergReadLayout,
+    read_projection: IcebergReadProjection,
     nominals: Arc<crate::schema_mapping::nominal_declaration::NominalSourceDeclarations>,
     table_schema: Arc<Schema>,
     partition_spec: PartitionSpec,
@@ -775,7 +775,7 @@ impl IcebergReadRelation {
         partition_spec_id: i32,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
-            output_layout: IcebergReadLayout::Offsets,
+            read_projection: IcebergReadProjection::for_table(handle, IcebergReadLayout::Offsets),
             nominals: Arc::new(handle.nominal_declarations().clone()),
             table_schema: Arc::new(handle.parse_table_schema()?),
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
@@ -800,7 +800,7 @@ impl IcebergReadRelation {
         partition_spec_id: i32,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
-            output_layout: IcebergReadLayout::Offsets,
+            read_projection: IcebergReadProjection::Sql(IcebergReadLayout::Offsets),
             nominals: Arc::new(handle.nominal_declarations().clone()),
             table_schema: Arc::new(handle.parse_table_schema()?),
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
@@ -839,7 +839,9 @@ impl IcebergReadRelation {
     }
 
     pub(super) fn with_output_layout(mut self, layout: IcebergReadLayout) -> Self {
-        self.output_layout = layout;
+        if let IcebergReadProjection::Sql(current) = &mut self.read_projection {
+            *current = layout;
+        }
         self
     }
 
@@ -964,7 +966,7 @@ fn partition_only_source(
 /// stream can build it in its first poll.
 struct ParquetSplitRequest {
     split: IcebergSplit,
-    output_layout: IcebergReadLayout,
+    read_projection: IcebergReadProjection,
     nominals: Arc<crate::schema_mapping::nominal_declaration::NominalSourceDeclarations>,
     name_mapping: Option<Arc<NameMapping>>,
     columns: Vec<IcebergColumnHandle>,
@@ -988,7 +990,7 @@ impl ParquetSplitRequest {
         (
             Self {
                 split: request.split.clone(),
-                output_layout: request.relation.output_layout,
+                read_projection: request.relation.read_projection,
                 nominals: request.relation.nominals.clone(),
                 name_mapping: request.relation.name_mapping.clone(),
                 columns: request.columns.to_vec(),
@@ -1039,7 +1041,7 @@ impl ParquetSplitRequest {
             delete_domains: self.delete_domains,
             delete_mode,
             table_schema: admitted.table_schema,
-            output_layout: self.output_layout,
+            read_projection: self.read_projection,
             nominals: self.nominals,
             name_mapping: self.name_mapping,
             partition_spec: admitted.partition_spec,
@@ -1331,7 +1333,7 @@ fn try_partition_only_page_source(
                 let array = constant_column(value.as_ref(), column.target(), 1)?;
                 let target = output_carrier(
                     column.target(),
-                    relation.output_layout,
+                    relation.read_projection,
                     &relation.nominals,
                     &relation.table_schema,
                 )?;
@@ -1354,6 +1356,7 @@ fn try_partition_only_page_source(
     })?;
     Ok(Some(IcebergPartitionOnlyPageSource {
         constants,
+        read_projection: relation.read_projection,
         total_rows,
         emitted_rows: 0,
         context,
@@ -1365,6 +1368,7 @@ fn try_partition_only_page_source(
 /// A split that needs no byte of its data file: its pages are constants.
 pub struct IcebergPartitionOnlyPageSource {
     constants: Vec<(ArrayRef, arrow::datatypes::DataType)>,
+    read_projection: IcebergReadProjection,
     total_rows: u64,
     emitted_rows: u64,
     context: FileReadContext,
@@ -1385,7 +1389,12 @@ impl IcebergPartitionOnlyPageSource {
             .constants
             .iter()
             .map(|(array, target)| {
-                OutputColumn::constant(array, target).with_fixed_binary_projection()
+                let column = OutputColumn::constant(array, target);
+                if self.read_projection.projects_fixed_as_binary() {
+                    column.with_fixed_binary_projection()
+                } else {
+                    column
+                }
             })
             .collect::<Vec<_>>();
         let projected = self
@@ -1536,7 +1545,7 @@ pub struct IcebergParquetPageSource {
     pending_output: Option<super::output::OutputCursor>,
     split: IcebergSplit,
     table_schema: Arc<Schema>,
-    output_layout: IcebergReadLayout,
+    read_projection: IcebergReadProjection,
     nominals: Arc<crate::schema_mapping::nominal_declaration::NominalSourceDeclarations>,
     name_mapping: Option<Arc<NameMapping>>,
     partition_spec: PartitionSpec,
@@ -1667,7 +1676,7 @@ impl IcebergParquetPageSource {
             .map(|field| {
                 output_carrier(
                     field,
-                    self.output_layout,
+                    self.read_projection,
                     &self.nominals,
                     &self.table_schema,
                 )
@@ -2041,7 +2050,7 @@ impl IcebergParquetPageSource {
                 return Ok(ConnectorPreparationProgress::Deferred);
             }
             let relation = IcebergReadRelation {
-                output_layout: self.output_layout,
+                read_projection: self.read_projection,
                 nominals: self.nominals.clone(),
                 table_schema: Arc::clone(&self.table_schema),
                 partition_spec: self.partition_spec.clone(),
@@ -2398,7 +2407,11 @@ impl IcebergParquetPageSource {
                 } else {
                     OutputColumn::new(&source.array, target)
                 };
-                column.with_fixed_binary_projection()
+                if self.read_projection.projects_fixed_as_binary() {
+                    column.with_fixed_binary_projection()
+                } else {
+                    column
+                }
             })
             .collect::<Vec<_>>();
         let projected = self
@@ -2419,14 +2432,14 @@ impl IcebergParquetPageSource {
 /// selection. This is the same primitive carrier choice as the schema author.
 fn output_carrier(
     field: &Field,
-    layout: IcebergReadLayout,
+    projection: IcebergReadProjection,
     nominals: &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
     table_schema: &Schema,
 ) -> Result<arrow::datatypes::DataType, ConnectorError> {
     use arrow::datatypes::{DataType, FieldRef};
     use novarocks_type_contract::ValueLogicalType;
     let child = |field: &FieldRef| {
-        let carrier = output_carrier(field, layout, nominals, table_schema)?;
+        let carrier = output_carrier(field, projection, nominals, table_schema)?;
         Ok::<_, ConnectorError>(if &carrier == field.data_type() {
             Arc::clone(field)
         } else {
@@ -2461,9 +2474,13 @@ fn output_carrier(
                         storage.id,
                     )));
                 }
-                DataType::Binary
+                if projection.projects_fixed_as_binary() {
+                    DataType::Binary
+                } else {
+                    ty.clone()
+                }
             } else {
-                layout.byte_carrier(ty, domain)
+                projection.byte_carrier(ty, domain)
             }
         }
     })

@@ -51,7 +51,9 @@ mod typed_source;
 
 fn sql_table_name(relation: &IcebergRuntimeRelation) -> Option<&SchemaTableName> {
     match relation {
-        IcebergRuntimeRelation::Table(table) => Some(table.schema_table_name()),
+        IcebergRuntimeRelation::Table(table) if !table.is_data_rewrite_read() => {
+            Some(table.schema_table_name())
+        }
         IcebergRuntimeRelation::ChangeWindow(window) => Some(window.schema_table_name()),
         _ => None,
     }
@@ -636,7 +638,7 @@ fn compare_public(
         nominals.get(&value_id).map(|domain| domain.logical_type()),
         column.scalar_integer_domain(),
         nominals,
-        read_layout,
+        relation.read_projection(read_layout),
         work,
     )?;
     if let Some(declaration) = declaration {
@@ -1279,9 +1281,12 @@ mod tests {
     }
 
     #[test]
-    fn selected_nominal_largeint_is_retired_by_frozen_field_identity() {
+    fn pinned_data_rewrites_preserve_fixed_and_nominal_storage_without_exposing_it_in_sql() {
         use crate::iceberg::spec::StructType;
         use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
+        use crate::typed_read::IcebergPinnedDataFileSet;
+        use crate::typed_read::runtime::IcebergReadLayout;
+        use novarocks_type_contract::ValueKind;
         let schema = schema(vec![NestedField::optional(
             1,
             "pair",
@@ -1301,38 +1306,87 @@ mod tests {
         let table = table(&schema, BTreeMap::new())
             .with_nominal_declarations(BTreeMap::from([(2, NominalSourceDomain::LargeInt)]))
             .unwrap();
-        let relation = IcebergRuntimeRelation::Table(table);
+        // MV partition reads pin files too. Their SQL projection and the
+        // retirement rule are independent of that restriction.
+        let files = ["s3://warehouse/db/events/data/file.parquet"];
+        let mut wire = table.to_proto();
+        wire.pinned_data_files = Some(IcebergPinnedDataFileSet::try_new(files).unwrap().to_proto());
+        let query = IcebergRuntimeRelation::Table(IcebergTableHandle::from_proto(&wire).unwrap());
+        wire.pinned_data_files = Some(
+            IcebergPinnedDataFileSet::for_data_rewrite(files)
+                .unwrap()
+                .to_proto(),
+        );
+        let rewrite = IcebergRuntimeRelation::Table(IcebergTableHandle::from_proto(&wire).unwrap());
         let pair = IcebergColumnHandle::base_column_of(&schema, 1).unwrap();
         let legacy = pair.dereference(&[2]).unwrap();
         let raw = pair.dereference(&[3]).unwrap();
         let mut request = |_| Ok(());
         let mut observe = |_| Ok(());
+        let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
         let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            storage.clone(),
             &mut request,
             &mut observe,
         );
-        let mut publish = |column| {
+        let mut publish = |relation: &IcebergRuntimeRelation, column: &IcebergColumnHandle| {
             public_read_schema(
-                &relation,
+                relation,
                 &[column],
-                crate::typed_read::runtime::IcebergReadLayout::Offsets,
+                IcebergReadLayout::Offsets,
                 &mut creation,
             )
         };
-        let schema = publish(&raw).unwrap();
-        assert_eq!(schema.schema().field(0).data_type(), &DataType::Binary);
-        for selected in [&legacy, &pair] {
-            let error = publish(selected).unwrap_err();
-            let PureProviderCompileError::Provider(error) = error else {
-                panic!("expected typed provider rejection");
-            };
-            assert_eq!(
-                error.kind(),
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported
-            );
-            assert!(error.message().contains("db.events field legacy (ID 2)"));
+        let sql = IcebergRuntimeRelation::Table(table);
+        for relation in [&sql, &query] {
+            let projected = publish(relation, &raw).unwrap();
+            assert_eq!(projected.schema().field(0).data_type(), &DataType::Binary);
+            for selected in [&legacy, &pair] {
+                let error = publish(relation, selected).unwrap_err();
+                let PureProviderCompileError::Provider(error) = error else {
+                    panic!("expected typed provider rejection");
+                };
+                assert_eq!(
+                    error.kind(),
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported
+                );
+                assert!(error.message().contains("db.events field legacy (ID 2)"));
+            }
         }
+
+        let (execution, source) = publish(&rewrite, &pair)
+            .unwrap()
+            .into_typed_parts()
+            .unwrap();
+        let value = execution.binding(0).unwrap();
+        let DataType::Struct(fields) = value.data_type() else {
+            panic!("expected the stored pair");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(fields[1].data_type(), &DataType::FixedSizeBinary(16));
+        assert!(!fields[0].is_nullable());
+        assert!(fields[1].is_nullable());
+        assert!(value.nullable());
+        assert_eq!(
+            value.value_type().child_type_at(0).unwrap().kind(),
+            &ValueKind::Nominal(ValueLogicalType::LargeInt)
+        );
+        let exact = ConnectorReadPublicFacts::try_new_typed(
+            public(vec![], vec![]).source().clone(),
+            None,
+            execution,
+            source,
+            storage,
+        )
+        .unwrap();
+        run(
+            &rewrite,
+            std::slice::from_ref(&pair),
+            &exact,
+            &Control::default(),
+        )
+        .unwrap();
+        rejected(&query, &[pair], &exact);
     }
 
     #[test]
