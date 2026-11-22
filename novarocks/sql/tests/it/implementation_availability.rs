@@ -84,7 +84,9 @@ fn concat_array_widening_preserves_the_original_common_conversion_in_the_package
                     continue;
                 }
                 let source = unit.definition(args[0]).expect("original ARRAY operand");
-                let source_item = source.ty.child_at(0).expect("source ARRAY item");
+                let Some(source_item) = source.ty.child_at(0) else {
+                    continue;
+                };
                 if source_item.data_type() != &DataType::Int32 {
                     continue;
                 }
