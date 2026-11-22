@@ -23,7 +23,7 @@ use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
 use crate::compiler::SqlCompileControl;
 use arrow::datatypes::DataType;
 use novarocks_parser::{Span, ast, build};
-use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, OperatorFunction};
 
 struct NoTables;
 impl PlannerTableProvider for NoTables {
@@ -84,56 +84,47 @@ fn same_typed(actual: &TypedExpr, expected: &TypedExpr, control: &SqlCompileCont
 }
 
 #[test]
-fn distinct_from_retains_null_safe_equality_and_not_results() {
+fn distinct_from_retains_null_safe_operands_and_exact_operator_identities() {
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for (left, right) in [
-        ("NULL", "NULL"),
-        ("NULL", "1"),
-        ("1", "NULL"),
-        ("1", "1"),
-        ("[1,NULL]", "[1,NULL]"),
-    ] {
-        let standard = query(&format!("SELECT {left} IS NOT DISTINCT FROM {right}"));
-        let actual_equal = ctx.analyze_expr(projection(&standard), &scope).unwrap();
-        assert_eq!(
-            actual_equal.value_type,
-            FunctionValueType::new(DataType::Boolean, false)
-        );
-        assert!(matches!(
-            actual_equal.kind,
-            ExprKind::BinaryOp {
-                op: BinOp::EqForNull,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                ..
-            }
-        ));
-        let old_not = query(&format!("SELECT NOT ({left} IS NOT DISTINCT FROM {right})"));
-        let old_not = ctx.analyze_expr(projection(&old_not), &scope).unwrap();
-        let standard = query(&format!("SELECT {left} IS DISTINCT FROM {right}"));
-        let actual_not = ctx.analyze_expr(projection(&standard), &scope).unwrap();
-        assert_eq!(actual_not.value_type, old_not.value_type);
-        assert_eq!(
-            actual_not.value_type,
-            FunctionValueType::new(DataType::Boolean, false)
-        );
-        let ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr: actual_inner,
-        } = &actual_not.kind
-        else {
-            panic!("typed NOT")
-        };
-        let ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr: original_inner,
-        } = &old_not.kind
-        else {
-            panic!("original typed NOT")
-        };
-        same_typed(actual_inner, original_inner, &control);
+    for (left, right) in [("NULL", "NULL"), ("NULL", "1"), ("1", "NULL"), ("1", "1")] {
+        let equal = query(&format!("SELECT {left} IS NOT DISTINCT FROM {right}"));
+        let unequal = query(&format!("SELECT {left} IS DISTINCT FROM {right}"));
+        let actual_equal = ctx.analyze_expr(projection(&equal), &scope).unwrap();
+        let actual_unequal = ctx.analyze_expr(projection(&unequal), &scope).unwrap();
+        for actual in [&actual_equal, &actual_unequal] {
+            assert_eq!(
+                actual.value_type,
+                FunctionValueType::new(DataType::Boolean, false)
+            );
+        }
+        let operator = crate::common::binary_operator::typed_operands;
+        let (equal, operands) = operator(&actual_equal).unwrap();
+        let (unequal, compared) = operator(&actual_unequal).unwrap();
+        assert_eq!(equal, OperatorFunction::Identical);
+        assert_eq!(unequal, OperatorFunction::Distinct);
+        for (actual, expected) in compared.into_iter().zip(operands) {
+            same_typed(actual, expected, &control);
+        }
     }
+    let legacy = query("SELECT [1,NULL] IS DISTINCT FROM [1,NULL]");
+    let actual = ctx.analyze_expr(projection(&legacy), &scope).unwrap();
+    assert!(!actual.value_type.nullable());
+    let ExprKind::UnaryOp {
+        op: UnOp::Not,
+        expr,
+    } = actual.kind
+    else {
+        panic!("legacy collection comparison still uses NOT over its original equality");
+    };
+    assert!(matches!(
+        expr.kind,
+        ExprKind::BinaryOp {
+            op: BinOp::EqForNull,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -246,16 +237,22 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
         let expected_probe = ctx.analyze_expr(&node.value, &scope).unwrap();
         let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
         let probe = match &actual.kind {
-            ExprKind::BinaryOp { left, .. }
-            | ExprKind::Between { expr: left, .. }
+            ExprKind::FunctionCall { binding, args, .. }
+                if binding.function_id == OperatorFunction::Equal.function_id() =>
+            {
+                &args[0]
+            }
+            ExprKind::Between { expr: left, .. }
             | ExprKind::InList { expr: left, .. }
             | ExprKind::Like { expr: left, .. } => left,
             _ => panic!("the admitted profile keeps its original typed IR kind"),
         };
         same_typed(probe, &expected_probe, &control);
         let pairs: Vec<(&TypedExpr, &ast::Expr)> = match (&actual.kind, &node.predicate) {
-            (ExprKind::BinaryOp { right, .. }, ast::Predicate::Comparison(p)) => {
-                vec![(right, &p.right)]
+            (ExprKind::FunctionCall { binding, args, .. }, ast::Predicate::Comparison(p))
+                if binding.function_id == OperatorFunction::Equal.function_id() =>
+            {
+                vec![(&args[1], &p.right)]
             }
             (ExprKind::Between { low, high, .. }, ast::Predicate::Between(p)) => {
                 vec![(low, &p.min), (high, &p.max)]

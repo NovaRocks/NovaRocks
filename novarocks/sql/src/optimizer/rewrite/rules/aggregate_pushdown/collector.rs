@@ -136,6 +136,9 @@ fn split_at_join(
         _ => return None,
     }
     let cond_id = join.condition?;
+    if !crate::optimizer::cascades_rules::implement::safe_key_operand(arena, cond_id) {
+        return None;
+    }
     let equi_keys = extract_equi_key_pairs(arena, cond_id);
     if equi_keys.is_empty() {
         return None;
@@ -326,20 +329,21 @@ fn extract_equi_key_pairs(arena: &ScalarArena, cond: ScalarId) -> Vec<(ScalarId,
 }
 
 fn walk_and_collect_equi(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<(ScalarId, ScalarId)>) {
+    if let Some((BinOp::Eq, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+    {
+        if [left, right].into_iter().all(|operand| {
+            matches!(arena.node(operand), ScalarNode::ColumnRef(_))
+                && crate::common::binary_operator::permits_equality_substitution(
+                    arena.data_type(operand),
+                )
+        }) {
+            out.push((left, right));
+        }
+        return;
+    }
     match arena.node(expr) {
         ScalarNode::Nested(inner) => walk_and_collect_equi(arena, *inner, out),
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } => {
-            if matches!(arena.node(*left), ScalarNode::ColumnRef(_))
-                && matches!(arena.node(*right), ScalarNode::ColumnRef(_))
-            {
-                out.push((*left, *right));
-            }
-        }
         ScalarNode::BinaryOp {
             left,
             op: BinOp::And,

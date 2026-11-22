@@ -366,6 +366,7 @@ fn folds_constants_inside_a_case_without_folding_the_case_itself() {
     let then = fixture.binary(BinOp::Add, one, two);
     let case = fixture.intern(
         ScalarNode::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: vec![(when, then)],
             else_expr: None,

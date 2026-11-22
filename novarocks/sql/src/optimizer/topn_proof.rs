@@ -129,6 +129,7 @@ fn collect_column_ids_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<C
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_column_ids_inner(arena, *operand, out);

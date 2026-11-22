@@ -312,6 +312,7 @@ fn static_case_keeps_exact_branches_implicit_null_and_type_only_checks() {
     for hidden in [false, true] {
         for simple in [false, true] {
             let case = |ids: &[ExprId], has_else: bool| ExprKind::Case {
+                ieee_float_equality: false,
                 operand: simple.then_some(ids[0]),
                 when_then: Box::new([(ids[usize::from(simple)], ids[usize::from(simple) + 1])]),
                 else_expr: has_else.then(|| ids[usize::from(simple) + 2]),

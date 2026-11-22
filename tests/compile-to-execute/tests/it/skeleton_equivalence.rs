@@ -79,8 +79,7 @@ impl Fixture {
             )])
             .unwrap(),
             sql_semantics: SqlSemanticSettings::default()
-                .with_sql_mode(SqlMode::from_assignment("ALLOW_THROW_EXCEPTION"))
-                .with_decimal_overflow_to_double(false),
+                .with_sql_mode(SqlMode::from_assignment("ALLOW_THROW_EXCEPTION")),
         }
     }
 

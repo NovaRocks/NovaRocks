@@ -100,6 +100,7 @@ fn collect_scalar_column_ids(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_scalar_column_ids(arena, *op, out);

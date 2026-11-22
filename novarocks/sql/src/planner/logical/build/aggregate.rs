@@ -934,10 +934,12 @@ fn rewrite_expr_children_with<E>(
             negated: *negated,
         },
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ExprKind::Case {
+            ieee_float_equality: *ieee_float_equality,
             operand: operand
                 .as_ref()
                 .map(|operand| rewrite_child(operand).map(novarocks_parser::ast::AstBox::new))
@@ -1141,6 +1143,7 @@ pub(super) fn collect_aggregates(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_aggregates(op, out, factory, control)?;
@@ -1286,6 +1289,7 @@ fn collect_non_agg_column_refs_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_non_agg_column_refs_inner(op, group_by, out, inside_agg, control)?;

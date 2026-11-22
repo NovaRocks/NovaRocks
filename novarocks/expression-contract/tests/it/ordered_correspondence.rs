@@ -182,6 +182,7 @@ fn case_unit() -> BoundExprSet {
             None,
             boolean(true),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::new([(ids[0], ids[1]), (ids[2], ids[3])]),
                 else_expr: Some(ids[4]),
@@ -223,6 +224,7 @@ fn case_metadata_and_ordered_when_then_occurrences_match_the_real_definition() {
     let mut changed = case_unit().into_parts();
     let definition = changed.roots[0].definition;
     changed.definitions[definition.get() as usize].kind = ExprKind::Case {
+        ieee_float_equality: false,
         operand: Some(ExprId::new(0)),
         when_then: Box::new([
             (ExprId::new(1), ExprId::new(2)),

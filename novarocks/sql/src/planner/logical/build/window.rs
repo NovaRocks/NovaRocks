@@ -223,6 +223,7 @@ fn has_window_call(expr: &TypedExpr) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.as_deref().is_some_and(has_window_call)
                 || when_then
@@ -594,11 +595,13 @@ fn rewrite_window_calls(
             value_type: expr.value_type.clone(),
         },
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => TypedExpr {
             kind: ExprKind::Case {
+                ieee_float_equality: *ieee_float_equality,
                 operand: operand.as_ref().map(|inner| {
                     novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                         inner,

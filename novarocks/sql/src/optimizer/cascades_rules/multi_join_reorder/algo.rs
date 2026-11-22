@@ -619,16 +619,21 @@ fn class_index(
 
 /// If `expr` is a `col = col` equi conjunct, return its two column ids.
 fn equi_columns(arena: &ScalarArena, expr: ScalarId) -> Option<(ColumnId, ColumnId)> {
-    match arena.node(expr) {
-        ScalarNode::Nested(inner) => equi_columns(arena, *inner),
-        ScalarNode::BinaryOp {
-            op: BinOp::Eq,
-            left,
-            right,
-            ..
-        } => Some((column_of(arena, *left)?, column_of(arena, *right)?)),
-        _ => None,
+    if let ScalarNode::Nested(inner) = arena.node(expr) {
+        return equi_columns(arena, *inner);
     }
+    let (BinOp::Eq, [left, right]) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)?
+    else {
+        return None;
+    };
+    // Transitive substitution requires a stronger relation than IEEE equality.
+    if ![left, right].into_iter().all(|operand| {
+        crate::common::binary_operator::permits_equality_substitution(arena.data_type(operand))
+    }) {
+        return None;
+    }
+    Some((column_of(arena, left)?, column_of(arena, right)?))
 }
 
 /// The column id of a (possibly `Nested`-wrapped) bare `ColumnRef`, if any.

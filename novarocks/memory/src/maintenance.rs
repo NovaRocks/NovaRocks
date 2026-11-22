@@ -22,7 +22,7 @@ use crate::{
     account::Path,
     authority::{MemoryAuthority, Shared},
     domain::FundingDomain,
-    error::{CapacityError, Refusal},
+    error::{CapacityError, MetadataRegistryLabel, Refusal},
     sync::{Arc, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ pub enum MaintenanceReason {
     CapacityReduced,
     ShortageCandidate,
     ExplicitLocalReclaim,
+    FundingRecordPressure,
 }
 #[derive(Debug, Default)]
 pub(crate) struct MaintenanceState {
@@ -316,36 +317,41 @@ impl MemoryAuthority {
         if let Err(error) = self.validate_account(account) {
             return RequestOutcome::Refused(error);
         }
+        let reason = match account.create_domain(bytes) {
+            Ok(domain) => return RequestOutcome::Granted(domain),
+            Err(CapacityError::ShortageCandidate(_)) => MaintenanceReason::ShortageCandidate,
+            Err(CapacityError::MetadataExhausted {
+                registry: MetadataRegistryLabel::FundingRecords,
+                ..
+            }) => MaintenanceReason::FundingRecordPressure,
+            Err(error) => return RequestOutcome::Refused(error),
+        };
+        // Stopping a producer leaves its registry entry and stable record in
+        // place until maintenance can verify that no facts or handles survive.
+        self.request_maintenance(reason);
+        let mut coverage = self.maintain(budget);
+        if !coverage.complete {
+            return RequestOutcome::SettlementPending(coverage);
+        }
         match account.create_domain(bytes) {
             Ok(domain) => RequestOutcome::Granted(domain),
-            Err(CapacityError::ShortageCandidate(_)) => {
-                self.request_maintenance(MaintenanceReason::ShortageCandidate);
-                let mut coverage = self.maintain(budget);
-                if !coverage.complete {
+            Err(CapacityError::ShortageCandidate(mut refusal)) => {
+                refusal.requested = bytes;
+                if refusal.capacity_revision != coverage.capacity_revision {
+                    self.request_maintenance(MaintenanceReason::ShortageCandidate);
                     return RequestOutcome::SettlementPending(coverage);
                 }
-                match account.create_domain(bytes) {
-                    Ok(domain) => RequestOutcome::Granted(domain),
-                    Err(CapacityError::ShortageCandidate(mut refusal)) => {
-                        refusal.requested = bytes;
-                        if refusal.capacity_revision != coverage.capacity_revision {
-                            self.request_maintenance(MaintenanceReason::ShortageCandidate);
-                            return RequestOutcome::SettlementPending(coverage);
-                        }
-                        coverage.root_revision = self.root().0.ledger.lock().unwrap().revision;
-                        let receipt = ShortageReceipt {
-                            refusal,
-                            coverage,
-                            rechecked_at: Instant::now(),
-                        };
-                        if !self.shortage_is_fresh(&receipt, Duration::from_secs(1)) {
-                            self.request_maintenance(MaintenanceReason::ShortageCandidate);
-                            return RequestOutcome::SettlementPending(receipt.coverage);
-                        }
-                        RequestOutcome::SharedShortage(receipt)
-                    }
-                    Err(error) => RequestOutcome::Refused(error),
+                coverage.root_revision = self.root().0.ledger.lock().unwrap().revision;
+                let receipt = ShortageReceipt {
+                    refusal,
+                    coverage,
+                    rechecked_at: Instant::now(),
+                };
+                if !self.shortage_is_fresh(&receipt, Duration::from_secs(1)) {
+                    self.request_maintenance(MaintenanceReason::ShortageCandidate);
+                    return RequestOutcome::SettlementPending(receipt.coverage);
                 }
+                RequestOutcome::SharedShortage(receipt)
             }
             Err(error) => RequestOutcome::Refused(error),
         }

@@ -26,7 +26,7 @@ use novarocks_type_contract::{
 
 use super::{
     CarrierConversion, ChildForm, ChildTyping, Conversion, LiteralValue, TypedLiteral,
-    TypingContext, TypingError, ValueDomainConversion,
+    TypingContext, TypingError, ValueConversionOrigin, ValueDomainConversion,
 };
 
 pub(super) fn typed_null(
@@ -100,6 +100,48 @@ pub(super) fn coerce_argument(
     }
 
     carrier_or_keep(context.decimal_overflow_policy, child, target, work)
+}
+
+/// Convert a Decimal128 operand in an exact floating operator domain.
+pub fn operator_decimal_float(
+    context: &TypingContext<'_>,
+    child: &ChildTyping,
+    target: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Conversion, TypingError> {
+    use novarocks_functions::builtin::value_conversion::{
+        OPERATOR_DECIMAL_FLOAT_COERCION, VALUE_CONVERSION_FUNCTION_ID,
+    };
+    use novarocks_type_contract::{FunctionId, FunctionOverloadId};
+
+    let function = FunctionId::try_new(VALUE_CONVERSION_FUNCTION_ID)
+        .expect("valid builtin value conversion identity");
+    let overload = FunctionOverloadId::try_new(OPERATOR_DECIMAL_FLOAT_COERCION)
+        .expect("valid operator coercion overload identity");
+    let arguments = [child.argument()];
+    work.flush()?;
+    let binding = context.catalog.select_exact_scalar(
+        &function,
+        &overload,
+        super::request(&arguments, Some(target)),
+        work.control(),
+    )?;
+    if binding.function_id != function
+        || binding.selected.overload != overload
+        || !matches!(&binding.selected.result_type, FunctionResultType::Scalar(result)
+            if result.exactly_equals_checked_observed(target, || work.step())?)
+    {
+        return Err(TypingError::InvalidShape(
+            "operator coercion differs from its exact selected target",
+        ));
+    }
+    Ok(Conversion::ValueDomain(Box::new(ValueDomainConversion {
+        binding,
+        expected_result: target.clone(),
+        target: target.clone(),
+        tail: None,
+        origin: ValueConversionOrigin::OperatorDecimalFloat,
+    })))
 }
 
 /// Publish the complete CASE branch target, including identity-domain
@@ -226,6 +268,7 @@ fn value_domain(
         expected_result,
         target,
         tail,
+        origin: ValueConversionOrigin::ValueDomain,
     })))
 }
 

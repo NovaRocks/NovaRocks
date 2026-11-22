@@ -251,6 +251,7 @@ fn collect_scalar_column_id_refs_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_scalar_column_id_refs_inner(arena, *operand, out);

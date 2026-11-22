@@ -171,7 +171,7 @@ Test 3.2: 38-digit * 25-digit	99999999999999	99999999999999	99999999999998000000
 -- query 36
 -- types	varchar	varchar	varchar	varchar	varchar
 test_case	_col1	_col2	result	expected
-Test 3.2: 38-digit * 25-digit	99999999999999	99999999999999	9999999999999800000000000001.0000000000	should not overflow
+Test 3.2: 38-digit * 25-digit	99999999999999	99999999999999	9999999999999800000000000001.000000	should not overflow
 
 -- query 37
 -- types	varchar	varchar	varchar	varchar
@@ -193,6 +193,11 @@ id	digits	_col2	result	expected
 5	30	99999999999999	9999999999999800000000000001	Boundary case
 6	35	99999999999999	9999999999999800000000000001	Should succeed
 7	38	99999999999999	9999999999999800000000000001	Should succeed
+
+-- query 40
+-- types	varchar	varchar	varchar
+test_case	result	expected
+Test 5.1: Exact zero at high scale	0.00000000000000000000000000000000000000	Zero remains exactly representable
 
 -- query 41
 -- types	varchar	varchar	varchar
@@ -218,8 +223,3 @@ Test 6.3: Large * 0.1	9999999999999.9	Should succeed, reduces magnitude
 -- types	varchar	varchar	varchar
 test_case	result	expected
 Test 6.4: Large * -1	-99999999999999	Should return negative of original
-
--- query 46
--- types	varchar	varchar	varchar
-test_case	result	expected
-Test 7.2: Scientific calculation	NULL	Simulates scientific computation overflow

@@ -150,10 +150,12 @@ pub(super) fn encode_kind(
             negated: *negated,
         }),
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => Kind::CaseExpression(wire::CaseExpression {
+            ieee_float_equality: Some(*ieee_float_equality),
             operand_expr_id: operand.map(ExprId::get),
             arms: project(when_then, work, |(when, then)| wire::WhenThen {
                 when_expr_id: Some(when.get()),

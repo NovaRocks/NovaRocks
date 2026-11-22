@@ -186,6 +186,7 @@ pub fn equality_program(kind: EqualityCase) -> Fixture {
                 None,
                 result_type.clone(),
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: Some(operand),
                     when_then: Box::from([(first, then_first), (second, then_second)]),
                     else_expr: Some(otherwise),

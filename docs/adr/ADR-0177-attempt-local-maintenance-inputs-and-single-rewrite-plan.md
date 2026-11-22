@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0250
+  - id: ADR-0251
     scope: "The DV-only execution carrier and rules 3 and 4's OPTIMIZE ref check at writer begin and RefUnchanged on commit"
-    link: "ADR-0250-iceberg-maintenance-commits-by-operation.md"
+    link: "ADR-0251-iceberg-maintenance-commits-by-operation.md"
 partially-supersedes: [ADR-0028]
 date: 2026-10-14
 provenance:

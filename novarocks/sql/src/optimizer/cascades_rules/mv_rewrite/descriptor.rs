@@ -790,18 +790,21 @@ fn split_join_condition(
     let mut edges = Vec::new();
     let mut residuals = Vec::new();
     for c in conjuncts {
-        let edge = match arena.node(c) {
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left,
-                right,
-                ..
-            } => match (arena.node(*left), arena.node(*right)) {
-                (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => {
-                    normalize_equi_edge(*l, *r, left_columns, right_columns)
+        let edge = match crate::common::binary_operator::scalar_comparison(arena, c) {
+            Some((BinOp::Eq, [left, right]))
+                if [left, right].into_iter().all(|operand| {
+                    crate::common::binary_operator::permits_equality_substitution(
+                        arena.data_type(operand),
+                    )
+                }) =>
+            {
+                match (arena.node(left), arena.node(right)) {
+                    (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => {
+                        normalize_equi_edge(*l, *r, left_columns, right_columns)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
             _ => None,
         };
         match edge {
@@ -994,10 +997,12 @@ pub(crate) fn substitute_scalar(
             negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ScalarNode::Case {
+            ieee_float_equality,
             operand: operand
                 .map(|item| substitute_scalar(arena, item, defs, control))
                 .transpose()?,
@@ -1105,6 +1110,7 @@ fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             let mut out = Vec::with_capacity(operand.iter().count() + when_then.len() * 2 + 1);
             out.extend(operand.iter().copied());

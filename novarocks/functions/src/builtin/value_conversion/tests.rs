@@ -141,6 +141,7 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
             LARGEINT_TEXT,
             NULL_LIFT,
             OPAQUE_BINARY,
+            OPERATOR_DECIMAL_FLOAT_COERCION,
             SIGNED_LARGEINT,
             UTF8_LARGEINT
         ]

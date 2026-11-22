@@ -3197,6 +3197,11 @@ pub fn contribute_builtin_functions(
     builder: &mut EngineFunctionCatalogBuilder,
 ) -> Result<(), FunctionCatalogError> {
     builder.register(super::value_conversion::value_conversion_definition()?)?;
+    for operator in novarocks_type_contract::OperatorFunction::ALL {
+        if operator != novarocks_type_contract::OperatorFunction::Negation {
+            builder.register(super::binary_operator_owner::definition(operator)?)?;
+        }
+    }
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {

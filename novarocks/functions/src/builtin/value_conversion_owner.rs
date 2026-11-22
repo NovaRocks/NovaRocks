@@ -37,7 +37,7 @@ use crate::{
     ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-fn implementation_pairs() -> [(&'static str, &'static str); 15] {
+fn implementation_pairs() -> [(&'static str, &'static str); 16] {
     [
         (
             value_conversion::JSON_TEXT,
@@ -98,6 +98,10 @@ fn implementation_pairs() -> [(&'static str, &'static str); 15] {
         (
             value_conversion::ARRAY_COMMON_COERCION,
             "builtin.scalar/value_domain_conversion/array_common_coercion/selected-v1",
+        ),
+        (
+            value_conversion::OPERATOR_DECIMAL_FLOAT_COERCION,
+            "builtin.scalar/value_domain_conversion/operator_decimal_float_coercion/selected-v1",
         ),
     ]
 }
@@ -332,6 +336,9 @@ struct PreparedConversion {
 impl PreparedScalarKernel for PreparedConversion {
     fn contract(&self) -> &Arc<ScalarCallContract> {
         &self.contract
+    }
+    fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
+        self.recipe.operator_decimal_float_resource_profile()
     }
     fn instance_retained_upper_bound(&self) -> usize {
         // Shared immutable preparation backing belongs to its preparation owner,

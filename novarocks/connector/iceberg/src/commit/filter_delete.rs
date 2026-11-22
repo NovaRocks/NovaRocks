@@ -73,7 +73,7 @@ impl RowFilterJudge for AlwaysTrue {
     }
 }
 
-// Design: ADR-0250 (docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)
+// Design: ADR-0251 (docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)
 /// Selection is always derived from B. The operation intent owns the protocol label.
 pub(crate) struct FilterDeletePreparer {
     filter: Predicate,

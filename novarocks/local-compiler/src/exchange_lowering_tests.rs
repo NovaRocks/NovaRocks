@@ -1039,6 +1039,7 @@ fn full_outer_exchange_input_packages(
     }
     let keys = (0..2)
         .map(|ordinal| JoinKey {
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             left: {
                 let definition = consumer
                     .fixture_definition(join, ty.clone(), ExprKind::Value(imported[0][ordinal]))

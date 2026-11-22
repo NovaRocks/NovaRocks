@@ -22,20 +22,24 @@
 use super::value_conversion::{
     ARRAY_COMMON_COERCION, BOOLEAN_LARGEINT, DECIMAL128_LARGEINT, DECIMAL256_LARGEINT,
     FLOAT32_LARGEINT, FLOAT64_LARGEINT, JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT,
-    LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, SIGNED_LARGEINT, UTF8_LARGEINT,
+    LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, OPERATOR_DECIMAL_FLOAT_COERCION,
+    SIGNED_LARGEINT, UTF8_LARGEINT, operator_decimal_float_types,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
     KernelFailure, ScalarCallContract, ScalarCallInput, SelectedValues, Selection,
-    cast::{decimal_integral_coefficient, decimal_overflow_error},
+    cast::{
+        TrinoFloatWidth, decimal_integral_coefficient, decimal_overflow_error,
+        trino_decimal_to_float_bits,
+    },
     kernel_control::{compile_failure, internal, invalid},
     kernel_input::{EvaluationCheckpoints, validate_argument_observed, validate_type_observed},
     largeint::{LARGEINT_BYTE_WIDTH, i128_to_be_bytes},
     selected_copy::{self, CopyError},
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray,
-    ListArray, MapArray, PrimitiveArray, StructArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray,
+    LargeListArray, ListArray, MapArray, PrimitiveArray, StructArray, UInt64Array,
     builder::{FixedSizeBinaryBuilder, PrimitiveBuilder},
     new_empty_array,
     types::*,
@@ -81,6 +85,11 @@ enum Operation {
     Utf8LargeInt,
     NullLift,
     ArrayCommon,
+    OperatorDecimalFloat {
+        precision_limit: u128,
+        scale: u8,
+        width: TrinoFloatWidth,
+    },
 }
 #[derive(Clone, Copy, Debug)]
 enum NumericLargeIntSource {
@@ -169,6 +178,17 @@ impl ConversionRecipe {
                 LARGEINT_TEXT => Operation::LargeIntText,
                 UTF8_LARGEINT => Operation::Utf8LargeInt,
                 NULL_LIFT => Operation::NullLift,
+                OPERATOR_DECIMAL_FLOAT_COERCION => {
+                    let (precision, scale, width) = operator_decimal_float_types(source, target)
+                        .ok_or_else(|| {
+                            invalid("Operator decimal conversion has foreign carriers")
+                        })?;
+                    Operation::OperatorDecimalFloat {
+                        precision_limit: 10_u128.pow(u32::from(precision)),
+                        scale,
+                        width,
+                    }
+                }
                 ARRAY_COMMON_COERCION => {
                     // Pure identity and NULL-promise widening reuse the original
                     // metadata reconstruction author, including UNKNOWN children.
@@ -242,6 +262,22 @@ impl ConversionRecipe {
     }
     pub(super) fn retained_bytes(&self) -> usize {
         self.retained
+    }
+
+    pub(super) fn operator_decimal_float_resource_profile(
+        &self,
+    ) -> Option<crate::ScalarInvocationResourceProfile> {
+        use crate::scalar_resources::PrimitiveBuilderOutput;
+        let Operation::OperatorDecimalFloat { width, .. } = self.operation else {
+            return None;
+        };
+        let output = match width {
+            TrinoFloatWidth::F32 => PrimitiveBuilderOutput::Real,
+            TrinoFloatWidth::F64 => PrimitiveBuilderOutput::Double,
+        };
+        Some(crate::ScalarInvocationResourceProfile::primitive_builder(
+            output, false,
+        ))
     }
     fn prepare_json(
         &mut self,
@@ -440,6 +476,43 @@ impl ConversionRecipe {
                         return Err(internal(
                             "ARRAY common conversion bypassed its prepared selected port",
                         ));
+                    }
+                    Operation::OperatorDecimalFloat {
+                        precision_limit,
+                        scale,
+                        width,
+                    } => {
+                        let source = argument
+                            .array()
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .ok_or_else(|| {
+                                internal("Operator decimal source cannot be downcast")
+                            })?;
+                        let bits = |coefficient: i128| {
+                            if coefficient.unsigned_abs() >= precision_limit {
+                                return Err(internal(
+                                    "Operator decimal coefficient exceeds its declared precision",
+                                ));
+                            }
+                            Ok(trino_decimal_to_float_bits(coefficient, scale, width))
+                        };
+                        match width {
+                            TrinoFloatWidth::F32 => build_decimal_float::<Float32Type>(
+                                *argument,
+                                source,
+                                selection,
+                                &mut work,
+                                |value| bits(value).map(|value| f32::from_bits(value as u32)),
+                            )?,
+                            TrinoFloatWidth::F64 => build_decimal_float::<Float64Type>(
+                                *argument,
+                                source,
+                                selection,
+                                &mut work,
+                                |value| bits(value).map(f64::from_bits),
+                            )?,
+                        }
                     }
                 }
             };
@@ -1190,6 +1263,33 @@ impl novarocks_failure_contract::FailureProjection for CommonPreparationFailure 
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for CommonPreparationFailure {}
+fn build_decimal_float<T: ArrowPrimitiveType>(
+    argument: EvaluatedArgument<'_>,
+    source: &Decimal128Array,
+    selection: Selection<'_>,
+    work: &mut EvaluationCheckpoints<'_>,
+    convert: impl Fn(i128) -> Result<T::Native, KernelFailure>,
+) -> Result<ArrayRef, KernelFailure> {
+    selection
+        .len()
+        .checked_mul(std::mem::size_of::<T::Native>())
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    let mut output = PrimitiveBuilder::<T>::with_capacity(selection.len());
+    for (ordinal, row) in selection.iter().enumerate() {
+        work.step()?;
+        let row = argument.value_row(ordinal, row);
+        if source.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(convert(source.value(row))?);
+        }
+    }
+    work.flush()?;
+    Ok(Arc::new(output.finish()))
+}
+
 fn common_preparation_failure(cause: crate::CastPrepareError) -> KernelFailure {
     match cause {
         crate::CastPrepareError::Control(source) => compile_failure(source),

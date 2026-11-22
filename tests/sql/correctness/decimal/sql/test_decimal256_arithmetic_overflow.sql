@@ -421,12 +421,11 @@ FROM ${case_db}.test_progressive_boundary ORDER BY id;
 -- =============================================================================
 
 -- query 40
--- @expect_error=arithmetic operator `Multiply` has no frozen result rule for Decimal128(38, 38) and Decimal128(38, 38)
--- Test 5.1: Scale overflow, tiny value (throw exception)
+-- Test 5.1: Exact zero at high scale
 SELECT
-    'Test 5.1: Scale overflow, tiny value' as test_case,
+    'Test 5.1: Exact zero at high scale' as test_case,
     cast(val_high_scale * val_high_scale as string) as result,
-    'Should fail due to scale=100 > 76' as expected
+    'Zero remains exactly representable' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 41
@@ -478,6 +477,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- =============================================================================
 
 -- query 46
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Test 7.2: Scientific calculation
 SELECT
     'Test 7.2: Scientific calculation' as test_case,

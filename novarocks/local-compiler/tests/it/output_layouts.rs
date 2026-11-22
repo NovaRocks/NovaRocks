@@ -333,6 +333,7 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
         "utf8_to_largeint_null_invalid",
         "null_to_typed_nullable",
         "array_common_coercion",
+        "operator_decimal_float_coercion",
     ] {
         manifest.push(InstalledPureKernel {
             function: FunctionId::try_new("builtin.scalar/value_domain_conversion/v1").unwrap(),

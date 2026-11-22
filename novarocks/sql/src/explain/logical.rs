@@ -653,6 +653,22 @@ fn expression(
         return Err(fmt::Error);
     }
     let next = depth + 1;
+    if let Some((operator, operands)) = crate::common::binary_operator::typed_operands(expr) {
+        for (ordinal, operand) in operands.into_iter().enumerate() {
+            if ordinal == 1 {
+                write!(out, " {} ", operator.sql())?;
+            }
+            let parens = typed_operand_has_lower_precedence(operand);
+            if parens {
+                out.write_str("(")?;
+            }
+            expression(out, operand, next, diagnostic)?;
+            if parens {
+                out.write_str(")")?;
+            }
+        }
+        return Ok(());
+    }
     if let Some(operand) = typed_operand(expr) {
         let needs_parentheses = typed_operand_has_lower_precedence(operand)
             || matches!(operand.kind, ExprKind::Nested(_));
@@ -838,6 +854,7 @@ fn expression(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             out.write_str("CASE")?;
             if let Some(operand) = operand {
@@ -967,6 +984,7 @@ fn validate_expression_depth(expr: &TypedExpr, depth: usize, visited: &mut usize
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(expr) = operand {
                 validate_expression_depth(expr, next, visited)?;

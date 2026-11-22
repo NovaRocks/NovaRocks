@@ -53,6 +53,7 @@ pub(crate) enum NullPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeyEquality {
     SqlGrouping(NullPolicy),
+    IeeeFloat,
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "RWM-10 first constructs result-content indexes.")
@@ -63,6 +64,7 @@ impl KeyEquality {
     fn null_policy(self) -> NullPolicy {
         match self {
             Self::SqlGrouping(nulls) => nulls,
+            Self::IeeeFloat => NullPolicy::Unmatchable,
             Self::ResultContent => NullPolicy::Equal,
         }
     }
@@ -118,13 +120,6 @@ impl KeySpec {
             checkpoint,
         )
     }
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "RWM-10 consumes the frozen result-content key policy."
-        )
-    )]
     pub(crate) fn with_equalities(
         types: &[FunctionValueType],
         equalities: &[KeyEquality],
@@ -158,6 +153,15 @@ impl KeySpec {
             checkpoint_at(i, checkpoint)?;
             copied_types.push(ty.clone_observed(checkpoint)?);
             let policy = equality(i);
+            if policy == KeyEquality::IeeeFloat
+                && !novarocks_type_contract::JoinKeyMatch::IeeeFloat.supports(
+                    ty.data_type(),
+                    ty.logical_type(),
+                    false,
+                )
+            {
+                return Err(invariant(ValueViolation::Carrier));
+            }
             copied_nulls.push(policy.null_policy());
             equalities.push(policy);
             canonical |=

@@ -109,7 +109,10 @@ pub fn grouped_state_topn_key_supported(
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 34;
+/// Revision 34 declares each hash key match relation and retires the
+/// decimal-to-double promotion parameter.
+/// Revision 35 retires the TableExecute connector relation.
+pub const PLAN_CONTRACT_REVISION: u32 = 35;
 
 #[cfg(test)]
 mod tests;

@@ -148,8 +148,8 @@ fn actual_analyzer_preserves_encoded_json_null_and_original_sql_null() {
         crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Null)
     ));
     assert!(matches!(
-        values.rows[0][0].kind,
-        crate::analysis::ExprKind::BinaryOp { .. }
+        crate::common::binary_operator::typed_operands(&values.rows[0][0]),
+        Some((novarocks_type_contract::OperatorFunction::Add, _))
     ));
 }
 

@@ -82,3 +82,70 @@ fn an_operator_definition_without_all_of_its_installation_records_cannot_seal() 
         Err(PureCatalogError::InstalledManifestMismatch)
     ));
 }
+
+#[test]
+fn binary_operator_resolution_uses_hidden_identity_and_exact_operand_types() {
+    use arrow_schema::DataType;
+    use novarocks_functions::{
+        FunctionArgument, FunctionArgumentType, FunctionBindingError, FunctionBindingRequest,
+        FunctionIntrinsicRowError, FunctionResultType, FunctionValueType, FunctionVisibility,
+    };
+
+    let metadata = builtin_engine_function_catalog();
+    let operator = OperatorFunction::Divide;
+    let arguments = [
+        FunctionArgument::Value {
+            value_type: FunctionValueType::new(DataType::Int16, false),
+            constant: None,
+        },
+        FunctionArgument::Value {
+            value_type: FunctionValueType::new(DataType::Decimal128(3, 2), true),
+            constant: None,
+        },
+    ];
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: 2,
+        expected_result_type: None,
+    };
+    let id = operator.function_id();
+    let definition = metadata.definition_by_id(&id).unwrap();
+    assert_eq!(definition.visibility(), FunctionVisibility::Hidden);
+    assert!(matches!(
+        metadata.resolve_bound_user(
+            operator.catalog_name(),
+            FunctionKind::Scalar,
+            request,
+            &Control
+        ),
+        Err(FunctionBindingError::HiddenFunction | FunctionBindingError::UnknownFunction)
+    ));
+    let selected = metadata
+        .resolve_bound_trusted_by_id(&id, FunctionKind::Scalar, request, &Control)
+        .unwrap();
+    let [
+        FunctionArgumentType::Value(left),
+        FunctionArgumentType::Value(right),
+    ] = &selected.selected.argument_types[..]
+    else {
+        panic!("binary operator must freeze two value arguments");
+    };
+    assert_eq!(
+        left,
+        &FunctionValueType::new(DataType::Decimal128(5, 0), false)
+    );
+    assert_eq!(
+        right,
+        &FunctionValueType::new(DataType::Decimal128(3, 2), true)
+    );
+    assert_eq!(
+        selected.selected.result_type,
+        FunctionResultType::Scalar(FunctionValueType::new(DataType::Decimal128(13, 6), true)),
+    );
+    let effects = definition
+        .binding_declaration()
+        .unwrap()
+        .effect_declaration(&selected.selected.overload)
+        .unwrap();
+    assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::MayRaise);
+}

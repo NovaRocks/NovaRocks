@@ -32,6 +32,7 @@ fn key(probe: u32, build: u32, null_safe: bool) -> ProgramJoinKey {
         probe: r(probe),
         build: r(build),
         null_safe,
+        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
     }
 }
 fn condition() -> ProgramJoinCondition {

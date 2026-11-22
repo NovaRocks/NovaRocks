@@ -1706,7 +1706,6 @@ impl SqlCompiler {
                     .sql_semantics
                     .sql_mode()
                     .group_concat_legacy()
-                    || request.session.sql_semantics.decimal_overflow_to_double()
                     || request.session.sql_semantics.sql_mode().error_if_overflow()),
                 request
                     .session

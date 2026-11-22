@@ -2228,19 +2228,12 @@ mod tests {
 
     #[test]
     fn admitted_session_completion_uses_frozen_settings_for_expression_assignments() {
-        let source = "WITH SESSION decimal_overflow_to_double = true AND true SELECT 1 AS a";
+        let source = "WITH SESSION sql_mode = concat('3', '2') SELECT 1 AS a";
         let query = Box::new(novarocks_parser::parser::parse_query(source).unwrap());
-        let mut legacy = request("SELECT 1 AS a", SqlCompileIntent::Query);
-        legacy.statement = SqlStatementInput::parsed_query(query.clone());
-        assert!(matches!(
-            legacy.try_into_completion(),
-            Err(SqlCompileError::Analyze(_))
-        ));
-
         let mut admitted = request("SELECT 1 AS a", SqlCompileIntent::Query);
         admitted.statement = SqlStatementInput::query_with_admitted_session(query);
-        admitted.session.sql_semantics =
-            crate::sql_mode::SqlSemanticSettings::default().with_decimal_overflow_to_double(true);
+        admitted.session.sql_semantics = crate::sql_mode::SqlSemanticSettings::default()
+            .with_sql_mode(crate::sql_mode::SqlMode::from_assignment("32"));
         let seed = admitted.try_into_completion().unwrap();
         let completed = SqlCompiler::start(seed, &SqlCompileControl::unbounded())
             .unwrap()
@@ -2293,11 +2286,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_arithmetic_and_cast_refs_freeze_the_exact_admitted_root_allow_value() {
-        use novarocks_expression_contract::{BinaryOperator, ExprKind};
+    fn completed_casts_freeze_the_exact_root_allow_value_independent_of_standard_arithmetic() {
+        use novarocks_expression_contract::ExprKind;
         use novarocks_type_contract::{
             DecimalOverflowPolicy::{OutputNull, ReportError},
-            SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
+            OperatorFunction, SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
         };
         let ordinary =
             "SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders";
@@ -2337,14 +2330,19 @@ mod tests {
                     .flat_map(|unit| unit.definitions())
                 {
                     let (reference, policy) = match &expression.kind {
-                        ExprKind::Binary {
-                            op: BinaryOperator::Add,
-                            allow_throw_exception: Some(reference),
-                            decimal_overflow_policy,
-                            ..
-                        } => {
+                        ExprKind::FunctionCall { function, .. }
+                            if OperatorFunction::from_function_id(&function.function_id)
+                                == Some(OperatorFunction::Add) =>
+                        {
                             arithmetic += 1;
-                            (*reference, *decimal_overflow_policy)
+                            assert!(
+                                expression
+                                    .kind
+                                    .intrinsic_parameter_references()
+                                    .next()
+                                    .is_none()
+                            );
+                            continue;
                         }
                         ExprKind::Cast {
                             allow_throw_exception,
@@ -2374,9 +2372,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_derived_query_inherits_root_allow_refs_and_decimal_policy() {
-        use novarocks_expression_contract::{BinaryOperator, ExprKind};
-        use novarocks_type_contract::{DecimalOverflowPolicy::OutputNull, SemanticParameterValue};
+    fn completed_derived_cast_inherits_root_allow_ref_and_decimal_policy() {
+        use novarocks_expression_contract::ExprKind;
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy::OutputNull, OperatorFunction, SemanticParameterValue,
+        };
         let completed = complete_root_intrinsic_fixture(
             "SELECT x + 1 AS a FROM (SELECT CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
             "ALLOW_THROW_EXCEPTION",
@@ -2399,12 +2399,19 @@ mod tests {
                     );
                 }
                 match &expression.kind {
-                    ExprKind::Binary {
-                        op: BinaryOperator::Add,
-                        decimal_overflow_policy: OutputNull,
-                        allow_throw_exception: Some(_),
-                        ..
-                    } => saw_root_arithmetic = true,
+                    ExprKind::FunctionCall { function, .. }
+                        if OperatorFunction::from_function_id(&function.function_id)
+                            == Some(OperatorFunction::Add) =>
+                    {
+                        saw_root_arithmetic = true;
+                        assert!(
+                            expression
+                                .kind
+                                .intrinsic_parameter_references()
+                                .next()
+                                .is_none()
+                        );
+                    }
                     ExprKind::Cast {
                         decimal_overflow_policy: OutputNull,
                         ..
@@ -2702,158 +2709,6 @@ mod tests {
         };
         let query = novarocks_parser::parser::parse_query(
             "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
-        )
-        .unwrap();
-        let definition = SqlMvRewriteDefinitionFacts::try_new(
-            91,
-            [11; 32],
-            query,
-            SqlMvDefinitionResolutionContext::try_new("iceberg".to_string(), "db".to_string())
-                .unwrap(),
-            "iceberg".to_string(),
-            Some(novarocks_types::naming::TableIdentity {
-                table: "missing_mv_target".to_string(),
-                ..table.clone()
-            }),
-            vec![
-                SqlMvRewriteSourceOccurrenceFacts::try_new(
-                    SqlMvRelationOccurrenceId::new(0),
-                    table,
-                    "orders".to_string(),
-                    None,
-                    SqlMvRewriteBaseTableFacts::unavailable("no publication".to_string()),
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap();
-        let progress = SqlCompiler::finish(
-            mv,
-            SqlFactBatch::MaterializedViews(Box::from([MaterializedViewFact::observed(
-                &need,
-                Box::from([definition]),
-            )])),
-            &SqlCompileControl::unbounded(),
-        )
-        .expect("stored unsupported candidate must not fail base query");
-        let target_catalog_reads = AtomicUsize::new(0);
-        complete_base_query_with_counters(progress, &discovery_calls, &target_catalog_reads);
-        assert_eq!(
-            discovery_calls.load(Ordering::Acquire),
-            1,
-            "modern discovery policy is unchanged"
-        );
-        assert_eq!(
-            target_catalog_reads.load(Ordering::Acquire),
-            0,
-            "no optional target read before late eligibility diagnostic"
-        );
-    }
-
-    #[test]
-    fn decimal_consumer_never_discovers_optional_mv_definitions() {
-        for (sql, connection_flag) in [
-            ("SELECT order_key FROM orders", true),
-            (
-                "WITH SESSION decimal_overflow_to_double = true SELECT order_key FROM orders",
-                false,
-            ),
-            (
-                "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
-                true,
-            ),
-            (
-                "SELECT order_key FROM (SELECT order_key FROM orders) d",
-                true,
-            ),
-        ] {
-            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
-            request.session.sql_semantics = request
-                .session
-                .sql_semantics
-                .clone()
-                .with_decimal_overflow_to_double(connection_flag);
-            let seed = request.try_into_completion().expect("eligible base query");
-            let discovery_calls = AtomicUsize::new(0);
-            let target_catalog_reads = AtomicUsize::new(0);
-            complete_base_query_with_counters(
-                SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
-                    .expect("start base query"),
-                &discovery_calls,
-                &target_catalog_reads,
-            );
-            assert_eq!(
-                discovery_calls.load(Ordering::Acquire),
-                0,
-                "an unrelated bad MV cannot be observed for this query"
-            );
-            assert_eq!(target_catalog_reads.load(Ordering::Acquire), 0);
-        }
-    }
-
-    #[test]
-    fn decimal_false_overrides_keep_existing_mv_discovery_policy() {
-        for sql in [
-            "WITH SESSION decimal_overflow_to_double = false SELECT order_key FROM orders",
-            "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
-        ] {
-            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
-            let mut query = crate::compiler::test_query(sql);
-            // UNION branches never own session properties. Bind the override
-            // explicitly to the root query, using WITH SESSION.
-            query.session_properties = crate::compiler::test_query(
-                "WITH SESSION decimal_overflow_to_double = false SELECT 1",
-            )
-            .session_properties;
-            request.statement = SqlStatementInput::parsed_query(query);
-            request.session.sql_semantics = request
-                .session
-                .sql_semantics
-                .clone()
-                .with_decimal_overflow_to_double(true);
-            let compilation = incomplete(
-                SqlCompiler::start(
-                    request.try_into_completion().unwrap(),
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap(),
-            );
-            assert!(matches!(
-                compilation.needs(),
-                SqlNeedBatch::MaterializedViews(_)
-            ));
-        }
-    }
-
-    #[test]
-    fn stored_decimal_definition_never_requests_optional_target_catalog() {
-        use super::super::mv_rewrite::{
-            SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId,
-            SqlMvRewriteBaseTableFacts, SqlMvRewriteSourceOccurrenceFacts,
-        };
-        let seed = request_with_mv(
-            "SELECT order_key FROM orders",
-            SqlCompileIntent::Query,
-            true,
-        )
-        .try_into_completion()
-        .unwrap();
-        let mv = incomplete(
-            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
-        );
-        let need = match mv.needs() {
-            SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
-            other => panic!("modern query retains MV discovery, got {other:?}"),
-        };
-        let discovery_calls = AtomicUsize::new(0);
-        discovery_calls.fetch_add(1, Ordering::AcqRel);
-        let table = novarocks_types::naming::TableIdentity {
-            catalog: "iceberg".to_string(),
-            namespace: "db".to_string(),
-            table: "orders".to_string(),
-        };
-        let query = novarocks_parser::parser::parse_query(
-            "WITH SESSION decimal_overflow_to_double = true SELECT order_key FROM orders",
         )
         .unwrap();
         let definition = SqlMvRewriteDefinitionFacts::try_new(

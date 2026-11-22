@@ -21,6 +21,7 @@ use novarocks_functions::{
     EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
 };
 use novarocks_sql::compiler::SqlCompileControl;
+use novarocks_type_contract::OperatorFunction;
 
 pub(crate) fn test_required_constant_interpreter() -> RequiredConstantInterpreter {
     test_product().0
@@ -42,6 +43,9 @@ pub(super) fn test_product() -> (RequiredConstantInterpreter, Arc<EngineFunction
         "rand",
         "__array_literal",
         novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME,
+        OperatorFunction::Add.catalog_name(),
+        OperatorFunction::Divide.catalog_name(),
+        OperatorFunction::Equal.catalog_name(),
     ] {
         let definition = metadata.definition(name, FunctionKind::Scalar).unwrap();
         builder.register(definition.clone()).unwrap();

@@ -65,6 +65,10 @@ enum Predicate {
     PrimitiveWithIndependentVolatileResidual,
     Function(FunctionVolatility),
     IntrinsicDescendant(FunctionVolatility),
+    ClosedComparison {
+        wrong_overload: bool,
+        column_argument: bool,
+    },
 }
 
 fn function(volatility: FunctionVolatility) -> BoundFunction {
@@ -127,22 +131,34 @@ fn install_unit(builder: &mut FragmentBuilder, node: NodeId) {
     let functions = draft
         .definitions()
         .filter_map(|definition| {
-            if let ExprKind::FunctionCall { function, .. } = &definition.kind {
-                Some((definition.id, function.clone()))
+            if let ExprKind::FunctionCall { args, .. } = &definition.kind {
+                let arguments = args
+                    .iter()
+                    .map(|argument| {
+                        let source = draft.definition(*argument).unwrap();
+                        crate::StaticFunctionArgument::Value {
+                            value_type: source.ty.clone(),
+                            constant: match source.kind {
+                                ExprKind::Constant(reference) => Some(reference),
+                                _ => None,
+                            },
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                Some((definition.id, arguments))
             } else {
                 None
             }
         })
         .collect::<Vec<_>>();
-    for (id, function) in functions {
-        assert_eq!(function.function_id.as_str(), "fixture/guarantee/boolean");
-        assert!(function.argument_types.is_empty());
+    for (id, arguments) in functions {
         draft
             .request(
                 id,
                 PhysicalCallRequest {
-                    arguments: Box::default(),
-                    logical_argument_count: 0,
+                    logical_argument_count: arguments.len(),
+                    arguments,
                     expected_result_type: None,
                     constant_policy: crate::ConstantPolicy {
                         max_rows: 16,
@@ -180,13 +196,19 @@ fn install_unit(builder: &mut FragmentBuilder, node: NodeId) {
             else {
                 return None;
             };
+            let mut effects =
+                occurrence_effects(function.legacy_metadata.as_ref().unwrap().volatility);
+            if novarocks_type_contract::OperatorFunction::from_function_id(&function.function_id)
+                .is_some()
+            {
+                effects.null_behavior = FunctionNullBehavior::Strict;
+                effects.proof_scope = CallProofScope::Region(invocation.context.region);
+            }
             Some((
                 *id,
                 ExpressionCallClaim {
                     context: invocation.context,
-                    effects: occurrence_effects(
-                        function.legacy_metadata.as_ref().unwrap().volatility,
-                    ),
+                    effects,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
                     regexp_count_pattern_source: None,
@@ -316,7 +338,7 @@ fn fixture_with_guarantee_count(
     guarantee_count: usize,
     sparse_last: bool,
 ) -> FragmentPackageInput {
-    let fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 33),
@@ -350,6 +372,51 @@ fn fixture_with_guarantee_count(
                 .unwrap()
         }
         Predicate::Function(volatility) => define_call(&mut builder, scan, volatility),
+        Predicate::ClosedComparison {
+            wrong_overload,
+            column_argument,
+        } => {
+            use novarocks_type_contract::{FunctionArgumentType, OperatorFunction, TypedFactSlice};
+            let operand = ty(DataType::Int64, false);
+            let result = ty(DataType::Boolean, false);
+            let left = builder
+                .define(scan, operand.clone(), ExprKind::Value(source))
+                .unwrap();
+            let right = if column_argument {
+                left
+            } else {
+                builder
+                    .define(scan, operand.clone(), fixture_constants.i64(7, &operand))
+                    .unwrap()
+            };
+            let operator = OperatorFunction::Equal;
+            let overload = if wrong_overload {
+                "fixture/guarantee/other-comparison"
+            } else {
+                operator.comparison_overload_text().unwrap()
+            };
+            let function = BoundFunction {
+                function_id: operator.function_id(),
+                overload: FunctionOverloadId::try_new(overload).unwrap(),
+                kind: FunctionKind::Scalar,
+                argument_types: TypedFactSlice::from_pure_boxed(Box::new([
+                    FunctionArgumentType::Value(operand.clone()),
+                    FunctionArgumentType::Value(operand),
+                ])),
+                result_type: result.clone(),
+                legacy_metadata: function(FunctionVolatility::Immutable).legacy_metadata,
+            };
+            builder
+                .define(
+                    scan,
+                    result,
+                    ExprKind::FunctionCall {
+                        function,
+                        args: Box::new([left, right]),
+                    },
+                )
+                .unwrap()
+        }
         Predicate::IntrinsicDescendant(volatility) => {
             let call = define_call(&mut builder, scan, volatility);
             let negation = builder
@@ -676,6 +743,41 @@ fn guarantee_intrinsic_descendants_and_actual_row_calls_cannot_supply_own_proof(
     );
     assert_eq!(unit(&pruning).claims().len(), 1);
     assert_missing_proof(pruning);
+}
+
+#[test]
+fn accepts_only_the_exact_basic_provider_call_with_its_original_column_and_constant() {
+    for (kind, residual) in [
+        (PredicateGuaranteeKind::Exact, false),
+        (PredicateGuaranteeKind::PruningOnly, true),
+    ] {
+        FragmentPackage::try_new(
+            fixture(
+                Predicate::ClosedComparison {
+                    wrong_overload: false,
+                    column_argument: false,
+                },
+                Some(kind),
+                residual,
+                false,
+            ),
+            admission(),
+            &Control,
+        )
+        .unwrap();
+
+        for (wrong_overload, column_argument) in [(true, false), (false, true)] {
+            assert_missing_proof(fixture(
+                Predicate::ClosedComparison {
+                    wrong_overload,
+                    column_argument,
+                },
+                Some(kind),
+                residual,
+                false,
+            ));
+        }
+    }
 }
 
 #[test]

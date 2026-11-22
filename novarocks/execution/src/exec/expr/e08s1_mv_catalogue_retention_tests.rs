@@ -34,6 +34,13 @@ fn e08s1_mv_exact_generated_bindings_borrow_one_scoped_catalogue_before_reentry(
             "entry captures one immutable Exact scope"
         );
         let bindings = observations.bindings.lock().unwrap();
+        let equality = novarocks_type_contract::OperatorFunction::Equal.catalog_name();
+        assert!(
+            bindings
+                .iter()
+                .any(|(name, scoped)| name == equality && *scoped),
+            "the original join equality is admitted in the same scope: {bindings:?}"
+        );
         assert!(
             bindings
                 .iter()

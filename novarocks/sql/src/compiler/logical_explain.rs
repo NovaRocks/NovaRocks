@@ -209,12 +209,12 @@ mod tests {
 
     #[test]
     fn logical_explain_carries_admitted_session_through_catalog_and_final_analysis() {
-        let sql = "WITH SESSION decimal_overflow_to_double = true AND true SELECT 1 AS a";
+        let sql = "WITH SESSION sql_mode = concat('3', '2') SELECT 1 AS a";
         let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let mut effective = session();
         effective.sql_semantics = effective
             .sql_semantics
-            .with_decimal_overflow_to_double(true);
+            .with_sql_mode(crate::sql_mode::SqlMode::from_assignment("32"));
         let logical = SqlLogicalExplainCatalog::try_new_for_input(
             SqlStatementInput::query_with_admitted_session(Box::new(query)),
             effective,

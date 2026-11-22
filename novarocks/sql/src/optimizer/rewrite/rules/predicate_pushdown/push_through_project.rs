@@ -361,6 +361,7 @@ fn remap_scalar(
             )?)
         }
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
@@ -378,6 +379,7 @@ fn remap_scalar(
                 candidate_or_none!(remap_optional_scalar(arena, else_expr, bindings, control)?);
             Some(arena.intern_observed(
                 ScalarNode::Case {
+                    ieee_float_equality,
                     operand,
                     when_then,
                     else_expr,

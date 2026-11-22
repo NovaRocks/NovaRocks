@@ -238,6 +238,7 @@ fn rewrite_children(
             negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
@@ -256,6 +257,7 @@ fn rewrite_children(
                 None => None,
             };
             ScalarNode::Case {
+                ieee_float_equality,
                 operand,
                 when_then: mapped_when_then,
                 else_expr,
@@ -556,6 +558,7 @@ mod tests {
     fn case_when(when: TypedExpr, then: TypedExpr, else_expr: Option<TypedExpr>) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: (vec![(when, then)]).into(),
                 else_expr: else_expr.map(novarocks_parser::ast::AstBox::new),

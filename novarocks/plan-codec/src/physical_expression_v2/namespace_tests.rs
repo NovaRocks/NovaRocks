@@ -466,6 +466,7 @@ fn all_kinds() -> Fixture {
             negated: true,
         },
         ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(z),
             when_then: Box::from([(a, z), (a, a)]),
             else_expr: Some(a),
@@ -652,6 +653,7 @@ fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurre
     assert_eq!(
         out[14].kind,
         Some(Kind::CaseExpression(wire::CaseExpression {
+            ieee_float_equality: Some(false),
             operand_expr_id: Some(15),
             arms: vec![
                 wire::WhenThen {
@@ -861,7 +863,7 @@ fn namespace_intrinsics_require_original_boolean_parameters_and_exact_presence()
     });
     wrong.parameters = SemanticParameters::try_new([(
         SemanticParameterId::new(0),
-        SemanticParameterValue::DecimalOverflowToDouble(false),
+        SemanticParameterValue::GroupConcatLegacy(false),
     )])
     .unwrap();
     assert!(

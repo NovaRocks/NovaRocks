@@ -1,0 +1,114 @@
+-- query 1
+-- types	decimal(9, 6)
+_col0
+0.333333
+
+-- query 2
+-- types	decimal(9, 6)
+_col0
+0.333333
+
+-- query 3
+-- types	decimal(3, 2)	decimal(5, 2)	decimal(5, 2)
+_col0	_col1	_col2
+1.21	45.41	38.61
+
+-- query 4
+-- types	decimal(5, 2)	decimal(5, 2)
+_col0	_col1
+100.00	99.90
+
+-- query 5
+-- types	decimal(38, 0)	decimal(38, 0)
+_col0	_col1
+13	12
+
+-- query 6
+-- types	decimal(38, 0)
+_col0
+-13
+
+-- query 7
+-- types	decimal(38, 6)
+_col0
+0.000001
+
+-- query 8
+-- types	decimal(38, 6)
+_col0
+-0.000001
+
+-- query 9
+-- types	decimal(7, 6)
+_col0
+0.007813
+
+-- query 10
+-- types	decimal(7, 6)
+_col0
+-0.007813
+
+-- query 11
+-- types	decimal(9, 6)	decimal(2, 2)
+_col0	_col1
+NULL	NULL
+
+-- query 12
+-- types	decimal(8, 6)	decimal(2, 2)
+_col0	_col1
+NULL	NULL
+
+-- query 15
+-- types	decimal(6, 2)	decimal(6, 2)	decimal(6, 2)	decimal(11, 6)	decimal(3, 2)
+_col0	_col1	_col2	_col3	_col4
+8.50	5.50	10.50	4.666667	1.00
+
+-- query 16
+-- types	decimal(7, 6)	decimal(3, 2)
+_col0	_col1
+0.214286	1.50
+
+-- query 17
+-- types	decimal(8, 2)	decimal(8, 2)	decimal(8, 2)	decimal(13, 6)	decimal(3, 2)
+_col0	_col1	_col2	_col3	_col4
+8.50	5.50	10.50	4.666667	1.00
+
+-- query 18
+-- types	decimal(9, 8)	decimal(3, 2)
+_col0	_col1
+0.21428571	1.50
+
+-- query 19
+-- types	decimal(13, 2)	decimal(13, 2)	decimal(13, 2)	decimal(18, 6)	decimal(3, 2)
+_col0	_col1	_col2	_col3	_col4
+8.50	5.50	10.50	4.666667	1.00
+
+-- query 20
+-- types	decimal(14, 13)	decimal(3, 2)
+_col0	_col1
+0.2142857142857	1.50
+
+-- query 21
+-- types	decimal(22, 2)	decimal(22, 2)	decimal(22, 2)	decimal(27, 6)	decimal(3, 2)
+_col0	_col1	_col2	_col3	_col4
+8.50	5.50	10.50	4.666667	1.00
+
+-- query 22
+-- types	decimal(23, 22)	decimal(3, 2)
+_col0	_col1
+0.2142857142857142857143	1.50
+
+-- query 26
+-- types	decimal(38, 6)
+_col0
+1.000000
+
+-- query 30
+-- types	decimal(38, 6)
+_col0
+1.000000
+
+-- query 31
+-- types	decimal(38, 38)
+_col0
+0.10000000000000000000000000000000000000

@@ -137,7 +137,7 @@ fn scoped_raw_values_sparse_ids_and_original_text_allocation_are_retained() {
         entry(0, StatementStartUtc(i64::MAX)),
         entry(15, TimeZone(zone)),
         entry(9, AllowThrowException(false)),
-        entry(8, DecimalOverflowToDouble(true)),
+        entry(8, GroupConcatLegacy(true)),
         entry(7, GroupConcatLegacy(false)),
         entry(16, TimeZone("UTC".into())),
         entry(19, AllowThrowException(true)),

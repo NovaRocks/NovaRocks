@@ -293,7 +293,7 @@ SQL client
 
 - `novarocks/expression-contract/src/{unit,builder}.rs`
   `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
-  codec 用受检的中立 parts 构造单元。修订号 33 的 package 在 PhysicalNode 信封承载单元，
+  codec 用受检的中立 parts 构造单元。修订号 35 的 package 在 PhysicalNode 信封承载单元，
   类型、常量和函数绑定由 package 共享。节点字段的根与端口由 `physical-plan/src/node_roots.rs` 核对。
   见 [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
@@ -397,7 +397,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 16、test-only 为 13；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 17、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -610,7 +610,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
     `commit/dependency/window.rs` 为行级核对与 OPTIMIZE 共用连续窗口的 manifest 读取。行级规则见 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)。
   - `novarocks/connector/iceberg/src/commit/model/protocol.rs` 由操作声明窗口核对、提交前提与提交样式。
     `novarocks/connector/iceberg/src/commit/filter_delete.rs` 在本轮基准逐 manifest 应用过滤，供主分支 TRUNCATE 使用。
-    `novarocks/connector/iceberg/src/catalog_control/maintenance_error.rs` 撰写公开提交失败消息。见 [ADR-0250](docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)。
+    `novarocks/connector/iceberg/src/catalog_control/maintenance_error.rs` 撰写公开提交失败消息。见 [ADR-0251](docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
   - `novarocks/connector/iceberg/src/commit/attempt.rs`：同一 operation 的单次提交循环；加载、依赖验证、稳定 stage ID 核对、准备与覆盖断言、单次派发及确定冲突重试，循环内不删除产物。
@@ -1377,7 +1377,7 @@ the guide differ.
   `commit/conflict_scope.rs` 的冲突范围及 `commit/dependency/window.rs` 的共用窗口输入。
   `commit/model/protocol.rs` 声明按操作的校验与条件，`commit/filter_delete.rs` 为 main TRUNCATE 准备按过滤删除。
   核对通过后在实际提交基准上定位移除条目。确定的 Catalog 竞争按原 operation 预算重试并沿用新增产物。见
-  [ADR-0250](docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)。
+  [ADR-0251](docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。

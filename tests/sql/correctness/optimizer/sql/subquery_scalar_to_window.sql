@@ -71,3 +71,23 @@ WHERE p_partkey = l_partkey
 -- query 14
 
 SET SESSION disable_optimizer_rules = '';
+
+-- query 15
+-- B2 has one row. The scalar comparison is false and the last conjunct is not needed.
+-- @explain_not_contains=WINDOW [
+SELECT count(*)
+FROM ${case_db}.wm_line, ${case_db}.wm_part
+WHERE p_partkey = l_partkey
+  AND p_brand = 'B2'
+  AND l_quantity < (SELECT avg(l_quantity) FROM ${case_db}.wm_line WHERE l_partkey = p_partkey)
+  AND DECIMAL '1' / CAST(p_partkey - p_partkey AS DECIMAL(2,0)) > DECIMAL '0';
+
+-- query 16
+-- The comparison is true on the same row, so the division is required.
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT count(*)
+FROM ${case_db}.wm_line, ${case_db}.wm_part
+WHERE p_partkey = l_partkey
+  AND p_brand = 'B2'
+  AND l_quantity <= (SELECT avg(l_quantity) FROM ${case_db}.wm_line WHERE l_partkey = p_partkey)
+  AND DECIMAL '1' / CAST(p_partkey - p_partkey AS DECIMAL(2,0)) > DECIMAL '0';

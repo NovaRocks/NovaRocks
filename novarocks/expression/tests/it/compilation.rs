@@ -1358,6 +1358,7 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
             None,
             int(true),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: Some(a),
                 when_then: Box::new([(z, a)]),
                 else_expr: Some(z),

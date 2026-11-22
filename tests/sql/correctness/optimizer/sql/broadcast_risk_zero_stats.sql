@@ -19,8 +19,10 @@
 -- Golden derivation: the probe's identity projects reuse generate_series,
 -- while generate_series + 0 creates the build's separately named k value.
 -- Thus the join/import names become generate_series = k, not k = k.
--- Preserve build filters/projections, both hash exchanges, partitioned join,
--- and the 11250000000000 estimate; no row-count or broadcast policy changes.
+-- The selected BIGINT addition has two non-null inputs, so k needs no derived
+-- IS NOT NULL filter. Removing its default 10% reduction increases the join
+-- estimate from 11250000000000 to 12500000000000. The partitioned join and
+-- both hash exchanges remain the broadcast risk assertions.
 CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 SET SESSION cbo_broadcast_backend_count = 3;

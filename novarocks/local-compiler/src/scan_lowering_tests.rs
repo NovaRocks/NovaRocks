@@ -534,6 +534,7 @@ fn fixture(spec: Spec) -> Fixture {
             )
             .unwrap();
         let key = JoinKey {
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             left: {
                 let definition = builder
                     .fixture_definition(JOIN, int64(), ExprKind::Value(provider[0]))

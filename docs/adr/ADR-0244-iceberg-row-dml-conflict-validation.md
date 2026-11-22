@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0250
+  - id: ADR-0251
     scope: "Rule 7's ownership of the public commit failure message for ordinary Iceberg row-level writes"
-    link: "ADR-0250-iceberg-maintenance-commits-by-operation.md"
+    link: "ADR-0251-iceberg-maintenance-commits-by-operation.md"
 partially-supersedes:
   - id: ADR-0171
     scope: "RefUnchanged and the conservative conflict-domain policy for ordinary Iceberg DELETE, UPDATE, and MERGE"

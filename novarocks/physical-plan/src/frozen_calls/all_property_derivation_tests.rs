@@ -431,6 +431,7 @@ pub(super) fn single_copy_dag() -> Fixture {
                         left: RootOrdinal::new(0),
                         right: RootOrdinal::new(1),
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }]),
                     residual: None,
                 },

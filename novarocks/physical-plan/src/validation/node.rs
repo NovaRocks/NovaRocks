@@ -985,6 +985,16 @@ pub(crate) fn validate_node_semantics(
                     "hash join must have at least one key",
                 ));
             }
+            if condition.is_null_aware()
+                && keys.iter().any(|key| {
+                    key.match_relation != novarocks_type_contract::JoinKeyMatch::Grouping
+                })
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "NULL-aware membership value keys require grouping equality",
+                ));
+            }
             for key in keys
                 .iter()
                 .chain(condition.scope_keys().into_iter().flatten())
@@ -992,12 +1002,23 @@ pub(crate) fn validate_node_semantics(
                 if let (Some(left), Some(right)) = (
                     fragment.root_expression(node.id, key.left),
                     fragment.root_expression(node.id, key.right),
-                ) && !super::value_bindings_match_ignoring_root_nullability(&left.ty, &right.ty)
-                {
-                    errors.push(ValidationError::new(
-                        path,
-                        "hash join key pair does not have one exact execution data type",
-                    ));
+                ) {
+                    if !super::value_bindings_match_ignoring_root_nullability(&left.ty, &right.ty) {
+                        errors.push(ValidationError::new(
+                            path,
+                            "hash join key pair does not have one exact execution data type",
+                        ));
+                    }
+                    if !key.match_relation.supports(
+                        left.ty.data_type(),
+                        left.ty.logical_type(),
+                        key.null_safe,
+                    ) {
+                        errors.push(ValidationError::new(
+                            path,
+                            "hash join key match relation does not admit its frozen type or NULL mode",
+                        ));
+                    }
                 }
             }
             if let Some(residual) = residual {

@@ -79,7 +79,7 @@ fn source() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(4),
-            SemanticParameterValue::DecimalOverflowToDouble(false),
+            SemanticParameterValue::GroupConcatLegacy(false),
         ),
         (
             SemanticParameterId::new(5),

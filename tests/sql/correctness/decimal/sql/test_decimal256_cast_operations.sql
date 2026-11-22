@@ -250,6 +250,7 @@ WHERE decimal_38_10 IS NOT NULL AND decimal256_50_15 IS NOT NULL
 ORDER BY id;
 
 -- query 11
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Test 8: Arithmetic operations with automatic casting
 -- Addition with different types
 SELECT
@@ -264,6 +265,7 @@ WHERE decimal256_50_15 IS NOT NULL AND tinyint_val IS NOT NULL
 ORDER BY id;
 
 -- query 12
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 SELECT
     id,
     decimal256_76_20 + float_val as decimal256_plus_float,
@@ -274,6 +276,7 @@ WHERE decimal256_76_20 IS NOT NULL AND float_val IS NOT NULL AND decimal256_50_1
 ORDER BY id;
 
 -- query 13
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Subtraction with different types
 SELECT
     id,
@@ -287,6 +290,7 @@ WHERE decimal256_50_15 IS NOT NULL AND tinyint_val IS NOT NULL AND decimal256_76
 ORDER BY id;
 
 -- query 14
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Multiplication with different types
 SELECT
     id,
@@ -317,6 +321,7 @@ WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL
 ORDER BY id;
 
 -- query 16
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Test 9: Mixed arithmetic operations between Iceberg-compatible decimal columns
 SELECT
     id,
@@ -330,6 +335,7 @@ WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL
 ORDER BY id;
 
 -- query 17
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Test 10: Complex arithmetic expressions with casting
 SELECT
     id,
@@ -390,6 +396,7 @@ WHERE decimal256_50_15 IS NOT NULL AND decimal_38_10 IS NOT NULL
 ORDER BY id;
 
 -- query 21
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Test 13: Comparison operations with automatic casting
 SELECT
     id,
@@ -457,4 +464,218 @@ SELECT
     COALESCE(CAST(tinyint_val AS decimal(38,15)), 0.000000000000000) as coalesce_cast_tinyint,
     COALESCE(CAST(decimal_38_10 AS decimal(38,20)), 0.00000000000000000000) as coalesce_cast_decimal38
 FROM ${case_db}.cast_test_source
+ORDER BY id;
+
+-- query 27
+-- Retain all safely representable additions and the mixed LARGEINT projection.
+-- Test 8: Arithmetic operations with automatic casting
+-- Addition with different types
+SELECT
+    id,
+    decimal256_50_15 + tinyint_val as decimal256_plus_tinyint,
+    decimal256_50_15 + smallint_val as decimal256_plus_smallint,
+    decimal256_50_15 + int_val as decimal256_plus_int,
+    decimal256_50_15 + bigint_val as decimal256_plus_bigint
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND tinyint_val IS NOT NULL
+    AND id IN (1, 2, 3, 6, 7, 8, 9)
+ORDER BY id;
+
+-- query 28
+-- Retain the original LARGEINT result and VARCHAR conversion on every row.
+-- Test 8: Arithmetic operations with automatic casting
+-- Addition with different types
+SELECT
+    id,
+    CAST(decimal256_50_15 + largeint_val AS VARCHAR) as decimal256_plus_largeint
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND tinyint_val IS NOT NULL
+ORDER BY id;
+
+-- query 29
+-- Check finite rows where both DECIMAL operands align without overflow.
+SELECT
+    id,
+    decimal256_76_20 + float_val as decimal256_plus_float,
+    decimal256_76_20 + double_val as decimal256_plus_double,
+    decimal256_50_15 + decimal_38_10 as decimal256_plus_decimal38
+FROM ${case_db}.cast_test_source
+WHERE decimal256_76_20 IS NOT NULL AND float_val IS NOT NULL AND decimal256_50_15 IS NOT NULL AND decimal_38_10 IS NOT NULL
+    AND id IN (2, 6, 8)
+ORDER BY id;
+
+-- query 30
+-- Check the original floating additions across the full row set.
+SELECT
+    id,
+    decimal256_76_20 + float_val as decimal256_plus_float,
+    decimal256_76_20 + double_val as decimal256_plus_double
+FROM ${case_db}.cast_test_source
+WHERE decimal256_76_20 IS NOT NULL AND float_val IS NOT NULL AND decimal256_50_15 IS NOT NULL AND decimal_38_10 IS NOT NULL
+ORDER BY id;
+
+-- query 31
+-- Check representable standard DECIMAL subtraction.
+-- Subtraction with different types
+SELECT
+    id,
+    decimal256_50_15 - tinyint_val as decimal256_minus_tinyint,
+    decimal256_50_15 - smallint_val as decimal256_minus_smallint,
+    decimal256_50_15 - int_val as decimal256_minus_int,
+    decimal256_50_15 - bigint_val as decimal256_minus_bigint,
+    decimal256_76_20 - decimal_38_10 as decimal256_minus_decimal38
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND tinyint_val IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal_38_10 IS NOT NULL
+    AND id IN (2, 6, 8)
+ORDER BY id;
+
+-- query 32
+-- Check the four original signed-width subtractions on every row.
+-- Subtraction with different types
+SELECT
+    id,
+    decimal256_50_15 - tinyint_val as decimal256_minus_tinyint,
+    decimal256_50_15 - smallint_val as decimal256_minus_smallint,
+    decimal256_50_15 - int_val as decimal256_minus_int,
+    decimal256_50_15 - bigint_val as decimal256_minus_bigint
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND tinyint_val IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal_38_10 IS NOT NULL
+ORDER BY id;
+
+-- query 33
+-- Check representable standard products and both floating widths.
+-- Multiplication with different types
+SELECT
+    id,
+    decimal256_50_15 * tinyint_val as decimal256_multiply_tinyint,
+    decimal256_50_15 * smallint_val as decimal256_multiply_smallint,
+    decimal256_76_20 * float_val as decimal256_multiply_float,
+    decimal256_76_20 * double_val as decimal256_multiply_double,
+    decimal256_50_15 * decimal_20_5 as decimal256_multiply_decimal20
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND tinyint_val IS NOT NULL
+    AND float_val IS NOT NULL AND decimal_20_5 IS NOT NULL
+    AND id IN (2, 6, 8)
+ORDER BY id;
+
+-- query 34
+-- Check the original floating products across the full row set.
+-- Multiplication with different types
+SELECT
+    id,
+    decimal256_76_20 * float_val as decimal256_multiply_float,
+    decimal256_76_20 * double_val as decimal256_multiply_double
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND tinyint_val IS NOT NULL
+    AND float_val IS NOT NULL AND decimal_20_5 IS NOT NULL
+ORDER BY id;
+
+-- query 35
+-- Check safely representable mixed DECIMAL expressions.
+-- Test 9: Mixed arithmetic operations between Iceberg-compatible decimal columns
+SELECT
+    id,
+    decimal256_50_15 + decimal256_76_20 as decimal256_addition,
+    decimal256_50_15 - decimal256_76_20 as decimal256_subtraction,
+    decimal256_50_15 * decimal256_76_0 as decimal256_multiplication,
+    decimal256_76_20 / decimal256_76_0 as decimal256_division
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL
+    AND decimal256_76_0 IS NOT NULL AND decimal256_76_0 != 0
+    AND id IN (6, 8)
+ORDER BY id;
+
+-- query 36
+-- Retain division on all original nonzero-denominator rows.
+-- Test 9: Mixed arithmetic operations between Iceberg-compatible decimal columns
+SELECT
+    id,
+    decimal256_76_20 / decimal256_76_0 as decimal256_division
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL
+    AND decimal256_76_0 IS NOT NULL AND decimal256_76_0 != 0
+ORDER BY id;
+
+-- query 37
+-- Check the four original compound expressions where all results fit.
+-- Test 10: Complex arithmetic expressions with casting
+SELECT
+    id,
+    (decimal256_50_15 + CAST(int_val AS decimal(38,15))) * CAST(float_val AS decimal(38,15)) as complex_expr1,
+    (decimal256_76_20 - CAST(bigint_val AS decimal(38,20))) / CAST(double_val AS decimal(38,20)) as complex_expr2,
+    CAST(tinyint_val AS decimal(38,0)) + decimal256_76_0 - CAST(smallint_val AS decimal(38,0)) as complex_expr3,
+    (decimal256_50_15 + decimal_38_10) * CAST(decimal_20_5 AS decimal(38,15)) as complex_expr4
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal256_76_0 IS NOT NULL
+    AND int_val IS NOT NULL AND float_val IS NOT NULL AND float_val != 0
+    AND bigint_val IS NOT NULL AND double_val IS NOT NULL AND double_val != 0
+    AND tinyint_val IS NOT NULL AND smallint_val IS NOT NULL
+    AND decimal_38_10 IS NOT NULL AND decimal_20_5 IS NOT NULL
+    AND id IN (6, 8)
+ORDER BY id;
+
+-- query 38
+-- Retain every explicit CAST on the original rows.
+SELECT id,
+    CAST(int_val AS decimal(38,15)) AS cast_1,
+    CAST(float_val AS decimal(38,15)) AS cast_2,
+    CAST(bigint_val AS decimal(38,20)) AS cast_3,
+    CAST(double_val AS decimal(38,20)) AS cast_4,
+    CAST(tinyint_val AS decimal(38,0)) AS cast_5,
+    CAST(smallint_val AS decimal(38,0)) AS cast_6,
+    CAST(decimal_20_5 AS decimal(38,15)) AS cast_7
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal256_76_0 IS NOT NULL
+    AND int_val IS NOT NULL AND float_val IS NOT NULL AND float_val != 0
+    AND bigint_val IS NOT NULL AND double_val IS NOT NULL AND double_val != 0
+    AND tinyint_val IS NOT NULL AND smallint_val IS NOT NULL
+    AND decimal_38_10 IS NOT NULL AND decimal_20_5 IS NOT NULL
+ORDER BY id;
+
+-- query 39
+-- Check the exact representable sum and subtraction over the original carriers.
+-- Test 10: Complex arithmetic expressions with casting
+SELECT
+    id,
+    CAST(tinyint_val AS decimal(38,0)) + decimal256_76_0 - CAST(smallint_val AS decimal(38,0)) as complex_expr3
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal256_76_0 IS NOT NULL
+    AND int_val IS NOT NULL AND float_val IS NOT NULL AND float_val != 0
+    AND bigint_val IS NOT NULL AND double_val IS NOT NULL AND double_val != 0
+    AND tinyint_val IS NOT NULL AND smallint_val IS NOT NULL
+    AND decimal_38_10 IS NOT NULL AND decimal_20_5 IS NOT NULL
+    AND id IN (1, 3, 6, 7, 8, 9)
+ORDER BY id;
+
+-- query 40
+-- Check the original comparisons and BETWEEN on representable bounds.
+-- Test 13: Comparison operations with automatic casting
+SELECT
+    id,
+    decimal256_50_15 > CAST(int_val AS decimal(38,15)) as decimal256_gt_int,
+    decimal256_76_20 = CAST(float_val AS decimal(38,20)) as decimal256_eq_float,
+    decimal256_76_0 < CAST(largeint_val AS decimal(38,0)) as decimal256_lt_largeint,
+    CAST(bigint_val AS decimal(38,20)) BETWEEN decimal256_76_20 - 1000 AND decimal256_76_20 + 1000 as bigint_between_decimal256,
+    decimal256_50_15 > decimal_38_10 as decimal256_gt_decimal38,
+    decimal_20_5 = CAST(decimal256_50_15 AS decimal(20,5)) as decimal20_eq_decimal256_cast
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal256_76_0 IS NOT NULL
+    AND int_val IS NOT NULL AND float_val IS NOT NULL AND largeint_val IS NOT NULL AND bigint_val IS NOT NULL
+    AND decimal_38_10 IS NOT NULL AND decimal_20_5 IS NOT NULL
+    AND id IN (1, 2, 3, 6, 7, 8, 9)
+ORDER BY id;
+
+-- query 41
+-- Retain explicit CAST and comparison coverage across the full original row set.
+SELECT id,
+    decimal256_50_15 > CAST(int_val AS decimal(38,15)) as decimal256_gt_int,
+    decimal256_76_20 = CAST(float_val AS decimal(38,20)) as decimal256_eq_float,
+    decimal256_76_0 < CAST(largeint_val AS decimal(38,0)) as decimal256_lt_largeint,
+    CAST(bigint_val AS decimal(38,20)) AS bigint_cast_from_between,
+    decimal256_50_15 > decimal_38_10 as decimal256_gt_decimal38,
+    decimal_20_5 = CAST(decimal256_50_15 AS decimal(20,5)) as decimal20_eq_decimal256_cast
+FROM ${case_db}.cast_test_source
+WHERE decimal256_50_15 IS NOT NULL AND decimal256_76_20 IS NOT NULL AND decimal256_76_0 IS NOT NULL
+    AND int_val IS NOT NULL AND float_val IS NOT NULL AND largeint_val IS NOT NULL AND bigint_val IS NOT NULL
+    AND decimal_38_10 IS NOT NULL AND decimal_20_5 IS NOT NULL
 ORDER BY id;

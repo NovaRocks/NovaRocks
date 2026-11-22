@@ -26,7 +26,7 @@ use super::super::{
 };
 use super::*;
 use crate::exec::{
-    hash_table::key_index::{BulkDomain, IndexPurpose, KeySpec, NullPolicy},
+    hash_table::key_index::{BulkDomain, IndexPurpose, KeyEquality, KeySpec, NullPolicy},
     operators::local_exchanger::LocalExchanger,
 };
 use std::sync::OnceLock;
@@ -200,15 +200,18 @@ impl CompiledJoinFrame {
                 "compiled join declaration has no original join node",
             ));
         };
-        let mode = |safe| {
-            if safe {
-                NullPolicy::Equal
-            } else {
-                NullPolicy::Unmatchable
+        let mode = |key: &novarocks_local_program::ProgramJoinKey| match key.match_relation {
+            novarocks_type_contract::JoinKeyMatch::IeeeFloat => KeyEquality::IeeeFloat,
+            novarocks_type_contract::JoinKeyMatch::Grouping => {
+                KeyEquality::SqlGrouping(if key.null_safe {
+                    NullPolicy::Equal
+                } else {
+                    NullPolicy::Unmatchable
+                })
             }
         };
-        let domain = |types: &[FunctionValueType], modes: &[NullPolicy]| {
-            let spec = KeySpec::new(types, modes, work.owner, &|| {
+        let domain = |types: &[FunctionValueType], modes: &[KeyEquality]| {
+            let spec = KeySpec::with_equalities(types, modes, work.owner, &|| {
                 work.control.checkpoint(0).map_err(ExecutionFailure::from)
             })?;
             BulkDomain::new(&spec, work.owner, work.control)
@@ -223,9 +226,9 @@ impl CompiledJoinFrame {
                     ));
                 }
             };
-            let mut modes = funded_vec(work.owner, plan.eq_null_safe.len())?;
-            for &safe in &plan.eq_null_safe {
-                modes.push(mode(safe));
+            let mut modes = funded_vec(work.owner, condition.keys().len())?;
+            for key in condition.keys() {
+                modes.push(mode(key));
             }
             return Ok(ProjectionDomains::Ordinary {
                 keys: domain(&plan.build_key_bindings, &modes)?,
@@ -245,13 +248,13 @@ impl CompiledJoinFrame {
             work.control.checkpoint(1)?;
             let site = key.build;
             types.push(root_value_type(&self.program, site)?);
-            modes.push(mode(key.null_safe));
+            modes.push(mode(key));
             columns.push(column);
         }
         for (ty, key) in plan.build_key_bindings.iter().zip(values) {
             work.control.checkpoint(1)?;
             types.push(ty.clone());
-            modes.push(mode(key.null_safe));
+            modes.push(mode(key));
         }
         let value_mode = NaaValueMode::from_signed_values(
             &plan.probe_key_bindings,

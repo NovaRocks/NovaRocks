@@ -364,6 +364,7 @@ fn add_join(
             left: value_root(builder, join, int64(true), l[0], RootScope::Port(0)),
             right: value_root(builder, join, int64(true), r[0], RootScope::Port(1)),
             null_safe,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         }),
         Family::NestLoop => None,
     };
@@ -1371,6 +1372,7 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
             .unwrap()
     };
     let key = JoinKey {
+        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         left: {
             let definition = if at == Overflow::ProbeKey {
                 overflowing(&mut builder, join, l[0])
@@ -3209,6 +3211,7 @@ fn authored_naa_plan(
                     RootScope::Port(1),
                 ),
                 null_safe,
+                match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice()
@@ -3632,6 +3635,7 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
                             left: probe,
                             right: build,
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         }]),
                         scope_keys: Box::default(),
                         eligibility: None,

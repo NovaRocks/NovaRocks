@@ -29,7 +29,9 @@ ORDER BY a;
 
 -- @skip_result_check=true
 -- @result_contains=__cse_
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT (a + b) AS x, (a + b) + a AS y
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) AS x,
+       (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) + CAST(a AS DOUBLE) AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
@@ -37,7 +39,9 @@ SET SESSION enable_common_subexpr_reuse = false;
 
 -- @skip_result_check=true
 -- @result_not_contains=__cse_
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT (a + b) AS x, (a + b) + a AS y
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) AS x,
+       (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) + CAST(a AS DOUBLE) AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
@@ -47,7 +51,9 @@ SET SESSION disable_optimizer_rules = 'CommonSubexpressionReuse';
 
 -- @skip_result_check=true
 -- @result_not_contains=__cse_
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT (a + b) AS x, (a + b) + a AS y
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) AS x,
+       (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) + CAST(a AS DOUBLE) AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 

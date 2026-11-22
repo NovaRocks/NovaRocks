@@ -593,6 +593,7 @@ pub(crate) fn validate_expression_types<'a, H>(
             }
         }
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
@@ -600,6 +601,7 @@ pub(crate) fn validate_expression_types<'a, H>(
             definitions,
             expression,
             *operand,
+            *ieee_float_equality,
             when_then,
             *else_expr,
             path,
@@ -783,6 +785,7 @@ pub(crate) fn validate_case_types<'a, H>(
     definitions: &'a [crate::ExprNode],
     expression: &'a crate::ExprNode,
     operand: Option<ExprId>,
+    ieee_float_equality: bool,
     when_then: &[(ExprId, ExprId)],
     else_expr: Option<ExprId>,
     path: ExprId,
@@ -794,6 +797,17 @@ pub(crate) fn validate_case_types<'a, H>(
     }
     let operand_type =
         operand.and_then(|id| definitions.get((id).get() as usize).map(|node| &node.ty));
+    if ieee_float_equality
+        && !operand_type.is_some_and(|ty| {
+            ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && matches!(ty.data_type(), DataType::Float32 | DataType::Float64)
+        })
+    {
+        errors.push(TypeIssue::new(
+            path,
+            "CASE IEEE equality requires a floating operand",
+        ));
+    }
     for (when, then) in when_then {
         if let Some(when) = definitions.get((*when).get() as usize) {
             let valid = match operand_type {

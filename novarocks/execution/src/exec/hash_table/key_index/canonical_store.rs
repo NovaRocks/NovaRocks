@@ -198,6 +198,7 @@ impl OwnedCanonicalColumn {
         target: usize,
     ) -> ExecutionResult<Self> {
         match input.spec.equalities()[column] {
+            KeyEquality::IeeeFloat => Err(invariant(ValueViolation::Carrier)),
             KeyEquality::SqlGrouping(_) => {
                 Self::copy_with_policy::<false>(input, column, rows, owner, host, control, target)
             }
@@ -375,6 +376,7 @@ impl OwnedCanonicalColumn {
             return Err(invariant(ValueViolation::Layout));
         }
         match self.spec.equalities()[column] {
+            KeyEquality::IeeeFloat => Err(invariant(ValueViolation::Carrier)),
             KeyEquality::SqlGrouping(_) => self.compare_with_policy::<false>(
                 input, column, input_rows, owned_rows, output, checkpoint,
             ),

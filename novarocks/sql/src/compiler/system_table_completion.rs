@@ -21,6 +21,7 @@ use super::completion::{CompileNeedId, SystemTableSnapshotFact, SystemTableSnaps
 use super::completion_predicate::{ProviderPredicateColumn, lower_atom_with_column};
 use crate::analysis::{BinOp, ExprKind, TypedExpr};
 use crate::column_id::ColumnId;
+use crate::common::binary_operator::typed_comparison;
 use crate::planner::physical::{PhysicalPlanKind, PhysicalPlanNode};
 use crate::planner::system_relation::PhysicalSystemTableState;
 use crate::system_table::{
@@ -115,11 +116,10 @@ pub(super) fn collect(
                 let mut constraint = SystemTableKeyConstraint::default();
                 for predicate in predicates {
                     work.step()?;
-                    if !matches!(
-                        &unnest(&predicate.expression).kind,
-                        ExprKind::BinaryOp { op: BinOp::Eq, .. }
-                            | ExprKind::InList { negated: false, .. }
-                    ) {
+                    let expression = unnest(&predicate.expression);
+                    if !matches!(typed_comparison(expression), Some((BinOp::Eq, _)))
+                        && !matches!(&expression.kind, ExprKind::InList { negated: false, .. })
+                    {
                         continue;
                     }
                     let atom = lower_atom_with_column(&predicate.expression, |expression| {

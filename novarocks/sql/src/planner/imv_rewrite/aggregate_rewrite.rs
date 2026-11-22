@@ -774,6 +774,7 @@ fn merged_state_expr(
         }
         SqlImvAggregateStateRole::RetractionCount => Ok(TypedExpr {
             kind: ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: (vec![(
                     TypedExpr {
@@ -1079,6 +1080,7 @@ fn branch_case_expr(
     let insert_expr = branch_case_arm_expr(insert_expr, &value_type);
     TypedExpr {
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
                 branch_marker_eq(branch_marker, CHANGE_BRANCH_DELETE),
@@ -2022,6 +2024,7 @@ fn align_expr_column_refs_to_child(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 align_expr_column_refs_to_child(operand, input_columns)?;
@@ -2323,6 +2326,7 @@ fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> T
     };
     TypedExpr {
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
                 TypedExpr {
@@ -3982,6 +3986,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_deref()

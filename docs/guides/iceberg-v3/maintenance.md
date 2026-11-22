@@ -77,7 +77,7 @@ Trino `updateType` 为 `ALTER TABLE EXECUTE`，不填 `updateCount`；客户端�
 获得新的位置删除或 DV，或必需移除的文件已不存活，提交会报冲突。
 冻结的输出分区规范须在提交时仍为默认规范，规范变化时需重新运行 OPTIMIZE。
 成功生成的 `replace` 快照从父链继承最近的统计登记，Puffin 副本保留 blob 原始来源。
-旧快照过期与物理回收各自取证。见 [ADR-0250](../../adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)。
+旧快照过期与物理回收各自取证。见 [ADR-0251](../../adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)。
 
 实现入口为 `novarocks/frontend-application/src/query_execution/maintenance/rewrite_job/direct.rs`，
 共享业务算法在 `novarocks/table-maintenance/src/product.rs`，Iceberg 选择与提交在

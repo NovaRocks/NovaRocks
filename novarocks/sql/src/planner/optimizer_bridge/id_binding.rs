@@ -484,6 +484,7 @@ fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Re
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 verify_expr(operand, input, context)?;

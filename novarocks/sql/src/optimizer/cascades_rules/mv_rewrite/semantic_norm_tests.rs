@@ -272,6 +272,7 @@ fn normalized_multisets_preserve_duplicates_in_head_and_case_arm_order() {
         intern(
             arena,
             ScalarNode::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then,
                 else_expr,

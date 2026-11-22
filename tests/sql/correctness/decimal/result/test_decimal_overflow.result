@@ -1,7 +1,12 @@
 -- query 2
--- types	decimal(38, 36)
+-- types	decimal(38, 6)
 _col0
-NULL
+274.977900
+
+-- query 3
+-- types	decimal(38, 6)
+_col0
+274.977900
 
 -- query 4
 -- types	decimal(9, 0)
@@ -20,16 +25,6 @@ NULL
 
 -- query 7
 -- types	decimal(18, 0)
-_col0
-NULL
-
--- query 8
--- types	decimal(38, 0)
-_col0
-NULL
-
--- query 9
--- types	decimal(38, 0)
 _col0
 NULL
 
@@ -53,16 +48,6 @@ _col0
 _col0
 -10000000000000
 
--- query 14
--- types	decimal(38, 0)
-_col0
-NULL
-
--- query 15
--- types	decimal(38, 0)
-_col0
-NULL
-
 -- query 22
 -- types	decimal(9, 0)
 _col0
@@ -84,16 +69,16 @@ _col0
 -10000000000000
 
 -- query 28
--- types	decimal(38, 20)
+-- types	decimal(31, 20)
 _col0
 -0.12345678901234567890
 
 -- query 29
--- types	decimal(38, 31)
+-- types	decimal(38, 17)
 adjust_lt
--147.8839239587535745703798959387468
+-147.88392395875357457
 
 -- query 30
--- types	decimal(38, 31)
+-- types	decimal(38, 17)
 adjust_lt
--291.2137392418358345703798959387468
+-291.21373924183583457

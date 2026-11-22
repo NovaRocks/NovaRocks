@@ -106,35 +106,44 @@ fn extract_column_pair_equality(
     arena: &ScalarArena,
     expr: ScalarId,
 ) -> Option<(ScalarId, ScalarId)> {
-    match arena.node(expr) {
-        ScalarNode::Nested(inner) => extract_column_pair_equality(arena, *inner),
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } if is_column_ref(arena, *left) && is_column_ref(arena, *right) => Some((*left, *right)),
-        _ => None,
+    if let ScalarNode::Nested(inner) = arena.node(expr) {
+        return extract_column_pair_equality(arena, *inner);
     }
+    let (BinOp::Eq, [left, right]) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)?
+    else {
+        return None;
+    };
+    [left, right]
+        .into_iter()
+        .all(|operand| {
+            is_column_ref(arena, operand)
+                && crate::common::binary_operator::permits_equality_substitution(
+                    arena.data_type(operand),
+                )
+        })
+        .then_some((left, right))
 }
 
 fn extract_column_literal_constraint(
     arena: &ScalarArena,
     expr: ScalarId,
 ) -> Option<ColumnConstraint> {
+    if let Some((operator, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+        && [left, right].into_iter().all(|operand| {
+            crate::common::binary_operator::permits_equality_substitution(arena.data_type(operand))
+        })
+    {
+        if is_constraint_operand(arena, left) && is_literal(arena, right) {
+            return build_binary_constraint(left, operator, right);
+        }
+        if is_literal(arena, left) && is_constraint_operand(arena, right) {
+            return build_binary_constraint(right, reverse_comparison(operator)?, left);
+        }
+    }
     match arena.node(expr) {
         ScalarNode::Nested(inner) => extract_column_literal_constraint(arena, *inner),
-        ScalarNode::BinaryOp {
-            left, op, right, ..
-        } => {
-            if is_constraint_operand(arena, *left) && is_literal(arena, *right) {
-                return build_binary_constraint(*left, *op, *right);
-            }
-            if is_literal(arena, *left) && is_constraint_operand(arena, *right) {
-                return build_binary_constraint(*right, reverse_comparison(*op)?, *left);
-            }
-            None
-        }
         ScalarNode::InList {
             child,
             list,

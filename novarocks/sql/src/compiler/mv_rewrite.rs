@@ -3516,7 +3516,7 @@ pub(crate) fn analyze_candidates(
         if consumer_requires_semantic_snapshot {
             entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(SqlMvRewriteDiagnostic {
                 mv_id: Some(definition.mv_id),
-                message: "mv rewrite: persisted definition is ineligible under GROUP_CONCAT_LEGACY or decimal_overflow_to_double because its semantic settings are not captured".to_string(),
+                message: "mv rewrite: persisted definition is ineligible under GROUP_CONCAT_LEGACY or ERROR_IF_OVERFLOW because its semantic settings are not captured".to_string(),
             }));
             continue;
         }
@@ -3976,34 +3976,6 @@ mod tests {
         let mut index = candidate_index();
         index.definitions[0].select_query =
             test_query("WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT k FROM base");
-        let analysis = analyze_candidates(
-            &index,
-            &catalog,
-            "db",
-            &logical,
-            &factory,
-            crate::functions::builtin_sql_function_catalog(),
-            &crate::optimizer::options::SessionOptimizerSettings::default(),
-            crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-            false,
-        )
-        .unwrap();
-        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("ineligible persisted definition"))));
-        assert_eq!(
-            catalog.resolutions.load(Ordering::Acquire),
-            resolutions_before
-        );
-    }
-
-    #[test]
-    fn stored_decimal_definition_is_ineligible_before_reanalysis() {
-        let catalog = CandidateCatalog::new();
-        let (logical, factory) = main_candidate_query(&catalog);
-        let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
-        let mut index = candidate_index();
-        index.definitions[0].select_query =
-            test_query("WITH SESSION decimal_overflow_to_double = true SELECT k FROM base");
         let analysis = analyze_candidates(
             &index,
             &catalog,
@@ -4577,9 +4549,11 @@ mod tests {
                     settings.disabled_rules.push("FoldConstant".into());
                 }
                 let control = crate::compiler::SqlCompileControl::unbounded();
+                // Operator binding already types the predicate's literal as BIGINT.
+                // Retain a real widening CAST for the independent fold receipt.
                 let request = SqlAnalyzeRequest::new(
                     SqlStatementInput::parsed_query(Box::new(test_query(&format!(
-                        "SELECT k FROM iceberg.db.base WHERE k > {minimum}"
+                        "SELECT k, CAST({minimum} AS BIGINT) FROM iceberg.db.base WHERE k > {minimum}"
                     )))),
                     crate::compiler::SqlCompileIntent::Query,
                     SqlSessionContext {

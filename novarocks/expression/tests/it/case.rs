@@ -46,7 +46,7 @@ fn assert_case_domains(program: &Fixture, has_else: bool) {
     );
     let definitions = unit.definitions();
     assert!(
-        matches!(definitions.node(invocation.definition).unwrap().kind(),StaticExprKind::Case {has_case_expr:false,has_else_expr,children} if *has_else_expr==has_else && children.len()==4+usize::from(has_else))
+        matches!(definitions.node(invocation.definition).unwrap().kind(),StaticExprKind::Case {has_case_expr:false,has_else_expr,children, ..} if *has_else_expr==has_else && children.len()==4+usize::from(has_else))
     );
     for (ordinal, child) in invocation.arguments.iter().enumerate() {
         let actual = &flow.uses()[child];

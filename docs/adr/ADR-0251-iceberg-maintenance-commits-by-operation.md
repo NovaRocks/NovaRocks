@@ -1,5 +1,5 @@
 ---
-id: ADR-0250
+id: ADR-0251
 title: "Iceberg maintenance commits validate the operation against the current base"
 domain: [provider-spi, table-maintenance]
 status: active

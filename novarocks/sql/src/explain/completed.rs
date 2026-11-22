@@ -1822,6 +1822,27 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 write_negation(formatter, false, |out| write!(out, "{}", expr(*operand)))?;
                 formatter.write_str(")")
             }
+            ExprKind::FunctionCall { function, args }
+                if novarocks_type_contract::OperatorFunction::from_function_id(
+                    &function.function_id,
+                )
+                .is_some() =>
+            {
+                let [left, right] = args.as_ref() else {
+                    return Err(fmt::Error);
+                };
+                let operator = novarocks_type_contract::OperatorFunction::from_function_id(
+                    &function.function_id,
+                )
+                .ok_or(fmt::Error)?;
+                write!(
+                    formatter,
+                    "({} {} {})",
+                    expr(*left),
+                    operator.sql(),
+                    expr(*right)
+                )
+            }
             ExprKind::FunctionCall { function, args } => write!(
                 formatter,
                 "{}@{}({})",
@@ -1915,6 +1936,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 formatter.write_str("CASE")?;
                 if let Some(operand) = operand {
@@ -5053,40 +5075,101 @@ mod tests {
             );
         }
 
-        let multiply = completed
+        use novarocks_expression_contract::ExprKind;
+        use novarocks_type_contract::{
+            FunctionArgumentType, FunctionIntrinsicRowError, OperatorFunction,
+        };
+
+        let (owner, unit, multiply) = completed
             .plan()
             .fragments()
             .values()
             .find_map(|fragment| {
                 fragment.nodes().values().find_map(|node| {
-                    node.expressions
-                        .as_ref()?
-                        .definitions()
-                        .iter()
-                        .find_map(|expression| {
-                            let novarocks_expression_contract::ExprKind::Binary {
-                                left,
-                                op: novarocks_expression_contract::BinaryOperator::Multiply,
-                                right,
-                                ..
-                            } = expression.kind
-                            else {
-                                return None;
-                            };
-                            Some((node.id, expression.id, left, right))
-                        })
+                    let unit = node.expressions.as_ref()?;
+                    let multiply = unit.definitions().iter().find(|expression| {
+                        matches!(&expression.kind, ExprKind::FunctionCall { function, .. }
+                            if function.function_id == OperatorFunction::Multiply.function_id())
+                    })?;
+                    Some((node.id, unit, multiply))
                 })
             })
             .expect("multiply expression");
-        assert!(
-            rendered.contains(&format!(
-                "{} = ({} * {})",
-                DefinitionRef(multiply.0, multiply.1),
-                DefinitionRef(multiply.0, multiply.2),
-                DefinitionRef(multiply.0, multiply.3)
-            )),
-            "{rendered}"
-        );
+        let ExprKind::FunctionCall {
+            function: multiply_binding,
+            args,
+        } = &multiply.kind
+        else {
+            unreachable!("multiply is a function call");
+        };
+        let [x, add_id] = args.as_ref() else {
+            panic!("multiply must consume x and the grouped addition");
+        };
+        let add = unit.definition(*add_id).expect("grouped addition");
+        let ExprKind::FunctionCall {
+            function: add_binding,
+            args,
+        } = &add.kind
+        else {
+            panic!("the right multiply operand must be an addition");
+        };
+        assert_eq!(add_binding.function_id, OperatorFunction::Add.function_id());
+        let [y, z] = args.as_ref() else {
+            panic!("addition must consume y and z");
+        };
+        let [input] = unit.ports() else {
+            panic!("the projection must retain its original input port");
+        };
+        let [(input_x, _), (input_y, _), (input_z, _)] = input.values.as_ref() else {
+            panic!("the projection input must expose x, y, and z");
+        };
+        for (operand, expected) in [(x, input_x), (y, input_y), (z, input_z)] {
+            assert!(matches!(
+                &unit.definition(*operand).expect("input definition").kind,
+                ExprKind::Value(value) if value == expected
+            ));
+        }
+        for (definition, binding, left, right) in [
+            (add, add_binding, y, z),
+            (multiply, multiply_binding, x, add_id),
+        ] {
+            assert_eq!(definition.ty, binding.result_type);
+            let [
+                FunctionArgumentType::Value(left_type),
+                FunctionArgumentType::Value(right_type),
+            ] = &binding.argument_types[..]
+            else {
+                panic!("arithmetic must retain two selected value types");
+            };
+            assert_eq!(left_type, &unit.definition(*left).expect("left operand").ty);
+            assert_eq!(
+                right_type,
+                &unit.definition(*right).expect("right operand").ty
+            );
+            let use_id = unit
+                .control_flow()
+                .uses()
+                .iter()
+                .find_map(|(id, invocation)| (invocation.definition == definition.id).then_some(id))
+                .expect("arithmetic call use");
+            assert_eq!(
+                unit.claims()[use_id].effects.own_row_error,
+                FunctionIntrinsicRowError::MayRaise
+            );
+        }
+        for (definition, left, op, right) in
+            [(add.id, *y, "+", *z), (multiply.id, *x, "*", *add_id)]
+        {
+            assert!(
+                rendered.contains(&format!(
+                    "{} = ({} {op} {})",
+                    DefinitionRef(owner, definition),
+                    DefinitionRef(owner, left),
+                    DefinitionRef(owner, right)
+                )),
+                "{rendered}"
+            );
+        }
     }
 
     #[test]

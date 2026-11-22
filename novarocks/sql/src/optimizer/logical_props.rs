@@ -218,6 +218,21 @@ fn collect_strict_column_equalities_inner(
     expr: ScalarId,
     out: &mut Vec<(ColumnId, ColumnId)>,
 ) {
+    if let Some((BinOp::Eq, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(scalars, expr)
+        && [left, right].iter().all(|&operand| {
+            crate::common::binary_operator::permits_equality_substitution(
+                scalars.data_type(operand),
+            )
+        })
+        && let (Some(left_id), Some(right_id)) = (
+            column_id_from_scalar(scalars, left),
+            column_id_from_scalar(scalars, right),
+        )
+    {
+        out.push((left_id, right_id));
+        return;
+    }
     match scalars.node(expr) {
         ScalarNode::Nested(inner) => collect_strict_column_equalities_inner(scalars, *inner, out),
         ScalarNode::BinaryOp {
@@ -228,19 +243,6 @@ fn collect_strict_column_equalities_inner(
         } => {
             collect_strict_column_equalities_inner(scalars, *left, out);
             collect_strict_column_equalities_inner(scalars, *right, out);
-        }
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } => {
-            if let (Some(left_id), Some(right_id)) = (
-                column_id_from_scalar(scalars, *left),
-                column_id_from_scalar(scalars, *right),
-            ) {
-                out.push((left_id, right_id));
-            }
         }
         _ => {}
     }
@@ -266,6 +268,37 @@ fn collect_literal_equalities_inner(
     expr: ScalarId,
     out: &mut Vec<LiteralEquality>,
 ) {
+    if let Some((BinOp::Eq, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(scalars, expr)
+        && [left, right].iter().all(|&operand| {
+            crate::common::binary_operator::permits_equality_substitution(
+                scalars.data_type(operand),
+            )
+        })
+    {
+        match (scalars.node(left), scalars.node(right)) {
+            (
+                ScalarNode::ColumnRef(column_id),
+                ScalarNode::Literal(_) | ScalarNode::Constant(_),
+            ) if *column_id != ColumnId::UNSET => {
+                out.push(LiteralEquality {
+                    column_id: *column_id,
+                    literal: right,
+                });
+            }
+            (
+                ScalarNode::Literal(_) | ScalarNode::Constant(_),
+                ScalarNode::ColumnRef(column_id),
+            ) if *column_id != ColumnId::UNSET => {
+                out.push(LiteralEquality {
+                    column_id: *column_id,
+                    literal: left,
+                });
+            }
+            _ => {}
+        }
+        return;
+    }
     match scalars.node(expr) {
         ScalarNode::Nested(inner) => collect_literal_equalities_inner(scalars, *inner, out),
         ScalarNode::BinaryOp {
@@ -277,32 +310,7 @@ fn collect_literal_equalities_inner(
             collect_literal_equalities_inner(scalars, *left, out);
             collect_literal_equalities_inner(scalars, *right, out);
         }
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } => match (scalars.node(*left), scalars.node(*right)) {
-            (
-                ScalarNode::ColumnRef(column_id),
-                ScalarNode::Literal(_) | ScalarNode::Constant(_),
-            ) if *column_id != ColumnId::UNSET => {
-                out.push(LiteralEquality {
-                    column_id: *column_id,
-                    literal: *right,
-                });
-            }
-            (
-                ScalarNode::Literal(_) | ScalarNode::Constant(_),
-                ScalarNode::ColumnRef(column_id),
-            ) if *column_id != ColumnId::UNSET => {
-                out.push(LiteralEquality {
-                    column_id: *column_id,
-                    literal: *left,
-                });
-            }
-            _ => {}
-        },
+
         _ => {}
     }
 }
@@ -746,6 +754,7 @@ mod tests {
                         left: left_key,
                         right: right_key,
                         null_safe: true,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: None,
                 },
@@ -790,6 +799,7 @@ mod tests {
                         left: left_key,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: None,
                 },

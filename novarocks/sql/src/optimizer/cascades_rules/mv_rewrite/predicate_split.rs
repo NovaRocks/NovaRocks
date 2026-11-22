@@ -131,73 +131,76 @@ fn as_range_conjunct(
                 .map(LiteralValue::Int),
         }
     };
-    match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left, op, right, ..
-        } => {
-            let (col, lit, op) = if let (Some(c), Some(l)) = (col_of(*left), lit_of(*right)) {
-                (c, l, *op)
-            } else if let (Some(l), Some(c)) = (lit_of(*left), col_of(*right)) {
-                // literal op col  ==  col flipped-op literal
-                let flipped = match op {
-                    BinOp::Lt => BinOp::Gt,
-                    BinOp::Le => BinOp::Ge,
-                    BinOp::Gt => BinOp::Lt,
-                    BinOp::Ge => BinOp::Le,
-                    BinOp::Eq => BinOp::Eq,
-                    _ => return None,
-                };
-                (c, l, flipped)
-            } else {
-                return None;
+    if let Some((op, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+        && [left, right].into_iter().all(|operand| {
+            crate::common::binary_operator::permits_equality_substitution(arena.data_type(operand))
+        })
+    {
+        let (col, lit, op) = if let (Some(c), Some(l)) = (col_of(left), lit_of(right)) {
+            (c, l, op)
+        } else if let (Some(l), Some(c)) = (lit_of(left), col_of(right)) {
+            // literal op col  ==  col flipped-op literal
+            let flipped = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Le => BinOp::Ge,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Ge => BinOp::Le,
+                BinOp::Eq => BinOp::Eq,
+                _ => return None,
             };
-            match op {
-                BinOp::Eq => Some((
-                    col,
-                    Some(Bound {
-                        value: lit.clone(),
-                        inclusive: true,
-                    }),
-                    Some(Bound {
-                        value: lit,
-                        inclusive: true,
-                    }),
-                )),
-                BinOp::Ge => Some((
-                    col,
-                    Some(Bound {
-                        value: lit,
-                        inclusive: true,
-                    }),
-                    None,
-                )),
-                BinOp::Gt => Some((
-                    col,
-                    Some(Bound {
-                        value: lit,
-                        inclusive: false,
-                    }),
-                    None,
-                )),
-                BinOp::Le => Some((
-                    col,
-                    None,
-                    Some(Bound {
-                        value: lit,
-                        inclusive: true,
-                    }),
-                )),
-                BinOp::Lt => Some((
-                    col,
-                    None,
-                    Some(Bound {
-                        value: lit,
-                        inclusive: false,
-                    }),
-                )),
-                _ => None,
-            }
-        }
+            (c, l, flipped)
+        } else {
+            return None;
+        };
+        return match op {
+            BinOp::Eq => Some((
+                col,
+                Some(Bound {
+                    value: lit.clone(),
+                    inclusive: true,
+                }),
+                Some(Bound {
+                    value: lit,
+                    inclusive: true,
+                }),
+            )),
+            BinOp::Ge => Some((
+                col,
+                Some(Bound {
+                    value: lit,
+                    inclusive: true,
+                }),
+                None,
+            )),
+            BinOp::Gt => Some((
+                col,
+                Some(Bound {
+                    value: lit,
+                    inclusive: false,
+                }),
+                None,
+            )),
+            BinOp::Le => Some((
+                col,
+                None,
+                Some(Bound {
+                    value: lit,
+                    inclusive: true,
+                }),
+            )),
+            BinOp::Lt => Some((
+                col,
+                None,
+                Some(Bound {
+                    value: lit,
+                    inclusive: false,
+                }),
+            )),
+            _ => None,
+        };
+    }
+    match arena.node(expr) {
         ScalarNode::Between {
             child,
             low,

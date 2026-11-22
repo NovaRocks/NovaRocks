@@ -472,6 +472,7 @@ message CaseExpression {
   optional uint32 operand_expr_id = 1;
   repeated WhenThen arms = 2;
   optional uint32 else_expr_id = 3;
+  optional bool ieee_float_equality = 4;
 }
 message WhenThen {
   optional uint32 when_expr_id = 1;
@@ -742,6 +743,12 @@ message JoinKey {
   optional uint32 left_root = 4;
   optional uint32 right_root = 5;
   bool null_safe = 3;
+  JoinKeyMatch match_relation = 6;
+}
+enum JoinKeyMatch {
+  JOIN_KEY_MATCH_UNSPECIFIED = 0;
+  JOIN_KEY_MATCH_GROUPING = 1;
+  JOIN_KEY_MATCH_IEEE_FLOAT = 2;
 }
 message OrdinaryHashJoinCondition {
   repeated JoinKey keys = 1;
