@@ -377,70 +377,6 @@ pub(crate) async fn write_puffin_artifacts_allocated_scoped(
     Ok(result)
 }
 
-#[cfg(test)]
-mod scoped_refusal_tests {
-    use super::*;
-    use novarocks_failure_contract::{FailureFact, FailureProjection};
-    use novarocks_spi::connector::{
-        ConnectorError, ConnectorErrorKind, ConnectorMutationFailureKind,
-    };
-
-    #[derive(Debug)]
-    struct OriginalRefusal(ConnectorErrorKind);
-    impl std::fmt::Display for OriginalRefusal {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("original bounded CPU marker")
-        }
-    }
-    impl std::error::Error for OriginalRefusal {}
-    impl FailureProjection for OriginalRefusal {
-        fn failure_fact(&self) -> FailureFact {
-            self.0.failure_fact()
-        }
-    }
-
-    #[test]
-    fn scoped_puffin_refusal_reaches_original_publication_fact_and_cause() {
-        for (kind, expected) in [
-            (
-                ConnectorErrorKind::ResourceExhausted,
-                ConnectorMutationFailureKind::ResourceExhausted,
-            ),
-            (
-                ConnectorErrorKind::Interrupted,
-                ConnectorMutationFailureKind::Interrupted,
-            ),
-            (
-                ConnectorErrorKind::Internal,
-                ConnectorMutationFailureKind::Internal,
-            ),
-        ] {
-            let original =
-                ConnectorError::from_domain(kind, OriginalRefusal(kind)).map_message(|_| {
-                    "internal CPU action Begin refused: original bounded detail".into()
-                });
-            let error = PuffinWriteFailure::Scoped(original.clone()).into_preparation_error();
-            let failure = crate::commit::attempt::before_dispatch_failure(&error);
-            assert_eq!(failure.kind(), expected);
-            assert_eq!(failure.failure_fact(), original.failure_fact());
-            assert_eq!(failure.connector_source(), Some(&original));
-            assert!(failure.message().contains("original bounded detail"));
-        }
-    }
-
-    #[test]
-    fn legacy_puffin_io_failure_keeps_original_unavailable_projection() {
-        let error = PuffinWriteFailure::Legacy("original Puffin storage error".into())
-            .into_preparation_error();
-        let failure = crate::commit::attempt::before_dispatch_failure(&error);
-        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unavailable);
-        assert_eq!(
-            failure.connector_source().unwrap().message(),
-            "original Puffin storage error"
-        );
-    }
-}
-
 /// Geometry from the original registration. For plaintext the framing is
 /// verified from the paid bytes, without decoding or normalizing the footer.
 pub(crate) struct PuffinCopyGeometry {
@@ -604,5 +540,69 @@ pub(crate) fn carried_statistics_registration(
                     .collect(),
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod scoped_refusal_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureFact, FailureProjection};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorMutationFailureKind,
+    };
+
+    #[derive(Debug)]
+    struct OriginalRefusal(ConnectorErrorKind);
+    impl std::fmt::Display for OriginalRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original bounded CPU marker")
+        }
+    }
+    impl std::error::Error for OriginalRefusal {}
+    impl FailureProjection for OriginalRefusal {
+        fn failure_fact(&self) -> FailureFact {
+            self.0.failure_fact()
+        }
+    }
+
+    #[test]
+    fn scoped_puffin_refusal_reaches_original_publication_fact_and_cause() {
+        for (kind, expected) in [
+            (
+                ConnectorErrorKind::ResourceExhausted,
+                ConnectorMutationFailureKind::ResourceExhausted,
+            ),
+            (
+                ConnectorErrorKind::Interrupted,
+                ConnectorMutationFailureKind::Interrupted,
+            ),
+            (
+                ConnectorErrorKind::Internal,
+                ConnectorMutationFailureKind::Internal,
+            ),
+        ] {
+            let original =
+                ConnectorError::from_domain(kind, OriginalRefusal(kind)).map_message(|_| {
+                    "internal CPU action Begin refused: original bounded detail".into()
+                });
+            let error = PuffinWriteFailure::Scoped(original.clone()).into_preparation_error();
+            let failure = crate::commit::attempt::before_dispatch_failure(&error);
+            assert_eq!(failure.kind(), expected);
+            assert_eq!(failure.failure_fact(), original.failure_fact());
+            assert_eq!(failure.connector_source(), Some(&original));
+            assert!(failure.message().contains("original bounded detail"));
+        }
+    }
+
+    #[test]
+    fn legacy_puffin_io_failure_keeps_original_unavailable_projection() {
+        let error = PuffinWriteFailure::Legacy("original Puffin storage error".into())
+            .into_preparation_error();
+        let failure = crate::commit::attempt::before_dispatch_failure(&error);
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unavailable);
+        assert_eq!(
+            failure.connector_source().unwrap().message(),
+            "original Puffin storage error"
+        );
     }
 }
