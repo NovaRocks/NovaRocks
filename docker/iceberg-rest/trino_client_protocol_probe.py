@@ -27,13 +27,20 @@ import fixture_run
 import fixture_runtime as runtime
 import trino_run
 
-# Only temporal logical-type differences are accepted by the approved G1b route.
+# Temporal logical-type differences are owned by TRC-6c.
 DIFFERENCE_OWNERS = {
     "ts_ntz": "TRC-6c", "ts_zoned": "TRC-6c", "time_value": "TRC-6c",
     "time_array": "TRC-6c", "time_map": "TRC-6c",
     "ts_ntz_array": "TRC-6c", "ts_zoned_array": "TRC-6c",
     "nano_ntz": "TRC-6c", "nano_zoned": "TRC-6c",
 }
+NESTED_VARIANT_OWNER = "IRU-9"
+NESTED_VARIANT_PATHS = {
+    "variant_array": "variant_array.element",
+    "variant_map": "variant_map.value",
+    "variant_row": "variant_row.v",
+}
+REGISTERED_OWNERS = DIFFERENCE_OWNERS | dict.fromkeys(NESTED_VARIANT_PATHS, NESTED_VARIANT_OWNER)
 BASE_COLUMNS = ["bool_value", "int_value", "long_value", "real_value", "double_value",
                 "decimal_value", "text_value", "binary_value", "date_value", "ts_ntz",
                 "ts_zoned", "array_value", "map_value", "row_value", "binary_map",
@@ -123,6 +130,13 @@ def compare_column(name, reference, candidate):
     actual_sig = candidate.get("columns", [{}])[0].get("typeSignature")
     if candidate_error or actual_sig != ref_sig:
         owner = DIFFERENCE_OWNERS.get(name)
+        variant_path = NESTED_VARIANT_PATHS.get(name)
+        if (variant_path and candidate_error
+                and candidate_error.get("errorName") == "GENERIC_INTERNAL_ERROR"
+                and candidate_error.get("message", "").endswith(
+                    "could not be negotiated: Unsupported: reading Iceberg Variant nested inside STRUCT, LIST or MAP "
+                    f"is not supported: column {variant_path}")):
+            owner = NESTED_VARIANT_OWNER
         if owner is None:
             raise ProbeFailure("unregistered G1b difference for " + name)
         return {"column": name, "owner": owner, "trino_signature": ref_sig,
@@ -392,7 +406,7 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
                     else:
                         compared.append({"mode": mode, "column": name, "rows": len(reference["data"])})
                     write_json(self.root / "g1a-comparison.json", {"status": "RUNNING", "compared": compared})
-                    write_json(self.root / "g1b-differences.json", {"status": "RUNNING", "registered_owners": DIFFERENCE_OWNERS, "differences": differences})
+                    write_json(self.root / "g1b-differences.json", {"status": "RUNNING", "registered_owners": REGISTERED_OWNERS, "differences": differences})
         # Conditional Variant coverage is discovered by real reads, not by image tag assumptions.
         probes = {endpoint: self.read_encoding_column(endpoint, "variant_values", "variant_value", "variant-support")
                   for endpoint in ("trino", "nova")}
@@ -414,7 +428,7 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
                         compared.append({"mode": capability, "column": name, "rows": len(reference["data"])})
             variant = {"status": "PASS"}
         write_json(self.root / "g1a-comparison.json", {"status": "PASS", "compared": compared, "variant": variant})
-        write_json(self.root / "g1b-differences.json", {"status": "PASS", "registered_owners": DIFFERENCE_OWNERS, "differences": differences})
+        write_json(self.root / "g1b-differences.json", {"status": "PASS", "registered_owners": REGISTERED_OWNERS, "differences": differences})
 
     def read_encoding_column(self, endpoint, table, column, label, capabilities="PARAMETRIC_DATETIME"):
         catalog = {"trino": "iceberg", "nova": "ice_rest"}[endpoint]

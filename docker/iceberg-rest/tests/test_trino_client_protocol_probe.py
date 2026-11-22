@@ -99,6 +99,23 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(probe.ProbeFailure, "oracle rejected"):
             probe.compare_column("ts_zoned", {"error": {"errorName": "REMOTE_TASK_ERROR"}}, result(signature("timestamp"), ["a"]))
 
+    def test_nested_variant_registers_only_the_existing_provider_refusal(self):
+        sig = signature("array", {"kind": "TYPE", "value": signature("json")})
+        reference = result(sig, [["1", None]])
+        error = {"errorName": "GENERIC_INTERNAL_ERROR", "message": (
+            "provider read of fixture.variant_values could not be negotiated: Unsupported: "
+            "reading Iceberg Variant nested inside STRUCT, LIST or MAP is not supported: column variant_array.element"
+        )}
+        difference = probe.compare_column("variant_array", reference, {"error": error})
+        self.assertEqual(difference["owner"], "IRU-9")
+        self.assertEqual(difference["novarocks_error"], error)
+        for invalid in ({**error, "message": "unexpected internal failure"},
+                        {**error, "message": error["message"].replace(".element", ".value")}):
+            with self.assertRaisesRegex(probe.ProbeFailure, "unregistered"):
+                probe.compare_column("variant_array", reference, {"error": invalid})
+        with self.assertRaisesRegex(probe.ProbeFailure, "NULL differs"):
+            probe.compare_column("variant_array", reference, result(sig, [[None, None]]))
+
 
 class ReferenceInputTests(unittest.TestCase):
     def probe(self, **args):
