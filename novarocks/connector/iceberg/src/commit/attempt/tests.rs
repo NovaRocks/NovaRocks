@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod rewrite_files;
 mod row_delta_window;
 mod truncate;
 
@@ -34,6 +35,7 @@ use std::sync::{
 enum Dispatch {
     Commit,
     ConflictThen(Box<TableMetadata>),
+    UpdateBeforeRequirements(Box<TableMetadata>),
     ConflictSequence(Vec<TableMetadata>),
     Unknown,
     AlwaysConflict,
@@ -174,7 +176,15 @@ impl Publisher for ControlledPublisher<'_> {
             }
             _ => {}
         }
-        let metadata = self.metadata.lock().unwrap().clone();
+        let metadata = {
+            let mut metadata = self.metadata.lock().unwrap();
+            if let Dispatch::UpdateBeforeRequirements(update) = &self.dispatch
+                && call == 1
+            {
+                *metadata = update.as_ref().clone();
+            }
+            metadata.clone()
+        };
         for requirement in request.requirements() {
             if let Err(error) = requirement.check(Some(&metadata)) {
                 return CatalogOutcome::uncommitted(
@@ -2802,4 +2812,5 @@ async fn rewrite_policy_reuses_its_previous_group_before_considering_concurrent_
 }
 
 mod new_manifest_reuse;
+mod statistics_carry_ledger;
 mod terminal_cleanup;

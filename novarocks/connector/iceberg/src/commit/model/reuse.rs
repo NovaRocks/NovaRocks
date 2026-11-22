@@ -19,7 +19,7 @@
 
 use super::{ArtifactLedger, ObjectIdentity, invalid};
 use crate::iceberg::Result;
-use crate::iceberg::spec::ManifestFile;
+use crate::iceberg::spec::{ManifestFile, StatisticsFile};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub enum AddedManifestAuthor {
     IntentData,
     EntryGroups,
+    #[cfg(test)]
     PhysicalRewrite,
 }
 
@@ -92,12 +93,108 @@ impl ManifestRewriteReuse {
     }
 }
 
+/// The source's physical registration. Blob properties belong to the fresh
+/// snapshot registration. They do not identify the immutable Puffin object.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct StatisticsSourceIdentity {
+    path: String,
+    file_size_in_bytes: i64,
+    file_footer_size_in_bytes: i64,
+    // Opaque encryption metadata may contain key material.
+    key_metadata: Option<String>,
+}
+
+impl From<&StatisticsFile> for StatisticsSourceIdentity {
+    fn from(source: &StatisticsFile) -> Self {
+        Self {
+            path: source.statistics_path.clone(),
+            file_size_in_bytes: source.file_size_in_bytes,
+            file_footer_size_in_bytes: source.file_footer_size_in_bytes,
+            key_metadata: source.key_metadata.clone(),
+        }
+    }
+}
+
+/// The exact source and output identity required by the statistics writer.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct StatisticsReuseBasis {
+    pub(crate) stage: usize,
+    pub(crate) source: StatisticsSourceIdentity,
+    pub(crate) stage_snapshot_id: i64,
+}
+
+/// Facts about the operation-owned Puffin object after its actual close.
+/// A new round authors its own registration using the current source metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReusableStatisticsFile {
+    pub(crate) object: ObjectIdentity,
+    pub(crate) snapshot_id: i64,
+    pub(crate) file_size_in_bytes: i64,
+    pub(crate) file_footer_size_in_bytes: i64,
+}
+
+fn puffin_framing_fits(file_size: i64, footer_size: i64) -> bool {
+    // The file begins with a four-byte magic. The footer has its own opening
+    // magic and ends with three four-byte fields (length, flags, and magic).
+    const FILE_HEADER_BYTES: i64 = 4;
+    const FOOTER_FRAMING_BYTES: i64 = 16;
+    footer_size >= FOOTER_FRAMING_BYTES
+        && file_size
+            .checked_sub(FILE_HEADER_BYTES)
+            .is_some_and(|after_header| footer_size <= after_header)
+}
+
 #[derive(Default)]
 pub struct ManifestReuseIndex {
     keyed: HashMap<ManifestReuseBasis, ManifestFile>,
     rewrites: BTreeMap<usize, ManifestRewriteReuse>,
+    statistics: BTreeMap<usize, (StatisticsReuseBasis, ReusableStatisticsFile)>,
 }
 impl ManifestReuseIndex {
+    pub(crate) fn find_statistics(
+        &mut self,
+        ledger: &ArtifactLedger,
+        basis: &StatisticsReuseBasis,
+    ) -> Result<Option<ReusableStatisticsFile>> {
+        let Some((recorded, output)) = self.statistics.get(&basis.stage) else {
+            return Ok(None);
+        };
+        if recorded != basis {
+            return Ok(None);
+        }
+        if ledger.is_retired(&output.object) {
+            self.statistics.remove(&basis.stage);
+            return Ok(None);
+        }
+        ledger.check_reusable_statistics(&output.object)?;
+        Ok(Some(output.clone()))
+    }
+
+    pub(crate) fn remember_statistics(
+        &mut self,
+        ledger: &ArtifactLedger,
+        basis: StatisticsReuseBasis,
+        output: ReusableStatisticsFile,
+    ) -> Result<()> {
+        if output.snapshot_id != basis.stage_snapshot_id
+            || output.object.path() == basis.source.path
+        {
+            return Err(invalid(
+                "Iceberg statistics copy has a different stage or source identity",
+            ));
+        }
+        if !puffin_framing_fits(
+            basis.source.file_size_in_bytes,
+            basis.source.file_footer_size_in_bytes,
+        ) || !puffin_framing_fits(output.file_size_in_bytes, output.file_footer_size_in_bytes)
+        {
+            return Err(invalid("Iceberg statistics copy has inconsistent extents"));
+        }
+        ledger.check_reusable_statistics(&output.object)?;
+        self.statistics.insert(basis.stage, (basis, output));
+        Ok(())
+    }
+
     pub fn find(
         &mut self,
         ledger: &ArtifactLedger,

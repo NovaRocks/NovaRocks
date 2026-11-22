@@ -896,4 +896,5 @@ async fn standard_preparation_rewrites_a_retired_manifest_without_dropping_its_r
     }
 }
 
+mod statistics_carry_ledger;
 mod written_once;

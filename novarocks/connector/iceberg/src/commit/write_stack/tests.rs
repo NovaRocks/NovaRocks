@@ -1146,10 +1146,9 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
 
 #[test]
 fn a_rewrite_is_not_gated_by_the_external_write_fence() {
-    // The rewrite is arbitrated by the ordinary Iceberg base-state compare and
-    // swap the frozen publication runner already performs against the frozen snapshot, so
-    // it must not also take the distributed external write fence. Every other
-    // flavor keeps it.
+    // Each publication attempt validates its current Iceberg base. The
+    // rewrite keeps its original planning snapshot without an external
+    // write fence. Every other flavor below keeps the fence.
     for flavor in [
         IcebergWriteFlavor::Append,
         IcebergWriteFlavor::Overwrite,
@@ -1175,8 +1174,7 @@ fn a_rewrite_is_not_gated_by_the_external_write_fence() {
     .expect("plan a distributed rewrite");
     let (handle, _) = flavor_session(plan);
     assert!(!handle.requires_external_write_fence());
-    // The compare-and-swap input the commit dispatch checks the loaded table
-    // against, and the rewrite commit action it dispatches.
+    // Preserve the planning snapshot and the actual rewrite operation.
     assert_eq!(handle.table().base_snapshot_id(), Some(77));
     assert_eq!(handle.commit_op_kind(), CommitOpKind::SelectedRewrite);
 }
@@ -3451,6 +3449,7 @@ impl FrozenRewriteLake {
 }
 
 mod baseline_contract_tests;
+mod rewrite_begin;
 mod row_mutation_begin;
 
 #[test]
@@ -3515,135 +3514,6 @@ fn distributed_rewrite_inputs_are_attempt_owned_and_never_written() {
 }
 
 #[test]
-fn distributed_rewrite_refuses_a_head_that_moved_before_begin_without_writing() {
-    use novarocks_spi::connector::write_stack::ConnectorWriteControl;
-    let lake = FrozenRewriteLake::new();
-    lake.write_rows(
-        novarocks_spi::connector::ConnectorWriteIntent::Append,
-        &[1],
-        "old",
-    );
-    lake.write_rows(
-        novarocks_spi::connector::ConnectorWriteIntent::Append,
-        &[2],
-        "older",
-    );
-    let shared_context = request_context();
-    // Production FE clones this exact context across metadata, planning and begin.
-    let observed = lake
-        .runtime
-        .load_table_for_request("db", "t", &shared_context)
-        .unwrap();
-    let plan = lake.plan();
-    assert_eq!(
-        observed.table.metadata().current_snapshot_id(),
-        plan.frozen()
-            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
-            .unwrap()
-            .base_snapshot_id
-    );
-    lake.write_rows(
-        novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
-        &[99],
-        "concurrent",
-    );
-    let before = lake.inventory();
-    let mut request = lake.request(&plan);
-    request.context = shared_context.clone();
-    assert_eq!(
-        lake.runtime
-            .load_table_for_request("db", "t", &shared_context)
-            .unwrap()
-            .table
-            .metadata()
-            .current_snapshot_id(),
-        observed.table.metadata().current_snapshot_id(),
-        "the cached planning observation intentionally remains S0"
-    );
-    let error = lake.control.begin_write(request).unwrap_err();
-    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    assert!(error.message().contains("moved after planning"));
-    assert_eq!(lake.inventory(), before);
-    assert_eq!(lake.rows(), vec![99]);
-}
-
-#[test]
-fn distributed_rewrite_replaces_only_frozen_inputs_and_rejects_concurrent_commit() {
-    use novarocks_spi::connector::write_stack::{
-        ConnectorWriteControl, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
-    };
-    for concurrent in [false, true] {
-        let lake = FrozenRewriteLake::new();
-        lake.write_rows(
-            novarocks_spi::connector::ConnectorWriteIntent::Append,
-            &[1],
-            "a",
-        );
-        lake.write_rows(
-            novarocks_spi::connector::ConnectorWriteIntent::Append,
-            &[2],
-            "b",
-        );
-        let plan = lake.plan();
-        let session = lake.control.begin_write(lake.request(&plan)).unwrap();
-        for (target, cohort) in session.targets().iter().zip(plan.cohorts()) {
-            assert_eq!(target.rewrite_group_digest(), Some(cohort.group_digest()));
-        }
-        let handle = lake
-            .adapter
-            .commit_session(session.commit_session())
-            .unwrap();
-        let selected = crate::commit::write_stack::control::selected_rewrite_files(handle).unwrap();
-        let content = plan
-            .frozen()
-            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
-            .unwrap();
-        assert_eq!(
-            selected.data_paths,
-            content
-                .groups
-                .iter()
-                .flat_map(|g| g.data_files.iter().map(|f| EntryIdentity::DataFile {
-                    path: f.path.clone()
-                }))
-                .collect()
-        );
-        let row_count = lake.output(&session, &[1, 2], "rewritten");
-        if concurrent {
-            lake.write_rows(
-                novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
-                &[99],
-                "concurrent",
-            );
-        }
-        let result = lake
-            .control
-            .finish_write(ConnectorWriteFinishRequest {
-                commit: session.commit_session(),
-                row_count,
-                statistics: Vec::new(),
-                publication: ConnectorWriteFinishPublication::None,
-                context: request_context(),
-            })
-            .unwrap();
-        if concurrent {
-            assert!(
-                matches!(result, ExternalMutationOutcome::KnownUncommitted { .. }),
-                "{result:?}"
-            );
-            assert_eq!(lake.rows(), vec![99]);
-        } else {
-            assert!(
-                matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
-                "{result:?}"
-            );
-            assert_eq!(lake.rows(), vec![1, 2]);
-        }
-        lake.inventory();
-    }
-}
-
-#[test]
 fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
     let lake = FrozenRewriteLake::new();
     lake.write_rows(
@@ -3662,7 +3532,7 @@ fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
         .frozen()
         .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
         .unwrap();
-    for case in 0..8 {
+    for case in 0..12 {
         let mut content = original.as_ref().clone();
         let mut owner = lake.control.binding_key().clone();
         match case {
@@ -3674,6 +3544,10 @@ fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
             5 => content.artifact.groups.clear(),
             6 => content.artifact.table_uuid = "other".to_string(),
             7 => content.artifact.base_snapshot_id = None,
+            8 => content.artifact.base_sequence_number += 1,
+            9 => content.artifact.schema_id += 1,
+            10 => content.artifact.default_spec_id += 1,
+            11 => content.artifact.version -= 1,
             _ => unreachable!(),
         }
         let frozen = if case == 1 {
@@ -4934,30 +4808,54 @@ fn an_empty_finish_cannot_replace_an_original_terminal_or_inflight_fact() {
                     ),
                 ).unwrap()).0,
             };
-            assert_eq!(
-                handle.empty_write_decision(),
+            let rewrite = handle.flavor() == IcebergWriteFlavor::DistributedRewrite;
+            let empty = if rewrite {
+                let query = write_query_identity();
+                handle
+                    .with_active_receiving(|receiving| {
+                        receiving.begin_query(
+                            query,
+                            &handle.expected_targets(),
+                            &mut None,
+                            handle.targets(),
+                            None,
+                        )?;
+                        receiving.confirm(query)
+                    })
+                    .unwrap();
+                IcebergEmptyWriteDecision::Commit
+            } else {
                 IcebergEmptyWriteDecision::SkipExternalCommit
-            );
-            // Exercise the same no-op author directly for each flavor.
+            };
+            assert_eq!(handle.empty_write_decision(), empty);
             // The managed fixture does not construct a publication packet.
-            let finish = || -> Result<_, ConnectorError> {
-                match handle.claim_finish(|| empty_write_needed(&handle).map(Some))? {
-                    super::domain::ClaimedWriteFinish::EmptyNoOp(completion) => Ok(completion),
-                    _ => panic!("an empty NoOp must never enter publication"),
-                }
+            let finish = || {
+                handle.claim_finish(|| match empty {
+                    IcebergEmptyWriteDecision::SkipExternalCommit => {
+                        empty_write_needed(&handle).map(Some)
+                    }
+                    IcebergEmptyWriteDecision::Commit => Ok(None),
+                })
             };
             let mut original_needed = None;
             let mut original_evidence = None;
             match previous {
-                0 => {
-                    let ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } =
-                        finish().expect("original Active session may settle its NoOp")
-                    else {
-                        panic!("empty Active finish lost its NoOp")
-                    };
-                    assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
-                    original_needed = Some(needed);
-                }
+                0 => match finish().expect("the original Active session owns finish") {
+                    super::domain::ClaimedWriteFinish::Publish {
+                        received,
+                        empty_preflight_error,
+                    } if rewrite => {
+                        assert!(received.is_empty());
+                        assert!(empty_preflight_error.is_none());
+                    }
+                    super::domain::ClaimedWriteFinish::EmptyNoOp(
+                        ConnectorWritePublicationCompletion::KnownCommitted { needed, .. },
+                    ) if !rewrite => {
+                        assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
+                        original_needed = Some(needed);
+                    }
+                    _ => panic!("the active empty write lost its flavor's publication decision"),
+                },
                 1 => {
                     assert!(matches!(
                         release_session_state(
@@ -5023,7 +4921,9 @@ fn an_empty_finish_cannot_replace_an_original_terminal_or_inflight_fact() {
             let state_before = format!("{:?}", handle.state().unwrap());
             let cleanup_before = handle.terminal_cleanup();
             let responsibility_before = handle.cleanup_responsibility();
-            let rejected = finish().expect_err("empty finish cannot replace an earlier fact");
+            let Err(rejected) = finish() else {
+                panic!("empty finish cannot replace an earlier fact");
+            };
             assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
             assert_eq!(format!("{:?}", handle.state().unwrap()), state_before);
             assert_eq!(handle.terminal_cleanup(), cleanup_before);

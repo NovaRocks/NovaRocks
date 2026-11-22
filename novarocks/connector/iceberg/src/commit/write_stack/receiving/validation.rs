@@ -29,8 +29,8 @@ use crate::iceberg::spec::DataContentType;
 
 use super::super::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCreationReceipt,
-    IcebergDeletionVectorArtifact, IcebergFinalDeleteKind, IcebergSealedWriteTarget,
-    IcebergWriteBranch, IcebergWriteCommitSession, corrupt, invalid,
+    IcebergDeletionVectorArtifact, IcebergFinalDeleteKind, IcebergWriteBranch,
+    IcebergWriteCommitSession, corrupt, invalid,
 };
 
 type Creation = (WriteTargetOrdinal, IcebergCreationReceipt);
@@ -95,7 +95,6 @@ impl StatementIndexes {
 
 pub(crate) struct FragmentAdmission<'session, 'fragment> {
     handle: &'session IcebergWriteCommitSession,
-    targets: BTreeMap<WriteTargetOrdinal, &'session IcebergSealedWriteTarget>,
     previous: Option<&'session StatementIndexes>,
     keys: IndexKeys<'fragment>,
     // Record-local witnesses only. Across records the compact deletion effect
@@ -127,11 +126,6 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
     ) -> Self {
         Self {
             handle,
-            targets: handle
-                .targets()
-                .iter()
-                .map(|target| (target.ordinal(), target))
-                .collect(),
             previous,
             keys: IndexKeys::default(),
             v2_partitions: BTreeMap::new(),
@@ -212,12 +206,21 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
             ));
         }
         let new_creation = self.check_creation(ordinal, fragment, admits_creation)?;
-        let target = self.targets.get(&ordinal).copied().ok_or_else(|| {
-            invalid(format!(
-                "Iceberg commit fragment names write target {} which this session never sealed",
-                ordinal.get()
-            ))
-        })?;
+        // The normal planner emits dense sorted targets. The validated handle
+        // can also retain a different ordering, so keep exact identity lookup.
+        // In compact mode this avoids rebuilding the full session index for
+        // every output record of a large rewrite.
+        let targets = self.handle.targets();
+        let target = targets
+            .get(ordinal.get() as usize)
+            .filter(|target| target.ordinal() == ordinal)
+            .or_else(|| targets.iter().find(|target| target.ordinal() == ordinal))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "Iceberg commit fragment names write target {} which this session never sealed",
+                    ordinal.get()
+                ))
+            })?;
         let branch = target.branch();
         if fragment.branch() != branch {
             return Err(invalid(format!(

@@ -17,6 +17,7 @@
 
 //! Freeze once from admission; every catalog conflict prepares fresh metadata.
 
+#[cfg(test)]
 mod lineage;
 mod managed_repartition;
 pub(super) use managed_repartition::slot_matches;
@@ -185,6 +186,123 @@ pub(in crate::commit) fn written_file_with_historical_partition(
     })
 }
 
+pub(in crate::commit) struct RewriteFileBacking {
+    pub(in crate::commit) file: usize,
+    pub(in crate::commit) partition: usize,
+}
+
+/// Quote the file backing before copying any decoded fragment member. The
+/// same quote covers the SDK's mutable builder while it clones the final file.
+pub(in crate::commit) fn rewrite_file_backing(
+    fragment: &IcebergCommitFragment,
+    metadata: &TableMetadata,
+) -> Result<RewriteFileBacking, ConnectorError> {
+    use std::alloc::Layout;
+
+    use crate::iceberg::spec::{Datum, Literal, PrimitiveType};
+    use novarocks_type_contract::owned_resources::hashmap::fresh_table_layout;
+
+    fn add(total: &mut usize, extra: usize) -> Result<(), ConnectorError> {
+        *total = total.checked_add(extra).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg rewrite file backing extent is unrepresentable",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn array<T>(count: usize) -> Result<usize, ConnectorError> {
+        Layout::array::<T>(count)
+            .map(|layout| layout.size())
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::ResourceExhausted, error.to_string())
+            })
+    }
+
+    fn map<T>(count: usize) -> Result<usize, ConnectorError> {
+        fresh_table_layout::<i32, T>(count)
+            .map(|facts| facts.request_bytes_upper_bound)
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::ResourceExhausted, error.to_string())
+            })
+    }
+
+    fn literal_bytes(ty: &PrimitiveType, raw: &[u8]) -> usize {
+        match ty {
+            PrimitiveType::String | PrimitiveType::Fixed(_) | PrimitiveType::Binary => raw.len(),
+            _ => 0,
+        }
+    }
+
+    let IcebergCommitArtifact::DataFile(file) = fragment.artifact() else {
+        return Err(corrupt("Iceberg rewrite received a non-data addition"));
+    };
+    let source_partition = file.partition();
+    if source_partition.partition_spec_id() != metadata.default_partition_spec_id() {
+        return Err(corrupt(
+            "Iceberg rewrite output does not match its frozen partition spec",
+        ));
+    }
+    let values = &source_partition.descriptor().values;
+    let partition_type = metadata.default_partition_type();
+    if values.len() != partition_type.fields().len() {
+        return Err(corrupt(
+            "Iceberg rewrite partition width differs from its frozen spec",
+        ));
+    }
+    let mut partition = array::<Option<Literal>>(values.len())?;
+    for (value, field) in values.iter().zip(partition_type.fields()) {
+        if value.is_null {
+            continue;
+        }
+        let bytes = value
+            .datum_bytes
+            .as_deref()
+            .ok_or_else(|| corrupt("Iceberg rewrite partition is missing its encoded value"))?;
+        let ty = field
+            .field_type
+            .as_primitive_type()
+            .ok_or_else(|| corrupt("Iceberg rewrite partition field type is not primitive"))?;
+        add(&mut partition, literal_bytes(ty, bytes))?;
+    }
+
+    let mut file_bytes = fragment.path().len();
+    add(&mut file_bytes, partition)?;
+    let metrics = file.metrics();
+    add(
+        &mut file_bytes,
+        array::<i64>(metrics.split_offsets().len())?,
+    )?;
+    if let Some(stats) = metrics.column_stats() {
+        for counts in [
+            &stats.column_sizes,
+            &stats.value_counts,
+            &stats.null_value_counts,
+            &stats.nan_value_counts,
+        ] {
+            add(&mut file_bytes, map::<u64>(counts.len())?)?;
+        }
+        let schema = metadata.current_schema();
+        for bounds in [&stats.lower_bounds, &stats.upper_bounds] {
+            add(
+                &mut file_bytes,
+                map::<Datum>(projected_bounds(bounds).count())?,
+            )?;
+            for (&field_id, raw) in projected_bounds(bounds) {
+                add(
+                    &mut file_bytes,
+                    literal_bytes(bound_type(schema, field_id)?, raw),
+                )?;
+            }
+        }
+    }
+    Ok(RewriteFileBacking {
+        file: file_bytes,
+        partition,
+    })
+}
+
 struct WriteRecipe<'a> {
     source: Arc<TableMetadata>,
     files: Vec<WrittenFile>,
@@ -193,7 +311,7 @@ struct WriteRecipe<'a> {
     fixed_mutation: bool,
     session_protocol: WriteSessionCommitProtocol,
     writer: WriterSchemaSpec,
-    selected: Option<crate::commit::selected_rewrite::SelectedRewriteFiles>,
+    rewrite_removals: Option<Arc<[crate::commit::model::FrozenEntry]>>,
     start: Option<StartSnapshot>,
     target: TableTarget,
     target_ref: String,
@@ -303,10 +421,6 @@ impl<'a> WriteRecipe<'a> {
         }
         let materialized = (!targets.is_empty())
             .then(|| Arc::new(materialized::MaterializedDeleteStep::new(targets)));
-        let selected = selected_rewrite_files(handle);
-        if crate::schema_facts::row_lineage_enabled(&source) && selected.is_some() {
-            lineage::freeze_preserved_row_ids(validated, &mut files)?;
-        }
         let output_facts = crate::write_codec::written_output_facts(&files).map_err(invalid)?;
         let mut summary = session_snapshot_properties_for_commit(handle)?;
         let keyed_documents = documents.map(|intent| intent.documents.clone());
@@ -359,7 +473,7 @@ impl<'a> WriteRecipe<'a> {
             fixed_mutation,
             session_protocol: handle.commit_protocol(),
             writer,
-            selected,
+            rewrite_removals: handle.frozen_rewrite_removals().cloned(),
             start: facts.base_snapshot_id().map(|id| StartSnapshot {
                 snapshot_id: id,
                 sequence_number: facts.base_sequence_number(),
@@ -383,20 +497,10 @@ impl<'a> WriteRecipe<'a> {
         let mut added = Vec::new();
         for file in &self.files {
             let data = crate::commit::data_file::from_written_file(file)?;
-            let entry = if self.op_kind == CommitOpKind::SelectedRewrite {
-                AddedContent::rewritten_data(
-                    data,
-                    file.partition_spec_id,
-                    self.start
-                        .ok_or_else(|| {
-                            format_error(invalid("Rewrite requires a frozen source snapshot"))
-                        })?
-                        .sequence_number,
-                )?
-            } else {
-                AddedContent::new_logical_data(data, file.partition_spec_id)?
-            };
-            added.push(entry);
+            added.push(AddedContent::new_logical_data(
+                data,
+                file.partition_spec_id,
+            )?);
         }
         let mut removed = Vec::new();
         if let Some(step) = &self.materialized {
@@ -420,6 +524,7 @@ impl<'a> WriteRecipe<'a> {
                     | CommitOpKind::Overwrite
                     | CommitOpKind::RowDelta
                     | CommitOpKind::MaterializedRowDelta
+                    | CommitOpKind::SelectedRewrite
             )
         {
             let source_io = operation.begin_attempt()?;
@@ -427,17 +532,6 @@ impl<'a> WriteRecipe<'a> {
                 ValidationInputs::new(&self.source, self.start.map(|s| s.snapshot_id), &source_io);
             let live = inputs.compact_live_entries().await?;
             let mut identities: BTreeSet<_> = match self.op_kind {
-                CommitOpKind::SelectedRewrite => {
-                    let selected = self
-                        .selected
-                        .as_ref()
-                        .ok_or_else(|| format_error(invalid("Selected rewrite input is absent")))?;
-                    selected
-                        .data_paths
-                        .union(&selected.delete_paths)
-                        .cloned()
-                        .collect()
-                }
                 CommitOpKind::Truncate => live.keys().cloned().collect(),
                 CommitOpKind::OverwritePartitions => live
                     .iter()
@@ -486,6 +580,15 @@ impl<'a> WriteRecipe<'a> {
             WriteSessionCommitProtocol::Legacy => {
                 (self.dependencies.clone(), CommitProtocol::Legacy)
             }
+            WriteSessionCommitProtocol::RewriteFiles => (
+                Vec::new(),
+                CommitProtocol::RewriteFiles {
+                    output_spec_id: self.writer.default_spec_id,
+                    replaced: Arc::clone(self.rewrite_removals.as_ref().ok_or_else(|| {
+                        format_error(internal("Iceberg rewrite lost its original removal facts"))
+                    })?),
+                },
+            ),
             WriteSessionCommitProtocol::RowDelta(_) => {
                 let window = operation.row_delta_check().ok_or_else(|| {
                     format_error(internal(
@@ -538,6 +641,17 @@ impl<'a> WriteRecipe<'a> {
         if let Some(step) = &self.materialized {
             return Ok(Box::new(Arc::clone(step)));
         }
+        if self.session_protocol.operation() == crate::commit::model::CommitOperation::Optimize {
+            let stage = self
+                .compact_stage
+                .ok_or_else(|| internal("Iceberg rewrite lost its original compact additions"))?;
+            return Ok(Box::new(
+                crate::commit::selected_rewrite::CompactRewritePreparer {
+                    operation: operation.clone(),
+                    stage,
+                },
+            ));
+        }
         if self.compact_stage.is_some() {
             return Ok(Box::new(
                 crate::commit::fast_append::CompactFastAppendPreparer(operation.clone()),
@@ -566,18 +680,13 @@ impl<'a> WriteRecipe<'a> {
                 }
                 Box::new(crate::commit::fast_append::FastAppendPreparer)
             }
-            CommitOpKind::SelectedRewrite => {
-                Box::new(crate::commit::selected_rewrite::SelectedRewritePreparer {
-                    files: self
-                        .selected
-                        .clone()
-                        .ok_or_else(|| invalid("Selected rewrite input is absent"))?,
-                })
-            }
             CommitOpKind::OverwritePartitions => {
                 Box::new(crate::commit::overwrite_partitions::OverwritePartitionsPreparer)
             }
             CommitOpKind::Truncate => Box::new(crate::commit::truncate::TruncatePreparer),
+            CommitOpKind::SelectedRewrite => {
+                return Err(internal("Iceberg rewrite lost its RewriteFiles protocol"));
+            }
         })
     }
 }
@@ -946,7 +1055,7 @@ impl IcebergWriteSessionControl {
         );
         let catalog = Arc::clone(self.runtime.novarocks_catalog());
         let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
-            expected_table_uuid: recipe.selected.as_ref().map(|_| recipe.source.uuid()),
+            expected_table_uuid: None,
             catalog_operation: handle.flavor().catalog_operation(),
             catalog,
             ident: recipe.target.ident.clone(),
@@ -987,7 +1096,38 @@ impl IcebergWriteSessionControl {
                 Some(managed) => managed,
                 None => data.as_ref(),
             };
-            preparers.extend([data, &stats as &dyn Preparer]);
+            let carried_statistics = if matches!(
+                recipe.session_protocol,
+                WriteSessionCommitProtocol::RewriteFiles
+            ) {
+                let Some((stage, author)) = recipe
+                    .compact_stage
+                    .zip(handle.rewrite_payload_byte_author())
+                else {
+                    let failure = format_error(internal(
+                        "Iceberg rewrite statistics lost its original Replace stage or byte author",
+                    ));
+                    return attempt::rejected(
+                        &run_operation,
+                        attempt::before_dispatch_failure(&failure),
+                    )
+                    .await;
+                };
+                Some(
+                    crate::commit::statistics_carry::CarryForwardStatisticsPreparer::new(
+                        &run_operation,
+                        stage,
+                        author,
+                    ),
+                )
+            } else {
+                None
+            };
+            preparers.push(data);
+            if let Some(carry) = &carried_statistics {
+                preparers.push(carry);
+            }
+            preparers.push(&stats);
             attempt::run_to_committed_frontier(
                 &run_operation,
                 &intent,

@@ -246,7 +246,7 @@ fn paid_projection_consumes_only_its_exact_original_fragment() {
     let first = decode(&adapter, data(), &author);
     let mut other = Some(decode(&adapter, data(), &author));
     let original = window.lock().unwrap().live;
-    let mut preparation = CompactEntry::prepare(&adapter, &first, 0, &author).unwrap();
+    let mut preparation = CompactEntry::prepare(&adapter, &first, 0, &author, None).unwrap();
     assert!(window.lock().unwrap().live > original);
     let result = preparation.finish(&adapter, &mut other);
     drop(preparation);

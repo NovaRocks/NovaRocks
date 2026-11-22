@@ -19,6 +19,7 @@
 
 // Design: ADR-0239 (docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)
 
+use std::alloc::Layout;
 use std::collections::{BTreeMap, LinkedList};
 use std::sync::Arc;
 
@@ -40,8 +41,11 @@ use super::staging::{
     ManifestEntryWrite, StagedView, write_manifest_with_sources, write_sourced_manifest,
 };
 use super::write_stack::codec::CompactFragmentCodec;
-use super::write_stack::control::publication::written_file_with_historical_partition;
-use super::write_stack::receiving::compact::{AddedCounters, CompactEntry};
+use super::write_stack::control::publication::{
+    rewrite_file_backing, written_file_with_historical_partition,
+};
+use super::write_stack::domain::IcebergCommitFragment;
+use super::write_stack::receiving::compact::{AddedCounters, CompactAddition, CompactEntry};
 use super::write_stack::receiving::{AdditionGroup, ReceivedCompactFiles};
 
 mod registered;
@@ -227,6 +231,7 @@ async fn write_pending(
     historical: Option<&BTreeMap<i32, StructType>>,
 ) -> Result<WrittenNewManifests> {
     let version = view.metadata().format_version();
+    let rewrite_sequence = view.rewrite_source_sequence()?;
     let target_bytes = manifest_target_bytes(view)?;
     let ReceivedCompactFiles {
         groups,
@@ -279,6 +284,7 @@ async fn write_pending(
             codec: &pending.codec,
             author,
             partition_type,
+            rewrite_sequence,
         };
         let output = RollingOutput {
             view,
@@ -346,6 +352,7 @@ enum RollingInput<'a> {
         codec: &'a CompactFragmentCodec,
         author: &'a ConnectorPayloadRetentionGuard,
         partition_type: Option<&'a StructType>,
+        rewrite_sequence: Option<i64>,
     },
     Registered(std::vec::IntoIter<super::RegisteredFile>),
 }
@@ -407,42 +414,65 @@ impl RollingInput<'_> {
                 codec,
                 author,
                 partition_type,
+                rewrite_sequence,
             } => {
                 let remaining = entries.split_off(count);
                 let batch = std::mem::replace(entries, remaining);
-                let values = batch
-                    .iter()
-                    .map(|entry| {
-                        view.artifacts().check_active()?;
-                        decode_addition(output.source, codec, author, entry, *partition_type)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let descriptor = if let Some(partition_type) = partition_type {
-                    let source = Arc::new(ManifestWriteSource::for_position_output(
-                        output.source.current_schema().clone(),
-                        output.spec.clone(),
-                        (*partition_type).clone(),
-                    ));
-                    let sourced = values
-                        .into_iter()
-                        .map(|entry| SourcedManifestEntry {
-                            source: Arc::clone(&source),
-                            entry,
-                        })
-                        .collect();
-                    write_sourced_manifest(
-                        view.artifacts(),
-                        view.metadata(),
-                        output.snapshot,
-                        output.spec,
-                        ManifestContentType::Deletes,
-                        sourced,
-                        &[],
-                    )
-                    .await?
+                let mut descriptor = if let Some(sequence) = *rewrite_sequence {
+                    if partition_type.is_some() {
+                        return Err(invariant(
+                            "Iceberg rewrite output must use its frozen data partition",
+                        ));
+                    }
+                    output
+                        .write_rewrite_data(&batch, codec, author, sequence)
+                        .await?
                 } else {
-                    output.write_data(values.into_iter().map(Ok)).await?
+                    let values = batch
+                        .iter()
+                        .map(|entry| {
+                            view.artifacts().check_active()?;
+                            decode_addition(output.source, codec, author, entry, *partition_type)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if let Some(partition_type) = partition_type {
+                        let source = Arc::new(ManifestWriteSource::for_position_output(
+                            output.source.current_schema().clone(),
+                            output.spec.clone(),
+                            (*partition_type).clone(),
+                        ));
+                        let sourced = values
+                            .into_iter()
+                            .map(|entry| SourcedManifestEntry {
+                                source: Arc::clone(&source),
+                                entry,
+                            })
+                            .collect();
+                        write_sourced_manifest(
+                            view.artifacts(),
+                            view.metadata(),
+                            output.snapshot,
+                            output.spec,
+                            ManifestContentType::Deletes,
+                            sourced,
+                            &[],
+                        )
+                        .await?
+                    } else {
+                        output.write_data(values.into_iter().map(Ok)).await?
+                    }
                 };
+                if rewrite_sequence.is_some()
+                    && view.metadata().format_version() == FormatVersion::V3
+                {
+                    descriptor.first_row_id = batch
+                        .iter()
+                        .filter_map(|entry| entry.addition.as_ref()?.first_row_id)
+                        .min()
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| invariant("Iceberg rewrite row ID must be nonnegative"))?;
+                }
                 // Compact inputs and their receipts survive the actual write.
                 drop(batch);
                 Ok(descriptor)
@@ -463,6 +493,63 @@ impl RollingInput<'_> {
 }
 
 impl RollingOutput<'_, '_> {
+    async fn write_rewrite_data(
+        &self,
+        batch: &LinkedList<CompactEntry>,
+        codec: &CompactFragmentCodec,
+        author: &ConnectorPayloadRetentionGuard,
+        sequence: i64,
+    ) -> Result<ManifestFile> {
+        let slots = Layout::array::<PaidRewriteFile>(batch.len()).map_err(rewrite_resource)?;
+        let _slots = reserve_rewrite_backing(author, slots.size())?;
+        let mut files = Vec::new();
+        files
+            .try_reserve_exact(batch.len())
+            .map_err(rewrite_resource)?;
+        let sequence =
+            (self.view.metadata().format_version() != FormatVersion::V1).then_some(sequence);
+        let mut partition_bytes = 0;
+        for entry in batch {
+            self.view.artifacts().check_active()?;
+            let addition = entry.addition.as_ref().expect("grouped data addition");
+            let (fragment, decoded) = decode_compact_file(codec, author, addition)?;
+            let backing = rewrite_file_backing(&fragment, self.source).map_err(project_failure)?;
+            // The decoded source stays paid while the projection creates its
+            // owned path, partition, metric maps and bound values.
+            let file_receipt = reserve_rewrite_backing(author, backing.file)?;
+            let written = written_file_with_historical_partition(
+                &fragment,
+                self.source,
+                Some(self.source.default_partition_type()),
+            )
+            .map_err(project_failure)?;
+            drop(fragment);
+            drop(decoded);
+
+            // DataFileBuilder::build clones its owned fields. That copy and
+            // the builder coexist until finish_addition returns.
+            let builder_receipt = reserve_rewrite_backing(author, backing.file)?;
+            let entry = finish_addition(written, self.source, addition, None, sequence)?;
+            drop(builder_receipt);
+            files.push(PaidRewriteFile {
+                entry: Some(entry),
+                _file: file_receipt,
+            });
+            partition_bytes = partition_bytes.max(backing.partition);
+        }
+        // The fixed manifest encoder validates one projected partition at a
+        // time, while the complete batch of file values is still live.
+        let _partition = (partition_bytes != 0)
+            .then(|| reserve_rewrite_backing(author, partition_bytes))
+            .transpose()?;
+        let batch = PaidRewriteBatch(files.iter_mut());
+        let result = self.write_data(batch).await;
+        // The iterator moves each DataFile into the SDK's writer. Its receipt
+        // remains here until the writer completes or its future has exited.
+        drop(files);
+        result
+    }
+
     async fn write_data(
         &self,
         entries: impl Iterator<Item = Result<ManifestEntryWrite>>,
@@ -521,23 +608,79 @@ async fn write_rolled(
     }
 }
 
-fn decode_addition(
-    source: &TableMetadata,
+struct PaidRewriteFile {
+    entry: Option<ManifestEntryWrite>,
+    _file: ConnectorPayloadRetentionGuard,
+}
+
+struct PaidRewriteBatch<'a>(std::slice::IterMut<'a, PaidRewriteFile>);
+
+impl Iterator for PaidRewriteBatch<'_> {
+    type Item = Result<ManifestEntryWrite>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let file = self.0.next()?;
+        Some(Ok(file
+            .entry
+            .take()
+            .expect("rewrite manifest entry is written once")))
+    }
+}
+
+fn rewrite_resource(error: impl std::fmt::Display) -> Error {
+    project_failure(ConnectorError::new(
+        ConnectorErrorKind::ResourceExhausted,
+        error.to_string(),
+    ))
+}
+
+fn project_failure(error: ConnectorError) -> Error {
+    Error::new(ErrorKind::DataInvalid, error.message()).with_source(error)
+}
+
+fn reserve_rewrite_backing(
+    author: &ConnectorPayloadRetentionGuard,
+    bytes: usize,
+) -> Result<ConnectorPayloadRetentionGuard> {
+    author.reserve_owned_bytes(bytes).map_err(project_failure)
+}
+
+fn decode_compact_file(
     codec: &CompactFragmentCodec,
     author: &ConnectorPayloadRetentionGuard,
-    entry: &CompactEntry,
-    historical: Option<&crate::iceberg::spec::StructType>,
-) -> Result<ManifestEntryWrite> {
-    let addition = entry.addition.as_ref().expect("grouped data addition");
-    let (fragment, _decoded) = codec.decode(&addition.payload, author).map_err(|error| {
+    addition: &CompactAddition,
+) -> Result<(IcebergCommitFragment, ConnectorPayloadRetentionGuard)> {
+    codec.decode(&addition.payload, author).map_err(|error| {
         Error::new(
             ErrorKind::Unexpected,
             "Could not decode paid compact addition",
         )
         .with_source(error)
-    })?;
+    })
+}
+
+fn decode_addition(
+    source: &TableMetadata,
+    codec: &CompactFragmentCodec,
+    author: &ConnectorPayloadRetentionGuard,
+    entry: &CompactEntry,
+    historical: Option<&StructType>,
+) -> Result<ManifestEntryWrite> {
+    let addition = entry.addition.as_ref().expect("grouped data addition");
+    let (fragment, _decoded) = decode_compact_file(codec, author, addition)?;
     let written = written_file_with_historical_partition(&fragment, source, historical)
-        .map_err(|error| Error::new(ErrorKind::DataInvalid, error.message()).with_source(error))?;
+        .map_err(project_failure)?;
+    drop(fragment);
+    finish_addition(written, source, addition, historical, None)
+}
+
+fn finish_addition(
+    mut written: super::WrittenFile,
+    source: &TableMetadata,
+    addition: &CompactAddition,
+    historical: Option<&StructType>,
+    rewrite_sequence: Option<i64>,
+) -> Result<ManifestEntryWrite> {
     if written.path != addition.object_path.as_ref()
         || written.partition_spec_id != addition.partition_spec_id
     {
@@ -555,12 +698,28 @@ fn decode_addition(
             "Historical position output cannot carry table-column bounds",
         ));
     }
-    drop(fragment);
+    if rewrite_sequence.is_some() {
+        written.first_row_id = addition.first_row_id;
+    }
     let file = super::data_file::into_written_file(written)?;
-    Ok(ManifestEntryWrite::Added(AddedContent::new_logical_data(
-        file,
-        addition.partition_spec_id,
-    )?))
+    let added = match rewrite_sequence {
+        Some(sequence) => {
+            use super::model::SeqField;
+            let expected = if source.format_version() == FormatVersion::V1 {
+                SeqField::Inherit
+            } else {
+                SeqField::Explicit(sequence)
+            };
+            if addition.data_sequence != expected {
+                return Err(invariant(
+                    "Iceberg compact rewrite changed its source sequence",
+                ));
+            }
+            AddedContent::rewritten_data(file, addition.partition_spec_id, sequence)
+        }
+        None => AddedContent::new_logical_data(file, addition.partition_spec_id),
+    }?;
+    Ok(ManifestEntryWrite::Added(added))
 }
 
 async fn upgrade_v1(
@@ -569,6 +728,7 @@ async fn upgrade_v1(
     mut written: WrittenNewManifests,
 ) -> Result<WrittenNewManifests> {
     let version = view.metadata().format_version();
+    let rewrite_sequence = view.rewrite_source_sequence()?;
     let mut rewritten = Vec::with_capacity(written.manifests.len());
     for prior in written.manifests {
         view.artifacts().check_active()?;
@@ -588,12 +748,15 @@ async fn upgrade_v1(
                 ));
             }
             let entry = Arc::unwrap_or_clone(entry);
-            // V1's decoded zero is physical format behavior. Reauthor the
-            // original addition with inheritance for the winning publication.
-            Ok(ManifestEntryWrite::Added(AddedContent::new_logical_data(
-                entry.data_file,
-                prior.partition_spec_id,
-            )?))
+            // The V1 representation has no explicit age field. OPTIMIZE
+            // restores its frozen E sequence when the winning format has one.
+            let added = match rewrite_sequence {
+                Some(sequence) => {
+                    AddedContent::rewritten_data(entry.data_file, prior.partition_spec_id, sequence)
+                }
+                None => AddedContent::new_logical_data(entry.data_file, prior.partition_spec_id),
+            }?;
+            Ok(ManifestEntryWrite::Added(added))
         });
         let encoding = (
             version,

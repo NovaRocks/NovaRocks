@@ -17,20 +17,23 @@
 
 //! One-snapshot replacement of a provider-frozen Iceberg file set.
 //!
-//! The provider freezes logical entry identities before writer staging. The
-//! preparer rejects a target ref that no longer contains the owned live set.
+//! Resolve the original selected entries on the current publication base and
+//! consume new files from their operation-owned compact stage.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 
 use crate::commit::model::EntryIdentity;
 use async_trait::async_trait;
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SelectedRewriteFiles {
     pub(crate) data_paths: BTreeSet<EntryIdentity>,
     pub(crate) delete_paths: BTreeSet<EntryIdentity>,
 }
 
+#[cfg(test)]
 impl SelectedRewriteFiles {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.data_paths.is_empty() {
@@ -49,10 +52,12 @@ impl SelectedRewriteFiles {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct SelectedRewritePreparer {
     pub(crate) files: SelectedRewriteFiles,
 }
 
+#[cfg(test)]
 #[async_trait]
 impl super::staging::Preparer for SelectedRewritePreparer {
     async fn prepare(
@@ -106,608 +111,105 @@ impl super::staging::Preparer for SelectedRewritePreparer {
     }
 }
 
+#[cfg(test)]
 fn selected_invalid(message: impl Into<String>) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)
 }
 
-#[cfg(test)]
-mod preparer_tests {
-    use super::*;
-    use crate::commit::{dependency::ValidationInputs, model::*, staging::*};
-    use crate::iceberg::io::FileIO;
-    use crate::iceberg::spec::*;
-    use crate::iceberg::{NamespaceIdent, TableIdent};
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
+pub(crate) struct CompactRewritePreparer {
+    pub(super) operation: super::operation::IcebergCommitOperation,
+    pub(super) stage: usize,
+}
 
-    struct Writer {
-        directory: tempfile::TempDir,
-        io: FileIO,
-        attempt: AttemptToken,
-        ledger: Mutex<ArtifactLedger>,
-    }
-    impl Writer {
-        fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
-            let token = OperationToken::from_write(
-                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([19; 16]),
-            );
-            let handle = tokio::runtime::Handle::current();
-            let binding = crate::access_binding::IcebergReadBinding::new(
-                None,
-                novarocks_fs::FsAccessResolver::new(),
-                Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-                novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
-                Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle)),
-            );
-            let io = crate::fs_io::build_file_io_for_location(
-                &format!("file://{}", directory.path().display()),
-                binding,
-            );
-            Self {
-                directory,
-                io,
-                attempt: AttemptToken::new(token, 0),
-                ledger: Mutex::new(ArtifactLedger::new(token)),
-            }
-        }
-    }
-    impl ArtifactWriter for Writer {
-        fn file_io(&self) -> &FileIO {
-            &self.io
-        }
-        fn allocate(&self, kind: ArtifactKind) -> crate::iceberg::Result<ObjectIdentity> {
-            let mut ledger = self.ledger.lock().unwrap();
-            let object = ObjectIdentity::new(format!(
-                "file://{}/object-{}.{}",
-                self.directory.path().display(),
-                ledger.records().count(),
-                kind.extension()
-            ))?;
-            ledger.register(ArtifactRecord::produced(
-                object.clone(),
-                self.attempt_token(),
-                kind,
-            ))?;
-            Ok(object)
-        }
-        fn attempt_token(&self) -> AttemptToken {
-            self.attempt
-        }
-        fn check_active(&self) -> crate::iceberg::Result<()> {
-            Ok(())
-        }
-        fn snapshot_artifacts(
-            &self,
-            lists: &[crate::commit::model::ObjectIdentity],
-            statistics: &[crate::commit::model::ObjectIdentity],
-        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
-            self.ledger.lock().unwrap().snapshot_for_request(
-                self.attempt_token(),
-                lists,
-                statistics,
-            )
-        }
+#[async_trait]
+impl super::staging::Preparer for CompactRewritePreparer {
+    async fn prepare(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        use super::model::{CommitOperation, CommitProtocol};
+        use crate::iceberg::spec::Operation;
 
-        fn record_manifest(
-            &self,
-            object: &crate::commit::model::ObjectIdentity,
-            added_paths: &[String],
-            existing_paths: &[String],
-            replaces: &[String],
-        ) -> crate::iceberg::Result<()> {
-            let mut ledger = self.ledger.lock().unwrap();
-            // This callback follows the successful FileIO write in the fixture.
-            let written = ledger.records().any(|record| {
-                record.object == *object
-                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
-            });
-            if !written {
-                ledger.confirm_written_for_test(object)?;
-            }
-            ledger.record_manifest(object, added_paths, existing_paths, replaces)
-        }
-
-        fn record_manifest_list(
-            &self,
-            object: &crate::commit::model::ObjectIdentity,
-            snapshot_id: i64,
-            paths: &[String],
-        ) -> crate::iceberg::Result<()> {
-            let mut ledger = self.ledger.lock().unwrap();
-            // This callback follows the successful FileIO write in the fixture.
-            let written = ledger.records().any(|record| {
-                record.object == *object
-                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
-            });
-            if !written {
-                ledger.confirm_written_for_test(object)?;
-            }
-            ledger.record_manifest_list(object, snapshot_id, paths)
-        }
-    }
-    fn data(path: &str, first: Option<i64>) -> DataFile {
-        DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path(path.into())
-            .file_format(DataFileFormat::Parquet)
-            .record_count(3)
-            .file_size_in_bytes(100)
-            .partition_spec_id(0)
-            .first_row_id(first)
-            .build()
-            .unwrap()
-    }
-    fn metadata(writer: &Writer) -> TableMetadata {
-        TableMetadataBuilder::new(
-            Schema::builder()
-                .with_fields(vec![Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Long),
-                ))])
-                .build()
-                .unwrap(),
-            PartitionSpec::unpartition_spec(),
-            SortOrder::unsorted_order(),
-            format!("file://{}", writer.directory.path().display()),
-            FormatVersion::V3,
-            HashMap::new(),
-        )
-        .unwrap()
-        .build()
-        .unwrap()
-        .metadata
-    }
-    async fn append_fixture(
-        writer: &Writer,
-        metadata: TableMetadata,
-        files: Vec<DataFile>,
-        snapshot_id: i64,
-        target: &str,
-    ) -> TableMetadata {
-        let mut manifests = Vec::new();
-        for content in [DataContentType::Data, DataContentType::PositionDeletes] {
-            let group = files
-                .iter()
-                .filter(|f| f.content_type() == content)
-                .cloned()
-                .collect::<Vec<_>>();
-            if group.is_empty() {
-                continue;
-            }
-            manifests.push(
-                write_manifest(
-                    writer,
-                    FormatVersion::V3,
-                    snapshot_id,
-                    metadata.current_schema().clone(),
-                    metadata.default_partition_spec().as_ref().clone(),
-                    if content == DataContentType::Data {
-                        ManifestContentType::Data
-                    } else {
-                        ManifestContentType::Deletes
-                    },
-                    group.into_iter().map(|f| {
-                        ManifestEntryWrite::Added(AddedContent::new_logical_data(f, 0).unwrap())
-                    }),
-                )
-                .await
-                .unwrap(),
-            );
-        }
-        let list = crate::commit::staging::write_manifest_list(
-            writer,
-            &metadata,
+        let CommitProtocol::RewriteFiles { replaced, .. } = intent.protocol() else {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::Unexpected,
+                "Compact rewrite preparer requires its original RewriteFiles intent",
+            ));
+        };
+        let validation = |detail: String| {
+            crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, detail.clone())
+                .with_source(super::commit_failure::validation_failure(
+                    CommitOperation::Optimize,
+                    detail,
+                ))
+        };
+        let current = view
+            .metadata()
+            .snapshot_for_ref(view.target_ref())
+            .ok_or_else(|| {
+                let path = replaced.first().map_or("", |entry| entry.identity().path());
+                super::base_removal::missing_required_file(CommitOperation::Optimize, path)
+            })?;
+        let snapshot_id = current.snapshot_id();
+        let mut scope = crate::manifest::target_query::ManifestReadScope::new(
+            view.metadata_ref(),
             snapshot_id,
+        )?
+        .with_owned_request(self.operation.request_context());
+        let removed = super::base_removal::locate_on_base(
+            &mut scope,
+            replaced.iter(),
+            CommitOperation::Optimize,
+            view.artifacts().file_io(),
+            || view.artifacts().check_active(),
+        )
+        .await?;
+        let sources = scope.snapshot_sources()?;
+        let removed = removed.iter().collect::<Vec<_>>();
+        let snapshot = view.stage_snapshot_id()?;
+        let (added, counts) = super::new_manifests::prepare_added_manifests(
+            &self.operation,
+            view,
+            self.stage,
+            snapshot,
             None,
+        )
+        .await?;
+        let mut summary = super::overwrite::snapshot_file_summary(&[], &removed)?;
+        summary.extend(super::overwrite::compact_append_summary(counts));
+        let removed_rows = replaced
+            .iter()
+            .filter(|entry| matches!(entry.identity(), EntryIdentity::DataFile { .. }))
+            .try_fold(0u64, |sum, entry| {
+                sum.checked_add(entry.facts().record_count).ok_or_else(|| {
+                    validation("Replaced Iceberg record count is unrepresentable".to_string())
+                })
+            })?;
+        if counts.data.rows > removed_rows {
+            return Err(validation(format!(
+                "Invalid REPLACE operation: {} added records > {removed_rows} replaced records",
+                counts.data.rows,
+            )));
+        }
+        super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
+        let manifests = super::manifest_transform::ordinary_manifests_scoped(
+            view, snapshot, &sources, &removed, added, &scope, true,
+        )
+        .await?;
+        super::overwrite::prepare_ordinary_snapshot_change(
+            view,
+            intent,
+            snapshot,
+            Operation::Replace,
             manifests,
+            summary,
+            false,
         )
         .await
-        .unwrap();
-        let builder = Snapshot::builder()
-            .with_snapshot_id(snapshot_id)
-            .with_sequence_number(metadata.next_sequence_number())
-            .with_timestamp_ms(metadata.last_updated_ms() + 1)
-            .with_manifest_list(list.object.path().to_string())
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::from([
-                    (
-                        "total-records".into(),
-                        files
-                            .iter()
-                            .filter(|f| f.content_type() == DataContentType::Data)
-                            .map(|f| f.record_count())
-                            .sum::<u64>()
-                            .to_string(),
-                    ),
-                    (
-                        "total-data-files".into(),
-                        files
-                            .iter()
-                            .filter(|f| f.content_type() == DataContentType::Data)
-                            .count()
-                            .to_string(),
-                    ),
-                    (
-                        "total-delete-files".into(),
-                        files
-                            .iter()
-                            .filter(|f| f.content_type() != DataContentType::Data)
-                            .count()
-                            .to_string(),
-                    ),
-                    (
-                        "total-files-size".into(),
-                        files
-                            .iter()
-                            .map(|f| {
-                                super::super::row_delta_dv_metadata::logical_file_size(f).unwrap()
-                            })
-                            .sum::<u64>()
-                            .to_string(),
-                    ),
-                ]),
-            })
-            .with_schema_id(metadata.current_schema_id());
-        let (first, count) = list.row_range.unwrap();
-        let snapshot = builder.with_row_range(first, count).build();
-        metadata
-            .into_builder(None)
-            .set_branch_snapshot(snapshot, target)
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata
-    }
-    async fn fixture(writer: &Writer, dvs: bool) -> TableMetadata {
-        let mut files = vec![
-            data("file:///source-a.parquet", None),
-            data("file:///source-b.parquet", None),
-        ];
-        if dvs {
-            let mut dv = super::super::puffin_dv::DeletionVector::new();
-            dv.insert(1).unwrap();
-            let inputs = ["file:///source-a.parquet", "file:///source-b.parquet"].map(|path| {
-                super::super::puffin_dv::DeletionVectorBlobInput {
-                    referenced_data_file: path.into(),
-                    deletion_vector: dv.clone(),
-                }
-            });
-            let written = super::super::puffin_dv::write_multi_deletion_vector_puffin_allocated(
-                writer, &inputs,
-            )
-            .await
-            .unwrap();
-            for blob in written {
-                files.push(
-                    DataFileBuilder::default()
-                        .content(DataContentType::PositionDeletes)
-                        .file_path(blob.path)
-                        .file_format(DataFileFormat::Puffin)
-                        .record_count(blob.cardinality)
-                        .file_size_in_bytes(blob.file_size_in_bytes)
-                        .partition_spec_id(0)
-                        .content_offset(Some(blob.content_offset))
-                        .content_size_in_bytes(Some(blob.content_size_in_bytes))
-                        .referenced_data_file(Some(blob.referenced_data_file))
-                        .build()
-                        .unwrap(),
-                );
-            }
-        }
-        let metadata = append_fixture(writer, metadata(writer), files, 10, "dev").await;
-        append_fixture(
-            writer,
-            metadata,
-            vec![data("file:///only-main.parquet", None)],
-            20,
-            "main",
-        )
-        .await
-    }
-    fn intent(
-        writer: &Writer,
-        metadata: &TableMetadata,
-        added: Vec<AddedContent>,
-        removed: Vec<FrozenEntry>,
-        shape: RequestShape,
-    ) -> OperationIntent {
-        OperationIntent::new(OperationIntentParts {
-            target: TableTarget {
-                ident: TableIdent::new(NamespaceIdent::new("db".into()), "t".into()),
-                uuid: Some(metadata.uuid()),
-            },
-            target_ref: "dev".into(),
-            start: Some(StartSnapshot {
-                snapshot_id: 10,
-                sequence_number: 1,
-            }),
-            changes: FileChanges { added, removed },
-            dependencies: vec![Dependency::RefUnchanged],
-            protocol: crate::commit::model::CommitProtocol::Legacy,
-            shape,
-            summary: BTreeMap::new(),
-            token: writer.attempt.operation(),
-        })
-        .unwrap()
-    }
-    fn base(metadata: TableMetadata) -> StagingBase {
-        StagingBase::Existing {
-            metadata,
-            metadata_location: "file:///metadata.json".into(),
-        }
-    }
-    async fn live(
-        writer: &Writer,
-        metadata: &TableMetadata,
-        parent: i64,
-    ) -> crate::commit::dependency::LiveSet {
-        ValidationInputs::new(metadata, Some(parent), writer)
-            .live_set()
-            .await
-            .unwrap()
-            .clone()
-    }
-
-    #[tokio::test]
-    async fn physical_rewrite_uses_frozen_data_age_exact_ref_and_actual_row_allocation() {
-        let writer = Writer::new();
-        let metadata = fixture(&writer, false).await;
-        let original = live(&writer, &metadata, 10).await;
-        for preserve in [true, false] {
-            let file = DataFileBuilder::default()
-                .content(DataContentType::Data)
-                .file_path(
-                    if preserve {
-                        "file:///preserved.parquet"
-                    } else {
-                        "file:///historical-output.parquet"
-                    }
-                    .into(),
-                )
-                .file_format(DataFileFormat::Parquet)
-                .record_count(6)
-                .file_size_in_bytes(200)
-                .partition_spec_id(0)
-                .first_row_id(preserve.then_some(0))
-                .build()
-                .unwrap();
-            let intent = intent(
-                &writer,
-                &metadata,
-                vec![AddedContent::rewritten_data(file, 0, 1).unwrap()],
-                original.values().map(|e| e.frozen.clone()).collect(),
-                RequestShape::SnapshotProducing,
-            );
-            let mut staging =
-                StagingEngine::begin(base(metadata.clone()), &intent, &writer).unwrap();
-            staging
-                .stage(&super::super::rewrite_data_files::RewriteDataFilesPreparer)
-                .await
-                .unwrap();
-            let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
-            assert_eq!(snapshot.parent_snapshot_id(), Some(10));
-            assert_eq!(snapshot.sequence_number(), 3);
-            assert_eq!(snapshot.summary().operation, Operation::Replace);
-            assert_eq!(
-                snapshot.added_rows_count(),
-                Some(if preserve { 0 } else { 6 })
-            );
-            assert_eq!(
-                staging
-                    .metadata()
-                    .snapshot_for_ref("main")
-                    .unwrap()
-                    .snapshot_id(),
-                20
-            );
-            let output = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
-            assert_eq!(output.len(), 1);
-            let entry = output.values().next().unwrap();
-            assert_eq!(entry.frozen.facts().data_sequence, Some(1));
-            assert_eq!(entry.frozen.facts().file_sequence, Some(3));
-            assert_eq!(
-                entry.frozen.facts().first_row_id,
-                Some(if preserve { 0 } else { 9 })
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn physical_rewrite_mixed_assigned_and_historical_outputs_allocates_only_unassigned_rows()
-    {
-        let writer = Writer::new();
-        let metadata = fixture(&writer, false).await;
-        let original = live(&writer, &metadata, 10).await;
-        let added = vec![
-            AddedContent::rewritten_data(data("file:///already-assigned.parquet", Some(0)), 0, 1)
-                .unwrap(),
-            AddedContent::rewritten_data(data("file:///historical-null.parquet", None), 0, 1)
-                .unwrap(),
-        ];
-        let intent = intent(
-            &writer,
-            &metadata,
-            added,
-            original.values().map(|e| e.frozen.clone()).collect(),
-            RequestShape::SnapshotProducing,
-        );
-        let mut staging = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
-        staging
-            .stage(&super::super::rewrite_data_files::RewriteDataFilesPreparer)
-            .await
-            .unwrap();
-        let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
-        assert_eq!(snapshot.row_range(), Some((9, 3)));
-        assert_eq!(staging.metadata().next_row_id(), 12);
-        let output = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
-        assert_eq!(output.len(), 2);
-        assert_eq!(
-            output[&EntryIdentity::DataFile {
-                path: "file:///already-assigned.parquet".into()
-            }]
-                .frozen
-                .facts()
-                .first_row_id,
-            Some(0)
-        );
-        assert_eq!(
-            output[&EntryIdentity::DataFile {
-                path: "file:///historical-null.parquet".into()
-            }]
-                .frozen
-                .facts()
-                .first_row_id,
-            Some(9)
-        );
-        for entry in output.values() {
-            assert_eq!(entry.frozen.facts().data_sequence, Some(1));
-            assert_eq!(entry.frozen.facts().file_sequence, Some(3));
-        }
-    }
-
-    #[tokio::test]
-    async fn selected_data_rewrite_replaces_only_owned_files_and_carries_parent_totals() {
-        let writer = Writer::new();
-        let metadata = fixture(&writer, true).await;
-        let original = live(&writer, &metadata, 10).await;
-        let selected_data = EntryIdentity::DataFile {
-            path: "file:///source-a.parquet".into(),
-        };
-        let selected_deletes = original.keys().filter(|id| matches!(id,
-            EntryIdentity::DeletionVector { referenced_data_file, .. } if referenced_data_file == "file:///source-a.parquet"
-        )).cloned().collect::<BTreeSet<_>>();
-        assert_eq!(selected_deletes.len(), 1);
-        let retained_delete_bytes = original
-            .keys()
-            .find_map(|id| match id {
-                EntryIdentity::DeletionVector {
-                    referenced_data_file,
-                    length,
-                    ..
-                } if referenced_data_file == "file:///source-b.parquet" => {
-                    Some(u64::try_from(*length).unwrap())
-                }
-                _ => None,
-            })
-            .expect("the unselected data file retains its own DV blob");
-        let removed = std::iter::once(selected_data.clone())
-            .chain(selected_deletes.iter().cloned())
-            .map(|id| original[&id].frozen.clone())
-            .collect();
-        let output = DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path("file:///partial-output.parquet".into())
-            .file_format(DataFileFormat::Parquet)
-            .record_count(2)
-            .file_size_in_bytes(70)
-            .partition_spec_id(0)
-            .build()
-            .unwrap();
-        let intent = intent(
-            &writer,
-            &metadata,
-            vec![AddedContent::rewritten_data(output, 0, 1).unwrap()],
-            removed,
-            RequestShape::SnapshotProducing,
-        );
-        let mut staging = StagingEngine::begin(base(metadata.clone()), &intent, &writer).unwrap();
-        staging
-            .stage(&SelectedRewritePreparer {
-                files: SelectedRewriteFiles {
-                    data_paths: BTreeSet::from([selected_data.clone()]),
-                    delete_paths: selected_deletes.clone(),
-                },
-            })
-            .await
-            .unwrap();
-        let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
-        // The rewrite targets dev's snapshot 10 even though main points at 20.
-        assert_eq!(snapshot.parent_snapshot_id(), Some(10));
-        let facts = &snapshot.summary().additional_properties;
-        assert_eq!(facts["total-records"], "5");
-        assert_eq!(facts["total-data-files"], "2");
-        assert_eq!(facts["total-delete-files"], "1");
-        // Preserve source-b's 100-byte data file and its exact DV blob;
-        // replace only source-a with the independently specified 70-byte output.
-        assert_eq!(
-            facts["total-files-size"],
-            (100 + 70 + retained_delete_bytes).to_string()
-        );
-        let after = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
-        assert_eq!(after.len(), 3);
-        assert!(!after.contains_key(&selected_data));
-        assert!(selected_deletes.iter().all(|id| !after.contains_key(id)));
-        for (id, entry) in &original {
-            if id != &selected_data && !selected_deletes.contains(id) {
-                assert_eq!(after[id].frozen.facts(), entry.frozen.facts());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn statistics_metadata_change_has_no_ref_assertion_and_matches_standard_update() {
-        let writer = Writer::new();
-        let metadata = fixture(&writer, false).await;
-        let intent = intent(
-            &writer,
-            &metadata,
-            vec![],
-            vec![],
-            RequestShape::MetadataOnly,
-        );
-        let draft = novarocks_spi::connector::StatisticsArtifactDraft::try_new(
-            vec![1],
-            "test-statistics",
-            bytes::Bytes::from_static(b"body"),
-            BTreeMap::new(),
-        )
-        .unwrap();
-        let statistics =
-            crate::stats_assembler::write_puffin_artifacts_allocated(&writer, 10, 1, &[draft])
-                .await
-                .unwrap()
-                .unwrap();
-        // This double uses raw FileIO, so record completion only after its
-        // actual Puffin write has returned successfully.
-        writer
-            .ledger
-            .lock()
-            .unwrap()
-            .confirm_written_for_test(
-                &ObjectIdentity::new(statistics.statistics_path.clone()).unwrap(),
-            )
-            .unwrap();
-        let mut staging = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
-        let preparer = super::super::statistics::StatisticsPreparer {
-            statistics: statistics.clone(),
-        };
-        let change = preparer.prepare(&staging.view(), &intent).await.unwrap();
-        assert!(change.requirements.is_empty());
-        assert_eq!(
-            serde_json::to_value(&change.updates).unwrap(),
-            serde_json::json!([{"action":"set-statistics","snapshot-id":10,"statistics":statistics}])
-        );
-        staging.stage(&preparer).await.unwrap();
-        let frozen = staging.freeze().unwrap();
-        assert_eq!(frozen.requirements().len(), 1);
-        assert!(matches!(
-            frozen.requirements()[0],
-            crate::iceberg::TableRequirement::UuidMatch { .. }
-        ));
-        assert!(
-            writer
-                .io
-                .new_input(&statistics.statistics_path)
-                .unwrap()
-                .exists()
-                .await
-                .unwrap()
-        );
-        assert_eq!(statistics.blob_metadata[0].snapshot_id, 10);
-        assert_eq!(statistics.blob_metadata[0].sequence_number, 1);
-        assert!(statistics.file_size_in_bytes > statistics.file_footer_size_in_bytes);
     }
 }
+
+#[cfg(test)]
+#[path = "selected_rewrite/tests.rs"]
+mod preparer_tests;

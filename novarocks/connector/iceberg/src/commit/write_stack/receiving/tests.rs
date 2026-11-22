@@ -330,3 +330,5 @@ mod logical_rows;
 mod rewritten_target;
 
 mod written_partitions;
+
+mod rewrite_compact;

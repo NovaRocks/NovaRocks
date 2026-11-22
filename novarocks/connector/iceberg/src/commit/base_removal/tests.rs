@@ -267,9 +267,15 @@ async fn locates_rewritten_data_and_equality_under_their_own_partitions() {
         path: EQUALITY.to_owned(),
     }]
         .frozen;
-    let found = locate_on_base(&mut scope, [data, equality], &io, || Ok(()))
-        .await
-        .unwrap();
+    let found = locate_on_base(
+        &mut scope,
+        [data, equality],
+        CommitOperation::Write,
+        &io,
+        || Ok(()),
+    )
+    .await
+    .unwrap();
     let sources = scope.snapshot_sources().unwrap();
     let paths: Vec<_> = sources
         .sources()
@@ -288,9 +294,11 @@ async fn locates_rewritten_data_and_equality_under_their_own_partitions() {
 async fn adds_the_current_vector_when_removing_its_data_file() {
     let (mut scope, entries, io) = fixture(true).await;
     let original = &entries[&data_identity(DATA)].frozen;
-    let found = locate_on_base(&mut scope, [original], &io, || Ok(()))
-        .await
-        .unwrap();
+    let found = locate_on_base(&mut scope, [original], CommitOperation::Write, &io, || {
+        Ok(())
+    })
+    .await
+    .unwrap();
     assert_eq!(found.len(), 2);
     assert_eq!(
         found[1].frozen.identity(),
@@ -320,7 +328,7 @@ async fn missing_or_changed_required_entry_is_a_validation_conflict() {
         FrozenEntry::new(data_identity(DATA), changed).unwrap(),
     ];
     for entry in &required {
-        let err = locate_on_base(&mut scope, [entry], &io, || Ok(()))
+        let err = locate_on_base(&mut scope, [entry], CommitOperation::Write, &io, || Ok(()))
             .await
             .unwrap_err();
         let cause = err

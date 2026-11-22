@@ -2278,6 +2278,8 @@ pub struct IcebergWriteCommitSession {
     /// order. Present exactly on a distributed rewrite, which is the one flavor
     /// whose commit replaces files it named before any writer ran.
     rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
+    /// Exact original removal facts followed by their original metadata guard.
+    rewrite_removals: Option<FrozenRewriteRemovals>,
     /// The partition replacement this session's single external commit applies
     /// ahead of its snapshot. Present only on a managed publication that was
     /// admitted with one.
@@ -2298,6 +2300,13 @@ pub struct IcebergWriteCommitSession {
     publication: std::sync::Mutex<Option<IcebergWritePublication>>,
     empty_cleanup_disposed: std::sync::atomic::AtomicBool,
     progress: Mutex<IcebergWriteSessionProgress>,
+}
+
+#[derive(Debug)]
+struct FrozenRewriteRemovals {
+    entries: Arc<[crate::commit::model::FrozenEntry]>,
+    _retention: Option<Arc<novarocks_spi::connector::ConnectorPayloadRetentionGuard>>,
+    payload_byte_author: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 
 #[derive(Debug)]
@@ -2597,6 +2606,7 @@ impl IcebergWriteCommitSession {
             )));
         }
         let compact_receiving = flavor == IcebergWriteFlavor::Append
+            || flavor.is_distributed_rewrite()
             || (repartition.is_none()
                 && document_publication.as_ref().is_some_and(|publication| {
                     matches!(
@@ -2605,11 +2615,16 @@ impl IcebergWriteCommitSession {
                             | ConnectorManagedPublicationTechnique::Incremental
                     )
                 }));
+        let rewrite_groups = flavor.is_distributed_rewrite().then_some(targets.len());
         Ok(Self {
             session_id,
             creation_scope: None,
             mutation_read: None,
-            commit_protocol: crate::commit::model::WriteSessionCommitProtocol::Legacy,
+            commit_protocol: if flavor.is_distributed_rewrite() {
+                crate::commit::model::WriteSessionCommitProtocol::RewriteFiles
+            } else {
+                crate::commit::model::WriteSessionCommitProtocol::Legacy
+            },
             table,
             flavor,
             purpose,
@@ -2619,6 +2634,7 @@ impl IcebergWriteCommitSession {
             staged_metadata,
             source_metadata: None,
             rewrite_inputs,
+            rewrite_removals: None,
             repartition,
             statistics_expectations: BTreeMap::new(),
             document_records: std::sync::Mutex::new(None),
@@ -2633,7 +2649,7 @@ impl IcebergWriteCommitSession {
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             progress: Mutex::new(IcebergWriteSessionProgress {
                 state: IcebergWriteSessionState::Active,
-                receiving: IcebergReceiving::with_compact_mode(compact_receiving),
+                receiving: IcebergReceiving::with_compact_mode(compact_receiving, rewrite_groups),
             }),
         })
     }
@@ -2691,6 +2707,44 @@ impl IcebergWriteCommitSession {
         }
         self.statistics_expectations = expectations;
         Ok(self)
+    }
+
+    pub(crate) fn with_frozen_rewrite_removals(
+        mut self,
+        removals: Arc<[crate::commit::model::FrozenEntry]>,
+        retention: Option<Arc<novarocks_spi::connector::ConnectorPayloadRetentionGuard>>,
+        payload_byte_author: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
+    ) -> Result<Self, ConnectorError> {
+        if self.flavor != IcebergWriteFlavor::DistributedRewrite
+            || self.rewrite_removals.is_some()
+            || removals.is_empty()
+        {
+            return Err(invalid(
+                "Frozen rewrite removals do not belong to this sealed session",
+            ));
+        }
+        self.rewrite_removals = Some(FrozenRewriteRemovals {
+            entries: removals,
+            _retention: retention,
+            payload_byte_author,
+        });
+        Ok(self)
+    }
+
+    pub(crate) fn frozen_rewrite_removals(
+        &self,
+    ) -> Option<&Arc<[crate::commit::model::FrozenEntry]>> {
+        self.rewrite_removals
+            .as_ref()
+            .map(|rewrite| &rewrite.entries)
+    }
+
+    pub(crate) fn rewrite_payload_byte_author(
+        &self,
+    ) -> Option<&novarocks_spi::connector::ConnectorPayloadRetentionGuard> {
+        self.rewrite_removals
+            .as_ref()
+            .and_then(|rewrite| rewrite.payload_byte_author.as_ref())
     }
 
     /// The frozen input files this session's commit replaces, unioned across
@@ -2841,13 +2895,12 @@ impl IcebergWriteCommitSession {
 
     /// What an empty prepared write set means for this session.
     ///
-    /// Artifact-only row deltas with zero logical actions, distributed rewrites
-    /// with no input, and managed publications explicitly declaring abort can
-    /// finish without publishing. Overwrite may remove frozen old data even
-    /// when they produce no artifact; zero-row append still publishes. A managed
-    /// publication's own declared disposition remains authoritative.
+    /// Artifact-only row deltas and explicit managed aborts can finish without
+    /// publishing. A rewrite session already owns a nonempty removal set and
+    /// settles it even when no rows survive. A plan with no groups starts no
+    /// session.
     pub fn empty_write_decision(&self) -> IcebergEmptyWriteDecision {
-        if self.flavor.is_distributed_rewrite() || self.flavor.is_artifact_row_delta() {
+        if self.flavor.is_artifact_row_delta() {
             return IcebergEmptyWriteDecision::SkipExternalCommit;
         }
         let disposition = self
@@ -3142,6 +3195,7 @@ impl IcebergWriteCommitSession {
         let mut progress = self.progress()?;
         progress.require_active()?;
         progress.receiving.require_complete()?;
+        progress.receiving.require_rewrite_groups_complete()?;
         let empty = if progress.receiving.is_empty() {
             prepare_empty()
         } else {

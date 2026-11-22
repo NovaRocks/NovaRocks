@@ -202,6 +202,7 @@ impl Fixture {
             changes: Default::default(),
             dependencies: Vec::new(),
             protocol: CommitProtocol::RewriteFiles {
+                output_spec_id: self.metadata.default_partition_spec_id(),
                 replaced: Arc::from([replaced]),
             },
             shape: RequestShape::SnapshotProducing,

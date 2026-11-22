@@ -697,6 +697,14 @@ async fn prepare(
             prefix.requirements.push(requirement);
         }
     }
+    if let Some(requirement) = protocol.rewrite_output_requirement() {
+        requirement
+            .check(Some(metadata))
+            .map_err(|error| validation_failure(protocol.operation(), error.to_string()))?;
+        // Check and dispatch the same rule. A metadata-only change can occur
+        // after preparing against B without advancing the target ref.
+        prefix.requirements.push(requirement);
+    }
     let mut engine = StagingEngine::begin_attempt(
         base,
         intent,

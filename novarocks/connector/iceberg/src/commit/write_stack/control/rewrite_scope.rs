@@ -70,9 +70,6 @@ impl<'a> RewriteBeginScope<'a> {
         original.check_active()?;
         Ok(Self { original })
     }
-    pub(crate) fn original(&self) -> &ConnectorOriginalResultScope {
-        self.original
-    }
 }
 impl OriginalScope<OriginalResultCheckError> for RewriteBeginScope<'_> {
     fn check_active(&self) -> Result<(), OriginalResultCheckError> {

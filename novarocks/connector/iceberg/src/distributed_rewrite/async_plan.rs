@@ -59,7 +59,6 @@ struct PlanBody {
     metadata: Option<novarocks_spi::connector::ConnectorTableMetadata>,
     table: Option<crate::iceberg::table::Table>,
     capture: Option<ConnectorOriginalResultScope>,
-    files: Option<crate::manifest::CheckedDataFiles>,
     snapshot_result: Option<ScopedReadSnapshot>,
     phase: CpuPhase,
     started: bool,
@@ -187,7 +186,9 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                 body.result = Some((|| {
                     let capture = body.capture.as_ref().unwrap();
                     let scope = CaptureScope::new(capture).map_err(capture_failure)?;
-                    let checked = if let Some(snapshot) = body.snapshot_result.take() {
+                    let (files, observed_entries, retention) = if let Some(snapshot) =
+                        body.snapshot_result.take()
+                    {
                         let table = body.table.as_ref().unwrap();
                         let snapshot_id = table
                             .metadata()
@@ -202,28 +203,21 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                                 &scope,
                             )
                             .map_err(capture_failure)?;
-                        checked
+                        let observed_entries = snapshot.rewrite_entries.ok_or_else(|| {
+                            internal("Rewrite original snapshot has no removal entry observation")
+                        })?;
+                        let files = checked.files.into_iter().map(|file| file.stats).collect();
+                        (files, observed_entries, Some(snapshot._retention_guard))
                     } else {
-                        crate::manifest::CheckedDataFiles {
-                            files: Vec::new(),
-                            _retention_guard: capture.retention_guard(),
-                        }
+                        (Vec::new(), RewriteEntries::default(), None)
                     };
-                    body.files = Some(checked);
-                    let checked = body
-                        .files
-                        .as_ref()
-                        .expect("original checked Rewrite capture");
-                    let files = checked
-                        .files
-                        .iter()
-                        .map(|file| file.stats.clone())
-                        .collect::<Vec<_>>();
                     let plan = with_original_creation(body, |creation| {
                         body.control.build_loaded_plan(
                             body.request.as_ref().unwrap(),
                             body.table.as_ref().unwrap(),
                             files,
+                            observed_entries,
+                            retention,
                             creation,
                         )
                     })?;
@@ -289,7 +283,6 @@ pub(super) fn prepare_source_in(
                 metadata: None,
                 table: None,
                 capture: None,
-                files: None,
                 snapshot_result: None,
                 phase: CpuPhase::Metadata,
                 started: false,

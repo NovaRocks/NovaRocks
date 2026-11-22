@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::commit::base_removal::{
-    locate_on_base, manifest_removal_location, missing_required_file as missing,
+    locate_on_base, manifest_removal_location, missing_required_file,
 };
 use crate::commit::helpers::{snapshot_total_records, target_ref_snapshot_id};
 use crate::commit::manifest_sources::{LocatedEntry, SnapshotSources};
@@ -476,7 +476,12 @@ impl Preparer for Arc<MaterializedDeleteStep> {
         let current = view
             .metadata()
             .snapshot_for_ref(view.target_ref())
-            .ok_or_else(|| missing("current target snapshot"))?;
+            .ok_or_else(|| {
+                missing_required_file(
+                    crate::commit::model::CommitOperation::Write,
+                    "current target snapshot",
+                )
+            })?;
         let original = observed
             .scope
             .metadata()
@@ -611,14 +616,20 @@ impl CompletedStep {
         // target, including files that the write does not physically remove.
         for (path, original) in &self.targets.files {
             view.artifacts().check_active()?;
-            let actual = current.files.get(path).ok_or_else(|| missing(path))?;
+            let actual = current.files.get(path).ok_or_else(|| {
+                missing_required_file(crate::commit::model::CommitOperation::Write, path)
+            })?;
             if actual.data.frozen != original.data.frozen {
-                return Err(missing(path));
+                return Err(missing_required_file(
+                    crate::commit::model::CommitOperation::Write,
+                    path,
+                ));
             }
         }
         let removed = locate_on_base(
             &mut scope,
             self.removed.iter().map(|entry| &entry.frozen),
+            crate::commit::model::CommitOperation::Write,
             view.artifacts().file_io(),
             || view.artifacts().check_active(),
         )

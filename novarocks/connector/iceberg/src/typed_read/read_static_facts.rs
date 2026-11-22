@@ -30,7 +30,9 @@ use novarocks_type_contract::{
 use prost::Message;
 use sha2::{Digest, Sha256};
 
-use super::column_handle::{invalid, unsupported};
+#[cfg(test)]
+use super::column_handle::invalid;
+use super::column_handle::unsupported;
 use super::{IcebergColumnHandle, IcebergRuntimeRelation};
 
 #[derive(Debug)]

@@ -22,13 +22,14 @@ use crate::iceberg::{Error, ErrorKind, Result};
 use crate::manifest::target_query::ManifestReadScope;
 
 use super::manifest_sources::{LocatedEntry, SnapshotSources, duplicate_identity};
-use super::model::FrozenEntry;
+use super::model::{CommitOperation, FrozenEntry};
 
 /// Resolve the required entries against the already-bound attempt base.
 /// Removing a data entry also removes its current deletion vector, if any.
 pub(crate) async fn locate_on_base<'a>(
     scope: &mut ManifestReadScope,
     required: impl IntoIterator<Item = &'a FrozenEntry>,
+    operation: CommitOperation,
     io: &FileIO,
     active: impl Fn() -> Result<()> + Sync,
 ) -> Result<Vec<LocatedEntry>> {
@@ -44,7 +45,7 @@ pub(crate) async fn locate_on_base<'a>(
         active()?;
         let actual = located.get(identity);
         if !actual.is_some_and(|entry| &entry.frozen == expected) {
-            return Err(missing_required_file(identity.path()));
+            return Err(missing_required_file(operation, identity.path()));
         }
     }
     let sources = scope.snapshot_sources()?;
@@ -110,10 +111,10 @@ pub(super) fn manifest_removal_location(
     Ok(entry)
 }
 
-pub(super) fn missing_required_file(path: &str) -> Error {
-    super::new_manifests::commit_validation_error(format!(
-        "Missing required files to delete: {path}"
-    ))
+pub(super) fn missing_required_file(operation: CommitOperation, path: &str) -> Error {
+    let message = format!("Missing required files to delete: {path}");
+    let failure = super::commit_failure::validation_failure(operation, message.clone());
+    Error::new(ErrorKind::DataInvalid, message).with_source(failure)
 }
 
 #[cfg(test)]

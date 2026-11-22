@@ -80,6 +80,7 @@ fn row_delta_cannot_also_freeze_the_target_ref() {
 #[test]
 fn rewrite_files_uses_its_own_window_and_transaction_style() {
     let protocol = CommitProtocol::RewriteFiles {
+        output_spec_id: 0,
         replaced: Arc::from([]),
     };
     assert!(matches!(

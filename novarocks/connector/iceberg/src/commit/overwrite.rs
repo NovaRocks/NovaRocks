@@ -329,6 +329,24 @@ async fn prepare_snapshot_change_with_summary(
             max_snapshot_age_ms: None,
             max_ref_age_ms: None,
         });
+    let mut requirements = Vec::new();
+    if !matches!(
+        intent.protocol(),
+        super::model::CommitProtocol::RewriteFiles { .. }
+    ) {
+        requirements.extend([
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: metadata.current_schema_id(),
+            },
+            TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: metadata.default_partition_spec_id(),
+            },
+        ]);
+    }
+    requirements.push(TableRequirement::RefSnapshotIdMatch {
+        r#ref: intent.target_ref().to_string(),
+        snapshot_id: parent,
+    });
     Ok(super::staging::PreparedChange {
         updates: vec![
             TableUpdate::AddSnapshot { snapshot },
@@ -340,18 +358,7 @@ async fn prepare_snapshot_change_with_summary(
                 },
             },
         ],
-        requirements: vec![
-            TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: metadata.current_schema_id(),
-            },
-            TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: metadata.default_partition_spec_id(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: intent.target_ref().to_string(),
-                snapshot_id: parent,
-            },
-        ],
+        requirements,
     })
 }
 

@@ -67,6 +67,7 @@ pub(crate) mod slot_change;
 pub mod snapshot_lifecycle_helpers;
 pub(crate) mod staging;
 pub mod statistics;
+pub(crate) mod statistics_carry;
 pub(crate) mod truncate;
 pub mod types;
 pub mod validation;

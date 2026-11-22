@@ -28,7 +28,6 @@ pub(crate) enum CommitOperation {
     Write,
     Optimize,
     Truncate,
-    Delete,
     OptimizeManifests,
     ExpireSnapshots,
 }
@@ -45,9 +44,7 @@ impl CommitOperation {
         match self {
             Self::Legacy => CommitStyle::Legacy,
             Self::Write | Self::Optimize => CommitStyle::Transaction,
-            Self::Truncate | Self::Delete | Self::OptimizeManifests | Self::ExpireSnapshots => {
-                CommitStyle::Update
-            }
+            Self::Truncate | Self::OptimizeManifests | Self::ExpireSnapshots => CommitStyle::Update,
         }
     }
 }
@@ -77,6 +74,7 @@ pub(crate) enum WriteSessionCommitProtocol {
     #[default]
     Legacy,
     RowDelta(IsolationLevel),
+    RewriteFiles,
 }
 
 impl WriteSessionCommitProtocol {
@@ -84,12 +82,13 @@ impl WriteSessionCommitProtocol {
         match self {
             Self::Legacy => CommitOperation::Legacy,
             Self::RowDelta(_) => CommitOperation::Write,
+            Self::RewriteFiles => CommitOperation::Optimize,
         }
     }
 
     pub(crate) const fn row_delta_isolation(self) -> Option<IsolationLevel> {
         match self {
-            Self::Legacy => None,
+            Self::Legacy | Self::RewriteFiles => None,
             Self::RowDelta(isolation) => Some(isolation),
         }
     }
@@ -104,15 +103,9 @@ pub(crate) enum CommitProtocol {
         window: RowDeltaWindowCheck,
         writer: WriterSchemaSpec,
     },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "The OPTIMIZE cutover supplies this frozen intent."
-        )
-    )]
     RewriteFiles {
         replaced: Arc<[FrozenEntry]>,
+        output_spec_id: i32,
     },
 }
 
@@ -130,7 +123,7 @@ impl CommitProtocol {
         match self {
             Self::Legacy | Self::Truncate => WindowValidation::None,
             Self::RowDelta { window, .. } => WindowValidation::RowDelta(window),
-            Self::RewriteFiles { replaced } => WindowValidation::RewriteFiles(replaced),
+            Self::RewriteFiles { replaced, .. } => WindowValidation::RewriteFiles(replaced),
         }
     }
 
@@ -140,6 +133,17 @@ impl CommitProtocol {
             Self::RowDelta { writer, .. } => Some(*writer),
         }
     }
+    pub(crate) const fn rewrite_output_requirement(&self) -> Option<TableRequirement> {
+        match self {
+            Self::RewriteFiles { output_spec_id, .. } => {
+                Some(TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: *output_spec_id,
+                })
+            }
+            Self::Legacy | Self::Truncate | Self::RowDelta { .. } => None,
+        }
+    }
+
     pub(crate) const fn requires_target_branch(&self) -> bool {
         matches!(self, Self::Truncate | Self::RewriteFiles { .. })
     }
