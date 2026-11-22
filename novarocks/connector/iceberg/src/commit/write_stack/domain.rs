@@ -3422,18 +3422,13 @@ mod tests {
             IcebergWriteFlavor::RowMutationDeletionVector.branches(),
             &[IcebergWriteBranch::Data, IcebergWriteBranch::DeletionVector]
         );
-        // Two flavors deliberately own no data branch: they write delete
-        // artifacts and nothing else, so sealing one would give SQL somewhere
-        // to send rows the statement never produces.
-        for (flavor, branches) in [(
-            IcebergWriteFlavor::EqualityDelete,
-            &[IcebergWriteBranch::EqualityDelete][..],
-        )] {
-            assert_eq!(flavor.branches(), branches, "{}", flavor.as_str());
-            let _ = flavor.commit_op_kind();
-            let _ = flavor.connector_intent();
-            assert!(flavor.accepts_empty_prepared_set());
-        }
+        // Equality deletes write only delete artifacts. Sealing a data branch
+        // would give SQL somewhere to send rows this statement never produces.
+        let flavor = IcebergWriteFlavor::EqualityDelete;
+        assert_eq!(flavor.branches(), &[IcebergWriteBranch::EqualityDelete]);
+        let _ = flavor.commit_op_kind();
+        let _ = flavor.connector_intent();
+        assert!(flavor.accepts_empty_prepared_set());
     }
 
     #[test]
