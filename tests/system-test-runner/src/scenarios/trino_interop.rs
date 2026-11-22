@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
+const S3_CREDENTIAL_ENV: [&str; 2] = ["AWS_S3_ACCESS_KEY_ID", "AWS_S3_SECRET_ACCESS_KEY"];
+
 #[derive(Clone, Copy)]
 enum Mode {
     Encoding,
@@ -75,6 +77,75 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         .collect()
 }
 
+fn fixture_launch_config(publication: &Path) -> Result<ScenarioLaunchConfig> {
+    let mut launch = ScenarioLaunchConfig::default();
+    let (fe, be) = (
+        &mut launch.child_environment.fe,
+        &mut launch.child_environment.be,
+    );
+    let overlay = &mut launch.config_overlay;
+    for (config_env, file, purpose, role_overlay, environment) in [
+        (
+            "NOVAROCKS_FE_CONFIG",
+            "fe.toml",
+            "object-store-metadata",
+            &mut overlay.fe,
+            fe,
+        ),
+        (
+            "NOVAROCKS_BE_CONFIG",
+            "be.toml",
+            "object-store-data",
+            &mut overlay.be,
+            be,
+        ),
+    ] {
+        let config = PathBuf::from(
+            std::env::var_os(config_env)
+                .with_context(|| format!("missing published {config_env} fixture config"))?,
+        )
+        .canonicalize()?;
+        ensure!(
+            config == publication.with_file_name(file),
+            "{config_env} does not belong to the original fixture publication"
+        );
+        let source = fs::read_to_string(config)?;
+        let parsed = source
+            .parse::<toml::Table>()
+            .map_err(|_| anyhow::anyhow!("invalid published {config_env} fixture config"))?;
+        let credentials = parsed
+            .get("connector")
+            .and_then(|value| value.get("credentials"))
+            .and_then(toml::Value::as_array)
+            .with_context(|| format!("published {config_env} is missing fixture credentials"))?;
+        let [credential] = credentials.as_slice() else {
+            anyhow::bail!("published {config_env} must declare one fixture credential");
+        };
+        ensure!(
+            credential.get("purpose").and_then(toml::Value::as_str) == Some(purpose),
+            "published {config_env} fixture credential has the wrong role"
+        );
+        if credential.get("kind").and_then(toml::Value::as_str) == Some("s3") {
+            for name in S3_CREDENTIAL_ENV {
+                let value = std::env::var(name)
+                    .with_context(|| format!("missing published fixture {name}"))?;
+                ensure!(!value.is_empty(), "empty published fixture {name}");
+                environment.insert(name.to_owned(), value);
+            }
+        }
+        // Keep the harness-owned topology and state store from the original System config.
+        let connector = toml::Table::from_iter([(
+            "credentials".into(),
+            toml::Value::Array(credentials.clone()),
+        )]);
+        *role_overlay = Some(toml::to_string(&toml::Table::from_iter([(
+            "connector".into(),
+            toml::Value::Table(connector),
+        )]))?);
+    }
+    Ok(launch)
+}
+
 impl Scenario for TrinoInterop {
     fn name(&self) -> &'static str {
         self.mode.name()
@@ -120,6 +191,10 @@ impl Scenario for TrinoInterop {
             },
             env_inputs: [
                 ("NOVA_ENV_REST_ENV_FILE", "file-content"),
+                ("NOVAROCKS_FE_CONFIG", "file-content"),
+                ("NOVAROCKS_BE_CONFIG", "file-content"),
+                (S3_CREDENTIAL_ENV[0], "value"),
+                (S3_CREDENTIAL_ENV[1], "value"),
                 ("DOCKER_HOST", "value"),
                 ("DOCKER_CONTEXT", "value"),
                 ("DOCKER_CONFIG", "value"),
@@ -134,7 +209,17 @@ impl Scenario for TrinoInterop {
             ),
             heavy: Some(ScenarioHeavyReason {
                 reason: "external-programs",
-                detail: "Requires the declared Trino reference image, Linux host networking, original Spark/Iceberg REST fixture and native 1FE+3BE. JDBC uses the declared driver mounted read-only. Reference inputs are resolved before cluster startup; unavailable Docker/host networking is BLOCKED.",
+                detail: match self.mode {
+                    Mode::Encoding => {
+                        "Requires the declared Trino reference image on the original Spark/Iceberg REST fixture network and host HTTP access to native 1FE+3BE."
+                    }
+                    Mode::Cli => {
+                        "Requires the declared Trino reference image, Linux Docker host networking, original Spark/Iceberg REST fixture and native 1FE+3BE."
+                    }
+                    Mode::Jdbc => {
+                        "Requires the declared Trino reference image, its read-only JDBC driver, Linux Docker host networking and native 1FE+3BE."
+                    }
+                },
             }),
         }
     }
@@ -153,6 +238,10 @@ impl Scenario for TrinoInterop {
             })?
             .canonicalize()?;
         let storage = RunStorageScope::from_publication(&publication, budget)?.to_json()?;
+        let launch = match self.mode {
+            Mode::Encoding | Mode::Cli => fixture_launch_config(&publication)?,
+            Mode::Jdbc => ScenarioLaunchConfig::default(),
+        };
         *self
             .prepared
             .lock()
@@ -163,7 +252,7 @@ impl Scenario for TrinoInterop {
                 storage,
                 probe: None,
             });
-        Ok(ScenarioLaunchConfig::default())
+        Ok(launch)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         super::connector::require_three_backends(context)?;
@@ -206,42 +295,40 @@ impl Scenario for TrinoInterop {
         )?;
         let code = outcome.output.status.code();
         let clean = read_cleanup(&root).is_ok();
-        let primary = if code == Some(75)
-            && !outcome.timed_out
-            && outcome.failures.is_empty()
-            && clean
-        {
-            Err(novarocks_cluster_harness::fixture_run::rejected(
-                anyhow::anyhow!(
-                    "{} missing Docker/Linux host-network prerequisite; retained raw result at {}",
-                    self.mode.name(),
-                    root.display()
-                ),
-            ))
-        } else {
-            (|| -> Result<()> {
-                ensure!(
-                    outcome.group_exit_observed(),
-                    "official-client local payload group has not actually exited"
-                );
-                ensure!(
-                    !outcome.timed_out && outcome.failures.is_empty(),
-                    "released-client process lifecycle failed: {:?}",
-                    outcome.failures
-                );
-                ensure!(
-                    outcome.output.status.success(),
-                    "released-client probe exited {code:?}; retained raw responses at {}",
-                    root.display()
-                );
-                let result: Value = serde_json::from_slice(&fs::read(root.join("result.json"))?)?;
-                ensure!(
-                    result["status"] == "PASS",
-                    "released-client probe did not record PASS: {result}"
-                );
-                Ok(())
-            })()
-        };
+        let primary =
+            if code == Some(75) && !outcome.timed_out && outcome.failures.is_empty() && clean {
+                Err(novarocks_cluster_harness::fixture_run::rejected(
+                    anyhow::anyhow!(
+                        "{} missing a declared fixture prerequisite; retained raw result at {}",
+                        self.mode.name(),
+                        root.display()
+                    ),
+                ))
+            } else {
+                (|| -> Result<()> {
+                    ensure!(
+                        outcome.group_exit_observed(),
+                        "official-client local payload group has not actually exited"
+                    );
+                    ensure!(
+                        !outcome.timed_out && outcome.failures.is_empty(),
+                        "released-client process lifecycle failed: {:?}",
+                        outcome.failures
+                    );
+                    ensure!(
+                        outcome.output.status.success(),
+                        "released-client probe exited {code:?}; retained raw responses at {}",
+                        root.display()
+                    );
+                    let result: Value =
+                        serde_json::from_slice(&fs::read(root.join("result.json"))?)?;
+                    ensure!(
+                        result["status"] == "PASS",
+                        "released-client probe did not record PASS: {result}"
+                    );
+                    Ok(())
+                })()
+            };
         drop(slot);
         let convergence =
             super::result_delivery_support::await_idle(context, "trino", "interop-after", epoch);
