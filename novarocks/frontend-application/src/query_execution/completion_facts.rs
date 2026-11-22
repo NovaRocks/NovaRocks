@@ -119,6 +119,10 @@ impl CompletionFactOwners {
     ) -> &Arc<novarocks_query_application::system_tables::SystemTableRegistry> {
         &self.system_relations
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Completion keeps each original fact owner and the required constant interpreter explicit."
+    )]
     pub(crate) const fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,

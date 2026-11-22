@@ -6381,10 +6381,7 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(arena.value_type(scalar), &expected);
-                    assert_eq!(
-                        crate::optimizer::scalar_expr::can_fail(&arena, scalar),
-                        true
-                    );
+                    assert!(crate::optimizer::scalar_expr::can_fail(&arena, scalar));
                     let rebuilt = crate::planner::optimizer_bridge::scalar::materialize_exprs(
                         &arena,
                         &[scalar],
