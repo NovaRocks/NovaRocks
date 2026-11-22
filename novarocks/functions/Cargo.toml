@@ -41,7 +41,7 @@ regex-automata = { version = "=0.4.13", default-features = false, features = ["s
 regex-syntax = "=0.8.8"
 # Reuse the locked Unicode property author for Trino's BMP decimal digits.
 icu_properties = "=2.1.2"
-icu_normalizer = "=2.1.1"
+icu_normalizer = { version = "=2.1.1", default-features = false, features = ["compiled_data", "utf8_iter"] }
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
