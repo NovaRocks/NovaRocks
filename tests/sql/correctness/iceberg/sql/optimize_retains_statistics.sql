@@ -52,4 +52,5 @@ SELECT id, value FROM iceberg_cat_${suite_uuid0}.stats_rewrite_${uuid0}.stats_ro
 -- query 8
 -- @cleanup=true
 -- @skip_result_check=true
-DROP SCHEMA IF EXISTS iceberg_cat_${suite_uuid0}.stats_rewrite_${uuid0} CASCADE;
+DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.stats_rewrite_${uuid0}.stats_rows;
+DROP SCHEMA IF EXISTS iceberg_cat_${suite_uuid0}.stats_rewrite_${uuid0};
