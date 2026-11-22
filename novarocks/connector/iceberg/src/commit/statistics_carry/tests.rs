@@ -218,25 +218,28 @@ async fn statistics_carry_one_slot_retains_physical_copy_and_refreshes_registrat
         "{report:?}"
     );
 
-    let requests = publisher.requests.lock().unwrap();
-    let [first, last] = requests.as_slice() else {
-        panic!("expected exactly two rounds")
+    let (old, new) = {
+        let requests = publisher.requests.lock().unwrap();
+        let [first, last] = requests.as_slice() else {
+            panic!("expected exactly two rounds")
+        };
+        let old = requested_copy(first);
+        let new = requested_copy(last);
+        let sequence = |request: &serde_json::Value| {
+            request["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|update| update["action"] == "add-snapshot")
+                .unwrap()["snapshot"]["sequence-number"]
+                .as_i64()
+                .unwrap()
+        };
+        assert!(sequence(first) < sequence(last));
+        (old, new)
     };
-    let old = requested_copy(first);
-    let new = requested_copy(last);
     assert_eq!(old.statistics_path, new.statistics_path);
     assert_eq!(old.snapshot_id, new.snapshot_id);
-    let sequence = |request: &serde_json::Value| {
-        request["updates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|update| update["action"] == "add-snapshot")
-            .unwrap()["snapshot"]["sequence-number"]
-            .as_i64()
-            .unwrap()
-    };
-    assert!(sequence(first) < sequence(last));
     assert_eq!(old.blob_metadata, first_registration.blob_metadata);
     assert_eq!(new.blob_metadata, source.blob_metadata);
     assert_eq!(
@@ -276,7 +279,6 @@ async fn statistics_carry_one_slot_retains_physical_copy_and_refreshes_registrat
     let live = root.live.load(Ordering::SeqCst);
     assert!(live > 127);
     assert!(root.peak.load(Ordering::SeqCst) >= live + 2 * source.file_size_in_bytes as usize);
-    drop(requests);
     drop(publisher);
     drop(fixture);
     assert_eq!(root.live.load(Ordering::SeqCst), 127);
