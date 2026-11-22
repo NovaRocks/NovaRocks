@@ -116,6 +116,7 @@ fn selected_invalid(message: impl Into<String>) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)
 }
 
+// Design: ADR-0250 (docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)
 pub(crate) struct CompactRewritePreparer {
     pub(super) operation: super::operation::IcebergCommitOperation,
     pub(super) stage: usize,

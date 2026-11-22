@@ -94,6 +94,7 @@ impl WriteSessionCommitProtocol {
     }
 }
 
+// Design: ADR-0250 (docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)
 /// Encodes only combinations authored by their operation.
 #[derive(Debug)]
 pub(crate) enum CommitProtocol {

@@ -88,6 +88,7 @@ pub(crate) enum CommitFailureDisposition {
     Unknown,
 }
 
+// Design: ADR-0250 (docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)
 /// Project an original commit failure after the owner has finished retry and
 /// selected the terminal. The owner keeps the terminal, evidence and cleanup.
 pub(crate) fn project_maintenance_commit_failure(

@@ -607,7 +607,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   - 普通行级 DML 在 `novarocks/connector/iceberg/src/commit/row_mutation_preparation.rs`
     冻结准入观察与隔离级别。FE 的 `catalog_application/query_bindings.rs` 为同句 Current 复用原观察。
     `commit/conflict_scope.rs` 消费读侧签发的被改写目标谓词事实与写出分区，
-    `commit/dependency/row_delta.rs` 核对连续快照窗口。见 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)。
+    `commit/dependency/window.rs` 为行级核对与 OPTIMIZE 共用连续窗口的 manifest 读取。行级规则见 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)。
+  - `novarocks/connector/iceberg/src/commit/model/protocol.rs` 由操作声明窗口核对、提交前提与提交样式。
+    `novarocks/connector/iceberg/src/commit/filter_delete.rs` 在本轮基准逐 manifest 应用过滤，供主分支 TRUNCATE 使用。
+    `novarocks/connector/iceberg/src/catalog_control/maintenance_error.rs` 撰写公开提交失败消息。见 [ADR-0250](docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
   - `novarocks/connector/iceberg/src/commit/attempt.rs`：同一 operation 的单次提交循环；加载、依赖验证、稳定 stage ID 核对、准备与覆盖断言、单次派发及确定冲突重试，循环内不删除产物。
@@ -1371,8 +1374,10 @@ the guide differ.
   对照 `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 的交接与
   `novarocks/connector/iceberg/src/commit/new_manifests.rs` 的 stage 持有、滚动写出和沿用。
   普通行级提交按 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md) 核对准入观察、
-  `commit/conflict_scope.rs` 的冲突范围及 `commit/dependency/row_delta.rs` 的历史窗口。
-  核对通过后在实际提交基准上定位移除条目。确定的 Catalog 竞争按原 operation 预算重试并沿用新增产物。
+  `commit/conflict_scope.rs` 的冲突范围及 `commit/dependency/window.rs` 的共用窗口输入。
+  `commit/model/protocol.rs` 声明按操作的校验与条件，`commit/filter_delete.rs` 为 main TRUNCATE 准备按过滤删除。
+  核对通过后在实际提交基准上定位移除条目。确定的 Catalog 竞争按原 operation 预算重试并沿用新增产物。见
+  [ADR-0250](docs/adr/ADR-0250-iceberg-maintenance-commits-by-operation.md)。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
