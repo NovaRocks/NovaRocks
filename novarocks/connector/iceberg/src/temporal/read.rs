@@ -33,6 +33,14 @@ use novarocks_value_arrays::{
 
 use crate::iceberg::spec::Type;
 
+type ConvertTemporalLeaf<C> = fn(
+    &ArrayRef,
+    TemporalType,
+    &str,
+    Option<&SelectionSet>,
+    &mut C,
+) -> Result<ArrayRef, ConnectorError>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TemporalReadProjection {
     Identity,
@@ -222,13 +230,7 @@ impl TemporalReadProjection {
         path: &str,
         reachable: Option<&SelectionSet>,
         check_active: &mut C,
-        leaf: fn(
-            &ArrayRef,
-            TemporalType,
-            &str,
-            Option<&SelectionSet>,
-            &mut C,
-        ) -> Result<ArrayRef, ConnectorError>,
+        leaf: ConvertTemporalLeaf<C>,
         writing: bool,
     ) -> Result<ArrayRef, ConnectorError> {
         match self {

@@ -138,29 +138,21 @@ pub(super) fn type_literal(
             false,
         ),
         LiteralSyntax::TypedString { name, value } => {
-            let parser: Option<
-                fn(
-                    &str,
-                )
-                    -> Result<ParsedTemporal, novarocks_functions::temporal_value::LiteralError>,
-            > = if name.eq_ignore_ascii_case("time") {
-                Some(parse_time_literal)
-            } else if name.eq_ignore_ascii_case("timestamp") {
-                Some(parse_timestamp_literal)
-            } else {
-                None
-            };
-            if let Some(parse) = parser {
+            let is_time = name.eq_ignore_ascii_case("time");
+            if is_time || name.eq_ignore_ascii_case("timestamp") {
                 for _ in value.bytes() {
                     work.step()?;
                 }
-                let parsed = parse(value).map_err(
-                    |error: novarocks_functions::temporal_value::LiteralError| {
-                        TypingError::InvalidLiteral(format!(
-                            "invalid {name} literal '{value}': {error}"
-                        ))
-                    },
-                )?;
+                let parsed = if is_time {
+                    parse_time_literal(value)
+                } else {
+                    parse_timestamp_literal(value)
+                }
+                .map_err(|error| {
+                    TypingError::InvalidLiteral(format!(
+                        "invalid {name} literal '{value}': {error}"
+                    ))
+                })?;
                 return temporal_constant(context, parsed, work);
             }
             let target = typed_string(name).ok_or_else(|| {

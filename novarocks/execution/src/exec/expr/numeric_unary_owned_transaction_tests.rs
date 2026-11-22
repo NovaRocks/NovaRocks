@@ -17,6 +17,4 @@
 // Transitional re-export for the remaining Execution tests.
 // Chain inputs and their SQL-to-runtime assertions live in compile-to-execute.
 // Remove this bridge after the remaining consumers migrate.
-pub(super) use novarocks_test_compile_to_execute::programs::{
-    programs_with_catalogue, programs_with_catalogue_and_original_inlist_source,
-};
+pub(super) use novarocks_test_compile_to_execute::programs::programs_with_catalogue_and_original_inlist_source;

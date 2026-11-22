@@ -3470,7 +3470,6 @@ name = "novarocks-expression"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "chrono",
  "novarocks-constant-contract",
  "novarocks-expression-contract",
  "novarocks-failure-contract",
@@ -3953,7 +3952,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
- "chrono-tz",
  "futures",
  "novarocks-connector-contract",
  "novarocks-constant-contract",

@@ -354,12 +354,10 @@ pub fn decode_writer_semantic_parameters_with_creator_in<H>(
     }
     for entry in &source.entries {
         work.step().map_err(SemanticsCodecError::from)?;
-        if let Some(wire::semantic_parameter::Value::TimeZone(value)) = &entry.value {
-            if value.len() > 255 {
-                return Err(
-                    SemanticsCodecError::from(SemanticParameterError::InvalidTimeZone).into(),
-                );
-            }
+        if let Some(wire::semantic_parameter::Value::TimeZone(value)) = &entry.value
+            && value.len() > 255
+        {
+            return Err(SemanticsCodecError::from(SemanticParameterError::InvalidTimeZone).into());
         }
     }
     let parameters = decode_parameters_observed(source, work)?;

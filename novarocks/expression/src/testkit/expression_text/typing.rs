@@ -726,18 +726,17 @@ impl TextNode {
                 }
             }
             TextKind::Case(children) => {
-                let mut pairs = children.chunks_exact(2);
+                let (pairs, otherwise) = children.as_chunks::<2>();
                 let when_then = pairs
-                    .by_ref()
-                    .map(|pair| {
+                    .iter()
+                    .map(|[condition, branch]| {
                         Ok((
-                            pair[0].emit(draft, constants, context, work)?,
-                            pair[1].emit(draft, constants, context, work)?,
+                            condition.emit(draft, constants, context, work)?,
+                            branch.emit(draft, constants, context, work)?,
                         ))
                     })
                     .collect::<Result<Box<_>, TextError>>()?;
-                let else_expr = pairs
-                    .remainder()
+                let else_expr = otherwise
                     .first()
                     .map(|child| child.emit(draft, constants, context, work))
                     .transpose()?;

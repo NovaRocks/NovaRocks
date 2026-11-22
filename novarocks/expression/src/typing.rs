@@ -611,8 +611,9 @@ fn type_searched_case(
         return Err(TypingError::InvalidShape("invalid searched CASE operands"));
     }
     let (cases, otherwise) = children.split_at(2 * when_count);
+    let (cases, _) = cases.as_chunks::<2>();
     let mut result = FunctionValueType::new(DataType::Null, true);
-    for branch in cases.chunks_exact(2).map(|pair| &pair[1]).chain(otherwise) {
+    for branch in cases.iter().map(|[_, branch]| branch).chain(otherwise) {
         work.step()?;
         result = novarocks_type_contract::assignment_common_value_type(
             &result,
@@ -625,9 +626,9 @@ fn type_searched_case(
     }
 
     let mut conversions = Vec::with_capacity(children.len());
-    for pair in cases.chunks_exact(2) {
-        conversions.push(boolean_operand(context, &pair[0], "CASE WHEN", work)?);
-        conversions.push(conversion::assign(context, &pair[1], &result, work)?);
+    for [condition, branch] in cases {
+        conversions.push(boolean_operand(context, condition, "CASE WHEN", work)?);
+        conversions.push(conversion::assign(context, branch, &result, work)?);
     }
     for branch in otherwise {
         conversions.push(conversion::assign(context, branch, &result, work)?);

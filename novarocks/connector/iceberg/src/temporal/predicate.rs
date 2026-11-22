@@ -48,7 +48,7 @@ pub(crate) fn project_domain(primitive: &PrimitiveType, domain: &Domain) -> Opti
     } else if let Some(points) = values.discrete_values() {
         let mut projected = Vec::with_capacity(points.len());
         for point in points {
-            let picos = exact(&point)?;
+            let picos = exact(point)?;
             if picos.rem_euclid(step) == 0 {
                 projected.push(value(picos.div_euclid(step))?);
             }

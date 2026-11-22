@@ -258,12 +258,12 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
 
     fn temporal_relation_key_type(&self) -> Option<novarocks_type_contract::TemporalType> {
         match self {
-            Self::Ordered { temporal, .. } => *temporal,
-            Self::Membership {
-                data_type,
+            Self::Ordered { temporal, .. }
+            | Self::Membership {
+                data_type: DataType::FixedSizeBinary(10 | 12 | 14),
                 temporal,
                 ..
-            } if matches!(data_type, DataType::FixedSizeBinary(10 | 12 | 14)) => *temporal,
+            } => *temporal,
             Self::Membership { .. } => None,
         }
     }

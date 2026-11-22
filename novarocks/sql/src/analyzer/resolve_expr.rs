@@ -8989,8 +8989,7 @@ mod tests {
                 crate::constant::test_constant_policy(),
                 &control,
             )
-            .err()
-            .expect("untyped negation operand");
+            .expect_err("untyped negation operand");
             assert_eq!(
                 error.kind(),
                 crate::analyze_error::AnalyzeErrorKind::TypeMismatch

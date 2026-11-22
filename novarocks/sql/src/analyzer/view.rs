@@ -755,9 +755,7 @@ mod tests {
         let dependent = catalog(declaration(dependent_source, "ts", declared.clone()));
         let deterministic = catalog(declaration(deterministic_source, "ts", declared));
         for query in [dependent_source, "SELECT ts FROM v"] {
-            let failure = analyze(query, &dependent)
-                .err()
-                .expect("time environment is required");
+            let failure = analyze(query, &dependent).expect_err("time environment is required");
             assert!(
                 failure
                     .to_string()

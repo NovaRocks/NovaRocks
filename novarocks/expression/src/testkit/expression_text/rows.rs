@@ -338,7 +338,7 @@ fn call_inapplicability(
                 _ => Some(CallInapplicability::WholeInvocation),
             }
         };
-        let reason = reason.or_else(|| match effects.argument_control {
+        let reason = reason.or(match effects.argument_control {
             ArgumentControl::Eager
             | ArgumentControl::If
             | ArgumentControl::Coalesce

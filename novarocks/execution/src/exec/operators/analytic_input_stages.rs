@@ -328,16 +328,15 @@ pub(crate) fn compare_keys<W: AnalyticInputWork>(
 ) -> Result<Ordering, Result<ExecutionFailure, W::Failure>> {
     for (index, array) in keys.iter().enumerate() {
         work.step().map_err(Err)?;
-        if let Some(key_types) = key_types {
-            if let Some(order) = key_types[index]
+        if let Some(key_types) = key_types
+            && let Some(order) = key_types[index]
                 .temporal_order(array.as_ref(), left, right)
                 .map_err(Ok)?
-            {
-                if !order.is_eq() {
-                    return Ok(order);
-                }
-                continue;
+        {
+            if !order.is_eq() {
+                return Ok(order);
             }
+            continue;
         }
         match (array.is_null(left), array.is_null(right)) {
             (true, true) => continue,

@@ -460,16 +460,16 @@ fn literal_zone(raw: &str, key: TimeZoneKey) -> Result<LiteralZone, LiteralError
         return Ok(LiteralZone::FixedOffset(0));
     }
 
-    if let Some(suffix) = raw.strip_prefix("Etc/GMT") {
-        if let Some((sign, magnitude)) = suffix.as_bytes().split_first() {
-            let fixed_hours = match (sign, magnitude) {
-                (b'+', [b'1', b'0'..=b'2'] | [b'1'..=b'9'])
-                | (b'-', [b'1', b'0'..=b'4'] | [b'1'..=b'9']) => suffix.parse::<i32>().ok(),
-                _ => None,
-            };
-            if let Some(hour) = fixed_hours {
-                return Ok(LiteralZone::FixedOffset(-hour * 3600));
-            }
+    if let Some(suffix) = raw.strip_prefix("Etc/GMT")
+        && let Some((sign, magnitude)) = suffix.as_bytes().split_first()
+    {
+        let fixed_hours = match (sign, magnitude) {
+            (b'+', [b'1', b'0'..=b'2'] | [b'1'..=b'9'])
+            | (b'-', [b'1', b'0'..=b'4'] | [b'1'..=b'9']) => suffix.parse::<i32>().ok(),
+            _ => None,
+        };
+        if let Some(hour) = fixed_hours {
+            return Ok(LiteralZone::FixedOffset(-hour * 3600));
         }
     }
     Err(LiteralError::InvalidZone)

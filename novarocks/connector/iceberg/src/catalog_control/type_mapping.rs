@@ -300,8 +300,8 @@ mod tests {
                 value: parsed.value,
             }),
         };
-        let v2 = schema_fields(&[column.clone()], FormatVersion::V2).unwrap();
-        let v3 = schema_fields(&[column], FormatVersion::V3).unwrap();
+        let v2 = schema_fields(std::slice::from_ref(&column), FormatVersion::V2).unwrap();
+        let v3 = schema_fields(std::slice::from_ref(&column), FormatVersion::V3).unwrap();
         assert_eq!(v2[0].initial_default, Some(Literal::long(0)));
         assert_eq!(v3[0].initial_default, Some(Literal::long(500)));
         assert_eq!(v3[0].write_default, v3[0].initial_default);
