@@ -30,7 +30,7 @@ use novarocks_spi::connector::read_stack::negotiation::{
 };
 use novarocks_spi::connector::read_stack::{
     Assignment, ColumnHandle, ConnectorReadMetadata, ConnectorReadRelationVersion,
-    ConnectorReadTableExecuteProcedure, ConnectorSession, Constraint, SchemaTableName, TupleDomain,
+    ConnectorSession, Constraint, SchemaTableName, TupleDomain,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorError, ConnectorInstanceDescriptor,
@@ -167,9 +167,6 @@ where
                 K::PinnedFileSet { pinned } => self
                     .get_pinned_file_set_handle(session, name, pinned)
                     .map(|v| v.map(|v| (v, None))),
-                K::TableExecute { procedure } => self
-                    .get_table_execute_plan(session, name, procedure.clone())
-                    .map(|v| v.map(|v| (v, None))),
             }
         })
     }
@@ -282,15 +279,6 @@ where
         _session: &ConnectorSession,
         _name: &SchemaTableName,
         _window: novarocks_spi::connector::read_stack::ConnectorReadChangeWindow,
-    ) -> Result<Option<Self::Table>, ConnectorError> {
-        Ok(None)
-    }
-
-    fn get_table_execute_plan(
-        &self,
-        _session: &ConnectorSession,
-        _name: &SchemaTableName,
-        _procedure: ConnectorReadTableExecuteProcedure,
     ) -> Result<Option<Self::Table>, ConnectorError> {
         Ok(None)
     }

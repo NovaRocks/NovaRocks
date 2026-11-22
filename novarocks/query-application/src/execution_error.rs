@@ -59,6 +59,33 @@ pub fn has_explicit_connector_detail(error: &crate::session_error::QueryServiceE
         .is_some()
 }
 
+/// Borrow a Provider's opted-in public rendering from the original retained
+/// source. The selected failure still owns its class, reason and disposition.
+pub fn prefixed_connector_failure_detail(
+    error: &crate::session_error::QueryServiceError,
+) -> Option<&str> {
+    use novarocks_failure_contract::SharedFailureCause;
+    use novarocks_spi::connector::{ConnectorError, ConnectorMutationFailure};
+
+    let selected = error.execution_failure()?.fact();
+    let cause = error
+        .failure_cause()
+        .filter(|cause| cause.failure_fact() == selected)?;
+    if let Some(detail) = cause.prefixed_public_detail() {
+        return Some(detail);
+    }
+    let connector = cause.downcast_ref::<ConnectorError>().or_else(|| {
+        cause
+            .downcast_ref::<ConnectorMutationFailure>()?
+            .connector_source()
+    })?;
+    let origin = std::error::Error::source(connector)?.downcast_ref::<SharedFailureCause>()?;
+    if origin.failure_fact() != selected {
+        return None;
+    }
+    origin.prefixed_public_detail()
+}
+
 /// Project the publication verdict from the original terminal for a specific
 /// data mutation. The statement tag is selected at admission, not from SQL text.
 pub fn data_mutation_publication_effect(

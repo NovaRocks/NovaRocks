@@ -24,7 +24,7 @@ use crate::commit::write_stack::domain::{
     IcebergWriterOutput,
 };
 use crate::commit::write_stack::test_support::{
-    data_branch_plan, equality_delete_recipe, position_rewrite_target, writer_resources,
+    data_branch_plan, equality_delete_recipe, writer_resources,
 };
 use arrow::array::{BinaryArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -122,18 +122,10 @@ impl Fixture {
             4,
             1,
             0,
-            if branch == IcebergWriteBranch::DeletionVector {
-                3
-            } else {
-                2
-            },
+            2,
         )
         .unwrap();
-        let format = if branch == IcebergWriteBranch::DeletionVector {
-            IcebergFileFormat::Puffin
-        } else {
-            IcebergFileFormat::Parquet
-        };
+        let format = IcebergFileFormat::Parquet;
         let output = options.output.unwrap_or_else(|| {
             IcebergWriterOutput::for_test(format, parquet::basic::Compression::SNAPPY)
         });
@@ -223,57 +215,15 @@ impl Fixture {
                 });
                 (handle, batch)
             }
-            IcebergWriteBranch::DeletionVector => {
-                let source = format!("{root}/a-source.parquet");
-                let handle = IcebergWriterHandle::try_new_delete(branch, table, output)
-                    .unwrap()
-                    .try_with_position_rewrite(position_rewrite_target(&source, 2))
-                    .unwrap()
-                    .with_creation_scope(
-                        IcebergCreationScope::try_new(
-                            IcebergWriteSessionId::new(),
-                            [1; 16],
-                            [2; 32],
-                        )
-                        .unwrap(),
-                    );
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new(
-                        crate::position_delete::FILE_PATH_COLUMN,
-                        DataType::Utf8,
-                        false,
-                    ),
-                    Field::new(crate::position_delete::POS_COLUMN, DataType::Int64, false),
-                ]));
-                (
-                    handle,
-                    RecordBatch::try_new(
-                        schema,
-                        vec![
-                            Arc::new(StringArray::from(vec![
-                                source.clone(),
-                                source.clone(),
-                                source,
-                            ])),
-                            Arc::new(Int64Array::from(vec![0, 0, 1])),
-                        ],
-                    )
-                    .unwrap(),
-                )
-            }
-            IcebergWriteBranch::PositionDelete => unreachable!("maintenance requires v3"),
+            _ => unreachable!("fixture uses data or equality-delete writers"),
         };
         let stop = ConnectorStopOwner::new();
         let writer = self
             .execution
             .open_writer(ConnectorOpenWriterRequest {
-                resources: options.resources.or_else(|| {
-                    matches!(
-                        branch,
-                        IcebergWriteBranch::Data | IcebergWriteBranch::DeletionVector
-                    )
-                    .then(writer_resources)
-                }),
+                resources: options
+                    .resources
+                    .or_else(|| (branch == IcebergWriteBranch::Data).then(writer_resources)),
                 handle: self.adapter.wrap_writer_handle(handle),
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_schema: batch.schema(),
@@ -356,10 +306,6 @@ async fn sealed_data_survives_old_abort_drop_and_lost_receipt() {
 #[tokio::test]
 async fn sealed_equality_delete_survives_old_abort_drop_and_lost_receipt() {
     check_sealed(IcebergWriteBranch::EqualityDelete).await;
-}
-#[tokio::test]
-async fn sealed_maintenance_vector_survives_old_abort_drop_and_lost_receipt() {
-    check_sealed(IcebergWriteBranch::DeletionVector).await;
 }
 #[tokio::test]
 async fn unsealed_data_and_equality_delete_still_clean_their_own_objects() {
@@ -582,60 +528,6 @@ async fn failed_original_stream_abort_remains_a_failure_on_reentry() {
         "repairing the path cannot invent the lost original abort receipt"
     );
     assert!(writer.finish().await.is_err());
-}
-
-#[tokio::test]
-async fn maintenance_vector_rejects_foreign_and_out_of_domain_rows_before_staging() {
-    let fixture = Fixture::new();
-    for (foreign, position) in [(true, 0), (false, 2), (false, -1)] {
-        let (mut writer, original, _) = fixture.writer(IcebergWriteBranch::DeletionVector).await;
-        let names = original
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let path = if foreign {
-            "file:///foreign/data.parquet"
-        } else {
-            names.value(0)
-        };
-        let batch = RecordBatch::try_new(
-            original.schema(),
-            vec![
-                Arc::new(StringArray::from(vec![path])),
-                Arc::new(Int64Array::from(vec![position])),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            writer.append(batch).await.unwrap_err().kind(),
-            ConnectorErrorKind::InvalidRequest
-        );
-        writer.abort().await.unwrap();
-        assert!(fixture.files().is_empty());
-    }
-}
-
-#[tokio::test]
-async fn maintenance_vector_repacks_full_coverage_with_an_owned_puffin() {
-    let fixture = Fixture::new();
-    let (mut writer, batch, _) = fixture.writer(IcebergWriteBranch::DeletionVector).await;
-    writer.append(batch).await.unwrap();
-    let fragments = writer.finish().await.unwrap();
-    let [fragment] = fragments.as_slice() else {
-        panic!("one selected file must produce one vector");
-    };
-    let fragment = fixture.adapter.commit_fragment(fragment).unwrap();
-    let crate::commit::write_stack::IcebergCommitArtifact::DeletionVector(vector) =
-        fragment.artifact()
-    else {
-        panic!("maintenance must stage a replacement vector even at full coverage");
-    };
-    assert_eq!(vector.cardinality(), 2);
-    assert!(vector.merged_old_references().is_empty());
-    assert!(fragment.creation().is_some());
-    let [path]: [_; 1] = fixture.files().try_into().unwrap();
-    assert!(std::fs::read(path).unwrap().starts_with(b"PFA1"));
 }
 
 #[tokio::test]

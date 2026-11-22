@@ -59,9 +59,7 @@ struct PlanBody {
     metadata: Option<novarocks_spi::connector::ConnectorTableMetadata>,
     table: Option<crate::iceberg::table::Table>,
     capture: Option<ConnectorOriginalResultScope>,
-    files: Option<crate::manifest::CheckedDataFiles>,
     snapshot_result: Option<ScopedReadSnapshot>,
-    deletes: Vec<Arc<crate::delete_semantics::DeleteFact>>,
     phase: CpuPhase,
     started: bool,
     metadata_result: Option<Result<(), ConnectorError>>,
@@ -167,27 +165,12 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                             .metadata()
                             .uuid(),
                     )?;
-                    let operation = match body.source_request.selection {
-                        ConnectorRewriteSelection::Optimize {
-                            file_size_threshold_bytes,
-                        } => ConnectorDistributedRewriteOperation::OptimizeDataFiles {
-                            table: metadata.table.clone(),
-                            file_size_threshold_bytes,
-                        },
-                        ConnectorRewriteSelection::DataFiles { rewrite_all } => {
-                            ConnectorDistributedRewriteOperation::RewriteDataFiles {
-                                table: metadata.table.clone(),
-                                rewrite_all,
-                            }
-                        }
-                        ConnectorRewriteSelection::PositionDeletes {
-                            rewrite_all,
-                            min_input_files,
-                        } => ConnectorDistributedRewriteOperation::RewritePositionDeletes {
-                            table: metadata.table.clone(),
-                            rewrite_all,
-                            min_input_files,
-                        },
+                    let ConnectorRewriteSelection::Optimize {
+                        file_size_threshold_bytes,
+                    } = body.source_request.selection;
+                    let operation = ConnectorDistributedRewriteOperation::OptimizeDataFiles {
+                        table: metadata.table.clone(),
+                        file_size_threshold_bytes,
                     };
                     body.metadata = Some(metadata);
                     body.request = Some(ConnectorDistributedRewritePlanningRequest::try_new(
@@ -203,7 +186,9 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                 body.result = Some((|| {
                     let capture = body.capture.as_ref().unwrap();
                     let scope = CaptureScope::new(capture).map_err(capture_failure)?;
-                    let checked = if let Some(snapshot) = body.snapshot_result.take() {
+                    let (files, observed_entries, retention) = if let Some(snapshot) =
+                        body.snapshot_result.take()
+                    {
                         let table = body.table.as_ref().unwrap();
                         let snapshot_id = table
                             .metadata()
@@ -218,64 +203,21 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                                 &scope,
                             )
                             .map_err(capture_failure)?;
-                        body.deletes = snapshot.all_deletes;
-                        checked
+                        let observed_entries = snapshot.rewrite_entries.ok_or_else(|| {
+                            internal("Rewrite original snapshot has no removal entry observation")
+                        })?;
+                        let files = checked.files.into_iter().map(|file| file.stats).collect();
+                        (files, observed_entries, Some(snapshot._retention_guard))
                     } else {
-                        crate::manifest::CheckedDataFiles {
-                            files: Vec::new(),
-                            _retention_guard: capture.retention_guard(),
-                        }
+                        (Vec::new(), RewriteEntries::default(), None)
                     };
-                    body.files = Some(checked);
-                    let checked = body
-                        .files
-                        .as_ref()
-                        .expect("original checked Rewrite capture");
-                    let mut live = BTreeSet::new();
-                    for fact in &body.deletes {
-                        scope.active().map_err(capture_failure)?;
-                        use crate::delete_semantics::{DeleteContentAddress, DeleteKind};
-                        let identity = match (fact.address(), fact.kind()) {
-                            (
-                                DeleteContentAddress::PuffinBlob {
-                                    path,
-                                    offset,
-                                    length,
-                                },
-                                DeleteKind::DeletionVector { exact_target },
-                            ) => EntryIdentity::DeletionVector {
-                                path: path.to_string(),
-                                offset: i64::try_from(*offset)
-                                    .map_err(|_| corrupt("Rewrite DV offset exceeds i64"))?,
-                                length: i64::try_from(*length)
-                                    .map_err(|_| corrupt("Rewrite DV length exceeds i64"))?,
-                                referenced_data_file: exact_target.to_string(),
-                            },
-                            (DeleteContentAddress::File(path), _) => EntryIdentity::DeleteFile {
-                                path: path.to_string(),
-                            },
-                            _ => {
-                                return Err(corrupt(
-                                    "Rewrite delete address differs from its exact kind",
-                                ));
-                            }
-                        };
-                        identity.validate().map_err(|e| corrupt(e.to_string()))?;
-                        if !live.insert(identity) {
-                            return Err(corrupt("Rewrite snapshot repeats a logical delete entry"));
-                        }
-                    }
-                    let files = checked
-                        .files
-                        .iter()
-                        .map(|file| file.stats.clone())
-                        .collect::<Vec<_>>();
                     let plan = with_original_creation(body, |creation| {
                         body.control.build_loaded_plan(
                             body.request.as_ref().unwrap(),
                             body.table.as_ref().unwrap(),
                             files,
-                            &live,
+                            observed_entries,
+                            retention,
                             creation,
                         )
                     })?;
@@ -311,13 +253,7 @@ pub(super) fn prepare_source_in(
     if original.table.instance_id != control.key.instance_id {
         return Err(invalid("rewrite source request has a foreign generation"));
     }
-    let operation = match original.selection {
-        ConnectorRewriteSelection::DataFiles { .. }
-        | ConnectorRewriteSelection::Optimize { .. } => CatalogOperation::RewriteDataFiles,
-        ConnectorRewriteSelection::PositionDeletes { .. } => {
-            CatalogOperation::RewritePositionDeletes
-        }
-    };
+    let operation = CatalogOperation::RewriteDataFiles;
     control
         .runtime
         .novarocks_catalog()
@@ -347,9 +283,7 @@ pub(super) fn prepare_source_in(
                 metadata: None,
                 table: None,
                 capture: None,
-                files: None,
                 snapshot_result: None,
-                deletes: Vec::new(),
                 phase: CpuPhase::Metadata,
                 started: false,
                 metadata_result: None,

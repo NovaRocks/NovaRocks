@@ -73,8 +73,6 @@ pub enum QueryFrozenReadInput {
     Snapshot(i64),
     /// Exactly the files a provider pinned for one cohort.
     PinnedFileSet,
-    /// One group inside an immutable rewrite artifact a provider minted.
-    TableExecute,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -276,7 +274,6 @@ impl QueryTableBindingAdmission {
 #[derive(Clone, Debug)]
 pub enum QueryFrozenCohortRead {
     PinnedFileSet(crate::query_execution::cohort_read::QueryPinnedFileSetRead),
-    TableExecute(crate::query_execution::cohort_read::QueryRewriteGroupRead),
 }
 
 impl QueryFrozenCohortRead {
@@ -284,7 +281,6 @@ impl QueryFrozenCohortRead {
     pub fn planning_pin(&self) -> &ConnectorControlPlanningPin {
         match self {
             Self::PinnedFileSet(read) => &read.planning_pin,
-            Self::TableExecute(read) => &read.planning_pin,
         }
     }
 
@@ -292,7 +288,6 @@ impl QueryFrozenCohortRead {
     pub const fn frozen_read_input(&self) -> QueryFrozenReadInput {
         match self {
             Self::PinnedFileSet(_) => QueryFrozenReadInput::PinnedFileSet,
-            Self::TableExecute(_) => QueryFrozenReadInput::TableExecute,
         }
     }
 }
@@ -1047,7 +1042,7 @@ impl QueryTableBindingStore {
             // A cohort is not a materialization of a relation: it names files
             // or a group directly, so there is nothing here to resolve it to.
             // Its carrier is read through `frozen_cohort_read` instead.
-            QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => Err(
+            QueryFrozenReadInput::PinnedFileSet => Err(
                 "a provider-frozen cohort is read through its admitted carrier, not through a relation materialization"
                     .to_string(),
             ),

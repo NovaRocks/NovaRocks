@@ -30,19 +30,49 @@ use std::{
 trait ProjectedCause: Error + Send + Sync {
     fn fact(&self) -> FailureFact;
     fn local_detail(&self) -> &str;
+    fn prefixed_public_detail(&self) -> Option<&str>;
     fn original(&self) -> &(dyn Error + 'static);
     fn retain_source_lifetime(&self, custody: Box<dyn SourceRetentionCapability>);
 }
-struct CauseRecord<E> {
+trait RetainedDetail: fmt::Debug + Send + Sync {
+    fn local(&self) -> &str;
+    fn prefixed_public(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl RetainedDetail for BoundedDetail {
+    fn local(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug)]
+struct PrefixedPublicDetail {
+    message: Box<str>,
+    local_end: usize,
+}
+
+impl RetainedDetail for PrefixedPublicDetail {
+    fn local(&self) -> &str {
+        &self.message[..self.local_end]
+    }
+
+    fn prefixed_public(&self) -> Option<&str> {
+        Some(&self.message)
+    }
+}
+
+struct CauseRecord<E, D = BoundedDetail> {
     cause: E,
     fact: FailureFact,
-    detail: BoundedDetail,
+    detail: D,
     // Keep last: destroy the original payload before its admitted guards,
     // including when that payload's destructor unwinds. This proves this
     // canonical node's exit, not every independently shared child resource.
     retention: Mutex<Vec<Box<dyn SourceRetentionCapability>>>,
 }
-impl<E> fmt::Debug for CauseRecord<E> {
+impl<E, D: RetainedDetail> fmt::Debug for CauseRecord<E, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DomainCause")
             .field("fact", &self.fact)
@@ -50,22 +80,25 @@ impl<E> fmt::Debug for CauseRecord<E> {
             .finish()
     }
 }
-impl<E> fmt::Display for CauseRecord<E> {
+impl<E, D: RetainedDetail> fmt::Display for CauseRecord<E, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.detail.fmt(f)
+        f.write_str(self.detail.local())
     }
 }
-impl<E: Error + 'static> Error for CauseRecord<E> {
+impl<E: Error + 'static, D: RetainedDetail> Error for CauseRecord<E, D> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.cause)
     }
 }
-impl<E: Error + Send + Sync + 'static> ProjectedCause for CauseRecord<E> {
+impl<E: Error + Send + Sync + 'static, D: RetainedDetail> ProjectedCause for CauseRecord<E, D> {
     fn fact(&self) -> FailureFact {
         self.fact
     }
     fn local_detail(&self) -> &str {
-        self.detail.as_str()
+        self.detail.local()
+    }
+    fn prefixed_public_detail(&self) -> Option<&str> {
+        self.detail.prefixed_public()
     }
     fn original(&self) -> &(dyn Error + 'static) {
         &self.cause
@@ -143,6 +176,33 @@ impl SharedFailureCause {
             retention: Mutex::new(Vec::new()),
         }))
     }
+    /// Keep an authored public diagnostic with its original bounded, redacted
+    /// body and static affixes. The ordinary local rendering remains bounded;
+    /// a protocol may explicitly borrow the full authored text.
+    ///
+    /// Existing shared sources keep their original node, custody and diagnostics.
+    pub fn from_prefixed_public_detail<E: Error + FailureProjection + Send + Sync + 'static>(
+        cause: E,
+        prefix: &'static str,
+        marker: &'static str,
+        body: BoundedDetail,
+    ) -> Self {
+        if let Some(shared) = (&cause as &dyn Any).downcast_ref::<Self>() {
+            return shared.clone();
+        }
+        let fact = cause.failure_fact();
+        let message = format!("{prefix}{marker}{body}").into_boxed_str();
+        let detail = PrefixedPublicDetail {
+            local_end: BoundedDetail::truncating_backing_len(&message),
+            message,
+        };
+        Self(Arc::new(CauseRecord {
+            cause,
+            fact,
+            detail,
+            retention: Mutex::new(Vec::new()),
+        }))
+    }
     /// The actual private pointee, including fact and BoundedDetail header.
     /// The caller's locked Arc-layout author adds the original Arc counters;
     /// E's already-owned pointees and diagnostic bytes are separate custody.
@@ -151,6 +211,11 @@ impl SharedFailureCause {
     }
     pub fn detail(&self) -> &str {
         self.0.local_detail()
+    }
+    /// Borrow the originating author's opt-in public detail without executing
+    /// the source formatter. Ordinary local diagnostics never opt in implicitly.
+    pub fn prefixed_public_detail(&self) -> Option<&str> {
+        self.0.prefixed_public_detail()
     }
     pub fn downcast_ref<E: Error + 'static>(&self) -> Option<&E> {
         self.0.original().downcast_ref()

@@ -75,6 +75,36 @@ pub enum ArtifactOrigin {
 pub trait ArtifactWriter: Send + Sync {
     fn file_io(&self) -> &FileIO;
     fn allocate(&self, kind: ArtifactKind) -> Result<ObjectIdentity>;
+    #[cfg(not(test))]
+    fn allocate_reusable_statistics(&self) -> Result<ObjectIdentity>;
+    #[cfg(test)]
+    fn allocate_reusable_statistics(&self) -> Result<ObjectIdentity> {
+        Err(invariant(
+            "This artifact writer cannot own reusable statistics",
+        ))
+    }
+    #[cfg(not(test))]
+    fn find_reusable_statistics(
+        &self,
+        basis: &super::StatisticsReuseBasis,
+    ) -> Result<Option<super::ReusableStatisticsFile>>;
+    #[cfg(test)]
+    fn find_reusable_statistics(
+        &self,
+        _basis: &super::StatisticsReuseBasis,
+    ) -> Result<Option<super::ReusableStatisticsFile>> {
+        Ok(None)
+    }
+    #[cfg(test)]
+    fn remember_reusable_statistics(
+        &self,
+        _basis: super::StatisticsReuseBasis,
+        _output: super::ReusableStatisticsFile,
+    ) -> Result<()> {
+        Err(invariant(
+            "This artifact writer cannot certify reusable statistics",
+        ))
+    }
     fn attempt_token(&self) -> AttemptToken;
     fn check_active(&self) -> Result<()>;
     #[cfg(not(test))]
@@ -186,6 +216,9 @@ pub struct ArtifactRecord {
     pub origin: ArtifactOrigin,
     pub write_state: ArtifactWriteState,
     pub retired: bool,
+    // A rewrite copy is owned across retries, while appearing as an ordinary
+    // Statistics file in the exact successful request.
+    reusable_statistics: bool,
     pub covers: BTreeSet<ObjectIdentity>,
     pub added_entries: usize,
     pub resolved_added_entries: usize,
@@ -203,6 +236,7 @@ impl ArtifactRecord {
             origin: ArtifactOrigin::Received { publishes },
             write_state: ArtifactWriteState::Written,
             retired: false,
+            reusable_statistics: false,
             covers: BTreeSet::new(),
             added_entries: 0,
             resolved_added_entries: 0,
@@ -218,6 +252,7 @@ impl ArtifactRecord {
             origin: ArtifactOrigin::Produced { attempt, kind },
             write_state: ArtifactWriteState::Allocated,
             retired: false,
+            reusable_statistics: false,
             covers: BTreeSet::new(),
             added_entries: 0,
             resolved_added_entries: 0,
@@ -225,6 +260,16 @@ impl ArtifactRecord {
             list_snapshot_id: None,
             replaces: Vec::new(),
             members: BTreeSet::new(),
+        }
+    }
+
+    pub(in crate::commit) fn reusable_statistics(
+        object: ObjectIdentity,
+        attempt: AttemptToken,
+    ) -> Self {
+        Self {
+            reusable_statistics: true,
+            ..Self::produced(object, attempt, ArtifactKind::Statistics)
         }
     }
 }
@@ -384,6 +429,7 @@ impl ArtifactLedger {
             attempt,
             kind: ArtifactKind::ManifestList | ArtifactKind::Statistics,
         } = record.origin
+            && !record.reusable_statistics
         {
             self.round_artifacts
                 .entry(attempt)
@@ -769,6 +815,20 @@ impl ArtifactLedger {
             )));
         }
         Ok(record)
+    }
+    pub(crate) fn is_reusable_statistics(&self, object: &ObjectIdentity) -> bool {
+        self.records
+            .get(object)
+            .is_some_and(|record| record.reusable_statistics)
+    }
+    pub(super) fn check_reusable_statistics(&self, object: &ObjectIdentity) -> Result<()> {
+        let record = self.produced(object, ArtifactKind::Statistics)?;
+        if !record.reusable_statistics {
+            return Err(invariant(
+                "This statistics artifact cannot survive a retired attempt",
+            ));
+        }
+        Ok(())
     }
     pub fn check_reusable_manifest(&self, object: &ObjectIdentity) -> Result<()> {
         self.produced(object, ArtifactKind::Manifest).map(|_| ())

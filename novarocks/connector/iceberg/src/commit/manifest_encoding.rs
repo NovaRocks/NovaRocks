@@ -336,28 +336,31 @@ fn project_partition(
     {
         return None;
     }
-    partition
+    let mut projected = Vec::with_capacity(partition.fields().len());
+    for (value, (source, target)) in partition
         .fields()
         .iter()
         .zip(source.fields().iter().zip(target.fields()))
-        .map(|(value, (source, target))| {
-            let Some(value) = value else {
-                return Some(None);
-            };
-            let Literal::Primitive(value) = value else {
-                return None;
-            };
-            let source = source.field_type.as_primitive_type()?;
-            let target = target.field_type.as_primitive_type()?;
-            if !source.compatible(value) || !can_promote(version, source, target) {
-                return None;
-            }
-            let value = resolved_partition_primitive(value, target);
-            target
-                .compatible(&value)
-                .then(|| Some(Literal::Primitive(value.into_owned())))
-        })
-        .collect::<Option<Struct>>()
+    {
+        let Some(value) = value else {
+            projected.push(None);
+            continue;
+        };
+        let Literal::Primitive(value) = value else {
+            return None;
+        };
+        let source = source.field_type.as_primitive_type()?;
+        let target = target.field_type.as_primitive_type()?;
+        if !source.compatible(value) || !can_promote(version, source, target) {
+            return None;
+        }
+        let value = resolved_partition_primitive(value, target);
+        if !target.compatible(&value) {
+            return None;
+        }
+        projected.push(Some(Literal::Primitive(value.into_owned())));
+    }
+    Some(Struct::from_iter(projected))
 }
 
 fn can_promote(version: FormatVersion, source: &PrimitiveType, target: &PrimitiveType) -> bool {

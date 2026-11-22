@@ -46,11 +46,8 @@ use crate::typed_read::table_handle::tests::{
 use crate::typed_read::{
     HiveTransactionHandle, IcebergChangeWindowHandle, IcebergChangeWindowHandleParams,
     IcebergColumnHandle, IcebergInsertTableHandle, IcebergInsertTableHandleParams,
-    IcebergMergeTableHandle, IcebergRewriteArtifactContentId,
-    IcebergRewritePositionDeleteFilesHandle, IcebergSystemTableReference,
-    IcebergSystemTableReferenceParams, IcebergSystemTableType, IcebergTableExecuteHandle,
-    IcebergTableExecuteHandleParams, IcebergTableExecuteProcedureHandle, IcebergTableHandle,
-    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, TableChangesFunctionHandle,
+    IcebergMergeTableHandle, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
+    IcebergSystemTableType, IcebergTableHandle, TableChangesFunctionHandle,
     TableChangesFunctionHandleParams, change_op_column_handle,
 };
 
@@ -538,48 +535,6 @@ fn window_fixture() -> Fixture {
         metadata: None,
     }
 }
-fn rewrite_fixture() -> Fixture {
-    let handle = partitioned_handle();
-    let execute = IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
-        schema_table_name: handle.schema_table_name().clone(),
-        procedure_id: crate::typed_read::IcebergProcedureId::RewritePositionDeleteFiles,
-        table_location: handle.table_location().into(),
-        procedure_handle: Some(
-            IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
-                IcebergRewritePositionDeleteFilesHandle::try_new(
-                    handle,
-                    IcebergRewriteArtifactContentId::try_new(
-                        novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
-                        "12".repeat(32),
-                    )
-                    .unwrap(),
-                    "34".repeat(32),
-                )
-                .unwrap(),
-            ),
-        ),
-    })
-    .unwrap();
-    let relation = IcebergRuntimeRelation::TableExecute(execute);
-    let columns = REWRITE_POSITION_DELETE_OUTPUT_COLUMNS
-        .into_iter()
-        .map(|(name, metadata)| {
-            crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    Fixture {
-        source: source_for(&relation),
-        domains: BTreeMap::new(),
-        published_source: None,
-        published_bindings: None,
-        fields: columns.iter().map(column_field).collect(),
-        relation,
-        columns,
-        metadata: None,
-    }
-}
-
 #[test]
 fn complete_system_read_uses_actual_metadata_schema_kind_evidence_and_execution_mode() {
     for kind in [
@@ -609,21 +564,6 @@ fn complete_change_window_retains_exact_required_change_sign_and_endpoint_facts(
     assert_unchanged(&fixture.build());
     let mut wrong = fixture.clone();
     wrong.fields[2] = Arc::new(sign.as_ref().clone().with_nullable(true));
-    assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
-}
-
-#[test]
-fn complete_table_execute_rewrite_retains_two_required_pseudo_columns_and_exact_coverage() {
-    let fixture = rewrite_fixture();
-    assert_eq!(fixture.columns.len(), 2);
-    assert!(fixture.fields.iter().all(|field| !field.is_nullable()));
-    assert!(matches!(
-        fixture.source.artifact_coverage(),
-        ConnectorReadArtifactCoverage::Exact { .. }
-    ));
-    assert_unchanged(&fixture.build());
-    let mut wrong = fixture.clone();
-    wrong.fields[0] = Arc::new(wrong.fields[0].as_ref().clone().with_nullable(true));
     assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
 }
 
@@ -1230,7 +1170,7 @@ fn published(fixture: &Fixture) -> Fixture {
 #[test]
 fn every_final_relation_kind_publishes_a_schema_its_pure_compiler_accepts() {
     let catalog = iceberg_catalog();
-    let mut fixtures = vec![Fixture::table(), window_fixture(), rewrite_fixture()];
+    let mut fixtures = vec![Fixture::table(), window_fixture()];
     for kind in [
         IcebergSystemTableType::Files,
         IcebergSystemTableType::Entries,
@@ -1314,10 +1254,13 @@ fn published_schema_carries_ids_defaults_and_nested_domains_and_passes_the_pure_
         .build()
         .unwrap();
     let base = |id| IcebergColumnHandle::base_column_of(&schema, id).unwrap();
-    let file = crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(
-        "_file",
-        IcebergMetadataColumn::Path,
-    )
+    let metadata = IcebergMetadataColumn::Path;
+    let file = IcebergColumnHandle::base_column(&NestedField::new(
+        metadata.field_id(),
+        metadata.column_name(),
+        Type::Primitive(metadata.declared_type()),
+        !metadata.nullable(),
+    ))
     .unwrap();
     let columns = vec![
         base(1),

@@ -23,7 +23,7 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationSession, ConnectorControlPlanningPin, ConnectorNamespaceIdentity,
     ConnectorRequestContext, ConnectorTableIdentity,
 };
-use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
+use novarocks_sql::semantic::{CatalogSqlCommand, StatisticsSqlCommand};
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
 
 use crate::admitted_query_context::RequestContext;
@@ -598,29 +598,6 @@ pub trait StatisticsCommandConsumer: Send + Sync + 'static {
     fn execute(
         &self,
         command: StatisticsSqlCommand,
-        request_context: RequestContext,
-        command_context: CommandContext,
-    ) -> CommandFuture;
-}
-
-pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
-    /// Prepare a move-only action for the original registered statement source.
-    /// Construction performs no physical dispatch and creates no Work owner.
-    fn prepare_statement_action(
-        &self,
-        _command: MaintenanceSqlCommand,
-        _request_context: RequestContext,
-        _command_context: CommandContext,
-    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError> {
-        Err(CommandError::new(
-            CommandErrorKind::Unsupported,
-            "maintenance consumer does not provide a governed statement action",
-        ))
-    }
-
-    fn execute(
-        &self,
-        command: MaintenanceSqlCommand,
         request_context: RequestContext,
         command_context: CommandContext,
     ) -> CommandFuture;

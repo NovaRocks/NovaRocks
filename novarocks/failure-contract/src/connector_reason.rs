@@ -28,7 +28,7 @@ pub const ICEBERG_TOO_MANY_OPEN_PARTITIONS: FailureReason =
 pub const COMMIT_TRANSACTION_CONFLICT: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(51).unwrap());
 
-/// Iceberg row-delta validation found a change that invalidates the write.
+/// Iceberg commit validation rejected a conflicting observation.
 pub const ICEBERG_COMMIT_VALIDATION_CONFLICT: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(52).unwrap());
 
@@ -44,7 +44,7 @@ pub const ICEBERG_INVALID_METADATA: FailureReason =
 pub const ICEBERG_FILESYSTEM_ERROR: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(55).unwrap());
 
-/// An explicit Iceberg operation failed to commit.
+/// An Iceberg update was rejected or an existing metadata procedure did not confirm it.
 pub const ICEBERG_COMMIT_ERROR: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(56).unwrap());
 

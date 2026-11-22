@@ -209,28 +209,6 @@ fn compile(
             ],
             work,
         )?,
-        (IcebergWriteBranch::DeletionVector, ConnectorWriteInputShape::DeletionVector { .. })
-            if value.position_rewrite().is_some() =>
-        {
-            // Standalone maintenance still consumes its original positional
-            // relation. The runtime checks each row against the frozen target.
-            let mut fields = draft.input().fields_iter();
-            let file_matches = fields
-                .next()
-                .is_some_and(|field| field.field().data_type() == &DataType::Utf8);
-            work.step()?;
-            let position_matches = fields
-                .next()
-                .is_some_and(|field| field.field().data_type() == &DataType::Int64);
-            work.step()?;
-            if !file_matches || !position_matches {
-                return Err(invalid(
-                    "input",
-                    "Iceberg delete writer requires first input columns Utf8 and Int64",
-                ));
-            }
-            work.step()?;
-        }
         _ => {
             return Err(invalid(
                 "input",

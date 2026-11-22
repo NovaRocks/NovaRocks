@@ -328,7 +328,7 @@ mod tests {
 mod document_expiry_recovery_tests {
     use super::*;
     use crate::commit::model::{
-        Dependency, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts, TableTarget,
+        Dependency, FileChanges, OperationIntent, OperationIntentParts, TableTarget,
     };
     use crate::commit::overwrite::preparer_tests::Fixture;
     use crate::commit::staging::{PreparedChange, StagingBase, StagingEngine};
@@ -350,7 +350,7 @@ mod document_expiry_recovery_tests {
             start: None,
             changes: FileChanges::default(),
             dependencies: vec![Dependency::NoRead],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::DocumentExpiry,
             summary: Default::default(),
             token: fixture.operation.token(),

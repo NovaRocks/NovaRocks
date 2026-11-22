@@ -17,9 +17,7 @@
 
 //! Provider-frozen cohort inputs retained by one rewrite statement.
 
-use novarocks_spi::connector::{
-    ConnectorControlPlanningPin, ConnectorFrozenRewriteGroup, ConnectorPinnedFileSet,
-};
+use novarocks_spi::connector::{ConnectorControlPlanningPin, ConnectorPinnedFileSet};
 
 /// The exact file set a mutation or rewrite cohort reads and later replaces.
 #[derive(Clone)]
@@ -36,25 +34,6 @@ impl std::fmt::Debug for QueryPinnedFileSetRead {
             .field("table", &self.pinned.table())
             .field("version_ordinal", &self.pinned.version_ordinal())
             .field("files", &self.pinned.files().len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// The exact frozen artifact group a distributed procedure cohort reads.
-#[derive(Clone)]
-pub(crate) struct QueryRewriteGroupRead {
-    pub(crate) group: ConnectorFrozenRewriteGroup,
-    pub(crate) group_digest: [u8; 32],
-    pub(crate) planning_pin: ConnectorControlPlanningPin,
-}
-
-impl std::fmt::Debug for QueryRewriteGroupRead {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RewriteGroupRead")
-            .field("namespace", &self.group.schema_name())
-            .field("table", &self.group.table_name())
-            .field("operation_id", &self.group.operation_id())
             .finish_non_exhaustive()
     }
 }

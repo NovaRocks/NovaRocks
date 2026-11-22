@@ -907,8 +907,7 @@ mod tests {
     #[tokio::test]
     async fn repartition_staging_binds_new_ids_and_reuses_an_exact_historical_spec() {
         use crate::commit::model::{
-            FileChanges, IsolationLevel, OperationIntent, OperationIntentParts, RequestShape,
-            TableTarget,
+            FileChanges, OperationIntent, OperationIntentParts, RequestShape, TableTarget,
         };
         use crate::commit::staging::{StagingBase, StagingEngine};
         let fixture = crate::commit::overwrite::preparer_tests::Fixture::new();
@@ -926,7 +925,7 @@ mod tests {
                 start: None,
                 changes: FileChanges::default(),
                 dependencies: Vec::new(),
-                isolation: IsolationLevel::Snapshot,
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: RequestShape::MetadataOnly,
                 summary: std::collections::BTreeMap::new(),
                 token: fixture.operation.token(),

@@ -20,11 +20,14 @@
 mod builtin;
 pub(crate) mod history;
 mod inputs;
+mod rewrite_files;
 mod row_delta;
+mod window;
 
 pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;
 pub(crate) use builtin::validate_with_removed_data;
+#[cfg(test)]
 pub use history::HistoryGap;
 #[cfg(test)]
 pub use history::{HistoryWindow, history_window};
@@ -34,8 +37,6 @@ pub use inputs::ValidationInputs;
 pub(crate) use row_delta::{RemovedDataFiles, RowDeltaWindowCheck};
 
 use novarocks_spi::connector::ConnectorMutationFailure;
-
-use crate::iceberg::spec::TableMetadata;
 
 use super::model::Dependency;
 
@@ -51,25 +52,14 @@ pub enum Culprit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verdict<D = Dependency> {
     Holds,
-    Broken { dependency: D, culprit: Culprit },
+    Broken {
+        dependency: D,
+        culprit: Culprit,
+    },
     ValidationConflict(ConnectorMutationFailure),
-    Unprovable { dependency: D, reason: HistoryGap },
-}
-
-impl Verdict {
-    pub(crate) fn row_delta_conflict(
-        &self,
-        metadata: &TableMetadata,
-        start: Option<i64>,
-        parent: Option<i64>,
-    ) -> Option<ConnectorMutationFailure> {
-        match self {
-            Self::ValidationConflict(failure) => Some(failure.clone()),
-            Self::Unprovable {
-                dependency: Dependency::RowDeltaWindow(_),
-                reason,
-            } => Some(row_delta::history_conflict(reason, metadata, start, parent)),
-            _ => None,
-        }
-    }
+    #[cfg(test)]
+    Unprovable {
+        dependency: D,
+        reason: HistoryGap,
+    },
 }

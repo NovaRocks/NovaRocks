@@ -25,7 +25,6 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
-use tokio::runtime::Handle;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
@@ -395,7 +394,6 @@ pub struct MaintenanceCommandPorts {
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     service: Arc<dyn TableMaintenanceService>,
-    runtime: Handle,
 }
 
 impl MaintenanceCommandPorts {
@@ -412,7 +410,6 @@ impl MaintenanceCommandPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         service: Arc<dyn TableMaintenanceService>,
-        runtime: Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
@@ -430,7 +427,6 @@ impl MaintenanceCommandPorts {
             mv_storage_observation,
             mv_readiness,
             service,
-            runtime,
         }
     }
 
@@ -466,7 +462,7 @@ impl MaintenanceCommandPorts {
 pub fn maintenance_command_executor(
     ports: MaintenanceCommandPorts,
 ) -> maintenance_command::MaintenanceCommandExecutor {
-    maintenance_command::MaintenanceCommandExecutor::new(ports.kernel(), ports.runtime)
+    maintenance_command::MaintenanceCommandExecutor::new(ports.kernel())
 }
 
 /// Leaf ports for MV metadata and refresh execution.

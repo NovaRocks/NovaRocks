@@ -43,7 +43,6 @@ pub enum SplitCategory {
     ChangeWindow,
     SystemManifest,
     SystemRelation,
-    RewritePositionDeleteFiles,
 }
 
 /// A validated public split carrier.
@@ -218,12 +217,6 @@ fn decode_category(
             SplitCategory::SystemManifest,
             value.provider_payload.as_ref(),
             path.field("system_manifest").field("provider_payload"),
-        ),
-        dto::connector_split::Category::RewritePositionDeleteFiles(value) => (
-            SplitCategory::RewritePositionDeleteFiles,
-            value.provider_payload.as_ref(),
-            path.field("rewrite_position_delete_files")
-                .field("provider_payload"),
         ),
     };
     let payload = crate::connector_common::decode_embedded_connector_payload(

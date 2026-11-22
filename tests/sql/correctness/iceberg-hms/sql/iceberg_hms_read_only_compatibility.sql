@@ -220,17 +220,13 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE optimize_manifests;
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE remove_orphan_files(retention_threshold => '7d');
 
 -- query 44
--- Rewrite data files
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_data_files
 CALL ice_hms_${uuid0}.system.rewrite_data_files("table" => 'iru7_${uuid0}.v3', options => map('rewrite-all','true'));
 
 -- query 45
--- Rewrite position deletes
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
+-- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
+-- @expect_error=Procedure not registered: system.rewrite_position_delete_files
 CALL ice_hms_${uuid0}.system.rewrite_position_delete_files("table" => 'iru7_${uuid0}.v2', options => map('rewrite-all','true'));
 
 -- query 46

@@ -276,9 +276,6 @@ impl ProviderReadMetadata for LateProvider {
                 K::PinnedFileSet { pinned } => self
                     .get_pinned_file_set_handle(session, name, pinned)
                     .map(|v| v.map(|v| (v, None))),
-                K::TableExecute { procedure } => self
-                    .get_table_execute_plan(session, name, procedure.clone())
-                    .map(|v| v.map(|v| (v, None))),
             }
         })
     }
@@ -476,14 +473,6 @@ impl ProviderReadMetadata for LateProvider {
             .lock()
             .unwrap()
             .push(ReadOpenCall::Delta(name.clone(), window));
-        Ok(None)
-    }
-    fn get_table_execute_plan(
-        &self,
-        _: &ConnectorSession,
-        _: &SchemaTableName,
-        _: ConnectorReadTableExecuteProcedure,
-    ) -> Result<Option<Self::Table>, ConnectorError> {
         Ok(None)
     }
 }

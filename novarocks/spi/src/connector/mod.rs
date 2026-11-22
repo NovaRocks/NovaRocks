@@ -35,6 +35,7 @@ mod handle;
 mod identity;
 mod io_admission;
 mod listing;
+mod maintenance_data_size;
 mod maintenance_duration;
 mod metadata;
 mod metadata_maintenance;
@@ -152,11 +153,10 @@ pub use distributed_rewrite::{
     ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanSummary,
     ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
     ConnectorDistributedRewriteReceiptSummary, ConnectorDistributedRewriteResolver,
-    ConnectorDistributedRewriteShape, ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead,
-    ConnectorRewritePlanSource, ConnectorRewritePrepared, ConnectorRewriteSelection,
-    ConnectorRewriteSourceRequest, ConnectorRewriteWriteBeginSource,
-    MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
-    REWRITE_POSITION_DELETES_KIND, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
+    ConnectorDistributedRewriteShape, ConnectorRewriteCohortRead, ConnectorRewritePlanSource,
+    ConnectorRewritePrepared, ConnectorRewriteSelection, ConnectorRewriteSourceRequest,
+    ConnectorRewriteWriteBeginSource, MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES,
+    REWRITE_DATA_FILES_KIND, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
     SharedConnectorDistributedRewrite,
 };
 pub use distribution::ProviderBindingEpoch;
@@ -181,6 +181,7 @@ pub use io_admission::{
     SelectedThriftServiceOrigin, SharedDependency, ThriftServiceOrigin,
 };
 pub use listing::{ConnectorListingCollector, ConnectorListingPageSize};
+pub use maintenance_data_size::{ConnectorDataSize, DataSizeParseFailure, parse_airlift_data_size};
 pub use maintenance_duration::{
     ConnectorMaintenanceDuration, ConnectorMaintenanceRetention,
     EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,

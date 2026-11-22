@@ -133,12 +133,6 @@ message IcebergEqualityDeleteRecipe {
   string field_schema_json = 2;
 }
 
-message IcebergPositionRewriteTarget {
-  string data_file_path = 1;
-  uint64 record_count = 2;
-  IcebergArtifactPartition partition = 3;
-}
-
 message IcebergMutationSnapshot {
   string manifest_list = 1;
   int32 schema_id = 2;
@@ -159,6 +153,8 @@ message IcebergCreationScope {
 // The recipe intentionally carries no cohort, query, attempt,
 // backend, driver, or sink identity and no credential material.
 message IcebergWriterHandle {
+  reserved 10;
+  reserved "position_rewrite";
   IcebergWriteBranch branch = 1;
   IcebergWriteTableFacts table = 2;
   IcebergWriterOutput output = 3;
@@ -169,7 +165,6 @@ message IcebergWriterHandle {
   optional IcebergMutationReadRecipe mutation_read = 7;
   optional IcebergCreationScope creation_scope = 8;
   optional bytes position_group_id = 9;
-  optional IcebergPositionRewriteTarget position_rewrite = 10;
 }
 
 // BE -> FE: one staged provider artifact.

@@ -113,6 +113,7 @@ pub(crate) struct WritePermit {
     io: Option<tokio::sync::OwnedSemaphorePermit>,
     stream_started: std::sync::atomic::AtomicBool,
     exit_confirmed: std::sync::atomic::AtomicBool,
+    statistics_copy: bool,
 }
 
 impl WritePermit {
@@ -126,7 +127,12 @@ impl WritePermit {
             io: None,
             stream_started: std::sync::atomic::AtomicBool::new(false),
             exit_confirmed: std::sync::atomic::AtomicBool::new(false),
+            statistics_copy: false,
         }
+    }
+    pub(crate) fn with_statistics_copy(mut self, statistics_copy: bool) -> Self {
+        self.statistics_copy = statistics_copy;
+        self
     }
     async fn acquire(mut self) -> Result<Self> {
         self.io = Some(self.admission.io_permit().await?);
@@ -357,6 +363,10 @@ impl IcebergFsStorage {
     }
 
     async fn ensure_parent_dir(op: &Operator, path: &str) -> Result<()> {
+        Self::ensure_parent_dir_for(op, path, false).await
+    }
+
+    async fn ensure_parent_dir_for(op: &Operator, path: &str, statistics_copy: bool) -> Result<()> {
         let Some(parent) = Path::new(path).parent() else {
             return Ok(());
         };
@@ -367,11 +377,15 @@ impl IcebergFsStorage {
         if !parent.ends_with('/') {
             parent.push('/');
         }
-        op.create_dir(&parent).await.map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("create fs parent directory {parent}: {e}"),
-            )
+        op.create_dir(&parent).await.map_err(|error| {
+            if statistics_copy {
+                statistics_storage_failure("Create Iceberg statistics parent directory", error)
+            } else {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("create fs parent directory {parent}: {error}"),
+                )
+            }
         })
     }
 
@@ -596,7 +610,8 @@ impl Storage for IcebergFsStorage {
         if let Some(permit) = &permit {
             permit.check_active()?;
         }
-        Self::ensure_parent_dir(&op, &relative_path).await?;
+        let statistics_copy = permit.as_ref().is_some_and(|permit| permit.statistics_copy);
+        Self::ensure_parent_dir_for(&op, &relative_path, statistics_copy).await?;
         if let Some(permit) = &permit {
             permit.check_active()?;
         }
@@ -629,6 +644,12 @@ impl Storage for IcebergFsStorage {
             Err(error) => {
                 if let Some(stream) = stream {
                     stream.closed();
+                }
+                if statistics_copy {
+                    return Err(statistics_storage_failure(
+                        "Open Iceberg statistics output",
+                        error,
+                    ));
                 }
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -834,6 +855,17 @@ impl IcebergFsFileWrite {
     fn closed_metadata(&self, metadata: crate::opendal::Metadata) -> Result<FileMetadata> {
         let reported = metadata.content_length();
         if reported != 0 && reported != self.accepted_bytes {
+            if self
+                .permit
+                .as_ref()
+                .is_some_and(|permit| permit.statistics_copy)
+            {
+                let message =
+                    "Closed Iceberg statistics output length differs from the bytes written";
+                return Err(Error::new(ErrorKind::DataInvalid, message).with_source(
+                    ConnectorError::new(ConnectorErrorKind::CorruptData, message),
+                ));
+            }
             let object = self
                 .permit
                 .as_ref()
@@ -861,6 +893,75 @@ impl std::fmt::Debug for IcebergFsFileWrite {
     }
 }
 
+#[derive(Debug)]
+struct StatisticsStorageFailure {
+    file: novarocks_fs::FileError,
+    fact: novarocks_failure_contract::FailureFact,
+}
+
+impl std::fmt::Display for StatisticsStorageFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Iceberg statistics output failed")
+    }
+}
+
+impl std::error::Error for StatisticsStorageFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.file)
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for StatisticsStorageFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.fact
+    }
+}
+
+fn statistics_storage_failure(operation: &'static str, error: crate::opendal::Error) -> Error {
+    use novarocks_failure_contract::FailureProjection;
+
+    let file = novarocks_fs::map_object_store_io_error(operation, error);
+    let classification = ConnectorError::from(&file);
+    let fact = classification.failure_fact();
+    Error::new(ErrorKind::Unexpected, operation).with_source(ConnectorError::from_domain_static(
+        classification.kind(),
+        StatisticsStorageFailure { file, fact },
+        operation,
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn statistics_storage_failure_retains_typed_classification_and_raw_source() {
+    let error = statistics_storage_failure(
+        "Open Iceberg statistics output",
+        crate::opendal::Error::new(
+            crate::opendal::ErrorKind::PermissionDenied,
+            "original backend refusal",
+        ),
+    );
+    let failure = crate::commit::attempt::before_dispatch_failure(&error);
+    assert_eq!(
+        failure.kind(),
+        novarocks_spi::connector::ConnectorMutationFailureKind::PermissionDenied
+    );
+    use std::error::Error as _;
+    let classified = error
+        .source()
+        .unwrap()
+        .downcast_ref::<ConnectorError>()
+        .unwrap();
+    let mut cause = classified.source();
+    while let Some(error) = cause {
+        if let Some(raw) = error.downcast_ref::<crate::opendal::Error>() {
+            assert_eq!(raw.kind(), crate::opendal::ErrorKind::PermissionDenied);
+            return;
+        }
+        cause = error.source();
+    }
+    panic!("typed statistics error lost its raw storage source");
+}
+
 async fn abort_after_failure(
     writer: &mut crate::opendal::Writer,
     error: Error,
@@ -879,6 +980,13 @@ async fn abort_after_failure(
                     &permit.object,
                     StreamExitFailure::AbortFailed(abort.to_string()),
                 );
+            }
+            if permit.is_some_and(|permit| permit.statistics_copy) {
+                return Error::new(
+                    ErrorKind::Unexpected,
+                    "Abort Iceberg statistics output failed",
+                )
+                .with_source(error);
             }
             Error::new(
                 ErrorKind::Unexpected,
@@ -996,8 +1104,16 @@ impl FileWrite for IcebergFsFileWrite {
             .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "write to closed fs file"))?;
         let result = await_stream_step(self.permit.as_ref(), async {
             let accepted_bytes = accepted_bytes?;
-            writer.write(bs).await.map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "fs stream write failed").with_source(e)
+            writer.write(bs).await.map_err(|error| {
+                if self
+                    .permit
+                    .as_ref()
+                    .is_some_and(|permit| permit.statistics_copy)
+                {
+                    statistics_storage_failure("Write Iceberg statistics output", error)
+                } else {
+                    Error::new(ErrorKind::Unexpected, "fs stream write failed").with_source(error)
+                }
             })?;
             Ok(accepted_bytes)
         })
@@ -1048,8 +1164,16 @@ impl FileWrite for IcebergFsFileWrite {
             .take()
             .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "fs file already closed"))?;
         let result = await_stream_step(self.permit.as_ref(), async {
-            writer.close().await.map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "fs stream close failed").with_source(e)
+            writer.close().await.map_err(|error| {
+                if self
+                    .permit
+                    .as_ref()
+                    .is_some_and(|permit| permit.statistics_copy)
+                {
+                    statistics_storage_failure("Close Iceberg statistics output", error)
+                } else {
+                    Error::new(ErrorKind::Unexpected, "fs stream close failed").with_source(error)
+                }
             })
         })
         .await;

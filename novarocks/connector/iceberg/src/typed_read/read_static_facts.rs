@@ -30,8 +30,10 @@ use novarocks_type_contract::{
 use prost::Message;
 use sha2::{Digest, Sha256};
 
-use super::column_handle::{invalid, unsupported};
-use super::{IcebergColumnHandle, IcebergRuntimeRelation, IcebergTableExecuteProcedureHandle};
+#[cfg(test)]
+use super::column_handle::invalid;
+use super::column_handle::unsupported;
+use super::{IcebergColumnHandle, IcebergRuntimeRelation};
 
 #[derive(Debug)]
 pub(crate) enum ReadStaticFactsError {
@@ -177,43 +179,6 @@ fn project(
                 work,
             )
         }
-        IcebergRuntimeRelation::TableExecute(handle) => {
-            let frozen = work.opaque(|| handle.to_proto().encode_to_vec())?;
-            let selection_digest =
-                static_digest(b"iceberg-final-static-table-execute-v1", &frozen, work)?;
-            let artifact_coverage = match handle.procedure_handle() {
-                Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
-                    let content_digest =
-                        decode_hex(rewrite.artifact().artifact_digest_hex(), work)?;
-                    let evidence = work.opaque(|| rewrite.artifact().evidence())?;
-                    work.opaque_source(|| {
-                        ConnectorReadArtifactCoverage::exact(
-                            selection_digest,
-                            content_digest,
-                            evidence,
-                        )
-                    })?
-                }
-                Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
-                    ConnectorReadArtifactCoverage::NoArtifactInputs
-                }
-            };
-            let input_digest = static_digest(
-                b"iceberg-final-static-table-execute-input-v1",
-                &frozen,
-                work,
-            )?;
-            let properties = unconstrained_read_properties(work)?;
-            work.opaque_source(|| {
-                ConnectorReadStaticFacts::try_new(
-                    ConnectorReadInputVersion::try_new(input_digest.as_slice())?,
-                    selection_digest,
-                    properties,
-                    artifact_coverage,
-                    Vec::new(),
-                )
-            })
-        }
         IcebergRuntimeRelation::TableFunction(_) => Err(unsupported(
             "iceberg table-function relations do not publish final static read facts",
         )
@@ -283,6 +248,7 @@ pub(crate) fn decode_sha256_hex(value: &str) -> Result<[u8; 32], ConnectorError>
         }
     }
 }
+#[cfg(test)]
 fn decode_hex(value: &str, work: &mut Work<'_>) -> Result<[u8; 32], ReadStaticFactsError> {
     if value.len() != 64 {
         return Err(invalid("iceberg artifact digest is not a SHA-256 hex value").into());
@@ -307,10 +273,8 @@ mod tests {
     use super::*;
     use crate::typed_boundary::final_static_facts_tests::table_handle;
     use crate::typed_read::{
-        IcebergChangeWindowHandle, IcebergChangeWindowHandleParams, IcebergProcedureId,
-        IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
-        IcebergSystemTableReference, IcebergSystemTableReferenceParams, IcebergSystemTableType,
-        IcebergTableExecuteHandle, IcebergTableExecuteHandleParams, TableChangesFunctionHandle,
+        IcebergChangeWindowHandle, IcebergChangeWindowHandleParams, IcebergSystemTableReference,
+        IcebergSystemTableReferenceParams, IcebergSystemTableType, TableChangesFunctionHandle,
         TableChangesFunctionHandleParams,
     };
     use novarocks_spi::connector::read_stack::{ConnectorTableHandle as _, SchemaTableName};
@@ -355,30 +319,6 @@ mod tests {
                 metadata_file_location: "s3://warehouse/db/orders/metadata/v1.json".to_string(),
                 table_uuid: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
                 snapshot_id: Some(41),
-            })
-            .unwrap(),
-        )
-    }
-    fn rewrite() -> IcebergRuntimeRelation {
-        let table = table_handle();
-        let procedure = IcebergRewritePositionDeleteFilesHandle::try_new(
-            table.clone(),
-            IcebergRewriteArtifactContentId::try_new(
-                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
-                "01".repeat(32),
-            )
-            .unwrap(),
-            "02".repeat(32),
-        )
-        .unwrap();
-        IcebergRuntimeRelation::TableExecute(
-            IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
-                schema_table_name: table.schema_table_name().clone(),
-                procedure_id: IcebergProcedureId::RewritePositionDeleteFiles,
-                table_location: table.table_location().to_string(),
-                procedure_handle: Some(
-                    IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(procedure),
-                ),
             })
             .unwrap(),
         )
@@ -438,7 +378,6 @@ mod tests {
             system(IcebergSystemTableType::Files),
             system(IcebergSystemTableType::Snapshots),
             change(),
-            rewrite(),
         ] {
             let control = Control::default();
             let actual = iceberg_final_static_facts_for_compile(&relation, &control).unwrap();
@@ -447,7 +386,7 @@ mod tests {
         }
     }
     #[test]
-    fn metadata_is_unconstrained_and_retains_coverage_and_rewrite_exact_artifact() {
+    fn metadata_is_unconstrained_and_retains_coverage() {
         for kind in [
             IcebergSystemTableType::Files,
             IcebergSystemTableType::Entries,
@@ -471,29 +410,6 @@ mod tests {
                 reference.to_proto().encode_to_vec()
             );
         }
-        let facts =
-            iceberg_final_static_facts_for_compile(&rewrite(), &Control::default()).unwrap();
-        let ConnectorReadArtifactCoverage::Exact {
-            source_selection_digest,
-            content_digest,
-            evidence,
-        } = facts.artifact_coverage()
-        else {
-            panic!("rewrite must retain exact artifact coverage")
-        };
-        assert_eq!(*source_selection_digest, facts.selection_digest());
-        assert_eq!(*content_digest, [1; 32]);
-        assert_eq!(
-            evidence.as_ref(),
-            super::super::table_execute::IcebergRewriteArtifactContentId::try_new(
-                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
-                "01".repeat(32)
-            )
-            .unwrap()
-            .evidence()
-            .as_slice()
-        );
-        assert!(facts.coverage_evidence().is_empty());
     }
     #[test]
     fn source_fact_entry_preserves_all_three_primary_controls() {
@@ -503,7 +419,7 @@ mod tests {
                 refusal: Some((1, cause.clone())),
             };
             assert!(
-                matches!(iceberg_final_static_facts_for_compile(&rewrite(), &control),
+                matches!(iceberg_final_static_facts_for_compile(&IcebergRuntimeRelation::Table(table_handle()), &control),
                 Err(ReadStaticFactsError::Control(error)) if error == cause)
             );
             assert_eq!(*control.calls.lock().unwrap(), [0]);

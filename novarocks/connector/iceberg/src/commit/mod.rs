@@ -22,6 +22,8 @@
 
 mod action;
 pub(crate) mod attempt;
+pub(crate) mod base_removal;
+pub(crate) mod commit_failure;
 pub(crate) mod conflict;
 pub(crate) mod conflict_scope;
 mod data_file;
@@ -29,6 +31,7 @@ pub mod data_writer;
 pub(crate) mod dependency;
 pub mod equality_delete_writer;
 pub(crate) mod fast_append;
+pub(crate) mod filter_delete;
 pub mod frozen_write;
 pub(crate) mod helpers;
 pub(crate) mod manifest_encoding;
@@ -64,6 +67,7 @@ pub(crate) mod slot_change;
 pub mod snapshot_lifecycle_helpers;
 pub(crate) mod staging;
 pub mod statistics;
+pub(crate) mod statistics_carry;
 pub(crate) mod truncate;
 pub mod types;
 pub mod validation;

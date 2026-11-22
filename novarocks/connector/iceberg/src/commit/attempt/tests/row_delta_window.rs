@@ -21,6 +21,7 @@ use super::*;
 use crate::commit::conflict::{CandidateFile, MayMatch, RowDeltaValidationFacts};
 use crate::commit::dependency::RowDeltaWindowCheck;
 use crate::commit::fast_append::CompactFastAppendPreparer;
+use crate::commit::model::IsolationLevel;
 use crate::commit::new_manifests::tests::install_appends;
 use novarocks_failure_contract::FailureProjection;
 use novarocks_failure_contract::connector_reason::{
@@ -52,14 +53,20 @@ fn row_delta_intent(
         target_ref: ordinary.target_ref().into(),
         start: ordinary.start(),
         changes: FileChanges::default(),
-        dependencies: vec![Dependency::RowDeltaWindow(RowDeltaWindowCheck::new(
-            isolation,
-            Arc::new(AllFiles),
-            Arc::new(RowDeltaValidationFacts::default()),
-            true,
-            false,
-        ))],
-        isolation,
+        dependencies: Vec::new(),
+        protocol: crate::commit::model::CommitProtocol::RowDelta {
+            window: RowDeltaWindowCheck::new(
+                isolation,
+                Arc::new(AllFiles),
+                Arc::new(RowDeltaValidationFacts::default()),
+                true,
+                false,
+            ),
+            writer: crate::commit::model::WriterSchemaSpec {
+                schema_id: metadata.current_schema_id(),
+                default_spec_id: metadata.default_partition_spec_id(),
+            },
+        },
         shape: ordinary.shape(),
         summary: Default::default(),
         token: fixture.operation.token(),

@@ -35,8 +35,8 @@ fn registration_and_arrival_are_atomic_for_sealed_target_subsets() {
     let zero = WriteTargetOrdinal::try_new(0).unwrap();
     let one = WriteTargetOrdinal::try_new(1).unwrap();
     let targets = [
-        IcebergSealedWriteTarget::new(one, IcebergWriteBranch::Data, None),
-        IcebergSealedWriteTarget::new(zero, IcebergWriteBranch::Data, None),
+        IcebergSealedWriteTarget::new(one, IcebergWriteBranch::Data),
+        IcebergSealedWriteTarget::new(zero, IcebergWriteBranch::Data),
     ];
     let query = write_query_identity();
     let mut received = IcebergReceiving::default();
@@ -86,7 +86,6 @@ fn same_target_queries_keep_separate_proofs_and_completion() {
     let sealed = [IcebergSealedWriteTarget::new(
         target,
         IcebergWriteBranch::Data,
-        None,
     )];
     let query1 = write_query_identity();
     let query2 = write_query_identity();
@@ -331,3 +330,5 @@ mod logical_rows;
 mod rewritten_target;
 
 mod written_partitions;
+
+mod rewrite_compact;

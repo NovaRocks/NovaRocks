@@ -22,6 +22,7 @@ mod format_guard;
 
 mod lower_bound;
 pub(in crate::commit) mod registered;
+mod rewrite_equality;
 mod rolling;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,6 +36,7 @@ use super::*;
 use crate::commit::model::ObjectIdentity;
 use crate::commit::overwrite::preparer_tests::Fixture;
 use crate::commit::write_stack::codec::{IcebergWriteFragmentDecoder, IcebergWriteFragmentEncoder};
+use crate::commit::write_stack::domain::IcebergWriteTableFacts;
 use crate::commit::write_stack::tests::{adapter, data_fragment};
 
 #[derive(Default)]
@@ -75,6 +77,35 @@ pub(in crate::commit) fn install_appends_with_adoption(
     count: usize,
     adopt: impl Fn(usize) -> bool,
 ) -> Arc<AtomicUsize> {
+    install_compact_files(fixture, metadata, count, None, adopt)
+}
+
+pub(in crate::commit) fn install_rewrite(fixture: &Fixture, metadata: &TableMetadata) {
+    let snapshot = metadata.current_snapshot().unwrap();
+    let facts = IcebergWriteTableFacts::try_new(
+        metadata.uuid().to_string(),
+        "db".into(),
+        "t".into(),
+        metadata.location().to_owned(),
+        format!("{}/data", metadata.location()),
+        "main".into(),
+        Some(snapshot.snapshot_id()),
+        snapshot.sequence_number(),
+        metadata.current_schema_id(),
+        metadata.default_partition_spec_id(),
+        metadata.format_version() as u8,
+    )
+    .unwrap();
+    install_compact_files(fixture, metadata, 1, Some(&facts), |_| true);
+}
+
+fn install_compact_files(
+    fixture: &Fixture,
+    metadata: &TableMetadata,
+    count: usize,
+    rewrite: Option<&IcebergWriteTableFacts>,
+    adopt: impl Fn(usize) -> bool,
+) -> Arc<AtomicUsize> {
     let window = Arc::new(Window::default());
     let live = window.0.clone();
     let author = ConnectorPayloadRetentionGuard::from_byte_budget(window);
@@ -94,7 +125,10 @@ pub(in crate::commit) fn install_appends_with_adoption(
                 .decode_commit_fragment_payload(&encoded, &author)
                 .unwrap(),
         );
-        let entry = CompactEntry::from_arrival(&adapter, &mut original, 0, &author).unwrap();
+        let mut pending =
+            CompactEntry::prepare(&adapter, original.as_ref().unwrap(), 0, &author, rewrite)
+                .unwrap();
+        let entry = pending.finish(&adapter, &mut original).unwrap();
         if adopt(ordinal) {
             fixture
                 .operation

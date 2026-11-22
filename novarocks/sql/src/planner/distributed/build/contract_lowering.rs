@@ -11492,7 +11492,6 @@ fn provider_partition_identity_digest(
         ConnectorReadRelationKind::TableFunction => b"table-function".as_slice(),
         ConnectorReadRelationKind::ChangeWindow => b"change-window".as_slice(),
         ConnectorReadRelationKind::SystemTable => b"system-table".as_slice(),
-        ConnectorReadRelationKind::TableExecute => b"table-execute".as_slice(),
         ConnectorReadRelationKind::MergeTable => b"merge-table".as_slice(),
     };
     let catalog_version = read.binding.catalog_handle().version();

@@ -38,8 +38,6 @@ use super::dto;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_NAME_BYTES: usize = 1024;
 const MAX_SCHEMA_JSON_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PARTITION_VALUES: usize = 4096;
-const MAX_PARTITION_VALUE_BYTES: usize = 64 * 1024;
 const MAX_PARTITION_COLUMNS: usize = 4096;
 const MAX_TRANSFORM_EXPRS: usize = 4096;
 const MAX_TRANSFORM_EXPR_BYTES: usize = 64 * 1024;
@@ -150,7 +148,6 @@ enum MessageKind {
     WriteTable,
     WriterOutput,
     DataRecipe,
-    PositionRewriteTarget,
     EqualityRecipe,
     EqualityColumn,
     Partition,
@@ -244,10 +241,6 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::WriterHandle, 7) => Some(singular(F::Message(M::MutationReadRecipe))),
         (M::WriterHandle, 8) => Some(singular(F::Message(M::CreationScope))),
         (M::WriterHandle, 9) => Some(singular(F::Bytes)),
-        (M::WriterHandle, 10) => Some(singular(F::Message(M::PositionRewriteTarget))),
-        (M::PositionRewriteTarget, 1) => Some(singular(F::Text)),
-        (M::PositionRewriteTarget, 2) => Some(singular(F::Varint)),
-        (M::PositionRewriteTarget, 3) => Some(singular(F::Message(M::Partition))),
         (M::CreationScope, 1..=3) => Some(singular(F::Bytes)),
         (M::MutationReadRecipe, 1 | 2) => Some(singular(F::Text)),
         (M::MutationReadRecipe, 3) => Some(singular(F::Message(M::MutationSnapshot))),
@@ -601,8 +594,7 @@ fn validate_writer_handle(
             if !matches!(
                 branch,
                 dto::IcebergWriteBranch::PositionDelete | dto::IcebergWriteBranch::DeletionVector
-            ) || handle.position_rewrite.is_some()
-            {
+            ) {
                 return Err(inconsistent(
                     field,
                     "fixed mutation input conflicts with the writer branch",
@@ -634,33 +626,6 @@ fn validate_writer_handle(
             }
             context.observe_compile_step()?;
         }
-        if let Some(target) = &handle.position_rewrite {
-            let field = path.field("position_rewrite");
-            if branch != dto::IcebergWriteBranch::DeletionVector {
-                return Err(inconsistent(
-                    field,
-                    "position rewrite requires a deletion-vector branch",
-                ));
-            }
-            bounded_text(
-                &target.data_file_path,
-                MAX_PATH_BYTES,
-                field.field("data_file_path"),
-                false,
-            )?;
-            if target.record_count == 0 {
-                return Err(invalid(
-                    field.field("record_count"),
-                    "position rewrite requires a nonempty data file",
-                ));
-            }
-            validate_partition(
-                target.partition.as_ref(),
-                field.field("partition"),
-                PartitionCarrier::WriterHandle,
-                context,
-            )?;
-        }
         match branch {
             dto::IcebergWriteBranch::Data => {
                 let recipe = handle.data.as_ref().ok_or_else(|| {
@@ -677,16 +642,16 @@ fn validate_writer_handle(
             dto::IcebergWriteBranch::PositionDelete | dto::IcebergWriteBranch::DeletionVector => {
                 if handle.data.is_some()
                     || handle.equality.is_some()
-                    || (handle.mutation_read.is_none() && handle.position_rewrite.is_none())
+                    || handle.mutation_read.is_none()
                 {
                     return Err(inconsistent(
                         path.clone(),
-                        "position writer requires exactly one position input recipe",
+                        "position writer requires a fixed mutation input recipe",
                     ));
                 }
             }
             dto::IcebergWriteBranch::EqualityDelete => {
-                if handle.data.is_some() || handle.position_rewrite.is_some() {
+                if handle.data.is_some() {
                     return Err(inconsistent(
                         path.clone(),
                         "equality-delete branch cannot carry a data recipe",
@@ -980,7 +945,6 @@ fn validate_commit_fragment(
                 validate_partition(
                     file.partition.as_ref(),
                     path.field("data_file").field("partition"),
-                    PartitionCarrier::CommitFragment,
                     context,
                 )?;
                 validate_metrics(
@@ -1013,12 +977,7 @@ fn validate_commit_fragment(
             dto::iceberg_commit_fragment::Artifact::EqualityDeleteFile(file) => {
                 let base = path.field("equality_delete_file");
                 required_text(&file.path, base.field("path"))?;
-                validate_partition(
-                    file.partition.as_ref(),
-                    base.field("partition"),
-                    PartitionCarrier::CommitFragment,
-                    context,
-                )?;
+                validate_partition(file.partition.as_ref(), base.field("partition"), context)?;
                 validate_metrics(file.metrics.as_ref(), base.field("metrics"), context)?;
                 if file.equality_field_ids.is_empty()
                     || any_observed(file.equality_field_ids.iter(), context, |value| *value < 0)?
@@ -1093,12 +1052,7 @@ fn validate_final_delete(
     match effect.effect.as_ref() {
         Some(Effect::RemoveDataFile(remove)) if !created => {
             let field = path.field("remove_data_file");
-            validate_partition(
-                remove.partition.as_ref(),
-                field.field("partition"),
-                PartitionCarrier::CommitFragment,
-                context,
-            )?;
+            validate_partition(remove.partition.as_ref(), field.field("partition"), context)?;
             validate_merged_references(
                 &remove.old_exclusive_deletes,
                 field.field("old_exclusive_deletes"),
@@ -1127,12 +1081,7 @@ fn validate_delete_artifact_common(
     let result = (|| {
         required_text(path_value, path.field("path"))?;
         required_text(referenced_data_file, path.field("referenced_data_file"))?;
-        validate_partition(
-            partition,
-            path.field("partition"),
-            PartitionCarrier::CommitFragment,
-            context,
-        )?;
+        validate_partition(partition, path.field("partition"), context)?;
         validate_metrics(metrics, path.field("metrics"), context)?;
         validate_merged_references(merged, path.field("merged_old_references"), context)
     })();
@@ -1282,35 +1231,14 @@ fn validate_merged_reference<'a>(
     result
 }
 
-#[derive(Clone, Copy)]
-enum PartitionCarrier {
-    WriterHandle,
-    CommitFragment,
-}
-
 fn validate_partition(
     partition: Option<&dto::IcebergArtifactPartition>,
     path: ConnectorFieldPath,
-    carrier: PartitionCarrier,
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
     let result = (|| {
         let partition =
             partition.ok_or_else(|| missing(path.clone(), "artifact requires partition"))?;
-        if matches!(carrier, PartitionCarrier::WriterHandle) {
-            bounded_text(
-                &partition.partition_path,
-                MAX_PATH_BYTES,
-                path.field("partition_path"),
-                true,
-            )?;
-            bounded_text(
-                &partition.null_fingerprint,
-                MAX_NAME_BYTES,
-                path.field("null_fingerprint"),
-                true,
-            )?;
-        }
         nonnegative(
             i64::from(partition.partition_spec_id),
             path.field("partition_spec_id"),
@@ -1319,13 +1247,6 @@ fn validate_partition(
             .descriptor
             .as_ref()
             .ok_or_else(|| missing(path.field("descriptor"), "partition requires descriptor"))?;
-        if matches!(carrier, PartitionCarrier::WriterHandle) {
-            bounded_count(
-                descriptor.values.len(),
-                MAX_PARTITION_VALUES,
-                path.field("descriptor").field("values"),
-            )?;
-        }
         for (index, value) in descriptor.values.iter().enumerate() {
             let value_path = path.field("descriptor").field("values").index(index);
             match (value.is_null, value.datum_bytes.as_ref()) {
@@ -1333,15 +1254,6 @@ fn validate_partition(
                     return Err(inconsistent(
                         value_path,
                         "partition null marker and datum presence disagree",
-                    ));
-                }
-                (false, Some(bytes))
-                    if matches!(carrier, PartitionCarrier::WriterHandle)
-                        && bytes.len() > MAX_PARTITION_VALUE_BYTES =>
-                {
-                    return Err(capacity(
-                        value_path,
-                        "partition value exceeds its byte limit",
                     ));
                 }
                 _ => {}
@@ -1690,22 +1602,7 @@ mod compile_control_tests {
             output(IcebergFileFormat::Parquet),
         )
         .unwrap()
-        .try_with_mutation_read(mutation, None)
-        .unwrap();
-        let partition = IcebergArtifactPartition::try_new(
-            String::new(),
-            String::new(),
-            0,
-            IcebergPartitionDescriptor {
-                values: vec![
-                    IcebergPartitionValueDescriptor {
-                        is_null: false,
-                        datum_bytes: Some(vec![1, 2, 3, 4]),
-                    };
-                    321
-                ],
-            },
-        )
+        .try_with_mutation_read(mutation.clone(), None)
         .unwrap();
         let vector = IcebergWriterHandle::try_new_delete(
             IcebergWriteBranch::DeletionVector,
@@ -1713,13 +1610,13 @@ mod compile_control_tests {
             output(IcebergFileFormat::Puffin),
         )
         .unwrap()
-        .try_with_position_rewrite(
-            IcebergPositionRewriteTarget::try_new(
-                "s3://b/data/a.parquet".to_owned(),
-                100,
-                partition,
-            )
-            .unwrap(),
+        .try_with_mutation_read(
+            mutation,
+            Some(
+                novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes(
+                    [1; 32],
+                ),
+            ),
         )
         .unwrap();
         let codec = IcebergWriteValueCodec::new("catalog.iceberg");

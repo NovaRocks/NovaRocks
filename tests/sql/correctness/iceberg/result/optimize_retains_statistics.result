@@ -1,0 +1,33 @@
+-- query 2
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+id	NULL	4.0	0.0	NULL	1	4
+value	NULL	4.0	0.0	NULL	10	40
+NULL	NULL	NULL	NULL	4.0	NULL	NULL
+
+-- query 3
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 5
+-- types	varchar
+operation
+replace
+
+-- query 6
+-- types	varchar	double	double	double	double	varchar	varchar
+column_name	data_size	distinct_values_count	nulls_fraction	row_count	low_value	high_value
+id	NULL	4.0	0.0	NULL	1	4
+value	NULL	4.0	0.0	NULL	10	40
+NULL	NULL	NULL	NULL	4.0	NULL	NULL
+
+-- query 7
+-- types	bigint	bigint
+id	value
+1	10
+2	20
+3	30
+4	40

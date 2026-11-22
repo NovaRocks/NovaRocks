@@ -543,7 +543,7 @@ mod t8b_tests {
                 removed,
             },
             dependencies: vec![Dependency::RefUnchanged],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),
             token: token(),

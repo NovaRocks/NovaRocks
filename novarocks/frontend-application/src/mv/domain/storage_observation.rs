@@ -572,6 +572,7 @@ impl MvMaintenanceMetadataObservation {
         self.total_data_files
     }
 
+    #[cfg(test)]
     pub const fn total_delete_files(&self) -> Option<u64> {
         self.total_delete_files
     }

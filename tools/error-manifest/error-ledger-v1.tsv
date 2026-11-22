@@ -39,6 +39,7 @@ sql.admit.kill_denied	Admit	Deprecated
 sql.admit.merge_unsupported_form	Admit	Active
 sql.admit.not_in_transaction	Admit	Active
 sql.admit.persisted_definition_semantics_unsupported	Admit	Active
+sql.admit.procedure_not_found	Admit	Active
 sql.admit.schema_already_exists	Admit	Active
 sql.admit.session_catalog_not_found	Admit	Active
 sql.admit.session_global_scope_unsupported	Admit	Deprecated

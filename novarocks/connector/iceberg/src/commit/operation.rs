@@ -31,7 +31,7 @@ use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::{Error, ErrorKind, Result};
 use crate::resources::IcebergCatalogRuntime;
 use futures::StreamExt;
-use novarocks_fs::FileCancellation;
+use novarocks_fs::{FileCancellation, FileIdentity, FileReadRange};
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -102,6 +102,11 @@ struct OperationArtifacts {
     reuse: super::model::ManifestReuseIndex,
     loop_entered: bool,
     stage_ids: BTreeMap<usize, i64>,
+    statistics_registration: Option<(
+        AttemptToken,
+        novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    )>,
+    statistics_copy: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
     new_files: BTreeMap<usize, StageNewFiles>,
     cleanup_withheld: Option<String>,
 }
@@ -114,6 +119,14 @@ fn internal(message: impl Into<String>) -> Error {
             message,
         ),
     )
+}
+
+fn statistics_read_failure(error: novarocks_spi::connector::ConnectorError) -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        "Iceberg statistics source range read failed",
+    )
+    .with_source(error)
 }
 
 impl std::fmt::Debug for OperationState {
@@ -174,6 +187,8 @@ impl IcebergCommitOperation {
                     reuse: super::model::ManifestReuseIndex::default(),
                     loop_entered: false,
                     stage_ids: BTreeMap::new(),
+                    statistics_registration: None,
+                    statistics_copy: None,
                     new_files: BTreeMap::new(),
                     cleanup_withheld: None,
                 }),
@@ -418,6 +433,133 @@ impl IcebergCommitOperation {
         Ok(id)
     }
 
+    pub(crate) fn statistics_artifact_path_bound(&self) -> Result<usize> {
+        // Matches artifact_path and AttemptToken::path_component without
+        // allocating a path or reserving an object ordinal.
+        let uuid = uuid::fmt::Hyphenated::LENGTH;
+        let operation = self.token().authority().label().len() + "-".len() + uuid;
+        let attempt =
+            operation + "-attempt-".len() + (u32::MAX.ilog10() as usize + 1) + "-".len() + uuid;
+        let suffix = "/metadata/".len()
+            + attempt
+            + "-".len()
+            + (u64::MAX.ilog10() as usize + 1)
+            + ".".len()
+            + ArtifactKind::Statistics.extension().len();
+        self.inner
+            .location
+            .trim_end_matches('/')
+            .len()
+            .checked_add(suffix)
+            .ok_or_else(|| {
+                let message = "Iceberg statistics artifact path is not representable";
+                Error::new(ErrorKind::Unexpected, message).with_source(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                        message,
+                    ),
+                )
+            })
+    }
+
+    pub(crate) fn prepared_statistics_target(&self, replace_stage: usize) -> Result<i64> {
+        self.inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg operation artifacts poisoned"))?
+            .stage_ids
+            .get(&replace_stage)
+            .copied()
+            .ok_or_else(|| internal("Iceberg statistics has no preceding Replace stage"))
+    }
+
+    pub(crate) async fn read_statistics_into(
+        &self,
+        path: &str,
+        file_size: u64,
+        target: &mut [u8],
+    ) -> Result<()> {
+        let _permit = self.inner.io_permit().await?;
+        let binding = self
+            .inner
+            .binding
+            .for_request(self.request_context().clone());
+        let _phase = binding.admit_non_http_io(path).await.map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Iceberg statistics I/O admission refused",
+            )
+            .with_source(error)
+        })?;
+        let access = binding
+            .resolve_access_for_request_async(path)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Iceberg statistics source access failed",
+                )
+                .with_source(error)
+            })?;
+        let file = access
+            .bind(0, FileIdentity::new(path, file_size, None))
+            .map_err(|error| statistics_read_failure(error.into()))?;
+        #[cfg(test)]
+        crate::fs_io::note_test_storage_request("statistics-read", path);
+        file.read_into(
+            FileReadRange::WholeFile,
+            target,
+            &self.inner.preparation_cancellation(),
+        )
+        .await
+        .map_err(|error| statistics_read_failure(error.into()))?;
+        self.check_active()
+    }
+
+    pub(crate) fn remember_paid_statistics_copy(
+        &self,
+        basis: super::model::StatisticsReuseBasis,
+        output: super::model::ReusableStatisticsFile,
+        backing: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    ) -> Result<()> {
+        let previous = {
+            let mut artifacts = self
+                .inner
+                .artifacts
+                .lock()
+                .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
+            let OperationArtifacts {
+                ledger,
+                reuse,
+                statistics_copy,
+                ..
+            } = &mut *artifacts;
+            reuse.remember_statistics(ledger, basis, output)?;
+            statistics_copy.replace(backing)
+        };
+        drop(previous);
+        Ok(())
+    }
+
+    pub(crate) fn retain_statistics_registration(
+        &self,
+        attempt: AttemptToken,
+        backing: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    ) -> Result<()> {
+        let mut artifacts = self
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg operation artifacts poisoned"))?;
+        if attempt.operation() != self.token() || artifacts.statistics_registration.is_some() {
+            return Err(internal(
+                "Iceberg statistics lost its original attempt registration",
+            ));
+        }
+        artifacts.statistics_registration = Some((attempt, backing));
+        Ok(())
+    }
+
     /// A refreshed base containing our ID is ambiguous. Never delete its objects.
     pub(crate) fn check_stage_snapshot_ids(&self, metadata: &TableMetadata) -> Result<()> {
         let mut artifacts = self
@@ -493,12 +635,25 @@ impl IcebergCommitOperation {
 
     /// Conflict withdraws only artifacts tied to this round. Deletion waits for a terminal result.
     pub(crate) fn retire_attempt_bound_artifacts(&self, attempt: AttemptToken) -> Result<()> {
-        let mut artifacts = self
-            .inner
-            .artifacts
-            .lock()
-            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
-        artifacts.ledger.retire_round(attempt)
+        let retired = {
+            let mut artifacts = self
+                .inner
+                .artifacts
+                .lock()
+                .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+            artifacts.ledger.retire_round(attempt)?;
+            if artifacts
+                .statistics_registration
+                .as_ref()
+                .is_some_and(|(owner, _)| *owner == attempt)
+            {
+                artifacts.statistics_registration.take()
+            } else {
+                None
+            }
+        };
+        drop(retired);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -807,6 +962,27 @@ impl IcebergCommitAttempt {
     }
 }
 
+impl IcebergCommitAttempt {
+    fn artifact_path(&self, kind: ArtifactKind) -> Result<ObjectIdentity> {
+        self.check_active()?;
+        let ordinal = self
+            .operation
+            .inner
+            .object_ordinal
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| invalid("Iceberg object ordinal exhausted"))?;
+        let scope = self.token.path_component();
+        let object = ObjectIdentity::new(format!(
+            "{}/metadata/{}-{}.{}",
+            self.operation.inner.location.trim_end_matches('/'),
+            scope,
+            ordinal,
+            kind.extension()
+        ))?;
+        Ok(object)
+    }
+}
+
 impl ArtifactWriter for IcebergCommitAttempt {
     fn find_reusable_manifest(
         &self,
@@ -886,29 +1062,57 @@ impl ArtifactWriter for IcebergCommitAttempt {
         self.operation.check_active()
     }
     fn allocate(&self, kind: ArtifactKind) -> Result<ObjectIdentity> {
-        self.check_active()?;
-        let ordinal = self
-            .operation
-            .inner
-            .object_ordinal
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| invalid("Iceberg object ordinal exhausted"))?;
-        let scope = self.token.path_component();
-        let object = ObjectIdentity::new(format!(
-            "{}/metadata/{}-{}.{}",
-            self.operation.inner.location.trim_end_matches('/'),
-            scope,
-            ordinal,
-            kind.extension()
-        ))?;
+        let object = self.artifact_path(kind)?;
         self.operation
             .inner
             .artifacts
             .lock()
-            .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
             .ledger
             .register(ArtifactRecord::produced(object.clone(), self.token, kind))?;
         Ok(object)
+    }
+    fn allocate_reusable_statistics(&self) -> Result<ObjectIdentity> {
+        let object = self.artifact_path(ArtifactKind::Statistics)?;
+        self.operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?
+            .ledger
+            .register(ArtifactRecord::reusable_statistics(
+                object.clone(),
+                self.token,
+            ))?;
+        Ok(object)
+    }
+    fn find_reusable_statistics(
+        &self,
+        basis: &super::model::StatisticsReuseBasis,
+    ) -> Result<Option<super::model::ReusableStatisticsFile>> {
+        let mut artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+        let OperationArtifacts { ledger, reuse, .. } = &mut *artifacts;
+        reuse.find_statistics(ledger, basis)
+    }
+    #[cfg(test)]
+    fn remember_reusable_statistics(
+        &self,
+        basis: super::model::StatisticsReuseBasis,
+        output: super::model::ReusableStatisticsFile,
+    ) -> Result<()> {
+        let mut artifacts = self
+            .operation
+            .inner
+            .artifacts
+            .lock()
+            .map_err(|_| internal("Iceberg artifact ledger poisoned"))?;
+        let OperationArtifacts { ledger, reuse, .. } = &mut *artifacts;
+        reuse.remember_statistics(ledger, basis, output)
     }
     fn record_manifest(
         &self,
@@ -1047,12 +1251,15 @@ impl IcebergWriteAdmission for OperationState {
         self.check_active()?;
         let object = ObjectIdentity::new(path)?;
         self.check_output_active(&object)?;
-        self.artifacts
-            .lock()
-            .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?
-            .ledger
-            .mark_writing(&object)?;
-        Ok(WritePermit::new(self, object))
+        let is_statistics_copy = {
+            let mut artifacts = self
+                .artifacts
+                .lock()
+                .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?;
+            artifacts.ledger.mark_writing(&object)?;
+            artifacts.ledger.is_reusable_statistics(&object)
+        };
+        Ok(WritePermit::new(self, object).with_statistics_copy(is_statistics_copy))
     }
     fn mark_written(&self, object: &ObjectIdentity) -> Result<()> {
         self.artifacts

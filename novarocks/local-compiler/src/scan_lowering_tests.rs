@@ -1303,21 +1303,14 @@ fn primitive_exact_provider_guarantee_preserves_its_validated_recipe() {
 }
 
 #[test]
-fn metadata_and_table_execute_reads_compile_as_work_unit_scans() {
-    for spec in [
-        Spec {
-            metadata: true,
-            kind: ConnectorReadRelationKind::SystemTable,
-            ..Spec::slice()
-        },
-        Spec {
-            kind: ConnectorReadRelationKind::TableExecute,
-            ..Spec::slice()
-        },
-    ] {
-        let program = compile(spec).expect("supported work-unit scan compiles");
-        assert_eq!(program.scan_inputs().len(), 1);
-    }
+fn metadata_read_compiles_as_work_unit_scan() {
+    let program = compile(Spec {
+        metadata: true,
+        kind: ConnectorReadRelationKind::SystemTable,
+        ..Spec::slice()
+    })
+    .expect("system table work-unit scan compiles");
+    assert_eq!(program.scan_inputs().len(), 1);
 }
 
 #[test]

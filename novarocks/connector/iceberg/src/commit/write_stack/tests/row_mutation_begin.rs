@@ -149,7 +149,7 @@ fn begin_keeps_admitted_generation_after_catalog_advances_and_never_observes_it(
         .commit_session(session.commit_session())
         .unwrap();
     assert_eq!(
-        handle.row_mutation_isolation(),
+        handle.commit_protocol().row_delta_isolation(),
         Some(IsolationLevel::Snapshot)
     );
     assert_eq!(handle.table().base_snapshot_id(), start);

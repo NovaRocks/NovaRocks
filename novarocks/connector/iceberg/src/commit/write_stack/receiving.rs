@@ -58,6 +58,7 @@ pub(crate) struct IcebergReceiving {
     queries: BTreeMap<ConnectorWriteQueryIdentity, QueryReceiving>,
     records: Vec<ReceivedRecord>,
     compact: Option<CompactReceiving>,
+    rewrite_groups: Option<usize>,
     rewritten_target: Option<Box<RewrittenTargetReceiving>>,
 }
 
@@ -202,9 +203,10 @@ fn matches_rewritten_target(metadata: &TableMetadata, binding: RewrittenTargetBi
 }
 
 impl IcebergReceiving {
-    pub(super) fn with_compact_mode(compact: bool) -> Self {
+    pub(super) fn with_compact_mode(compact: bool, rewrite_groups: Option<usize>) -> Self {
         Self {
             compact: compact.then(CompactReceiving::default),
+            rewrite_groups,
             ..Self::default()
         }
     }
@@ -310,6 +312,10 @@ impl IcebergReceiving {
         if fragments.is_empty() {
             return Ok(());
         }
+        let rewrite = handle
+            .flavor()
+            .is_distributed_rewrite()
+            .then_some(handle.table());
         let mut record_partitions = WrittenPartitionDomain::default();
         let mut admission = FragmentAdmission::for_record(handle, &compact.indexes);
         let mut counts = compact.files.counts;
@@ -367,7 +373,7 @@ impl IcebergReceiving {
                     .collector
                     .observe(existing, &mut record_partitions, partition, author)?;
             }
-            let entry = CompactEntry::prepare(adapter, fragment, index_bytes, author)?;
+            let entry = CompactEntry::prepare(adapter, fragment, index_bytes, author, rewrite)?;
             counts = counts.checked_add(entry.counts())?;
             prepared.push(entry);
         }
@@ -425,6 +431,11 @@ impl IcebergReceiving {
         rewritten_target: Option<&ConnectorRewrittenTargetFact>,
     ) -> Result<(), ConnectorError> {
         validate_query_target_ordinals(targets)?;
+        if self.rewrite_groups.is_some() && targets.len() != 1 {
+            return Err(invalid(
+                "Iceberg rewrite query must receive exactly one frozen group",
+            ));
+        }
         if targets
             .iter()
             .any(|ordinal| !sealed.iter().any(|target| target.ordinal() == *ordinal))
@@ -520,6 +531,38 @@ impl IcebergReceiving {
                 ConnectorErrorKind::Internal,
                 "Iceberg write session has queries that have not completed receiving",
             ));
+        }
+        Ok(())
+    }
+
+    /// The session's dense target set represents its exact frozen groups.
+    /// Query confirmation proves a group even when it emits zero fragments.
+    /// This finish-only check is separate from actual exit for partial aborts.
+    pub(super) fn require_rewrite_groups_complete(&self) -> Result<(), ConnectorError> {
+        let Some(expected) = self.rewrite_groups else {
+            return Ok(());
+        };
+        if self.queries.len() != expected {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Iceberg rewrite receiving does not cover every frozen group",
+            ));
+        }
+        let mut seen = [false; novarocks_connector_contract::MAX_CONNECTOR_WRITE_TARGETS];
+        for query in self.queries.values() {
+            let [ordinal] = query.targets.as_slice() else {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "Iceberg rewrite query lost its one frozen group",
+                ));
+            };
+            let index = ordinal.get() as usize;
+            if index >= expected || std::mem::replace(&mut seen[index], true) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "Iceberg rewrite receiving repeats or names a foreign frozen group",
+                ));
+            }
         }
         Ok(())
     }

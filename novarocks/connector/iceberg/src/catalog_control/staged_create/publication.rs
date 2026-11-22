@@ -24,9 +24,8 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::PublicationPreparer;
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    AddedContent, ArtifactWriter, FileChanges, FrozenRequest, IsolationLevel, ObjectIdentity,
-    OperationIntent, OperationIntentParts, OperationToken, RequestShape, StagedCreateIdentity,
-    TableTarget,
+    AddedContent, ArtifactWriter, FileChanges, FrozenRequest, ObjectIdentity, OperationIntent,
+    OperationIntentParts, OperationToken, RequestShape, StagedCreateIdentity, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
 use crate::commit::publication_descriptor::PublicationDescriptor;
@@ -114,7 +113,7 @@ pub(super) fn create_intent(
             removed: vec![],
         },
         dependencies: vec![],
-        isolation: IsolationLevel::Serializable,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::Create,
         summary: BTreeMap::new(),
         token,

@@ -67,7 +67,7 @@ fn intent(shape: RequestShape) -> OperationIntent {
         start: None,
         changes: FileChanges::default(),
         dependencies: vec![Dependency::NoRead],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape,
         summary: BTreeMap::new(),
         token: token(),

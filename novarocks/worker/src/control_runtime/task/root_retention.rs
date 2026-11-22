@@ -19,7 +19,7 @@
 //! read aliases and payload credit stay here through real Participation disposal.
 use super::TaskRootReadError;
 use crate::control_runtime::participation_host::task_io::TaskRootWake;
-use crate::root_result_channel::{RootChannelRead, RootResultChannel};
+use crate::root_result_channel::{RootChannelError, RootChannelRead, RootResultChannel};
 use novarocks_control_runtime::transaction::ScopeHandle;
 use novarocks_execution_contract::{
     ParticipationRef, TaskIdentity, root_lifetime::RootRetentionClose, root_result::RootResultRead,
@@ -98,11 +98,11 @@ impl RootParticipationRetention {
             .lock()
             .expect("original Participation Root handoff");
         let root = state.root.as_ref().ok_or(TaskRootReadError::NoRoot)?;
-        // A real Participation seal may have won installation; preserve that closed
-        // channel without reopening reads or manufacturing an End.
-        if !root.is_closed() {
-            root.mark_participation_owned()
-                .map_err(TaskRootReadError::Channel)?;
+        // The channel lock orders adoption against the actual seal. A sealed
+        // channel still transfers its original retirement custody.
+        match root.mark_participation_owned() {
+            Ok(()) | Err(RootChannelError::Closed) => {}
+            Err(error) => return Err(TaskRootReadError::Channel(error)),
         }
         state.adopted = true;
         Ok(())

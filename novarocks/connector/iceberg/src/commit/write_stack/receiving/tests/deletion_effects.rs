@@ -85,7 +85,7 @@ fn v2_keeps_one_exact_partition_witness_and_every_position_file() {
             base_version_digest: None,
             staged_metadata: None,
             data: data_branch_plan(),
-            deletes: vec![delete_branch_plan(IcebergWriteBranch::PositionDelete, None)],
+            deletes: vec![delete_branch_plan(IcebergWriteBranch::PositionDelete)],
         },
     )
     .unwrap();

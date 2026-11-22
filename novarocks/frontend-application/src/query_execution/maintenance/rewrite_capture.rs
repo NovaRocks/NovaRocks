@@ -17,10 +17,12 @@
 
 //! Rewrite borrows the SAME positive metadata Root payload for formation.
 use super::io_admission::MetadataIoAdmission;
+use crate::query_execution::internal_result_cpu::InternalResultRetention;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_spi::connector::{
-    ConnectorOperationControl, ConnectorOperationControlView, ConnectorOriginalResultScope,
-    ConnectorOriginalResultScopeCheck, ConnectorRequestContext, OriginalResultCheckClass as Class,
+    ConnectorError, ConnectorOperationControl, ConnectorOperationControlView,
+    ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck, ConnectorPayloadByteBudget,
+    ConnectorPayloadRetentionGuard, ConnectorRequestContext, OriginalResultCheckClass as Class,
     OriginalResultCheckError as Failure,
 };
 use std::{sync::Arc, time::Instant};
@@ -50,6 +52,15 @@ impl ConnectorOriginalResultScopeCheck for OriginalRewriteCapture {
     }
 }
 
+impl ConnectorPayloadByteBudget for OriginalRewriteCapture {
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+        InternalResultRetention::reserve_for_binding(&self.binding, bytes)
+    }
+}
+
 pub(super) fn borrow_positive_capture(
     io: &MetadataIoAdmission,
     context: &ConnectorRequestContext,
@@ -64,10 +75,11 @@ pub(super) fn borrow_positive_capture(
         .scope()
         .check()
         .map_err(|e| Failure::new(Class::Admission, e))?;
-    let original = ConnectorOriginalResultScope::from_original(Arc::new(OriginalRewriteCapture {
-        control: context.original_operation_control(),
-        binding,
-    }));
+    let original =
+        ConnectorOriginalResultScope::from_budgeted_original(Arc::new(OriginalRewriteCapture {
+            control: context.original_operation_control(),
+            binding,
+        }));
     original.check_active()?;
     Ok(original)
 }

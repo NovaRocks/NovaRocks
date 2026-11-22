@@ -69,7 +69,7 @@ pub use access::{
     FsListEntry, FsListStream, FsLocation, FsScheme, ObjectStoreAccessContext, ObjectStoreConfig,
     ObjectStoreEndpointConfig, ObjectStoreProviderPool, ObjectStoreProviderPoolMetrics,
     ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial, ResolvedFsPath,
-    is_object_store_location_parse_only, map_object_store_listing_error,
+    is_object_store_location_parse_only, map_object_store_io_error, map_object_store_listing_error,
     parse_object_store_path_parse_only,
 };
 pub use aliyun_ecs_credentials::AliyunEcsRamRoleConfig;

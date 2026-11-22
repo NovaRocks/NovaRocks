@@ -231,7 +231,7 @@ fn distributed_v2_records_can_repeat_a_target_with_an_exact_matching_partition()
             base_version_digest: None,
             staged_metadata: None,
             data: data_branch_plan(),
-            deletes: vec![delete_branch_plan(IcebergWriteBranch::PositionDelete, None)],
+            deletes: vec![delete_branch_plan(IcebergWriteBranch::PositionDelete)],
         },
     )
     .unwrap();

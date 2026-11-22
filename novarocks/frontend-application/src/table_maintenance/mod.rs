@@ -26,10 +26,8 @@ use novarocks_table_maintenance::{
 };
 use std::sync::Arc;
 
-pub(crate) use self::admission::{
-    ParsedMaintenanceAction, ParsedMaintenanceStatement, lower_semantic_maintenance_statement,
-};
-use self::result::action_result;
+pub(crate) use self::admission::{ParsedMaintenanceAction, ParsedMaintenanceStatement};
+use self::result::procedure_metrics_result;
 use self::worker::LegacyMaintenanceEffects;
 use crate::query_execution::maintenance::{
     MaintenanceRequestContext, MaintenanceStatementResult, TableMaintenanceEngine,
@@ -87,73 +85,43 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         engine: &dyn TableMaintenanceEngine,
         state: &crate::query_execution::maintenance::MaintenanceActionState,
         statement: ParsedMaintenanceStatement,
-        spark_procedure: bool,
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, TerminalError> {
         let ParsedMaintenanceStatement { name_parts, action } = statement;
         let target = engine.resolve_target(&name_parts, context)?;
-        let request = action.into_request(engine, target)?;
+        let request = action.into_request(target);
         let outcome = self
             .product
             .execute_user_action(&LegacyMaintenanceEffects::new(engine, state), request)
             .await?;
-        if spark_procedure || matches!(outcome, MaintenanceActionOutcome::Procedure { .. }) {
-            action_result(outcome).map_err(TerminalError::from)
-        } else {
-            Ok(MaintenanceStatementResult::Ok)
+        match outcome {
+            MaintenanceActionOutcome::Procedure { metrics } => procedure_metrics_result(metrics)
+                .map(MaintenanceStatementResult::Query)
+                .map_err(TerminalError::from),
+            _ => Ok(MaintenanceStatementResult::Ok),
         }
     }
 }
 
 impl ParsedMaintenanceAction {
-    fn into_request(
-        self,
-        engine: &dyn TableMaintenanceEngine,
-        target: MaintenanceTarget,
-    ) -> Result<MaintenanceActionRequest, String> {
+    fn into_request(self, target: MaintenanceTarget) -> MaintenanceActionRequest {
         match self {
-            Self::RewriteDataFiles {
-                options,
-                branch,
-                where_clause,
-            } => Ok(MaintenanceActionRequest::RewriteDataFiles {
-                target: target.clone(),
-                base_snapshot_id: engine.current_snapshot_id(&target)?,
-                job_id: None,
-                options,
-                branch,
-                where_clause,
-            }),
             Self::RewriteManifests {
                 use_caching,
                 spec_id,
-            } => Ok(MaintenanceActionRequest::RewriteManifests {
+            } => MaintenanceActionRequest::RewriteManifests {
                 target,
                 use_caching,
                 spec_id,
-            }),
+            },
             Self::ExpireSnapshots {
                 older_than_ms,
                 retain_last,
-            } => Ok(MaintenanceActionRequest::ExpireSnapshots {
+            } => MaintenanceActionRequest::ExpireSnapshots {
                 target,
                 older_than_ms,
                 retain_last,
-            }),
-            Self::RemoveOrphanFiles { older_than_ms } => {
-                Ok(MaintenanceActionRequest::RemoveOrphanFiles {
-                    target,
-                    older_than_ms,
-                })
-            }
-            Self::RewritePositionDeleteFiles {
-                options,
-                where_clause,
-            } => Ok(MaintenanceActionRequest::RewritePositionDeleteFiles {
-                target,
-                options,
-                where_clause,
-            }),
+            },
         }
     }
 }

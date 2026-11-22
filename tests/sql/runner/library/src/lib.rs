@@ -5992,7 +5992,23 @@ fn validate_publication_catalog_directives(
                     "after-frontend-exit timing requires an exact table-load,corrupt-package fault and explicit cross-process frontend restart in verify or strict conversion mode"
                 );
             }
+            let scoped_lost_response = matches!(
+                step.meta.publication_catalog_fault,
+                Some(PublicationCatalogFaultDirective {
+                    action: PublicationCatalogAction::TableCommit,
+                    fault: PublicationCatalogFault::AfterCommitBeforeResponseHideTableLoad,
+                })
+            );
+            if scoped_lost_response
+                && (step.meta.publication_catalog_fault_target.is_none()
+                    || step.meta.retry_count.is_some_and(|count| count != 1))
+            {
+                bail!(
+                    "after-commit-before-response-hide-table-load requires an exact table target and one primary query attempt"
+                );
+            }
             if step.meta.publication_catalog_fault_target.is_some()
+                && !scoped_lost_response
                 && !matches!(
                     step.meta.publication_catalog_fault,
                     Some(PublicationCatalogFaultDirective {
@@ -6001,7 +6017,9 @@ fn validate_publication_catalog_directives(
                     })
                 )
             {
-                bail!("publication_catalog_fault_target requires table-load,corrupt-package");
+                bail!(
+                    "publication_catalog_fault_target requires table-load,corrupt-package or table-commit,after-commit-before-response-hide-table-load"
+                );
             }
             if !publication_catalog_fixture_suite(suite_name) {
                 bail!(
@@ -7919,6 +7937,36 @@ mod tests {
         case.steps[0].meta.publication_catalog_fault_timing = None;
         case.steps[0].meta.restart_fe_after_step = false;
         assert!(valid(&case, ClusterMode::CrossProcess, Mode::Verify).is_ok());
+    }
+
+    #[test]
+    fn scoped_lost_response_requires_an_exact_target_and_one_client_attempt() {
+        let mut case = test_case_with_meta(QueryMeta {
+            publication_catalog_fault: Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableCommit,
+                fault: PublicationCatalogFault::AfterCommitBeforeResponseHideTableLoad,
+            }),
+            ..Default::default()
+        });
+        case.sequential = true;
+        let valid = |case: &SqlCase| {
+            validate_publication_catalog_directives(
+                "lake-publication",
+                std::slice::from_ref(case),
+                true,
+                ClusterMode::CrossProcess,
+                Mode::Verify,
+                false,
+            )
+        };
+        assert!(valid(&case).is_err());
+        case.steps[0].meta.publication_catalog_fault_target = Some(PublicationCatalogFaultTarget {
+            namespace: "owned_ns".into(),
+            table: "t".into(),
+        });
+        assert!(valid(&case).is_ok());
+        case.steps[0].meta.retry_count = Some(2);
+        assert!(valid(&case).is_err());
     }
 
     #[test]

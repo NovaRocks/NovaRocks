@@ -51,8 +51,8 @@ fn known_uncommitted_maintenance_keeps_independent_refusals() {
     ] {
         let original = ConnectorMutationFailure::from_connector(error);
         assert_eq!(
-            commit_failure(
-                MaintenanceCommitProcedure::ExpireSnapshots,
+            project_maintenance_commit_failure(
+                CommitOperation::ExpireSnapshots,
                 CommitFailureDisposition::KnownUncommitted,
                 original.clone(),
             ),
@@ -63,8 +63,8 @@ fn known_uncommitted_maintenance_keeps_independent_refusals() {
 
 #[test]
 fn commit_diagnostic_distinguishes_known_rejection_from_actual_unknown() {
-    let rejected = commit_failure(
-        MaintenanceCommitProcedure::ExpireSnapshots,
+    let rejected = project_maintenance_commit_failure(
+        CommitOperation::ExpireSnapshots,
         CommitFailureDisposition::KnownUncommitted,
         ConnectorMutationFailure::new(
             ConnectorMutationFailureKind::Conflict,
@@ -78,8 +78,8 @@ fn commit_diagnostic_distinguishes_known_rejection_from_actual_unknown() {
         )
         .with_public_failure_detail(),
     );
-    let unknown = commit_failure(
-        MaintenanceCommitProcedure::OptimizeManifests,
+    let unknown = project_maintenance_commit_failure(
+        CommitOperation::OptimizeManifests,
         CommitFailureDisposition::Unknown,
         original_unknown.clone(),
     );
@@ -88,11 +88,13 @@ fn commit_diagnostic_distinguishes_known_rejection_from_actual_unknown() {
         .unwrap()
         .source()
         .unwrap()
-        .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+        .source()
         .unwrap()
-        .downcast_ref::<MaintenanceCommitFailure>()
+        .source()
+        .unwrap()
+        .downcast_ref::<ConnectorMutationFailure>()
         .unwrap();
-    assert_eq!(original_cause.original, original_unknown);
+    assert_eq!(original_cause, &original_unknown);
     for (failure, message) in [
         (
             rejected,
@@ -103,6 +105,7 @@ fn commit_diagnostic_distinguishes_known_rejection_from_actual_unknown() {
             "Failed to commit during optimize_manifests: [CommitUnknown] catalog reply was lost",
         ),
     ] {
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unavailable);
         assert_eq!(
             failure.failure_fact(),
             FailureFact::new(FailureClass::Dependency, ICEBERG_COMMIT_ERROR)

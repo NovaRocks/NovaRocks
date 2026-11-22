@@ -19,17 +19,18 @@ under the License.
 
 # 维护 / 治理
 
-Iceberg 表可压缩小文件、清理历史快照、回收孤儿文件、重写 manifest 与重写 deletion vector。
+Iceberg 表可压缩小文件、清理历史快照、回收孤儿文件、重写 manifest 和清空主分支。
 以下维护操作均在原语句内执行。增量压缩、按排序顺序重写和通用定时调度仍待支持。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `ALTER TABLE ... OPTIMIZE`（选择文件压缩） | ✅ | 原语句内执行，返回三行指标 |
-| `OPTIMIZE` 选择文件 | ✅ | 默认阈值 100MB；任意 WHERE 与阈值参数尚未开放 |
+| `ALTER TABLE ... EXECUTE optimize` | ✅ | 原语句内压缩所选文件，返回三行指标 |
+| `OPTIMIZE` 文件大小阈值 | ✅ | `file_size_threshold` 默认 100MB |
+| `TRUNCATE TABLE` | ✅ | 清空 `main` 的获胜提交基准，返回无计数的命令完成 |
 | `EXECUTE expire_snapshots` | ✅ | 保留期、分支与标签保留规则，可清理未使用的 schema 和 partition spec |
 | `EXECUTE remove_orphan_files` | ✅ | REST/Hadoop 表内扫描，按保留期与完整有效文件名集合判定 |
 | `EXECUTE optimize_manifests` | ✅ | 聚簇重写数据 manifest，实际重写时返回四行指标 |
-| `rewrite_position_delete_files`（V3 Puffin DV repack） | ✅ | 语句内 Spark-style `CALL` |
+| 独立 deletion-vector 压实 | 已退役 | `OPTIMIZE` 仍会应用所选数据文件上的删除 |
 | V2 Parquet position delete → V3 DV 升级 | ❌ | |
 | `REWRITE DATA FILES BY SORT ORDER` | ❌ | |
 | 自动 maintenance 调度器 | ❌ | |
@@ -50,6 +51,7 @@ Iceberg 表可压缩小文件、清理历史快照、回收孤儿文件、重写
 
 ``` sql
 ALTER TABLE orders EXECUTE optimize;
+ALTER TABLE orders EXECUTE optimize(file_size_threshold => '1GB');
 ```
 
 现有写法直接在原语句内执行；结果为 `(metric_name varchar, metric_value bigint)`，依次返回：
@@ -61,20 +63,21 @@ ALTER TABLE orders EXECUTE optimize;
 | added_data_files_count | 实际新增的数据文件数；无已证明计数时为 NULL |
 
 Trino `updateType` 为 `ALTER TABLE EXECUTE`，不填 `updateCount`；客户端须继续取到终页确认。
-没有可重写文件时三项均为 0，不产生新 snapshot。`ALTER TABLE ... EXECUTE optimize` 的新写法与参数
-不在当前语法中，后续语言扩展另行开放。
-
-文件选择遵循 Trino 的默认 100MB（100 × 1024 × 1024 bytes）阈值：
+没有可重写文件时三项均为 0，也不产生新快照。`file_size_threshold` 使用 Trino 数据大小格式，
+默认 100MB（100 × 1024 × 1024 bytes）。
 
 - 没有挂靠删除且大于阈值的数据文件跳过。
 - 当前 partition spec 内，某分区仅有一个且不带删除的候选文件时跳过；两个以上候选，或任一候选带删除，则重写该分区的候选文件。
 - 遇到旧 partition spec 的候选文件时，全部候选文件重写；输入仍按各自的 spec 解释，输出使用当前 spec。
-- 只移除选中的 data files 与挂靠在它们上的 V2 position deletes / V3 deletion vectors；未选文件与删除保留。
+- 移除所选数据文件与已完全应用的删除文件。指向这些数据文件的悬挂 DV 随提交移除，不计入 `removed_delete_files_count`。
 - 快照 `total-*` 从父快照扣除本次移除量并加上本次新增量；V3 `_row_id` 与 `_last_updated_sequence_number` 保留，不分配新 row ID。
 
-捕获的物理对象身份贯穿规划与提交，表被替换时以 typed `TARGET_REPLACED` 拒绝；规划前发现替换不派发工作。
-提交仍用 `RefUnchanged`：规划后目标 ref 的任意新提交都会触发冲突，尚不采用 Trino 允许并发追加的校验。
-新快照提交不证明旧 snapshot 或文件已回收；过期与物理回收分别取证。
+读取、writer 和提交共用规划时冻结的文件组。规划前发现目标表已被替换时以 `TARGET_REPLACED` 拒绝。
+每个提交轮次校验实际基准上的表身份、历史和移除条目。兼容的并发追加保留在表中。若待替换文件
+获得新的位置删除或 DV，或必需移除的文件已不存活，提交会报冲突。
+冻结的输出分区规范须在提交时仍为默认规范，规范变化时需重新运行 OPTIMIZE。
+成功生成的 `replace` 快照从父链继承最近的统计登记，Puffin 副本保留 blob 原始来源。
+旧快照过期与物理回收各自取证。见 [ADR-0251](../../adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)。
 
 实现入口为 `novarocks/frontend-application/src/query_execution/maintenance/rewrite_job/direct.rs`，
 共享业务算法在 `novarocks/table-maintenance/src/product.rs`，Iceberg 选择与提交在
@@ -82,9 +85,17 @@ Trino `updateType` 为 `ALTER TABLE EXECUTE`，不填 `updateCount`；客户端�
 `novarocks/connector/iceberg/src/commit/selected_rewrite.rs`。
 这些入口不构成全工作区或原生验收完成证明。
 
-## ❌ OPTIMIZE 自定义选择参数
+任意 `WHERE` 尚未开放。`sorted_by` 返回 `NOT_SUPPORTED`，恢复条件是支持按指定 sort order 写出。
 
-任意 `WHERE`、自定义文件阈值与 sort-order rewrite 尚未开放；当前旧写法使用上述固定选择规则。
+## ✅ TRUNCATE
+
+```sql
+TRUNCATE TABLE orders;
+```
+
+每次提交以实际 `main` 为基准，对存活条目应用恒真过滤。获胜轮次之前提交的追加被清空，之后的追加保留。
+空表也产生一个 `delete` 快照。Trino 返回 `TRUNCATE TABLE` 和空的 `updateCount`。
+结果未知时只裁定原请求，以免重发清空后来追加的行。
 
 ## 元数据维护的保留期与返回值
 
@@ -252,21 +263,10 @@ partition spec 第一字段的有序值聚簇，缺少该字段或值为 NULL �
 实现入口为 Iceberg Provider 的 `catalog_control/metadata_maintenance.rs`、
 `catalog_control/orphan_files.rs` 及 `commit/snapshot_lifecycle_helpers/`。
 
-## ✅ REWRITE POSITION DELETE FILES
+## 已退役的 Spark 命名 CALL
 
-``` sql
-CALL iceberg_catalog.system.rewrite_position_delete_files(
-  "table" => 'database.orders',
-  options => map('rewrite-all', 'true')
-);
-```
-
-该语句内 action 重写 Iceberg V3 表中现有 Puffin deletion-vector 文件，保持可见 row set、
-`_row_id` 与 live data files 不变，并返回 rewritten/added file 与 byte counts。当前不支持
-`where`、`target-file-size-bytes` 或 V2 Parquet position delete → V3 DV 的格式升级。
-
-实现入口：
-`novarocks/connector/iceberg/src/distributed_rewrite.rs`。
+Spark 命名的 Iceberg 维护 CALL，包括 `rewrite_position_delete_files`，返回 `PROCEDURE_NOT_FOUND`。
+压缩数据文件使用 `ALTER TABLE ... EXECUTE optimize`，该操作仍会应用所选数据文件上的删除。
 
 ## ❌ REWRITE DATA FILES BY SORT ORDER
 

@@ -202,12 +202,6 @@ pub(super) fn nominal_declarations(
     match relation {
         IcebergRuntimeRelation::Table(table) => Some(table.nominal_declarations()),
         IcebergRuntimeRelation::ChangeWindow(window) => Some(window.nominal_declarations()),
-        IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
-            Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
-                Some(optimize.table_handle().nominal_declarations())
-            }
-            _ => None,
-        },
         _ => None,
     }
 }

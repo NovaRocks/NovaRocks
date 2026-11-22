@@ -18,6 +18,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use crate::commit::base_removal::{
+    locate_on_base, manifest_removal_location, missing_required_file,
+};
 use crate::commit::helpers::{snapshot_total_records, target_ref_snapshot_id};
 use crate::commit::manifest_sources::{LocatedEntry, SnapshotSources};
 use crate::commit::model::{ArtifactWriter, EntryIdentity, FrozenEntry, OperationIntent};
@@ -371,11 +374,7 @@ fn push_removal(
     if !seen.insert(entry.frozen.identity().clone()) {
         return Err(invalid("materialized step repeats one removed entry"));
     }
-    let mut located = entry.clone();
-    located.source_index = sources
-        .source_index_for_list_ordinal(entry.source_index)
-        .ok_or_else(|| invalid("materialized locator does not belong to the completed list"))?;
-    output.push(located);
+    output.push(manifest_removal_location(sources, entry.clone())?);
     Ok(())
 }
 
@@ -477,7 +476,12 @@ impl Preparer for Arc<MaterializedDeleteStep> {
         let current = view
             .metadata()
             .snapshot_for_ref(view.target_ref())
-            .ok_or_else(|| missing("current target snapshot"))?;
+            .ok_or_else(|| {
+                missing_required_file(
+                    crate::commit::model::CommitOperation::Write,
+                    "current target snapshot",
+                )
+            })?;
         let original = observed
             .scope
             .metadata()
@@ -608,59 +612,30 @@ impl CompletedStep {
                 view.artifacts().check_active()
             })
             .await?;
-        let sources = scope.snapshot_sources()?;
-        let required = self
-            .removed
-            .iter()
-            .map(|entry| (entry.frozen.identity(), &entry.frozen))
-            .collect::<BTreeMap<_, _>>();
-        let mut removed = Vec::new();
-        let mut seen = BTreeSet::new();
+        // Retain the row mutation's position-read checks for every observed
+        // target, including files that the write does not physically remove.
         for (path, original) in &self.targets.files {
             view.artifacts().check_active()?;
-            let actual = current.files.get(path).ok_or_else(|| missing(path))?;
+            let actual = current.files.get(path).ok_or_else(|| {
+                missing_required_file(crate::commit::model::CommitOperation::Write, path)
+            })?;
             if actual.data.frozen != original.data.frozen {
-                return Err(missing(path));
-            }
-            if required.contains_key(actual.data.frozen.identity()) {
-                push_removal(&mut removed, &mut seen, &sources, &actual.data)?;
-                for position in &actual.positions {
-                    let identity = position.entry.frozen.identity();
-                    if matches!(identity, EntryIdentity::DeletionVector { .. })
-                        && !required.contains_key(identity)
-                    {
-                        push_removal(&mut removed, &mut seen, &sources, &position.entry)?;
-                    }
-                }
+                return Err(missing_required_file(
+                    crate::commit::model::CommitOperation::Write,
+                    path,
+                ));
             }
         }
-        // A B deletion vector can shadow an earlier live Parquet position
-        // delete in the row-read result. Required removals are physically
-        // identified and must be located independently of read precedence.
-        for entry in scope.live_position_entries() {
-            view.artifacts().check_active()?;
-            let identity = entry.frozen.identity();
-            if let Some(original) = required.get(identity) {
-                if **original != entry.frozen {
-                    return Err(missing(identity.path()));
-                }
-                push_removal(&mut removed, &mut seen, &sources, entry)?;
-            }
-        }
-        if let Some(identity) = required
-            .into_keys()
-            .find(|identity| !seen.contains(*identity))
-        {
-            return Err(missing(identity.path()));
-        }
+        let removed = locate_on_base(
+            &mut scope,
+            self.removed.iter().map(|entry| &entry.frozen),
+            crate::commit::model::CommitOperation::Write,
+            view.artifacts().file_io(),
+            || view.artifacts().check_active(),
+        )
+        .await?;
         Ok((scope, removed))
     }
-}
-
-fn missing(path: &str) -> Error {
-    crate::commit::new_manifests::row_delta_validation_error(format!(
-        "Missing required files to delete: {path}"
-    ))
 }
 
 fn legacy_addition_summary(

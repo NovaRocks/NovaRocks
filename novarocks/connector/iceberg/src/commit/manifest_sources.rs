@@ -128,7 +128,7 @@ impl<'a> SnapshotSources<'a> {
             .await
     }
 
-    async fn fold_indexed(
+    pub(super) async fn fold_indexed(
         &self,
         io: &FileIO,
         active: impl Fn() -> Result<()>,

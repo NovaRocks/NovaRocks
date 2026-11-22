@@ -193,7 +193,9 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.admit.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
         "sql.admit.invalid_branch_property" => "INVALID_BRANCH_PROPERTY",
         "sql.admit.invalid_table_procedure_arguments" => "INVALID_ARGUMENTS",
-        "sql.admit.table_procedure_not_found" => "PROCEDURE_NOT_FOUND",
+        "sql.admit.table_procedure_not_found" | "sql.admit.procedure_not_found" => {
+            "PROCEDURE_NOT_FOUND"
+        }
         "sql.admit.invalid_table_procedure_argument" => "INVALID_PROCEDURE_ARGUMENT",
         "sql.admit.duplicate_table_procedure_argument" => "DUPLICATE_PROPERTY",
         "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
@@ -343,6 +345,7 @@ fn every_registered_user_descriptor_has_an_explicit_trino_mapping() {
             "query.execution.update_target_row_multiple_matches" => {
                 "One UPDATE target table row matched more than one source row".to_owned()
             }
+            "sql.admit.procedure_not_found" => "original domain detail".to_owned(),
             _ => format!("[{}] original domain detail", descriptor.code),
         };
         assert_eq!(wire.message, expected);

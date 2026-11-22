@@ -80,11 +80,6 @@ pub trait ConnectorTableHandle: Debug + Send + Sync + 'static {
 /// A connector-owned handle for one table-function invocation.
 pub trait ConnectorTableFunctionHandle: Debug + Send + Sync + 'static {}
 
-/// A connector-owned handle for one `ALTER TABLE ... EXECUTE` procedure.
-pub trait ConnectorTableExecuteHandle: Debug + Send + Sync + 'static {
-    fn schema_table_name(&self) -> &SchemaTableName;
-}
-
 /// A connector-owned handle for the read side of a row-level merge.
 pub trait ConnectorMergeTableHandle: Debug + Send + Sync + 'static {
     fn schema_table_name(&self) -> &SchemaTableName;

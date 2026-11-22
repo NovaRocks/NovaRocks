@@ -85,7 +85,7 @@ ALTER TABLE target_mv EXECUTE add_equality_delete(columns => ARRAY['order_id'], 
 
 -- query 12
 -- @expect_error=materialized view
-CALL ice_w6_${uuid0}.system.rewrite_manifests("table" => 'ns_${uuid0}.target_mv');
+ALTER TABLE target_mv EXECUTE optimize_manifests;
 
 -- query 13
 -- @expect_error=materialized view
@@ -93,9 +93,7 @@ ALTER TABLE target_mv EXECUTE remove_orphan_files(retention_threshold => '7d');
 
 -- query 14
 -- @expect_error=materialized view
-CALL ice_w6_${uuid0}.system.remove_orphan_files(
-  "table" => 'ns_${uuid0}.target_mv',
-  older_than => TIMESTAMP '2020-01-01 00:00:00');
+ALTER TABLE target_mv EXECUTE expire_snapshots(retention_threshold => '7d');
 
 -- query 15
 -- @expect_error=materialized view

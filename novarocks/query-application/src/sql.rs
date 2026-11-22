@@ -23,15 +23,13 @@ use novarocks_parser::{ParserError, ast::TrinoStatement};
 use novarocks_spi::connector::ConnectorPartitionTransform;
 use novarocks_sql::semantic::command::CommandLiteral;
 use novarocks_sql::semantic::{
-    CatalogSqlCommand, IcebergPartitionFieldExpr, MaintenanceSqlCommand, ObjectName,
-    StatisticsSqlCommand,
+    CatalogSqlCommand, IcebergPartitionFieldExpr, ObjectName, StatisticsSqlCommand,
 };
 use novarocks_types::schema::SqlType;
 
 use crate::admitted_query_context::RequestContext;
 use crate::api::{
-    CatalogCommandConsumer, CommandContext, CommandFuture, MaintenanceCommandConsumer,
-    StatisticsCommandConsumer,
+    CatalogCommandConsumer, CommandContext, CommandFuture, StatisticsCommandConsumer,
 };
 
 /// Connection-local execution settings after SQL and session validation.
@@ -72,19 +70,16 @@ pub mod catalog;
 pub struct ProductCommandRouter {
     catalog: Arc<dyn CatalogCommandConsumer>,
     statistics: Arc<dyn StatisticsCommandConsumer>,
-    maintenance: Arc<dyn MaintenanceCommandConsumer>,
 }
 
 impl ProductCommandRouter {
     pub fn new(
         catalog: Arc<dyn CatalogCommandConsumer>,
         statistics: Arc<dyn StatisticsCommandConsumer>,
-        maintenance: Arc<dyn MaintenanceCommandConsumer>,
     ) -> Self {
         Self {
             catalog,
             statistics,
-            maintenance,
         }
     }
 
@@ -139,17 +134,6 @@ impl ProductCommandRouter {
             .prepare_statement_action(command, request_context, command_context)
     }
 
-    pub fn prepare_maintenance_statement_action(
-        &self,
-        command: MaintenanceSqlCommand,
-        request_context: RequestContext,
-        command_context: CommandContext,
-    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
-    {
-        self.maintenance
-            .prepare_statement_action(command, request_context, command_context)
-    }
-
     pub fn execute(
         &self,
         command: ProductSqlCommand,
@@ -165,10 +149,6 @@ impl ProductCommandRouter {
                 self.statistics
                     .execute(command, request_context, command_context)
             }
-            ProductSqlCommand::Maintenance(command) => {
-                self.maintenance
-                    .execute(command, request_context, command_context)
-            }
         }
     }
 }
@@ -182,7 +162,6 @@ impl ProductCommandRouter {
 pub enum ProductSqlCommand {
     Catalog(Box<CatalogSqlCommand>),
     Statistics(StatisticsSqlCommand),
-    Maintenance(MaintenanceSqlCommand),
 }
 
 /// Lowers one parser-admitted command family to its closed semantic value.

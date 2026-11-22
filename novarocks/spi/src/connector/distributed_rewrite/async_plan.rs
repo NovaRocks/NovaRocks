@@ -24,16 +24,7 @@ use std::task::{Context, Poll};
 /// freezes its real table handle and planning digest after original observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorRewriteSelection {
-    Optimize {
-        file_size_threshold_bytes: u64,
-    },
-    DataFiles {
-        rewrite_all: bool,
-    },
-    PositionDeletes {
-        rewrite_all: bool,
-        min_input_files: Option<u32>,
-    },
+    Optimize { file_size_threshold_bytes: u64 },
 }
 #[derive(Clone)]
 pub struct ConnectorRewriteSourceRequest {
@@ -45,20 +36,7 @@ pub struct ConnectorRewriteSourceRequest {
 }
 impl ConnectorRewriteSourceRequest {
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        crate::connector::ConnectorOperationControl::check_active(&self.context)?;
-        if matches!(
-            self.selection,
-            ConnectorRewriteSelection::PositionDeletes {
-                min_input_files: Some(0),
-                ..
-            }
-        ) {
-            return Err(ConnectorError::new(
-                crate::connector::ConnectorErrorKind::InvalidRequest,
-                "rewrite position deletes min_input_files must be positive",
-            ));
-        }
-        Ok(())
+        crate::connector::ConnectorOperationControl::check_active(&self.context)
     }
 }
 

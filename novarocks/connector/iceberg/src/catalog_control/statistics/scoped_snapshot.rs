@@ -48,9 +48,9 @@ pub(crate) enum SnapshotReadKind {
 }
 pub(crate) struct ScopedReadSnapshot {
     pub(crate) files: Vec<crate::read_model::IcebergReadFile>,
-    pub(crate) all_deletes: Vec<Arc<crate::delete_semantics::DeleteFact>>,
     pub(crate) referenced_specs: Option<ReferencedSpecInventory>,
-    pub(crate) retention_guard: ConnectorPayloadRetentionGuard,
+    pub(crate) rewrite_entries: Option<crate::read_snapshot::rewrite_entries::RewriteEntries>,
+    pub(crate) _retention_guard: ConnectorPayloadRetentionGuard,
 }
 /// The original complete discovery records one i32 slot per distinct manifest,
 /// then compacts unique spec IDs in place. Capacity is retained until actual
@@ -223,13 +223,13 @@ enum IoState {
         result: Option<Result<Bytes, ConnectorError>>,
     },
     Returned(Result<Bytes, ConnectorError>),
-    ReserveSpecsRequested {
-        slots: usize,
+    ReserveOwnedRequested {
+        bytes: std::num::NonZeroU64,
     },
-    ReservingSpecs {
+    ReservingOwned {
         result: Option<Result<(), ConnectorError>>,
     },
-    SpecsReserved(Result<(), ConnectorError>),
+    OwnedReserved(Result<(), ConnectorError>),
 }
 pub(crate) struct SnapshotIoGate {
     state: Mutex<Option<IoState>>,
@@ -273,9 +273,9 @@ impl SnapshotIoGate {
                     Poll::Pending
                 }
                 IoState::Reading { .. }
-                | IoState::ReserveSpecsRequested { .. }
-                | IoState::ReservingSpecs { .. }
-                | IoState::SpecsReserved(_) => {
+                | IoState::ReserveOwnedRequested { .. }
+                | IoState::ReservingOwned { .. }
+                | IoState::OwnedReserved(_) => {
                     panic!("snapshot read collided with another original gate obligation")
                 }
                 IoState::Returned(_) => {
@@ -292,25 +292,34 @@ impl SnapshotIoGate {
         if slots == 0 {
             return Ok(());
         }
+        let bytes =
+            spec_slot_backing_bytes(slots).map_err(|error| ReadFailure::Original(error.into()))?;
+        self.reserve_owned_backing(bytes).await
+    }
+
+    pub(crate) async fn reserve_owned_backing(
+        &self,
+        bytes: std::num::NonZeroU64,
+    ) -> Result<(), ReadFailure> {
         std::future::poll_fn(|_| {
             let mut loan = IoLoan::take(self);
             match loan.state.as_mut().unwrap() {
                 IoState::Idle => {
-                    loan.state = Some(IoState::ReserveSpecsRequested { slots });
+                    loan.state = Some(IoState::ReserveOwnedRequested { bytes });
                     Poll::Pending
                 }
-                IoState::ReserveSpecsRequested { slots: original } => {
-                    assert_eq!(*original, slots, "same original spec-slot request");
+                IoState::ReserveOwnedRequested { bytes: original } => {
+                    assert_eq!(*original, bytes, "same original backing request");
                     Poll::Pending
                 }
-                IoState::SpecsReserved(_) => {
-                    let Some(IoState::SpecsReserved(result)) = loan.state.replace(IoState::Idle)
+                IoState::OwnedReserved(_) => {
+                    let Some(IoState::OwnedReserved(result)) = loan.state.replace(IoState::Idle)
                     else {
                         unreachable!()
                     };
                     Poll::Ready(result.map_err(|cause| ReadFailure::Original(cause.into())))
                 }
-                _ => panic!("spec reserve collided with another original gate obligation"),
+                _ => panic!("backing reservation collided with another original gate obligation"),
             }
         })
         .await
@@ -323,34 +332,25 @@ impl SnapshotIoGate {
         // The same requested path remains in this loan across the foreign F.
         // Neither poll, wake nor SDK Drop runs under the mutex.
         let mut loan = IoLoan::take(self);
-        if let IoState::ReserveSpecsRequested { slots } = loan.state.as_ref().unwrap() {
-            let bytes = spec_slot_backing_bytes(*slots);
-            loan.state = Some(IoState::ReservingSpecs { result: None });
-            let reserved = match bytes {
-                Err(error) => Err(error),
-                Ok(bytes) => {
-                    if context
-                        .io_admission()
-                        .and_then(std::sync::Weak::upgrade)
-                        .is_none()
-                    {
-                        Err(invalid(
-                            "prepared spec inventory lost its original MIO source",
-                        ))
-                    } else {
-                        context.reserve_owned_metadata(bytes).await
-                    }
-                }
+        if let IoState::ReserveOwnedRequested { bytes } = loan.state.as_ref().unwrap() {
+            let bytes = *bytes;
+            loan.state = Some(IoState::ReservingOwned { result: None });
+            let reserved = if context
+                .io_admission()
+                .and_then(std::sync::Weak::upgrade)
+                .is_none()
+            {
+                Err(invalid("snapshot backing lost its original MIO source"))
+            } else {
+                context.reserve_owned_metadata(bytes).await
             };
-            let IoState::ReservingSpecs { result } = loan.state.as_mut().unwrap() else {
+            let IoState::ReservingOwned { result } = loan.state.as_mut().unwrap() else {
                 unreachable!()
             };
             // Stable receipt/refusal before this same gate resumes pure CPU.
             *result = Some(reserved);
-            let received = result
-                .take()
-                .expect("original spec-slot reservation result");
-            loan.state = Some(IoState::SpecsReserved(received));
+            let received = result.take().expect("original backing reservation result");
+            loan.state = Some(IoState::OwnedReserved(received));
             return Ok(());
         }
         let IoState::Requested { path } = loan.state.as_ref().unwrap() else {
@@ -803,7 +803,7 @@ mod tests {
         let loan = IoLoan::take(&gate);
         assert!(matches!(
             loan.state.as_ref(),
-            Some(IoState::ReserveSpecsRequested { slots: 7 })
+            Some(IoState::ReserveOwnedRequested { bytes }) if *bytes == spec_slot_backing_bytes(7).unwrap()
         ));
     }
     #[test]
@@ -818,7 +818,7 @@ mod tests {
         assert!(borrowed.as_mut().poll(&mut cx).is_pending());
         {
             let mut loan = IoLoan::take(&gate);
-            loan.state = Some(IoState::SpecsReserved(Err(original.clone())));
+            loan.state = Some(IoState::OwnedReserved(Err(original.clone())));
         }
         let Poll::Ready(Err(ReadFailure::Original(
             novarocks_spi::connector::ConnectorScopedBeginCause::Provider(actual),

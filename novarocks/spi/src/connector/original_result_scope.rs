@@ -18,7 +18,7 @@
 //! Closed first-party original-result check and retention projection.
 //! No allowance, provider credential, wire identity, or measurement is created.
 
-use super::ConnectorPayloadRetentionGuard;
+use super::{ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard};
 use std::{error::Error, fmt, sync::Arc, time::Instant};
 
 /// Implemented by the caller that already owns the original result binding.
@@ -87,6 +87,7 @@ impl novarocks_failure_contract::OuterFailureProjection for OriginalResultCheckE
 pub struct ConnectorOriginalResultScope {
     checks: Arc<dyn ConnectorOriginalResultScopeCheck>,
     guard: ConnectorPayloadRetentionGuard,
+    payload_byte_author: Option<ConnectorPayloadRetentionGuard>,
 }
 impl ConnectorOriginalResultScope {
     /// Both projections share the supplied neutral retention owner.
@@ -96,8 +97,24 @@ impl ConnectorOriginalResultScope {
         Self {
             checks: owner.clone(),
             guard: ConnectorPayloadRetentionGuard::from_shared(owner),
+            payload_byte_author: None,
         }
     }
+    /// Expose the byte port only when the same original owner has approved
+    /// allocations on its existing result capacity.
+    pub fn from_budgeted_original<T>(owner: Arc<T>) -> Self
+    where
+        T: ConnectorOriginalResultScopeCheck + ConnectorPayloadByteBudget,
+    {
+        let mut scope = Self::from_original(Arc::clone(&owner));
+        scope.payload_byte_author = Some(ConnectorPayloadRetentionGuard::from_byte_budget(owner));
+        scope
+    }
+
+    pub fn payload_byte_author(&self) -> Option<&ConnectorPayloadRetentionGuard> {
+        self.payload_byte_author.as_ref()
+    }
+
     pub fn original_deadline(&self) -> Instant {
         self.checks.original_deadline()
     }

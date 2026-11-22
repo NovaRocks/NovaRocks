@@ -29,8 +29,7 @@ use crate::typed_read::schema_binding::{
 };
 use crate::typed_read::{
     ColumnIdentity, ICEBERG_CHANGE_OP_FIELD_ID, IcebergColumnHandle, IcebergRuntimeRelation,
-    IcebergSystemTableType, IcebergTableExecuteProcedureHandle, IcebergTableHandle,
-    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, change_op_column_handle,
+    IcebergSystemTableType, IcebergTableHandle, change_op_column_handle,
 };
 use arrow::datatypes::{DataType, Field, FieldRef};
 use novarocks_connector_contract::{ConnectorReadPublicFacts, PureProviderCompileError};
@@ -269,42 +268,6 @@ fn visit_source_fields(
         IcebergRuntimeRelation::SystemTable(_) => Err(unsupported(
             "Iceberg metadata relation fields are mirrored from their frozen system schema",
         )),
-        IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
-            Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
-                visit_table(optimize.table_handle(), columns, work, visit)
-            }
-            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
-                for (ordinal, column) in columns.iter().enumerate() {
-                    let mut expected = None;
-                    for (name, metadata) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
-                        if column.base_field_id() == metadata.field_id() {
-                            expected = Some(opaque_source(work, || {
-                                crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
-                            })?);
-                        }
-                        work.step()?;
-                    }
-                    let expected = expected.ok_or_else(|| {
-                        invalid("rewrite-position reader has no such output column")
-                    })?;
-                    compare_handle(column, &expected, work)?;
-                    let field = projected_field(&expected, work)?;
-                    visit(
-                        ordinal,
-                        &field,
-                        expected.nullable(),
-                        None,
-                        column.type_json().len(),
-                        work,
-                    )?;
-                    work.step()?;
-                }
-                Ok(())
-            }
-            None => Err(unsupported(
-                "Iceberg table execute has no static read schema",
-            )),
-        },
         IcebergRuntimeRelation::TableFunction(_) | IcebergRuntimeRelation::MergeTable(_) => Err(
             unsupported("Iceberg relation does not publish final static read facts"),
         ),
@@ -1272,12 +1235,15 @@ mod tests {
             Type::Primitive(PrimitiveType::Long),
         )]);
         let relation = IcebergRuntimeRelation::Table(table(&schema, BTreeMap::new()));
-        let column = crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(
-            "_file",
-            IcebergMetadataColumn::Path,
-        )
+        let metadata = IcebergMetadataColumn::Path;
+        let column = IcebergColumnHandle::base_column(&NestedField::new(
+            metadata.field_id(),
+            metadata.column_name(),
+            Type::Primitive(metadata.declared_type()),
+            !metadata.nullable(),
+        ))
         .unwrap();
-        let field = metadata_target_field(&column, IcebergMetadataColumn::Path).unwrap();
+        let field = metadata_target_field(&column, metadata).unwrap();
         run(
             &relation,
             std::slice::from_ref(&column),

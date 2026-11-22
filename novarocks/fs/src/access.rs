@@ -3079,6 +3079,11 @@ fn map_opendal_error(operation: &str, error: opendal::Error) -> FileError {
     carry_authority_cause(FileError::with_source(kind, operation, error), cause)
 }
 
+/// Classify a governed provider file request and retain its raw storage cause.
+pub fn map_object_store_io_error(operation: &str, error: opendal::Error) -> FileError {
+    map_opendal_error(operation, error)
+}
+
 /// Bound the diagnostic we create at the catalog listing boundary. OpenDAL
 /// 0.55 exposes its kind but no borrowed message accessor; its Display builds
 /// context Vecs/Strings and may invoke arbitrary source Display. Preserve the

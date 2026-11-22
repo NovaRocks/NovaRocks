@@ -50,8 +50,7 @@ use novarocks_query_application::admitted_query_context::{RequestAdmission, Requ
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{
     CatalogCommandConsumer, CommandContext, CommandError, CommandErrorKind, CommandFuture,
-    MaintenanceCommandConsumer, OptionalCommandFuture, QueryExecutionError,
-    StatisticsCommandConsumer,
+    OptionalCommandFuture, QueryExecutionError, StatisticsCommandConsumer,
 };
 use novarocks_query_application::api::{QueryResult, build_string_query_result};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
@@ -422,81 +421,6 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
     }
 }
 
-#[derive(Clone)]
-struct FrontendMaintenanceCommandConsumer {
-    maintenance: MaintenanceCommandExecutor,
-    executor: QueryBlockingExecutor,
-    #[cfg(novarocks_dev_controls)]
-    statement_observation:
-        Option<std::sync::Weak<crate::preparation_diagnostics::StatementObservationOwner>>,
-}
-
-impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
-    fn prepare_statement_action(
-        &self,
-        command: novarocks_sql::semantic::MaintenanceSqlCommand,
-        request_context: RequestContext,
-        command_context: CommandContext,
-    ) -> Result<
-        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        CommandError,
-    > {
-        #[cfg(novarocks_dev_controls)]
-        let observation = self
-            .statement_observation
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-            .and_then(|owner| owner.bound_statement(command_context.statement_token()));
-        maintenance_action::prepare(
-            &self.maintenance,
-            &command,
-            &request_context,
-            &command_context,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        )
-    }
-
-    fn execute(
-        &self,
-        command: novarocks_sql::semantic::MaintenanceSqlCommand,
-        request_context: RequestContext,
-        command_context: CommandContext,
-    ) -> CommandFuture {
-        if crate::query_execution::maintenance::command::is_async_metadata_command(
-            &command,
-            request_context.session().current_catalog(),
-            request_context.session().current_database(),
-        )
-        .unwrap_or(false)
-        {
-            return Box::pin(async {
-                Err(CommandError::new(
-                    CommandErrorKind::Conflict,
-                    "metadata maintenance requires the original registered statement source",
-                ))
-            });
-        }
-        let maintenance = self.maintenance.clone();
-        execute_product_command_edge(
-            self.executor.clone(),
-            request_context,
-            command_context,
-            move |context, command_context| {
-                maintenance
-                    .execute_non_metadata_command(
-                        &command,
-                        context.session().current_catalog(),
-                        context.session().current_database(),
-                        context.execution(),
-                        command_context.connector_context(),
-                    )
-                    .map_err(maintenance_command_error)
-            },
-        )
-    }
-}
-
 /// Project only the domain author's retained verdict into supervisor metadata.
 /// The original Lake terminal, target, receipt, and cause remain domain-owned.
 pub(crate) const fn external_effect_from_lake(
@@ -553,12 +477,8 @@ pub(crate) fn product_command_router(
     view: ViewCommandExecutor,
     iceberg_ref: IcebergRefCommandExecutor,
     statistics: StatisticsCommandExecutor,
-    maintenance: MaintenanceCommandExecutor,
     executor: QueryBlockingExecutor,
     state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
-    #[cfg(novarocks_dev_controls)] statement_observation: Option<
-        Arc<crate::preparation_diagnostics::StatementObservationOwner>,
-    >,
 ) -> ProductCommandRouter {
     ProductCommandRouter::new(
         Arc::new(FrontendCatalogCommandConsumer {
@@ -566,15 +486,9 @@ pub(crate) fn product_command_router(
             state_store,
             view,
             iceberg_ref,
-            executor: executor.clone(),
+            executor,
         }),
         Arc::new(FrontendStatisticsCommandConsumer { statistics }),
-        Arc::new(FrontendMaintenanceCommandConsumer {
-            maintenance,
-            executor,
-            #[cfg(novarocks_dev_controls)]
-            statement_observation: statement_observation.as_ref().map(Arc::downgrade),
-        }),
     )
 }
 

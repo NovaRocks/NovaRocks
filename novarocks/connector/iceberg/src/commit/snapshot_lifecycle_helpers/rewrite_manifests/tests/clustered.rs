@@ -358,8 +358,8 @@ async fn clustered_v3_rewrite_rolls_historical_lanes_and_keeps_each_live_entry()
 #[tokio::test]
 async fn execute_keeps_delete_manifest_descriptors_and_reports_kept_count() {
     use crate::commit::model::{
-        Dependency, FileChanges, IsolationLevel, ObjectIdentity, OperationIntent,
-        OperationIntentParts, RequestShape, TableTarget,
+        Dependency, FileChanges, ObjectIdentity, OperationIntent, OperationIntentParts,
+        RequestShape, TableTarget,
     };
     use crate::commit::staging::{StagingBase, StagingEngine};
     use crate::iceberg::{NamespaceIdent, TableIdent};
@@ -426,7 +426,7 @@ async fn execute_keeps_delete_manifest_descriptors_and_reports_kept_count() {
         start: None,
         changes: FileChanges::default(),
         dependencies: vec![Dependency::NoRead],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: BTreeMap::new(),
         token: artifacts.attempt_token().operation(),

@@ -220,9 +220,7 @@ impl Preparer for SlotChangePreparer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::{
-        FileChanges, IsolationLevel, OperationIntentParts, StartSnapshot, TableTarget,
-    };
+    use super::super::model::{FileChanges, OperationIntentParts, StartSnapshot, TableTarget};
     use super::super::overwrite::preparer_tests::Fixture;
     use super::*;
     use crate::iceberg::spec::FormatVersion;
@@ -253,7 +251,7 @@ mod tests {
             }),
             changes: FileChanges::default(),
             dependencies: vec![Dependency::RefUnchanged],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary,
             token: fixture.operation.token(),

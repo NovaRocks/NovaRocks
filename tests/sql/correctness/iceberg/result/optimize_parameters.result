@@ -1,0 +1,60 @@
+-- query 2
+-- types	bigint	boolean	boolean
+files	fits_1024_bytes	exceeds_1_byte
+2	true	true
+
+-- query 4
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	0
+removed_delete_files_count	0
+added_data_files_count	0
+
+-- query 7
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	0
+removed_delete_files_count	0
+added_data_files_count	0
+
+-- query 8
+-- types	bigint
+unchanged_snapshot
+1
+
+-- query 9
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 11
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 13
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 15
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 16
+-- types	bigint
+a
+1
+2
+3
+4
+5
