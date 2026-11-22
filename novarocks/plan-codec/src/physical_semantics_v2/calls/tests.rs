@@ -590,6 +590,7 @@ fn special_fixture_with_rows(input_rows: usize) -> RelationFixture {
             .unwrap();
         outputs.push(output);
         aggregates.push(AggregateCall {
+            filter_root: None,
             id,
             binding: AggregateBinding {
                 function: function(FunctionKind::Aggregate, integer()),

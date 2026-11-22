@@ -57,3 +57,9 @@ ORDER BY g;
 -- query 6
 -- @skip_result_check=true
 SET SESSION disable_optimizer_rules = '';
+
+-- query 7
+-- @explain_contains=HASH AGGREGATE (SINGLE,
+-- @explain_not_contains=HASH AGGREGATE (DISTINCT_GLOBAL,
+SELECT g, count(DISTINCT x) FILTER (WHERE a BETWEEN 20 AND 60) AS dc, sum(a) AS sa
+FROM ${case_db}.t_dg GROUP BY g ORDER BY g;

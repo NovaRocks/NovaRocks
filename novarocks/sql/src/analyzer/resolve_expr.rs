@@ -25,7 +25,7 @@ use novarocks_parser::ast;
 use novarocks_parser::printer::print_object_name;
 
 use crate::analysis::*;
-use crate::analyze_error::AnalyzeError;
+use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use novarocks_type_contract::{
     ArithmeticOperator, arithmetic_result_value_type_with_op, comparison_common_value_type,
     wider_comparison_value_type,
@@ -998,26 +998,13 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
             ast::Predicate::BooleanTest(predicate) => {
-                use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-
-                let inner = self.analyze_expr(value, scope)?;
-                let inner = if is_strict_null_value_type(&inner.value_type) {
-                    self.cast_to_value_type(
-                        inner,
-                        FunctionValueType::new(DataType::Boolean, true),
-                        value.span(),
-                    )?
-                } else if inner.value_type.logical_type() == ValueLogicalType::Physical
-                    && inner.value_type.data_type() == &DataType::Boolean
-                {
-                    inner
-                } else {
-                    return Err(AnalyzeError::type_mismatch(
-                        "Boolean test operand must be BOOLEAN",
-                        value.span(),
-                    ));
-                };
-                let value_type = FunctionValueType::new(DataType::Boolean, false);
+                let inner = self.require_boolean(
+                    self.analyze_expr(value, scope)?,
+                    value.span(),
+                    "Boolean test operand must be BOOLEAN",
+                )?;
+                let value_type =
+                    novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false);
                 match predicate.truth_value {
                     ast::TruthValue::Unknown => Ok(TypedExpr {
                         value_type,
@@ -2122,22 +2109,155 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
-        if original_name == "grouping" {
-            return self.analyze_grouping_function(func, scope);
+        let original_input = if func.filter.is_some()
+            && func.window.is_none()
+            && (is_aggregate_function(self.function_catalog, &original_name)
+                || is_analyzer_aggregate_syntax(&original_name))
+        {
+            self.grouping_scope
+                .borrow()
+                .as_ref()
+                .and_then(|state| state.from_scope.borrow().clone())
+        } else {
+            None
+        };
+        let mut call = if original_name == "grouping" {
+            self.analyze_grouping_function(func, scope)?
+        } else {
+            self.analyze_function_from_metadata(
+                FunctionMetadata {
+                    original: Some(func),
+                    span: func.span,
+                    distinct: func.distinct,
+                    order_by: func.order_by.as_ref(),
+                    window: func.window.as_ref(),
+                    null_treatment: func.null_treatment,
+                },
+                original_name,
+                original_arguments,
+                original_input.as_ref().unwrap_or(scope),
+            )?
+        };
+        if let Some(predicate) = &func.filter {
+            match &mut call.kind {
+                ExprKind::AggregateCall { filter, .. } => {
+                    *filter = Some(ast::AstBox::new(
+                        self.analyze_aggregate_filter(predicate, scope)?,
+                    ));
+                }
+                ExprKind::WindowCall { .. } => {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "FILTER is not supported for window functions",
+                        predicate.span(),
+                    ));
+                }
+                _ => {
+                    return Err(AnalyzeError::at(
+                        AnalyzeErrorKind::FunctionNotAggregate,
+                        "FILTER requires an aggregate function",
+                        predicate.span(),
+                    ));
+                }
+            }
         }
-        self.analyze_function_from_metadata(
-            FunctionMetadata {
-                original: Some(func),
-                span: func.span,
-                distinct: func.distinct,
-                order_by: func.order_by.as_ref(),
-                window: func.window.as_ref(),
-                null_treatment: func.null_treatment,
-            },
-            original_name,
-            original_arguments,
-            scope,
+        Ok(call)
+    }
+
+    fn analyze_aggregate_filter(
+        &self,
+        predicate: &ast::Expr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        struct ScalarCheck<'a, 'catalog> {
+            analyzer: &'a super::AnalyzerContext<'catalog>,
+            error: Option<AnalyzeError>,
+        }
+        impl ast::Visit for ScalarCheck<'_, '_> {
+            fn visit_query(&mut self, _: &ast::Query) {}
+
+            #[recursive::recursive]
+            fn visit_expr(&mut self, expression: &ast::Expr) {
+                if self.error.is_some() {
+                    return;
+                }
+                if let Err(error) = self.analyzer.check_control() {
+                    self.error = Some(error);
+                    return;
+                }
+                let relation_predicate = match expression {
+                    ast::Expr::Exists(_) => true,
+                    ast::Expr::Predicated(node) => matches!(
+                        &node.predicate,
+                        ast::Predicate::In(input) if matches!(input.value_list, ast::Expr::Subquery(_))
+                    ),
+                    _ => false,
+                };
+                if relation_predicate {
+                    self.error = Some(AnalyzeError::unsupported_expression(
+                        "Relational EXISTS and IN subqueries are not supported in aggregate FILTER",
+                        expression.span(),
+                    ));
+                    return;
+                }
+                let non_scalar = match expression {
+                    ast::Expr::GroupingOperation(_) | ast::Expr::WindowOperation(_) => true,
+                    ast::Expr::FunctionCall(call) => {
+                        let name = print_object_name(&call.name).to_ascii_lowercase();
+                        call.window.is_some()
+                            || name == "grouping"
+                            || is_aggregate_function(self.analyzer.function_catalog, &name)
+                            || is_analyzer_aggregate_syntax(&name)
+                    }
+                    _ => false,
+                };
+                if non_scalar {
+                    self.error = Some(AnalyzeError::at(
+                        AnalyzeErrorKind::ExpressionNotScalar,
+                        "Aggregate FILTER must contain only scalar expressions",
+                        expression.span(),
+                    ));
+                } else {
+                    ast::walk_expr(self, expression);
+                }
+            }
+        }
+        let mut check = ScalarCheck {
+            analyzer: self,
+            error: None,
+        };
+        ast::Visit::visit_expr(&mut check, predicate);
+        if let Some(error) = check.error {
+            return Err(error);
+        }
+        let from_scope = self
+            .grouping_scope
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.from_scope.borrow().clone());
+        let typed = self.analyze_expr(predicate, from_scope.as_ref().unwrap_or(scope))?;
+        self.require_boolean(
+            typed,
+            predicate.span(),
+            "Aggregate FILTER predicate must be BOOLEAN",
         )
+    }
+
+    fn require_boolean(
+        &self,
+        value: TypedExpr,
+        span: Span,
+        message: &str,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        if is_strict_null_value_type(&value.value_type) {
+            self.cast_to_value_type(value, FunctionValueType::new(DataType::Boolean, true), span)
+        } else if value.value_type.logical_type() == ValueLogicalType::Physical
+            && value.value_type.data_type() == &DataType::Boolean
+        {
+            Ok(value)
+        } else {
+            Err(AnalyzeError::type_mismatch(message, span))
+        }
     }
 
     #[recursive::recursive]
@@ -2935,6 +3055,8 @@ impl<'a> super::AnalyzerContext<'a> {
             let value_type = crate::functions::aggregate_result_type(&signature).clone();
             Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
+                    occurrence: crate::analysis::AggregateOccurrence::new(),
+                    filter: None,
                     name,
                     args: (args_typed).into(),
                     distinct: is_distinct,
@@ -6154,9 +6276,19 @@ fn typed_expr_contains_column_ref(expr: &TypedExpr) -> bool {
         | ExprKind::Nested(expr)
         | ExprKind::IsNull { expr, .. }
         | ExprKind::IsTruthValue { expr, .. } => typed_expr_contains_column_ref(expr),
-        ExprKind::FunctionCall { args, .. }
-        | ExprKind::AggregateCall { args, .. }
-        | ExprKind::WindowCall { args, .. } => args.iter().any(typed_expr_contains_column_ref),
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => args
+            .iter()
+            .chain(order_by.iter().map(|item| &item.expr))
+            .chain(filter.as_deref())
+            .any(typed_expr_contains_column_ref),
+        ExprKind::FunctionCall { args, .. } | ExprKind::WindowCall { args, .. } => {
+            args.iter().any(typed_expr_contains_column_ref)
+        }
         ExprKind::Case {
             operand,
             when_then,

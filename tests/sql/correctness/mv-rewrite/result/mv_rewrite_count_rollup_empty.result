@@ -43,3 +43,8 @@ user_id	c
 -- query 23
 -- types	integer	bigint
 user_id	c
+
+-- query 24
+-- types	bigint
+c
+0

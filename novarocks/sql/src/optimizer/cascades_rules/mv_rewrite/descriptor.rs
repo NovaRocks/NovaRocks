@@ -176,7 +176,8 @@ impl SpjgDescriptor {
 
         let aggregate = match &node.op {
             Operator::LogicalAggregate(a) => {
-                if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
+                if a.stage != AggStage::Single || a.is_split || has_unhandled_aggregate_channels(a)
+                {
                     return Err("unsupported aggregate shape for MV rewrite"
                         .to_string()
                         .into());
@@ -339,7 +340,8 @@ impl SpjgDescriptor {
         let (aggregate, mut node) = match &expr.op {
             Operator::LogicalAggregate(a) => {
                 // Only the original, unsplit Single aggregate is accepted.
-                if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
+                if a.stage != AggStage::Single || a.is_split || has_unhandled_aggregate_channels(a)
+                {
                     return Ok(None);
                 }
                 let child = miss!(first_logical_expr(memo, *miss!(expr.children.first())));
@@ -565,10 +567,10 @@ fn references_any(arena: &ScalarArena, expr: ScalarId, ids: &[ColumnId]) -> bool
     }
 }
 
-fn aggregate_has_order_by(agg: &LogicalAggregateOp) -> bool {
+fn has_unhandled_aggregate_channels(agg: &LogicalAggregateOp) -> bool {
     agg.aggregates
         .iter()
-        .any(|call| !call.source.order_by().is_empty())
+        .any(|call| !call.source.order_by().is_empty() || call.source.has_projected_inputs())
 }
 
 fn substitute_aggregate(
@@ -931,12 +933,18 @@ pub(crate) fn substitute_scalar(
             volatility,
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ScalarNode::AggregateCall {
+            occurrence,
+            filter: filter
+                .map(|id| substitute_scalar(arena, id, defs, control))
+                .transpose()?,
             name,
             args: args
                 .into_iter()

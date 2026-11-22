@@ -50,6 +50,8 @@ sql.admit.unsupported_statement	Admit
 sql.admit.update_unsupported_form	Admit
 sql.analyze.ambiguous_function_call	Analyze
 sql.analyze.duplicate_column_name	Analyze
+sql.analyze.expression_not_scalar	Analyze
+sql.analyze.function_not_aggregate	Analyze
 sql.analyze.internal	Analyze
 sql.analyze.invalid_analyze_property	Analyze
 sql.analyze.invalid_argument	Analyze

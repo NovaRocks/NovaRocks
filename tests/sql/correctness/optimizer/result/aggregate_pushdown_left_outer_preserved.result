@@ -54,3 +54,9 @@ PLAN FRAGMENT 3
      TABLE: ${case_db}.t_agg_pd_lo_b
      columns: k
      min-max stats
+
+-- query 10
+-- types	integer	bigint	bigint
+k	matched_sum	all_rows
+1	1990200	200
+99	NULL	200

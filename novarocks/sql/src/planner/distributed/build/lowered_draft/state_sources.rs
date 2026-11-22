@@ -1178,7 +1178,7 @@ fn construction_input_root<'a, G: StateGraph<'a>>(
     let actual=match demand {
         AggregateRuntimeDemand::ExpressionState(expr)=>graph.unit(fragment,node.id).and_then(|unit| unit.definition(expr)).is_some_and(|expr|matches!(expr.kind,novarocks_expression_contract::ExprKind::Value(value) if value==root.value)),
         AggregateRuntimeDemand::WriterState(value)=>value==root.value,
-        AggregateRuntimeDemand::Update=>false,
+        AggregateRuntimeDemand::Update | AggregateRuntimeDemand::FilteredUpdate { .. } => false,
     };
     work.step()?;
     if !actual {

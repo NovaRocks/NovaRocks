@@ -282,7 +282,9 @@ fn normalize_inner(
             distinct,
             resolved,
             order_by,
-        } => NormExpr::Call {
+            filter,
+            ..
+        } if filter.is_none() => NormExpr::Call {
             value_type: value_type.clone(),
             argument_order: NormArgumentOrder::Ordered,
             name: format!("agg:{}", name.to_ascii_lowercase()),
@@ -293,6 +295,7 @@ fn normalize_inner(
             order_by: required!(normalize_order(arena, order_by, base_names, control, work)?),
             args: required!(normalize_args(arena, args, base_names, control, work)?),
         },
+        ScalarNode::AggregateCall { .. } => return Ok(None),
         ScalarNode::Cast {
             array_failure_mode,
             child,

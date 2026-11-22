@@ -82,9 +82,14 @@ pub(crate) struct CapturedAggregateLogicalRequest {
     identity: super::AggregateLogicalSourceIdentity,
     arguments: Box<[FunctionArgument]>,
     logical_count: usize,
+    filter_input: Option<crate::column_id::ColumnId>,
     constant_policy: ConstantPolicy,
 }
 impl CapturedAggregateLogicalRequest {
+    pub(crate) fn filter_input(&self) -> Option<crate::column_id::ColumnId> {
+        self.filter_input
+    }
+
     pub(crate) fn logical_identity(&self) -> &super::AggregateLogicalSourceIdentity {
         &self.identity
     }
@@ -172,6 +177,7 @@ pub(crate) fn capture_aggregate_logical_request(
             binding: binding.clone(),
             arguments: captured.into_boxed_slice(),
             logical_count: arguments.len(),
+            filter_input: source.filter_input(),
             constant_policy: policy,
         })
     })();

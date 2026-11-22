@@ -55,6 +55,16 @@ const AMBIGUOUS_FUNCTION_CALL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const FUNCTION_NOT_AGGREGATE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.function_not_aggregate"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const EXPRESSION_NOT_SCALAR: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.expression_not_scalar"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const TYPE_MISMATCH: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.type_mismatch"),
     phase: ErrorPhase::Analyze,
@@ -146,6 +156,8 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_FUNCTION,
     AMBIGUOUS_FUNCTION_CALL,
     TYPE_MISMATCH,
+    FUNCTION_NOT_AGGREGATE,
+    EXPRESSION_NOT_SCALAR,
     INVALID_LITERAL,
     INVALID_ARGUMENT,
     INVALID_ANALYZE_PROPERTY,
@@ -173,6 +185,8 @@ pub enum AnalyzeErrorKind {
     UnknownFunction,
     AmbiguousFunctionCall,
     TypeMismatch,
+    FunctionNotAggregate,
+    ExpressionNotScalar,
     InvalidLiteral,
     InvalidArgument,
     InvalidAnalyzeProperty,
@@ -202,6 +216,8 @@ impl AnalyzeErrorKind {
             Self::UnknownFunction => UNKNOWN_FUNCTION,
             Self::AmbiguousFunctionCall => AMBIGUOUS_FUNCTION_CALL,
             Self::TypeMismatch => TYPE_MISMATCH,
+            Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
+            Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
             Self::InvalidAnalyzeProperty => INVALID_ANALYZE_PROPERTY,
@@ -289,7 +305,7 @@ pub struct AnalyzeError {
 }
 
 impl AnalyzeError {
-    fn at(kind: AnalyzeErrorKind, message: impl Into<String>, span: Span) -> Self {
+    pub(crate) fn at(kind: AnalyzeErrorKind, message: impl Into<String>, span: Span) -> Self {
         Self::at_optional(kind, message, Some(span))
     }
 

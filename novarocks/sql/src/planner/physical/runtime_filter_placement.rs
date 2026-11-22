@@ -2185,6 +2185,8 @@ mod tests {
         let args = vec![
             unset_col_ref("unset"),
             typed_expr(ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "sum".to_string(),
                 args: (vec![col_ref(7, "agg_arg")]).into(),
                 distinct: false,

@@ -1718,6 +1718,7 @@ fn concat_normalization_reloans_original_value_separator_and_order_occurrences()
             distinct,
             order_by,
             resolved,
+            ..
         } = &select.projection[0].expr.kind
         else {
             panic!("actual selected aggregate");

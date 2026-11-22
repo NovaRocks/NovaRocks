@@ -1096,7 +1096,7 @@ impl<'a> AnalyzerContext<'a> {
             let (mut body, body_output) = ctx.analyze_set_expr(set_expr)?;
 
             // Analyze ORDER BY
-            let order_by = ctx.analyze_order_by(
+            let mut order_by = ctx.analyze_order_by(
                 modifiers.order_by.as_ref(),
                 select,
                 span,
@@ -1104,6 +1104,7 @@ impl<'a> AnalyzerContext<'a> {
                 &body,
             )?;
             if let QueryBody::Select(select) = &mut body {
+                ctx.rewrite_order_aggregate_subqueries(select, &mut order_by)?;
                 ctx.validate_grouping_calls(&select.group_by)?;
                 ctx.append_grouping_calls(select);
             }
@@ -1596,7 +1597,12 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- Detect aggregation ---
         let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
-        let has_aggregation = !group_by.is_empty() || has_agg_in_select;
+        let has_aggregation = !group_by.is_empty()
+            || has_agg_in_select
+            || select
+                .having
+                .as_ref()
+                .is_some_and(|expr| self.expr_contains_aggregate(expr));
 
         if let Some(state) = self.grouping_scope.borrow().as_ref() {
             state.enabled.set(true);
@@ -1607,11 +1613,15 @@ impl<'a> AnalyzerContext<'a> {
         // real aggregate call (e.g. `total` → `sum(v)`).
         let having = match &select.having {
             Some(expr) => {
+                let prior_subqueries = self.collected_subqueries.borrow().len();
                 let analyzed = self.analyze_expr(expr, &scope);
                 match analyzed {
                     Ok(h) => Some(h),
                     Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
+                        self.collected_subqueries
+                            .borrow_mut()
+                            .truncate(prior_subqueries);
                         // Maybe references a SELECT alias — build alias scope
                         let mut alias_scope = scope.clone();
                         for item in &projection {
@@ -1802,6 +1812,8 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::AggregateCall {
+                occurrence,
+                filter,
                 name,
                 args,
                 distinct,
@@ -1811,6 +1823,8 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::AggregateCall {
+                    occurrence,
+                    filter,
                     name,
                     args: args
                         .into_iter()
@@ -2052,6 +2066,8 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::AggregateCall {
+                occurrence,
+                filter,
                 name,
                 args,
                 distinct,
@@ -2061,6 +2077,8 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::AggregateCall {
+                    occurrence,
+                    filter,
                     name,
                     args: args
                         .into_iter()
@@ -2874,6 +2892,48 @@ impl<'a> AnalyzerContext<'a> {
         }
     }
 
+    fn rewrite_order_aggregate_subqueries(
+        &self,
+        select: &mut ResolvedSelect,
+        order_by: &mut [SortItem],
+    ) -> Result<(), AnalyzeError> {
+        use subquery_rewrite::expr_contains_placeholder;
+
+        self.collected_subqueries.borrow_mut().retain(|subquery| {
+            order_by
+                .iter()
+                .any(|sort| expr_contains_placeholder(&sort.expr, subquery.id))
+        });
+        if self.collected_subqueries.borrow().is_empty() {
+            return Ok(());
+        }
+        let mut scope = self
+            .grouping_scope
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.from_scope.borrow().clone())
+            .ok_or_else(|| {
+                AnalyzeError::internal("ORDER BY aggregate has no original input scope")
+            })?;
+
+        // Route input scalar queries through the same Apply author used for
+        // SELECT and HAVING. The original sort items retain their output roles.
+        let visible = select.projection.len();
+        select
+            .projection
+            .extend(order_by.iter().map(|sort| ProjectItem {
+                expr: sort.expr.clone(),
+                output_name: String::new(),
+                field_name: None,
+                output_column_id: ColumnId::UNSET,
+            }));
+        self.rewrite_subqueries(select, &mut scope)?;
+        for (sort, item) in order_by.iter_mut().zip(select.projection.drain(visible..)) {
+            sort.expr = item.expr;
+        }
+        Ok(())
+    }
+
     /// Analyze ORDER BY clause.
     fn analyze_order_by(
         &self,
@@ -3038,7 +3098,13 @@ impl<'a> AnalyzerContext<'a> {
                             // `SELECT a.c, b.c ... ORDER BY a.c, b.c` would
                             // produce two unqualified `c` refs and collapse
                             // both keys onto the first projection slot.
-                            if ast_expr_text == ob_text {
+                            let separately_evaluated_aggregate = matches!(
+                                ast_item,
+                                ast::SelectItem::SingleColumn(column)
+                                    if self.expr_contains_aggregate(&column.expression)
+                                    && !crate::analysis::expr_identity::expression_can_share_evaluation(&ir_item.expr)
+                            );
+                            if ast_expr_text == ob_text && !separately_evaluated_aggregate {
                                 matched_alias = Some(ir_item.expr.clone());
                                 break;
                             }
@@ -3092,6 +3158,15 @@ impl<'a> AnalyzerContext<'a> {
                                             Ok(typed) => self
                                                 .substitute_select_aliases(typed, &sel.projection),
                                             Err(error) if error.control_error().is_some() => {
+                                                return Err(error);
+                                            }
+                                            Err(error)
+                                                if matches!(error.kind(),
+                                                    crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+                                                    | crate::analyze_error::AnalyzeErrorKind::FunctionNotAggregate
+                                                    | crate::analyze_error::AnalyzeErrorKind::ExpressionNotScalar
+                                                    | crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression) =>
+                                            {
                                                 return Err(error);
                                             }
                                             Err(_) => {
@@ -3148,7 +3223,23 @@ impl<'a> AnalyzerContext<'a> {
                 Some(from_scope) => self.rebind_order_by_agg_args(typed, from_scope, false),
                 None => typed,
             };
-            if contains_subquery_placeholder(&typed) {
+            if contains_subquery_placeholder(&typed)
+                && (!matches!(body, QueryBody::Select(select) if !select.distinct)
+                    || !self
+                        .collected_subqueries
+                        .borrow()
+                        .iter()
+                        .filter(|subquery| {
+                            subquery_rewrite::expr_contains_placeholder(&typed, subquery.id)
+                        })
+                        .all(|subquery| {
+                            matches!(subquery.kind, crate::analysis::SubqueryKind::Scalar)
+                                && subquery_rewrite::placeholder_is_aggregate_input(
+                                    &typed,
+                                    subquery.id,
+                                )
+                        }))
+            {
                 return Err(AnalyzeError::unsupported_query_shape(
                     "subquery is not supported in ORDER BY",
                     ob.span,
@@ -3248,12 +3339,16 @@ impl<'a> AnalyzerContext<'a> {
                 }
             }
             ExprKind::AggregateCall {
+                occurrence,
+                filter,
                 name,
                 args,
                 distinct,
                 order_by,
                 resolved,
             } => ExprKind::AggregateCall {
+                occurrence,
+                filter,
                 name,
                 args: args
                     .into_iter()
@@ -3467,12 +3562,16 @@ fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
         ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
             contains_subquery_placeholder(body)
         }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            args.iter().any(contains_subquery_placeholder)
-                || order_by
-                    .iter()
-                    .any(|item| contains_subquery_placeholder(&item.expr))
-        }
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => args
+            .iter()
+            .chain(order_by.iter().map(|item| &item.expr))
+            .chain(filter.as_deref())
+            .any(contains_subquery_placeholder),
         ExprKind::InList { expr, list, .. } => {
             contains_subquery_placeholder(expr) || list.iter().any(contains_subquery_placeholder)
         }
@@ -6693,6 +6792,7 @@ mod tests {
                 distinct,
                 order_by,
                 resolved,
+                ..
             } = &projection.expr.kind
             else {
                 panic!("{group_by} must keep the actual COUNT aggregate binding");

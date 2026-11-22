@@ -260,16 +260,23 @@ fn remap_scalar(
             )?)
         }
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => {
+            if filter.is_some() {
+                return Ok(None);
+            }
             let args = candidate_or_none!(remap_scalar_vec(arena, args, bindings, control)?);
             let order_by = candidate_or_none!(remap_sort_keys(arena, order_by, bindings, control)?);
             Some(arena.intern_observed(
                 ScalarNode::AggregateCall {
+                    occurrence,
+                    filter,
                     name,
                     args,
                     distinct,

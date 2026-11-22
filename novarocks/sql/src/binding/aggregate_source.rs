@@ -18,6 +18,8 @@
 //! Authored logical aggregate channels, independent of runtime merge state.
 
 use super::SqlFunctionBinding;
+use crate::analysis::{AggregateOccurrence, TypedExpr};
+use crate::column_id::ColumnId;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +68,11 @@ pub(crate) struct AggregateArgumentSource<A, O> {
     arguments: Vec<A>,
     order_by: Vec<O>,
     binding: SqlFunctionBinding,
+    occurrences: Vec<AggregateOccurrence>,
+    filter: Option<Arc<TypedExpr>>,
+    filter_input: Option<ColumnId>,
+    projected_arguments: Vec<Option<ColumnId>>,
+    projected_order_by: Vec<Option<ColumnId>>,
 }
 
 impl<A, O> AggregateArgumentSource<A, O> {
@@ -82,6 +89,11 @@ impl<A, O> AggregateArgumentSource<A, O> {
             arguments,
             order_by,
             binding,
+            occurrences: Vec::new(),
+            filter: None,
+            filter_input: None,
+            projected_arguments: Vec::new(),
+            projected_order_by: Vec::new(),
         }
     }
 
@@ -98,7 +110,64 @@ impl<A, O> AggregateArgumentSource<A, O> {
             arguments,
             order_by,
             binding,
+            occurrences: Vec::new(),
+            filter: None,
+            filter_input: None,
+            projected_arguments: Vec::new(),
+            projected_order_by: Vec::new(),
         }
+    }
+
+    pub(crate) fn set_filter(&mut self, filter: Option<&TypedExpr>) {
+        self.filter = filter.map(|expr| Arc::new(expr.clone()));
+    }
+
+    pub(crate) fn filter(&self) -> Option<&TypedExpr> {
+        self.filter.as_deref()
+    }
+
+    pub(crate) fn record_occurrence(&mut self, occurrence: &AggregateOccurrence) {
+        if !self.contains_occurrence(occurrence) {
+            self.occurrences.push(occurrence.clone());
+        }
+    }
+
+    pub(crate) fn contains_occurrence(&self, occurrence: &AggregateOccurrence) -> bool {
+        self.occurrences
+            .iter()
+            .any(|candidate| candidate.same(occurrence))
+    }
+
+    pub(crate) fn set_projected_inputs(
+        &mut self,
+        arguments: Vec<Option<ColumnId>>,
+        order_by: Vec<Option<ColumnId>>,
+        filter: Option<ColumnId>,
+    ) {
+        if let Some(identity) = &mut self.identity {
+            identity.renew_revision();
+        }
+        self.projected_arguments = arguments;
+        self.projected_order_by = order_by;
+        self.filter_input = filter;
+    }
+
+    pub(crate) fn filter_input(&self) -> Option<ColumnId> {
+        self.filter_input
+    }
+
+    pub(crate) fn projected_argument(&self, ordinal: usize) -> Option<ColumnId> {
+        self.projected_arguments.get(ordinal).copied().flatten()
+    }
+
+    pub(crate) fn projected_order_key(&self, ordinal: usize) -> Option<ColumnId> {
+        self.projected_order_by.get(ordinal).copied().flatten()
+    }
+
+    pub(crate) fn has_projected_inputs(&self) -> bool {
+        self.filter_input.is_some()
+            || self.projected_arguments.iter().any(Option::is_some)
+            || self.projected_order_by.iter().any(Option::is_some)
     }
 
     pub(crate) fn logical_identity(&self) -> Option<&AggregateLogicalSourceIdentity> {
@@ -136,6 +205,11 @@ impl<A, O> AggregateArgumentSource<A, O> {
             arguments: arguments(&self.arguments)?,
             order_by: order_by(&self.order_by)?,
             binding: self.binding.clone(),
+            occurrences: self.occurrences.clone(),
+            filter: self.filter.clone(),
+            filter_input: self.filter_input,
+            projected_arguments: self.projected_arguments.clone(),
+            projected_order_by: self.projected_order_by.clone(),
         })
     }
 

@@ -443,6 +443,7 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, ConstantPools, usiz
                 NodeKind::Aggregate {
                     group_by: Box::default(),
                     calls: Box::from([AggregateCall {
+                        filter_root: None,
                         id: AggregateCallId::new(0),
                         binding: aggregate,
                         arguments: Box::default(),

@@ -466,12 +466,19 @@ where
             body: candidate_or_none!(rewrite(arena, body)?),
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ScalarNode::AggregateCall {
+            occurrence,
+            filter: match filter {
+                Some(id) => Some(candidate_or_none!(rewrite(arena, id)?)),
+                None => None,
+            },
             name,
             args: candidate_or_none!(rewrite_vec(arena, args, rewrite, control)?),
             distinct,

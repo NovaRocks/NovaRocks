@@ -25,9 +25,10 @@ use crate::planner::payload::*;
 use novarocks_type_contract::PureCompileControl;
 
 use super::aggregate::{
-    collect_aggregates, ensure_aggregate_output_columns, planner_aggregate_group_by_targets,
-    planner_repeat_original_group_by_targets, rewrite_agg_calls_to_refs, rewrite_expr_children,
-    rewrite_group_by_expr_refs, typed_expr_semantically_eq,
+    collect_aggregates, contains_aggregate, ensure_aggregate_output_columns,
+    planner_aggregate_group_by_targets, planner_repeat_original_group_by_targets,
+    rewrite_agg_calls_to_refs, rewrite_expr_children, rewrite_group_by_expr_refs,
+    typed_expr_semantically_eq,
 };
 use super::output::{adapt_plan_output, adapt_plan_output_with_qualifier, plan_output_columns};
 use super::relation::{plan_set_operation_scoped, plan_values};
@@ -75,8 +76,8 @@ pub(super) fn plan_scoped_query(
         return plan_nested_subquery_chain(resolved, cte_registry, factory, control);
     }
     let ResolvedQuery {
-        body,
-        order_by,
+        mut body,
+        mut order_by,
         limit,
         offset,
         output_columns,
@@ -84,6 +85,10 @@ pub(super) fn plan_scoped_query(
     } = resolved;
 
     let output_columns = crate::analysis::schema::planner_columns(&output_columns);
+    let visible_projection = match &mut body {
+        QueryBody::Select(select) => stage_order_aggregates(select, &mut order_by, factory),
+        _ => None,
+    };
 
     // Plan the query body first so we can stamp fresh set-op ColumnIds before
     // apply_query_modifiers consumes output_columns.
@@ -117,6 +122,8 @@ pub(super) fn plan_scoped_query(
         factory,
         control,
     )?;
+
+    root = strip_order_aggregates(root, visible_projection)?;
 
     for cte_id in local_cte_ids.into_iter().rev() {
         let entry = cte_registry
@@ -216,7 +223,9 @@ fn plan_nested_subquery_chain(
         }
     };
     let mut plan = plan_scoped_query(base, cte_registry, factory, control)?;
-    while let Some(layer) = layers.pop() {
+    while let Some(mut layer) = layers.pop() {
+        let visible_projection =
+            stage_order_aggregates(&mut layer.select, &mut layer.order_by, factory);
         let source = adapt_plan_output_with_qualifier(
             plan,
             &crate::analysis::schema::planner_columns(&layer.source_output_columns),
@@ -238,8 +247,82 @@ fn plan_nested_subquery_chain(
             factory,
             control,
         )?;
+        plan = strip_order_aggregates(plan, visible_projection)?;
     }
     Ok(plan)
+}
+
+fn stage_order_aggregates(
+    select: &mut ResolvedSelect,
+    order_by: &mut [SortItem],
+    factory: &mut ColumnRefFactory,
+) -> Option<usize> {
+    if select.distinct {
+        return None;
+    }
+    let visible = select.projection.len();
+    for (ordinal, sort) in order_by.iter_mut().enumerate() {
+        if !contains_aggregate(&sort.expr) {
+            continue;
+        }
+        let name = format!("__aggregate_sort_{ordinal}");
+        let value_type = sort.expr.value_type.clone();
+        let column_id = factory.create(None, name.clone(), value_type.clone());
+        let expr = std::mem::replace(
+            &mut sort.expr,
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id,
+                    qualifier: None,
+                    column: name.clone(),
+                },
+                value_type,
+            },
+        );
+        select
+            .projection
+            .push(crate::analysis::schema::AnalyzedProjectItem {
+                expr,
+                output_name: name,
+                field_name: None,
+                output_column_id: column_id,
+            });
+        select.has_aggregation = true;
+    }
+    (select.projection.len() != visible).then_some(visible)
+}
+
+fn strip_order_aggregates(
+    plan: LogicalPlanNode,
+    visible_projection: Option<usize>,
+) -> Result<LogicalPlanNode, SqlCompileError> {
+    let Some(visible) = visible_projection else {
+        return Ok(plan);
+    };
+    let items = plan_output_columns(&plan)?
+        .into_iter()
+        .take(visible)
+        .map(|column| ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: column.column_id,
+                    qualifier: None,
+                    column: column.name.clone(),
+                },
+                value_type: column.value_type,
+            },
+            output_name: column.name,
+            output_column_id: column.column_id,
+        })
+        .collect();
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Project(PlanProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![plan],
+        None,
+    ))
 }
 
 fn apply_query_modifiers(

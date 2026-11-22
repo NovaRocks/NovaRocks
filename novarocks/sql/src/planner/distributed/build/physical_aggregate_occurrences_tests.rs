@@ -377,6 +377,7 @@ impl Fixture {
                 })
                 .collect();
             calls.push(AggregateCall {
+                filter_root: None,
                 id,
                 binding: binding.clone(),
                 arguments,
@@ -1314,6 +1315,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         kind: NodeKind::Aggregate {
             group_by: Box::from([(key_root, key)]),
             calls: Box::from([AggregateCall {
+                filter_root: None,
                 id: partial_id,
                 binding: binding.clone(),
                 arguments: Box::default(),
@@ -1352,6 +1354,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
     let output = b.add_value(out_type, origin).unwrap();
     let state_root = root(&mut b, owner, state_expr, RootScope::Port(0));
     let call = AggregateCall {
+        filter_root: None,
         id: call_id,
         binding,
         arguments: Box::from([state_root]),

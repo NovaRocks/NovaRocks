@@ -60,7 +60,8 @@ fn sql_call_dependency_loan_original_aggregate_all_phases_keep_source_and_state_
                         assert!(std::ptr::eq(actual, source));
                         assert_eq!(phase, source.binding.phase);
                         match runtime {
-                            AggregateRuntimeDemand::Update => updates += 1,
+                            AggregateRuntimeDemand::Update
+                            | AggregateRuntimeDemand::FilteredUpdate { .. } => updates += 1,
                             AggregateRuntimeDemand::ExpressionState(id) => {
                                 let [root] = source.arguments.as_ref() else {
                                     panic!("the merge consumes exactly its original state");

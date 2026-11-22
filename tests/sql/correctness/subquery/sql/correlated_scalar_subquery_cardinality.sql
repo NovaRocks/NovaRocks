@@ -36,3 +36,16 @@ FROM ${case_db}.outer_rows o WHERE o.id = 1;
 -- @expect_error=[query.execution.invalid_data] Data failure (reason 1:422)
 SELECT o.id, (SELECT i.v FROM ${case_db}.inner_rows i WHERE i.k = o.k) AS v
 FROM ${case_db}.outer_rows o WHERE o.id = 2;
+
+-- query 5
+SELECT count(*) FILTER (
+           WHERE (SELECT i.v FROM ${case_db}.inner_rows i WHERE i.k = o.k) > 99
+       ) AS qualifying_rows
+FROM ${case_db}.outer_rows o WHERE o.id = 1;
+
+-- query 6
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:422)
+SELECT count(*) FILTER (
+           WHERE (SELECT i.v FROM ${case_db}.inner_rows i WHERE i.k = o.k) > 99
+       )
+FROM ${case_db}.outer_rows o WHERE o.id = 2;

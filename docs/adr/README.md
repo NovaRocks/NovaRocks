@@ -330,6 +330,8 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0252](ADR-0252-aggregate-filters-select-original-rows-per-call.md) — 普通聚合怎样按原行逐调用选行，并保留分组集求值和分阶段状态来源（active）
+
 - [ADR-0250](ADR-0250-standard-numeric-operator-semantics.md) — 标准数值怎样经共享定型和普通调用冻结，并保留遗留宽数消费者（active）
 
 - [ADR-0249](ADR-0249-trino-public-functions-and-internal-aggregate-identities.md) — Trino 公开候选如何尊重可见性，标准 DISTINCT 如何保留内部准确重载和状态（active）

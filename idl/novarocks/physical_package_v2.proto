@@ -736,6 +736,7 @@ message AggregateCall {
   bool distinct = 4;
   repeated SortExpression order_by = 5;
   optional uint32 output_value_id = 6;
+  optional uint32 filter_root = 8;
 }
 message JoinKey {
   reserved 1, 2;

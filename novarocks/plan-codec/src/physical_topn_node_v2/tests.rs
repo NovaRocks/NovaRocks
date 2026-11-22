@@ -270,6 +270,7 @@ fn node() -> p::PhysicalNode {
                 ]),
                 calls: Box::from([
                     p::AggregateCall {
+                        filter_root: None,
                         id: p::AggregateCallId::new(0),
                         binding: aggregate(p::AggregatePhase::Intermediate {
                             sequence: p::AggregateSequenceId::new(0),
@@ -295,6 +296,7 @@ fn node() -> p::PhysicalNode {
                         output: p::ValueId::new(u32::MAX),
                     },
                     p::AggregateCall {
+                        filter_root: None,
                         id: p::AggregateCallId::new(u32::MAX),
                         binding: aggregate(p::AggregatePhase::Intermediate {
                             sequence: p::AggregateSequenceId::new(u32::MAX),
@@ -413,6 +415,7 @@ fn expected() -> wire::PhysicalNode {
                         ],
                         calls: vec![
                             wire::AggregateCall {
+                                filter_root: None,
                                 id: 0,
                                 aggregate_binding_id: Some(0),
                                 argument_roots: vec![0, 1, 0],
@@ -432,6 +435,7 @@ fn expected() -> wire::PhysicalNode {
                                 output_value_id: Some(u32::MAX),
                             },
                             wire::AggregateCall {
+                                filter_root: None,
                                 id: u32::MAX,
                                 aggregate_binding_id: Some(u32::MAX),
                                 argument_roots: vec![],

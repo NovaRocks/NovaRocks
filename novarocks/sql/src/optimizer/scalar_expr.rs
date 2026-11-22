@@ -71,7 +71,15 @@ fn collect_column_ids_strict_inner(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             collect_column_ids_strict_inner(arena, *body, out)?;
         }
-        ScalarNode::AggregateCall { args, order_by, .. } => {
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                collect_column_ids_strict_inner(arena, *predicate, out)?;
+            }
             for arg in args {
                 collect_column_ids_strict_inner(arena, *arg, out)?;
             }
@@ -771,9 +779,16 @@ fn contains_function_matching(
                     .iter()
                     .any(|arg| contains_function_matching(arena, *arg, matches))
         }
-        ScalarNode::AggregateCall { args, order_by, .. } => {
-            args.iter()
-                .any(|arg| contains_function_matching(arena, *arg, matches))
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            filter.is_some_and(|predicate| contains_function_matching(arena, predicate, matches))
+                || args
+                    .iter()
+                    .any(|arg| contains_function_matching(arena, *arg, matches))
                 || order_by
                     .iter()
                     .any(|item| contains_function_matching(arena, item.expr, matches))
@@ -1128,8 +1143,14 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
     }
     match arena.node(expr) {
         ScalarNode::FunctionCall { args, .. } => args.iter().any(|arg| can_fail(arena, *arg)),
-        ScalarNode::AggregateCall { args, order_by, .. } => {
-            args.iter().any(|arg| can_fail(arena, *arg))
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            filter.is_some_and(|predicate| can_fail(arena, predicate))
+                || args.iter().any(|arg| can_fail(arena, *arg))
                 || order_by.iter().any(|item| can_fail(arena, item.expr))
         }
         ScalarNode::WindowCall {
@@ -1712,6 +1733,8 @@ mod intrinsic_error_consumer_tests {
         );
         let agg = arena.intern(
             ScalarNode::AggregateCall {
+                occurrence: None,
+                filter: None,
                 name: "array_agg".into(),
                 args: vec![boolean],
                 distinct: false,

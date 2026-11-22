@@ -263,6 +263,7 @@ fn node() -> p::PhysicalNode {
             ]),
             calls: Box::from([
                 p::AggregateCall {
+                    filter_root: None,
                     id: p::AggregateCallId::new(0),
                     binding: aggregate(p::AggregatePhase::Partial {
                         sequence: p::AggregateSequenceId::new(0),
@@ -288,6 +289,7 @@ fn node() -> p::PhysicalNode {
                     output: p::ValueId::new(u32::MAX),
                 },
                 p::AggregateCall {
+                    filter_root: None,
                     id: p::AggregateCallId::new(u32::MAX),
                     binding: aggregate(p::AggregatePhase::Final {
                         sequence: p::AggregateSequenceId::new(u32::MAX),
@@ -342,6 +344,7 @@ fn expected() -> wire::PhysicalNode {
             ],
             calls: vec![
                 wire::AggregateCall {
+                    filter_root: None,
                     id: 0,
                     aggregate_binding_id: Some(0),
                     argument_roots: vec![0, 1, 0],
@@ -361,6 +364,7 @@ fn expected() -> wire::PhysicalNode {
                     output_value_id: Some(u32::MAX),
                 },
                 wire::AggregateCall {
+                    filter_root: None,
                     id: u32::MAX,
                     aggregate_binding_id: Some(u32::MAX),
                     argument_roots: vec![],
@@ -684,6 +688,40 @@ fn aggregate_complete_payload_has_independent_wire_and_owned_oracles() {
         }
     });
 }
+
+#[test]
+fn aggregate_filter_root_zero_round_trips_as_a_present_reference() {
+    use prost::Message;
+
+    let round_trip = |filter_root: Option<u32>| {
+        let mut original = node();
+        calls(&mut original)[0].filter_root = filter_root.map(RootOrdinal::new);
+        Fixture::new().with(
+            &original,
+            &Control::default(),
+            |values, expressions, decoded, bindings| {
+                let (wire_node, sender) =
+                    encode_aggregate_node(&original, values, expressions, SOURCE, limits())
+                        .unwrap();
+                let wire_node =
+                    wire::PhysicalNode::decode(wire_node.encode_to_vec().as_slice()).unwrap();
+                let wire_calls = &raw(&wire_node).unwrap().calls;
+                assert_eq!(wire_calls[0].filter_root, filter_root);
+                assert_eq!(wire_calls[1].filter_root, None);
+                let (actual, receiver) =
+                    decode_aggregate_node(&wire_node, decoded, bindings, SOURCE, limits()).unwrap();
+                assert_eq!(actual, original);
+                (sender.list_item_count, receiver.list_item_count)
+            },
+        )
+    };
+
+    let (unfiltered_sender, unfiltered_receiver) = round_trip(None);
+    let (filtered_sender, filtered_receiver) = round_trip(Some(0));
+    assert_eq!(filtered_sender, unfiltered_sender + 1);
+    assert_eq!(filtered_receiver, unfiltered_receiver + 1);
+}
+
 #[test]
 fn aggregate_all_phases_grouping_and_intentional_source_aliases_preserve_identity() {
     for phase in [
@@ -1139,6 +1177,7 @@ fn aggregate_known_container_layouts_precede_nested_quantum_and_late_three_cause
         *group_by = Box::default();
         *calls = (0..COUNT)
             .map(|i| p::AggregateCall {
+                filter_root: None,
                 id: p::AggregateCallId::new(if i + 1 == COUNT { u32::MAX } else { i as u32 }),
                 binding: aggregate(p::AggregatePhase::Partial {
                     sequence: p::AggregateSequenceId::new(0),

@@ -44,7 +44,7 @@ pub(crate) fn entry_safety_check(
     // Per-call filters.
     for spec in &aggregate.aggregates {
         // Distinct is SplitDistinctAgg's domain.
-        if spec.distinct {
+        if spec.distinct || spec.source.has_projected_inputs() {
             return None;
         }
         // Order-sensitive aggregate.
