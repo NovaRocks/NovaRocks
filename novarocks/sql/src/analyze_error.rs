@@ -895,6 +895,8 @@ mod tests {
                 "sql.analyze.unknown_function",
                 "sql.analyze.ambiguous_function_call",
                 "sql.analyze.type_mismatch",
+                "sql.analyze.function_not_aggregate",
+                "sql.analyze.expression_not_scalar",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.invalid_argument",
                 "sql.analyze.invalid_analyze_property",
