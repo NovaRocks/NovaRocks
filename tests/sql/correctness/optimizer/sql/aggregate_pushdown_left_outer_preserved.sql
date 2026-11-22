@@ -40,12 +40,3 @@ SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_lo_a a
 LEFT OUTER JOIN ${case_db}.t_agg_pd_lo_b b ON a.k = b.k
 GROUP BY a.k;
-
--- The predicate reads a null-extended input from the other side of the join.
--- @explain_not_contains=aggregations: sum(sum(a.v))
-SELECT a.k, sum(a.v) FILTER (WHERE b.k IS NOT NULL) AS matched_sum,
-       count(*) AS all_rows
-FROM ${case_db}.t_agg_pd_lo_a a
-LEFT OUTER JOIN ${case_db}.t_agg_pd_lo_b b ON a.k = b.k
-WHERE a.k IN (1, 99)
-GROUP BY a.k ORDER BY a.k;

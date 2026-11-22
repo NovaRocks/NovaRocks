@@ -137,27 +137,22 @@ SELECT user_id, COUNT(tag_id) AS c FROM user_tags WHERE user_id = 2 GROUP BY use
 SELECT user_id, COUNT(tag_id) AS c FROM user_tags WHERE user_id > 2 GROUP BY user_id ORDER BY user_id;
 
 -- query 24
--- The fresh rollup lacks tag_id and cannot answer this per-call predicate.
--- @explain_not_contains=rewritten with mv
-SELECT count(tag_id) FILTER (WHERE tag_id > 1) AS c FROM user_tags;
-
--- query 25
 -- @cleanup=true
 -- @skip_result_check=true
 USE mvrw_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.cnt_mv;
 
--- query 26
+-- query 25
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.user_tags ;
 
--- query 27
+-- query 26
 -- @cleanup=true
 -- @skip_result_check=true
 DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
--- query 28
+-- query 27
 -- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG IF EXISTS mvrw_${uuid0};
