@@ -240,30 +240,16 @@ TRUNCATE TABLE ${case_db}.t_reject PARTITION (id=1);
 TRUNCATE TABLE ${case_db}.t_reject WHERE id = 1;
 
 -- query 39
--- The v2, v3 and initially empty tables each retain their one TRUNCATE
--- snapshot after the subsequent INSERT. After row DELETE, the main ref
--- identifies the TRUNCATE even when two snapshots have operation=delete.
-WITH truncated(table_case, summary) AS (
-    SELECT 'v2', summary FROM ${case_db}."t_v2$snapshots" WHERE operation = 'delete'
-    UNION ALL
-    SELECT 'v3', summary FROM ${case_db}."t_v3$snapshots" WHERE operation = 'delete'
-    UNION ALL
-    SELECT 'empty_v3', summary FROM ${case_db}."t_empty$snapshots" WHERE operation = 'delete'
-    UNION ALL
-    SELECT 'after_dv', s.summary
-    FROM ${case_db}."t_dv$snapshots" AS s
-    JOIN ${case_db}."t_dv$refs" AS r ON s.snapshot_id = r.snapshot_id
-    WHERE r.name = 'main' AND s.operation = 'delete'
-)
-SELECT table_case,
+-- The v2 table retains its TRUNCATE snapshot after the subsequent INSERT.
+SELECT 'v2' AS table_case,
        summary['total-records'] AS total_records,
        summary['total-files-size'] AS total_files_size,
        summary['total-data-files'] AS total_data_files,
        summary['total-delete-files'] AS total_delete_files,
        summary['total-position-deletes'] AS total_position_deletes,
        summary['total-equality-deletes'] AS total_equality_deletes
-FROM truncated
-ORDER BY table_case;
+FROM ${case_db}."t_v2$snapshots"
+WHERE operation = 'delete';
 
 -- query 40
 -- Empty TRUNCATE has no physical removals and therefore no removal counters.
@@ -277,6 +263,43 @@ WHERE operation = 'delete';
 -- query 41
 -- After row DELETE the full-table removal also retires the live DVs.
 SELECT CAST(summary['removed-dvs'] AS BIGINT) > 0 AS removed_dvs
+FROM ${case_db}."t_dv$snapshots" AS s
+JOIN ${case_db}."t_dv$refs" AS r ON s.snapshot_id = r.snapshot_id
+WHERE r.name = 'main' AND s.operation = 'delete';
+
+-- query 42
+-- The v3 table retains its TRUNCATE snapshot after the subsequent INSERT.
+SELECT 'v3' AS table_case,
+       summary['total-records'] AS total_records,
+       summary['total-files-size'] AS total_files_size,
+       summary['total-data-files'] AS total_data_files,
+       summary['total-delete-files'] AS total_delete_files,
+       summary['total-position-deletes'] AS total_position_deletes,
+       summary['total-equality-deletes'] AS total_equality_deletes
+FROM ${case_db}."t_v3$snapshots"
+WHERE operation = 'delete';
+
+-- query 43
+-- TRUNCATE records zero totals even when the original table has no rows.
+SELECT 'empty_v3' AS table_case,
+       summary['total-records'] AS total_records,
+       summary['total-files-size'] AS total_files_size,
+       summary['total-data-files'] AS total_data_files,
+       summary['total-delete-files'] AS total_delete_files,
+       summary['total-position-deletes'] AS total_position_deletes,
+       summary['total-equality-deletes'] AS total_equality_deletes
+FROM ${case_db}."t_empty$snapshots"
+WHERE operation = 'delete';
+
+-- query 44
+-- The main ref selects the TRUNCATE snapshot after the earlier row DELETE.
+SELECT 'after_dv' AS table_case,
+       s.summary['total-records'] AS total_records,
+       s.summary['total-files-size'] AS total_files_size,
+       s.summary['total-data-files'] AS total_data_files,
+       s.summary['total-delete-files'] AS total_delete_files,
+       s.summary['total-position-deletes'] AS total_position_deletes,
+       s.summary['total-equality-deletes'] AS total_equality_deletes
 FROM ${case_db}."t_dv$snapshots" AS s
 JOIN ${case_db}."t_dv$refs" AS r ON s.snapshot_id = r.snapshot_id
 WHERE r.name = 'main' AND s.operation = 'delete';
