@@ -541,6 +541,7 @@ enum BindingResolverOwnerKind {
     Unnest(Arc<crate::builtin::UnnestOwner>),
     BorrowedAggregate(Arc<crate::builtin::catalogue::BuiltinAggregateResolver>),
     BorrowedConversion(Arc<crate::builtin::value_conversion::ValueConversionResolver>),
+    BorrowedBinaryOperator(Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>),
     ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
     Original(Arc<dyn FunctionBindingResolver>),
 }
@@ -571,6 +572,11 @@ impl FunctionBindingResolverOwner {
         owner: Arc<crate::builtin::value_conversion::ValueConversionResolver>,
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedConversion(owner))
+    }
+    pub(crate) fn borrowed_binary_operator(
+        owner: Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedBinaryOperator(owner))
     }
     pub(crate) fn parametric_aggregate(owner: Arc<ParametricAggregateBindingResolver>) -> Self {
         Self(BindingResolverOwnerKind::ParametricAggregate(owner))
@@ -603,6 +609,9 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedConversion(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::ParametricAggregate(owner) => owner
                         .validate_selected_with_creator_in(selected, request, creation, control),
                     BindingResolverOwnerKind::Original(_) => {
@@ -619,6 +628,7 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::Unnest(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Original(owner) => owner.as_ref(),
         }

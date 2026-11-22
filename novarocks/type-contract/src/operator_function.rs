@@ -15,26 +15,143 @@
 // limitations under the License.
 
 // Design: ADR-0244 (docs/adr/ADR-0244-operators-are-identified-catalogue-functions.md)
-use crate::FunctionId;
+use crate::{ArithmeticOperator, ComparisonOperator, FunctionId};
 
 /// SQL operator identities backed by ordinary installed scalar functions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum OperatorFunction {
     Negation,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    Identical,
+    Distinct,
 }
 
 impl OperatorFunction {
-    pub const ALL: [Self; 1] = [Self::Negation];
+    pub const ALL: [Self; 14] = [
+        Self::Negation,
+        Self::Add,
+        Self::Subtract,
+        Self::Multiply,
+        Self::Divide,
+        Self::Modulo,
+        Self::Equal,
+        Self::NotEqual,
+        Self::LessThan,
+        Self::LessThanOrEqual,
+        Self::GreaterThan,
+        Self::GreaterThanOrEqual,
+        Self::Identical,
+        Self::Distinct,
+    ];
 
     pub const fn catalog_name(self) -> &'static str {
         match self {
             Self::Negation => "__negate",
+            Self::Add => "__operator_add",
+            Self::Subtract => "__operator_subtract",
+            Self::Multiply => "__operator_multiply",
+            Self::Divide => "__operator_divide",
+            Self::Modulo => "__operator_modulo",
+            Self::Equal => "__operator_equal",
+            Self::NotEqual => "__operator_not_equal",
+            Self::LessThan => "__operator_less_than",
+            Self::LessThanOrEqual => "__operator_less_than_or_equal",
+            Self::GreaterThan => "__operator_greater_than",
+            Self::GreaterThanOrEqual => "__operator_greater_than_or_equal",
+            Self::Identical => "__operator_identical",
+            Self::Distinct => "__operator_distinct",
         }
     }
 
     pub const fn function_id_text(self) -> &'static str {
         match self {
             Self::Negation => "builtin.scalar/__negate/v1",
+            Self::Add => "builtin.scalar/__operator_add/v1",
+            Self::Subtract => "builtin.scalar/__operator_subtract/v1",
+            Self::Multiply => "builtin.scalar/__operator_multiply/v1",
+            Self::Divide => "builtin.scalar/__operator_divide/v1",
+            Self::Modulo => "builtin.scalar/__operator_modulo/v1",
+            Self::Equal => "builtin.scalar/__operator_equal/v1",
+            Self::NotEqual => "builtin.scalar/__operator_not_equal/v1",
+            Self::LessThan => "builtin.scalar/__operator_less_than/v1",
+            Self::LessThanOrEqual => "builtin.scalar/__operator_less_than_or_equal/v1",
+            Self::GreaterThan => "builtin.scalar/__operator_greater_than/v1",
+            Self::GreaterThanOrEqual => "builtin.scalar/__operator_greater_than_or_equal/v1",
+            Self::Identical => "builtin.scalar/__operator_identical/v1",
+            Self::Distinct => "builtin.scalar/__operator_distinct/v1",
+        }
+    }
+
+    /// The fixed overload identity of each private comparison owner.
+    pub const fn comparison_overload_text(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Equal => "builtin.scalar/__operator_equal/comparison-v1",
+            Self::NotEqual => "builtin.scalar/__operator_not_equal/comparison-v1",
+            Self::LessThan => "builtin.scalar/__operator_less_than/comparison-v1",
+            Self::LessThanOrEqual => "builtin.scalar/__operator_less_than_or_equal/comparison-v1",
+            Self::GreaterThan => "builtin.scalar/__operator_greater_than/comparison-v1",
+            Self::GreaterThanOrEqual => {
+                "builtin.scalar/__operator_greater_than_or_equal/comparison-v1"
+            }
+            Self::Identical => "builtin.scalar/__operator_identical/comparison-v1",
+            Self::Distinct => "builtin.scalar/__operator_distinct/comparison-v1",
+            _ => return None,
+        })
+    }
+
+    pub const fn arithmetic(self) -> Option<ArithmeticOperator> {
+        Some(match self {
+            Self::Add => ArithmeticOperator::Add,
+            Self::Subtract => ArithmeticOperator::Subtract,
+            Self::Multiply => ArithmeticOperator::Multiply,
+            Self::Divide => ArithmeticOperator::Divide,
+            Self::Modulo => ArithmeticOperator::Modulo,
+            _ => return None,
+        })
+    }
+
+    pub const fn comparison(self) -> Option<ComparisonOperator> {
+        Some(match self {
+            Self::Equal => ComparisonOperator::Eq,
+            Self::NotEqual => ComparisonOperator::Ne,
+            Self::LessThan => ComparisonOperator::Lt,
+            Self::LessThanOrEqual => ComparisonOperator::Le,
+            Self::GreaterThan => ComparisonOperator::Gt,
+            Self::GreaterThanOrEqual => ComparisonOperator::Ge,
+            _ => return None,
+        })
+    }
+
+    pub const fn is_null_safe_comparison(self) -> bool {
+        matches!(self, Self::Identical | Self::Distinct)
+    }
+
+    pub const fn sql(self) -> &'static str {
+        match self {
+            Self::Negation => "-",
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+            Self::Modulo => "%",
+            Self::Equal => "=",
+            Self::NotEqual => "<>",
+            Self::LessThan => "<",
+            Self::LessThanOrEqual => "<=",
+            Self::GreaterThan => ">",
+            Self::GreaterThanOrEqual => ">=",
+            Self::Identical => "IS NOT DISTINCT FROM",
+            Self::Distinct => "IS DISTINCT FROM",
         }
     }
 

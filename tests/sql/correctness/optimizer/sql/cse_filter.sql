@@ -39,7 +39,8 @@ ORDER BY a;
 -- @result_not_contains=__cse_
 SELECT a, b
 FROM ${case_db}.cse_filter_t
-WHERE (a + b) > 6 AND (a + b) < 20
+WHERE (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) > 6e0
+  AND (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) < 20e0
 ORDER BY a;
 
 SET SESSION disable_optimizer_rules = '';

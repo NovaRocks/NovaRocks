@@ -394,7 +394,16 @@ impl<'a> QualifiedLineageCollector<'a> {
         sides: &JoinSideQualifiers,
         out: &mut Vec<SqlMvJoinPredicateLineage>,
     ) -> Result<(), AnalyzeError> {
-        match &unwrap_nested_expr(expr).kind {
+        let expr = unwrap_nested_expr(expr);
+        if let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(expr)
+        {
+            let left_ref = self.single_qualified_column(left)?;
+            let right_ref = self.single_qualified_column(right)?;
+            out.push(normalize_join_predicate(left_ref, right_ref, sides)?);
+            return Ok(());
+        }
+        match &expr.kind {
             ExprKind::BinaryOp {
                 left,
                 op: BinOp::And,
@@ -403,17 +412,6 @@ impl<'a> QualifiedLineageCollector<'a> {
             } => {
                 self.collect_join_predicates(left, sides, out)?;
                 self.collect_join_predicates(right, sides, out)
-            }
-            ExprKind::BinaryOp {
-                left,
-                op: BinOp::Eq,
-                right,
-                ..
-            } => {
-                let left_ref = self.single_qualified_column(left)?;
-                let right_ref = self.single_qualified_column(right)?;
-                out.push(normalize_join_predicate(left_ref, right_ref, sides)?);
-                Ok(())
             }
             _ => Err(lineage_internal(
                 "incremental join MV supports only AND-combined equi-join predicates",
@@ -560,6 +558,7 @@ fn typed_expr_children(expr: &TypedExpr) -> Vec<&TypedExpr> {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             let mut out = Vec::new();
             if let Some(operand) = operand {
@@ -676,6 +675,7 @@ fn collect_column_refs(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             kind.saw_func();
             if let Some(op) = operand {

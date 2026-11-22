@@ -352,6 +352,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
                         left: left_key,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }]),
                     residual: None,
                 },

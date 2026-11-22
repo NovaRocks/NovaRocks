@@ -467,6 +467,7 @@ fn fixture(
                 .unwrap();
             (
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: Some(a),
                     when_then: Box::from([(b, first), (a, second)]),
                     else_expr: Some(otherwise),
@@ -825,6 +826,7 @@ fn simple_case_has_one_exact_recipe_per_ordered_when_and_keeps_actual_rand_effec
         has_case_expr: true,
         has_else_expr: true,
         children,
+        ..
     } = arena.node(invocation.definition).unwrap().kind()
     else {
         panic!("simple CASE keeps its actual ordered children")

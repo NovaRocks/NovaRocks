@@ -135,6 +135,13 @@ fn expression(
     out: &mut DisplayOutput<'_, '_>,
 ) -> Result<(), SqlCompileError> {
     out.work.step()?;
+    if let Some((operator, [left, right])) = crate::common::binary_operator::typed_operands(expr) {
+        with_parens(left, out)?;
+        out.append(" ")?;
+        out.append(operator.sql())?;
+        out.append(" ")?;
+        return with_parens(right, out);
+    }
     if let Some(operand) = typed_operand(expr) {
         if let ExprKind::Constant(value) = &operand.kind {
             out.work.step()?;
@@ -369,6 +376,7 @@ fn expression(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             out.append("CASE")?;
             if let Some(value) = operand {
@@ -471,15 +479,16 @@ fn expressions(
     Ok(())
 }
 fn with_parens(expr: &TypedExpr, out: &mut DisplayOutput<'_, '_>) -> Result<(), SqlCompileError> {
-    let parens = !matches!(
-        expr.kind,
-        ExprKind::ColumnRef { .. }
-            | ExprKind::LambdaParamRef { .. }
-            | ExprKind::Literal(_)
-            | ExprKind::Constant(_)
-            | ExprKind::FunctionCall { .. }
-            | ExprKind::AggregateCall { .. }
-    );
+    let parens = crate::common::binary_operator::typed_operands(expr).is_some()
+        || !matches!(
+            expr.kind,
+            ExprKind::ColumnRef { .. }
+                | ExprKind::LambdaParamRef { .. }
+                | ExprKind::Literal(_)
+                | ExprKind::Constant(_)
+                | ExprKind::FunctionCall { .. }
+                | ExprKind::AggregateCall { .. }
+        );
     if parens {
         out.append("(")?;
     }

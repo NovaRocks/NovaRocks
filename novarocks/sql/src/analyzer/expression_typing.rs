@@ -113,18 +113,15 @@ impl AnalyzerContext<'_> {
         args: Vec<TypedExpr>,
         span: Span,
     ) -> Result<(FunctionValueType, Vec<TypedExpr>), AnalyzeError> {
-        self.with_typing(span, |context, work| {
-            let check_branch_constants = matches!(shape, NodeShape::SearchedCase { .. });
-            let children = typed_children(context, &args, check_branch_constants, work)?;
-            let NodeTyping::Value {
-                result,
-                conversions,
-            } = typing::type_node(context, shape, &children, work)?
-            else {
-                return Err(TypingError::InvalidShape("expected a typed value node"));
-            };
-            Ok((result, apply_conversions(context, args, conversions, work)?))
-        })
+        type_value_node_with_catalog(
+            self.function_catalog,
+            shape,
+            args,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
+            span,
+        )
     }
 
     pub(super) fn type_literal(&self, literal: &ast::Literal) -> Result<TypedExpr, AnalyzeError> {
@@ -164,6 +161,22 @@ impl AnalyzerContext<'_> {
         })
     }
 
+    pub(super) fn coerce_simple_case_float_operand(
+        &self,
+        value: TypedExpr,
+        target: &FunctionValueType,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        self.with_typing(span, |context, work| {
+            let mut children = typed_children(context, std::slice::from_ref(&value), false, work)?;
+            let child = children.pop().expect("one simple CASE operand");
+            let target = target.with_nullable(value.value_type.nullable())?;
+            let conversion = typing::operator_decimal_float(context, &child, &target, work)?;
+            let mut args = apply_conversions(context, vec![value], vec![conversion], work)?;
+            Ok(args.pop().expect("one converted simple CASE operand"))
+        })
+    }
+
     fn with_typing<T>(
         &self,
         span: Span,
@@ -178,6 +191,36 @@ impl AnalyzerContext<'_> {
             action,
         )
     }
+}
+
+pub(super) fn type_value_node_with_catalog(
+    catalog: &dyn SqlFunctionCatalog,
+    shape: NodeShape<'_>,
+    args: Vec<TypedExpr>,
+    decimal_overflow_policy: DecimalOverflowPolicy,
+    constant_policy: ConstantPolicy,
+    control: &dyn PureCompileControl,
+    span: Span,
+) -> Result<(FunctionValueType, Vec<TypedExpr>), AnalyzeError> {
+    with_typing(
+        catalog,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+        span,
+        |context, work| {
+            let check_branch_constants = matches!(shape, NodeShape::SearchedCase { .. });
+            let children = typed_children(context, &args, check_branch_constants, work)?;
+            let NodeTyping::Value {
+                result,
+                conversions,
+            } = typing::type_node(context, shape, &children, work)?
+            else {
+                return Err(TypingError::InvalidShape("expected a typed value node"));
+            };
+            Ok((result, apply_conversions(context, args, conversions, work)?))
+        },
+    )
 }
 
 pub(super) fn type_scalar_call_with_catalog(
@@ -265,6 +308,9 @@ fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeError {
         TypingError::InvalidLiteral(message) => AnalyzeError::invalid_literal(message, span),
         TypingError::Unsupported(message) => AnalyzeError::unsupported_expression(message, span),
         TypingError::Control(error) => AnalyzeError::control(error),
+        TypingError::Binding(error @ FunctionBindingError::AmbiguousOverload) => {
+            AnalyzeError::ambiguous_function_call(error, span)
+        }
         TypingError::Binding(error) => AnalyzeError::function_binding(error).at_type_mismatch(span),
         TypingError::Constant(error) => {
             AnalyzeError::function_binding(error.into()).at_type_mismatch(span)
@@ -337,12 +383,23 @@ fn apply_conversions(
                 };
                 let result = result.clone();
                 let volatility = conversion.binding.semantics.volatility;
-                let binding = SqlFunctionBinding::new_with_conversion_constraint(
-                    conversion.binding,
-                    context.decimal_overflow_policy,
-                    conversion.expected_result,
-                    conversion.target,
-                );
+                let binding = match conversion.origin {
+                    typing::ValueConversionOrigin::ValueDomain => {
+                        SqlFunctionBinding::new_with_conversion_constraint(
+                            conversion.binding,
+                            context.decimal_overflow_policy,
+                            conversion.expected_result,
+                            conversion.target,
+                        )
+                    }
+                    typing::ValueConversionOrigin::OperatorDecimalFloat => {
+                        SqlFunctionBinding::new_with_operator_decimal_float_constraint(
+                            conversion.binding,
+                            context.decimal_overflow_policy,
+                            conversion.expected_result,
+                        )
+                    }
+                };
                 let expression = TypedExpr {
                     kind: ExprKind::FunctionCall {
                         name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.into(),

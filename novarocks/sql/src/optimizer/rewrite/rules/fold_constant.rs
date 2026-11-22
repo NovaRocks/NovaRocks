@@ -641,6 +641,7 @@ fn fold_scalar_uncached(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 *operand = fold_scalar_id(arena, *operand, ctx, memo, work)?;

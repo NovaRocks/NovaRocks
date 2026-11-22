@@ -335,6 +335,7 @@ impl BridgeCtx<'_> {
                                         left: materialize(self.scalars, cond.left),
                                         right: materialize(self.scalars, cond.right),
                                         null_safe: cond.null_safe,
+                                        match_relation: cond.match_relation,
                                     })
                                     .collect(),
                             )

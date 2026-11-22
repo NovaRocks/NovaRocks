@@ -1265,6 +1265,7 @@ impl<'a> AnalyzerContext<'a> {
             ),
 
             kind: ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: (when_then).into(),
                 else_expr: Some(novarocks_parser::ast::AstBox::new(bool_literal(negated))),
@@ -2361,6 +2362,7 @@ impl<'a> AnalyzerContext<'a> {
                 ),
 
                 kind: ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then: (when_then).into(),
                     else_expr: Some(novarocks_parser::ast::AstBox::new(bool_literal(negated))),
@@ -3792,6 +3794,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
@@ -3799,6 +3802,7 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::Case {
+                ieee_float_equality,
                 operand: operand.map(|operand| {
                     novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
                         operand.into_inner(),
@@ -3994,6 +3998,7 @@ fn collect_outer_ref_column_ids(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_outer_ref_column_ids(operand, inner_scope, outer_scope, out);
@@ -4288,6 +4293,7 @@ fn walk_for_outer_ref(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 walk_for_outer_ref(op, inner_scope, outer_scope, saw_outer);
@@ -4365,55 +4371,44 @@ fn extract_corr_preds_inner(
     outer_scope: &AnalyzerScope,
     out: &mut Vec<CorrelationPred>,
 ) {
+    if let Some((op, [left, right])) = crate::common::binary_operator::typed_comparison(expr) {
+        let left_outer_only = is_outer_only_ref(left, inner_scope, outer_scope);
+        let right_outer_only = is_outer_only_ref(right, inner_scope, outer_scope);
+        if left_outer_only && !right_outer_only {
+            out.push(CorrelationPred {
+                outer_col: left.clone(),
+                inner_col: right.clone(),
+                op,
+                full_expr: expr.clone(),
+            });
+        } else if !left_outer_only && right_outer_only {
+            let rev_op = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Le => BinOp::Ge,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Ge => BinOp::Le,
+                _ => op,
+            };
+            out.push(CorrelationPred {
+                outer_col: right.clone(),
+                inner_col: left.clone(),
+                op: rev_op,
+                full_expr: expr.clone(),
+            });
+        }
+        return;
+    }
     match &expr.kind {
         ExprKind::BinaryOp {
-            left, op, right, ..
-        } => match op {
-            BinOp::And | BinOp::Or => {
-                extract_corr_preds_inner(left, inner_scope, outer_scope, out);
-                extract_corr_preds_inner(right, inner_scope, outer_scope, out);
-            }
-            BinOp::Eq
-            | BinOp::EqForNull
-            | BinOp::Ne
-            | BinOp::Lt
-            | BinOp::Le
-            | BinOp::Gt
-            | BinOp::Ge => {
-                let left_outer_only = is_outer_only_ref(left, inner_scope, outer_scope);
-                let right_outer_only = is_outer_only_ref(right, inner_scope, outer_scope);
-
-                if left_outer_only && !right_outer_only {
-                    out.push(CorrelationPred {
-                        outer_col: left.clone().into_inner(),
-                        inner_col: right.clone().into_inner(),
-                        op: *op,
-                        full_expr: expr.clone(),
-                    });
-                } else if !left_outer_only && right_outer_only {
-                    let rev_op = match op {
-                        BinOp::Eq => BinOp::Eq,
-                        BinOp::EqForNull => BinOp::EqForNull,
-                        BinOp::Ne => BinOp::Ne,
-                        BinOp::Lt => BinOp::Gt,
-                        BinOp::Le => BinOp::Ge,
-                        BinOp::Gt => BinOp::Lt,
-                        BinOp::Ge => BinOp::Le,
-                        _ => *op,
-                    };
-                    out.push(CorrelationPred {
-                        outer_col: right.clone().into_inner(),
-                        inner_col: left.clone().into_inner(),
-                        op: rev_op,
-                        full_expr: expr.clone(),
-                    });
-                }
-            }
-            _ => {}
-        },
-        ExprKind::Nested(inner) => {
-            extract_corr_preds_inner(inner, inner_scope, outer_scope, out);
+            left,
+            op: BinOp::And | BinOp::Or,
+            right,
+            ..
+        } => {
+            extract_corr_preds_inner(left, inner_scope, outer_scope, out);
+            extract_corr_preds_inner(right, inner_scope, outer_scope, out);
         }
+        ExprKind::Nested(inner) => extract_corr_preds_inner(inner, inner_scope, outer_scope, out),
         _ => {}
     }
 }
@@ -4559,6 +4554,7 @@ fn collect_column_outer_status(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_column_outer_status(
@@ -4805,6 +4801,7 @@ fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bo
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand
                 .as_ref()
@@ -5024,6 +5021,7 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand
                 && expr_contains_placeholder(op, placeholder_id)
@@ -5191,6 +5189,7 @@ fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_column_refs(op, out);
@@ -5492,6 +5491,7 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
@@ -5525,6 +5525,7 @@ fn replace_placeholder_in_expr(
                 value_type: novarocks_type_contract::FunctionValueType::new(result_type, true),
 
                 kind: ExprKind::Case {
+                    ieee_float_equality: *ieee_float_equality,
                     operand: operand.map(novarocks_parser::ast::AstBox::from_box),
                     when_then: (rewritten_when_then).into(),
                     else_expr: else_expr.map(novarocks_parser::ast::AstBox::from_box),
@@ -5706,6 +5707,9 @@ fn remove_correlation_preds_from_expr(
 /// JSON admission follows OR ownership even through an existing value wrapper.
 /// Ordinary predicate Apply routing retains its existing narrower shape rules.
 fn json_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
+    if let Some((_, [left, right])) = crate::common::binary_operator::typed_operands(expr) {
+        return json_placeholder_inside_or(left, id) || json_placeholder_inside_or(right, id);
+    }
     match &expr.kind {
         ExprKind::BinaryOp {
             left,
@@ -5725,6 +5729,7 @@ fn json_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand
                 .as_ref()
@@ -5762,6 +5767,9 @@ fn is_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
 
 /// Check if an expression contains a SubqueryPlaceholder with the given id.
 fn has_placeholder(expr: &TypedExpr, id: usize) -> bool {
+    if let Some((_, [left, right])) = crate::common::binary_operator::typed_operands(expr) {
+        return has_placeholder(left, id) || has_placeholder(right, id);
+    }
     match &expr.kind {
         ExprKind::SubqueryPlaceholder { id: pid, .. } => *pid == id,
         ExprKind::BinaryOp { left, right, .. } => {
@@ -5791,7 +5799,7 @@ fn factor_common_correlation_from_or(
 ) -> TypedExpr {
     // Only act on top-level OR
     let branches = split_or(expr);
-    if branches.len() < 2 {
+    if branches.len() < 2 || !correlation_factor_is_total(expr) {
         return expr.clone();
     }
 
@@ -5854,18 +5862,61 @@ fn is_correlation_eq(
     inner_scope: &super::scope::AnalyzerScope,
     outer_scope: &super::scope::AnalyzerScope,
 ) -> bool {
-    if let ExprKind::BinaryOp {
-        left,
-        op: BinOp::Eq,
-        right,
-        ..
-    } = &expr.kind
+    if let Some((BinOp::Eq, [left, right])) = crate::common::binary_operator::typed_comparison(expr)
     {
         let l_outer = is_outer_only_ref(left, inner_scope, outer_scope);
         let r_outer = is_outer_only_ref(right, inner_scope, outer_scope);
         (l_outer && !r_outer) || (!l_outer && r_outer)
     } else {
         false
+    }
+}
+
+/// Factoring can skip evaluations even when it preserves Boolean truth.
+#[recursive::recursive]
+fn correlation_factor_is_total(expression: &TypedExpr) -> bool {
+    match &expression.kind {
+        ExprKind::ColumnRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => true,
+        ExprKind::Nested(inner) | ExprKind::IsNull { expr: inner, .. } => {
+            correlation_factor_is_total(inner)
+        }
+        ExprKind::BinaryOp {
+            left,
+            op:
+                BinOp::And
+                | BinOp::Or
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge,
+            right,
+            ..
+        } => correlation_factor_is_total(left) && correlation_factor_is_total(right),
+        ExprKind::Cast {
+            expr,
+            target,
+            decimal_overflow_policy,
+            array_failure_mode,
+        } => {
+            !crate::optimizer::scalar_expr::scalar_cast_can_fail(
+                expr.value_type.data_type(),
+                target,
+                *decimal_overflow_policy,
+                *array_failure_mode,
+            ) && correlation_factor_is_total(expr)
+        }
+        ExprKind::UnaryOp {
+            op: UnOp::Not,
+            expr,
+        } => correlation_factor_is_total(expr),
+        ExprKind::FunctionCall { binding, args, .. } => {
+            binding.semantics.volatility.is_replica_deterministic()
+                && !crate::optimizer::scalar_expr::scalar_call_can_fail(binding)
+                && args.iter().all(correlation_factor_is_total)
+        }
+        _ => false,
     }
 }
 
@@ -5912,7 +5963,10 @@ fn disjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
     }
     let first = exprs.remove(0);
     exprs.into_iter().fold(first, |acc, e| TypedExpr {
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            DataType::Boolean,
+            acc.value_type.nullable() || e.value_type.nullable(),
+        ),
 
         kind: ExprKind::BinaryOp {
             left: novarocks_parser::ast::AstBox::new(acc),
@@ -5930,7 +5984,10 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
     }
     let first = exprs.remove(0);
     exprs.into_iter().fold(first, |acc, e| TypedExpr {
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            DataType::Boolean,
+            acc.value_type.nullable() || e.value_type.nullable(),
+        ),
 
         kind: ExprKind::BinaryOp {
             left: novarocks_parser::ast::AstBox::new(acc),

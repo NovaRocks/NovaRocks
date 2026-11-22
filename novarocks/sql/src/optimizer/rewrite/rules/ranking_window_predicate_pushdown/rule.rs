@@ -373,27 +373,23 @@ fn int_lit(arena: &ScalarArena, expr: ScalarId) -> Option<i64> {
 }
 
 fn conjunct_upper_bound(arena: &ScalarArena, expr: ScalarId, rank_col: ColumnId) -> Option<i64> {
+    if let Some((op, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+    {
+        let (lit, col_on_left) = if is_rank_col(arena, left, rank_col) {
+            (int_lit(arena, right)?, true)
+        } else if is_rank_col(arena, right, rank_col) {
+            (int_lit(arena, left)?, false)
+        } else {
+            return None;
+        };
+        return match (op, col_on_left) {
+            (BinOp::Le, true) | (BinOp::Ge, false) | (BinOp::Eq, _) => Some(lit),
+            (BinOp::Lt, true) | (BinOp::Gt, false) => lit.checked_sub(1),
+            _ => None,
+        };
+    }
     match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left, op, right, ..
-        } => {
-            let (lit, col_on_left) = if is_rank_col(arena, *left, rank_col) {
-                (int_lit(arena, *right)?, true)
-            } else if is_rank_col(arena, *right, rank_col) {
-                (int_lit(arena, *left)?, false)
-            } else {
-                return None;
-            };
-            match (op, col_on_left) {
-                // rank_col <= lit  or  lit >= rank_col
-                (BinOp::Le, true) | (BinOp::Ge, false) => Some(lit),
-                // rank_col < lit  or  lit > rank_col
-                (BinOp::Lt, true) | (BinOp::Gt, false) => Some(lit - 1),
-                // rank_col = lit  or  lit = rank_col
-                (BinOp::Eq, _) => Some(lit),
-                _ => None,
-            }
-        }
         // BETWEEN low AND high: upper bound is `high`
         ScalarNode::Between {
             child,

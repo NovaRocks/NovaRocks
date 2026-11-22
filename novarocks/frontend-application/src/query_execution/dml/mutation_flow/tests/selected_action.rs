@@ -270,6 +270,7 @@ fn literal_when_matrix_retains_truth_only_case_and_exact_action_tags() {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } = &unit.definition(action).unwrap().kind
             else {
                 panic!(

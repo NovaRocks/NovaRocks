@@ -22,7 +22,7 @@ use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catal
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::ExprKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
-use novarocks_type_contract::{ValueLogicalType, arithmetic_result_value_type_with_op};
+use novarocks_type_contract::{OperatorFunction, ValueLogicalType};
 fn statement(text: &str, query: u32) -> String {
     let marker = format!("-- query {query}\n");
     let start = text.find(&marker).unwrap() + marker.len();
@@ -63,42 +63,27 @@ fn sources() -> Vec<SqlAuthoredPhysicalPlan> {
         .collect()
 }
 fn authored() {
-    for (case, source) in sources().into_iter().enumerate() {
+    for source in sources() {
         let mut float = 0;
         for fragment in source.plan().fragments().values() {
-            for (_source_node, unit, id, expr) in super::sql_test_source::unit_definitions(fragment)
-            {
-                let ExprKind::Binary {
-                    op,
-                    left,
-                    right,
-                    decimal_overflow_policy,
-                    allow_throw_exception,
-                } = &expr.kind
+            for (_, unit, _, expr) in super::sql_test_source::unit_definitions(fragment) {
+                let ExprKind::FunctionCall { function, args } = &expr.kind else {
+                    continue;
+                };
+                let Some(_) = OperatorFunction::from_function_id(&function.function_id)
+                    .and_then(OperatorFunction::arithmetic)
                 else {
                     continue;
                 };
-                let Some(operator) = op.arithmetic_operator() else {
-                    continue;
-                };
-                let left = &unit.definition(*left).unwrap().ty;
-                let right = &unit.definition(*right).unwrap().ty;
-                eprintln!(
-                    "statistics original arithmetic case={case} mode=compiled fragment={:?} definition={id:?} operator={operator:?} left={left:?} right={right:?} result={:?} policy={decimal_overflow_policy:?} allow_source={allow_throw_exception:?}",
-                    fragment.id(),
-                    expr.ty
-                );
-                let mut expected =
-                    arithmetic_result_value_type_with_op(left, right, operator).unwrap();
-                expected = expected
-                    .with_nullable(true)
-                    .expect("valid test root nullability");
-                assert_eq!(expr.ty, expected);
-                assert!(allow_throw_exception.is_some());
-                if matches!(left.data_type(), DataType::Float32 | DataType::Float64)
-                    || matches!(right.data_type(), DataType::Float32 | DataType::Float64)
-                {
-                    assert_eq!(expr.ty.data_type().clone(), DataType::Float64);
+                if matches!(expr.ty.data_type(), DataType::Float32 | DataType::Float64) {
+                    let &[left, right] = args.as_ref() else {
+                        panic!("binary statistics arithmetic");
+                    };
+                    for input in [left, right] {
+                        let actual = &unit.definition(input).unwrap().ty;
+                        assert_eq!(actual.data_type(), expr.ty.data_type());
+                        assert_eq!(actual.logical_type(), ValueLogicalType::Physical);
+                    }
                     assert_eq!(expr.ty.logical_type(), ValueLogicalType::Physical);
                     float += 1;
                 }

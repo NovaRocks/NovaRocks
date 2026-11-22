@@ -154,12 +154,11 @@ fn assert_same_projection_distinct_digest(
         digest(FunctionKind::Scalar, right)
     );
 }
-fn keys() -> [SemanticParameterKey; 6] {
+fn keys() -> [SemanticParameterKey; 5] {
     [
         SemanticParameterKey::StatementStartUtc,
         SemanticParameterKey::TimeZone,
         SemanticParameterKey::AllowThrowException,
-        SemanticParameterKey::DecimalOverflowToDouble,
         SemanticParameterKey::GroupConcatLegacy,
         SemanticParameterKey::GroupConcatMaxLen,
     ]

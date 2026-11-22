@@ -88,6 +88,8 @@ impl StaticPlanInterpreter {
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
+/// Epoch 17 freezes the match relation on hash join keys and retires the
+/// decimal-to-double promotion parameter alongside the numeric call migration.
 /// Epoch 16 carries exact Exchange route failure stops in the existing
 /// refusal envelope. Epoch-15 senders treat this observation as a new Task
 /// failure, so they cannot share the same island.
@@ -156,7 +158,7 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 16;
+pub const NATIVE_COMPAT_EPOCH: u64 = 17;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
@@ -713,7 +715,7 @@ mod tests {
         #[cfg(feature = "native-compatibility-test-fixture")]
         assert_eq!(NATIVE_COMPAT_EPOCH, 13);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 16);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 17);
     }
     #[test]
     fn receiver_authorized_exchange_isolates_the_previous_write_runtime_and_test_island() {

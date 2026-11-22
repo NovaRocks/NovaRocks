@@ -260,7 +260,11 @@ fn normalize_inner(
         } => NormExpr::Call {
             value_type: value_type.clone(),
             argument_order: NormArgumentOrder::Ordered,
-            name: if crate::common::negation::is_negation(&binding.function_id) {
+            name: if novarocks_type_contract::OperatorFunction::from_function_id(
+                &binding.function_id,
+            )
+            .is_some()
+            {
                 format!("fn:{}", binding.function_id.as_str())
             } else {
                 format!("fn:{}", name.to_ascii_lowercase())
@@ -383,6 +387,7 @@ fn normalize_inner(
         // marker calls so `CASE WHEN c THEN a END` can never collide with
         // `CASE WHEN c THEN a ELSE b END`.
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
@@ -414,7 +419,14 @@ fn normalize_inner(
                 ),
                 None => call("case_no_else", vec![]),
             });
-            call("case", args)
+            call(
+                if *ieee_float_equality {
+                    "case_ieee_float"
+                } else {
+                    "case"
+                },
+                args,
+            )
         }
         // IsTruthValue / WindowCall / Lambda* / LambdaParamRef /
         // SubqueryPlaceholder: not normalizable here -> fail closed.

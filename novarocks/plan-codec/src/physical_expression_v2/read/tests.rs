@@ -533,6 +533,7 @@ impl Fixture {
                 12,
                 1,
                 K::CaseExpression(wire::CaseExpression {
+                    ieee_float_equality: Some(false),
                     operand_expr_id: None,
                     arms: vec![wire::WhenThen {
                         when_expr_id: Some(4),
@@ -772,6 +773,7 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     }
     let mut bad = valid.clone();
     bad[0].kind = Some(K::CaseExpression(wire::CaseExpression {
+        ieee_float_equality: Some(false),
         arms: vec![wire::WhenThen {
             when_expr_id: None,
             then_expr_id: Some(1),

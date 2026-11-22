@@ -875,6 +875,22 @@ fn estimate_selectivity_scalar(
 ) -> Result<f64, SqlCompileError> {
     let node = arena.node(expr);
     work.step()?;
+    if let Some((op, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+    {
+        return match op {
+            BinOp::Eq | BinOp::EqForNull => {
+                estimate_eq_selectivity_scalar(arena, left, right, column_stats, work)
+            }
+            BinOp::Ne => {
+                Ok(1.0 - estimate_eq_selectivity_scalar(arena, left, right, column_stats, work)?)
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                estimate_range_selectivity_scalar(arena, left, right, op, column_stats, work)
+            }
+            _ => Ok(PREDICATE_UNKNOWN_FILTER),
+        };
+    }
     Ok(match node {
         ScalarNode::BinaryOp {
             left, op, right, ..
@@ -898,15 +914,6 @@ fn estimate_selectivity_scalar(
                 let l = estimate_selectivity_scalar(arena, *left, column_stats, work)?;
                 let r = estimate_selectivity_scalar(arena, *right, column_stats, work)?;
                 l + r - l * r
-            }
-            BinOp::Eq | BinOp::EqForNull => {
-                estimate_eq_selectivity_scalar(arena, *left, *right, column_stats, work)?
-            }
-            BinOp::Ne => {
-                1.0 - estimate_eq_selectivity_scalar(arena, *left, *right, column_stats, work)?
-            }
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                estimate_range_selectivity_scalar(arena, *left, *right, *op, column_stats, work)?
             }
             _ => PREDICATE_UNKNOWN_FILTER,
         },
@@ -2130,20 +2137,18 @@ fn collect_equi_join_column_pairs_inner_scalar(
     expr: ScalarId,
     pairs: &mut Vec<(ColumnId, ColumnId)>,
 ) {
-    match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq | BinOp::EqForNull,
-            right,
-            ..
-        } => {
-            if let (Some(left_id), Some(right_id)) = (
-                extract_column_id_scalar(arena, *left),
-                extract_column_id_scalar(arena, *right),
-            ) {
-                pairs.push((left_id, right_id));
-            }
+    if let Some((BinOp::Eq | BinOp::EqForNull, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
+    {
+        if let (Some(left_id), Some(right_id)) = (
+            extract_column_id_scalar(arena, left),
+            extract_column_id_scalar(arena, right),
+        ) {
+            pairs.push((left_id, right_id));
         }
+        return;
+    }
+    match arena.node(expr) {
         ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
@@ -2414,33 +2419,29 @@ fn try_collect_equi_key_scalar(
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
     estimate: &mut ScalarJoinConditionEstimate,
 ) -> bool {
-    let ScalarNode::BinaryOp {
-        left,
-        op: BinOp::Eq | BinOp::EqForNull,
-        right,
-        ..
-    } = arena.node(expr)
+    let Some((BinOp::Eq | BinOp::EqForNull, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
     else {
         return false;
     };
 
-    let Some(left_id) = extract_column_id_scalar(arena, *left) else {
+    let Some(left_id) = extract_column_id_scalar(arena, left) else {
         return false;
     };
-    let Some(right_id) = extract_column_id_scalar(arena, *right) else {
+    let Some(right_id) = extract_column_id_scalar(arena, right) else {
         return false;
     };
 
     let forward = left_stats.contains_key(&left_id) && right_stats.contains_key(&right_id);
     let reverse = left_stats.contains_key(&right_id) && right_stats.contains_key(&left_id);
     let (left_expr, right_expr, left_key, right_key) = match (forward, reverse) {
-        (true, false) => (*left, *right, left_id, right_id),
-        (false, true) => (*right, *left, right_id, left_id),
+        (true, false) => (left, right, left_id, right_id),
+        (false, true) => (right, left, right_id, left_id),
         (true, true) if left_id == right_id => {
             let (left_ndv, left_confidence) =
-                get_join_key_ndv_with_confidence_scalar(arena, *left, left_stats);
+                get_join_key_ndv_with_confidence_scalar(arena, left, left_stats);
             let (right_ndv, right_confidence) =
-                get_join_key_ndv_with_confidence_scalar(arena, *right, right_stats);
+                get_join_key_ndv_with_confidence_scalar(arena, right, right_stats);
             estimate.eq_key_ndvs.push((
                 left_ndv,
                 right_ndv,
@@ -2486,23 +2487,18 @@ fn is_unknown_column_literal_eq_scalar(
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, SqlCompileError> {
-    let ScalarNode::BinaryOp {
-        left,
-        op: BinOp::Eq | BinOp::EqForNull,
-        right,
-        ..
-    } = arena.node(expr)
+    let Some((BinOp::Eq | BinOp::EqForNull, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
     else {
         return Ok(false);
     };
 
     let Some(column_id) =
-        extract_column_id_scalar(arena, *left).or_else(|| extract_column_id_scalar(arena, *right))
+        extract_column_id_scalar(arena, left).or_else(|| extract_column_id_scalar(arena, right))
     else {
         return Ok(false);
     };
-    if !(scalar_is_literal_like(arena, *left, work)?
-        || scalar_is_literal_like(arena, *right, work)?)
+    if !(scalar_is_literal_like(arena, left, work)? || scalar_is_literal_like(arena, right, work)?)
     {
         return Ok(false);
     }
@@ -4373,6 +4369,36 @@ mod tests {
         }
     }
 
+    fn selected_comparison(
+        operator: novarocks_type_contract::OperatorFunction,
+        left: TypedExpr,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        use novarocks_functions::FunctionBindingRequest;
+        use novarocks_type_contract::DecimalOverflowPolicy;
+
+        let control = crate::optimizer::test_optimizer_control();
+        let policy = crate::constant::test_constant_policy();
+        let arguments = [&left, &right]
+            .map(|argument| crate::analysis::function_argument(argument, policy, control).unwrap());
+        let binding = crate::functions::builtin_sql_function_catalog()
+            .resolve_scalar_operator_binding(
+                operator,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: None,
+                },
+                control,
+            )
+            .expect("installed comparison for exact fixture arguments");
+        crate::common::binary_operator::typed_call(
+            operator,
+            crate::binding::SqlFunctionBinding::new(binding, DecimalOverflowPolicy::OutputNull),
+            vec![left, right],
+        )
+    }
+
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -4604,6 +4630,7 @@ mod tests {
                             )
                             .unwrap(),
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         },
                         PhysicalHashJoinEqCondition {
                             left: intern_typed(
@@ -4619,6 +4646,7 @@ mod tests {
                             )
                             .unwrap(),
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         },
                     ],
                     residual: None,
@@ -4704,6 +4732,7 @@ mod tests {
                         )
                         .unwrap(),
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: None,
                 },
@@ -4783,7 +4812,11 @@ mod tests {
                 condition: Some(
                     intern_typed(
                         &mut memo.scalars,
-                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        &selected_comparison(
+                            novarocks_type_contract::OperatorFunction::Equal,
+                            col_ref("l_key"),
+                            col_ref("r_key"),
+                        ),
                         crate::optimizer::test_optimizer_control(),
                     )
                     .unwrap(),
@@ -4961,6 +4994,47 @@ mod tests {
     }
 
     #[test]
+    fn selected_comparison_keeps_scan_selectivity_and_unknown_join_residual() {
+        use novarocks_type_contract::{FunctionValueType, OperatorFunction};
+
+        let predicate = selected_comparison(
+            OperatorFunction::Equal,
+            col_ref("l_filter"),
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(7)),
+                value_type: FunctionValueType::new(DataType::Int32, false),
+            },
+        );
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let predicate = intern_typed(&mut arena, &predicate, control).unwrap();
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+        let known = HashMap::from([(
+            test_col_id("l_filter"),
+            ColumnStatistic::for_test_with_ndv(20.0, Confidence::Exact),
+        )]);
+        assert_eq!(
+            estimate_selectivity_scalar(&arena, predicate, &known, &mut work).unwrap(),
+            0.05
+        );
+        let unknown = HashMap::from([(test_col_id("l_filter"), ColumnStatistic::unknown())]);
+        let join = estimate_join_condition_scalar(
+            &arena,
+            Some(predicate),
+            &unknown,
+            &HashMap::new(),
+            &mut work,
+        )
+        .unwrap();
+        assert!(join.eq_key_ndvs.is_empty());
+        assert_eq!(
+            join.residual_selectivity,
+            Some((0.5, Confidence::Estimated))
+        );
+        work.finish().unwrap();
+    }
+
+    #[test]
     fn logical_join_reversed_condition_merges_key_equivalence() {
         use crate::optimizer::memo::{LogicalProperties, MExpr};
         use crate::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
@@ -5068,22 +5142,36 @@ mod tests {
         let left = values_group(&mut memo, 10_000.0, &[("l_k1", 100.0), ("l_k2", 500.0)]);
         let right = values_group(&mut memo, 4_000.0, &[("r_k1", 20.0), ("r_k2", 50.0)]);
         let condition = nested_expr(and_expr(
-            nested_expr(eq_expr(col_ref("l_k1"), col_ref("r_k1"))),
-            nested_expr(eq_expr(col_ref("l_k2"), col_ref("r_k2"))),
+            nested_expr(selected_comparison(
+                novarocks_type_contract::OperatorFunction::Equal,
+                col_ref("l_k1"),
+                col_ref("r_k1"),
+            )),
+            nested_expr(selected_comparison(
+                novarocks_type_contract::OperatorFunction::Identical,
+                col_ref("r_k2"),
+                col_ref("l_k2"),
+            )),
         ));
+        let condition = intern_typed(
+            &mut memo.scalars,
+            &condition,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        assert_eq!(
+            collect_equi_join_column_pairs_scalar(&memo.scalars, Some(condition)),
+            vec![
+                (test_col_id("l_k1"), test_col_id("r_k1")),
+                (test_col_id("r_k2"), test_col_id("l_k2")),
+            ]
+        );
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 naa_author: None,
                 join_type: JoinKind::Inner,
-                condition: Some(
-                    intern_typed(
-                        &mut memo.scalars,
-                        &condition,
-                        crate::optimizer::test_optimizer_control(),
-                    )
-                    .unwrap(),
-                ),
+                condition: Some(condition),
             }),
             children: vec![left, right],
         };
@@ -5153,7 +5241,11 @@ mod tests {
                 condition: Some(
                     intern_typed(
                         &mut memo.scalars,
-                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        &selected_comparison(
+                            novarocks_type_contract::OperatorFunction::Equal,
+                            col_ref("l_key"),
+                            col_ref("r_key"),
+                        ),
                         crate::optimizer::test_optimizer_control(),
                     )
                     .unwrap(),
@@ -5863,6 +5955,7 @@ mod tests {
                         )
                         .unwrap(),
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: None,
                 },

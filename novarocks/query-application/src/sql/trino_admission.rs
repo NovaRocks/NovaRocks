@@ -170,27 +170,22 @@ pub fn admit_persisted_definition_semantics(
         }
         _ => return Ok(()),
     };
-    let (legacy, numeric, strict) = match definition {
+    let (legacy, strict) = match definition {
         Some(query) => {
             let map_error = |error: novarocks_sql::analyze_error::AnalyzeError| {
                 QueryServiceError::from_user_error(error.to_user_error(Some(source)))
             };
             (
                 sql_mode::query_uses_group_concat_legacy(caller, query).map_err(map_error)?,
-                sql_mode::query_uses_decimal_overflow_to_double(caller, query)
-                    .map_err(map_error)?,
                 sql_mode::query_uses_error_if_overflow(caller, query).map_err(map_error)?,
             )
         }
         None => (
             caller.sql_mode().group_concat_legacy(),
-            caller.decimal_overflow_to_double(),
             caller.sql_mode().error_if_overflow(),
         ),
     };
-    let setting = if numeric {
-        "decimal_overflow_to_double=true"
-    } else if legacy {
+    let setting = if legacy {
         "GROUP_CONCAT_LEGACY"
     } else if strict {
         "ERROR_IF_OVERFLOW"
@@ -578,7 +573,6 @@ mod tests {
         let legacy = default
             .clone()
             .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
-        let numeric = default.clone().with_decimal_overflow_to_double(true);
         let strict = default
             .clone()
             .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
@@ -596,7 +590,6 @@ mod tests {
             assert!(admit_persisted_definition_semantics(source, &preparation, &default).is_ok());
             for (settings, feature) in [
                 (&legacy, "GROUP_CONCAT_LEGACY"),
-                (&numeric, "decimal_overflow_to_double=true"),
                 (&strict, "ERROR_IF_OVERFLOW"),
             ] {
                 let error = admit_persisted_definition_semantics(source, &preparation, settings)

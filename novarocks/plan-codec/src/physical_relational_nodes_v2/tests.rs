@@ -552,11 +552,13 @@ fn source(at: usize) -> p::PhysicalNode {
                         left: RootOrdinal::new(2),
                         right: RootOrdinal::new(1),
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     },
                     p::JoinKey {
                         left: RootOrdinal::new(0),
                         right: RootOrdinal::new(1),
                         null_safe: true,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     },
                 ]),
                 residual: Some(RootOrdinal::new(0)),
@@ -713,11 +715,13 @@ fn expected(at: usize) -> wire::PhysicalNode {
                             left_root: Some(2),
                             right_root: Some(1),
                             null_safe: false,
+                            match_relation: wire::JoinKeyMatch::Grouping as i32,
                         },
                         wire::JoinKey {
                             left_root: Some(0),
                             right_root: Some(1),
                             null_safe: true,
+                            match_relation: wire::JoinKeyMatch::Grouping as i32,
                         },
                     ],
                     residual_root: Some(0),
@@ -1954,6 +1958,55 @@ fn naa_source() -> p::PhysicalNode {
         eligibility: residual,
     };
     node
+}
+
+#[test]
+fn float_join_match_declaration_roundtrips_and_unknown_wire_values_are_rejected() {
+    let c = Control::default();
+    let fixture = Fixture::new();
+    fixture.with_tokens(
+        &source(5),
+        &c,
+        |values, expressions, read, functions, aggregates| {
+            let mut original = source(0);
+            let p::NodeKind::HashJoin {
+                condition: p::HashJoinCondition::Ordinary { keys, .. },
+                ..
+            } = &mut original.kind
+            else {
+                unreachable!()
+            };
+            keys[0].match_relation = novarocks_type_contract::JoinKeyMatch::IeeeFloat;
+            let (mut encoded, _) =
+                encode_relational_node(&original, values, expressions, SOURCE, limits()).unwrap();
+            let decode = |node: &wire::PhysicalNode| {
+                decode_relational_node(
+                    node,
+                    read,
+                    functions,
+                    aggregates,
+                    binding_limits(),
+                    SOURCE,
+                    limits(),
+                )
+            };
+            assert_eq!(decode(&encoded).unwrap().0, original);
+            for invalid in [0, i32::MAX] {
+                let Some(wire::physical_node::Kind::HashJoin(join)) = &mut encoded.kind else {
+                    unreachable!()
+                };
+                ordinary_wire_keys_mut(join)[0].match_relation = invalid;
+                assert!(decode(&encoded).is_err());
+            }
+            let Some(wire::physical_node::Kind::HashJoin(join)) = &mut encoded.kind else {
+                unreachable!()
+            };
+            let key = &mut ordinary_wire_keys_mut(join)[0];
+            key.match_relation = wire::JoinKeyMatch::IeeeFloat as i32;
+            key.null_safe = true;
+            assert!(decode(&encoded).is_err());
+        },
+    );
 }
 
 #[test]

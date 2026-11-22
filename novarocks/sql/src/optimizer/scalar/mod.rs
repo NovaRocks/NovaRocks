@@ -153,6 +153,7 @@ pub(crate) enum ScalarNode {
         negated: bool,
     },
     Case {
+        ieee_float_equality: bool,
         operand: Option<ScalarId>,
         when_then: Vec<(ScalarId, ScalarId)>,
         else_expr: Option<ScalarId>,
@@ -1473,6 +1474,7 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: Some(novarocks_parser::ast::AstBox::new(col(4, DataType::Int64))),
                     when_then: (vec![
                         (lit_int(1), lit_string("one")),

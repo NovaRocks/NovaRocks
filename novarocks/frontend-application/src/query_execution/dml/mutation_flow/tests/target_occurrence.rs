@@ -200,8 +200,9 @@ fn check_mutation_provider_reads(folded_delete: bool, row_mutation_match: bool) 
     );
     let (delete_label, delete_query) = if folded_delete {
         (
-            "DELETE WHERE id = 1",
-            "SELECT _file, _pos, _spec_id, _partition FROM t WHERE id = 1",
+            "DELETE WHERE id equals a folded BIGINT",
+            "SELECT _file, _pos, _spec_id, _partition FROM t \
+             WHERE id = 9223372036854775807 - 9223372036854775806",
         )
     } else {
         (

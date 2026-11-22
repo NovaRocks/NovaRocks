@@ -321,6 +321,14 @@ fn encode_join_keys(
             left_root: Some(key.left.get()),
             right_root: Some(key.right.get()),
             null_safe: key.null_safe,
+            match_relation: match key.match_relation {
+                novarocks_type_contract::JoinKeyMatch::Grouping => {
+                    wire::JoinKeyMatch::Grouping as i32
+                }
+                novarocks_type_contract::JoinKeyMatch::IeeeFloat => {
+                    wire::JoinKeyMatch::IeeeFloat as i32
+                }
+            },
         });
         w.step()?;
     }
@@ -333,10 +341,21 @@ fn decode_join_keys(
 ) -> Result<Box<[p::JoinKey]>, Error> {
     let mut output = reserve(keys.len(), w)?;
     for key in keys {
+        let match_relation = match wire::JoinKeyMatch::try_from(key.match_relation) {
+            Ok(wire::JoinKeyMatch::Grouping) => novarocks_type_contract::JoinKeyMatch::Grouping,
+            Ok(wire::JoinKeyMatch::IeeeFloat) if !key.null_safe => {
+                novarocks_type_contract::JoinKeyMatch::IeeeFloat
+            }
+            Ok(wire::JoinKeyMatch::IeeeFloat) => {
+                return Err(invalid("IEEE hash equality cannot be null-safe"));
+            }
+            _ => return Err(invalid("missing or unknown hash join key match relation")),
+        };
         output.push(p::JoinKey {
             left: novarocks_expression_contract::RootOrdinal::new(required(key.left_root, w)?),
             right: novarocks_expression_contract::RootOrdinal::new(required(key.right_root, w)?),
             null_safe: key.null_safe,
+            match_relation,
         });
         w.step()?;
     }
@@ -1394,8 +1413,17 @@ fn emit_decode(
                     }
                 }
                 Some(wire::hash_join_node::Condition::NullAwareEqual(v)) => {
+                    let value_equal_keys = decode_join_keys(&v.value_equal_keys, w)?;
+                    for key in &value_equal_keys {
+                        if key.match_relation != novarocks_type_contract::JoinKeyMatch::Grouping {
+                            return Err(invalid(
+                                "NULL-aware membership value keys require grouping equality",
+                            ));
+                        }
+                        w.step()?;
+                    }
                     p::HashJoinCondition::NullAwareEqual {
-                        value_equal_keys: decode_join_keys(&v.value_equal_keys, w)?,
+                        value_equal_keys,
                         scope_keys: decode_join_keys(&v.scope_keys, w)?,
                         eligibility: v
                             .eligibility_root

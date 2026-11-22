@@ -468,6 +468,7 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
             definitions.push(b.add(
                 ty(DataType::Boolean, false),
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand,
                     when_then: Box::from([(and, a), (false_, not)]),
                     else_expr: Some(false_),

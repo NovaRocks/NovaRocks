@@ -5953,6 +5953,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 left: left_root,
                 right: right_root,
                 null_safe: condition.null_safe,
+                match_relation: condition.match_relation,
             };
             if ordinal < join.condition.keys().len() {
                 left_key_values.push(left_value);
@@ -10355,6 +10356,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             owner,
             target.clone(),
             ContractExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(condition, lowered)]),
                 else_expr: Some(otherwise),
@@ -12321,6 +12323,7 @@ fn expression_is_replica_deterministic(expression: &TypedExpr) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand
                 .as_deref()
@@ -12818,6 +12821,7 @@ fn collect_operand_expressions(kind: &ContractExprKind, operands: &mut Vec<ExprI
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operands.extend(operand.iter().copied());
             operands.extend(when_then.iter().map(|(_, then)| *then));
@@ -14862,6 +14866,7 @@ mod tests {
                             left: column_ref(&left_key),
                             right: column_ref(&right_key),
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         }],
                         residual: None,
                     },
@@ -18633,6 +18638,7 @@ mod tests {
         );
         for kind in [
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: (vec![(literal_bool(true), column_ref(&right))]).into(),
                 else_expr: Some(novarocks_parser::ast::AstBox::new(literal_int(0))),
@@ -20232,6 +20238,7 @@ mod tests {
                 negated: false,
             },
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: Some(novarocks_parser::ast::AstBox::new(large)),
                 when_then: (vec![(
                     signed,

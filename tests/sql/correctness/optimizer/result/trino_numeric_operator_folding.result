@@ -1,0 +1,20 @@
+-- query 1
+-- types	decimal(9, 6)
+folded_ratio
+0.333333
+
+-- query 2
+-- types	decimal(7, 6)
+_col0
+2.000000
+
+-- query 3
+-- types	decimal(7, 6)
+_col0
+2.000000
+4.000000
+
+-- query 7
+-- types	decimal(9, 6)
+folded_ratio
+0.333333

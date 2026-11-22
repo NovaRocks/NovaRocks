@@ -25,6 +25,7 @@ use arrow_schema::DataType;
 mod decimal;
 mod float;
 mod largeint;
+pub(crate) mod trino_decimal;
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, CompileControlError, CompilePhase,
     DecimalOverflowPolicy, ExpressionEffectContext, ExpressionEffects, FunctionValueType,
@@ -518,36 +519,8 @@ impl PreparedArithmeticRecipe {
                     work.step()?;
                     let r = right_width.read(right.array().as_ref(), r)?;
                     work.step()?;
-                    use ArithmeticOperator::*;
-                    let output = match self.operator {
-                        Divide | Modulo if r == 0 => {
-                            ArithmeticRowResult::RowError(RowDataError::with_reason(
-                                left_ordinal,
-                                crate::DataFailureReason::DivisionByZero,
-                                "Division by zero",
-                            ))
-                        }
-                        Modulo => ArithmeticRowResult::Signed(l.wrapping_rem(r)),
-                        Add | Subtract | Multiply | Divide => {
-                            let (value, symbol) = match self.operator {
-                                Add => (l.checked_add(r), '+'),
-                                Subtract => (l.checked_sub(r), '-'),
-                                Multiply => (l.checked_mul(r), '*'),
-                                Divide => (l.checked_div(r), '/'),
-                                _ => unreachable!("checked signed arithmetic operation"),
-                            };
-                            match value.filter(|value| result_width.contains(*value)) {
-                                Some(value) => ArithmeticRowResult::Signed(value),
-                                None => ArithmeticRowResult::RowError(RowDataError::with_reason(
-                                    left_ordinal,
-                                    crate::DataFailureReason::NumericOutOfRange,
-                                    &format!(
-                                        "Arithmetic overflow: Overflow happened on: {l:?} {symbol} {r:?}"
-                                    ),
-                                )),
-                            }
-                        }
-                    };
+                    let output =
+                        signed_arithmetic_row(self.operator, *result_width, l, r, left_ordinal);
                     work.step()?;
                     output
                 }
@@ -578,6 +551,59 @@ impl PreparedArithmeticRecipe {
         work.finish()?;
         outcome
     }
+}
+
+pub(crate) fn signed_arithmetic_row(
+    operator: ArithmeticOperator,
+    width: SignedWidth,
+    l: i64,
+    r: i64,
+    ordinal: usize,
+) -> ArithmeticRowResult {
+    use ArithmeticOperator::*;
+    match operator {
+        Divide | Modulo if r == 0 => ArithmeticRowResult::RowError(RowDataError::with_reason(
+            ordinal,
+            crate::DataFailureReason::DivisionByZero,
+            "Division by zero",
+        )),
+        Modulo => ArithmeticRowResult::Signed(l.wrapping_rem(r)),
+        Add | Subtract | Multiply | Divide => {
+            let (value, symbol) = match operator {
+                Add => (l.checked_add(r), '+'),
+                Subtract => (l.checked_sub(r), '-'),
+                Multiply => (l.checked_mul(r), '*'),
+                Divide => (l.checked_div(r), '/'),
+                _ => unreachable!("checked signed arithmetic operation"),
+            };
+            match value.filter(|value| width.contains(*value)) {
+                Some(value) => ArithmeticRowResult::Signed(value),
+                None => ArithmeticRowResult::RowError(signed_overflow(l, r, symbol, ordinal)),
+            }
+        }
+    }
+}
+
+fn signed_overflow(l: i64, r: i64, symbol: char, ordinal: usize) -> RowDataError {
+    use std::io::Write as _;
+
+    // The static prefix, spaces and operator plus two signed i64
+    // coefficients occupy fewer than 96 bytes.
+    let mut bytes = [0_u8; 96];
+    let mut cursor = std::io::Cursor::new(bytes.as_mut_slice());
+    write!(
+        cursor,
+        "Arithmetic overflow: Overflow happened on: {l:?} {symbol} {r:?}"
+    )
+    .expect("signed arithmetic diagnostic has a fixed ASCII extent");
+    let len = cursor.position() as usize;
+    let message =
+        std::str::from_utf8(&bytes[..len]).expect("signed arithmetic diagnostic is ASCII");
+    RowDataError::with_reason(
+        ordinal,
+        crate::DataFailureReason::NumericOutOfRange,
+        message,
+    )
 }
 
 pub(crate) fn checked_row(

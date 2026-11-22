@@ -40,7 +40,8 @@ ORDER BY l.a, r.b;
 SELECT l.a, r.b
 FROM ${case_db}.cse_join_l l
 INNER JOIN ${case_db}.cse_join_r r
-    ON (l.a * 2) > r.b AND (l.a * 2) < r.b + 10
+    ON (CAST(l.a AS DOUBLE) * 2e0) > CAST(r.b AS DOUBLE)
+   AND (CAST(l.a AS DOUBLE) * 2e0) < CAST(r.b AS DOUBLE) + 10e0
 ORDER BY l.a, r.b;
 
 SET SESSION disable_optimizer_rules = '';

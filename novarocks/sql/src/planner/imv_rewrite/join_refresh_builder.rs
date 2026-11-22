@@ -742,6 +742,7 @@ fn build_key_shape_assert_join(
 fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
                 binary(column_ref(net_column), op, int_literal(0, DataType::Int64)),
@@ -1096,6 +1097,7 @@ fn build_final_coalesce_project(
 fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
     let case = TypedExpr {
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
                 binary(
@@ -2347,6 +2349,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_deref()
@@ -2574,6 +2577,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(operand) = operand {
                     collect_column_refs(operand, refs);

@@ -805,6 +805,7 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     let case = fixture.add(
         ty.clone(),
         ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: Box::from([(condition, then_value)]),
             else_expr: Some(else_value),

@@ -47,6 +47,7 @@ sql.admit.table_already_exists	Admit	Active
 sql.admit.table_procedure_not_found	Admit	Active
 sql.admit.unsupported_statement	Admit	Active
 sql.admit.update_unsupported_form	Admit	Active
+sql.analyze.ambiguous_function_call	Analyze	Active
 sql.analyze.duplicate_column_name	Analyze	Active
 sql.analyze.internal	Analyze	Active
 sql.analyze.invalid_analyze_property	Analyze	Active

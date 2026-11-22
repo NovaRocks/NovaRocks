@@ -335,6 +335,12 @@ fn apply_inner(
     memo: &mut Memo,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+    if join
+        .condition
+        .is_some_and(|condition| !super::implement::safe_key_operand(&memo.scalars, condition))
+    {
+        return Ok(Vec::new());
+    }
     let Some(left_props) = memo.groups[left_group].logical_props.clone() else {
         return Ok(Vec::new());
     };

@@ -559,6 +559,7 @@ impl ScalarEmission<'_, '_> {
                 negated: *negated,
             },
             ExprKind::Case {
+                ieee_float_equality,
                 operand,
                 when_then,
                 else_expr,
@@ -611,6 +612,7 @@ impl ScalarEmission<'_, '_> {
                     .map(|item| lower_branch(self, item))
                     .transpose()?;
                 ContractExprKind::Case {
+                    ieee_float_equality: *ieee_float_equality,
                     operand,
                     when_then: branches.into_boxed_slice(),
                     else_expr,

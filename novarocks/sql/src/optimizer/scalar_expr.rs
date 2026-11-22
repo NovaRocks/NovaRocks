@@ -100,6 +100,7 @@ fn collect_column_ids_strict_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_column_ids_strict_inner(arena, *operand, out)?;
@@ -398,6 +399,7 @@ pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.is_some_and(|expr| contains_aggregate(arena, expr))
                 || when_then.iter().any(|(when, then)| {
@@ -431,17 +433,29 @@ pub(crate) fn sort_key_column_id(arena: &ScalarArena, key: &SortKey) -> Option<C
 }
 
 pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String {
-    if let Some(operand) = scalar_operand(arena, expr) {
-        let needs_parentheses = !matches!(
-            arena.node(operand),
-            ScalarNode::ColumnRef(_)
-                | ScalarNode::LambdaParamRef { .. }
-                | ScalarNode::Literal(_)
-                | ScalarNode::Constant(_)
-                | ScalarNode::FunctionCall { .. }
-                | ScalarNode::AggregateCall { .. }
-                | ScalarNode::Cast { .. }
+    if let Some((operator, [left, right])) =
+        crate::common::binary_operator::scalar_operands(arena, expr)
+    {
+        return format!(
+            "{} {} {}",
+            scalar_display_name_with_parens(arena, left),
+            operator.sql(),
+            scalar_display_name_with_parens(arena, right)
         );
+    }
+    if let Some(operand) = scalar_operand(arena, expr) {
+        let needs_parentheses = crate::common::binary_operator::scalar_operands(arena, operand)
+            .is_some()
+            || !matches!(
+                arena.node(operand),
+                ScalarNode::ColumnRef(_)
+                    | ScalarNode::LambdaParamRef { .. }
+                    | ScalarNode::Literal(_)
+                    | ScalarNode::Constant(_)
+                    | ScalarNode::FunctionCall { .. }
+                    | ScalarNode::AggregateCall { .. }
+                    | ScalarNode::Cast { .. }
+            );
         return render_negation(&scalar_display_name(arena, operand), needs_parentheses);
     }
     match arena.node(expr) {
@@ -627,6 +641,9 @@ fn literal_display_name(value: &LiteralValue) -> String {
 }
 
 fn scalar_display_name_with_parens(arena: &ScalarArena, expr: ScalarId) -> String {
+    if crate::common::binary_operator::scalar_operands(arena, expr).is_some() {
+        return format!("({})", scalar_display_name(arena, expr));
+    }
     match arena.node(expr) {
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
@@ -806,6 +823,7 @@ fn contains_function_matching(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.is_some_and(|expr| contains_function_matching(arena, expr, matches))
                 || when_then.iter().any(|(when, then)| {
@@ -938,6 +956,130 @@ fn arrow_format_has_row_error(source: &DataType) -> bool {
     }
 }
 
+fn scalar_invocation_can_fail(binding: &crate::binding::SqlFunctionBinding) -> bool {
+    binding.declared_scalar_invocation_data
+        || binding
+            .admitted_execution_abi
+            .is_some_and(|abi| abi.may_raise_invocation_data())
+}
+
+pub(crate) fn scalar_call_can_fail(binding: &crate::binding::SqlFunctionBinding) -> bool {
+    assert_eq!(
+        binding.kind,
+        novarocks_functions::FunctionKind::Scalar,
+        "a non-row binding cannot be consumed as a scalar function"
+    );
+    scalar_invocation_can_fail(binding)
+        || match binding.semantics.intrinsic_row_error {
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
+            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
+                unreachable!("a scalar function cannot carry a non-row intrinsic fact")
+            }
+        }
+}
+
+pub(crate) fn scalar_cast_can_fail(
+    source: &DataType,
+    target: &DataType,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+) -> bool {
+    if let Some(mode) = array_failure_mode {
+        mode == novarocks_type_contract::ArrayCastFailureMode::ReportError
+    } else {
+        cast_has_intrinsic_row_error(source, target, true)
+            || (decimal_overflow_policy
+                == novarocks_type_contract::DecimalOverflowPolicy::ReportError
+                && novarocks_type_contract::is_checked_decimal_numeric_cast(source, target))
+    }
+}
+
+fn signed_integer_bounds(arena: &ScalarArena, mut expression: ScalarId) -> Option<(i64, i64)> {
+    if let Some(literal) = signed_integer_literal(arena, expression) {
+        return Some((literal, literal));
+    }
+    loop {
+        let value_type = arena.value_type(expression);
+        if let ScalarNode::Cast {
+            child,
+            target,
+            array_failure_mode: None,
+            ..
+        } = arena.node(expression)
+            && target == value_type.data_type()
+            && lossless_signed_widening(arena.value_type(*child), value_type)
+        {
+            expression = *child;
+            continue;
+        }
+        if value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
+            return None;
+        }
+        return match value_type.data_type() {
+            DataType::Int8 => Some((i64::from(i8::MIN), i64::from(i8::MAX))),
+            DataType::Int16 => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+            DataType::Int32 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+            DataType::Int64 => Some((i64::MIN, i64::MAX)),
+            _ => None,
+        };
+    }
+}
+
+/// Prove that the selected signed operator cannot raise a row arithmetic error.
+/// This does not change the selected overload or discharge an operand's effects.
+fn prove_signed_integer_operator_total(
+    arena: &ScalarArena,
+    expression: ScalarId,
+    binding: &crate::binding::SqlFunctionBinding,
+    args: &[ScalarId],
+) -> Option<()> {
+    use novarocks_functions::FunctionResultType;
+    use novarocks_type_contract::{FunctionArgumentType, OperatorFunction, ValueLogicalType};
+
+    let Some(operator @ (OperatorFunction::Add | OperatorFunction::Modulo)) =
+        OperatorFunction::from_function_id(&binding.function_id)
+    else {
+        return None;
+    };
+    let [left, right] = args else { return None };
+    let [
+        FunctionArgumentType::Value(selected_left),
+        FunctionArgumentType::Value(selected_right),
+    ] = binding.selected.argument_types.as_slice()
+    else {
+        return None;
+    };
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        return None;
+    };
+    let carrier = result.data_type();
+    if result != arena.value_type(expression)
+        || result.logical_type() != ValueLogicalType::Physical
+        || !signed_integer_fits(0, carrier)
+        || selected_left != arena.value_type(*left)
+        || selected_right != arena.value_type(*right)
+        || selected_left.logical_type() != ValueLogicalType::Physical
+        || selected_right.logical_type() != ValueLogicalType::Physical
+        || selected_left.data_type() != carrier
+        || selected_right.data_type() != carrier
+    {
+        return None;
+    }
+
+    if operator == OperatorFunction::Modulo {
+        let divisor = signed_integer_literal(arena, *right)?;
+        // Keep the exceptional signed min/-1 division pair out of this proof.
+        return (divisor != 0 && divisor != -1).then_some(());
+    }
+
+    let (left_min, left_max) = signed_integer_bounds(arena, *left)?;
+    let (right_min, right_max) = signed_integer_bounds(arena, *right)?;
+    let min = left_min.checked_add(right_min)?;
+    let max = left_max.checked_add(right_max)?;
+    (signed_integer_fits(min, carrier) && signed_integer_fits(max, carrier)).then_some(())
+}
+
 /// Whether evaluating the scalar can expose an intrinsic row error or a checked
 /// Decimal numeric overflow, including errors from any argument expression.
 /// This effect is independent from function volatility.
@@ -950,23 +1092,10 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         )
     };
     let own_error = match arena.node(expr) {
-        ScalarNode::FunctionCall { binding, .. } => {
-            assert_eq!(
-                binding.kind,
-                novarocks_functions::FunctionKind::Scalar,
-                "a non-row binding cannot be consumed as a scalar function"
-            );
-            binding.declared_scalar_invocation_data
-                || binding
-                    .admitted_execution_abi
-                    .is_some_and(|abi| abi.may_raise_invocation_data())
-                || match binding.semantics.intrinsic_row_error {
-                    novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => false,
-                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => true,
-                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => {
-                        unreachable!("a scalar function cannot carry a non-row intrinsic fact")
-                    }
-                }
+        ScalarNode::FunctionCall { binding, args, .. } => {
+            scalar_call_can_fail(binding)
+                && (scalar_invocation_can_fail(binding)
+                    || prove_signed_integer_operator_total(arena, expr, binding, args).is_none())
         }
         ScalarNode::BinaryOp {
             op,
@@ -986,18 +1115,12 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
             decimal_overflow_policy,
             array_failure_mode,
             ..
-        } => {
-            if let Some(mode) = array_failure_mode {
-                *mode == novarocks_type_contract::ArrayCastFailureMode::ReportError
-            } else {
-                cast_has_intrinsic_row_error(arena.data_type(*child), arena.data_type(expr), true)
-                    || (*decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                        && novarocks_type_contract::is_checked_decimal_numeric_cast(
-                            arena.data_type(*child),
-                            arena.data_type(expr),
-                        ))
-            }
-        }
+        } => scalar_cast_can_fail(
+            arena.data_type(*child),
+            arena.data_type(expr),
+            *decimal_overflow_policy,
+            *array_failure_mode,
+        ),
         _ => false,
     };
     if own_error {
@@ -1044,6 +1167,7 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.is_some_and(|expr| can_fail(arena, expr))
                 || when_then
@@ -1304,6 +1428,162 @@ mod intrinsic_error_consumer_tests {
     }
 
     #[test]
+    fn signed_add_proves_widened_operand_without_disabling_checked_integer_add() {
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy, FunctionArgumentType, OperatorFunction,
+        };
+
+        let mut arena = ScalarArena::new();
+        let smallint = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            FunctionValueType::new(DataType::Int16, true),
+        );
+        let integer_type = FunctionValueType::new(DataType::Int32, true);
+        let widened = arena.intern(
+            ScalarNode::Cast {
+                child: smallint,
+                target: DataType::Int32,
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                array_failure_mode: None,
+            },
+            integer_type.clone(),
+        );
+        let integer = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), integer_type);
+        let one = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            FunctionValueType::new(DataType::Int32, false),
+        );
+        let arguments = [widened, one].map(|id| FunctionArgument::Value {
+            value_type: arena.value_type(id).clone(),
+            constant: None,
+        });
+        let request = FunctionBindingRequest {
+            expected_result_type: None,
+            arguments: &arguments,
+            logical_argument_count: arguments.len(),
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let catalog = crate::functions::builtin_engine_function_catalog();
+        let operator = OperatorFunction::Add;
+        let selected = catalog
+            .resolve_bound_trusted_by_id(
+                &operator.function_id(),
+                FunctionKind::Scalar,
+                request,
+                &control,
+            )
+            .unwrap();
+        catalog
+            .validate_bound(&selected, request, &control)
+            .unwrap();
+        let FunctionResultType::Scalar(result) = &selected.selected.result_type else {
+            panic!("scalar result")
+        };
+        assert_eq!(result, &FunctionValueType::new(DataType::Int32, true));
+        assert_eq!(
+            selected.selected.argument_types.as_slice(),
+            &[
+                FunctionArgumentType::Value(arena.value_type(widened).clone()),
+                FunctionArgumentType::Value(arena.value_type(one).clone()),
+            ]
+        );
+        let result = result.clone();
+        let volatility = selected.semantics.volatility;
+        let binding =
+            crate::binding::SqlFunctionBinding::new(selected, DecimalOverflowPolicy::OutputNull);
+        assert!(scalar_call_can_fail(&binding));
+        for (left, expected) in [(widened, false), (integer, true)] {
+            let expression = arena.intern(
+                ScalarNode::FunctionCall {
+                    name: operator.catalog_name().into(),
+                    args: vec![left, one],
+                    distinct: false,
+                    binding: binding.clone(),
+                    volatility,
+                },
+                result.clone(),
+            );
+            assert_eq!(can_fail(&arena, expression), expected);
+        }
+    }
+
+    #[test]
+    fn signed_remainder_proves_nonzero_widened_divisor() {
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy, FunctionArgumentType, OperatorFunction,
+        };
+
+        let mut arena = ScalarArena::new();
+        let result_type = FunctionValueType::new(DataType::Int64, true);
+        let dividend = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), result_type.clone());
+        let divisor_type = FunctionValueType::new(DataType::Int64, false);
+        let arguments = [&result_type, &divisor_type].map(|value_type| FunctionArgument::Value {
+            value_type: value_type.clone(),
+            constant: None,
+        });
+        let request = FunctionBindingRequest {
+            expected_result_type: None,
+            arguments: &arguments,
+            logical_argument_count: arguments.len(),
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let catalog = crate::functions::builtin_engine_function_catalog();
+        let operator = OperatorFunction::Modulo;
+        let selected = catalog
+            .resolve_bound_trusted_by_id(
+                &operator.function_id(),
+                FunctionKind::Scalar,
+                request,
+                &control,
+            )
+            .unwrap();
+        catalog
+            .validate_bound(&selected, request, &control)
+            .unwrap();
+        assert_eq!(
+            selected.selected.result_type,
+            FunctionResultType::Scalar(result_type.clone())
+        );
+        assert_eq!(
+            selected.selected.argument_types.as_slice(),
+            &[
+                FunctionArgumentType::Value(result_type.clone()),
+                FunctionArgumentType::Value(divisor_type.clone()),
+            ]
+        );
+        let volatility = selected.semantics.volatility;
+        let binding =
+            crate::binding::SqlFunctionBinding::new(selected, DecimalOverflowPolicy::OutputNull);
+        assert!(scalar_call_can_fail(&binding));
+        for (literal, expected) in [(1000, false), (0, true), (-1, true)] {
+            let original = arena.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(literal))),
+                FunctionValueType::new(DataType::Int32, false),
+            );
+            let divisor = arena.intern(
+                ScalarNode::Cast {
+                    child: original,
+                    target: DataType::Int64,
+                    array_failure_mode: None,
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                },
+                divisor_type.clone(),
+            );
+            let expression = arena.intern(
+                ScalarNode::FunctionCall {
+                    name: operator.catalog_name().into(),
+                    args: vec![dividend, divisor],
+                    distinct: false,
+                    binding: binding.clone(),
+                    volatility,
+                },
+                result_type.clone(),
+            );
+            assert_eq!(can_fail(&arena, expression), expected);
+        }
+    }
+
+    #[test]
     fn selected_intrinsic_fact_controls_effect_without_display_name_dispatch() {
         let mut arena = ScalarArena::new();
         let text = arena.intern(
@@ -1387,6 +1667,7 @@ mod intrinsic_error_consumer_tests {
         );
         let branch = arena.intern(
             ScalarNode::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: vec![(condition, catching)],
                 else_expr: Some(boolean),

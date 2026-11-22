@@ -995,10 +995,12 @@ pub(crate) fn intern_typed(
             negated: *negated,
         },
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ScalarNode::Case {
+            ieee_float_equality: *ieee_float_equality,
             operand: operand
                 .as_ref()
                 .map(|item| intern_typed(arena, item, control))
@@ -1186,10 +1188,12 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             negated: *negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ExprKind::Case {
+            ieee_float_equality: *ieee_float_equality,
             operand: operand
                 .map(|item| novarocks_parser::ast::AstBox::new(materialize(arena, item))),
             when_then: when_then

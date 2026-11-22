@@ -112,6 +112,7 @@ fn lazy_type_issues_keep_cast_connective_case_and_arity_details() {
                 None,
                 integer(true),
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: simple.then_some(a),
                     when_then: Box::new([(if simple { b } else { a }, a)]),
                     else_expr: None,

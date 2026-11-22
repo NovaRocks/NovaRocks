@@ -16,7 +16,7 @@
 // under the License.
 use crate::fixtures::expression_sources;
 use arrow::datatypes::{DataType, Field};
-use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode, UnaryOperator};
+use novarocks_expression_contract::{ExprKind, ExprNode, UnaryOperator};
 use novarocks_sql::{
     analyze_error::AnalyzeErrorKind,
     compiler::{
@@ -24,7 +24,7 @@ use novarocks_sql::{
     },
 };
 use novarocks_sql_testkit::{sql_source_with_single_field, try_sql_source_with_declared_fields};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, OperatorFunction};
 
 fn boolean_constant(plan: &SqlAuthoredPhysicalPlan, node: &ExprNode) -> Option<bool> {
     let ExprKind::Constant(reference) = node.kind else {
@@ -75,11 +75,12 @@ fn truth_tests_expand_to_existing_nonnullable_boolean_primitives() {
                 .map(|(unit, root)| (unit, unit.definition(root.definition).unwrap()))
                 .find(|(_, node)| {
                     matches!(
+                        &node.kind,
+                        ExprKind::FunctionCall { function, .. }
+                            if function.function_id == OperatorFunction::Identical.function_id()
+                    ) || matches!(
                         node.kind,
-                        ExprKind::Binary {
-                            op: BinaryOperator::EqForNull,
-                            ..
-                        } | ExprKind::Unary {
+                        ExprKind::Unary {
                             op: UnaryOperator::Not,
                             ..
                         } | ExprKind::IsNull { .. }
@@ -102,14 +103,16 @@ fn truth_tests_expand_to_existing_nonnullable_boolean_primitives() {
                 } else {
                     root
                 };
-                let ExprKind::Binary {
-                    op: BinaryOperator::EqForNull,
-                    left,
-                    right,
-                    ..
-                } = comparison.kind
-                else {
-                    panic!("expected null-safe equality: {sql}");
+                let ExprKind::FunctionCall { function, args } = &comparison.kind else {
+                    panic!("expected bound null-safe equality: {sql}");
+                };
+                assert_eq!(
+                    function.function_id,
+                    OperatorFunction::Identical.function_id(),
+                    "{sql}"
+                );
+                let &[left, right] = args.as_ref() else {
+                    panic!("expected both original operands: {sql}");
                 };
                 assert!(!comparison.ty.nullable(), "{sql}");
                 assert_ne!(left, right, "{sql}");

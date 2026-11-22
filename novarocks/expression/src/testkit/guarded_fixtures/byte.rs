@@ -145,6 +145,7 @@ pub fn byte_program(carrier: DataType, required_error: bool) -> Fixture {
             None,
             bytes.clone(),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(condition, matched)]),
                 else_expr: Some(otherwise),

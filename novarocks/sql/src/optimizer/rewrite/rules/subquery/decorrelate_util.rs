@@ -21,7 +21,7 @@ use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
 use crate::common::BinOp;
-use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::optimizer::scalar::{ScalarArena, ScalarId};
 
 use super::scalar_utils;
 
@@ -45,8 +45,8 @@ pub(super) fn partition_conjuncts_opt(
 pub(super) fn all_binary_eq_opt(arena: &ScalarArena, conjuncts: &[ScalarId]) -> bool {
     conjuncts.iter().all(|conjunct| {
         matches!(
-            arena.node(*conjunct),
-            ScalarNode::BinaryOp { op: BinOp::Eq, .. }
+            crate::common::binary_operator::scalar_comparison(arena, *conjunct),
+            Some((BinOp::Eq, _))
         )
     })
 }

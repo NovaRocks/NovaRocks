@@ -106,14 +106,14 @@ pub use arithmetic::{
     ArithmeticOperator, DecimalOverflowPolicy, arithmetic_result_type,
     arithmetic_result_type_with_op, canonical_agg_decimal_type, decimal_arithmetic_result_type,
     decimal_error_policy_cast_supported, decimal_error_policy_cast_supported_observed,
-    decimal_multiplication_requires_float64, is_checked_decimal_numeric_cast,
+    is_checked_decimal_numeric_cast,
 };
 pub use array_generate::array_generate_item_type;
 pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_parameters_observed};
 pub use coercion::{
     supports_boolean_negation_value_type, wider_type, wider_type_with_construction,
 };
-pub use comparison::{ComparisonOperator, OrderedComparisonAlgorithm};
+pub use comparison::{ComparisonOperator, JoinKeyMatch, OrderedComparisonAlgorithm};
 pub use comparison_coercion::{
     ComparisonCoercionFailure, comparison_common_type, comparison_common_value_type,
     decimal_compare_type, value_type_for_common_layout,

@@ -74,7 +74,6 @@ pub enum SemanticParameterKey {
     StatementStartUtc,
     TimeZone,
     AllowThrowException,
-    DecimalOverflowToDouble,
     GroupConcatLegacy,
     GroupConcatMaxLen,
 }
@@ -111,7 +110,6 @@ pub enum SemanticParameterValue {
     /// An exact rule name or fixed-offset spelling from the admitted setting.
     TimeZone(Box<str>),
     AllowThrowException(bool),
-    DecimalOverflowToDouble(bool),
     GroupConcatLegacy(bool),
     /// Raw admitted setting; specialization applies the existing minimum clamp.
     GroupConcatMaxLen(i64),
@@ -123,7 +121,6 @@ impl SemanticParameterValue {
             Self::StatementStartUtc(_) => SemanticParameterKey::StatementStartUtc,
             Self::TimeZone(_) => SemanticParameterKey::TimeZone,
             Self::AllowThrowException(_) => SemanticParameterKey::AllowThrowException,
-            Self::DecimalOverflowToDouble(_) => SemanticParameterKey::DecimalOverflowToDouble,
             Self::GroupConcatLegacy(_) => SemanticParameterKey::GroupConcatLegacy,
             Self::GroupConcatMaxLen(_) => SemanticParameterKey::GroupConcatMaxLen,
         }

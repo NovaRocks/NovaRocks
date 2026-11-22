@@ -36,9 +36,42 @@ mod literal;
 mod route;
 #[doc(hidden)]
 pub mod syntax_constant;
+pub use conversion::operator_decimal_float;
 pub use literal::{LiteralEmission, LiteralSyntax, TypedLiteral, supports_typed_string};
 pub use route::{ScalarTypingRoute, scalar_typing_route};
 pub use syntax_constant::{LiteralValue, admit_syntax_constant};
+
+/// Project numeric and comparison syntax into the installed operator vocabulary.
+pub fn syntax_arithmetic(operator: novarocks_parser::ast::BinaryOperator) -> OperatorFunction {
+    use novarocks_parser::ast::BinaryOperator::*;
+    match operator {
+        Add => OperatorFunction::Add,
+        Subtract => OperatorFunction::Subtract,
+        Multiply => OperatorFunction::Multiply,
+        Divide => OperatorFunction::Divide,
+        Modulo => OperatorFunction::Modulo,
+    }
+}
+
+pub fn syntax_comparison(operator: novarocks_parser::ast::ComparisonOperator) -> OperatorFunction {
+    use novarocks_parser::ast::ComparisonOperator::*;
+    match operator {
+        Equal => OperatorFunction::Equal,
+        NotEqual => OperatorFunction::NotEqual,
+        LessThan => OperatorFunction::LessThan,
+        LessThanOrEqual => OperatorFunction::LessThanOrEqual,
+        GreaterThan => OperatorFunction::GreaterThan,
+        GreaterThanOrEqual => OperatorFunction::GreaterThanOrEqual,
+    }
+}
+
+pub fn syntax_distinct_from(negated: bool) -> OperatorFunction {
+    if negated {
+        OperatorFunction::Identical
+    } else {
+        OperatorFunction::Distinct
+    }
+}
 
 /// The caller's original statement binding authority. Implementations retain
 /// their declaration and installed implementation admission at both steps.
@@ -141,6 +174,7 @@ pub enum NodeShape<'a> {
         expected_result: Option<&'a FunctionValueType>,
     },
     Operator(OperatorFunction),
+    UnaryPlus,
     And,
     Or,
     IsNull,
@@ -188,6 +222,13 @@ pub struct ValueDomainConversion {
     pub expected_result: FunctionValueType,
     pub target: FunctionValueType,
     pub tail: Option<CarrierConversion>,
+    pub origin: ValueConversionOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueConversionOrigin {
+    ValueDomain,
+    OperatorDecimalFloat,
 }
 
 #[derive(Debug)]
@@ -323,13 +364,14 @@ pub fn type_node(
             type_selected_call(context, binding, expected_result, children, work)?
         }
         NodeShape::Operator(operator) => {
-            let [child] = children else {
-                return Err(TypingError::InvalidShape("negation requires one operand"));
-            };
-            if child.value_type.data_type() == &DataType::Null {
-                return Err(TypingError::TypeMismatch(
-                    "unary minus requires an operand with a specified numeric type".into(),
+            let unary = operator == OperatorFunction::Negation;
+            if children.len() != if unary { 1 } else { 2 } {
+                return Err(TypingError::InvalidShape(
+                    "operator has the wrong number of operands",
                 ));
+            }
+            if unary && children[0].value_type.data_type() == &DataType::Null {
+                return Err(FunctionBindingError::AmbiguousOverload.into());
             }
             let arguments = arguments(children, work)?;
             work.flush()?;
@@ -339,14 +381,48 @@ pub fn type_node(
                 work.control(),
             ) {
                 Err(FunctionBindingError::NoMatchingOverload) => {
+                    if unary {
+                        return Err(TypingError::TypeMismatch(format!(
+                            "unary minus requires a supported numeric operand, got {:?}",
+                            children[0].value_type.data_type()
+                        )));
+                    }
                     return Err(TypingError::TypeMismatch(format!(
-                        "unary minus requires a supported numeric operand, got {:?}",
-                        child.value_type.data_type()
+                        "operator {} does not accept {:?} and {:?}",
+                        operator.sql(),
+                        children[0].value_type.data_type(),
+                        children[1].value_type.data_type()
                     )));
                 }
                 result => result?,
             };
             type_selected_call(context, binding, None, children, work)?
+        }
+        NodeShape::UnaryPlus => {
+            let [child] = children else {
+                return Err(TypingError::InvalidShape("unary plus requires one operand"));
+            };
+            if child.value_type.logical_type()
+                != novarocks_type_contract::ValueLogicalType::Physical
+                || !matches!(
+                    child.value_type.data_type(),
+                    DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                )
+            {
+                return Err(TypingError::TypeMismatch(format!(
+                    "unary plus requires a signed integer, real, or double operand, got {:?}",
+                    child.value_type.data_type(),
+                )));
+            }
+            NodeTyping::Value {
+                result: child.value_type.clone(),
+                conversions: vec![Conversion::Keep],
+            }
         }
         NodeShape::IsNull => {
             if children.len() != 1 {
@@ -427,6 +503,8 @@ fn type_selected_call(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeTyping, TypingError> {
     check_shape(&binding, children.len())?;
+    let arithmetic = OperatorFunction::from_function_id(&binding.function_id)
+        .is_some_and(|operator| operator.arithmetic().is_some());
     let conversions = binding
         .selected
         .argument_types
@@ -438,6 +516,12 @@ fn type_selected_call(
                     "selected scalar expects a lambda argument",
                 ));
             };
+            if arithmetic
+                && matches!(child.value_type.data_type(), DataType::Decimal128(..))
+                && matches!(target.data_type(), DataType::Float32 | DataType::Float64)
+            {
+                return conversion::operator_decimal_float(context, child, target, work);
+            }
             conversion::coerce_argument(context, child, target, work)
         })
         .collect::<Result<_, _>>()?;

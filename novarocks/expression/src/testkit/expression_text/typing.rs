@@ -20,7 +20,8 @@ use crate::testkit::claim_author::{legacy_scalar_function, physical_call_request
 use crate::typing::{
     CarrierConversion, ChildForm, ChildTyping, Conversion, LiteralEmission, LiteralSyntax,
     LiteralValue, NodeShape, NodeTyping, ScalarTypingRoute, TypedLiteral, TypingContext,
-    TypingError, finish_call, scalar_typing_route, type_node,
+    TypingError, finish_call, scalar_typing_route, syntax_arithmetic, syntax_comparison,
+    syntax_distinct_from, type_node,
 };
 use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantPools;
@@ -150,6 +151,22 @@ impl<'a> TextTyping<'a> {
                 node.typing.form = form;
                 Ok(node)
             }
+            ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
+                let child = self.lower(&unary.expression, work, next)?;
+                let (_, mut children) =
+                    self.type_value(NodeShape::UnaryPlus, vec![child], span, work)?;
+                Ok(children.pop().expect("one unary plus operand"))
+            }
+            ast::Expr::Binary(binary) => {
+                let left = self.lower(&binary.left, work, next)?;
+                let right = self.lower(&binary.right, work, next)?;
+                self.type_call(
+                    NodeShape::Operator(syntax_arithmetic(binary.operator)),
+                    vec![left, right],
+                    span,
+                    work,
+                )
+            }
             ast::Expr::Logical(logical) => {
                 let operator = logical.operator;
                 let mut pending: Vec<_> = logical.terms.iter().rev().collect();
@@ -172,6 +189,26 @@ impl<'a> TextTyping<'a> {
                 Ok(TextNode::new(ty, TextKind::Logical(operator, children)))
             }
             ast::Expr::Predicated(node) => match &node.predicate {
+                ast::Predicate::Comparison(predicate) => {
+                    let left = self.lower(&node.value, work, next)?;
+                    let right = self.lower(&predicate.right, work, next)?;
+                    self.type_call(
+                        NodeShape::Operator(syntax_comparison(predicate.operator)),
+                        vec![left, right],
+                        span,
+                        work,
+                    )
+                }
+                ast::Predicate::DistinctFrom(predicate) => {
+                    let left = self.lower(&node.value, work, next)?;
+                    let right = self.lower(&predicate.right, work, next)?;
+                    self.type_call(
+                        NodeShape::Operator(syntax_distinct_from(predicate.negated)),
+                        vec![left, right],
+                        span,
+                        work,
+                    )
+                }
                 ast::Predicate::IsNull(predicate) => {
                     let child = self.lower(&node.value, work, next)?;
                     let (ty, mut children) =
@@ -558,6 +595,7 @@ impl TextNode {
                     .map(|child| child.emit(draft, constants, context, work))
                     .transpose()?;
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then,
                     else_expr,
@@ -583,13 +621,33 @@ impl TextNode {
                         constant: argument.typing.constant.clone(),
                     });
                 }
+                let widened_target;
+                let expected_result = if changed
+                    && binding.selected.overload.as_str()
+                        == novarocks_functions::builtin::value_conversion::OPERATOR_DECIMAL_FLOAT_COERCION
+                {
+                    let [FunctionArgument::Value { value_type, .. }] = &request_args[..] else {
+                        return Err(typing_error(
+                            TypingError::InvalidShape("operator coercion requires its original operand"),
+                            novarocks_parser::SYNTHETIC,
+                        ));
+                    };
+                    widened_target = expected_result
+                        .as_ref()
+                        .map(|target| target.with_nullable(target.nullable() || value_type.nullable()))
+                        .transpose()
+                        .map_err(TextError::ValueType)?;
+                    widened_target.as_ref()
+                } else {
+                    expected_result.as_ref()
+                };
                 let revised;
                 let binding = if changed {
                     work.flush()?;
                     let request = novarocks_functions::FunctionBindingRequest {
                         arguments: &request_args,
                         logical_argument_count: request_args.len(),
-                        expected_result_type: expected_result.as_ref(),
+                        expected_result_type: expected_result,
                     };
                     revised = context
                         .functions
@@ -614,7 +672,7 @@ impl TextNode {
                 let id = draft.add(None, ty, ExprKind::FunctionCall { function, args })?;
                 let request = physical_call_request(
                     &request_args,
-                    expected_result.as_ref(),
+                    expected_result,
                     context.constant_policy,
                     constants,
                 );

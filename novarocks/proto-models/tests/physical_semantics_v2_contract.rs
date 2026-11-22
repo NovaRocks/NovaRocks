@@ -70,13 +70,12 @@ fn effects(scope: v2::proof_scope::Kind) -> v2::CallEffects {
 }
 
 #[test]
-fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
+fn all_five_parameter_variants_preserve_raw_values_and_oneof_presence() {
     use v2::semantic_parameter::Value;
     let values = [
         Value::StatementStartUtcMicros(i64::MIN),
         Value::TimeZone("+08:00".into()),
         Value::AllowThrowException(false),
-        Value::DecimalOverflowToDouble(true),
         Value::GroupConcatLegacy(false),
         Value::GroupConcatMaxLen(i64::MAX),
     ];
@@ -85,7 +84,7 @@ fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
             .into_iter()
             .enumerate()
             .map(|(ordinal, value)| v2::SemanticParameter {
-                id: if ordinal == 5 {
+                id: if ordinal == 4 {
                     u32::MAX
                 } else {
                     ordinal as u32
@@ -106,7 +105,7 @@ fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
             .unwrap()
             .fields()
             .count(),
-        6
+        5
     );
     for entry in &parameters.entries {
         let absent = v2::SemanticParameter {

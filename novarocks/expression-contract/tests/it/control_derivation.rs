@@ -410,6 +410,7 @@ fn intrinsic_boolean_and_both_case_shapes_keep_ordered_hand_checked_guards() {
                 None,
                 ty.clone(),
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand,
                     when_then: Box::new([(and, a), (c, not)]),
                     else_expr: Some(c),
@@ -729,6 +730,7 @@ fn neutral_parts_cannot_bind_an_independent_root_inside_another_roots_guard() {
             None,
             boolean(true),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::new([(leaf, leaf)]),
                 else_expr: Some(leaf),

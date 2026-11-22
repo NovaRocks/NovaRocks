@@ -46,7 +46,7 @@ use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_type_contract::{
-    ArithmeticOperator, CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId,
+    CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId, OperatorFunction,
     PureCompileControl, ValueLogicalType,
 };
 use std::{sync::Arc, time::Duration};
@@ -82,9 +82,7 @@ fn policy() -> ConstantPolicy {
 #[derive(Clone, Copy, Debug)]
 enum Family {
     Constant,
-    Arithmetic,
-    Comparison,
-    NullSafe,
+    Operator(OperatorFunction),
     And,
     Or,
     Not,
@@ -95,9 +93,9 @@ impl Family {
     fn matches(self, kind: &StaticExprKind, function: Option<&str>) -> bool {
         match self {
             Self::Constant => matches!(kind, StaticExprKind::Constant(_)),
-            Self::Arithmetic => matches!(kind, StaticExprKind::PreparedArithmetic { .. }),
-            Self::Comparison => kind.ordinary_comparison().is_some(),
-            Self::NullSafe => matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }),
+            Self::Operator(operator) => {
+                Self::Call(operator.function_id_text()).matches(kind, function)
+            }
             Self::And => matches!(kind, StaticExprKind::NaryAnd { .. }),
             Self::Or => matches!(kind, StaticExprKind::NaryOr { .. }),
             Self::Not => matches!(kind, StaticExprKind::Not(_)),
@@ -131,9 +129,8 @@ impl Fixture {
         functions: &PureEngineFunctionCatalog,
     ) -> Self {
         let sql = format!("SELECT {expression} AS entry_parity");
-        let semantics = SqlSemanticSettings::default()
-            .with_sql_mode(SqlMode::from_assignment(mode))
-            .with_decimal_overflow_to_double(false);
+        let semantics =
+            SqlSemanticSettings::default().with_sql_mode(SqlMode::from_assignment(mode));
         let source = sql_source_with_semantics(&sql, DataType::Int64, semantics.clone());
         Self::find_root(source, family, sql, semantics, functions)
     }
@@ -410,12 +407,27 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
     metadata_cv_source_cross_entry(&functions, false);
     metadata_cv_source_cross_entry(&functions, true);
     let cases: Vec<(&str, Family, bool, ArrayRef)> = vec![
-        ("20 + 22", Family::Arithmetic, true, int(Some(42))),
-        ("1e0 * 1e0", Family::Arithmetic, true, float(1.0)),
-        ("20 < 22", Family::Comparison, false, boolean(Some(true))),
+        (
+            "20 + 22",
+            Family::Operator(OperatorFunction::Add),
+            false,
+            int(Some(42)),
+        ),
+        (
+            "1e0 * 1e0",
+            Family::Operator(OperatorFunction::Multiply),
+            false,
+            float(1.0),
+        ),
+        (
+            "20 < 22",
+            Family::Operator(OperatorFunction::LessThan),
+            false,
+            boolean(Some(true)),
+        ),
         (
             "1 IS NOT DISTINCT FROM 1",
-            Family::NullSafe,
+            Family::Operator(OperatorFunction::Identical),
             false,
             boolean(Some(true)),
         ),
@@ -467,21 +479,21 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
     for (expression, family, nullable, outcome, expected) in [
         (
             "(0e0 - 0e0) * 1e0",
-            Family::Arithmetic,
-            true,
+            Family::Operator(OperatorFunction::Multiply),
+            false,
             FoldOutcome::Folded,
             float(0.0),
         ),
         (
             "-0e0 * 1e0",
-            Family::Arithmetic,
-            true,
+            Family::Operator(OperatorFunction::Multiply),
+            false,
             FoldOutcome::Folded,
             float(-0.0),
         ),
         (
             "CAST('-0' AS DOUBLE) * 1e0",
-            Family::Arithmetic,
+            Family::Operator(OperatorFunction::Multiply),
             true,
             FoldOutcome::Folded,
             float(-0.0),
@@ -509,7 +521,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         ),
         (
             "CAST(NULL AS BIGINT) IS NOT DISTINCT FROM CAST(NULL AS BIGINT)",
-            Family::NullSafe,
+            Family::Operator(OperatorFunction::Identical),
             false,
             FoldOutcome::Folded,
             boolean(Some(true)),
@@ -529,6 +541,31 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             "frozen root: {expression}"
         );
         fixture.assert_both(&functions, outcome, Expected::Value(expected));
+    }
+}
+
+#[test]
+fn constant_entry_standard_widths_follow_original_catalogue_selection() {
+    let functions = installed_builtin_owner_catalogue();
+    for (expression, operator, result) in [
+        (
+            "DECIMAL '1.00' / DECIMAL '3.00'",
+            OperatorFunction::Divide,
+            decimal(Some(333_333), 9, 6),
+        ),
+        (
+            "CAST(0 AS REAL) + DECIMAL '1.0000000596046447753906250000000000001'",
+            OperatorFunction::Add,
+            Arc::new(Float32Array::from(vec![f32::from_bits(0x3f80_0001)])) as ArrayRef,
+        ),
+        (
+            "0e0 + DECIMAL '1801439850948188.9'",
+            OperatorFunction::Add,
+            float(f64::from_bits(0x4319_9999_9999_9974)),
+        ),
+    ] {
+        let fixture = Fixture::compile(expression, Family::Operator(operator), "32", &functions);
+        fixture.assert_both(&functions, FoldOutcome::Folded, Expected::Value(result));
     }
 }
 
@@ -557,7 +594,12 @@ fn constant_entry_heterogeneous_comparisons_replay_actual_sql_conversion_order()
         ),
     ];
     for (expression, left_source, right_source, outcome) in cases {
-        let fixture = Fixture::compile(expression, Family::Comparison, "32", &functions);
+        let fixture = Fixture::compile(
+            expression,
+            Family::Operator(OperatorFunction::LessThan),
+            "32",
+            &functions,
+        );
         let args = fixture.args(fixture.occurrence);
         let [left_at, right_at] = args.as_slice() else {
             panic!("binary comparison")
@@ -652,8 +694,8 @@ fn constant_entry_actual_largeint_conversion_then_carrier_tail_preserves_value_a
 
 #[test]
 fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_error_contract() {
-    use ArithmeticOperator::{Add, Multiply};
     use DecimalOverflowPolicy::{OutputNull, ReportError};
+    use OperatorFunction::{Add, Multiply};
     let functions = installed_builtin_owner_catalogue();
     let max = 10_i128.pow(38) - 1;
     for (policy, allow, mode) in [
@@ -662,54 +704,26 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
         (ReportError, false, "ERROR_IF_OVERFLOW"),
         (ReportError, true, "ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION"),
     ] {
-        for (operator, symbol, rhs, error) in [
-            (
-                Add,
-                "+",
-                1,
-                "Expr evaluate meet error: The 'add' operation involving decimal values overflows",
-            ),
-            (
-                Multiply,
-                "*",
-                2,
-                "Expr evaluate meet error: The 'mul' operation involving decimal values overflows",
-            ),
-        ] {
+        for (operator, rhs) in [(Add, 1), (Multiply, 2)] {
+            let symbol = operator.sql();
             let expression =
                 format!("CAST('{max}' AS DECIMAL(38,0)) {symbol} CAST({rhs} AS DECIMAL(2,0))");
-            let fixture = Fixture::compile(&expression, Family::Arithmetic, mode, &functions);
-            let StaticExprKind::PreparedArithmetic {
-                operator: frozen_op,
-                decimal_overflow_policy: frozen_policy,
-                allow_throw_exception: frozen_allow,
-                ..
-            } = fixture.kind(fixture.occurrence)
-            else {
-                unreachable!()
-            };
+            let fixture =
+                Fixture::compile(&expression, Family::Operator(operator), mode, &functions);
+            let kernel = fixture.call(fixture.occurrence);
             assert_eq!(
-                (*frozen_op, *frozen_policy, *frozen_allow),
-                (operator, policy, allow)
+                kernel.call_contract().function_id(),
+                &operator.function_id()
             );
             assert_eq!(
                 fixture.ty(fixture.occurrence).data_type(),
                 &DataType::Decimal128(38, 0)
             );
-            assert!(fixture.ty(fixture.occurrence).nullable());
-            // Independent existing owner contract: ALLOW adds multiplication's
-            // row error, but it does not turn OutputNull decimal ADD into an error.
-            let expected = if policy == ReportError || (operator == Multiply && allow) {
-                Expected::RowError(error)
-            } else {
-                Expected::Value(decimal(None, 38, 0))
-            };
-            let outcome = if allow || matches!(expected, Expected::RowError(_)) {
-                FoldOutcome::Kept
-            } else {
-                FoldOutcome::Folded
-            };
-            fixture.assert_both(&functions, outcome, expected);
+            fixture.assert_both(
+                &functions,
+                FoldOutcome::Kept,
+                Expected::RowError("Decimal overflow"),
+            );
         }
         let fixture = Fixture::compile(
             "CAST(CAST('999.99' AS DECIMAL(5,2)) AS DECIMAL(4,1))",

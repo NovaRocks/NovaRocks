@@ -1,4 +1,4 @@
 -- query 1
--- types	decimal(38, 8)
+-- types	decimal(38, 6)
 avg_yearly
-349073.90142857
+349073.901429

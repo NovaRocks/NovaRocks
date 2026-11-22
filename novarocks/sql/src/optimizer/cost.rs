@@ -838,6 +838,7 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand
                 .map(|expr| scalar_complexity(Some(arena), expr))
@@ -1452,6 +1453,7 @@ mod tests {
         )
         .unwrap();
         OptimizerPhysicalHashJoinEqCondition {
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             left,
             right,
             null_safe: false,
@@ -1485,6 +1487,7 @@ mod tests {
         right_id: u32,
     ) -> OptimizerPhysicalHashJoinEqCondition {
         OptimizerPhysicalHashJoinEqCondition {
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             left: column_ref(arena, left_id),
             right: column_ref(arena, right_id),
             null_safe: false,
@@ -1497,6 +1500,7 @@ mod tests {
         right_id: u32,
     ) -> OptimizerPhysicalHashJoinEqCondition {
         OptimizerPhysicalHashJoinEqCondition {
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             left: nested_column_ref(arena, left_id),
             right: column_ref(arena, right_id),
             null_safe: false,

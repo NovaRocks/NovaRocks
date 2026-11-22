@@ -39,16 +39,17 @@ pub(super) fn current_constraint(
             }
             Ok(None)
         }
-        SqlResultConstraintOrigin::ArrayCommonCoercion => {
+        SqlResultConstraintOrigin::ArrayCommonCoercion
+        | SqlResultConstraintOrigin::OperatorDecimalFloatCoercion => {
             let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
             else {
                 return Err(invalid(
-                    "ARRAY common constraint lacks its original value source",
+                    "direct conversion constraint lacks its original value source",
                 ));
             };
             let target = binding
                 .result_constraint()
-                .ok_or_else(|| invalid("ARRAY common constraint lost its authored target"))?;
+                .ok_or_else(|| invalid("direct conversion constraint lost its authored target"))?;
             work.flush()?;
             let target = target
                 .with_nullable(target.nullable() || value_type.nullable())

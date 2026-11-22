@@ -94,6 +94,7 @@ fn case(value: TypedExpr) -> TypedExpr {
     TypedExpr {
         value_type: value.value_type.clone(),
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
                 TypedExpr {

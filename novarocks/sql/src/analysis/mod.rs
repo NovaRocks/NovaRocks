@@ -675,6 +675,7 @@ pub enum ExprKind {
     },
     /// CASE [operand] WHEN ... THEN ... [ELSE ...] END.
     Case {
+        ieee_float_equality: bool,
         operand: Option<AstBox<TypedExpr>>,
         when_then: AstVec<(TypedExpr, TypedExpr)>,
         else_expr: Option<AstBox<TypedExpr>>,

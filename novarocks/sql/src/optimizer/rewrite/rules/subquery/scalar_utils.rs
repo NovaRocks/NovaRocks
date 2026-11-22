@@ -286,20 +286,16 @@ pub(super) fn orient_eq(
     conjunct: ScalarId,
     corr_ids: &HashSet<ColumnId>,
 ) -> Option<(ScalarId, ScalarId)> {
-    let ScalarNode::BinaryOp {
-        left,
-        op: BinOp::Eq,
-        right,
-        ..
-    } = arena.node(conjunct)
+    let (BinOp::Eq, [left, right]) =
+        crate::common::binary_operator::scalar_comparison(arena, conjunct)?
     else {
         return None;
     };
-    let left_outer = scalar_refs_any(arena, *left, corr_ids);
-    let right_outer = scalar_refs_any(arena, *right, corr_ids);
+    let left_outer = scalar_refs_any(arena, left, corr_ids);
+    let right_outer = scalar_refs_any(arena, right, corr_ids);
     match (left_outer, right_outer) {
-        (true, false) => Some((*left, *right)),
-        (false, true) => Some((*right, *left)),
+        (true, false) => Some((left, right)),
+        (false, true) => Some((right, left)),
         _ => None,
     }
 }
@@ -527,10 +523,12 @@ where
             negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ScalarNode::Case {
+            ieee_float_equality,
             operand: match operand {
                 Some(item) => Some(candidate_or_none!(rewrite(arena, item)?)),
                 None => None,

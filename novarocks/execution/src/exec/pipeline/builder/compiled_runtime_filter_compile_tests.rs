@@ -255,6 +255,7 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         left: probe,
         right: build_key,
         null_safe: false,
+        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
     };
     builder
         .add_join(

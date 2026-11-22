@@ -150,7 +150,7 @@ fn frozen_reads_with_residual_mode(
 pub fn frozen_reads_with_explicit_source_shape(
     source: &SqlAuthoredPhysicalPlan,
     admit_original_scan_residuals: bool,
-    admit_required_inlist_shape: bool,
+    admit_extended_source_shape: bool,
 ) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
     let mut reads = BTreeMap::new();
     for fragment in source.plan().fragments().values() {
@@ -179,7 +179,7 @@ pub fn frozen_reads_with_explicit_source_shape(
                 assert_eq!(provider_outputs.len(), 1);
                 assert_eq!(provider_outputs[0].0, relation.schema()[0].column);
                 let field = &relation.schema()[0];
-                if !admit_required_inlist_shape {
+                if !admit_extended_source_shape {
                     assert!(!field.ty.nullable());
                 }
                 let carrier = match field.ty.data_type() {
@@ -189,7 +189,7 @@ pub fn frozen_reads_with_explicit_source_shape(
                     DataType::Int64 => ConnectorValueType::BigInt,
                     DataType::Float32 => ConnectorValueType::Real,
                     DataType::Float64 => ConnectorValueType::Double,
-                    DataType::Utf8 if admit_required_inlist_shape => connector_type_for_value_type(
+                    DataType::Utf8 if admit_extended_source_shape => connector_type_for_value_type(
                         &field.ty,
                     )
                     .expect("actual required Utf8 source has its exact connector projection"),
@@ -292,11 +292,18 @@ pub fn programs_with_catalogue_and_original_inlist_source(
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
     programs_with_original_frozen_reads(source, functions, true, true)
 }
+pub fn programs_with_catalogue_and_nullable_source(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
+    programs_with_original_frozen_reads(source, functions, false, true)
+}
+
 fn programs_with_original_frozen_reads(
     source: &SqlAuthoredPhysicalPlan,
     functions: &PureEngineFunctionCatalog,
     admit_original_scan_residuals: bool,
-    admit_required_inlist_shape: bool,
+    admit_extended_source_shape: bool,
 ) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
     let pruning = source
         .plan()
@@ -330,7 +337,7 @@ fn programs_with_original_frozen_reads(
         .collect();
     let packages = extract_fragment_packages(
         source.plan(),
-        &if admit_required_inlist_shape {
+        &if admit_extended_source_shape {
             frozen_reads_with_explicit_source_shape(source, admit_original_scan_residuals, true)
         } else if admit_original_scan_residuals {
             frozen_reads_with_residual_mode(source, true)

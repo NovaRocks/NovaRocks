@@ -27,6 +27,7 @@ use crate::optimizer::operator::{Operator, ScanOp};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::planner::table::{ScanSource, SqlScanKind};
+use novarocks_type_contract::OperatorFunction;
 
 /// Physical identity of a scanned table. Two scans of the same physical table
 /// (e.g. a self-join's two legs, or an outer table re-scanned in a subquery)
@@ -214,15 +215,38 @@ pub(super) fn expr_phys_eq(
                 volatility: vb,
             },
         ) => {
-            na == nb
-                && da == db
-                && ra == rb
-                && va == vb
-                && aa.len() == ab.len()
-                && aa
-                    .iter()
-                    .zip(ab)
-                    .all(|(x, y)| expr_phys_eq(arena, *x, *y, map))
+            if na != nb || da != db || ra != rb || va != vb || aa.len() != ab.len() {
+                return false;
+            }
+            if aa
+                .iter()
+                .zip(ab)
+                .all(|(x, y)| expr_phys_eq(arena, *x, *y, map))
+            {
+                return true;
+            }
+            let (
+                Some(operator @ (OperatorFunction::Equal | OperatorFunction::NotEqual)),
+                [left, right],
+                [other_left, other_right],
+            ) = (
+                OperatorFunction::from_function_id(&ra.function_id),
+                aa.as_slice(),
+                ab.as_slice(),
+            )
+            else {
+                return false;
+            };
+            // The selected call and the paired operand declarations must agree.
+            // Reversing structurally equal operands must not reorder an error or
+            // an evaluation that can differ between replicas.
+            operator.comparison_overload_text() == Some(ra.selected.overload.as_str())
+                && arena.value_type(*left) == arena.value_type(*other_right)
+                && arena.value_type(*right) == arena.value_type(*other_left)
+                && crate::optimizer::cascades_rules::implement::safe_key_operand(arena, a)
+                && crate::optimizer::cascades_rules::implement::safe_key_operand(arena, b)
+                && expr_phys_eq(arena, *left, *other_right, map)
+                && expr_phys_eq(arena, *right, *other_left, map)
         }
         (
             ScalarNode::IsNull {
@@ -594,6 +618,79 @@ mod tests {
             "Lt must NOT be commutative: a < b should not match b < a"
         );
     }
+    #[test]
+    fn reversed_catalog_comparisons_require_the_same_exact_pairing() {
+        use novarocks_functions::{FunctionArgument, FunctionBindingRequest, FunctionKind};
+        use novarocks_type_contract::DecimalOverflowPolicy;
+
+        let catalog = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
+        let control = crate::optimizer::test_optimizer_control();
+        let call = |operator: OperatorFunction, left: TypedExpr, right: TypedExpr| {
+            let arguments = [&left, &right].map(|operand| FunctionArgument::Value {
+                value_type: operand.value_type.clone(),
+                constant: None,
+            });
+            let resolved = catalog
+                .resolve_bound_trusted_by_id(
+                    &operator.function_id(),
+                    FunctionKind::Scalar,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                        expected_result_type: None,
+                    },
+                    control,
+                )
+                .unwrap();
+            crate::common::binary_operator::typed_call(
+                operator,
+                crate::binding::SqlFunctionBinding::new(
+                    resolved,
+                    DecimalOverflowPolicy::ReportError,
+                ),
+                vec![left, right],
+            )
+        };
+        let outer_left = ColumnId(10);
+        let outer_right = ColumnId(20);
+        let inner_left = ColumnId(30);
+        let unrelated = ColumnId(40);
+        let left_table = fixture_table_identity("left_table");
+        let right_table = fixture_table_identity("right_table");
+        let map = HashMap::from([
+            (outer_left, (left_table.clone(), "key".to_owned())),
+            (inner_left, (left_table, "key".to_owned())),
+            (outer_right, (right_table, "key".to_owned())),
+            (
+                unrelated,
+                (fixture_table_identity("unrelated"), "key".to_owned()),
+            ),
+        ]);
+        for (operator, commutes) in [
+            (OperatorFunction::Equal, true),
+            (OperatorFunction::NotEqual, true),
+            (OperatorFunction::LessThan, false),
+        ] {
+            let forward = call(
+                operator,
+                col_ref(outer_left, "key"),
+                col_ref(outer_right, "key"),
+            );
+            let reversed = call(
+                operator,
+                col_ref(outer_right, "key"),
+                col_ref(inner_left, "key"),
+            );
+            assert_eq!(expr_phys_eq(&forward, &reversed, &map), commutes);
+            let different = call(
+                operator,
+                col_ref(outer_right, "key"),
+                col_ref(unrelated, "key"),
+            );
+            assert!(!expr_phys_eq(&forward, &different, &map));
+        }
+    }
+
     #[test]
     fn materialized_constants_match_only_the_same_observed_arena_identity() {
         use novarocks_functions::ConstantValue;

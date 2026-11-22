@@ -48,6 +48,33 @@ pub struct RelationField {
     pub ty: ValueType,
 }
 
+/// Exact carrier domains in which a provider scan can use ordinary comparison
+/// of its own column against a checked non-NULL constant.
+pub fn supports_provider_scan_comparison(ty: &ValueType) -> bool {
+    use arrow_schema::{DataType, TimeUnit};
+
+    ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+        && match ty.data_type() {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Time64(TimeUnit::Microsecond)
+            | DataType::Timestamp(
+                TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+                None,
+            )
+            | DataType::Utf8
+            | DataType::Binary => true,
+            DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, Some(zone)) => {
+                zone.eq_ignore_ascii_case("UTC")
+            }
+            _ => false,
+        }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PredicateGuaranteeKind {
     /// Every returned row satisfies the predicate.

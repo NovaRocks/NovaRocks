@@ -520,6 +520,7 @@ fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_expr_column_ids(operand, max_id);
@@ -4032,6 +4033,7 @@ crate::constant::test_constant_policy(),
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(operand) = operand {
                     collect_column_refs(operand, refs);

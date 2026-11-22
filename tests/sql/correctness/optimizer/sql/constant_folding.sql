@@ -209,10 +209,10 @@ SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decima
 -- @explain_contains= = CAST(
 SELECT CAST('2020-01-01' AS DATE) = '2020-01-01' AS folded_temporal_compare;
 
--- @explain_contains=<=>
+-- @explain_contains=IS NOT DISTINCT FROM
 SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(NULL AS INT) AS folded_nullsafe_equal;
 
--- @explain_contains=<=>
+-- @explain_contains=IS NOT DISTINCT FROM
 SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(1 AS INT) AS folded_nullsafe_distinct;
 
 -- @explain_contains=[CAST(12 AS

@@ -168,6 +168,7 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             let mut children = Vec::with_capacity(operand.iter().count() + when_then.len() * 2 + 1);
             children.extend(operand.iter().copied());
@@ -398,6 +399,7 @@ fn collect_column_refs_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_column_refs_inner(scalars, *operand, seen, refs);
@@ -548,10 +550,12 @@ fn substitute(
             negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ScalarNode::Case {
+            ieee_float_equality,
             operand: operand
                 .map(|operand| substitute(scalars, operand, subst, control))
                 .transpose()?,
@@ -3628,6 +3632,7 @@ mod tests {
                         left: left_a,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: Some(condition),
                 },
@@ -4027,6 +4032,7 @@ mod intrinsic_eligibility_tests {
                 );
                 let branch = arena.intern(
                     ScalarNode::Case {
+                        ieee_float_equality: false,
                         operand: None,
                         when_then: vec![(condition, call)],
                         else_expr: Some(child),

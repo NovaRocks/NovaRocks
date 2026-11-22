@@ -278,21 +278,25 @@ fn typed_expr_semantically_eq_with(
         }
         (
             ExprKind::Case {
+                ieee_float_equality: left_ieee,
                 operand: left_operand,
                 when_then: left_when_then,
                 else_expr: left_else,
             },
             ExprKind::Case {
+                ieee_float_equality: right_ieee,
                 operand: right_operand,
                 when_then: right_when_then,
                 else_expr: right_else,
             },
         ) => {
-            optional_typed_expr_semantically_eq_with(
-                left_operand.as_deref(),
-                right_operand.as_deref(),
-                work,
-            )? && left_when_then.len() == right_when_then.len()
+            left_ieee == right_ieee
+                && optional_typed_expr_semantically_eq_with(
+                    left_operand.as_deref(),
+                    right_operand.as_deref(),
+                    work,
+                )?
+                && left_when_then.len() == right_when_then.len()
                 && left_when_then.iter().zip(right_when_then.iter()).try_fold(
                     true,
                     |matched, ((left_when, left_then), (right_when, right_then))| {

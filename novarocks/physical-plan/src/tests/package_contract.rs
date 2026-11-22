@@ -403,6 +403,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
                     constants.boolean(true, &ty(DataType::Boolean, false));
                 parts.definitions[root.get() as usize].ty = ty(DataType::Int64, true);
                 parts.definitions[root.get() as usize].kind = ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then: Box::from([(left, right)]),
                     else_expr: None,
@@ -617,6 +618,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
             node,
             ty(DataType::Int64, true),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(condition, value)]),
                 else_expr: None,

@@ -344,11 +344,13 @@ fn node_fields<'a>(
             f.boolean(*negated)?;
         }
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => {
             f.number(13)?;
+            f.boolean(*ieee_float_equality)?;
             f.optional_id(*operand)?;
             f.number(when_then.len() as u128)?;
             for (when, then) in when_then {

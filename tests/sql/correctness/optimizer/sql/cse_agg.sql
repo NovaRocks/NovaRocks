@@ -28,5 +28,6 @@ FROM ${case_db}.cse_agg_t;
 
 -- @explain_contains=__cse_0
 -- @result_not_contains=__cse_
-SELECT SUM(a * b) AS sum_ab, AVG(a * b) AS avg_ab
+SELECT SUM(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS sum_ab,
+       AVG(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS avg_ab
 FROM ${case_db}.cse_agg_t;

@@ -113,6 +113,7 @@ fn case_clauses_keep_original_order_bindings_and_full_branch_declarations() {
             operand,
             when_then,
             else_expr,
+            ..
         } = &actual.kind
         else {
             panic!("original CASE IR")
