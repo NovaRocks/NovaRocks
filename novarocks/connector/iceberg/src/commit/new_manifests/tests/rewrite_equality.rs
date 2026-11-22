@@ -87,10 +87,12 @@ fn install_rewrite(fixture: &Fixture, source: &TableMetadata, path: &str) -> Arc
                 .unwrap(),
         )
         .unwrap();
-    let mut received = ReceivedCompactFiles::default();
-    received.counts = entry.counts;
+    let mut received = ReceivedCompactFiles {
+        counts: entry.counts,
+        author: Some(author),
+        ..Default::default()
+    };
     received.push(entry);
-    received.author = Some(author);
     fixture
         .operation
         .install_stage_new_files(
