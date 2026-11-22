@@ -42,6 +42,7 @@ regex-syntax = "=0.8.8"
 # Reuse the locked Unicode property author for Trino's BMP decimal digits.
 icu_properties = "=2.1.2"
 icu_normalizer = { version = "=2.1.1", default-features = false, features = ["compiled_data", "utf8_iter"] }
+icu_casemap = "=2.1.1"
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
