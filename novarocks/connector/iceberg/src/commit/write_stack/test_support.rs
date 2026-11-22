@@ -22,10 +22,11 @@
 
 use arrow::datatypes::{DataType, Field};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorExecutionResources, ConnectorReservationBackend,
-    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLedger,
-    ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
-    ConnectorWriteInputShape, ProviderBindingEpoch,
+    ConnectorError, ConnectorExecutionResources, ConnectorPayloadByteBudget,
+    ConnectorPayloadRetentionGuard, ConnectorReservationBackend, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLedger, ConnectorWriteBaseVersion,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+    ProviderBindingEpoch,
 };
 
 use crate::commit::write_stack::domain::{
@@ -44,7 +45,10 @@ use novarocks_spi::connector::write_stack::{
     ConnectorWriteProductionProof, ConnectorWriteQueryIdentity, ConnectorWriterPhysicalContext,
     WriteTargetOrdinal,
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 pub(crate) fn received_write_proof(
     target: WriteTargetOrdinal,
@@ -70,6 +74,26 @@ pub(crate) fn write_query_identity() -> ConnectorWriteQueryIdentity {
     ConnectorWriteQueryIdentity::try_new(*uuid::Uuid::now_v7().as_bytes(), 1, [2; 16]).unwrap()
 }
 
+pub(super) struct FixtureByteAuthor(pub(super) Arc<AtomicUsize>);
+struct FixtureByteReceipt(Arc<AtomicUsize>, usize);
+impl Drop for FixtureByteReceipt {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::SeqCst);
+    }
+}
+impl ConnectorPayloadByteBudget for FixtureByteAuthor {
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+        self.0.fetch_add(bytes, Ordering::SeqCst);
+        Ok(ConnectorPayloadRetentionGuard::new(FixtureByteReceipt(
+            Arc::clone(&self.0),
+            bytes,
+        )))
+    }
+}
+
 // Exercise the actual wire decoder before any fixture enters compact receiving.
 pub(crate) fn paid_fragments(
     adapter: &super::runtime::IcebergWriteAdapter,
@@ -91,30 +115,9 @@ pub(crate) fn paid_fragments_counted(
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use novarocks_spi::connector::{
-        ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
         ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct FixtureByteAuthor(Arc<AtomicUsize>);
-    struct FixtureByteReceipt(Arc<AtomicUsize>, usize);
-    impl Drop for FixtureByteReceipt {
-        fn drop(&mut self) {
-            self.0.fetch_sub(self.1, Ordering::SeqCst);
-        }
-    }
-    impl ConnectorPayloadByteBudget for FixtureByteAuthor {
-        fn reserve_bytes(
-            &self,
-            bytes: usize,
-        ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
-            self.0.fetch_add(bytes, Ordering::SeqCst);
-            Ok(ConnectorPayloadRetentionGuard::new(FixtureByteReceipt(
-                Arc::clone(&self.0),
-                bytes,
-            )))
-        }
-    }
     let live = Arc::new(AtomicUsize::new(0));
     let author = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(FixtureByteAuthor(
         Arc::clone(&live),

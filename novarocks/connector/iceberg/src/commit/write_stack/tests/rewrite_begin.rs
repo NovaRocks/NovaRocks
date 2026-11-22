@@ -16,7 +16,10 @@
 // under the License.
 
 use super::*;
-use crate::commit::write_stack::control::{IcebergWriteSessionControl, selected_rewrite_files};
+use crate::commit::write_stack::control::{
+    IcebergWriteSessionControl, selected_rewrite_files, validate_context,
+};
+use crate::commit::write_stack::test_support::FixtureByteAuthor;
 use crate::distributed_rewrite::FrozenRewritePlanContent;
 use novarocks_failure_contract::{
     FailureProjection, connector_reason::ICEBERG_COMMIT_VALIDATION_CONFLICT,
@@ -25,7 +28,37 @@ use novarocks_spi::connector::write_stack::{
     ConnectorWriteAbortProduction, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
     ConnectorWriteSessionAbortRequest,
 };
-use novarocks_spi::connector::{ConnectorMutationFailureKind, ConnectorWriteIntent};
+use novarocks_spi::connector::{
+    ConnectorMutationFailureKind, ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck,
+    ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard, ConnectorProcessLocalPayload,
+    ConnectorWriteIntent, OriginalResultCheckClass, OriginalResultCheckError,
+};
+
+struct OriginalRewriteFixture {
+    context: ConnectorRequestContext,
+    bytes: FixtureByteAuthor,
+}
+
+impl ConnectorOriginalResultScopeCheck for OriginalRewriteFixture {
+    fn original_deadline(&self) -> Instant {
+        self.context.deadline()
+    }
+
+    fn check_active(&self) -> Result<(), OriginalResultCheckError> {
+        validate_context(&self.context).map_err(|error| {
+            OriginalResultCheckError::new(OriginalResultCheckClass::Control, error)
+        })
+    }
+}
+
+impl ConnectorPayloadByteBudget for OriginalRewriteFixture {
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+        self.bytes.reserve_bytes(bytes)
+    }
+}
 
 fn seed_two_files(lake: &FrozenRewriteLake) {
     lake.write_rows(ConnectorWriteIntent::Append, &[1], "first");
@@ -138,7 +171,33 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_validates_the_current_bas
         let base = lake.table();
         let current_parent = base.metadata().current_snapshot_id();
         let before_begin = lake.inventory();
-        let session = lake.control.begin_write(lake.request(&plan)).unwrap();
+        let mut begin = lake.request(&plan);
+        let context = begin.context.clone();
+        let capture = ConnectorOriginalResultScope::from_budgeted_original(Arc::new(
+            OriginalRewriteFixture {
+                context: context.clone(),
+                bytes: FixtureByteAuthor(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            },
+        ));
+        // Model the original snapshot retention handed over by scoped planning.
+        let content = Arc::new(FrozenRewritePlanContent {
+            removal_retention: Some(Arc::new(capture.retention_guard())),
+            ..content.as_ref().clone()
+        });
+        begin.flavor = ConnectorWriteSessionFlavor::DistributedRewrite {
+            shape: plan.shape(),
+            frozen: ConnectorProcessLocalPayload::new(
+                lake.control.binding_key().clone(),
+                Arc::clone(&content),
+            ),
+        };
+        let session = lake
+            .executor
+            .block_on(
+                lake.control
+                    .begin_rewrite_with_scope_for_test(begin, &capture),
+            )
+            .unwrap();
         assert_eq!(lake.inventory(), before_begin);
         assert_eq!(session.targets().len(), plan.cohorts().len());
         let [target] = session.targets() else {
@@ -177,7 +236,7 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_validates_the_current_bas
                 row_count,
                 statistics: Vec::new(),
                 publication: ConnectorWriteFinishPublication::None,
-                context: request_context(),
+                context: context.clone(),
             })
         };
         if concurrent.is_none() {

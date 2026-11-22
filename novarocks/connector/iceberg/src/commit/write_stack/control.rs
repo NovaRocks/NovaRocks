@@ -262,6 +262,16 @@ impl IcebergWriteSessionControl {
         &self.adapter
     }
 
+    #[cfg(test)]
+    pub(super) async fn begin_rewrite_with_scope_for_test(
+        &self,
+        request: ConnectorWriteBeginRequest,
+        capture: &novarocks_spi::connector::ConnectorOriginalResultScope,
+    ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
+        self.begin_write_original_with_rewrite_scope(request, Some(capture))
+            .await
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
         mut self,
