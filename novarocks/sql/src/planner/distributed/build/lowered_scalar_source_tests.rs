@@ -25,7 +25,10 @@ use crate::planner::distributed::build::lowered_draft::{
 use crate::planner::payload::PlanProjectNode;
 use arrow::array::{Array, StringArray};
 use novarocks_constant_contract::ConstantPool;
-use novarocks_functions::{FunctionArgument, FunctionResultType};
+use novarocks_functions::{
+    FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionKind,
+    FunctionResultType,
+};
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Mutex;
 
@@ -151,29 +154,201 @@ pub(in crate::planner::distributed::build) fn lower_draft_with_control(
     )
 }
 
-pub(in crate::planner::distributed::build) fn analyzed_lambda_expression_for_test() -> TypedExpr {
-    // The real analyzer supplies the selected Lambda and LOWER declarations.
-    // This emitter fixture does not assert an installed ARRAY_MAP pure kernel
-    // or bypass the public compiler's implementation-presence admission.
-    let query = &novarocks_parser::parser::parse_query(
-        "SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped",
-    )
-    .unwrap();
+// Exercise the pre-admission emitter with a metadata-only function. The public
+// higher-order catalogue deliberately cannot author a typed lambda body yet.
+pub(in crate::planner::distributed::build) const LAMBDA_FIXTURE_ID: &str =
+    "test.scalar/lambda_source/v1";
+pub(in crate::planner::distributed::build) const LAMBDA_FIXTURE_OVERLOAD: &str =
+    "test.scalar/lambda_source/lambda-v1";
+const LAMBDA_FIXTURE_NAME: &str = "__test_lambda_source";
+
+struct LambdaFixtureResolver;
+
+impl novarocks_functions::FunctionBindingResolver for LambdaFixtureResolver {
+    fn resolve(
+        &self,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<novarocks_functions::FunctionBindingSelection, FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 1)?;
+        let [
+            lambda @ FunctionArgument::Lambda { result_type, .. },
+            array @ FunctionArgument::Value { value_type, .. },
+        ] = request.arguments
+        else {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        };
+        if !matches!(value_type.data_type(), DataType::List(_))
+            || request.logical_argument_count != 2
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        let result = ValueType::new(
+            DataType::List(Arc::new(result_type.try_to_field("item").unwrap())),
+            value_type.nullable(),
+        );
+        Ok(novarocks_functions::FunctionBindingSelection {
+            overload: novarocks_type_contract::FunctionOverloadId::try_new(LAMBDA_FIXTURE_OVERLOAD)
+                .unwrap(),
+            argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                vec![lambda.argument_type(), array.argument_type()].into_boxed_slice(),
+            ),
+            result_type: FunctionResultType::Scalar(result),
+            aggregate: None,
+        })
+    }
+
+    fn select_at_overload_observed(
+        &self,
+        overload: &novarocks_type_contract::FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<novarocks_functions::FunctionBindingSelection, FunctionBindingError> {
+        if overload.as_str() != LAMBDA_FIXTURE_OVERLOAD {
+            return Err(FunctionBindingError::UnknownOverload(overload.clone()));
+        }
+        self.resolve(request, control)
+    }
+
+    fn validate_selected(
+        &self,
+        selected: &novarocks_functions::FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        if &self.select_at_overload_observed(&selected.overload, request, control)? != selected {
+            return Err(FunctionBindingError::InvalidBinding(
+                "selected lambda fixture binding changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(in crate::planner::distributed::build) fn lambda_fixture_catalog()
+-> Arc<novarocks_functions::EngineFunctionCatalog> {
+    use novarocks_functions::{
+        EngineFunctionCatalogBuilder, FunctionArgumentEvaluation, FunctionBindingDeclaration,
+        FunctionDefinition, FunctionFailureBehavior, FunctionOverloadDeclaration,
+        FunctionSemantics, FunctionVisibility, FunctionVolatility,
+    };
+    static CATALOG: std::sync::OnceLock<Arc<novarocks_functions::EngineFunctionCatalog>> =
+        std::sync::OnceLock::new();
+    CATALOG
+        .get_or_init(|| {
+            let mut builder = EngineFunctionCatalogBuilder::new();
+            crate::functions::contribute_builtin_functions(&mut builder).unwrap();
+            let declaration = FunctionBindingDeclaration::try_new(
+                novarocks_type_contract::FunctionId::try_new(LAMBDA_FIXTURE_ID).unwrap(),
+                FunctionKind::Scalar,
+                [FunctionOverloadDeclaration {
+                    identity: novarocks_type_contract::FunctionOverloadId::try_new(
+                        LAMBDA_FIXTURE_OVERLOAD,
+                    )
+                    .unwrap(),
+                    argument_pattern: "(function(T,U),array(T))".into(),
+                    result_pattern: "array(U)".into(),
+                    semantics: FunctionSemantics {
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise,
+                    },
+                    effects: None,
+                    aggregate: None,
+                }],
+            )
+            .unwrap();
+            builder
+                .register(
+                    FunctionDefinition::try_new_bound(
+                        LAMBDA_FIXTURE_NAME,
+                        FunctionVisibility::Hidden,
+                        declaration,
+                        Arc::new(LambdaFixtureResolver),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            Arc::new(builder.seal_bound().unwrap())
+        })
+        .clone()
+}
+
+fn bound_lambda_fixture(
+    lambda: TypedExpr,
+    array: TypedExpr,
+    decimal: DecimalOverflowPolicy,
+) -> TypedExpr {
+    let expressions = vec![lambda, array];
+    let control = Control::default();
+    let arguments = expressions
+        .iter()
+        .map(|expression| {
+            crate::analysis::function_argument(expression, policy(), &control).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let resolved = lambda_fixture_catalog()
+        .resolve_bound_trusted(
+            LAMBDA_FIXTURE_NAME,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                logical_argument_count: arguments.len(),
+                arguments: &arguments,
+                expected_result_type: None,
+            },
+            &control,
+        )
+        .unwrap();
+    let FunctionResultType::Scalar(value_type) = &resolved.selected.result_type else {
+        panic!("lambda fixture scalar result");
+    };
+    TypedExpr {
+        value_type: value_type.clone(),
+        kind: ExprKind::FunctionCall {
+            name: LAMBDA_FIXTURE_NAME.into(),
+            args: expressions.into(),
+            distinct: false,
+            volatility: resolved.semantics.volatility,
+            binding: SqlFunctionBinding::new(resolved, decimal),
+        },
+    }
+}
+
+pub(in crate::planner::distributed::build) fn lower_lambda_fixture() -> TypedExpr {
+    let query = novarocks_parser::parser::parse_query("SELECT ARRAY['AA','BB']").unwrap();
     let (query, _, _) = crate::analyzer::analyze(
-        query,
+        &query,
         &crate::catalog::memory::PlannerMemoryCatalog::default(),
         "default",
     )
     .unwrap();
     let crate::analysis::QueryBody::Select(select) = query.body else {
-        panic!("Lambda projection")
+        panic!("source array projection");
     };
-    select.projection.into_iter().next().unwrap().expr
-}
-
-pub(in crate::planner::distributed::build) fn authored_lambda_source_for_test()
--> SqlAuthoredPhysicalPlan {
-    authored(analyzed_lambda_expression_for_test())
+    let array = select.projection.into_iter().next().unwrap().expr;
+    let parameter_type = array.value_type.child_at(0).unwrap();
+    let parameter = TypedExpr {
+        kind: ExprKind::LambdaParamRef {
+            name: "x".into(),
+            slot_id: 1,
+        },
+        value_type: parameter_type.clone(),
+    };
+    let decimal = DecimalOverflowPolicy::OutputNull;
+    let lambda = TypedExpr {
+        kind: ExprKind::LambdaFunction {
+            params: vec![crate::analysis::LambdaParam {
+                name: "x".into(),
+                slot_id: 1,
+                value_type: parameter_type,
+            }],
+            body: lower_call(parameter, decimal).into(),
+        },
+        value_type: ValueType::new(DataType::Null, true),
+    };
+    bound_lambda_fixture(lambda, array, decimal)
 }
 
 pub(in crate::planner::distributed::build) fn scalar_source(

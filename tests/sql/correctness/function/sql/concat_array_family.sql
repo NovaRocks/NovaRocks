@@ -35,3 +35,14 @@ WITH q(l) AS (VALUES CAST(ARRAY[] AS ARRAY(VARCHAR)))
 SELECT l, ARRAY[concat('a',l), concat('b',l)] AS nested FROM q;
 -- query 8
 SELECT concat(CAST(9223372036854775807 AS BIGINT), CAST(ARRAY[1] AS ARRAY(BIGINT))) AS exact_integer;
+
+-- query 9
+SELECT concat(ARRAY[CAST(1 AS INTEGER)], ARRAY[CAST(2147483648 AS BIGINT)]) AS combined,
+       concat(CAST(1 AS INTEGER), ARRAY[CAST(2147483648 AS BIGINT)]) AS prepended,
+       concat(ARRAY[CAST(1 AS INTEGER)], CAST(2147483648 AS BIGINT)) AS appended;
+-- query 10
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT concat(ARRAY['a'], ARRAY[1]);
+-- query 11
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT concat(ARRAY['a'], MAP(ARRAY[1], ARRAY[2]));

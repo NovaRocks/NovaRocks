@@ -291,7 +291,7 @@ fn installed_exact_scalar_owners_reauthor_nullable_numeric_text_calendar_and_col
         assert_eq!(selected.argument_types.as_ref(), &[late.argument_type()]);
         assert_eq!(
             selected.result_type,
-            FunctionResultType::Scalar(FunctionValueType::new(DataType::Int32, true))
+            FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, true))
         );
     }
 }

@@ -368,16 +368,23 @@ mod scalar_domain_tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
-        let bound = super::super::resolve_expr::resolved_scalar_call_at(
-            context.function_catalog,
-            "row",
-            vec![value],
-            Span::new(0, 0),
-            context.sql_semantics.sql_mode().decimal_overflow_policy(),
-            context.constant_policy,
-            context.control,
-        )
-        .unwrap();
+        let call = context
+            .type_scalar_call(
+                novarocks_expression::typing::NodeShape::Row,
+                vec![value],
+                Span::new(0, 0),
+            )
+            .unwrap();
+        let bound = TypedExpr {
+            value_type: call.value_type().clone(),
+            kind: ExprKind::FunctionCall {
+                name: "row".to_owned(),
+                args: call.args.into(),
+                distinct: false,
+                volatility: call.binding.semantics.volatility,
+                binding: call.binding,
+            },
+        };
         (context, scope, bound)
     }
     fn typed_list_source(json: bool, item_nullable: bool) -> TypedExpr {
@@ -1010,7 +1017,7 @@ mod scalar_domain_tests {
         }
         // A NULL default cannot erase a known sibling in a partial Struct or
         // a nested Map value. SqlType has no complete Null-bearing counterpart.
-        let sql = "with q as (select row(null,map('k',b)) as r from t) select lead(r,1,null) over (),lag(r,1,null) over () from q";
+        let sql = "with q as (select row(null,map(ARRAY['k'],ARRAY[b])) as r from t) select lead(r,1,null) over (),lag(r,1,null) over () from q";
         for expression in output_expressions(sql) {
             let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
                 unreachable!()

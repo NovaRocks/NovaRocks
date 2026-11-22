@@ -7779,7 +7779,7 @@ mod tests {
         let ExprKind::FunctionCall { name, .. } = &expr.kind else {
             panic!("bitnot must keep the original nonliteral NULL argument");
         };
-        assert_eq!(name, "__array_element_at");
+        assert_eq!(name, "element_at");
     }
 
     fn named_bitnot_operand(expression: &TypedExpr) -> &TypedExpr {
@@ -9295,6 +9295,7 @@ mod tests {
                 "SELECT concat(CAST(9223372036854775807 AS BIGINT), CAST(ARRAY[1] AS ARRAY(BIGINT)))",
                 &[false, true][..],
             ),
+            ("SELECT concat(1, ARRAY[2147483648])", &[false, true][..]),
         ] {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
@@ -9339,9 +9340,17 @@ mod tests {
 
     #[test]
     fn concat_array_incompatible_domain_fails_without_stringification() {
-        let error = analyze_projection_expr("SELECT concat(ARRAY['a'], map(ARRAY[1], ARRAY[2]))")
-            .expect_err("incompatible array item shapes must fail during binding");
-        assert!(error.contains("concat"), "{error}");
+        for sql in [
+            "SELECT concat(ARRAY['a'], map(ARRAY[1], ARRAY[2]))",
+            "SELECT concat(ARRAY['a'], ARRAY[1])",
+            "SELECT concat(ARRAY[1], ARRAY['a'])",
+            "SELECT concat(ARRAY['a'], 1)",
+            "SELECT concat(1, ARRAY['a'])",
+        ] {
+            let error = analyze_projection_expr(sql)
+                .expect_err("incompatible array item shapes must fail during binding");
+            assert!(error.contains("concat"), "{sql}: {error}");
+        }
         assert!(analyze_projection_expr("SELECT concat('a', ARRAY['b'], 'c')").is_err());
     }
 
@@ -9707,7 +9716,7 @@ mod tests {
     #[test]
     fn non_array_nested_report_decimal_numeric_cast_is_rejected_with_the_original_sql_span() {
         for sql in [
-            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(CAST(map(1,1) AS MAP<INT,DECIMAL(4,0)>) AS MAP<INT,DECIMAL(3,0)>)",
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(CAST(map(ARRAY[1],ARRAY[1]) AS MAP<INT,DECIMAL(4,0)>) AS MAP<INT,DECIMAL(3,0)>)",
             "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(CAST(ROW(1) AS ROW(a DECIMAL(4,0))) AS ROW(a DECIMAL(3,0)))",
         ] {
             let query = &novarocks_parser::parser::parse_query(sql).unwrap();
@@ -9790,12 +9799,9 @@ mod tests {
     }
     #[test]
     fn unavailable_builtin_is_explicitly_rejected_before_false_filter_pruning() {
-        for sql in [
-            "select array_reverse([1,2]) where false",
-            "select array_to_string([1,2], ',') where false",
-            "select isnull(1) where false",
-            "select cosh(1) where false",
-        ] {
+        let error = analyze_projection_expr("select reverse(ARRAY[1,2]) where false").unwrap_err();
+        assert!(error.contains("builtin.scalar/reverse/(list"), "{error}");
+        for sql in ["select isnull(1) where false", "select cosh(1) where false"] {
             let error = analyze_projection_expr(sql).unwrap_err();
             assert!(
                 error.contains("no admitted selected scalar implementation"),
@@ -9803,6 +9809,8 @@ mod tests {
             );
         }
         for sql in [
+            "select array_reverse([1,2]) where false",
+            "select array_to_string([1,2], ',') where false",
             "select next_day('2020-01-01') where false",
             "select next_day(cast('2020-01-01' as date), 'Monday') where false",
         ] {

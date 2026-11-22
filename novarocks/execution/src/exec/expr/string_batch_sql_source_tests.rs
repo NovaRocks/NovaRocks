@@ -36,7 +36,7 @@ const INTEGER_SQL: &str = include_str!(concat!(
 // These two members share the complete existing measurement family. They are
 // explicit source probes, not additional owners or inferred corpus coverage.
 const REMAINING_MEASUREMENT: &str = "SELECT ascii('A') AS a, char_length('é') AS n";
-pub(super) const NAMES: [&str; 6] = ["ascii", "length", "char_length", "repeat", "lpad", "rpad"];
+pub(super) const NAMES: [&str; 5] = ["ascii", "length", "char_length", "lpad", "rpad"];
 pub(super) fn calls(index: usize) -> Vec<(String, ResolvedFunctionBinding)> {
     let sql = [LENGTH_SQL, INTEGER_SQL, REMAINING_MEASUREMENT][index];
     let owner = sql_source(sql, DataType::Int64);

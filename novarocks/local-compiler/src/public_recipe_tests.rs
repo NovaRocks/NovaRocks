@@ -353,7 +353,7 @@ fn public_wrappers_preserve_each_family_unsupported_and_type_mismatch() {
     let nested = FunctionValueType::new(
         DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
-            DataType::Int64,
+            DataType::Float32,
             true,
         ))),
         true,
@@ -455,7 +455,7 @@ fn frozen_program_refusals_keep_the_exact_public_wrapper_refusal() {
     let nested = FunctionValueType::new(
         DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
-            DataType::Int64,
+            DataType::Float32,
             true,
         ))),
         true,

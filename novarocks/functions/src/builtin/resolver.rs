@@ -943,10 +943,11 @@ mod tests {
                 ],
             ),
             (
-                "array_slice",
+                "slice",
                 vec![
                     FunctionValueType::new(list_of(DataType::Int32), true),
                     FunctionValueType::new(DataType::Int32, false),
+                    FunctionValueType::new(DataType::Int64, true),
                 ],
             ),
             (

@@ -6466,7 +6466,7 @@ mod tests {
 
     #[test]
     fn test_group_concat_rejects_map_input() {
-        let err = parse_raw_and_analyze("SELECT group_concat(map(2,3)) FROM orders")
+        let err = parse_raw_and_analyze("SELECT group_concat(map(ARRAY[2],ARRAY[3])) FROM orders")
             .expect_err("group_concat should reject map input");
         assert!(
             err.contains(

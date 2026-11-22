@@ -19,13 +19,32 @@
 
 #[cfg(test)]
 mod tests {
-    use novarocks_functions::builtin::intrinsic::{
-        BuiltinDisposition, builtin_disposition, builtin_dispositions,
+    use novarocks_functions::{
+        FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionKind,
+        FunctionValueType,
+        builtin::{
+            collection_lambda,
+            intrinsic::{BuiltinDisposition, builtin_disposition, builtin_dispositions},
+        },
     };
     use std::collections::BTreeSet;
 
     #[test]
     fn every_declared_builtin_has_one_explicit_disposition_and_unknown_has_none() {
+        let catalog = super::super::build_builtin_engine_function_catalog().unwrap();
+        let collection_lambdas = catalog
+            .definitions()
+            .iter()
+            .filter(|definition| definition.kind() == FunctionKind::Scalar)
+            .filter_map(|definition| {
+                let signature = collection_lambda::signature(definition.canonical_name())?;
+                let declaration = definition.binding_declaration()?;
+                declaration
+                    .overloads()
+                    .iter()
+                    .any(|overload| overload.identity == signature.overload())
+                    .then_some(definition.canonical_name().to_owned())
+            });
         let mut declared = novarocks_functions::builtin::registry::builtin_scalar_declarations()
             .into_iter()
             .map(|(name, _)| name)
@@ -34,6 +53,7 @@ mod tests {
                     .iter()
                     .map(|name| (*name).to_owned()),
             )
+            .chain(collection_lambdas)
             .collect::<BTreeSet<_>>();
         // The retired registry spelling still has a SQL diagnostic disposition.
         assert!(declared.insert("negative".to_owned()));
@@ -58,7 +78,7 @@ mod tests {
 
     #[test]
     fn unavailable_and_lowered_builtins_have_no_selected_scalar_binding() {
-        use novarocks_functions::{FunctionBindingError, FunctionBindingRequest, FunctionKind};
+        use arrow::datatypes::DataType;
         let catalog = super::super::build_builtin_engine_function_catalog().unwrap();
         for (name, disposition) in builtin_dispositions() {
             if matches!(
@@ -68,20 +88,54 @@ mod tests {
                     | BuiltinDisposition::AggregateBoundary
                     | BuiltinDisposition::WindowBoundary
             ) {
-                assert_eq!(
-                    catalog.resolve_bound_user(
+                let control = crate::compiler::SqlCompileControl::unbounded();
+                let empty = catalog.resolve_bound_user(
+                    name,
+                    FunctionKind::Scalar,
+                    FunctionBindingRequest {
+                        expected_result_type: None,
+                        arguments: &[],
+                        logical_argument_count: 0,
+                    },
+                    &control,
+                );
+                if let Some(signature) = collection_lambda::signature(name) {
+                    assert_eq!(
+                        empty,
+                        Err(FunctionBindingError::NoMatchingOverload),
+                        "{name}"
+                    );
+                    let value = FunctionValueType::new(DataType::Null, true);
+                    let arguments = [
+                        FunctionArgument::Value {
+                            value_type: value.clone(),
+                            constant: None,
+                        },
+                        FunctionArgument::Lambda {
+                            parameter_types: vec![value; signature.arity()].into(),
+                            result_type: FunctionValueType::new(DataType::Boolean, true),
+                        },
+                    ];
+                    let binding = catalog.resolve_bound_user(
                         name,
                         FunctionKind::Scalar,
                         FunctionBindingRequest {
                             expected_result_type: None,
-                            arguments: &[],
-                            logical_argument_count: 0
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len(),
                         },
-                        &crate::compiler::SqlCompileControl::unbounded()
-                    ),
-                    Err(FunctionBindingError::UnknownFunction),
-                    "{name}"
-                );
+                        &control,
+                    );
+                    assert_eq!(
+                        binding,
+                        Err(FunctionBindingError::UnavailableImplementation(
+                            signature.overload()
+                        )),
+                        "{name}"
+                    );
+                } else {
+                    assert_eq!(empty, Err(FunctionBindingError::UnknownFunction), "{name}");
+                }
             }
         }
         assert!(

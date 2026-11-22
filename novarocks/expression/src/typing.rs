@@ -230,6 +230,7 @@ pub struct ValueDomainConversion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueConversionOrigin {
     ValueDomain,
+    ArrayCommonCoercion,
     OperatorDecimalFloat,
 }
 
@@ -551,6 +552,9 @@ fn type_selected_call(
     check_shape(&binding, children.len())?;
     let arithmetic = OperatorFunction::from_function_id(&binding.function_id)
         .is_some_and(|operator| operator.arithmetic().is_some());
+    let array_concat = binding.function_id.as_str() == "builtin.scalar/concat/v1"
+        && matches!(&binding.selected.result_type, FunctionResultType::Scalar(result)
+            if matches!(result.data_type(), DataType::List(_)));
     let conversions = binding
         .selected
         .argument_types
@@ -562,6 +566,9 @@ fn type_selected_call(
                     "selected scalar expects a lambda argument",
                 ));
             };
+            if array_concat && matches!(target.data_type(), DataType::List(_)) {
+                return conversion::array_common(context, child, target, work);
+            }
             if arithmetic
                 && matches!(child.value_type.data_type(), DataType::Decimal128(..))
                 && matches!(target.data_type(), DataType::Float32 | DataType::Float64)

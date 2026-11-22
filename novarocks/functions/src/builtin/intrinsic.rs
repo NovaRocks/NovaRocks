@@ -84,14 +84,8 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "adddate",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "all_match",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "any_match",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
+    ("all_match", BuiltinDisposition::Unavailable),
+    ("any_match", BuiltinDisposition::Unavailable),
     ("any_value", BuiltinDisposition::AggregateBoundary),
     (
         "approx_count_distinct",
@@ -429,6 +423,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "exp",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
+    ("filter", BuiltinDisposition::Unavailable),
     ("first_value", BuiltinDisposition::WindowBoundary),
     (
         "flatten",
@@ -961,14 +956,9 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("to_json", BuiltinDisposition::Unavailable),
     ("to_unix_timestamp", BuiltinDisposition::Unavailable),
-    (
-        "transform_keys",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    (
-        "transform_values",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
+    ("transform", BuiltinDisposition::Unavailable),
+    ("transform_keys", BuiltinDisposition::Unavailable),
+    ("transform_values", BuiltinDisposition::Unavailable),
     (
         "translate",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),

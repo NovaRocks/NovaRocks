@@ -441,9 +441,9 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
     let (window_source, _) = relational::window_fixture(vec![relational::integer(7)], vec![order]);
     for (source, window, overload) in [
         (
-            plan(scalar::analyzed_lambda_expression_for_test()),
+            plan(scalar::lower_lambda_fixture()),
             false,
-            "builtin.scalar/array_map/dynamic-v1",
+            scalar::LAMBDA_FIXTURE_OVERLOAD,
         ),
         (
             window_source,
@@ -458,7 +458,11 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
             version(),
             dop(),
             None,
-            crate::functions::builtin_sql_function_catalog().snapshot(),
+            if window {
+                crate::functions::builtin_sql_function_catalog().snapshot()
+            } else {
+                scalar::lambda_fixture_catalog()
+            },
             false,
             scalar::policy(),
             &control,

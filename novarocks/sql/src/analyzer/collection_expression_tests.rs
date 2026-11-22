@@ -303,19 +303,67 @@ fn root_null_keeps_the_explicit_array_boundary_and_original_null_source() {
 }
 
 #[test]
-fn map_literals_keep_the_existing_alternating_argument_binding() {
+fn map_constructor_keeps_its_exact_overload_and_ordered_array_sources() {
+    use crate::analysis::ExprKind;
+    use novarocks_functions::{FunctionArgumentType, FunctionResultType};
+
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for (literal, call) in [
-        ("SELECT map()", "SELECT map()"),
-        ("SELECT map(1,'one',2,'two')", "SELECT map(1,'one',2,'two')"),
+    for (sql, overload, sources, child_types) in [
+        (
+            "SELECT map()",
+            "builtin.scalar/map/empty-v1",
+            &[][..],
+            [DataType::Null, DataType::Null],
+        ),
+        (
+            "SELECT map(ARRAY[1, 2], ARRAY['one', 'two'])",
+            "builtin.scalar/map/array-keys-array-values-v1",
+            &["SELECT ARRAY[1, 2]", "SELECT ARRAY['one', 'two']"][..],
+            [DataType::Int32, DataType::Utf8],
+        ),
     ] {
-        let literal = ctx
-            .analyze_expr(projection(&query(literal)), &scope)
-            .unwrap();
-        let call = ctx.analyze_expr(projection(&query(call)), &scope).unwrap();
-        same_typed(&literal, &call, &control);
+        let actual = ctx.analyze_expr(projection(&query(sql)), &scope).unwrap();
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = &actual.kind
+        else {
+            panic!("selected MAP constructor");
+        };
+        assert_eq!(name, "map");
+        assert_eq!(binding.function_id.as_str(), "builtin.scalar/map/v1");
+        assert_eq!(binding.selected.overload.as_str(), overload);
+        assert_eq!(args.len(), sources.len());
+        assert_eq!(binding.selected.argument_types.len(), sources.len());
+        for ((argument, selected), source) in args
+            .iter()
+            .zip(binding.selected.argument_types.iter())
+            .zip(sources)
+        {
+            let original = ctx
+                .analyze_expr(projection(&query(source)), &scope)
+                .unwrap();
+            same_typed(argument, &original, &control);
+            assert_eq!(
+                selected,
+                &FunctionArgumentType::Value(argument.value_type.clone())
+            );
+        }
+        assert_eq!(
+            binding.selected.result_type,
+            FunctionResultType::Scalar(actual.value_type.clone())
+        );
+        assert!(matches!(actual.value_type.data_type(), DataType::Map(..)));
+        for (index, data_type) in child_types.iter().enumerate() {
+            assert_eq!(
+                actual.value_type.child_at(index).unwrap().data_type(),
+                data_type
+            );
+        }
     }
 }
 
@@ -724,9 +772,12 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for sql in [
-        "SELECT ROW(7)",
-        "SELECT ROW(CAST(1.25 AS DECIMAL(5,2)), [1, NULL])",
+    for (sql, type_name) in [
+        ("SELECT ROW(7)", "struct<col1 int>"),
+        (
+            "SELECT ROW(CAST(1.25 AS DECIMAL(5,2)), [1, NULL])",
+            "struct<col1 decimal128(5, 2), col2 array<int>>",
+        ),
     ] {
         let parsed = query(sql);
         let ast::Expr::Row(row) = projection(&parsed) else {
@@ -743,8 +794,11 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
                 .collect(),
         );
         let actual = ctx.analyze_expr(projection(&parsed), &scope).unwrap();
-        let expected = ctx.analyze_expr(&ordinary, &scope).unwrap();
-        same_typed(&actual, &expected, &control);
+        let error = ctx.analyze_expr(&ordinary, &scope).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction
+        );
         let ExprKind::FunctionCall {
             name,
             binding,
@@ -755,7 +809,25 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
             panic!("row binding");
         };
         assert_eq!(name, "row");
+        assert_eq!(binding.function_id.as_str(), "builtin.scalar/row/v1");
+        assert_eq!(
+            binding.selected.overload.as_str(),
+            "builtin.scalar/row/dynamic-v1"
+        );
         assert_eq!(args.len(), row.fields.len());
+        assert_eq!(binding.selected.argument_types.len(), row.fields.len());
+        for ((argument, field), selected) in args
+            .iter()
+            .zip(&row.fields)
+            .zip(binding.selected.argument_types.iter())
+        {
+            let original = ctx.analyze_expr(&field.expression, &scope).unwrap();
+            same_typed(argument, &original, &control);
+            assert_eq!(
+                selected,
+                &novarocks_functions::FunctionArgumentType::Value(argument.value_type.clone())
+            );
+        }
         let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
         else {
             panic!("scalar");
@@ -777,8 +849,14 @@ fn anonymous_row_uses_original_scalar_binding_and_named_fields_refuse_directly()
         let inspected = ctx
             .analyze_expr(&typeof_call(projection(&parsed).clone()), &scope)
             .unwrap();
-        let legacy_inspected = ctx.analyze_expr(&typeof_call(ordinary), &scope).unwrap();
-        same_typed(&inspected, &legacy_inspected, &control);
+        assert_eq!(
+            inspected.value_type,
+            novarocks_functions::FunctionValueType::new(DataType::Utf8, false)
+        );
+        assert!(matches!(
+            inspected.kind,
+            ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == type_name
+        ));
     }
     let names = ctx
         .analyze_query(&query("SELECT ROW(7), map(), ROW(7) AS Kept"))

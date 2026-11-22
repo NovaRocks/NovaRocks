@@ -37,10 +37,10 @@ use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
 use novarocks_functions::{
-    EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest, FunctionId,
-    FunctionKind, FunctionOverloadId, InstalledPureKernel, KernelFailure,
-    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
-    ScalarInvocationActivation, ScalarInvocationScope, Selection,
+    EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind, FunctionOverloadId,
+    InstalledPureKernel, KernelFailure, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi, ScalarInvocationActivation, ScalarInvocationScope,
+    Selection,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
@@ -566,55 +566,8 @@ enum Shape {
     CastFromBase64,
     ConcatFromBase64,
 }
-fn base64_catalogue() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    let mut installed = vec![];
-    for name in ["to_base64", "from_base64", "concat"] {
-        let args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(DataType::Utf8, true),
-            constant: None,
-        }];
-        let selected = actual
-            .resolve_bound_user(
-                name,
-                FunctionKind::Scalar,
-                FunctionBindingRequest {
-                    arguments: &args,
-                    logical_argument_count: 1,
-                    expected_result_type: None,
-                },
-                &Control,
-            )
-            .unwrap();
-        builder
-            .register(
-                actual
-                    .definition(name, FunctionKind::Scalar)
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap();
-        installed.push(InstalledPureKernel {
-            function: selected.function_id,
-            kind: FunctionKind::Scalar,
-            implementation: PureImplementationDeclaration {
-                overload: selected.selected.overload,
-                implementation: PureImplementationId::try_new(format!(
-                    "builtin.scalar/{name}/selected-v1"
-                ))
-                .unwrap(),
-                abi: PureKernelAbi::ScalarV1,
-            },
-            aggregate_state_format: None,
-        });
-    }
-    builder.seal_pure(installed).unwrap()
-}
-
 fn base64_program(shape: Shape) -> Program {
-    let functions = base64_catalogue();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let value = ValueId::new(91);
     let parameters = if matches!(shape, Shape::CastFromBase64) {
         SemanticParameters::try_new([(

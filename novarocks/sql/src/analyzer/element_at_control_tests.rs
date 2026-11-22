@@ -376,7 +376,8 @@ fn element_at_type_probe_preserves_selected_unavailable_without_rebinding() {
 #[test]
 fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_guessing() {
     let query = analyze(
-        "SELECT element_at([1,2],1), [1,2][1], element_at(map(1,2),1), map(1,2)[1]",
+        "SELECT element_at([1,2],1), [1,2][1], \
+         element_at(map(ARRAY[1], ARRAY[2]),1), map(ARRAY[1], ARRAY[2])[1]",
         crate::functions::builtin_sql_function_catalog(),
     )
     .unwrap();
@@ -384,24 +385,15 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
         panic!("select");
     };
     let expected = [
-        // Both spellings select the existing INTEGER index overload.
-        (
-            "__array_element_at",
-            DataType::Int32,
-            DataType::Int32,
-            false,
-        ),
-        (
-            "__array_element_at",
-            DataType::Int32,
-            DataType::Int32,
-            false,
-        ),
-        ("__map_element_at", DataType::Int32, DataType::Int32, false),
-        ("__map_element_at", DataType::Int32, DataType::Int32, false),
+        // The public ARRAY call selects BIGINT. The ARRAY subscript and
+        // both probes against MAP(INTEGER, INTEGER) select INTEGER.
+        ("element_at", DataType::Int64),
+        ("__array_element_at", DataType::Int32),
+        ("element_at", DataType::Int32),
+        ("__map_subscript", DataType::Int32),
     ];
     assert_eq!(select.projection.len(), expected.len());
-    for (project, (name, result, index, index_nullable)) in select.projection.iter().zip(expected) {
+    for (project, (name, index)) in select.projection.iter().zip(expected) {
         let ExprKind::FunctionCall {
             name: actual,
             binding,
@@ -424,22 +416,19 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
                 &FunctionArgumentType::Value(argument.value_type.clone())
             );
         }
-        let result = FunctionValueType::new(result, true);
+        let result = FunctionValueType::new(DataType::Int32, true);
         assert_eq!(project.expr.value_type, result);
         assert_eq!(
             binding.selected.result_type,
             FunctionResultType::Scalar(result)
         );
-        assert_eq!(
-            args[1].value_type,
-            FunctionValueType::new(index, index_nullable)
-        );
+        assert_eq!(args[1].value_type, FunctionValueType::new(index, false));
         assert!(
             matches!(
                 args[1].kind,
                 ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
             ),
-            "original INTEGER probe needs no narrowing"
+            "the selected width preserves the original literal value"
         );
         assert!(matches!(args[0].kind, ExprKind::FunctionCall { .. }));
     }

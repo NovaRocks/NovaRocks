@@ -1182,8 +1182,14 @@ impl BuiltinScalarResolver {
         }
         let carriers = ScalarCarriers::from_values(ScalarTypes::from_values(argument_types));
         validate_builtin_selected_domain(&self.canonical_name, carriers, work)?;
-        match self.canonical_name.as_ref() {
-            "contains_sequence" | "arrays_overlap" => {
+        let name = self.canonical_name.as_ref();
+        match name {
+            "contains_sequence" | "arrays_overlap" | "concat"
+                if name != "concat"
+                    || argument_types
+                        .iter()
+                        .any(|value| matches!(value.data_type(), DataType::List(_))) =>
+            {
                 for (original, selected) in request.arguments.iter().zip(argument_types.iter()) {
                     let FunctionArgument::Value { value_type, .. } = original else {
                         return Err(FunctionBindingError::NoMatchingOverload);

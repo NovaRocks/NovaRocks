@@ -323,7 +323,7 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
     // the original root. Do not invent an installed TypeOnly owner or an
     // unrooted definition, which the unit contract would independently reject.
     let query = novarocks_parser::parser::parse_query(
-        "SELECT CASE WHEN FALSE THEN ARRAY_MAP(x -> LOWER(x), ARRAY['AA','BB']) ELSE NULL END AS mapped",
+        "SELECT CASE WHEN FALSE THEN sequence(CAST(1 AS BIGINT), CAST(2 AS BIGINT)) ELSE NULL END AS mapped",
     )
     .unwrap();
     let (query, _, _) = crate::analyzer::analyze(
@@ -383,7 +383,7 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
         .definitions()
         .find(|node| {
             matches!(&node.kind, ContractExprKind::FunctionCall { function, .. }
-            if function.function_id.as_str() == "builtin.scalar/array_map/v1")
+            if function.function_id.as_str() == "builtin.scalar/sequence/v1")
         })
         .expect("the actual emitter retains the runtime-dead original call");
     let original = loan
@@ -391,10 +391,9 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
         .unwrap();
     let canonical = original.canonical_operational().unwrap();
     assert!(canonical.belongs_to(original.captured()));
-    assert_eq!(
-        canonical.selected().overload.as_str(),
-        "builtin.scalar/array_map/dynamic-v1"
-    );
+    let selected = &canonical.selected().overload;
+    assert!(selected.as_str().starts_with("builtin.scalar/sequence/"));
+    assert_eq!(original.captured().request().logical_argument_count, 2);
     let presence = source.functions.snapshot_for_scalar_presence();
     assert!(matches!(
         unit_authorship::admit_scalar_unit_sources_observed(
@@ -402,7 +401,7 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
         ),
         Err(ContractLoweringError::FunctionBinding(
             novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
-        )) if overload.as_str() == "builtin.scalar/array_map/dynamic-v1"
+        )) if overload == selected
     ));
     work.finish().unwrap();
     // The production standalone entry reaches the same original capability
@@ -411,6 +410,6 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
         emit(&expression, &Control::default()),
         Err(ContractLoweringError::FunctionBinding(
             novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
-        )) if overload.as_str() == "builtin.scalar/array_map/dynamic-v1"
+        )) if overload == selected
     ));
 }

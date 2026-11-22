@@ -1328,6 +1328,21 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.original.resolve_scalar_binding(name, args, control)
         }
+        fn finish_scalar_binding(
+            &self,
+            function: &novarocks_functions::FunctionId,
+            overload: &novarocks_functions::FunctionOverloadId,
+            request: novarocks_functions::FunctionBindingRequest<'_>,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<
+            novarocks_functions::ResolvedFunctionBinding,
+            novarocks_functions::FunctionBindingError,
+        > {
+            self.scalar_resolutions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.original
+                .finish_scalar_binding(function, overload, request, control)
+        }
         fn contains_aggregate(&self, name: &str) -> bool {
             self.original.contains_aggregate(name)
         }

@@ -30,10 +30,8 @@ use novarocks_expression::{
 };
 use novarocks_expression_contract::{ExprKind, ValueId};
 use novarocks_functions::{
-    ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind,
-    InstalledPureKernel, KernelEvaluationControl, KernelFailure, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScalarInvocationActivation, ScalarInvocationScope,
-    Selection,
+    ConstantValue, FunctionArgument, KernelEvaluationControl, KernelFailure,
+    ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
 use novarocks_type_contract::{CompilePhase, ControlShape, FunctionValueType};
 use std::{
@@ -51,35 +49,7 @@ fn compiled_slot_program(
     constant: Option<(usize, Option<&str>)>,
     trim_child: bool,
 ) -> StringFixture {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let names = if trim_child {
-        vec![name, "trim"]
-    } else {
-        vec![name]
-    };
-    let mut catalog = EngineFunctionCatalogBuilder::new();
-    let mut installed = vec![];
-    for name in names {
-        let definition = actual.definition(name, FunctionKind::Scalar).unwrap();
-        catalog.register(definition.clone()).unwrap();
-        installed.push(InstalledPureKernel {
-            function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
-            kind: FunctionKind::Scalar,
-            implementation: PureImplementationDeclaration {
-                overload: definition.binding_declaration().unwrap().overloads()[0]
-                    .identity
-                    .clone(),
-                implementation: PureImplementationId::try_new(format!(
-                    "builtin.scalar/{name}/selected-v1"
-                ))
-                .unwrap(),
-                abi: PureKernelAbi::ScalarV1,
-            },
-            aggregate_state_format: None,
-        });
-    }
-    let functions = catalog.seal_pure(installed).unwrap();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let inputs = arrays
         .iter()
         .enumerate()

@@ -182,6 +182,27 @@ fn tvf_real_query_alias_descriptor_and_parameter_children_survive_rendering() {
 }
 
 #[test]
+fn tvf_scalar_subqueries_keep_their_original_query_grouping() {
+    for (source, grouped) in [
+        ("SELECT * FROM TABLE(sequence(stop => (SELECT 3)))", false),
+        ("SELECT * FROM TABLE(f(((SELECT 3))))", true),
+    ] {
+        let original = roundtrip(source);
+        let [argument] = invocation(&original).arguments.as_slice() else {
+            panic!("expected one table function argument: {source}");
+        };
+        let TableFunctionArgumentValue::Expression(Expr::Subquery(subquery)) = &argument.value
+        else {
+            panic!("expected a scalar subquery expression: {source}");
+        };
+        assert!(matches!(
+            (grouped, subquery.query.body.as_ref()),
+            (false, SetExpr::Select(_)) | (true, SetExpr::Query(_))
+        ));
+    }
+}
+
+#[test]
 fn pivot_value_group_cardinality_aliases_names_and_group_by_are_real_fields() {
     let source = "SELECT * FROM (t) PIVOT (? AS \"total\", ? AS mean FOR (\"t\".a,b) IN ((?,?) AS pair, ROW(?,?) AS one) GROUP BY ()) AS p(x,y)";
     let original = roundtrip(source);

@@ -102,6 +102,51 @@ pub(super) fn coerce_argument(
     carrier_or_keep(context.decimal_overflow_policy, child, target, work)
 }
 
+/// Materialize the collection target selected by an exact ARRAY overload.
+pub(super) fn array_common(
+    context: &TypingContext<'_>,
+    child: &ChildTyping,
+    target: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Conversion, TypingError> {
+    use novarocks_functions::builtin::value_conversion::{
+        ARRAY_COMMON_COERCION, VALUE_CONVERSION_FUNCTION_ID,
+    };
+    use novarocks_type_contract::{FunctionId, FunctionOverloadId};
+
+    if same_type(&child.value_type, target, work)? {
+        return Ok(Conversion::Keep);
+    }
+    let function = FunctionId::try_new(VALUE_CONVERSION_FUNCTION_ID)
+        .expect("valid builtin value conversion identity");
+    let overload = FunctionOverloadId::try_new(ARRAY_COMMON_COERCION)
+        .expect("valid ARRAY common conversion overload identity");
+    let arguments = [child.argument()];
+    work.flush()?;
+    let binding = context.catalog.select_exact_scalar(
+        &function,
+        &overload,
+        super::request(&arguments, Some(target)),
+        work.control(),
+    )?;
+    if binding.function_id != function
+        || binding.selected.overload != overload
+        || !matches!(&binding.selected.result_type, FunctionResultType::Scalar(result)
+            if same_type(result, target, work)?)
+    {
+        return Err(TypingError::InvalidShape(
+            "ARRAY common conversion differs from its exact selected target",
+        ));
+    }
+    Ok(Conversion::ValueDomain(Box::new(ValueDomainConversion {
+        binding,
+        expected_result: target.clone(),
+        target: target.clone(),
+        tail: None,
+        origin: ValueConversionOrigin::ArrayCommonCoercion,
+    })))
+}
+
 /// Convert a Decimal128 operand in an exact floating operator domain.
 pub fn operator_decimal_float(
     context: &TypingContext<'_>,

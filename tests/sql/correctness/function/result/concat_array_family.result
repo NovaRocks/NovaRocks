@@ -37,3 +37,8 @@ l	nested
 -- types	array(bigint)
 exact_integer
 [9223372036854775807,1]
+
+-- query 9
+-- types	array(bigint)	array(bigint)	array(bigint)
+combined	prepended	appended
+[1,2147483648]	[1,2147483648]	[1,2147483648]

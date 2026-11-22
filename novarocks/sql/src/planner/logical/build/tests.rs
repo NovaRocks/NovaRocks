@@ -3487,7 +3487,12 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     assert_m07_planned_domains(
-        "select array_sortby(CAST([] AS ARRAY<json>),[1]) as x,array_sortby(CAST([] AS ARRAY<json>),[1]) as y",
+        "SELECT
+            concat(ARRAY[json_object('k': o_orderkey), json_object('m': o_orderkey)],
+                   ARRAY[json_object('n': o_orderkey), json_object('p': o_orderkey)]) AS x,
+            concat(ARRAY[json_object('k': o_orderkey), json_object('m': o_orderkey)],
+                   ARRAY[json_object('n': o_orderkey), json_object('p': o_orderkey)]) AS y
+         FROM orders",
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     // Exercise the duplicate-ID builder path with an actual analyzer-owned

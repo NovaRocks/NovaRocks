@@ -49,6 +49,56 @@ fn actual_map_key_keeps_original_exact_binding_and_names_uninstalled_key_domain(
     );
 }
 
+#[test]
+fn concat_array_widening_preserves_the_original_common_conversion_in_the_package() {
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION;
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+
+    let fields = [
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Int64, true),
+    ];
+    let authored = try_sql_source_with_declared_fields(
+        "SELECT concat(ARRAY[k, NULL], ARRAY[v]) AS items FROM t",
+        &fields,
+    )
+    .unwrap();
+    let schema = authored.original_public_result_declaration().unwrap();
+    let result = &schema.fields()[0].ty;
+    assert!(!result.nullable());
+    let item = result.child_at(0).expect("concat ARRAY result");
+    assert_eq!(item.data_type(), &DataType::Int64);
+    assert!(item.nullable());
+
+    let mut found = false;
+    for fragment in authored.plan().fragments().values() {
+        for node in fragment.nodes().values() {
+            let Some(unit) = &node.expressions else {
+                continue;
+            };
+            for expression in unit.definitions() {
+                let ExprKind::FunctionCall { function, .. } = &expression.kind else {
+                    continue;
+                };
+                if function.overload.as_str() == ARRAY_COMMON_COERCION
+                    && expression
+                        .ty
+                        .child_at(0)
+                        .is_some_and(|item| item.data_type() == &DataType::Int64)
+                {
+                    found = true;
+                    assert!(!expression.ty.nullable());
+                }
+            }
+        }
+    }
+    assert!(
+        found,
+        "the source ARRAY(INTEGER) uses the installed exact common coercion"
+    );
+}
+
 mod fold_frontiers {
     use crate::fixtures::{analyze_table_free, optimize_table_free, session, table_parent};
     use crate::fold_observation::FoldProbe;
