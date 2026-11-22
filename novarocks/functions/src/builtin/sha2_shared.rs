@@ -84,6 +84,17 @@ fn digest<D: Digest, E>(
     text: &[u8],
     observe: &mut impl FnMut(Observation) -> Result<(), E>,
 ) -> Result<String, E> {
+    let output = digest_bytes::<D, E>(text, observe)?;
+    // Keep the original v1 renderer as the sole author of digest text.
+    let rendered = hex::encode(output);
+    observe(Observation::OpaqueBoundary)?;
+    Ok(rendered)
+}
+
+pub(super) fn digest_bytes<D: Digest, E>(
+    text: &[u8],
+    observe: &mut impl FnMut(Observation) -> Result<(), E>,
+) -> Result<sha2::digest::Output<D>, E> {
     observe(Observation::OpaqueBoundary)?;
     let mut digest = D::new();
     observe(Observation::OpaqueBoundary)?;
@@ -100,10 +111,7 @@ fn digest<D: Digest, E>(
     observe(Observation::OpaqueBoundary)?;
     let output = digest.finalize();
     observe(Observation::OpaqueBoundary)?;
-    // Keep the original v1 renderer as the sole author of digest text.
-    let rendered = hex::encode(output);
-    observe(Observation::OpaqueBoundary)?;
-    Ok(rendered)
+    Ok(output)
 }
 /// Original full-batch result projection over already-evaluated normalized inputs.
 /// Caller length/index panics and the ignored requested carrier remain unchanged.

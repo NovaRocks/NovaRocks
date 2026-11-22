@@ -19,13 +19,31 @@
 use super::string_extended::Row;
 use crate::{KernelFailure, kernel_control::internal, kernel_input::EvaluationCheckpoints};
 use base64::{
-    DecodeSliceError, Engine,
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    DecodeSliceError, Engine, alphabet,
+    engine::{
+        DecodePaddingMode,
+        general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD, STANDARD_NO_PAD},
+    },
 };
+
+mod trino;
+mod trino_owner;
+pub(super) use trino::TrinoByteOp;
+pub(super) use trino_owner::{definition as trino_definition, effects as trino_effects};
+
+// Java's basic decoder accepts omitted final padding and nonzero unused bits.
+// Nonfinal quads cannot contain padding in either decoder.
+const TRINO_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_allow_trailing_bits(true)
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
 // This is the same hex crate parser v1 called through hex::decode. The
 // selected adapter bounds each opaque invocation without introducing a parser.
 fn hex(
-    text: &str,
+    text: &[u8],
     work: &mut EvaluationCheckpoints<'_>,
     mut emit: impl FnMut(u8) -> Result<(), KernelFailure>,
 ) -> Result<bool, KernelFailure> {
@@ -34,7 +52,7 @@ fn hex(
         return Ok(false);
     }
     let mut scratch = [0u8; 128];
-    for chunk in text.as_bytes().chunks(256) {
+    for chunk in text.chunks(256) {
         for _ in chunk {
             work.step()?;
         }
@@ -52,15 +70,13 @@ fn hex(
     Ok(true)
 }
 fn base64(
-    text: &str,
+    text: &[u8],
+    final_engine: &GeneralPurpose,
     work: &mut EvaluationCheckpoints<'_>,
     mut emit: impl FnMut(u8) -> Result<(), KernelFailure>,
 ) -> Result<bool, KernelFailure> {
-    if text.is_empty() {
-        return Ok(false);
-    }
     let mut scratch = [0u8; 192];
-    let chunks = text.as_bytes().chunks(256);
+    let chunks = text.chunks(256);
     let count = chunks.len();
     for (i, chunk) in chunks.enumerate() {
         for _ in chunk {
@@ -68,7 +84,7 @@ fn base64(
         }
         work.flush()?;
         let decoded = if i + 1 == count {
-            STANDARD.decode_slice(chunk, &mut scratch)
+            final_engine.decode_slice(chunk, &mut scratch)
         } else {
             STANDARD_NO_PAD.decode_slice(chunk, &mut scratch)
         };
@@ -105,18 +121,18 @@ pub(super) fn visit(
         return Ok(Row::Value);
     }
     if b64 {
-        if !base64(text, work, |_| Ok(()))? {
+        if text.is_empty() || !base64(text.as_bytes(), &STANDARD, work, |_| Ok(()))? {
             return Ok(Row::Null);
         }
-        if !base64(text, work, &mut emit)? {
+        if !base64(text.as_bytes(), &STANDARD, work, &mut emit)? {
             return Err(internal("binary source changed after validation"));
         }
         return Ok(Row::Value);
     }
-    if !hex(text, work, |_| Ok(()))? {
+    if !hex(text.as_bytes(), work, |_| Ok(()))? {
         return Ok(if unhex { Row::Value } else { Row::Null });
     }
-    if !hex(text, work, &mut emit)? {
+    if !hex(text.as_bytes(), work, &mut emit)? {
         return Err(internal("binary hex source changed after validation"));
     }
 

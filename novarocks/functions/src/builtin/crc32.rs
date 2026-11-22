@@ -209,7 +209,7 @@ impl KernelEvaluationControl for DirectControl {
     }
 }
 
-fn crc32_zlib_observed(
+pub(super) fn crc32_zlib_observed(
     data: &[u8],
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<u32, KernelFailure> {

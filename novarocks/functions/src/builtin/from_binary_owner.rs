@@ -30,7 +30,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-enum Format {
+pub(super) enum Format {
     Hex,
     Base64,
     Utf8,
@@ -45,7 +45,7 @@ impl Format {
         }
     }
 
-    fn output_len(
+    pub(super) fn output_len(
         self,
         bytes: &[u8],
         work: &mut EvaluationCheckpoints<'_>,
@@ -60,7 +60,7 @@ impl Format {
             }
             Self::Utf8 => {
                 let mut length = 0usize;
-                visit_utf8(bytes, work, |chunk| {
+                visit_utf8(bytes, Some("\u{fffd}".as_bytes()), work, |chunk| {
                     length = length
                         .checked_add(chunk.len())
                         .ok_or(KernelFailure::ResourceExhausted)?;
@@ -71,7 +71,7 @@ impl Format {
         }
     }
 
-    fn write(
+    pub(super) fn write(
         self,
         bytes: &[u8],
         work: &mut EvaluationCheckpoints<'_>,
@@ -107,17 +107,20 @@ impl Format {
                     work.flush()?;
                 }
             }
-            Self::Utf8 => visit_utf8(bytes, work, emit)?,
+            Self::Utf8 => {
+                visit_utf8(bytes, Some("\u{fffd}".as_bytes()), work, emit)?;
+            }
         }
         Ok(())
     }
 }
 
-fn visit_utf8(
+pub(super) fn visit_utf8(
     mut bytes: &[u8],
+    replacement: Option<&[u8]>,
     work: &mut EvaluationCheckpoints<'_>,
     mut emit: impl FnMut(&[u8]) -> Result<(), KernelFailure>,
-) -> Result<(), KernelFailure> {
+) -> Result<bool, KernelFailure> {
     while let Some((&lead, tail)) = bytes.split_first() {
         // Trino 484 FROM_UTF8 uses SliceUtf8 2.9. Group the continuation
         // prefix before validating it, including obsolete 5- and 6-byte forms.
@@ -142,12 +145,15 @@ fn visit_utf8(
         let output = if std::str::from_utf8(candidate).is_ok() {
             candidate
         } else {
-            "\u{fffd}".as_bytes()
+            let Some(replacement) = replacement else {
+                return Ok(false);
+            };
+            replacement
         };
         emit(output)?;
         bytes = rest;
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn evaluate<'a>(
