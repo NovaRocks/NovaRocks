@@ -814,7 +814,7 @@ fn required_ddl_property_port_runs_real_scalar_array_and_map_inputs() {
             V::ArrayVarchar(vec![Some("selected".into()), None]),
         ),
         (
-            "IF(TRUE, MAP(ARRAY['first','second'],ARRAY['value',NULL]), MAP(ARRAY['ignored'],ARRAY['ignored']))",
+            "IF(TRUE, MAP(ARRAY['first','second'],ARRAY['value',NULL]), MAP(ARRAY['ignored','other'],ARRAY['ignored',NULL]))",
             T::MapVarcharVarchar,
             V::MapVarcharVarchar(vec![
                 ("first".into(), Some("value".into())),
