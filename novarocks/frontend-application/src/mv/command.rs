@@ -320,13 +320,13 @@ impl MvCommandExecutor {
         }
         #[cfg(novarocks_dev_controls)]
         {
-            return name.parts.last().is_some_and(|part| {
+            name.parts.last().is_some_and(|part| {
                 part.value
                     .eq_ignore_ascii_case(crate::mv::domain::document_expiry::PROCEDURE)
                     || part
                         .value
                         .eq_ignore_ascii_case(crate::mv::domain::stateless_rebuild::PROCEDURE_NAME)
-            });
+            })
         }
         #[cfg(not(novarocks_dev_controls))]
         false
