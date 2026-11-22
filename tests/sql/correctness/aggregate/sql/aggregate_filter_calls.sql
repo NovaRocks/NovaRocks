@@ -110,7 +110,7 @@ SELECT sum(10 / x) FILTER (WHERE x <> 0) FROM ${case_db}.filter_error_input;
 SELECT array_agg(x ORDER BY 10 / x) FILTER (WHERE x <> 0) FROM ${case_db}.filter_error_input;
 
 -- query 18
-SELECT sum(IF(x <> 0, 10 / x)) FILTER (WHERE x <> 0) AS total
+SELECT sum(IF(x <> 0, 10 / x, CAST(NULL AS INTEGER))) FILTER (WHERE x <> 0) AS total
 FROM ${case_db}.filter_error_input;
 
 -- query 19
