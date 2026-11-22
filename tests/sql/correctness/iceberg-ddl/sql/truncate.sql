@@ -238,3 +238,45 @@ TRUNCATE TABLE ${case_db}.t_reject PARTITION (id=1);
 -- query 38
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 TRUNCATE TABLE ${case_db}.t_reject WHERE id = 1;
+
+-- query 39
+-- The v2, v3 and initially empty tables each retain their one TRUNCATE
+-- snapshot after the subsequent INSERT. After row DELETE, the main ref
+-- identifies the TRUNCATE even when two snapshots have operation=delete.
+WITH truncated(table_case, summary) AS (
+    SELECT 'v2', summary FROM ${case_db}."t_v2$snapshots" WHERE operation = 'delete'
+    UNION ALL
+    SELECT 'v3', summary FROM ${case_db}."t_v3$snapshots" WHERE operation = 'delete'
+    UNION ALL
+    SELECT 'empty_v3', summary FROM ${case_db}."t_empty$snapshots" WHERE operation = 'delete'
+    UNION ALL
+    SELECT 'after_dv', s.summary
+    FROM ${case_db}."t_dv$snapshots" AS s
+    JOIN ${case_db}."t_dv$refs" AS r ON s.snapshot_id = r.snapshot_id
+    WHERE r.name = 'main' AND s.operation = 'delete'
+)
+SELECT table_case,
+       summary['total-records'] AS total_records,
+       summary['total-files-size'] AS total_files_size,
+       summary['total-data-files'] AS total_data_files,
+       summary['total-delete-files'] AS total_delete_files,
+       summary['total-position-deletes'] AS total_position_deletes,
+       summary['total-equality-deletes'] AS total_equality_deletes
+FROM truncated
+ORDER BY table_case;
+
+-- query 40
+-- Empty TRUNCATE has no physical removals and therefore no removal counters.
+SELECT element_at(summary, 'deleted-data-files') IS NULL AS no_deleted_files,
+       element_at(summary, 'deleted-records') IS NULL AS no_deleted_rows,
+       element_at(summary, 'removed-files-size') IS NULL AS no_removed_bytes,
+       element_at(summary, 'removed-delete-files') IS NULL AS no_removed_deletes
+FROM ${case_db}."t_empty$snapshots"
+WHERE operation = 'delete';
+
+-- query 41
+-- After row DELETE the full-table removal also retires the live DVs.
+SELECT CAST(summary['removed-dvs'] AS BIGINT) > 0 AS removed_dvs
+FROM ${case_db}."t_dv$snapshots" AS s
+JOIN ${case_db}."t_dv$refs" AS r ON s.snapshot_id = r.snapshot_id
+WHERE r.name = 'main' AND s.operation = 'delete';

@@ -198,6 +198,8 @@ pub enum PublicationFault {
     BeforeDispatchHoldForConcurrentShell,
     BeforeRequirementCheckHoldForConcurrentShell,
     AfterCommitBeforeResponse,
+    /// Lose the successful response and withhold exact readback until release.
+    AfterCommitBeforeResponseHideTableLoad,
     AfterCommitHoldForFrontendKill,
     IncompleteDiscovery,
     CorruptPackage,
@@ -216,6 +218,9 @@ impl PublicationFault {
                 "before-requirement-check-hold-for-concurrent-shell"
             }
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
+            Self::AfterCommitBeforeResponseHideTableLoad => {
+                "after-commit-before-response-hide-table-load"
+            }
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
             Self::IncompleteDiscovery => "incomplete-discovery",
             Self::CorruptPackage => "corrupt-package",
@@ -240,6 +245,13 @@ struct ConsumedNextFault {
     entered: bool,
     release: Arc<tokio::sync::Notify>,
     released: Arc<AtomicBool>,
+    lost_response: Option<ScopedLostResponse>,
+}
+
+#[derive(Debug, Clone)]
+struct ScopedLostResponse {
+    target: ExactTableTarget,
+    withhold_table_load: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -539,6 +551,9 @@ fn parse_fault(value: &str) -> Result<PublicationFault> {
             Ok(PublicationFault::BeforeRequirementCheckHoldForConcurrentShell)
         }
         "after-commit-before-response" => Ok(PublicationFault::AfterCommitBeforeResponse),
+        "after-commit-before-response-hide-table-load" => {
+            Ok(PublicationFault::AfterCommitBeforeResponseHideTableLoad)
+        }
         "after-commit-hold-for-frontend-kill" => {
             Ok(PublicationFault::AfterCommitHoldForFrontendKill)
         }
@@ -604,7 +619,8 @@ impl FixtureFaultGuard {
             | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {
                 "downstream-response"
             }
-            PublicationFault::AfterCommitBeforeResponse => {
+            PublicationFault::AfterCommitBeforeResponse
+            | PublicationFault::AfterCommitBeforeResponseHideTableLoad => {
                 "response-dropped-after-downstream-success"
             }
             // Killing the FE closes its client connection. The proxy handler
@@ -622,9 +638,26 @@ impl FixtureFaultGuard {
             terminal_event,
             Instant::now() + Duration::from_secs(5),
         )?;
+        let events = self.control.trace_events(&self.arm_id);
+        if self.fault == PublicationFault::AfterCommitBeforeResponseHideTableLoad {
+            let forwarded = events
+                .iter()
+                .filter(|event| *event == "request-forwarded")
+                .count();
+            let withheld = events
+                .iter()
+                .any(|event| event == "table-load-withheld-after-response-loss");
+            let replayed = events.iter().any(|event| event == "target-commit-replayed");
+            if forwarded != 1 || !withheld || replayed {
+                anyhow::bail!(
+                    "scoped lost-response fault requires one forwarded commit, an attempted readback, and no replay: {}",
+                    events.join(" -> ")
+                );
+            }
+        }
         Ok(FixtureFaultEvidence {
             trace: self.trace(),
-            events: self.control.trace_events(&self.arm_id),
+            events,
         })
     }
 }
@@ -688,18 +721,26 @@ async fn arm_next_fault(
     State(state): State<AppState>,
     Json(request): Json<ArmNextFaultRequest>,
 ) -> Response {
-    if let Some(target) = &request.target
-        && (request.action != PublicationAction::TableLoad
-            || request.fault != PublicationFault::CorruptPackage
-            || target.namespace.is_empty()
-            || target.table.is_empty()
-            || target.namespace.contains('/')
-            || target.table.contains('/'))
+    let lost_response = request.fault == PublicationFault::AfterCommitBeforeResponseHideTableLoad;
+    let exact_table_supported = if lost_response {
+        request.action == PublicationAction::TableCommit
+    } else {
+        request.action == PublicationAction::TableLoad
+            && request.fault == PublicationFault::CorruptPackage
+    };
+    if (lost_response && request.target.is_none())
+        || request.target.as_ref().is_some_and(|target| {
+            !exact_table_supported
+                || target.namespace.is_empty()
+                || target.table.is_empty()
+                || target.namespace.contains('/')
+                || target.table.contains('/')
+        })
     {
         return wire_error(
             StatusCode::BAD_REQUEST,
             "fixture-target",
-            "invalid exact table-load fault target",
+            "invalid exact table fault target",
         );
     }
     let arm_id = format!(
@@ -777,6 +818,23 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         Err(error) => return temporary_failure(error.to_string()),
     };
     let action = standard_catalog_action(&parts.method, parts.uri.path(), &bytes);
+    if let Some(action) = action {
+        match observe_scoped_lost_response(&state, action, parts.uri.path()) {
+            Ok(true) => {
+                return forbidden_not_dispatched(
+                    "publication fixture withheld table load after lost commit response",
+                );
+            }
+            Ok(false) => {}
+            Err(_) => {
+                return wire_error(
+                    StatusCode::BAD_REQUEST,
+                    "fixture-target",
+                    "invalid encoded REST table target",
+                );
+            }
+        }
+    }
     let mutation_target = mutation_target(&parts.method, action, parts.uri.path(), &bytes);
     if action == Some(PublicationAction::TableLoad)
         && let Some((namespace, table)) = exact_table_target(parts.uri.path())
@@ -894,8 +952,22 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         && response.status().is_success()
     {
         match armed.fault {
-            PublicationFault::AfterCommitBeforeResponse => {
-                record_fault_event(&state, &armed, "response-dropped-after-downstream-success");
+            PublicationFault::AfterCommitBeforeResponse
+            | PublicationFault::AfterCommitBeforeResponseHideTableLoad => {
+                let mut next = state.next_fault.lock().expect("publication fault mutex");
+                if let Some(lost_response) = next
+                    .status
+                    .as_mut()
+                    .filter(|status| status.arm_id == armed.arm_id)
+                    .and_then(|status| status.lost_response.as_mut())
+                {
+                    lost_response.withhold_table_load = true;
+                }
+                record_fault_event_locked(
+                    &mut next,
+                    &armed.arm_id,
+                    "response-dropped-after-downstream-success",
+                );
                 return temporary_failure(
                     "publication REST response was lost after downstream success",
                 );
@@ -1119,6 +1191,47 @@ fn record_mutation(
     }
 }
 
+/// Keep the matching GET evidence unavailable until the original statement exits.
+fn observe_scoped_lost_response(
+    state: &AppState,
+    action: PublicationAction,
+    path: &str,
+) -> Result<bool> {
+    if !matches!(
+        action,
+        PublicationAction::TableLoad | PublicationAction::TableCommit
+    ) {
+        return Ok(false);
+    }
+    let mut next = state.next_fault.lock().expect("publication fault mutex");
+    let Some(status) = next.status.as_ref() else {
+        return Ok(false);
+    };
+    let Some(lost_response) = &status.lost_response else {
+        return Ok(false);
+    };
+    if !matches_exact_target(&lost_response.target, path)? {
+        return Ok(false);
+    }
+    let event = match action {
+        PublicationAction::TableLoad if lost_response.withhold_table_load => {
+            "table-load-withheld-after-response-loss"
+        }
+        // Keep a repeat dispatch transparent so the test can observe its real
+        // effect. The guard still fails independently of the SQL result.
+        PublicationAction::TableCommit => "target-commit-replayed",
+        _ => return Ok(false),
+    };
+    let arm_id = status.arm_id.clone();
+    record_fault_event_locked(&mut next, &arm_id, event);
+    Ok(action == PublicationAction::TableLoad)
+}
+
+fn matches_exact_target(target: &ExactTableTarget, path: &str) -> Result<bool> {
+    Ok(decoded_exact_table_target(path)?
+        .is_some_and(|(namespace, table)| namespace == target.namespace && table == target.table))
+}
+
 fn take_matching_fault(
     state: &AppState,
     action: PublicationAction,
@@ -1133,15 +1246,10 @@ fn take_matching_fault(
     if armed.action != action {
         return Ok(None);
     }
-    if let Some(target) = &armed.target {
-        let Some((namespace, table)) = decoded_exact_table_target(path)? else {
-            return Ok(None);
-        };
-        if namespace.as_ref() != target.namespace.as_str()
-            || table.as_ref() != target.table.as_str()
-        {
-            return Ok(None);
-        }
+    if let Some(target) = &armed.target
+        && !matches_exact_target(target, path)?
+    {
+        return Ok(None);
     }
     let matched_unix_nanos = observed_unix_nanos();
     // Consume the arm before the request is dispatched. In particular, a
@@ -1153,6 +1261,11 @@ fn take_matching_fault(
         entered: true,
         release: Arc::clone(&armed.release),
         released: Arc::clone(&armed.released),
+        lost_response: (armed.fault == PublicationFault::AfterCommitBeforeResponseHideTableLoad)
+            .then(|| ScopedLostResponse {
+                target: armed.target.clone().expect("scoped lost-response target"),
+                withhold_table_load: false,
+            }),
     });
     record_fault_event_locked(&mut next, &armed.arm_id, "matched");
     // Only the actual matched request allocates diagnostic routing strings.
@@ -1648,6 +1761,108 @@ mod tests {
             "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> package-response-corrupted -> control-release"
         );
         assert_eq!(control.traffic_snapshot().requests, 4);
+        fixture.shutdown().unwrap();
+        downstream.join().unwrap();
+    }
+
+    #[test]
+    fn scoped_lost_commit_withholds_only_exact_readback_and_detects_replay() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let downstream = std::thread::spawn(move || {
+            for _ in 0..9 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                consume_downstream_request(&mut socket);
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                )
+                .unwrap();
+            }
+        });
+        let mut fixture = PublicationCatalogFixture::start(format!("http://{address}")).unwrap();
+        let control = fixture.control().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let base = format!("{}/v1/namespaces/owned_ns/tables", fixture.uri());
+        let get = |table| {
+            client
+                .get(format!("{base}/{table}"))
+                .send()
+                .unwrap()
+                .status()
+        };
+        let post = |table| {
+            client
+                .post(format!("{base}/{table}"))
+                .json(&json!({"requirements": [], "updates": []}))
+                .send()
+                .unwrap()
+                .status()
+        };
+        let scoped = |table| {
+            control
+                .arm_next_for_table(
+                    "table-commit",
+                    PublicationFault::AfterCommitBeforeResponseHideTableLoad.as_str(),
+                    "owned_ns",
+                    table,
+                )
+                .unwrap()
+        };
+
+        assert!(
+            control
+                .arm_next(
+                    "table-commit",
+                    PublicationFault::AfterCommitBeforeResponseHideTableLoad.as_str(),
+                )
+                .is_err()
+        );
+        let ordinary = control
+            .arm_next("table-commit", "after-commit-before-response")
+            .unwrap();
+        assert_eq!(post("ordinary"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get("ordinary"), StatusCode::OK);
+        ordinary.finish().unwrap();
+
+        let guard = scoped("target");
+        assert_eq!(get("target"), StatusCode::OK);
+        assert_eq!(post("target"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get("target"), StatusCode::FORBIDDEN);
+        assert_eq!(get("target_extra"), StatusCode::OK);
+        assert_eq!(get("target"), StatusCode::FORBIDDEN);
+        assert_eq!(
+            guard.finish().unwrap().summary(),
+            "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> response-dropped-after-downstream-success -> table-load-withheld-after-response-loss -> table-load-withheld-after-response-loss -> control-release"
+        );
+        assert_eq!(get("target"), StatusCode::OK);
+        let counts = control.mutation_counts("owned_ns", "target");
+        assert_eq!(
+            (counts.table_commit_forwarded, counts.table_commit_succeeded),
+            (1, 1)
+        );
+
+        let guard = scoped("replayed");
+        assert_eq!(post("replayed"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get("replayed"), StatusCode::FORBIDDEN);
+        assert_eq!(post("replayed"), StatusCode::OK);
+        assert!(
+            guard
+                .finish()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("target-commit-replayed")
+        );
+        assert_eq!(get("replayed"), StatusCode::OK);
         fixture.shutdown().unwrap();
         downstream.join().unwrap();
     }
