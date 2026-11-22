@@ -399,13 +399,14 @@ pub(crate) async fn compile_routed_mutation_write(
             .continue_catalog(facts.into_boxed_slice())
             .map_err(DmlError::from_compile)?;
     }
-    let analyzed = preparation
-        .analyze(
-            &[],
+    let analyzed = provider
+        .analyze_dml_source(
+            preparation,
             state.function_catalog().as_ref(),
             Arc::clone(state.sealed_functions()),
             state.constant_policy(),
         )
+        .await
         .map_err(DmlError::from_compile)?;
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
         state, Arc::clone(bindings), context,

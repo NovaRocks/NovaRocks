@@ -104,7 +104,7 @@ try {
     Types.NestedField.required(2,"raw",Types.FixedType.ofLength(16)),
     Types.NestedField.optional(3,"st",Types.StructType.of(Types.NestedField.required(5,"f",Types.FixedType.ofLength(4)))),
     Types.NestedField.required(4,"n",Types.IntegerType.get()))
-  val fixedTable=VariantFixture.create(fixedSchema,properties=Map("write.update.mode"->"copy-on-write","write.row-lineage"->"true"))
+  val fixedTable=VariantFixture.create(fixedSchema,properties=MAP(ARRAY["write.update.mode"->"copy-on-write"], ARRAY["write.row-lineage"->"true"]))
   def fixedBytes(hex: String): Array[Byte] = hex.grouped(2).map(pair => Integer.parseInt(pair,16).toByte).toArray
   val nested=GenericRecord.create(fixedSchema.findType("st").asStructType())
   nested.setField("f",fixedBytes("01020304"))

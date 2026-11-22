@@ -33,7 +33,7 @@ pub use novarocks_functions::builtin::catalogue::{
     contribute_builtin_functions,
 };
 pub(crate) use novarocks_functions::builtin::catalogue::{
-    builtin_function_volatility, dynamic_scalar_data_type, resolve_bound_aggregate,
+    builtin_function_volatility, resolve_bound_aggregate,
 };
 
 use std::sync::Arc;
@@ -1259,7 +1259,18 @@ mod tests {
             value_argument(DataType::Utf8, false, Some(test_utf8_constant("right"))),
             value_argument(DataType::Boolean, true, None),
         ];
-        let named = resolve_exact_scalar(&catalog, "named_struct", &named);
+        let named = catalog
+            .resolve_bound_trusted(
+                "named_struct",
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &named,
+                    logical_argument_count: named.len(),
+                },
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         let DataType::Struct(fields) = &scalar_result(&named).data_type() else {
             panic!("named_struct must bind a struct result")
         };
@@ -1599,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn array_ordering_binding_closes_comparator_domain_and_preserves_sortby_values() {
+    fn array_ordering_binding_closes_comparator_domain() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
         for ty in [
@@ -1647,24 +1658,6 @@ mod tests {
                     "{name}"
                 );
             }
-            let arguments = [
-                value_argument(list(DataType::Utf8), true, None),
-                value_argument(list(ty), true, None),
-            ];
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        "array_sortby",
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 2
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .is_err()
-            );
         }
         for ty in [
             DataType::Null,
@@ -1687,31 +1680,14 @@ mod tests {
                 )
                 .unwrap();
         }
-        // A nested output list needs no comparison: only the independent keys do.
-        let arguments = [
-            value_argument(list(list(DataType::Int64)), true, None),
-            value_argument(list(DataType::Int64), true, None),
-        ];
-        let bound = resolve_exact_scalar(&catalog, "array_sortby", &arguments);
-        catalog
-            .validate_bound(
-                &bound,
-                FunctionBindingRequest {
-                    expected_result_type: None,
-                    arguments: &arguments,
-                    logical_argument_count: 2,
-                },
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
     }
 
     #[test]
-    fn selected_collection_shapes_preserve_recursive_equality_and_masks() {
+    fn selected_collection_shapes_preserve_recursive_equality() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
         for name in [
-            "array_contains",
+            "contains",
             "array_position",
             "array_remove",
             "array_distinct",
@@ -1740,46 +1716,7 @@ mod tests {
                 "{name}"
             );
         }
-        for name in ["all_match", "any_match", "array_filter"] {
-            let mut arguments = vec![value_argument(list(DataType::Int64), true, None)];
-            if name == "array_filter" {
-                arguments.push(value_argument(list(list(DataType::Boolean)), true, None));
-            } else {
-                arguments[0] = value_argument(list(list(DataType::Boolean)), true, None);
-            }
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        name,
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len()
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .is_err(),
-                "{name}"
-            );
-            let mut arguments = vec![value_argument(list(DataType::Int8), true, None)];
-            if name == "array_filter" {
-                arguments.push(value_argument(list(DataType::Int8), true, None));
-            }
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: arguments.len(),
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap();
-        }
-        for name in ["array_contains", "array_position", "array_remove"] {
+        for name in ["contains", "array_position", "array_remove"] {
             let item = list(DataType::FixedSizeBinary(16));
             let arguments = [
                 value_argument(list(item.clone()), true, None),
@@ -1799,10 +1736,10 @@ mod tests {
                 .unwrap();
         }
         for (name, types) in [
-            ("array_flatten", vec![list(DataType::Int64)]),
-            ("array_repeat", vec![DataType::Int64]),
-            ("arrays_zip", vec![]),
-            ("arrays_zip", vec![DataType::Int64]),
+            ("flatten", vec![list(DataType::Int64)]),
+            ("repeat", vec![DataType::Int64]),
+            ("zip", vec![]),
+            ("zip", vec![DataType::Int64]),
             ("map_entries", vec![DataType::Int64]),
         ] {
             let arguments = types
@@ -1827,7 +1764,7 @@ mod tests {
         }
         let arguments = [
             value_argument(list(DataType::Date32), true, None),
-            value_argument(list(DataType::Utf8), true, None),
+            value_argument(list(DataType::Date32), true, None),
         ];
         let bound = resolve_exact_scalar(&catalog, "arrays_overlap", &arguments);
         assert_eq!(
@@ -1840,7 +1777,7 @@ mod tests {
     fn selected_array_domain_is_checked_after_argument_widening() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
-        for name in ["array_contains", "array_position", "array_remove"] {
+        for name in ["contains", "array_position", "array_remove"] {
             let arguments = [
                 value_argument(list(DataType::Int64), true, None),
                 value_argument(DataType::Decimal256(60, 2), true, None),
@@ -1886,26 +1823,6 @@ mod tests {
                 novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
             );
         }
-        let arguments = [
-            value_argument(list(list(DataType::Int64)), true, None),
-            value_argument(list(DataType::Null), true, None),
-        ];
-        let bound = resolve_exact_scalar(&catalog, "array_sortby", &arguments);
-        catalog
-            .validate_bound(
-                &bound,
-                FunctionBindingRequest {
-                    expected_result_type: None,
-                    arguments: &arguments,
-                    logical_argument_count: 2,
-                },
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-        assert_eq!(
-            scalar_result(&bound).data_type().clone(),
-            list(list(DataType::Int64))
-        );
     }
 }
 

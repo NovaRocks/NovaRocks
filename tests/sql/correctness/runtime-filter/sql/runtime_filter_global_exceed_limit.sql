@@ -27,7 +27,7 @@ CREATE TABLE ${case_db}.t1 (
     k1 INT
 ) WITH (format_version = 3);
 
-INSERT INTO ${case_db}.t1 SELECT generate_series FROM TABLE(generate_series(1, 65535));
+INSERT INTO ${case_db}.t1 SELECT generate_series FROM TABLE(sequence(1, 65535)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t1 SELECT k1 + 65535 FROM ${case_db}.t1;
 INSERT INTO ${case_db}.t1 SELECT k1 + 65535 * 2 FROM ${case_db}.t1;
 INSERT INTO ${case_db}.t1 SELECT k1 + 65535 * 3 FROM ${case_db}.t1;

@@ -2539,14 +2539,28 @@ fn signed_state_input(
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         },
     ];
-    let binding = crate::analysis::resolve_function_binding(
-        function_catalog,
-        "named_struct",
-        &args,
+    let function = novarocks_functions::FunctionId::try_new("builtin.scalar/named_struct/v1")
+        .expect("frozen IVM row constructor identity");
+    let overload =
+        novarocks_functions::FunctionOverloadId::try_new("builtin.scalar/named_struct/dynamic-v1")
+            .expect("frozen IVM row constructor overload");
+    let arguments = args
+        .iter()
+        .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
+        .collect::<Result<Vec<_>, _>>()?;
+    let binding = crate::binding::SqlFunctionBinding::new(
+        function_catalog.finish_scalar_binding(
+            &function,
+            &overload,
+            novarocks_functions::FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: arguments.len(),
+                expected_result_type: None,
+            },
+            control,
+        )?,
         policy,
-        constant_policy,
-        control,
-    )?;
+    );
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
         return Err("named_struct must return a scalar value".to_string().into());
@@ -3556,12 +3570,21 @@ mod tests {
         let ExprKind::FunctionCall {
             name,
             args: struct_args,
+            binding,
             ..
         } = &args[0].kind
         else {
             panic!("expected named_struct signed input");
         };
         assert_eq!(name, "named_struct");
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/named_struct/v1"
+        );
+        assert_eq!(
+            binding.selected.overload.as_str(),
+            "builtin.scalar/named_struct/dynamic-v1",
+        );
         assert!(matches!(
             &struct_args[0].kind,
             ExprKind::Literal(LiteralValue::String(name)) if name == "value"

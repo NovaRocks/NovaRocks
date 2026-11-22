@@ -173,6 +173,8 @@ pub enum NodeShape<'a> {
         name: &'a str,
         expected_result: Option<&'a FunctionValueType>,
     },
+    Row,
+    MapSubscript,
     Operator(OperatorFunction),
     UnaryPlus,
     And,
@@ -362,6 +364,50 @@ pub fn type_node(
                 work.control(),
             )?;
             type_selected_call(context, binding, expected_result, children, work)?
+        }
+        NodeShape::Row => {
+            let function = FunctionId::try_new("builtin.scalar/row/v1")
+                .expect("valid ROW constructor function identity");
+            let overload = FunctionOverloadId::try_new("builtin.scalar/row/dynamic-v1")
+                .expect("valid ROW constructor overload identity");
+            let arguments = arguments(children, work)?;
+            work.flush()?;
+            let binding = context.catalog.select_exact_scalar(
+                &function,
+                &overload,
+                request(&arguments, None),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, None, children, work)?
+        }
+        NodeShape::MapSubscript => {
+            let arguments = arguments(children, work)?;
+            let function = FunctionId::try_new("builtin.scalar/__map_subscript/v1")
+                .expect("valid MAP subscript function identity");
+            let Some(child) = children.first() else {
+                return Err(TypingError::InvalidShape(
+                    "MAP subscript needs its collection",
+                ));
+            };
+            // This candidate is selected by the actual uninhabited-key domain,
+            // not by the syntax or a reconstructed probe carrier.
+            let overload = if novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
+                &child.value_type,
+            ) {
+                "builtin.scalar/__map_subscript/(map-with-uninhabited-key<M,V>,any)->any<V>;strict;legacy"
+            } else {
+                "builtin.scalar/__map_subscript/(map<any<K>,any<V>>,any<K>)->any<V>;strict;legacy"
+            };
+            let overload = FunctionOverloadId::try_new(overload)
+                .expect("valid MAP subscript overload identity");
+            work.flush()?;
+            let binding = context.catalog.select_exact_scalar(
+                &function,
+                &overload,
+                request(&arguments, None),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, None, children, work)?
         }
         NodeShape::Operator(operator) => {
             let unary = operator == OperatorFunction::Negation;

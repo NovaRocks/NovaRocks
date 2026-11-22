@@ -21,7 +21,7 @@
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, ListBuilder,
-        StringArray, StringBuilder,
+        MapBuilder, StringArray, StringBuilder,
     },
     datatypes::Field,
 };
@@ -474,46 +474,33 @@ fn ddl_catalog_keys_are_unmodified_and_default_and_whole_null_are_rejected() {
 }
 
 #[test]
-fn ddl_map_uses_original_key_then_value_children_and_preserves_null_values() {
-    let expression = parse_expression("\"MaP\"(ARRAY['a', 'b'], ARRAY['x', NULL])").unwrap();
-    let Expr::FunctionCall(call) = &expression else {
-        panic!("real MAP call")
-    };
-    let (Expr::Array(keys), Expr::Array(values)) =
-        (&call.arguments[0].value, &call.arguments[1].value)
-    else {
-        panic!("actual arrays")
-    };
-    let mut port = Port::new(vec![
-        Call {
-            expression: &keys.values[0],
-            target: Target::Varchar,
-            result: Ok(text(Some("a"))),
-        },
-        Call {
-            expression: &keys.values[1],
-            target: Target::Varchar,
-            result: Ok(text(Some("b"))),
-        },
-        Call {
-            expression: &values.values[0],
-            target: Target::Varchar,
-            result: Ok(text(Some("x"))),
-        },
-        Call {
-            expression: &values.values[1],
-            target: Target::Varchar,
-            result: Ok(text(None)),
-        },
-    ]);
+fn ddl_map_projects_the_original_complete_result_in_order() {
+    let expression =
+        parse_expression("IF(TRUE, MAP(ARRAY['a', 'b'], ARRAY['x', NULL]), MAP())").unwrap();
+    let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    map.keys().append_value("unused key");
+    map.values().append_value("unused value");
+    map.append(true).unwrap();
+    map.keys().append_value("a");
+    map.values().append_value("x");
+    map.keys().append_value("b");
+    map.values().append_null();
+    map.append(true).unwrap();
+
+    let mut port = Port::new(vec![Call {
+        expression: &expression,
+        target: Target::MapVarcharVarchar,
+        result: Ok(constant(Arc::new(map.finish()), ValueLogicalType::Physical)),
+    }]);
     let declarations = [declaration(
         "extra_properties",
         Type::MapVarcharVarchar,
         Value::Null,
     )];
+    let assignments = [assignment("extra_properties", &expression)];
     let result = evaluate(
         &declarations,
-        &[assignment("extra_properties", &expression)],
+        &assignments,
         &mut port,
         DdlPropertyEvaluationMode::Alter,
     )
@@ -523,97 +510,49 @@ fn ddl_map_uses_original_key_then_value_children_and_preserves_null_values() {
         result.properties()[0].change,
         DdlPropertyChange::Set(Value::MapVarcharVarchar(vec![
             ("a".into(), Some("x".into())),
-            ("b".into(), None)
+            ("b".into(), None),
         ]))
     );
-    // Key validation follows evaluation of both original arrays.
-    for nullable_key in [false, true] {
-        let mut port = Port::new(vec![
-            Call {
-                expression: &keys.values[0],
-                target: Target::Varchar,
-                result: Ok(text(if nullable_key { None } else { Some("a") })),
-            },
-            Call {
-                expression: &keys.values[1],
-                target: Target::Varchar,
-                result: Ok(text(Some("a"))),
-            },
-            Call {
-                expression: &values.values[0],
-                target: Target::Varchar,
-                result: Ok(text(Some("x"))),
-            },
-            Call {
-                expression: &values.values[1],
-                target: Target::Varchar,
-                result: Ok(text(None)),
-            },
-        ]);
-        let error = evaluate(
-            &declarations,
-            &[assignment("extra_properties", &expression)],
-            &mut port,
-            DdlPropertyEvaluationMode::Alter,
-        )
-        .unwrap_err();
-        assert!(error.message().contains(if nullable_key {
-            "Map property key cannot be NULL in property 'extra_properties'"
-        } else {
-            "Duplicate map property key 'a' in property 'extra_properties'"
-        }));
-        port.exhausted();
-    }
-    let original = QueryServiceError::new(
+
+    let refusal = QueryServiceError::new(
         QueryServiceErrorKind::Unsupported,
         "original value computation unavailable",
     );
-    let mut port = Port::new(vec![
-        Call {
-            expression: &keys.values[0],
-            target: Target::Varchar,
-            result: Ok(text(Some("a"))),
-        },
-        Call {
-            expression: &keys.values[1],
-            target: Target::Varchar,
-            result: Ok(text(Some("a"))),
-        },
-        Call {
-            expression: &values.values[0],
-            target: Target::Varchar,
-            result: Err(DdlPropertyConstantError::Failure(original.clone())),
-        },
-    ]);
+    let mut port = Port::new(vec![Call {
+        expression: &expression,
+        target: Target::MapVarcharVarchar,
+        result: Err(DdlPropertyConstantError::Failure(refusal.clone())),
+    }]);
     assert_eq!(
         evaluate(
             &declarations,
-            &[assignment("extra_properties", &expression)],
+            &assignments,
             &mut port,
-            DdlPropertyEvaluationMode::Alter
+            DdlPropertyEvaluationMode::Alter,
         )
         .unwrap_err(),
-        original
+        refusal,
     );
     port.exhausted();
-    for sql in [
-        "MAP(ARRAY['a'], ARRAY['x','y'])",
-        "cat.MAP(ARRAY['a'],ARRAY['x'])",
-        "MAP(ARRAY['a'], ARRAY['x']) FILTER (WHERE TRUE)",
-    ] {
-        let expression = parse_expression(sql).unwrap();
-        let mut port = Port::new(vec![]);
-        assert!(
-            evaluate(
-                &declarations,
-                &[assignment("extra_properties", &expression)],
-                &mut port,
-                DdlPropertyEvaluationMode::Alter
-            )
-            .is_err()
-        );
-        port.exhausted();
-    }
+
+    let mut port = Port::new(vec![Call {
+        expression: &expression,
+        target: Target::MapVarcharVarchar,
+        result: Ok(text(Some("not a declared map"))),
+    }]);
+    let mismatch = evaluate(
+        &declarations,
+        &assignments,
+        &mut port,
+        DdlPropertyEvaluationMode::Alter,
+    )
+    .unwrap_err();
+    assert!(
+        mismatch
+            .message()
+            .contains("different complete target type")
+    );
+    port.exhausted();
 }
 
 #[test]

@@ -29,7 +29,7 @@ USE ${case_db};
 
 -- query 3
 USE ${case_db};
-with input as (SELECT array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1)) AS a UNION ALL SELECT ['A', 'B', 'C'] AS a)
+with input as (SELECT transform(sequence(1, 2000000, 1), x -> CAST(x AS STRING)) AS a UNION ALL SELECT ['A', 'B', 'C'] AS a)
 SELECT count(*) from (select a from input group by 1) AS t;
 
 -- query 4
@@ -43,13 +43,13 @@ CREATE TABLE "t1" (
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 select generate_series, array_map(x -> cast(x as string), array_generate(1, generate_series % 100, 1)) from table(generate_series(1, 10000));
+insert into t1 select generate_series, transform(sequence(1, generate_series % 100, 1), x -> cast(x as string)) from table(sequence(1, 10000)) AS generate_series(generate_series);
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 values ROW(0, array_map(x -> CAST(x AS STRING), array_generate(1, 100000, 1))),
-ROW(10001, array_map(x -> CAST(x AS STRING), array_generate(1, 100000, 1)));
+insert into t1 values ROW(0, transform(sequence(1, 100000, 1), x -> CAST(x AS STRING))),
+ROW(10001, transform(sequence(1, 100000, 1), x -> CAST(x AS STRING)));
 
 -- query 7
 USE ${case_db};

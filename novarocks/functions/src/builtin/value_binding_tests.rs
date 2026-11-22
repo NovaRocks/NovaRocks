@@ -719,26 +719,6 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
             )
             .is_err()
     );
-    let list = physical(DataType::List(json_item(false)));
-    let arguments = [
-        value(list.clone()),
-        value(physical(DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        ))))),
-    ];
-    let sorted = resolve("array_sortby", FunctionKind::Scalar, &arguments);
-    assert_eq!(output(&sorted), &list);
-    let mut forged = sorted;
-    forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::List(Arc::new(
-        Field::new("item", DataType::Utf8, false),
-    ))));
-    assert!(
-        builtin_engine_function_catalog()
-            .validate_bound(&forged, request(&arguments), crate::binding_test_control())
-            .is_err()
-    );
 }
 
 #[test]

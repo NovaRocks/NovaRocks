@@ -28,10 +28,10 @@ CREATE TABLE ${case_db}.oq12_stats_set_l (k INT);
 CREATE TABLE ${case_db}.oq12_stats_set_r (k INT);
 INSERT INTO ${case_db}.oq12_stats_set_l
     SELECT generate_series % 100
-    FROM TABLE(generate_series(1, 1000));
+    FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.oq12_stats_set_r
     SELECT generate_series % 60
-    FROM TABLE(generate_series(1, 600));
+    FROM TABLE(sequence(1, 600)) AS generate_series(generate_series);
 ANALYZE ${case_db}.oq12_stats_set_l;
 ANALYZE ${case_db}.oq12_stats_set_r;
 

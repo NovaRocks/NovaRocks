@@ -153,11 +153,60 @@ impl ConstantValue {
         finish(work, result)
     }
 
+    /// Borrow VARCHAR keys and UNKNOWN values. An UNKNOWN value has no
+    /// payload, so each selected entry is NULL.
+    pub fn utf8_map_with_unknown_values_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<SelectedUtf8Map<'_>>, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let result = self.utf8_map_with_value_type_in(&mut work, &DataType::Null);
+        finish(work, result)
+    }
+
+    /// Inspect the actual entry range of a selected non-resident map key.
+    /// The caller validates the complete declared key and value types.
+    pub fn unknown_map_is_empty_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<bool>, ConstantError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let result = (|| {
+            let Some(row) = selected_row(self, &mut work)? else {
+                return Ok(None);
+            };
+            let valid = matches!(row.data.data_type(), DataType::Map(entries, _)
+                if matches!(entries.data_type(), DataType::Struct(fields)
+                    if fields.len() == 2
+                        && fields[0].data_type() == &DataType::Null));
+            work.step()?;
+            if !valid {
+                return Err(ConstantError::Invalid(
+                    "selected constant is not a map with UNKNOWN keys",
+                ));
+            }
+            let (start, end) = list_range(row)?;
+            work.step()?;
+            Ok(Some(start == end))
+        })();
+        finish(work, result)
+    }
+
     /// Borrow the selected collection using the caller's original meter.
     /// No entry or tail is published; items retain this exact source owner.
     pub fn utf8_map_in(
         &self,
         work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<SelectedUtf8Map<'_>>, ConstantError> {
+        self.utf8_map_with_value_type_in(work, &DataType::Utf8)
+    }
+
+    fn utf8_map_with_value_type_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+        value_type: &DataType,
     ) -> Result<Option<SelectedUtf8Map<'_>>, ConstantError> {
         let Some(row) = selected_row(self, work)? else {
             return Ok(None);
@@ -165,7 +214,7 @@ impl ConstantValue {
         let valid = matches!(row.data.data_type(), DataType::Map(entries, _)
             if matches!(entries.data_type(), DataType::Struct(fields)
                 if fields.len() == 2 && fields[0].data_type() == &DataType::Utf8
-                    && fields[1].data_type() == &DataType::Utf8));
+                    && fields[1].data_type() == value_type));
         work.step()?;
         if !valid {
             return Err(ConstantError::Invalid(
@@ -340,7 +389,12 @@ impl<'a> SelectedUtf8Map<'a> {
     ) -> Result<(Option<&'a str>, Option<&'a str>), ConstantError> {
         let index = ordinal(self.start, self.len, index, work)?;
         let key = text(self.keys, index, work)?;
-        let value = text(self.values, index, work)?;
+        let value = if self.values.data_type() == &DataType::Null {
+            work.step()?;
+            None
+        } else {
+            text(self.values, index, work)?
+        };
         Ok((key, value))
     }
 }

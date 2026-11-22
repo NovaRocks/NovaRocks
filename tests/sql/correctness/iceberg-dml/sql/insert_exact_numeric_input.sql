@@ -71,32 +71,32 @@ CREATE TABLE ${case_db}.t_insert_exact_nested (
 );
 INSERT INTO ${case_db}.t_insert_exact_nested VALUES
   ROW(1, [123456789.123456789, -(123456789.123456789), NULL],
-      map(123456789.123456789,-(123456789.123456789)),
+      MAP(ARRAY[123456789.123456789], ARRAY[-(123456789.123456789)]),
       row(123456789.123456789, [-(123456789.123456789), NULL])),
   ROW(2, [], map(), NULL),
   ROW(3, NULL, NULL, NULL),
-  ROW(4, [1.0, 2.50], map(1,2.50), row(NULL, []));
+  ROW(4, [1.0, 2.50], MAP(ARRAY[1], ARRAY[2.50]), row(NULL, []));
 INSERT INTO ${case_db}.t_insert_exact_nested
-SELECT 5, ARRAY[(- (DECIMAL '123456789.123456789')), NULL], map(DECIMAL '123456789.123456789', NULL), named_struct('d', (- (DECIMAL '123456789.123456789')), 'a', ARRAY[DECIMAL '123456789.123456789']);
+SELECT 5, ARRAY[(- (DECIMAL '123456789.123456789')), NULL], MAP(ARRAY[DECIMAL '123456789.123456789'], ARRAY[NULL]), ROW((- (DECIMAL '123456789.123456789')), ARRAY[DECIMAL '123456789.123456789']);
 INSERT INTO ${case_db}.t_insert_exact_nested VALUES
   ROW(6, [123456789.123456789, 1e0], NULL,
       row(123456789.123456789, [123456789.123456789, 1e0]));
 
 -- query 9
 SELECT id, a[1] AS first_value, a[2] AS second_value,
-       a[3] AS third_value, array_length(a) AS element_count,
+       a[3] AS third_value, cardinality(a) AS element_count,
        a IS NULL AS whole_null
 FROM ${case_db}.t_insert_exact_nested ORDER BY id;
 
 -- query 10
 -- Read keys and values without introducing a mixed-scale lookup comparison.
 SELECT id, map_keys(m)[1] AS first_key, map_values(m)[1] AS first_value,
-       map_size(m) AS entry_count, m IS NULL AS whole_null
+       cardinality(m) AS entry_count, m IS NULL AS whole_null
 FROM ${case_db}.t_insert_exact_nested ORDER BY id;
 
 -- query 11
 SELECT id, s.d AS decimal_field, s.a[1] AS nested_first,
-       s.a[2] AS nested_second, array_length(s.a) AS nested_count,
+       s.a[2] AS nested_second, cardinality(s.a) AS nested_count,
        s IS NULL AS whole_null
 FROM ${case_db}.t_insert_exact_nested ORDER BY id;
 

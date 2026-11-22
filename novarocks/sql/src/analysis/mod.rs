@@ -212,7 +212,7 @@ pub(crate) enum Relation {
     },
     /// A join between two relations.
     Join(AstBox<JoinRelation>),
-    /// `TABLE(generate_series(start, end[, step]))`.
+    /// A normalized `TABLE(sequence(...))` range.
     GenerateSeries(GenerateSeriesRelation),
     /// `LATERAL UNNEST(array_expr[, ...])`.
     Unnest(UnnestRelation),
@@ -758,7 +758,14 @@ pub(crate) enum ApplyClause {
     Projection,
 }
 
-/// A clause-owned scalar subquery or JSON value-form mark probe.
+#[derive(Clone, Debug)]
+pub(crate) struct RelationMarkSpec {
+    pub probe_column: AnalyzedOutputField,
+    pub demand_projections: Vec<AnalyzedProjectItem>,
+    pub predicate: TypedExpr,
+}
+
+/// A clause-owned scalar subquery or value-form mark probe.
 /// The planner emits `LogicalPlanKind::Apply` for scalar results and a
 /// null-aware mark join for `mark_probe`. The inner query is
 /// left INTACT — correlation predicates remain in its WHERE; M1b's
@@ -773,6 +780,8 @@ pub(crate) struct ApplyScalarSpec {
     pub mark_probe: Option<TypedExpr>,
     /// Exact hidden-call selection for the materialized probe and RHS values.
     pub mark_key_bindings: Option<[crate::binding::SqlFunctionBinding; 2]>,
+    /// A materialized probe and an ordinary typed predicate over actual pairs.
+    pub relation_mark: Option<RelationMarkSpec>,
     /// Placeholder id this spec replaced (matches the original SubqueryInfo.id).
     /// Read by M1b (AssertOneRow error message); unused in M1a production code.
     #[allow(dead_code)]

@@ -60,8 +60,8 @@ impl BinaryOperatorKernel {
         operator: OperatorFunction,
         operands: [&FunctionValueType; 2],
         control: &dyn PureCompileControl,
-    ) -> Result<(), FunctionBindingError> {
-        comparison_recipe(operator, operands, control).map(|_| ())
+    ) -> Result<bool, FunctionBindingError> {
+        comparison_recipe(operator, operands, control).map(|recipe| recipe.nullable_result())
     }
 
     pub(super) fn prepare(

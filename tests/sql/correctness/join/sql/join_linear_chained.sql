@@ -44,7 +44,7 @@ CREATE TABLE ${case_db}.__row_util_base (
 
 -- query 4
 -- @skip_result_check=true
-insert into ${case_db}.__row_util_base select generate_series from TABLE(generate_series(0, 2500 - 1));
+insert into ${case_db}.__row_util_base select generate_series from TABLE(sequence(0, 2500 - 1)) AS generate_series(generate_series);
 
 -- query 5
 -- @skip_result_check=true

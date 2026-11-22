@@ -60,12 +60,12 @@ CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uui
 -- query 7
 -- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
 -- @expect_error=Procedure not registered: system.rewrite_position_delete_files
-CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', options => map('partial-progress.enabled', 'true'));
+CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', options => MAP(ARRAY['partial-progress.enabled'], ARRAY['true']));
 
 -- query 8
 -- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
 -- @expect_error=Procedure not registered: system.rewrite_position_delete_files
-CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', options => map('target-file-size-bytes', '134217728'));
+CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.orders', options => MAP(ARRAY['target-file-size-bytes'], ARRAY['134217728']));
 
 -- query 9
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
@@ -73,7 +73,7 @@ CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uui
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
 -- @expect_error=Procedure not registered: system.rewrite_position_delete_files
-CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.v2_orders', options => map('rewrite-all', 'true'));
+CALL proc_err_${uuid0}.system.rewrite_position_delete_files("table" => 'ns_${uuid0}.v2_orders', options => MAP(ARRAY['rewrite-all'], ARRAY['true']));
 
 -- query 10
 -- @db=proc_err_${uuid0}.ns_${uuid0}

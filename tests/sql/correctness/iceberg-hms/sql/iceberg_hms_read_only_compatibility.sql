@@ -222,12 +222,12 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE remove_orphan_files(retent
 -- query 44
 -- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
 -- @expect_error=Procedure not registered: system.rewrite_data_files
-CALL ice_hms_${uuid0}.system.rewrite_data_files("table" => 'iru7_${uuid0}.v3', options => map('rewrite-all','true'));
+CALL ice_hms_${uuid0}.system.rewrite_data_files("table" => 'iru7_${uuid0}.v3', options => MAP(ARRAY['rewrite-all'], ARRAY['true']));
 
 -- query 45
 -- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
 -- @expect_error=Procedure not registered: system.rewrite_position_delete_files
-CALL ice_hms_${uuid0}.system.rewrite_position_delete_files("table" => 'iru7_${uuid0}.v2', options => map('rewrite-all','true'));
+CALL ice_hms_${uuid0}.system.rewrite_position_delete_files("table" => 'iru7_${uuid0}.v2', options => MAP(ARRAY['rewrite-all'], ARRAY['true']));
 
 -- query 46
 -- Optimize admission

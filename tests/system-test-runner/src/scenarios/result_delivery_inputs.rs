@@ -35,14 +35,10 @@ pub(super) enum RetentionShape {
 impl RetentionShape {
     pub(super) fn sql(self) -> &'static str {
         match self {
-            Self::Normal => {
-                "SELECT REPEAT('x', 1048576) AS payload FROM TABLE(generate_series(1, 1))"
-            }
-            Self::OneByte => {
-                "SELECT REPEAT('x', 1048569) AS payload FROM TABLE(generate_series(1, 1))"
-            }
+            Self::Normal => "SELECT rpad('', 1048576, 'x') AS payload FROM TABLE(sequence(1, 1))",
+            Self::OneByte => "SELECT rpad('', 1048569, 'x') AS payload FROM TABLE(sequence(1, 1))",
             Self::MinimumNewRow => {
-                "SELECT payload FROM (SELECT 0 AS ordinal, REPEAT('x', 1048568) AS payload UNION ALL SELECT 1 AS ordinal, '' AS payload) ordered_rows ORDER BY ordinal ASC"
+                "SELECT payload FROM (SELECT 0 AS ordinal, rpad('', 1048568, 'x') AS payload UNION ALL SELECT 1 AS ordinal, '' AS payload) ordered_rows ORDER BY ordinal ASC"
             }
         }
     }

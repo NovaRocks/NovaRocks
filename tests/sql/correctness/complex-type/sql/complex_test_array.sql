@@ -86,7 +86,7 @@ select c4 > c5 from array_data_type;
 
 -- query 13
 USE ${case_db};
-select * from (select array_map(x -> x*2 + x*2, [1,3]) col1) t1 CROSS JOIN (select array_map(x -> x*2 + x*2, c3) col2 from  array_data_type) t2;
+select * from (select transform([1,3], x -> x*2 + x*2) col1) t1 CROSS JOIN (select transform(c3, x -> x*2 + x*2) col2 from  array_data_type) t2;
 
 -- name: testArrayVarchar
 -- query 14
@@ -128,7 +128,7 @@ select * from array_data_type_1 where c5 = c4 or c6 = [['a']];
 -- query 20
 -- @skip_result_check=true
 USE ${case_db};
-select * from array_data_type_1 where array_map((x) -> concat(x, 'a'), c5) = c4;
+select * from array_data_type_1 where transform(c5, (x) -> concat(x, 'a')) = c4;
 
 -- query 21
 USE ${case_db};
@@ -137,7 +137,7 @@ select c6[0] = ['a'] from array_data_type_1;
 -- query 22
 -- @expect_error=comparison operator
 USE ${case_db};
-select c6[0] > array_map((x) -> concat(x, 'a'), c5) from array_data_type_1;
+select c6[0] > transform(c5, (x) -> concat(x, 'a')) from array_data_type_1;
 
 -- name: testArrayTopN
 -- query 23
@@ -200,7 +200,7 @@ CREATE TABLE array_exprr
 -- query 32
 -- @skip_result_check=true
 USE ${case_db};
-insert into array_exprr SELECT generate_series, generate_series FROM TABLE(generate_series(1,  13336));
+insert into array_exprr SELECT generate_series, generate_series FROM TABLE(sequence(1,  13336)) AS generate_series(generate_series);
 
 -- query 33
 USE ${case_db};
@@ -213,7 +213,7 @@ with t0 as (
     select c1 from (values ROW([])) as t(c1)
 )
 select 
-array_concat(c1, [1])
+concat(c1, [1])
 from t0;
 
 -- query 35
@@ -222,37 +222,37 @@ with t0 as (
     select c1 from (values ROW([])) as t(c1)
 )
 select 
-array_concat([1], c1)
+concat([1], c1)
 from t0;
 
 -- query 36
 USE ${case_db};
-select array_concat(c1, [[]])
+select concat(c1, [[]])
 from (select c1 from (values ROW([])) as t(c1)) t;
 
 -- query 37
 USE ${case_db};
-select array_concat(c1, [[1]])
+select concat(c1, [[1]])
 from (select c1 from (values ROW([])) as t(c1)) t;
 
 -- query 38
 USE ${case_db};
-select array_concat(c1, [[1]])
+select concat(c1, [[1]])
 from (select c1 from (values ROW([[]])) as t(c1)) t;
 
 -- query 39
 USE ${case_db};
-select array_concat(c1, [map('a',1)])
+select concat(c1, [MAP(ARRAY['a'], ARRAY[1])])
 from (select c1 from (values ROW([map()])) as t(c1)) t;
 
 -- query 40
 USE ${case_db};
-select array_concat(c1, [map('a',1)])
+select concat(c1, [MAP(ARRAY['a'], ARRAY[1])])
 from (select c1 from (values ROW([])) as t(c1)) t;
 
 -- query 41
 USE ${case_db};
-select array_concat(c1, [named_struct('a', 1, 'b', 2, 'c', 3)])
+select concat(c1, [CAST(ROW(1,2,3) AS ROW(a INTEGER,b INTEGER,c INTEGER))])
 from (select c1 from (values ROW([])) as t(c1)) t;
 
 -- query 42
@@ -276,61 +276,61 @@ select aad_1 != aas_1  from t2;
 -- name: test_array_generate
 -- query 45
 USE ${case_db};
-select array_generate(1, array_length([1,2,3]),1);
+select sequence(1, cardinality([1,2,3]),1);
 
 -- query 46
 USE ${case_db};
-select array_generate(1, NULL,1);
+select sequence(1, NULL,1);
 
 -- query 47
 USE ${case_db};
-select array_generate(NULL,1,1);
+select sequence(NULL,1,1);
 
 -- query 48
 USE ${case_db};
-select array_generate(1,1,NULL);
+select sequence(1,1,NULL);
 
 -- query 49
 USE ${case_db};
-select array_generate(1,9);
+select sequence(1,9);
 
 -- query 50
 USE ${case_db};
-select array_generate(9,1);
+select sequence(9,1);
 
 -- query 51
 USE ${case_db};
-select array_generate(9);
+select sequence(1, 9);
 
 -- query 52
 USE ${case_db};
-select array_generate(3,3);
+select sequence(3,3);
 
 -- query 53
 -- @skip_result_check=true
 USE ${case_db};
-select array_generate(3,2,1);
+select sequence(3,2,1);
 
 -- query 54
 USE ${case_db};
-select array_generate('2025-10-01', '2025-10-05',1);
+select sequence('2025-10-01', '2025-10-05',1);
 
 -- query 55
 USE ${case_db};
-select array_generate('2025-10-01', '2025-10-05',1, 'day');
+select sequence('2025-10-01', '2025-10-05',1, 'day');
 
 -- query 56
 -- @skip_result_check=true
 USE ${case_db};
-select array_generate('2025-10-01', '2025-10-05',0, 'day');
+select sequence('2025-10-01', '2025-10-05',0, 'day');
 
 -- query 57
 USE ${case_db};
-select array_generate('2025-10-01', 10000, 0, 'day');
+select sequence('2025-10-01', 10000, 0, 'day');
 
 -- query 58
 USE ${case_db};
-select array_generate('2025-10-01', 'abc', 1);
+select sequence('2025-10-01', 'abc', 1);
 
 -- query 59
 -- @expect_error_tier=target
@@ -338,95 +338,95 @@ select array_generate('2025-10-01', 'abc', 1);
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
-select array_generate('2025-10-01', '2025-10-05',-1, 'day');
+select sequence('2025-10-01', '2025-10-05',-1, 'day');
 
 -- query 60
 USE ${case_db};
-select array_generate(DATE'2025-10-01', DATE'2025-10-05',1, 'day');
+select sequence(DATE'2025-10-01', DATE'2025-10-05',1, 'day');
 
 -- query 61
 USE ${case_db};
-select array_generate(TIMESTAMP'2025-10-01', TIMESTAMP'2025-10-05',1, 'day');
+select sequence(TIMESTAMP'2025-10-01', TIMESTAMP'2025-10-05',1, 'day');
 
 -- query 62
 USE ${case_db};
-select array_generate('2025-10-01', '2027-10-05',1, 'year');
+select sequence('2025-10-01', '2027-10-05',1, 'year');
 
 -- query 63
 USE ${case_db};
-select array_generate('2025-10-01', '2027-10-05',1, 'quarter');
+select sequence('2025-10-01', '2027-10-05',1, 'quarter');
 
 -- query 64
 USE ${case_db};
-select array_generate('2025-10-01', '2026-10-05',2, 'month');
+select sequence('2025-10-01', '2026-10-05',2, 'month');
 
 -- query 65
 USE ${case_db};
-select array_generate('2025-10-01', '2025-12-05',2, 'week');
+select sequence('2025-10-01', '2025-12-05',2, 'week');
 
 -- query 66
 USE ${case_db};
-select array_generate('2025-10-01', '2025-10-05',2, 'day');
+select sequence('2025-10-01', '2025-10-05',2, 'day');
 
 -- query 67
 USE ${case_db};
-select array_generate('2025-10-01 14:28:31', '2025-10-01 23:12:36',3, 'hour');
+select sequence('2025-10-01 14:28:31', '2025-10-01 23:12:36',3, 'hour');
 
 -- query 68
 USE ${case_db};
-select array_generate('2025-10-01 14:28:31', '2025-10-01 15:12:36',8, 'minute');
+select sequence('2025-10-01 14:28:31', '2025-10-01 15:12:36',8, 'minute');
 
 -- query 69
 USE ${case_db};
-select array_generate('2025-10-01 14:28:31', '2025-10-01 14:29:36',10, 'second');
+select sequence('2025-10-01 14:28:31', '2025-10-01 14:29:36',10, 'second');
 
 -- query 70
 USE ${case_db};
-select array_generate('2025-10-01 14:28:31', '2025-10-01 14:28:34',500, 'millisecond');
+select sequence('2025-10-01 14:28:31', '2025-10-01 14:28:34',500, 'millisecond');
 
 -- query 71
 USE ${case_db};
-select array_generate('2025-10-01 14:28:31', '2025-10-01 14:28:32.800000',500000, 'microsecond');
+select sequence('2025-10-01 14:28:31', '2025-10-01 14:28:32.800000',500000, 'microsecond');
 
 -- query 72
 USE ${case_db};
-select array_generate('2027-10-05', '2025-10-01',1, 'year');
+select sequence('2027-10-05', '2025-10-01',1, 'year');
 
 -- query 73
 USE ${case_db};
-select array_generate('2027-10-05', '2025-10-01',1, 'quarter');
+select sequence('2027-10-05', '2025-10-01',1, 'quarter');
 
 -- query 74
 USE ${case_db};
-select array_generate('2026-10-05', '2025-10-01',2, 'month');
+select sequence('2026-10-05', '2025-10-01',2, 'month');
 
 -- query 75
 USE ${case_db};
-select array_generate('2025-12-05', '2025-10-01',2, 'week');
+select sequence('2025-12-05', '2025-10-01',2, 'week');
 
 -- query 76
 USE ${case_db};
-select array_generate('2025-10-05', '2025-10-01',2, 'day');
+select sequence('2025-10-05', '2025-10-01',2, 'day');
 
 -- query 77
 USE ${case_db};
-select array_generate('2025-10-01 23:12:36', '2025-10-01 14:28:31',3, 'hour');
+select sequence('2025-10-01 23:12:36', '2025-10-01 14:28:31',3, 'hour');
 
 -- query 78
 USE ${case_db};
-select array_generate('2025-10-01 15:12:36', '2025-10-01 14:28:31',8, 'minute');
+select sequence('2025-10-01 15:12:36', '2025-10-01 14:28:31',8, 'minute');
 
 -- query 79
 USE ${case_db};
-select array_generate('2025-10-01 14:29:36', '2025-10-01 14:28:31',10, 'second');
+select sequence('2025-10-01 14:29:36', '2025-10-01 14:28:31',10, 'second');
 
 -- query 80
 USE ${case_db};
-select array_generate('2025-10-01 14:28:34', '2025-10-01 14:28:31',500, 'millisecond');
+select sequence('2025-10-01 14:28:34', '2025-10-01 14:28:31',500, 'millisecond');
 
 -- query 81
 USE ${case_db};
-select array_generate('2025-10-01 14:28:32.800000', '2025-10-01 14:28:31',500000, 'microsecond');
+select sequence('2025-10-01 14:28:32.800000', '2025-10-01 14:28:31',500000, 'microsecond');
 
 -- query 82
 -- @expect_error_tier=target
@@ -434,26 +434,26 @@ select array_generate('2025-10-01 14:28:32.800000', '2025-10-01 14:28:31',500000
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
-select array_generate('2025-10-05', '2025-10-01',-1, 'day');
+select sequence('2025-10-05', '2025-10-01',-1, 'day');
 
 -- query 83
 -- @expect_error=array_generate requires step parameter must be a constant integer
 USE ${case_db};
-select array_generate('2025-10-01 14:28:32.800000', '2025-10-01 14:28:31',NULL);
+select sequence('2025-10-01 14:28:32.800000', '2025-10-01 14:28:31',NULL);
 
 -- name: test_array_repeat
 -- query 84
 USE ${case_db};
-select array_repeat(1,5);
+select repeat(1,5);
 
 -- query 85
 USE ${case_db};
-select array_repeat([1,2],3);
+select repeat([1,2],3);
 
 -- query 86
 -- @skip_result_check=true
 USE ${case_db};
-select array_repeat(1,-1);
+select repeat(1,-1);
 
 -- query 87
 -- @skip_result_check=true
@@ -467,16 +467,16 @@ INSERT INTO repeat_test (COLA, COLB) VALUES ROW(1, 3), ROW(NULL, 3), ROW(2, NULL
 
 -- query 89
 USE ${case_db};
-SELECT array_repeat(COLA, COLB) FROM repeat_test ORDER BY COLA;
+SELECT repeat(COLA, COLB) FROM repeat_test ORDER BY COLA;
 
 -- name: test_array_flatten
 -- query 90
 USE ${case_db};
-select array_flatten([[1, 2], [1, 4]]);
+select flatten([[1, 2], [1, 4]]);
 
 -- query 91
 USE ${case_db};
-select array_flatten([[[1],[2]],[[3],[4]]]);
+select flatten([[[1],[2]],[[3],[4]]]);
 
 -- query 92
 -- @skip_result_check=true
@@ -490,15 +490,15 @@ INSERT INTO flatten_test (COLA, COLB) VALUES ROW(1, [[1, 2], [1, 4]]), ROW(2, NU
 
 -- query 94
 USE ${case_db};
-SELECT array_flatten(COLB) FROM flatten_test ORDER BY COLA;
+SELECT flatten(COLB) FROM flatten_test ORDER BY COLA;
 
 -- query 95
 USE ${case_db};
-SELECT array_slice(array_flatten(COLB), 1, 2) FROM flatten_test ORDER BY COLA;
+SELECT slice(flatten(COLB), 1, 2) FROM flatten_test ORDER BY COLA;
 
 -- query 96
 USE ${case_db};
-SELECT array_flatten(array_slice(COLB, 1, 2)) FROM flatten_test ORDER BY COLA;
+SELECT flatten(slice(COLB, 1, 2)) FROM flatten_test ORDER BY COLA;
 
 -- query 97
 -- @skip_result_check=true
@@ -513,17 +513,17 @@ INSERT INTO flatten_one_layer_arr_test (COLA, COLB) VALUES ROW(1, [1, 2, 3]);
 -- query 99
 -- @expect_error=The only one input of array_flatten should be an array of arrays, rather than array<int(11)>
 USE ${case_db};
-SELECT array_flatten(COLB) FROM flatten_one_layer_arr_test ORDER BY COLA;
+SELECT flatten(COLB) FROM flatten_one_layer_arr_test ORDER BY COLA;
 
 -- query 100
 -- @expect_error=The only one input of array_flatten should be an array of arrays, rather than array<int(11)>
 USE ${case_db};
-SELECT array_slice(array_flatten(COLB), 1, 2) FROM flatten_one_layer_arr_test ORDER BY COLA;
+SELECT slice(flatten(COLB), 1, 2) FROM flatten_one_layer_arr_test ORDER BY COLA;
 
 -- query 101
 -- @expect_error=The only one input of array_flatten should be an array of arrays, rather than array<int(11)>
 USE ${case_db};
-SELECT array_flatten(array_slice(COLB, 1, 2)) FROM flatten_one_layer_arr_test ORDER BY COLA;
+SELECT flatten(slice(COLB, 1, 2)) FROM flatten_one_layer_arr_test ORDER BY COLA;
 
 -- name: null_or_empty
 -- query 102

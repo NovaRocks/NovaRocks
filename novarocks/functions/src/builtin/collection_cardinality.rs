@@ -87,12 +87,12 @@ pub(super) fn evaluate_collection_cardinality<'a>(
         };
         let target = input.contract().result_type();
         let exact = target.logical_type() == ValueLogicalType::Physical
-            && target.data_type() == &DataType::Int32
+            && target.data_type() == &DataType::Int64
             && target.nullable();
         work.borrow_mut().step()?;
         if !exact {
             return Err(invalid(
-                "cardinality differs from its exact nullable Int32 result",
+                "cardinality differs from its exact nullable Int64 result",
             ));
         }
         let collection = checked_input(source, argument.array().as_ref());

@@ -20,20 +20,21 @@ use super::{
     map_lookup_core::{LookupRows, MapLookupFailure, MapLookupInputs, lookup_observed},
 };
 use crate::{
-    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError,
-    ScalarCallContract, ScalarCallInput, SelectedValues,
+    DataFailureReason, EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl,
+    KernelFailure, RowDataError, ScalarCallContract, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
     selected_copy::{self, CopyError},
 };
-use arrow_array::{ArrayRef, UInt64Array};
+use arrow_array::{ArrayRef, BooleanArray, UInt64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-use std::{alloc::Layout, cell::RefCell};
+use std::{alloc::Layout, cell::RefCell, sync::Arc};
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Operation {
     ArrayLiteral,
     MapLookup,
+    MapSubscript,
 }
 pub(super) fn copy_error(error: CopyError) -> KernelFailure {
     error.into_kernel()
@@ -110,7 +111,7 @@ pub(super) fn validate_profile(
                 }
             }
         }
-        Operation::MapLookup => {
+        Operation::MapLookup | Operation::MapSubscript => {
             let [map, key] = args.as_ref() else {
                 return Err(invalid(
                     "map element_at has exactly two selected value arguments",
@@ -280,11 +281,13 @@ pub(super) fn evaluate<'a>(
                         internal("array literal compact result violates its checked contract")
                     })
             }
-            Operation::MapLookup => {
+            Operation::MapLookup | Operation::MapSubscript => {
                 let [map, key] = input.arguments() else {
                     return Err(invalid("map lookup requires two evaluated arguments"));
                 };
-                let inputs = MapLookupInputs::new(map.array(), key.array(), None)?;
+                let check = matches!(operation, Operation::MapSubscript)
+                    .then(|| Arc::new(BooleanArray::from(vec![true])) as ArrayRef);
+                let inputs = MapLookupInputs::new(map.array(), key.array(), check.as_ref())?;
                 Layout::array::<Option<u32>>(selection.len())
                     .map_err(|_| KernelFailure::ResourceExhausted)?;
                 let mut errors = reserve::<RowDataError>(selection.len(), &work)?;
@@ -302,7 +305,7 @@ pub(super) fn evaluate<'a>(
                         Ok(LookupRows {
                             map: map_row,
                             key: key_row,
-                            check: None,
+                            check: check.as_ref().map(|_| 0),
                         })
                     },
                     Some(target.data_type()),
@@ -321,7 +324,20 @@ pub(super) fn evaluate<'a>(
                         .map_err(copy_error)
                     },
                     |ordinal, cause| {
-                        errors.push(RowDataError::from_domain(ordinal, cause)?);
+                        let error = if matches!(operation, Operation::MapSubscript)
+                            && matches!(cause, super::map_lookup_core::LookupRowFailure::MissingKey)
+                        {
+                            RowDataError::with_reason(
+                                ordinal,
+                                DataFailureReason::Domain(
+                                    novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                                ),
+                                cause.message(),
+                            )
+                        } else {
+                            RowDataError::from_domain(ordinal, cause)?
+                        };
+                        errors.push(error);
                         Ok(())
                     },
                     &mut observer,

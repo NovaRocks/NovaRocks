@@ -142,6 +142,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.view_service,
         ports.constant_policy,
         ports.system_relations.clone(),
+        Arc::clone(&ports.sealed_functions),
     );
     let system_tables = domain::SystemTableQueryKernel::new(ports.system_relations.clone());
     FrontendQueryCompiler::new(
@@ -561,6 +562,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
 pub struct ViewCommandPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -577,10 +579,12 @@ impl ViewCommandPorts {
         view_service: Arc<dyn ViewService>,
         constant_policy: novarocks_functions::ConstantPolicy,
         system_relations: Arc<SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             constant_policy,
             functions,
+            sealed_functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -599,6 +603,7 @@ pub(crate) fn view_command_executor(ports: ViewCommandPorts) -> ViewCommandExecu
         ports.view_service,
         ports.constant_policy,
         ports.system_relations.clone(),
+        ports.sealed_functions,
     ))
 }
 

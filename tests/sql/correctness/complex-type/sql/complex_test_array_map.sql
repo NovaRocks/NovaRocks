@@ -70,26 +70,11 @@ values
 USE ${case_db};
 INSERT INTO t1 (k1, c1)
 VALUES 
-ROW(1, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
-    ARRAY_GENERATE(1, 1000)
-)),
-ROW(2, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
-    ARRAY_GENERATE(1, 1000)
-)),
-ROW(3, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
-    ARRAY_GENERATE(1, 1000)
-)),
-ROW(4, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
-    ARRAY_GENERATE(1, 1000)
-)),
-ROW(5, ARRAY_MAP(
-    x -> CAST(x AS STRING), 
-    ARRAY_GENERATE(1, 1000)
-));
+ROW(1, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
+ROW(2, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
+ROW(3, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
+ROW(4, transform(sequence(1, 1000), x -> CAST(x AS STRING))),
+ROW(5, transform(sequence(1, 1000), x -> CAST(x AS STRING)));
 
 -- query 7
 -- @skip_result_check=true
@@ -129,7 +114,7 @@ SELECT t1.id AS t1_id, t2.id AS t2_id, t1.arr_largeint
 FROM table1 t1
 LEFT JOIN table2 t2
 ON t1.id = t2.id
-AND array_length(array_map(x -> x + array_length(t2.arr_str), t1.arr_largeint)) >= 2;
+AND cardinality(transform(t1.arr_largeint, x -> x + cardinality(t2.arr_str))) >= 2;
 
 -- query 12
 USE ${case_db};
@@ -137,18 +122,18 @@ WITH "CTE" AS (
     SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ['a'] AS arr
     UNION ALL
     SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ['a'] AS arr
-) SELECT ARRAY_MAP((arg)->"bool_1" AND "bool_2" AND "bool_3", arr), ARRAY_MAP((arg)->"bool_1" AND "bool_3" AND "bool_2", arr) FROM "CTE";
+) SELECT transform(arr, (arg)->"bool_1" AND "bool_2" AND "bool_3"), transform(arr, (arg)->"bool_1" AND "bool_3" AND "bool_2") FROM "CTE";
 
 -- query 13
 USE ${case_db};
 with t1 as (
  select parse_json('[{"open_id": "aaa", "num": 1},{"open_id": "bbb", "num": 2},{"open_id": "ccc", "num": 3}]') as price_list
 ),t2 as (
- select price_list,array_map(x -> get_json_string(x,'$.open_id'), cast(price_list as array<json>)  ) as  fields
+ select price_list,transform(cast(price_list as array<json>), x -> get_json_string(x,'$.open_id')) as  fields
  from t1  
 )
 select * from t2 
-where  array_contains(fields,'bbb');
+where  contains(fields,'bbb');
 
 -- query 14
 -- @skip_result_check=true

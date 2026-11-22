@@ -30,7 +30,7 @@ CREATE TABLE t1 (
     dt VARCHAR(10) NOT NULL
 ) WITH (format_version = 3);
 INSERT INTO t1 SELECT generate_series, generate_series, generate_series % 100, '2024-07-24'
-FROM TABLE(generate_series(1, 10));
+FROM TABLE(sequence(1, 10)) AS generate_series(generate_series);
 SELECT t2.dt, "unnest", sum(d1), sum(d2)
 FROM (
     SELECT * FROM (
@@ -45,7 +45,7 @@ GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 10;
 -- query 2
 USE ${case_db};
 INSERT INTO t1 SELECT generate_series, generate_series, generate_series % 100, '2024-07-24'
-FROM TABLE(generate_series(1, 10));
+FROM TABLE(sequence(1, 10)) AS generate_series(generate_series);
 SELECT t2.dt, "unnest", sum(d1), sum(d2)
 FROM (
     SELECT * FROM (

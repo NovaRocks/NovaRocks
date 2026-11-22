@@ -42,7 +42,7 @@ CREATE TABLE t2 (
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 select generate_series, array_append([], generate_series) from TABLE(generate_series(1, 100000));
+insert into t1 select generate_series, concat([], generate_series) from TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 
 -- query 5
 -- @skip_result_check=true
@@ -51,4 +51,4 @@ insert into t2 select 1, array_agg(c2) from t1;
 
 -- query 6
 USE ${case_db};
-select array_length(array_distinct(c2)) from t2;
+select cardinality(array_distinct(c2)) from t2;

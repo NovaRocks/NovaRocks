@@ -34,7 +34,7 @@ CREATE TABLE ${case_db}.lineorder (lo_orderkey INT, lo_datekey INT, lo_revenue I
 CREATE TABLE ${case_db}.date_dim (d_datekey INT, d_year INT);
 INSERT INTO ${case_db}.lineorder
     SELECT generate_series, 19980101 + (generate_series % 2), generate_series * 10
-    FROM TABLE(generate_series(1, 20000));
+    FROM TABLE(sequence(1, 20000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.date_dim VALUES ROW(19980101, 1998), ROW(19980102, 1998);
 ANALYZE ${case_db}.lineorder;
 ANALYZE ${case_db}.date_dim;

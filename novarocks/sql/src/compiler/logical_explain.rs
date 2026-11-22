@@ -122,30 +122,98 @@ impl SqlLogicalExplainCatalog {
         environment: SqlPlanningEnvironment,
         level: ExplainLevel,
     ) -> Result<Vec<String>, SqlCompileError> {
+        self.finish_with_table_arguments(
+            facts,
+            functions,
+            sealed_functions,
+            policy,
+            environment,
+            level,
+            |_| {
+                Err(SqlCompileError::InvalidRequest(
+                    "Logical EXPLAIN requires the original table argument evaluator".into(),
+                ))
+            },
+        )
+    }
+
+    pub fn finish_with_table_arguments(
+        self,
+        facts: &[CatalogRelationFact],
+        functions: &dyn SqlFunctionCatalog,
+        sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
+        policy: novarocks_functions::ConstantPolicy,
+        environment: SqlPlanningEnvironment,
+        level: ExplainLevel,
+        evaluate: impl FnOnce(
+            Box<[super::TableSequenceArgumentNeed]>,
+        )
+            -> Result<Box<[super::TableSequenceArgumentFact]>, SqlCompileError>,
+    ) -> Result<Vec<String>, SqlCompileError> {
+        use super::table_sequence::TableSequencePass;
         self.control.check()?;
         let facts = self.catalog.fact_catalog(facts)?;
         let snapshot = SqlPlannerTableSnapshot::new(&facts);
-        let query = Box::new(self.catalog.query().clone());
-        let input = if self.root_session_admitted {
-            SqlStatementInput::query_with_admitted_session(query)
-        } else {
-            SqlStatementInput::parsed_query(query)
+        let make_request = |pass: &TableSequencePass| {
+            let query = Box::new(self.catalog.query().clone());
+            let input = if self.root_session_admitted {
+                SqlStatementInput::query_with_admitted_session(query)
+            } else {
+                SqlStatementInput::parsed_query(query)
+            };
+            let mut request = SqlAnalyzeRequest::new(
+                input,
+                SqlCompileIntent::LogicalOnly,
+                self.session.clone(),
+                environment,
+                &snapshot,
+                functions,
+                std::sync::Arc::clone(&sealed_functions),
+                None,
+                policy,
+                self.control.clone(),
+            );
+            request.table_sequence = Some(pass);
+            SqlCompiler::analyze_with_table_sequence(request)?
+                .map(|output| output.into_complete())
+                .transpose()
         };
-        let request = SqlAnalyzeRequest::new(
-            input,
-            SqlCompileIntent::LogicalOnly,
-            self.session,
-            environment,
-            &snapshot,
-            functions,
-            sealed_functions,
-            None,
-            policy,
-            self.control.clone(),
+        let pass = TableSequencePass::request(
+            std::sync::Arc::clone(&sealed_functions),
+            self.catalog.next_need_ordinal(),
         );
-        SqlCompiler::analyze(request)?
-            .into_complete()?
-            .into_explain_lines(level, true, &self.control)
+        let analyzed = make_request(&pass)?;
+        let (occurrences, _) = pass.into_requests();
+        let analyzed = if occurrences.is_empty() {
+            analyzed.ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "Logical EXPLAIN did not publish an analysis".into(),
+                )
+            })?
+        } else {
+            let needs = TableSequencePass::needs(&occurrences);
+            let facts = evaluate(needs.clone())?;
+            if facts.len() != needs.len()
+                || !facts
+                    .iter()
+                    .zip(&needs)
+                    .all(|(fact, need)| fact.matches(need))
+            {
+                return Err(SqlCompileError::InvalidRequest(
+                    "Logical EXPLAIN table argument facts differ from their prepared expressions"
+                        .into(),
+                ));
+            }
+            let pass = TableSequencePass::resume(occurrences, facts, &self.control)?;
+            let analyzed = make_request(&pass)?.ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "Logical EXPLAIN still needs table arguments".into(),
+                )
+            })?;
+            pass.check_consumed()?;
+            analyzed
+        };
+        analyzed.into_explain_lines(level, true, &self.control)
     }
 }
 

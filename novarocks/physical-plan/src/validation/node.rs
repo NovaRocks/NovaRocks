@@ -108,16 +108,21 @@ pub(crate) fn validate_value(
         ValueOrigin::JoinMark { node } => {
             if !matches!(
                 fragment.nodes().get(node).map(|owner| &owner.kind),
-                Some(NodeKind::HashJoin {
-                    kind: crate::JoinKind::LeftMark,
-                    ..
-                })
+                Some(
+                    NodeKind::HashJoin {
+                        kind: crate::JoinKind::LeftMark,
+                        ..
+                    } | NodeKind::NestLoopJoin {
+                        kind: crate::JoinKind::LeftMark,
+                        ..
+                    }
+                )
             ) || *value.ty.data_type() != DataType::Boolean
                 || !value.ty.nullable()
             {
                 errors.push(ValidationError::new(
                     &path,
-                    "join mark must be a nullable Boolean owned by a hash left mark join",
+                    "join mark must be a nullable Boolean owned by a left mark join",
                 ));
             }
         }
@@ -692,6 +697,10 @@ pub(crate) fn value_origin_allowed(
             NodeKind::HashJoin {
                 kind: crate::JoinKind::LeftMark,
                 ..
+            }
+            | NodeKind::NestLoopJoin {
+                kind: crate::JoinKind::LeftMark,
+                ..
             },
             ValueOrigin::JoinMark { node: owner },
         ) => *owner == node.id,
@@ -1131,16 +1140,14 @@ pub(crate) fn validate_node_semantics(
             predicate,
             null_extended,
         } => {
-            if *kind == crate::JoinKind::LeftMark {
+            if matches!(
+                kind,
+                crate::JoinKind::NullAwareLeftAnti | crate::JoinKind::LeftMark
+            ) && predicate.is_none()
+            {
                 errors.push(ValidationError::new(
                     path,
-                    "left mark join requires hash execution",
-                ));
-            }
-            if *kind == crate::JoinKind::NullAwareLeftAnti && predicate.is_none() {
-                errors.push(ValidationError::new(
-                    path,
-                    "null-aware nested-loop join requires its complete predicate",
+                    "null-aware or mark nested-loop join requires its complete predicate",
                 ));
             }
             if *kind == crate::JoinKind::Cross && (predicate.is_some() || !null_extended.is_empty())

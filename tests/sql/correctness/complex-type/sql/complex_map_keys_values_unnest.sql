@@ -27,8 +27,8 @@
 SELECT k, v
 FROM (
     SELECT
-        MAP_KEYS(MAP('a', 1, 'b', 2)) AS ks,
-        MAP_VALUES(MAP('a', 1, 'b', 2)) AS vs
+        MAP_KEYS(MAP(ARRAY['a', 'b'], ARRAY[1, 2])) AS ks,
+        MAP_VALUES(MAP(ARRAY['a', 'b'], ARRAY[1, 2])) AS vs
 ) t
 CROSS JOIN  UNNEST(t.ks, t.vs) AS u(k, v)
 ORDER BY k;

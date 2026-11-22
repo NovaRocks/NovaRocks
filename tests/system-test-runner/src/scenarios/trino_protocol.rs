@@ -313,7 +313,7 @@ fn failed_query(actor: &TrinoClient, sql: &str, expected: (i64, &str, &str)) -> 
 }
 fn paging_sql() -> String {
     format!(
-        "SELECT generate_series AS id, REPEAT('x', {PAYLOAD_BYTES}) AS payload FROM TABLE(generate_series(1, {PAGING_ROWS})) ORDER BY generate_series"
+        "SELECT sequential_number AS id, rpad('', {PAYLOAD_BYTES}, 'x') AS payload FROM TABLE(sequence(1, {PAGING_ROWS})) ORDER BY sequential_number"
     )
 }
 fn assert_row(row: &Value, expected: usize) -> Result<()> {
@@ -875,7 +875,7 @@ fn row_budget(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> 
     // Each legal scalar remains at the existing 1 MiB string boundary; seven
     // fields form one row larger than the Client page remainder below 6 MiB.
     let fields = (0..7)
-        .map(|index| format!("REPEAT('x', 1048576) AS field_{index}"))
+        .map(|index| format!("rpad('', 1048576, 'x') AS field_{index}"))
         .collect::<Vec<_>>()
         .join(", ");
     failed_query(

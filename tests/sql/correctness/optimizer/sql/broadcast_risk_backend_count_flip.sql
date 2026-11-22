@@ -24,10 +24,10 @@ USE ${case_db};
 CREATE TABLE probe_flip (k INT, pad1 VARCHAR(100), pad2 VARCHAR(100));
 CREATE TABLE build_flip (k INT);
 INSERT INTO probe_flip
-    SELECT generate_series, repeat('p', 100), repeat('q', 100)
-    FROM TABLE(generate_series(1, 5000000));
+    SELECT generate_series, rpad('', 100, 'p'), rpad('', 100, 'q')
+    FROM TABLE(sequence(1, 5000000)) AS generate_series(generate_series);
 INSERT INTO build_flip
-    SELECT generate_series FROM TABLE(generate_series(1, 500000));
+    SELECT generate_series FROM TABLE(sequence(1, 500000)) AS generate_series(generate_series);
 ANALYZE probe_flip;
 ANALYZE build_flip;
 -- Recorded sizing: 5M wide probe + 500k narrow build. be=2 keeps broadcast;

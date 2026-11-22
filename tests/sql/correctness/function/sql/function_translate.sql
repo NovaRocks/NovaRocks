@@ -34,28 +34,28 @@
 -- Exceed OLAP_STRING_MAX_LENGTH: constant args, same-byte replacement
 USE ${case_db};
 SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(REPEAT('a', 1024*1024), 'a', 'b')
+    TRANSLATE(rpad('', 1024*1024, 'a'), 'a', 'b')
 )), 0);
 
 -- query 2
 -- Exceed OLAP_STRING_MAX_LENGTH: constant args, multi-byte to single-byte
 USE ${case_db};
 SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT(REPEAT('a', 1024*1024-1024*3), REPEAT('膨', 1024)), '膨', 'p')
+    TRANSLATE(CONCAT(rpad('', 1024*1024-1024*3, 'a'), rpad('', 1024, '膨')), '膨', 'p')
 )), 0);
 
 -- query 3
 -- Exceed OLAP_STRING_MAX_LENGTH: constant args, single-byte to multi-byte
 USE ${case_db};
 SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT('a', REPEAT('b', 1024*1024 - 1 - 2)), 'a', '膨')
+    TRANSLATE(CONCAT('a', rpad('', 1024*1024 - 1 - 2, 'b')), 'a', '膨')
 )), 0);
 
 -- query 4
 -- Expansion beyond max length: may return NULL
 -- @skip_result_check=true
 USE ${case_db};
-SELECT TRANSLATE(REPEAT('a', 1024*1024), 'a', '膨');
+SELECT TRANSLATE(rpad('', 1024*1024, 'a'), 'a', '膨');
 
 -- query 5
 -- @skip_result_check=true
@@ -75,7 +75,7 @@ insert into t1 values ROW('placeholder', 'a', 'b');
 -- Exceed OLAP_STRING_MAX_LENGTH: table-based, same-byte replacement
 USE ${case_db};
 SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(REPEAT('a', 1024*1024), from_str, to_str)
+    TRANSLATE(rpad('', 1024*1024, 'a'), from_str, to_str)
 )), 0) from t1;
 
 -- query 8
@@ -92,7 +92,7 @@ insert into t1 values ROW('placeholder', '膨', 'p');
 -- Exceed OLAP_STRING_MAX_LENGTH: table-based, multi-byte to single-byte
 USE ${case_db};
 SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT(REPEAT('a', 1024*1024-1024*3), REPEAT('膨', 1024)), from_str, to_str)
+    TRANSLATE(CONCAT(rpad('', 1024*1024-1024*3, 'a'), rpad('', 1024, '膨')), from_str, to_str)
 )), 0) from t1;
 
 -- query 11
@@ -109,7 +109,7 @@ insert into t1 values ROW('placeholder', 'a', '膨');
 -- Exceed OLAP_STRING_MAX_LENGTH: table-based, single-byte to multi-byte
 USE ${case_db};
 SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(CONCAT('a', REPEAT('b', 1024*1024 - 1 - 2)), from_str, to_str)
+    TRANSLATE(CONCAT('a', rpad('', 1024*1024 - 1 - 2, 'b')), from_str, to_str)
 )), 0) from t1;
 
 -- query 14
@@ -126,7 +126,7 @@ insert into t1 values ROW('placeholder', 'a', '膨');
 -- Exceed OLAP_STRING_MAX_LENGTH: table-based, expansion
 USE ${case_db};
 SELECT ifnull(sum(murmur_hash3_32(
-    TRANSLATE(REPEAT('a', 1024*1024), from_str, to_str)
+    TRANSLATE(rpad('', 1024*1024, 'a'), from_str, to_str)
 )), 0) from t1;
 
 -- ------------------------------------------------------------------------
@@ -208,27 +208,27 @@ CREATE TABLE "t1" (
 -- query 28
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('a|b|c', generate_series), 'ab', '123' FROM TABLE(generate_series(1, 4095*2));
+INSERT INTO t1 SELECT CONCAT('a|b|c', generate_series), 'ab', '123' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 29
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('a|b|c', generate_series), 'abc', '12' FROM TABLE(generate_series(1, 4095*2));
+INSERT INTO t1 SELECT CONCAT('a|b|c', generate_series), 'abc', '12' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 30
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('C|S', generate_series), 'CS', '测试' FROM TABLE(generate_series(1, 4095*2));
+INSERT INTO t1 SELECT CONCAT('C|S', generate_series), 'CS', '测试' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 31
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('测|试', generate_series), '测试', 'CS' FROM TABLE(generate_series(1, 4095*2));
+INSERT INTO t1 SELECT CONCAT('测|试', generate_series), '测试', 'CS' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 32
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 SELECT CONCAT('测|试', generate_series), '测试', 'C' FROM TABLE(generate_series(1, 4095*2));
+INSERT INTO t1 SELECT CONCAT('测|试', generate_series), '测试', 'C' FROM TABLE(sequence(1, 4095*2)) AS generate_series(generate_series);
 
 -- query 33
 -- Multi-chunk: all non-constant args

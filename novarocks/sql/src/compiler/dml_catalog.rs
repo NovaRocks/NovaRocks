@@ -23,6 +23,10 @@ use super::{
     SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
     SqlSessionContext, SqlStatementInput, SqlStatementInputKind,
     completion_catalog::CatalogCompletionState,
+    table_sequence::{
+        TableSequenceArgumentFact, TableSequenceArgumentNeed, TableSequenceOccurrence,
+        TableSequencePass,
+    },
 };
 use std::sync::Arc;
 
@@ -35,6 +39,51 @@ pub struct SqlDmlCatalogPreparation {
     control: SqlCompileControl,
     intent: SqlCompileIntent,
     write_assignments: Option<std::sync::Arc<super::SqlWriteAssignments>>,
+}
+
+/// The original DML analysis may need statement-scoped table arguments.
+pub enum SqlDmlAnalysisProgress {
+    Ready(Box<SqlAnalyzedQuery>),
+    TableSequence(Box<SqlDmlTableSequenceAnalysis>),
+}
+
+/// Retains the same completed DML catalog, exact write declarations and
+/// requested occurrences across the original statement's argument evaluation.
+pub struct SqlDmlTableSequenceAnalysis {
+    preparation: SqlDmlCatalogPreparation,
+    occurrences: Vec<TableSequenceOccurrence>,
+    functions: Arc<dyn SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+    policy: ConstantPolicy,
+}
+
+impl SqlDmlTableSequenceAnalysis {
+    pub fn needs(&self) -> Box<[TableSequenceArgumentNeed]> {
+        TableSequencePass::needs(&self.occurrences)
+    }
+
+    pub fn resume(
+        self,
+        facts: Box<[TableSequenceArgumentFact]>,
+    ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
+        let pass = TableSequencePass::resume(self.occurrences, facts, &self.preparation.control)?;
+        let analyzed = self
+            .preparation
+            .analyze_with_pass(
+                &[],
+                self.functions.as_ref(),
+                self.sealed_functions,
+                self.policy,
+                Some(&pass),
+            )?
+            .ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "DML source still needs its original table sequence arguments".into(),
+                )
+            })?;
+        pass.check_consumed()?;
+        Ok(analyzed)
+    }
 }
 
 impl SqlDmlCatalogPreparation {
@@ -156,17 +205,74 @@ impl SqlDmlCatalogPreparation {
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         policy: ConstantPolicy,
     ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
+        self.analyze_with_pass(facts, functions, sealed_functions, policy, None)?
+            .ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "DML source did not complete its table sequence arguments".into(),
+                )
+            })
+    }
+
+    pub fn begin_analysis(
+        self,
+        functions: &dyn SqlFunctionCatalog,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+        policy: ConstantPolicy,
+    ) -> Result<SqlDmlAnalysisProgress, SqlCompileError> {
+        let functions = functions.snapshot();
+        let pass = TableSequencePass::request(
+            Arc::clone(&sealed_functions),
+            self.catalog.next_need_ordinal(),
+        );
+        let analyzed = self.analyze_with_pass(
+            &[],
+            functions.as_ref(),
+            Arc::clone(&sealed_functions),
+            policy,
+            Some(&pass),
+        )?;
+        let (occurrences, _) = pass.into_requests();
+        match analyzed {
+            Some(analyzed) if occurrences.is_empty() => {
+                Ok(SqlDmlAnalysisProgress::Ready(Box::new(analyzed)))
+            }
+            None if !occurrences.is_empty() => Ok(SqlDmlAnalysisProgress::TableSequence(Box::new(
+                SqlDmlTableSequenceAnalysis {
+                    preparation: self,
+                    occurrences,
+                    functions,
+                    sealed_functions,
+                    policy,
+                },
+            ))),
+            _ => Err(SqlCompileError::InvalidRequest(
+                "DML source analysis returned inconsistent table sequence requests".into(),
+            )),
+        }
+    }
+
+    fn analyze_with_pass(
+        &self,
+        facts: &[CatalogRelationFact],
+        functions: &dyn SqlFunctionCatalog,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+        policy: ConstantPolicy,
+        pass: Option<&TableSequencePass>,
+    ) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
         self.control.check()?;
         let catalog = self.catalog.fact_catalog(facts)?;
         let snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let query = Box::new(self.catalog.query().clone());
-        let statement = match self.statement.kind {
+        let statement = match &self.statement.kind {
             SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
                 // Keep the original pool and ordinal. The analysis borrow is
                 // rebuilt from structural sites on this actual owned AST.
                 source.loan(&query, &self.control)?;
                 SqlStatementInput {
-                    kind: SqlStatementInputKind::MaterializedValuesQuery { query, source },
+                    kind: SqlStatementInputKind::MaterializedValuesQuery {
+                        query,
+                        source: source.clone(),
+                    },
                 }
             }
             SqlStatementInputKind::ParsedQuery(_) => SqlStatementInput::parsed_query(query),
@@ -176,23 +282,26 @@ impl SqlDmlCatalogPreparation {
                 ));
             }
         };
-        let request = SqlAnalyzeRequest::new(
+        let mut request = SqlAnalyzeRequest::new(
             statement,
-            self.intent,
-            self.session,
+            self.intent.clone(),
+            self.session.clone(),
             SqlPlanningEnvironment::Distributed,
             &snapshot,
             functions,
             sealed_functions,
             None,
             policy,
-            self.control,
+            self.control.clone(),
         );
-        let request = match self.write_assignments {
-            Some(assignments) => request.with_write_assignments(assignments)?,
+        request.table_sequence = pass;
+        let request = match &self.write_assignments {
+            Some(assignments) => request.with_write_assignments(Arc::clone(assignments))?,
             None => request,
         };
-        SqlCompiler::analyze(request)?.into_pending()
+        SqlCompiler::analyze_with_table_sequence(request)?
+            .map(super::SqlAnalyzeOutput::into_pending)
+            .transpose()
     }
 }
 
@@ -286,6 +395,70 @@ mod tests {
                 .unwrap();
         assert!(matches!(analyze(source, &[fact]), Err(error)
             if error.to_string().contains("original table fact is missing")));
+    }
+
+    #[test]
+    fn dml_table_sequence_computed_arguments_resume_the_same_write_source() {
+        let input = SqlStatementInput::parsed_query(Box::new(query(
+            "SELECT n FROM TABLE(sequence(0, 1000 - 1)) AS src(n)",
+        )));
+        let source = prepare(input)
+            .with_write_assignments(write_sites(vec![(
+                FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
+                None,
+            )]))
+            .unwrap();
+        let policy = crate::constant::test_constant_policy();
+        let progress = source
+            .begin_analysis(
+                crate::functions::builtin_sql_function_catalog(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+                policy,
+            )
+            .unwrap();
+        let SqlDmlAnalysisProgress::TableSequence(pending) = progress else {
+            panic!("computed sequence bound must use the original statement fact source");
+        };
+        let needs = pending.needs();
+        assert_eq!(needs.len(), 2);
+        let facts = needs
+            .iter()
+            .zip([0, 999])
+            .map(|(need, value)| {
+                let prepared = need.prepared();
+                let ty = prepared.value_type().clone();
+                let field = Arc::new(ty.try_to_field("bound").unwrap());
+                let value = ConstantValue::from_i64(
+                    field,
+                    ty,
+                    value,
+                    policy,
+                    CompilePhase::Validate,
+                    prepared.control(),
+                )
+                .unwrap();
+                TableSequenceArgumentFact::from_evaluated(need, value).unwrap()
+            })
+            .collect();
+        let analyzed = pending.resume(facts).unwrap();
+        assert!(matches!(
+            analyzed.intent,
+            SqlCompileIntent::IcebergWrite { .. }
+        ));
+        let fields = crate::planner::plan_output_columns(&analyzed.logical_plan).unwrap();
+        assert_eq!(fields[0].name, "n");
+        assert_eq!(
+            fields[0].value_type.data_type(),
+            &arrow::datatypes::DataType::Int64
+        );
+
+        fn range(node: &LogicalPlanNode) -> Option<[i64; 3]> {
+            if let LogicalPlanKind::GenerateSeries(series) = &node.kind {
+                return Some([series.start, series.end, series.step]);
+            }
+            node.children.iter().find_map(range)
+        }
+        assert_eq!(range(&analyzed.logical_plan), Some([0, 999, 1]));
     }
 
     fn variant(control: &SqlCompileControl) -> ConstantValue {

@@ -65,7 +65,7 @@ pub(super) fn launch_config() -> crate::scenario::ScenarioLaunchConfig {
 
 pub(super) fn held_sql(catalog: &str, database: &str, table: &str) -> String {
     format!(
-        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(generate_series(1, 64)) AS gs(x)"
+        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(sequence(1, 64)) AS gs(x)"
     )
 }
 pub(super) fn count_sql(catalog: &str, database: &str, table: &str) -> String {
@@ -530,7 +530,7 @@ fn materialized_inserts(
     table: &str,
     ranges: [&str; 3],
 ) -> Vec<Spec> {
-    ranges.into_iter().map(|range|Spec::observed(format!("INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"),&[MATERIAL])).collect()
+    ranges.into_iter().map(|range|Spec::observed(format!("INSERT INTO {catalog}.{database}.{table} SELECT sequential_number FROM TABLE(sequence({range}))"),&[MATERIAL])).collect()
 }
 
 pub(super) fn observed_fixture(
@@ -557,7 +557,7 @@ pub(super) fn observed_fixture(
             &selected,
             control,
             &format!(
-                "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
+                "INSERT INTO {catalog}.{database}.{table} SELECT sequential_number FROM TABLE(sequence({range}))"
             ),
         )?;
     }

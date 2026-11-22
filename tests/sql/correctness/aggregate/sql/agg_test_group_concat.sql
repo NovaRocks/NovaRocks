@@ -1104,7 +1104,7 @@ select group_concat(JSON_OBJECT('2:3': NULL)) from ss;
 -- query 250
 -- @expect_error=No matching function with signature: group_concat(map<int(11),int(11)>, varchar).
 USE ${case_db};
-select group_concat(map(2,3)) from ss;
+select group_concat(MAP(ARRAY[2], ARRAY[3])) from ss;
 
 -- query 251
 USE ${case_db};

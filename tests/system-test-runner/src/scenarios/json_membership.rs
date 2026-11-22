@@ -168,10 +168,10 @@ impl Scenario for JsonMembership {
         ))?;
         for low in [1, 1025, 2049] {
             let high = low + 1023;
-            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.probe SELECT generate_series, CASE WHEN generate_series % 17=0 THEN NULL ELSE CONCAT('{{\"a\":',CAST(generate_series % 13 AS STRING),',\"b\":1}}') END FROM TABLE(generate_series({low},{high}))"))?;
+            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.probe SELECT sequential_number, CASE WHEN sequential_number % 17=0 THEN NULL ELSE CONCAT('{{\"a\":',CAST(sequential_number % 13 AS STRING),',\"b\":1}}') END FROM TABLE(sequence({low},{high}))"))?;
         }
         for (low, high) in [(0, 4), (5, 8)] {
-            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.rhs SELECT CONCAT('{{\"b\":1,\"a\":',CAST(generate_series AS STRING),'}}') FROM TABLE(generate_series({low},{high}))"))?;
+            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.rhs SELECT CONCAT('{{\"b\":1,\"a\":',CAST(sequential_number AS STRING),'}}') FROM TABLE(sequence({low},{high}))"))?;
         }
         control.execute(format!(
             "INSERT INTO {CATALOG}.{DATABASE}.rhs VALUES ROW(NULL), ROW('{{\"b\":1,\"a\":0}}')"
@@ -517,7 +517,7 @@ fn seed_capacity(context: &mut ScenarioContext, control: &mut SqlSession) -> Res
     let seed_rows = 2 * 1024 * 1024 / BIG_TEXT;
     for low in (1..=BIG_ROWS).step_by(seed_rows as usize) {
         let high = (low + seed_rows - 1).min(BIG_ROWS);
-        control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.big_rhs SELECT CONCAT('{{\"key\":',CAST(generate_series AS STRING),',\"large\":\"',REPEAT('x',{BIG_TEXT}),'\"}}') FROM TABLE(generate_series({low},{high}))"))?;
+        control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.big_rhs SELECT CONCAT('{{\"key\":',CAST(sequential_number AS STRING),',\"large\":\"',rpad('', {BIG_TEXT}, 'x'),'\"}}') FROM TABLE(sequence({low},{high}))"))?;
     }
     context.action("bounded large RHS fixture written");
     CAPACITY_SETTINGS.apply(control)?;

@@ -32,8 +32,8 @@ CREATE TABLE t (
     v4 ARRAY<STRING>
 ) WITH (format_version = 3);
 INSERT INTO t SELECT generate_series, generate_series, generate_series,
-    array_repeat(CAST(generate_series AS STRING), 5)
-FROM TABLE(generate_series(1, 100));
+    repeat(CAST(generate_series AS STRING), 5)
+FROM TABLE(sequence(1, 100)) AS generate_series(generate_series);
 SELECT * FROM t WHERE v1 = 10 AND v2 = v3;
 
 -- query 2
@@ -47,7 +47,7 @@ SELECT * FROM t WHERE v1 = v3 AND (v2 = 5 OR v3 = 10) ORDER BY v1;
 -- query 4
 -- Lambda expression in predicate
 USE ${case_db};
-SELECT * FROM t WHERE v1 < 10 AND array_max(array_map(x->length(x) + v2, v4)) > 0 ORDER BY v1;
+SELECT * FROM t WHERE v1 < 10 AND array_max(transform(v4, x->length(x) + v2)) > 0 ORDER BY v1;
 
 -- query 5
 -- Same queries with enable_scan_predicate_expr_reuse disabled
@@ -64,7 +64,7 @@ SELECT * FROM t WHERE v1 = v3 AND (v2 = 5 OR v3 = 10) ORDER BY v1;
 
 -- query 8
 USE ${case_db};
-SELECT * FROM t WHERE v1 < 10 AND array_max(array_map(x->length(x) + v2, v4)) > 0 ORDER BY v1;
+SELECT * FROM t WHERE v1 < 10 AND array_max(transform(v4, x->length(x) + v2)) > 0 ORDER BY v1;
 
 -- query 9
 -- Complex types: PRIMARY KEY table with arrays, structs, maps, JSON
@@ -82,11 +82,11 @@ CREATE TABLE t0 (
     v9 JSON
 ) WITH (format_version = 3);
 INSERT INTO t0 VALUES
-ROW(1,[1],[1],[1],row(1,row(1)),row(1,row([1])),map(1,1),map(1,1,2,2),parse_json('{"a":{"b":1}}'),parse_json('{"a":1,"b":[1]}')),
-ROW(2,[2],[2],[2],row(2,row(2)),row(2,row([2])),map(1,1),map(1,2,2,2),parse_json('{"a":{"b":2}}'),parse_json('{"a":1,"b":[1]}')),
-ROW(3,[3],[3],[3],row(3,row(3)),row(3,row([3])),map(1,1),map(1,3,2,2),parse_json('{"a":{"b":3}}'),parse_json('{"a":1,"b":[1]}')),
-ROW(4,[4],[4],[4],row(4,row(4)),row(4,row([4])),map(1,1),map(1,4,2,2),parse_json('{"a":{"b":4}}'),parse_json('{"a":1,"b":[1]}')),
-ROW(5,[5],[5],[5],row(5,row(5)),row(5,row([5])),map(1,1),map(1,5,2,2),parse_json('{"a":{"b":5}}'),parse_json('{"a":1,"b":[1]}'));
+ROW(1,[1],[1],[1],row(1,row(1)),row(1,row([1])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[1, 2]),parse_json('{"a":{"b":1}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(2,[2],[2],[2],row(2,row(2)),row(2,row([2])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[2, 2]),parse_json('{"a":{"b":2}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(3,[3],[3],[3],row(3,row(3)),row(3,row([3])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[3, 2]),parse_json('{"a":{"b":3}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(4,[4],[4],[4],row(4,row(4)),row(4,row([4])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[4, 2]),parse_json('{"a":{"b":4}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(5,[5],[5],[5],row(5,row(5)),row(5,row([5])),MAP(ARRAY[1], ARRAY[1]),MAP(ARRAY[1, 2], ARRAY[5, 2]),parse_json('{"a":{"b":5}}'),parse_json('{"a":1,"b":[1]}'));
 SELECT k FROM t0 WHERE v1[1] = v2[1] ORDER BY k;
 
 -- query 10
@@ -103,34 +103,34 @@ SELECT k, v2 FROM t0 WHERE v1[1] = v2[1] ORDER BY k;
 
 -- query 13
 USE ${case_db};
-SELECT k FROM t0 WHERE array_length(v1) = array_length(v2) ORDER BY k;
+SELECT k FROM t0 WHERE cardinality(v1) = cardinality(v2) ORDER BY k;
 
 -- query 14
 -- Struct nested field access in predicate
 USE ${case_db};
-SELECT k FROM t0 WHERE array_length(v1) = array_length(v5.b.a) ORDER BY k;
+SELECT k FROM t0 WHERE cardinality(v1) = cardinality(v5.b.a) ORDER BY k;
 
 -- query 15
 USE ${case_db};
-SELECT k, v5 FROM t0 WHERE array_length(v1) = array_length(v5.b.a) ORDER BY k;
+SELECT k, v5 FROM t0 WHERE cardinality(v1) = cardinality(v5.b.a) ORDER BY k;
 
 -- query 16
 USE ${case_db};
-SELECT k, v5.a FROM t0 WHERE array_length(v1) = array_length(v5.b.a) ORDER BY k;
+SELECT k, v5.a FROM t0 WHERE cardinality(v1) = cardinality(v5.b.a) ORDER BY k;
 
 -- query 17
 -- Lambda with struct field and column reference
 USE ${case_db};
-SELECT k FROM t0 WHERE array_max(array_map(x->x+k, v5.b.a)) > 0 ORDER BY k;
+SELECT k FROM t0 WHERE array_max(transform(v5.b.a, x->x+k)) > 0 ORDER BY k;
 
 -- query 18
 -- Multi-arg lambda with struct, map_keys, and array
 USE ${case_db};
-SELECT k FROM t0 WHERE array_max(array_map((x,y,z)->x+y+z, v5.b.a, map_keys(v6), v1)) > 0 ORDER BY k;
+SELECT k FROM t0 WHERE array_max(transform(zip(v5.b.a, map_keys(v6), v1), inputs -> inputs[1]+inputs[2]+inputs[3])) > 0 ORDER BY k;
 
 -- query 19
 USE ${case_db};
-SELECT k, v5.a FROM t0 WHERE array_max(array_map((x,y,z)->x+y+z, v5.b.a, map_keys(v6), v1)) > 0 ORDER BY k;
+SELECT k, v5.a FROM t0 WHERE array_max(transform(zip(v5.b.a, map_keys(v6), v1), inputs -> inputs[1]+inputs[2]+inputs[3])) > 0 ORDER BY k;
 
 -- query 20
 -- JSON path access in predicate

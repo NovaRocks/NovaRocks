@@ -412,7 +412,7 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
 }
 
 #[test]
-fn canonical_higher_order_helper_keeps_original_lambda_and_nested_source_metadata() {
+fn canonical_cardinality_keeps_original_nested_source_metadata() {
     let field = Arc::new(
         Field::new("source_element", DataType::Int64, false).with_metadata(
             std::collections::HashMap::<String, String>::from([(
@@ -426,58 +426,41 @@ fn canonical_higher_order_helper_keeps_original_lambda_and_nested_source_metadat
         logical: None,
         nullable: true,
     };
-    let query = analyze(
-        "SELECT array_map(v -> v,x) FROM temporal_source",
+    let selected = analyze(
+        "SELECT cardinality(x) FROM temporal_source",
         &source,
         crate::constant::test_constant_policy(),
     )
     .unwrap();
-    let expression = project(&query, 0);
+    let expression = project(&selected, 0);
     let (_, binding, args) = call(expression);
-    assert_eq!(binding.function_id.as_str(), "builtin.scalar/array_map/v1");
-    let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
-        panic!("lambda");
-    };
-    assert_eq!(params.len(), 1);
-    let expected = FunctionValueType::new(DataType::Int64, false);
-    assert_eq!(params[0].value_type, expected);
-    assert_eq!(body.value_type, expected);
-    assert!(matches!(body.kind, ExprKind::LambdaParamRef { .. }));
     assert_eq!(
-        binding.selected.argument_types[0],
-        FunctionArgumentType::Lambda {
-            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                vec![expected.clone()].into_boxed_slice()
-            ),
-            result_type: expected,
-        }
+        binding.function_id.as_str(),
+        "builtin.scalar/cardinality/v1"
     );
     assert_eq!(
-        args[1].value_type,
+        expression.value_type,
+        FunctionValueType::new(DataType::Int64, true)
+    );
+    assert_eq!(
+        args[0].value_type,
         FunctionValueType::new(source.carrier.clone(), true)
     );
-    assert!(matches!(args[1].kind, ExprKind::ColumnRef { .. }));
     assert_eq!(
-        binding.selected.argument_types[1],
-        FunctionArgumentType::Value(args[1].value_type.clone())
+        binding.selected.argument_types[0],
+        FunctionArgumentType::Value(args[0].value_type.clone())
     );
-    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
-        panic!("scalar");
+    let DataType::List(item) = args[0].value_type.data_type() else {
+        panic!("canonical source ARRAY")
     };
-    assert_eq!(&expression.value_type, result);
-    let DataType::List(item) = &result.data_type() else {
-        panic!("list");
-    };
-    assert_eq!(item.data_type(), &DataType::Int64);
-    assert!(item.is_nullable());
     assert_eq!(item.name(), "item");
     assert!(item.metadata().as_arc().is_none());
-    let DataType::List(source_item) = &source.carrier else {
-        panic!("expected original source list");
+    let DataType::List(provider_item) = &source.carrier else {
+        panic!("original provider ARRAY")
     };
-    assert_eq!(source_item.name(), "source_element");
+    assert_eq!(provider_item.name(), "source_element");
     assert_eq!(
-        source_item.metadata().get("provider").map(String::as_str),
+        provider_item.metadata().get("provider").map(String::as_str),
         Some("exact original field")
     );
 }

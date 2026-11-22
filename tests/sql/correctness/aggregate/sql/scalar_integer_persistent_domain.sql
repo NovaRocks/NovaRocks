@@ -19,9 +19,9 @@
 -- The input domain, overflow-to-NULL, and all coefficients are independent oracles.
 -- query 1
 CREATE TABLE ${case_db}.scalar_integer_domain(id INT,t TINYINT,age SMALLINT,i INT);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(127,128)) g(x);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(32767,32768)) g(x);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(-129,-128)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(sequence(127,128)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(sequence(32767,32768)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(sequence(-129,-128)) g(x);
 SELECT id,t,age,i FROM ${case_db}.scalar_integer_domain ORDER BY id;
 
 -- query 2

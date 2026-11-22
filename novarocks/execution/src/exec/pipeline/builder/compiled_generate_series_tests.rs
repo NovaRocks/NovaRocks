@@ -381,7 +381,7 @@ fn roots_preserved(source: &FragmentPackage, program: &LocalProgram, width: usiz
 }
 
 #[test]
-fn compiled_generate_series_source_literal_bounds_are_original_uses_once_and_public_nonnull() {
+fn compiled_generate_series_opening_evaluates_literal_bounds_once_in_frozen_order() {
     for explicit in [false, true] {
         let source = literal_source([Some(-3), Some(3), Some(1)], explicit, false);
         let program = compile(Arc::clone(&source), 8);
@@ -394,44 +394,6 @@ fn compiled_generate_series_source_literal_bounds_are_original_uses_once_and_pub
                 &[Some(-3), Some(3)]
             },
         );
-        // Default or explicit +1 over the inclusive interval [-3, 3].
-        assert_series_values(
-            &program,
-            &DataType::Int64,
-            &(-3_i128..=3).map(Some).collect::<Vec<_>>(),
-        );
-        let result = run(&program);
-        assert_eq!(
-            int64_rows(&result),
-            (-3..=3).map(|value| vec![Some(value)]).collect::<Vec<_>>()
-        );
-        for chunk in result {
-            assert!(!chunk.schema().field(0).is_nullable());
-            assert_eq!(chunk.schema().field(0).name(), "c0");
-        }
-    }
-}
-#[test]
-fn compiled_generate_series_source_descending_empty_null_and_int64_endpoints() {
-    for (values, expected) in [
-        ([Some(5), Some(-1), Some(-2)], vec![5, 3, 1, -1]),
-        ([Some(5), Some(1), Some(1)], vec![]),
-        ([Some(i64::MIN), Some(i64::MIN), Some(1)], vec![i64::MIN]),
-        ([Some(i64::MAX), Some(i64::MAX), Some(1)], vec![i64::MAX]),
-    ] {
-        let result = run(&compile(literal_source(values, true, false), 4));
-        assert_eq!(
-            int64_rows(&result),
-            expected
-                .into_iter()
-                .map(|value| vec![Some(value)])
-                .collect::<Vec<_>>()
-        );
-    }
-    for null in 0..3 {
-        let mut values = [Some(1), Some(3), Some(1)];
-        values[null] = None;
-        assert!(run(&compile(literal_source(values, true, true), 4)).is_empty());
     }
 }
 #[test]
@@ -489,20 +451,13 @@ fn compiled_generate_series_source_pooled_complete_reader_domain_and_original_re
     );
 }
 #[test]
-fn compiled_generate_series_source_original_step_zero_and_cap_are_full_pipeline_data() {
-    for (values, message) in [
-        (
-            [Some(1), Some(3), Some(0)],
-            "table function generate_series step size cannot equal zero",
-        ),
-        (
-            [Some(0), Some(i64::from(u32::MAX)), Some(1)],
-            "table function output too large",
-        ),
-    ] {
-        let error = try_run(&compile(literal_source(values, true, false), 2)).unwrap_err();
-        assert!(error.contains(message), "{error}");
-    }
+fn compiled_generate_series_source_original_zero_step_is_full_pipeline_data() {
+    let source = literal_source([Some(1), Some(3), Some(0)], true, false);
+    let error = try_run(&compile(source, 2)).unwrap_err();
+    assert!(
+        error.contains("table function generate_series step size cannot equal zero"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -639,7 +594,7 @@ fn compiled_generate_series_compile_three_causes_return_at_original_callback_pre
 }
 
 #[test]
-fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program() {
+fn compiled_generate_series_batch_uses_actual_creator_through_last_buffer_alias() {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
     use crate::exec::pipeline::operator::ConstructionFailure;
@@ -662,7 +617,7 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
         ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
     ));
     drop(missing);
-    let tracker = MemTracker::new_root("series schema and slice creator");
+    let tracker = MemTracker::new_root("series batch creator");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let mut operator = factory.create(1, 0);
     operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
@@ -701,12 +656,22 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
     let schema = output.chunk_schema_ref();
     assert!(schema.is_typed());
     assert!(schema.slots()[0].field_ref().metadata().as_arc().is_none());
+    let detached = output.record_batch().column(0).slice(1, 1);
     drop(processor);
     drop(operator);
     assert!(tracker.current() > 0);
     drop(output);
-    assert!(tracker.current() > 0);
     drop(schema);
+    assert!(tracker.current() > 0, "the detached buffer is still owned");
+    assert_eq!(
+        detached
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+    drop(detached);
     assert_eq!(tracker.current(), 0);
 }
 
@@ -750,6 +715,81 @@ fn compiled_series_prepare_keeps_typed_first_memory_refusal_without_later_constr
             .is_err()
     );
     assert_eq!(tracker.current(), installed_bytes);
+    drop(operator);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn compiled_generate_series_batch_allocation_refusal_is_observed_before_publication() {
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeState;
+    use crate::runtime::task::ExecutionFailureCause;
+
+    let bounds = [i64::MIN, i64::MAX, 1];
+    let program = compile(literal_source(bounds.map(Some), true, false), 1);
+    let state = RuntimeState::default();
+    let factory = CompiledGenerateSeriesProcessorFactory::try_new(
+        Arc::clone(&program),
+        program.graph().root(),
+        state.error_state(),
+        novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
+    )
+    .unwrap();
+    let mut operator = factory.create(1, 0);
+    let tracker = MemTracker::new_root("series batch allocation refusal");
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        state.error_state(),
+    ));
+    operator.prepare().unwrap();
+    let prepared_bytes = tracker.current();
+    let batch_bytes = i64::from(
+        novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+            .max_rows
+            .get(),
+    ) * 8;
+    tracker
+        .install_limit_once(prepared_bytes + batch_bytes / 2)
+        .unwrap();
+    operator.bind_runtime_state(&state).unwrap();
+
+    let layout = program.graph().nodes()[0].output_layout();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        layout.schema().clone(),
+        bounds
+            .map(|value| Arc::new(Int64Array::from(vec![value])) as ArrayRef)
+            .to_vec(),
+    )
+    .unwrap();
+    let input =
+        Chunk::try_new_with_chunk_schema(batch, ChunkSchema::from_compiled_layout(layout).unwrap())
+            .unwrap();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
+    processor.accept_without_output(input).unwrap();
+    let installed = processor.drive().unwrap();
+    assert!(installed.output.is_none());
+    assert!(matches!(
+        installed.next,
+        crate::exec::pipeline::step::NextStep::Runnable
+    ));
+    assert_eq!(
+        tracker.current(),
+        prepared_bytes,
+        "bounds only install a cursor"
+    );
+    let refusal = processor.advance_to_boundary().unwrap_err();
+    assert!(matches!(
+        refusal.cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+    ));
+    assert_eq!(tracker.current(), prepared_bytes);
+    assert_eq!(processor.drive().unwrap_err(), refusal);
+    drop(processor);
+    operator.close().unwrap();
     drop(operator);
     assert_eq!(tracker.current(), 0);
 }

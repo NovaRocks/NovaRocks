@@ -867,3 +867,61 @@ fn ordinary_and_null_safe_float_comparisons_preserve_distinct_relations() {
         );
     }
 }
+
+#[test]
+fn integer_array_equality_keeps_nested_nulls_and_compares_mixed_width_elements() {
+    use arrow::array::{ListArray, types};
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let left: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int32Type, _, _>([
+        Some(vec![Some(1), None]),
+        Some(vec![None, Some(3)]),
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(1)]),
+        Some(vec![None]),
+        None,
+    ]));
+    let right: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int64Type, _, _>([
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(2), Some(4)]),
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![]),
+        Some(vec![]),
+        Some(vec![]),
+    ]));
+    let columns = [
+        column("lhs", 10, left.data_type().clone(), true),
+        column("rhs", 20, right.data_type().clone(), false),
+    ];
+    let batch = batch(&columns, vec![left, right]);
+    for (sql, expected) in [
+        (
+            "lhs = rhs",
+            [
+                None,
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                None,
+            ],
+        ),
+        (
+            "lhs <> rhs",
+            [None, Some(true), Some(false), Some(true), Some(true), None],
+        ),
+    ] {
+        let expression = compile(sql, &columns, &context);
+        let checked = evaluate(&expression, &batch);
+        assert!(checked.batch.errors.is_empty());
+        let values = checked
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), expected, "{sql}");
+    }
+}

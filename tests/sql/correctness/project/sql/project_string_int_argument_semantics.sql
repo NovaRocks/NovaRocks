@@ -22,15 +22,13 @@
 -- 2. Prevent regressions where INT-typed arguments are rejected or produce wrong NULL/empty semantics.
 -- Test Flow:
 -- 1. Evaluate string scalar functions in a single deterministic SELECT.
--- 2. Cover negative/zero/positive integer argument behavior for split_part, substring_index, repeat, space, left/right, lpad/rpad.
+-- 2. Cover negative/zero/positive integer argument behavior for split_part, substring_index, space, left/right, lpad/rpad.
 -- 3. Compare one-row output against expected values.
 SELECT
   split_part('a,b,c', ',', -1) AS sp_neg1,
   split_part('a,b,c', ',', -2) AS sp_neg2,
   split_part('abc', '', 1) AS sp_empty_d1,
   split_part('abc', '', 4) AS sp_empty_d4,
-  repeat('ab', 2) AS rep2,
-  repeat('ab', -1) AS rep_neg,
   strleft('abc', 2) AS left2,
   strleft('abc', -1) AS left_neg,
   strright('abc', 2) AS right2,

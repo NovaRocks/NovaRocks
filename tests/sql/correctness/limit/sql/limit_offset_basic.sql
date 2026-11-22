@@ -148,17 +148,17 @@ LIMIT  10) xx;
 
 -- query 17
 -- generate_series 1..100000; skip 50000, take 10
-SELECT count() FROM (SELECT * FROM TABLE(generate_series(1, 100000)) OFFSET 50000
+SELECT count() FROM (SELECT * FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series) OFFSET 50000
 LIMIT  10) x;
 
 -- query 18
 -- generate_series 1..100000; skip 90000, take 20000 → only 10000 remaining
-SELECT count() FROM (SELECT * FROM TABLE(generate_series(1, 100000)) OFFSET 90000
+SELECT count() FROM (SELECT * FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series) OFFSET 90000
 LIMIT  20000) x;
 
 -- query 19
 -- generate_series 1..100000; skip 1, take 1000
-SELECT count() FROM (SELECT * FROM TABLE(generate_series(1, 100000)) OFFSET 1
+SELECT count() FROM (SELECT * FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series) OFFSET 1
 LIMIT  1000) x;
 
 -- query 20

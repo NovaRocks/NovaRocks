@@ -48,7 +48,7 @@ CREATE TABLE ${case_db}.phj_row_util_base (
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT generate_series FROM TABLE(generate_series(0, 10000 - 1));
+INSERT INTO ${case_db}.phj_row_util_base SELECT generate_series FROM TABLE(sequence(0, 10000 - 1)) AS generate_series(generate_series);
 
 -- query 6
 -- @skip_result_check=true

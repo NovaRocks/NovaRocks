@@ -1286,7 +1286,7 @@ impl Scenario for CatalogReadWriteRuntime {
                 .enumerate()
             {
                 connector_control_plan::execute(context, &self.controls.take(index)?, &mut control,
-                &format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"))
+                &format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT sequential_number FROM TABLE(sequence({range}))"))
                 .with_context(|| format!("distributed insert range {range} through catalog writer runtime"))?;
             }
             let rows: Vec<(i64, i64)> = connector_control_plan::query(
@@ -1525,7 +1525,7 @@ impl Scenario for VendedRestReadWritePem {
             for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
                 control
                 .execute(format!(
-                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT sequential_number FROM TABLE(sequence({range}))"
                 )).map(|_| ())
                 .with_context(|| format!("insert vended REST data range {range}"))?;
             }
@@ -2495,7 +2495,7 @@ impl Scenario for VendedRestRefreshPem {
         for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
             control
                 .execute(format!(
-                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT sequential_number FROM TABLE(sequence({range}))"
                 )).map(|_| ())
                 .with_context(|| format!("insert vended refresh data range {range}"))?;
         }
@@ -2510,7 +2510,7 @@ impl Scenario for VendedRestRefreshPem {
         const TARGET_TABLE: &str = "vended_refresh_target";
         control
             .execute(format!(
-                "INSERT INTO {CATALOG}.{DATABASE}.{TARGET_TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
+                "INSERT INTO {CATALOG}.{DATABASE}.{TARGET_TABLE} SELECT sequential_number FROM TABLE(sequence(1, 1000))"
             )).map(|_| ())
             .context("write one targeted vended data file")?;
         let target_sql =
@@ -3012,7 +3012,7 @@ impl Scenario for VendedCredentialFaultPem {
             .context("create CAD-2 vended catalog")?;
         control
             .execute(format!(
-                "INSERT INTO {setup_catalog}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
+                "INSERT INTO {setup_catalog}.{DATABASE}.{TABLE} SELECT sequential_number FROM TABLE(sequence(1, 1000))"
             )).map(|_| ())
             .context("write one CAD-2 vended data file")?;
         await_resource_convergence(context, &baseline, "credential fault setup write")?;
@@ -4837,7 +4837,7 @@ fn create_catalog_table_and_data(
     for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
         control
             .execute(format!(
-                "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
+                "INSERT INTO {catalog}.{database}.{table} SELECT sequential_number FROM TABLE(sequence({range}))"
             )).map(|_| ())
             .with_context(|| format!("write data range {range} to {catalog}.{database}.{table}"))?;
     }
@@ -4866,7 +4866,7 @@ fn create_static_catalog_table_and_data(
     for range in ranges {
         control
             .execute(format!(
-                "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
+                "INSERT INTO {catalog}.{database}.{table} SELECT sequential_number FROM TABLE(sequence({range}))"
             )).map(|_| ())
             .with_context(|| {
                 format!("write static credential range {range} to {catalog}.{database}.{table}")
@@ -4962,7 +4962,7 @@ fn create_catalog_table_and_dense_data(
     for _ in 0..3 {
         control
             .execute(format!(
-                "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series(1, 200000))"
+                "INSERT INTO {catalog}.{database}.{table} SELECT sequential_number FROM TABLE(sequence(1, 200000))"
             )).map(|_| ())
             .with_context(|| format!("write dense page-index data to {catalog}.{database}.{table}"))?;
     }

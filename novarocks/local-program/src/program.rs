@@ -321,6 +321,7 @@ pub enum NestedLoopJoinType {
     LeftSemi,
     LeftAnti,
     NullAwareLeftAnti,
+    LeftMark,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -936,7 +937,10 @@ impl ProgramNodeKind {
                 if let Some(id) = join_conjunct {
                     visit(
                         Some(*id),
-                        if matches!(join_type, NestedLoopJoinType::NullAwareLeftAnti) {
+                        if matches!(
+                            join_type,
+                            NestedLoopJoinType::NullAwareLeftAnti | NestedLoopJoinType::LeftMark
+                        ) {
                             Value
                         } else {
                             TruthOnly
@@ -2351,6 +2355,30 @@ fn validate_shape(
                 let bad = group_by.get(filter.group_key_ordinal) != Some(&filter.group_key_expr);
                 work.step()?;
                 if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+        }
+        ProgramNodeKind::NestedLoopJoin {
+            join_type: NestedLoopJoinType::LeftMark,
+            join_conjunct,
+            left_layout,
+            ..
+        } => {
+            let fields = node.output_layout.schema().fields();
+            if join_conjunct.is_none()
+                || left_layout.slots().len().checked_add(1) != Some(fields.len())
+                || fields.last().is_none_or(|field| {
+                    field.data_type() != &DataType::Boolean || !field.is_nullable()
+                })
+            {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for (source, target) in left_layout.schema().fields().iter().zip(fields.iter()) {
+                work.step()?;
+                if source.data_type() != target.data_type()
+                    || source.is_nullable() != target.is_nullable()
+                {
                     return Err(LocalProgramError::InvalidNodeShape.into());
                 }
             }

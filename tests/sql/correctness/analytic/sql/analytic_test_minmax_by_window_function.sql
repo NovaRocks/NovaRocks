@@ -31,7 +31,7 @@ CREATE TABLE ${case_db}."t1_nulls" (
   "v6" map<int, string> ,
   "v7" array<int>
 ) WITH (format_version = 3);
-INSERT INTO ${case_db}."t1_nulls" SELECT generate_series, generate_series, generate_series, generate_series, generate_series, map(generate_series, generate_series), [generate_series] FROM TABLE(generate_series(1, 40960));
+INSERT INTO ${case_db}."t1_nulls" SELECT generate_series, generate_series, generate_series, generate_series, generate_series, MAP(ARRAY[generate_series], ARRAY[generate_series]), [generate_series] FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
 
 -- query 2
 select count(mb), sum(mb) from (select min_by(v1, v1) over (partition by v1) mb from ${case_db}.t1_nulls) t;
@@ -59,7 +59,7 @@ CREATE TABLE ${case_db}."t1_not_nulls" (
   "v6" map<int, string>,
   "v7" array<int>
 ) WITH (format_version = 3);
-INSERT INTO ${case_db}."t1_not_nulls" SELECT generate_series, generate_series, generate_series, generate_series, generate_series, map(generate_series, generate_series), [generate_series] FROM TABLE(generate_series(1, 40960));
+INSERT INTO ${case_db}."t1_not_nulls" SELECT generate_series, generate_series, generate_series, generate_series, generate_series, MAP(ARRAY[generate_series], ARRAY[generate_series]), [generate_series] FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
 
 -- query 8
 select count(mb), sum(mb) from (select min_by(v1, v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
@@ -77,16 +77,16 @@ select count(mb), max(mb) from (select min_by(v4, v4) over (partition by v1) mb 
 select count(mb), max(get_json_int(mb, '$')) from (select min_by(v5, v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
 
 -- query 13
-select count(mb) from (select min_by(named_struct('k',v1,'v',v1), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
+select count(mb) from (select min_by(CAST(ROW(v1, v1) AS ROW(k INTEGER, v INTEGER)), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
 
 -- query 14
-select count(mb) from (select min_by(named_struct('k',v1,'v',v1), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
+select count(mb) from (select min_by(CAST(ROW(v1, v1) AS ROW(k INTEGER, v INTEGER)), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
 
 -- query 15
 select count(mb) from (select min_by(['k',v1,'v',v1], v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
 
 -- query 16
-select count(mb) from (select min_by(map('k',v1), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
+select count(mb) from (select min_by(MAP(ARRAY['k'], ARRAY[v1]), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
 
 -- query 17
-select count(mb) from (select min_by(map('k',[v1]), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;
+select count(mb) from (select min_by(MAP(ARRAY['k'], ARRAY[[v1]]), v1) over (partition by v1) mb from ${case_db}.t1_not_nulls) t;

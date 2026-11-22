@@ -218,13 +218,21 @@ impl BinaryOperatorOwner {
         } else {
             let [left, right] = inputs;
             work.flush()?;
-            let common = wider_comparison_value_type(left, right)
-                .map_err(|_| FunctionBindingError::NoMatchingOverload)?;
-            let args = [
-                common.with_nullable(left_null)?,
-                common.with_nullable(right_null)?,
-            ];
-            BinaryOperatorKernel::validate_comparison(
+            let args = if matches!(left.data_type(), DataType::List(_))
+                && matches!(right.data_type(), DataType::List(_))
+            {
+                // The equality recipe widens only the actual signed elements.
+                // The two independently authored ARRAY layouts stay intact.
+                [left.clone(), right.clone()]
+            } else {
+                let common = wider_comparison_value_type(left, right)
+                    .map_err(|_| FunctionBindingError::NoMatchingOverload)?;
+                [
+                    common.with_nullable(left_null)?,
+                    common.with_nullable(right_null)?,
+                ]
+            };
+            let nullable = BinaryOperatorKernel::validate_comparison(
                 self.operator,
                 [&args[0], &args[1]],
                 work.control(),
@@ -234,7 +242,7 @@ impl BinaryOperatorOwner {
                 arguments: args,
                 result: FunctionValueType::new(
                     DataType::Boolean,
-                    !self.operator.is_null_safe_comparison() && (left_null || right_null),
+                    !self.operator.is_null_safe_comparison() && nullable,
                 ),
             }
         };
@@ -393,14 +401,15 @@ impl FunctionBindingResolver for BinaryOperatorOwner {
                 )
             } else {
                 work.flush()?;
-                BinaryOperatorKernel::validate_comparison(self.operator, inputs, work.control())?;
+                let nullable = BinaryOperatorKernel::validate_comparison(
+                    self.operator,
+                    inputs,
+                    work.control(),
+                )?;
                 (
                     "(comparable T,comparable T)",
                     DataType::Boolean,
-                    !self.operator.is_null_safe_comparison()
-                        && (left.nullable()
-                            || right.nullable()
-                            || *left.data_type() == DataType::Null),
+                    !self.operator.is_null_safe_comparison() && nullable,
                 )
             };
             work.step()?;

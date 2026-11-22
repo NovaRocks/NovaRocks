@@ -32,8 +32,8 @@
 
 -- query 1
 -- transform_keys: rewrite keys, values pass through.
-SELECT transform_keys((k, v) -> k + 100, MAP(1, 10, 2, 20)) AS keyed;
+SELECT transform_keys((k, v) -> k + 100, MAP(ARRAY[1, 2], ARRAY[10, 20])) AS keyed;
 
 -- query 2
 -- transform_values: rewrite values, keys pass through.
-SELECT transform_values((k, v) -> v * 2, MAP(1, 10, 2, 20)) AS valued;
+SELECT transform_values((k, v) -> v * 2, MAP(ARRAY[1, 2], ARRAY[10, 20])) AS valued;

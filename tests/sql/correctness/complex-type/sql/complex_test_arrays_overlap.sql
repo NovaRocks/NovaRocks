@@ -539,7 +539,7 @@ select arrays_overlap( cast ('null' as array<int>), [40360]);
 
 -- query 115
 USE ${case_db};
-select arrays_overlap([map(1,2, 2,3, 3,4), map(3,4, 4,5), map(3,4, 4,5), map(1,2, 2,3, 3,4)], [map(1,2, 2,3, 3,4)]);
+select arrays_overlap([MAP(ARRAY[1, 2, 3], ARRAY[2, 3, 4]), MAP(ARRAY[3, 4], ARRAY[4, 5]), MAP(ARRAY[3, 4], ARRAY[4, 5]), MAP(ARRAY[1, 2, 3], ARRAY[2, 3, 4])], [MAP(ARRAY[1, 2, 3], ARRAY[2, 3, 4])]);
 
 -- query 116
 USE ${case_db};

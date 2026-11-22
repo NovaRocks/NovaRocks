@@ -39,7 +39,7 @@ INSERT INTO tbinary_ndv_test
 SELECT generate_series,
        to_binary(CONCAT('value_', CAST(generate_series AS VARCHAR)), 'utf8'),
        (generate_series - 1) % 5 + 1
-FROM TABLE(GENERATE_SERIES(1, 100));
+FROM TABLE(sequence(1, 100)) AS generate_series(generate_series);
 
 -- query 4
 USE ${case_db};

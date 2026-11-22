@@ -793,7 +793,7 @@ impl Fixture {
 }
 
 #[test]
-fn required_ddl_property_port_runs_real_scalar_array_and_structural_map_inputs() {
+fn required_ddl_property_port_runs_real_scalar_array_and_map_inputs() {
     use novarocks_query_application::sql::property_evaluation::DdlPropertyChange;
     use novarocks_spi::connector::{DdlPropertyType as T, DdlPropertyValue as V};
     let fixture = Fixture::new();
@@ -814,12 +814,22 @@ fn required_ddl_property_port_runs_real_scalar_array_and_structural_map_inputs()
             V::ArrayVarchar(vec![Some("selected".into()), None]),
         ),
         (
-            "MAP(ARRAY['first','second'],ARRAY['value',NULL])",
+            "IF(TRUE, MAP(ARRAY['first','second'],ARRAY['value',NULL]), MAP(ARRAY['ignored'],ARRAY['ignored']))",
             T::MapVarcharVarchar,
             V::MapVarcharVarchar(vec![
                 ("first".into(), Some("value".into())),
                 ("second".into(), None),
             ]),
+        ),
+        (
+            "MAP()",
+            T::MapVarcharVarchar,
+            V::MapVarcharVarchar(Vec::new()),
+        ),
+        (
+            "MAP(ARRAY['only'], ARRAY[NULL])",
+            T::MapVarcharVarchar,
+            V::MapVarcharVarchar(vec![("only".into(), None)]),
         ),
     ] {
         let properties = fixture
@@ -835,6 +845,44 @@ fn required_ddl_property_port_runs_real_scalar_array_and_structural_map_inputs()
             "{source}"
         );
         drop(properties);
+        assert_eq!(fixture.window.retained_payload_bytes(), 0, "{source}");
+    }
+    fixture.close();
+}
+
+#[test]
+fn required_ddl_map_preserves_original_constructor_data_and_property_location() {
+    use novarocks_spi::connector::DdlPropertyType;
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    for (source, message) in [
+        ("MAP(ARRAY['a'], ARRAY['x', 'y'])", "same length"),
+        (
+            "MAP(ARRAY['a', 'a'], ARRAY['x', 'y'])",
+            "Duplicate map keys",
+        ),
+        (
+            "MAP(ARRAY[CAST(NULL AS VARCHAR)], ARRAY['x'])",
+            "map key cannot be null",
+        ),
+    ] {
+        let error = fixture
+            .evaluate_ddl_property(source, DdlPropertyType::MapVarcharVarchar, &control)
+            .unwrap_err();
+        assert!(error.message().contains(message), "{source}: {error}");
+        let user = error.user_error().expect("property-domain validation");
+        assert_eq!(user.code().as_str(), "sql.admit.invalid_table_property");
+        assert!(user.location().is_some());
+        let cause = error
+            .failure_cause()
+            .expect("original MAP construction failure");
+        assert!(
+            cause
+                .downcast_ref::<novarocks_expression::RequiredExpressionRowError>()
+                .is_some(),
+            "{source}: {error}",
+        );
+        drop(error);
         assert_eq!(fixture.window.retained_payload_bytes(), 0, "{source}");
     }
     fixture.close();

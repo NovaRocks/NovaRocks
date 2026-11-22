@@ -1136,26 +1136,26 @@ CREATE TABLE lineitem (
     L_LINENUMBER INT
 ) WITH (format_version = 3);
 INSERT INTO lineitem
-SELECT 'A', 1 FROM TABLE(generate_series(1, 9))
-UNION ALL SELECT 'A', 2 FROM TABLE(generate_series(1, 8))
-UNION ALL SELECT 'A', 3 FROM TABLE(generate_series(1, 7))
-UNION ALL SELECT 'A', 4 FROM TABLE(generate_series(1, 6))
-UNION ALL SELECT 'A', 5 FROM TABLE(generate_series(1, 5))
-UNION ALL SELECT 'A', 6 FROM TABLE(generate_series(1, 4))
-UNION ALL SELECT 'A', 7 FROM TABLE(generate_series(1, 3))
-UNION ALL SELECT 'N', 1 FROM TABLE(generate_series(1, 15))
-UNION ALL SELECT 'N', 2 FROM TABLE(generate_series(1, 13))
-UNION ALL SELECT 'N', 3 FROM TABLE(generate_series(1, 11))
-UNION ALL SELECT 'N', 4 FROM TABLE(generate_series(1, 9))
-UNION ALL SELECT 'N', 5 FROM TABLE(generate_series(1, 7))
-UNION ALL SELECT 'N', 6 FROM TABLE(generate_series(1, 5))
-UNION ALL SELECT 'N', 7 FROM TABLE(generate_series(1, 3))
-UNION ALL SELECT 'R', 1 FROM TABLE(generate_series(1, 12))
-UNION ALL SELECT 'R', 2 FROM TABLE(generate_series(1, 10))
-UNION ALL SELECT 'R', 3 FROM TABLE(generate_series(1, 8))
-UNION ALL SELECT 'R', 4 FROM TABLE(generate_series(1, 6))
-UNION ALL SELECT 'R', 5 FROM TABLE(generate_series(1, 4))
-UNION ALL SELECT 'R', 6 FROM TABLE(generate_series(1, 2));
+SELECT 'A', 1 FROM TABLE(sequence(1, 9)) AS generate_series(generate_series)
+UNION ALL SELECT 'A', 2 FROM TABLE(sequence(1, 8)) AS generate_series(generate_series)
+UNION ALL SELECT 'A', 3 FROM TABLE(sequence(1, 7)) AS generate_series(generate_series)
+UNION ALL SELECT 'A', 4 FROM TABLE(sequence(1, 6)) AS generate_series(generate_series)
+UNION ALL SELECT 'A', 5 FROM TABLE(sequence(1, 5)) AS generate_series(generate_series)
+UNION ALL SELECT 'A', 6 FROM TABLE(sequence(1, 4)) AS generate_series(generate_series)
+UNION ALL SELECT 'A', 7 FROM TABLE(sequence(1, 3)) AS generate_series(generate_series)
+UNION ALL SELECT 'N', 1 FROM TABLE(sequence(1, 15)) AS generate_series(generate_series)
+UNION ALL SELECT 'N', 2 FROM TABLE(sequence(1, 13)) AS generate_series(generate_series)
+UNION ALL SELECT 'N', 3 FROM TABLE(sequence(1, 11)) AS generate_series(generate_series)
+UNION ALL SELECT 'N', 4 FROM TABLE(sequence(1, 9)) AS generate_series(generate_series)
+UNION ALL SELECT 'N', 5 FROM TABLE(sequence(1, 7)) AS generate_series(generate_series)
+UNION ALL SELECT 'N', 6 FROM TABLE(sequence(1, 5)) AS generate_series(generate_series)
+UNION ALL SELECT 'N', 7 FROM TABLE(sequence(1, 3)) AS generate_series(generate_series)
+UNION ALL SELECT 'R', 1 FROM TABLE(sequence(1, 12)) AS generate_series(generate_series)
+UNION ALL SELECT 'R', 2 FROM TABLE(sequence(1, 10)) AS generate_series(generate_series)
+UNION ALL SELECT 'R', 3 FROM TABLE(sequence(1, 8)) AS generate_series(generate_series)
+UNION ALL SELECT 'R', 4 FROM TABLE(sequence(1, 6)) AS generate_series(generate_series)
+UNION ALL SELECT 'R', 5 FROM TABLE(sequence(1, 4)) AS generate_series(generate_series)
+UNION ALL SELECT 'R', 6 FROM TABLE(sequence(1, 2)) AS generate_series(generate_series);
 
 -- query 178
 USE ${case_db};

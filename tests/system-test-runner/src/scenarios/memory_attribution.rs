@@ -33,7 +33,7 @@ use std::{
 };
 const OBSERVATION_QUERIES: [&str; 2] = [
     "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v",
-    "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)",
+    "SELECT SUM(i) FROM TABLE(sequence(1, 1000)) AS t(i)",
 ];
 const CANCELLATION_QUERY: &str =
     "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";

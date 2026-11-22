@@ -37,7 +37,7 @@ INSERT INTO ${case_db}.oq12_stats_and_chain
         generate_series % 60,
         generate_series % 50,
         generate_series
-    FROM TABLE(generate_series(1, 10000));
+    FROM TABLE(sequence(1, 10000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.oq12_stats_and_chain;
 
 -- @explain_contains=oq12_stats_and_chain

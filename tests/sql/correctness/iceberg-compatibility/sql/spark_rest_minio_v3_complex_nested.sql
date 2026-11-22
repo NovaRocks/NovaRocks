@@ -46,14 +46,14 @@ INSERT INTO ice_rest.${case_db}.spark_v3_complex_${uuid0} VALUES
     1,
     named_struct('name', 'ann', 'city', 'sf'),
     array('blue', 'green'),
-    map('score', 10, 'level', 2),
+    MAP(ARRAY['score', 'level'], ARRAY[10, 2]),
     array(named_struct('kind', 'click', 'weight', 3), named_struct('kind', 'view', 'weight', 4))
   ),
   (
     2,
     named_struct('name', 'bob', 'city', 'ny'),
     array('red'),
-    map('score', 20, 'level', 1),
+    MAP(ARRAY['score', 'level'], ARRAY[20, 1]),
     array(named_struct('kind', 'click', 'weight', 7))
   );
 SPARK_SQL
@@ -63,7 +63,7 @@ printf 'SPARK_SQL_OK\n'
 -- query 2
 SELECT id,
        profile.city AS city,
-       array_length(tags) AS tag_count,
+       cardinality(tags) AS tag_count,
        tags[1] AS first_tag,
        attrs['score'] AS score,
        events[1].weight AS first_event_weight

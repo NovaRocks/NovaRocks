@@ -39,16 +39,16 @@ CREATE TABLE ${case_db}.t_delete_data_file_rows_span_chunks (
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_delete_data_file_rows_span_chunks
 SELECT CAST(n AS INT), CAST(n AS BIGINT)
-FROM TABLE(generate_series(1, 20000)) t(n) ORDER BY n;
+FROM TABLE(sequence(1, 20000)) t(n) ORDER BY n;
 INSERT INTO ${case_db}.t_delete_data_file_rows_span_chunks
 SELECT CAST(n AS INT), CAST(n AS BIGINT)
-FROM TABLE(generate_series(20001, 40000)) t(n) ORDER BY n;
+FROM TABLE(sequence(20001, 40000)) t(n) ORDER BY n;
 INSERT INTO ${case_db}.t_delete_data_file_rows_span_chunks
 SELECT CAST(n AS INT), CAST(n AS BIGINT)
-FROM TABLE(generate_series(40001, 60000)) t(n) ORDER BY n;
+FROM TABLE(sequence(40001, 60000)) t(n) ORDER BY n;
 INSERT INTO ${case_db}.t_delete_data_file_rows_span_chunks
 SELECT CAST(n AS INT), CAST(n AS BIGINT)
-FROM TABLE(generate_series(60001, 80000)) t(n) ORDER BY n;
+FROM TABLE(sequence(60001, 80000)) t(n) ORDER BY n;
 DELETE FROM ${case_db}.t_delete_data_file_rows_span_chunks
 WHERE id <= 18000
    OR (id > 20000 AND id <= 38000)

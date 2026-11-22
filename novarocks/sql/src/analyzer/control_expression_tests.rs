@@ -44,6 +44,7 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         control,
         constant_policy: crate::constant::test_constant_policy(),
         materialized_values: None,
+        table_sequence: None,
         catalog: &NoTables,
         current_database: "default",
         function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -54,7 +55,6 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         ctes: Default::default(),
         pending_ctes: Default::default(),
         next_subquery_id: Default::default(),
-        next_lambda_slot_id: Default::default(),
         collected_subqueries: Default::default(),
         cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
     }
@@ -297,7 +297,7 @@ fn cast_safe_syntax_retains_the_existing_conversion_policy_and_display_contract(
 }
 
 #[test]
-fn lambda_body_borrow_retains_original_constant_ordinal_and_write_conversion() {
+fn array_item_borrow_retains_original_constant_ordinal_and_write_conversion() {
     use crate::compiler::SqlWriteAssignmentSite;
     use crate::compiler::materialized_values::MaterializedSourceBorrow;
     use arrow::array::{Array, Int32Array};
@@ -306,7 +306,7 @@ fn lambda_body_borrow_retains_original_constant_ordinal_and_write_conversion() {
     use std::{borrow::Cow, sync::Arc};
     let control = SqlCompileControl::unbounded();
     let field = Arc::new(arrow::datatypes::Field::new(
-        "original_lambda_body",
+        "original_array_item",
         DataType::Int32,
         false,
     ));
@@ -320,21 +320,18 @@ fn lambda_body_borrow_retains_original_constant_ordinal_and_write_conversion() {
     )
     .unwrap();
     let value = pool.value(1).unwrap();
-    let query = query("SELECT array_map(x -> only_original_body, [1,2])");
-    let ast::Expr::FunctionCall(call) = projection(&query) else {
-        panic!("array_map")
+    let query = query("SELECT ARRAY[only_original_body, CAST(1 AS BIGINT)]");
+    let ast::Expr::Array(array) = projection(&query) else {
+        panic!("array literal")
     };
-    let ast::Expr::Lambda(lambda) = &call.arguments[0].value else {
-        panic!("lambda")
-    };
-    assert_eq!(lambda.arguments[0].name.value, "x");
+    let original = &array.values[0];
     let mut source = MaterializedSourceBorrow::empty(&query);
     source
-        .insert_context_constant(&lambda.body, value.clone(), &control)
+        .insert_context_constant(original, value.clone(), &control)
         .unwrap();
     source
         .insert_write_assignment(
-            &lambda.body,
+            original,
             Cow::Owned(
                 SqlWriteAssignmentSite::try_new(
                     0,
@@ -343,25 +340,21 @@ fn lambda_body_borrow_retains_original_constant_ordinal_and_write_conversion() {
                     &control,
                 )
                 .unwrap()
-                .with_source_span(lambda.body.span()),
+                .with_source_span(original.span()),
             ),
             &control,
         )
         .unwrap();
-    assert!(source.view().constant_at(&lambda.body.clone()).is_none());
+    assert!(source.view().constant_at(&original.clone()).is_none());
     let mut ctx = context(&control);
     ctx.materialized_values = Some(source.view());
     let scope = ctx.new_scope();
-    let expected = ctx.analyze_expr(&lambda.body, &scope).unwrap();
+    let expected = ctx.analyze_expr(original, &scope).unwrap();
     let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
     let ExprKind::FunctionCall { args, .. } = &actual.kind else {
         panic!("original array function binding")
     };
-    let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
-        panic!("original lambda binder")
-    };
-    assert_eq!(params.len(), 1);
-    assert_eq!(params[0].name, "x");
+    let body = &args[0];
     same_typed(body, &expected, &control);
     assert_eq!(
         body.value_type,
@@ -372,7 +365,7 @@ fn lambda_body_borrow_retains_original_constant_ordinal_and_write_conversion() {
     };
     assert_eq!(target, &DataType::Int64);
     let ExprKind::Constant(retained) = &expr.kind else {
-        panic!("original lambda body source")
+        panic!("original ARRAY item source")
     };
     assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
     assert_eq!(retained.ordinal(), 1);

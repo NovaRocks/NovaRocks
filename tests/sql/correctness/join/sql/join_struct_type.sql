@@ -51,13 +51,13 @@ INSERT INTO ${case_db}.struct_test (pk, s0) VALUES ROW(7, row(3, '', null, null)
 -- query 4
 -- @skip_result_check=true
 INSERT INTO ${case_db}.struct_test VALUES
-  (0, row(0,'ab'), row(0,'ab'), row(0,['1','2']), row('1',map(1,'abc')), row(1,json_object('name':'abc','age':23)), row(0, row(1,'a')));
+  (0, row(0,'ab'), row(0,'ab'), row(0,['1','2']), row('1',MAP(ARRAY[1], ARRAY['abc'])), row(1,json_object('name':'abc','age':23)), row(0, row(1,'a')));
 
 -- query 5
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; s3 inner map '' key coerces to null int -> dropped that entry
 INSERT INTO ${case_db}.struct_test VALUES
-  (1, row(1, null), row(null,''), row(1,[]), row('11',map(1,'abc')), row(null,json_object('name':null)), row(null, row(null,null)));
+  (1, row(1, null), row(null,''), row(1,[]), row('11',MAP(ARRAY[1], ARRAY['abc'])), row(null,json_object('name':null)), row(null, row(null,null)));
 
 -- query 6
 -- @skip_result_check=true
@@ -69,7 +69,7 @@ INSERT INTO ${case_db}.struct_test VALUES
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; s3 inner map had a trailing null key, dropped it (kept the non-null entry)
 INSERT INTO ${case_db}.struct_test VALUES
-  (3, row(3,''), row(3,''), row(3,['3',null, null,null]), row('3',map(3,'a33c')), row(null,json_object('name':'abc','age':23)), row(null, row(3,'a')));
+  (3, row(3,''), row(3,''), row(3,['3',null, null,null]), row('3',MAP(ARRAY[3], ARRAY['a33c'])), row(null,json_object('name':'abc','age':23)), row(null, row(3,'a')));
 
 -- query 8
 -- @skip_result_check=true

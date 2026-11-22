@@ -27,7 +27,7 @@ CREATE TABLE ${case_db}.rf_remap_b (k INT, v INT);
 CREATE TABLE ${case_db}.rf_remap_c (k INT, v INT);
 INSERT INTO ${case_db}.rf_remap_a
     SELECT generate_series, generate_series
-    FROM TABLE(generate_series(1, 100000));
+    FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.rf_remap_b VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
 INSERT INTO ${case_db}.rf_remap_c VALUES ROW(4, 40), ROW(5, 50), ROW(6, 60);
 ANALYZE ${case_db}.rf_remap_a;

@@ -1046,20 +1046,6 @@ mod tests {
                 "ordinary repeated T stays strict in both orders"
             );
         }
-        let list = FunctionValueType::new(list_of(DataType::Int64), false);
-        let item = FunctionValueType::new(DataType::Int32, false);
-        assert!(
-            resolve_scalar_function_signature_with_overload(
-                "array_append",
-                &[list.data_type().clone(), DataType::Int32]
-            )
-            .is_err(),
-            "List<T> does not grant the Map key role"
-        );
-        assert!(
-            resolve_scalar_value_signature_with_overload("array_append", &[list, item], &Control)
-                .is_err()
-        );
         assert!(
             resolve_scalar_value_signature_with_overload(
                 "lead",
@@ -1185,20 +1171,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_array_append_propagates_element_type() {
+    fn resolve_array_concat_propagates_element_type() {
         // `array_append(List<T>, T) -> List<T>` — polymorphic.
-        let r =
-            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Int64]);
+        let r = resolve_scalar_function("concat", &[list_of(DataType::Int64), DataType::Int64]);
         assert_eq!(r, Ok(list_of(DataType::Int64)));
-    }
-
-    #[test]
-    fn resolve_array_append_rejects_mismatched_element_type() {
-        // `array_append(List<Int64>, Utf8)` should not match — T is bound
-        // to Int64 by the first arg, second arg violates the binding.
-        let r =
-            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Utf8]);
-        assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
     }
 
     #[test]

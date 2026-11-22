@@ -20,22 +20,32 @@ SELECT [JSON '{"2:3": null}'] AS json_values,
        [CAST(JSON '{"2:3": null}' AS VARCHAR)] AS string_values;
 
 -- query 2
-SELECT array_sortby([JSON '{"k": 1}', JSON '{"k": 2}'], [2,1]) AS json_values,
-       array_sortby([CAST(JSON '{"k": 1}' AS VARCHAR), CAST(JSON '{"k": 2}' AS VARCHAR)], [2,1]) AS string_values;
+SELECT array_agg(j ORDER BY k1 NULLS FIRST, ordinal) AS json_values,
+       array_agg(s ORDER BY k1 NULLS FIRST, ordinal) AS string_values
+FROM (VALUES
+    (1, JSON '{"k": 1}', CAST(JSON '{"k": 1}' AS VARCHAR), 2),
+    (2, JSON '{"k": 2}', CAST(JSON '{"k": 2}' AS VARCHAR), 1)
+) AS input_rows(ordinal, j, s, k1);
 
 -- query 3
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
-WITH q AS (SELECT [JSON '{"key": "value1"}', JSON '{"key": "value2"}'] AS j)
-SELECT array_sortby(j,[2,1]) AS json_values,
-       array_sortby(CAST(j AS ARRAY<VARCHAR>),[2,1]) AS string_values FROM q;
+WITH q AS (
+    SELECT [JSON '{"key": "value1"}', JSON '{"key": "value2"}'] AS j
+), source AS (
+    SELECT j, CAST(j AS ARRAY<VARCHAR>) AS s FROM q
+)
+SELECT array_agg(j[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS json_values,
+       array_agg(s[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS string_values
+FROM source CROSS JOIN (VALUES (1,2), (2,1)) AS positions(ordinal, k1);
 
 -- query 4
 SELECT CAST([] AS ARRAY<JSON>) AS json_values, CAST([] AS ARRAY<VARCHAR>) AS string_values;
 
 -- query 5
--- Preserve the original first projection independently of the retired object-to-text conversion.
+-- Preserve the original typed JSON projection independently.
 WITH q AS (SELECT [JSON '{"key": "value1"}', JSON '{"key": "value2"}'] AS j)
-SELECT array_sortby(j,[2,1]) AS json_values FROM q;
+SELECT array_agg(j[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS json_values
+FROM q CROSS JOIN (VALUES (1,2), (2,1)) AS positions(ordinal, k1);
 
 -- query 6
 SELECT CAST(['abc','{"k":1}','null',NULL] AS ARRAY<JSON>) AS json_values;

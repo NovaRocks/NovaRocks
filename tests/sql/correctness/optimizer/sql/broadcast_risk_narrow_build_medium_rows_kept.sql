@@ -24,10 +24,10 @@ CREATE TABLE probe_5m (k INT, pad1 VARCHAR(100), pad2 VARCHAR(100));
 -- be=3 with the suite's actual persisted column-width statistics.
 CREATE TABLE build_500k_int (k INT);
 INSERT INTO probe_5m
-    SELECT generate_series, repeat('x', 100), repeat('y', 100)
-    FROM TABLE(generate_series(1, 5000000));
+    SELECT generate_series, rpad('', 100, 'x'), rpad('', 100, 'y')
+    FROM TABLE(sequence(1, 5000000)) AS generate_series(generate_series);
 INSERT INTO build_500k_int
-    SELECT generate_series FROM TABLE(generate_series(1, 500000));
+    SELECT generate_series FROM TABLE(sequence(1, 500000)) AS generate_series(generate_series);
 ANALYZE probe_5m;
 ANALYZE build_500k_int;
 SET SESSION cbo_broadcast_backend_count = 3;

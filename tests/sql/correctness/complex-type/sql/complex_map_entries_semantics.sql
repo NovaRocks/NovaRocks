@@ -25,6 +25,6 @@
 -- 2. Project MAP_KEYS, MAP_VALUES, and MAP_ENTRIES.
 -- 3. Assert deterministic JSON-style outputs.
 SELECT
-    MAP_KEYS(MAP('a', 1, 'b', 2)) AS ks,
-    MAP_VALUES(MAP('a', 1, 'b', 2)) AS vs,
-    MAP_ENTRIES(MAP('a', 1, 'b', 2)) AS entries_v;
+    MAP_KEYS(MAP(ARRAY['a', 'b'], ARRAY[1, 2])) AS ks,
+    MAP_VALUES(MAP(ARRAY['a', 'b'], ARRAY[1, 2])) AS vs,
+    MAP_ENTRIES(MAP(ARRAY['a', 'b'], ARRAY[1, 2])) AS entries_v;

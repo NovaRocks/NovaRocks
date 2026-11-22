@@ -24,9 +24,9 @@ DROP TABLE IF EXISTS ${case_db}.oq8_build_big;
 CREATE TABLE ${case_db}.oq8_probe_big (k INT, v INT);
 CREATE TABLE ${case_db}.oq8_build_big (k INT, v INT);
 INSERT INTO ${case_db}.oq8_probe_big
-    SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000));
+    SELECT generate_series, generate_series FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.oq8_build_big
-    SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000));
+    SELECT generate_series, generate_series FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.oq8_probe_big;
 ANALYZE ${case_db}.oq8_build_big;
 SET SESSION cbo_broadcast_backend_count = 7;

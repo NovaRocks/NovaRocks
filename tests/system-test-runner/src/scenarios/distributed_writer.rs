@@ -789,8 +789,8 @@ fn row_count(control: &mut SqlSession, table: &str) -> Result<i64> {
 /// Create the catalog and a source table with two committed data files per
 /// backend.
 ///
-/// The seeded shape matters twice. `generate_series` is a whole-relation
-/// source, so a write reading it is scheduled onto a single instance at one
+/// The seeded shape matters twice. `TABLE(sequence(...))` produces its range
+/// on a single instance, so a write reading it is scheduled at one
 /// driver no matter how many backends exist -- which is why the seeding writes
 /// each leave a one-entry root prepared-set peak behind, and why they cannot
 /// themselves demonstrate anything about distribution. Only a scan whose work
@@ -820,7 +820,7 @@ fn seed_source_files(
         control
             .execute(format!(
                 "INSERT INTO {catalog}.{database}.{source} \
-                 SELECT generate_series FROM TABLE(generate_series({low}, {high}))"
+                 SELECT sequential_number FROM TABLE(sequence({low}, {high}))"
             ))
             .with_context(|| format!("seed {catalog}.{database}.{source} rows {low}..{high}"))?;
     }
@@ -1559,8 +1559,8 @@ impl Scenario for DistributedStatisticsDataflow {
             let high = (file + 1) * SEED_ROWS_PER_FILE;
             control
                 .execute(format!(
-                    "INSERT INTO {source} SELECT generate_series FROM \
-                     TABLE(generate_series({low}, {high}))"
+                    "INSERT INTO {source} SELECT sequential_number FROM \
+                     TABLE(sequence({low}, {high}))"
                 ))
                 .with_context(|| format!("seed native statistics rows {low}..{high}"))?;
         }
@@ -1714,7 +1714,7 @@ impl Scenario for DistributedStatisticsDataflow {
             .collect::<Vec<_>>()
             .join(", ");
         let wide_values = (0..WIDE_STATISTICS_CHANNELS)
-            .map(|index| format!("generate_series + {}", index * 1_000_000))
+            .map(|index| format!("sequential_number + {}", index * 1_000_000))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1730,7 +1730,7 @@ impl Scenario for DistributedStatisticsDataflow {
             control
                 .execute(format!(
                     "INSERT INTO {wide_source} SELECT {wide_values} FROM \
-                     TABLE(generate_series({low}, {high}))"
+                     TABLE(sequence({low}, {high}))"
                 ))
                 .with_context(|| format!("seed wide native statistics rows {low}..{high}"))?;
         }
@@ -2157,7 +2157,7 @@ impl Scenario for DistributedWriterOverwrite {
         // driver so it, like the seeding writes, leaves a one-entry root peak.
         control
             .execute(format!(
-                "INSERT INTO {target} SELECT generate_series FROM TABLE(generate_series(1, 7))"
+                "INSERT INTO {target} SELECT sequential_number FROM TABLE(sequence(1, 7))"
             ))
             .context("seed the distributed overwrite target with stale rows")?;
 

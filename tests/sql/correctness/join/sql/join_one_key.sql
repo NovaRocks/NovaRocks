@@ -37,7 +37,7 @@ CREATE TABLE ${case_db}.__row_util_base (
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 2500 - 1));
+INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(sequence(0, 2500 - 1)) AS generate_series(generate_series);
 
 -- query 4
 -- @skip_result_check=true

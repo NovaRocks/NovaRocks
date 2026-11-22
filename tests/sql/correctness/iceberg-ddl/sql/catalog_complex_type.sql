@@ -29,8 +29,8 @@ CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0}
   )>
 );
 INSERT INTO iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} VALUES
-ROW([named_struct('user', 'official', 'family', 'Glover433', 'given', ['Kira861'], 'prefix', ['Ms.'], 'suffix', NULL)]);
-SELECT array_filter(x -> x."user" = 'official', name)[1].family AS family_name
+ROW([ROW('official', 'Glover433', ARRAY['Kira861'], ARRAY['Ms.'], NULL)]);
+SELECT filter(name, x -> x."user" = 'official')[1].family AS family_name
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 
 -- query 2
@@ -46,7 +46,7 @@ FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 -- @result_contains="prefix": List(Utf8
 -- @result_contains="suffix": List(Utf8
 EXPLAIN WITH SESSION explain_detail = 'CONTRACT'
-SELECT array_filter(x -> x."user" = 'official', name)[1].family AS family_name
+SELECT filter(name, x -> x."user" = 'official')[1].family AS family_name
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} ;
 DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};

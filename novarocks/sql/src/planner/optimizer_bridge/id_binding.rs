@@ -307,16 +307,7 @@ fn verify_hash_join(
             "PhysicalHashJoin other condition",
         )?;
     }
-    if let crate::common::JoinKind::LeftMark { mark } = op.join_type {
-        verify_output_id(mark, "PhysicalHashJoin mark output")?;
-        if left.contains(&mark) || right.contains(&mark) {
-            return Err("mark output reuses an input ColumnId".into());
-        }
-        let mut output = left.clone();
-        output.insert(mark);
-        return Ok(output);
-    }
-    Ok(union_ids(left, right))
+    verify_join_output(op.join_type, left, right, "PhysicalHashJoin mark output")
 }
 
 fn verify_nested_loop_join(
@@ -332,6 +323,29 @@ fn verify_nested_loop_join(
             &union_ids(left, right),
             "PhysicalNestLoopJoin condition",
         )?;
+    }
+    verify_join_output(
+        op.join_type,
+        left,
+        right,
+        "PhysicalNestLoopJoin mark output",
+    )
+}
+
+fn verify_join_output(
+    kind: crate::common::JoinKind,
+    left: &HashSet<ColumnId>,
+    right: &HashSet<ColumnId>,
+    mark_context: &str,
+) -> Result<HashSet<ColumnId>, String> {
+    if let crate::common::JoinKind::LeftMark { mark } = kind {
+        verify_output_id(mark, mark_context)?;
+        if left.contains(&mark) || right.contains(&mark) {
+            return Err("mark output reuses an input ColumnId".into());
+        }
+        let mut output = left.clone();
+        output.insert(mark);
+        return Ok(output);
     }
     Ok(union_ids(left, right))
 }

@@ -41,7 +41,7 @@ SELECT
     IF(i % 3 = 0, NULL, CONCAT('foo_', i)) AS c2,
     IF(i % 3 = 0, NULL, CONCAT('bar_', i)) AS c3,
     IF(i % 3 = 0, NULL, [CONCAT('foo_', i), CONCAT('bar_', i)]) AS c4
-FROM TABLE(generate_series(1, 10000)) t(i);
+FROM TABLE(sequence(1, 10000)) t(i);
 
 -- query 2
 -- first_value: varchar and array results must match on every non-null row

@@ -170,7 +170,7 @@ impl SignedWidth {
         }
         Self::from_carrier(ty.data_type())
     }
-    fn from_carrier(carrier: &DataType) -> Option<Self> {
+    pub(crate) fn from_carrier(carrier: &DataType) -> Option<Self> {
         Some(match carrier {
             DataType::Int8 => Self::I8,
             DataType::Int16 => Self::I16,

@@ -6151,12 +6151,6 @@ impl<'a> ContractLoweringVisitor<'a> {
         plan: &PhysicalPlanNode,
         join: &crate::planner::physical::PhysicalNestLoopJoinNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
-        if matches!(join.join_type, crate::common::JoinKind::LeftMark { .. }) {
-            return Err(ContractLoweringError::InvalidJoin {
-                node: "NestLoopJoin",
-                detail: "left mark join requires hash execution",
-            });
-        }
         expect_children(plan, 2)?;
         require_output_shape("NestLoopJoin", &plan.output_columns, &join.output_columns)?;
         let left = self.lower_node(&plan.children[0])?;
@@ -6253,7 +6247,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         } = self.lower_join_outputs(
             node,
             JoinOutputRequest {
-                mark_column: None,
+                mark_column: join.join_type.mark_output().map(|column| column.column_id),
                 kind,
                 requested: &plan.output_columns,
                 left: &left,

@@ -68,7 +68,7 @@ CREATE TABLE ${case_db}.fpj_t1 (
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 40960));
+INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(1, 40960)) AS generate_series(generate_series);
 
 -- query 9
 -- @skip_result_check=true
@@ -76,7 +76,7 @@ INSERT INTO ${case_db}.fpj_t1 SELECT * FROM ${case_db}.fpj_t0;
 
 -- query 10
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(40960, 40960 + 20000));
+INSERT INTO ${case_db}.fpj_t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(40960, 40960 + 20000)) AS generate_series(generate_series);
 
 -- query 11
 -- INNER JOIN with multi-column equality
@@ -170,7 +170,7 @@ INSERT INTO ${case_db}.fpj_t2 VALUES ROW(NULL, NULL, NULL, NULL);
 
 -- query 28
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fpj_t3 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 409600));
+INSERT INTO ${case_db}.fpj_t3 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(1, 409600)) AS generate_series(generate_series);
 
 -- query 29
 -- NOT IN with correlated IF predicate (null row, expect 0)

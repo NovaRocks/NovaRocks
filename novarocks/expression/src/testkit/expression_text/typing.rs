@@ -96,6 +96,14 @@ impl<'a> TextTyping<'a> {
         let span = expr.span();
         let next = depth + 1;
         if let Some(call) = canonical_call(expr).map_err(TextError::UnsupportedSyntax)? {
+            if call.name == "row" {
+                let children = call
+                    .arguments
+                    .into_iter()
+                    .map(|arg| self.lower(arg, work, next))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return self.type_call(NodeShape::Row, children, span, work);
+            }
             return self.lower_call(call.name, call.arguments, span, work, next);
         }
         match expr {

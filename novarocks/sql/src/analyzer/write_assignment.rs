@@ -219,10 +219,15 @@ fn register_literal_assignments<'a>(
                             visit(&pair[1].value, ordinal)?;
                         }
                     }
-                    ("map", DataType::Map(..)) if function.arguments.len() % 2 == 0 => {
-                        for pair in function.arguments.as_chunks::<2>().0 {
-                            visit(&pair[0].value, 0)?;
-                            visit(&pair[1].value, 1)?;
+                    ("map", DataType::Map(..)) => {
+                        if let Some([keys, values]) = plain_map_arguments(function) {
+                            for (ordinal, argument) in [keys, values].into_iter().enumerate() {
+                                if let ast::Expr::Array(array) = &argument.value {
+                                    for element in &array.values {
+                                        visit(element, ordinal)?;
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -397,12 +402,42 @@ fn plain_map_arguments(
         && call.null_treatment.is_none()
         && call.window.is_none()
         && call.processing_mode.is_none()
-        && call.arguments.len().is_multiple_of(2)
+        && matches!(call.arguments.len(), 0 | 2)
         && call
             .arguments
             .iter()
             .all(|argument| argument.name.is_none()))
     .then_some(call.arguments.as_slice())
+}
+
+fn required_map_literal_array(
+    item: &novarocks_type_contract::FunctionValueType,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
+    use novarocks_type_contract::{
+        ArrayCommonTypeFailure, ValueConstructionFailure, ValueConstructionRequest,
+        ValueTypeStorageLifetime,
+    };
+    let mut observe = |request| {
+        let units = match request {
+            ValueConstructionRequest::Work(units) => u32::try_from(units)
+                .map_err(|_| novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+            ValueConstructionRequest::Exact(_) | ValueConstructionRequest::OpaqueUpper(_) => 0,
+        };
+        control.checkpoint(CompilePhase::Validate, units)
+    };
+    novarocks_type_contract::list_value_type_with_construction(
+        item,
+        false,
+        ValueTypeStorageLifetime::pure(),
+        Some(&mut observe),
+    )
+    .map_err(|error| match error {
+        ArrayCommonTypeFailure::Construction(ValueConstructionFailure::Observer(cause)) => {
+            AnalyzeError::control(cause)
+        }
+        other => AnalyzeError::internal(format!("map literal array declaration failed: {other:?}")),
+    })
 }
 
 fn context_hole(
@@ -512,15 +547,21 @@ fn context_literal<'a>(
             if call.arguments.is_empty() {
                 Some(empty_literal(expected, policy, control)?)
             } else {
-                let key = expected
-                    .child_at(0)
-                    .ok_or_else(|| AnalyzeError::internal("map literal context lost its key"))?;
-                let value = expected
-                    .child_at(1)
-                    .ok_or_else(|| AnalyzeError::internal("map literal context lost its value"))?;
-                for pair in call.arguments.as_chunks::<2>().0 {
-                    context_literal(&pair[0].value, &key, source, policy, control)?;
-                    context_literal(&pair[1].value, &value, source, policy, control)?;
+                for (ordinal, argument) in call.arguments.iter().enumerate() {
+                    let ast::Expr::Array(array) = &argument.value else {
+                        continue;
+                    };
+                    let item = expected.child_at(ordinal).ok_or_else(|| {
+                        AnalyzeError::internal("map literal context lost its array item")
+                    })?;
+                    if array.values.is_empty() {
+                        let array_type = required_map_literal_array(&item, control)?;
+                        context_literal(&argument.value, &array_type, source, policy, control)?;
+                    } else {
+                        for element in &array.values {
+                            context_literal(element, &item, source, policy, control)?;
+                        }
+                    }
                 }
                 None
             }

@@ -50,7 +50,7 @@ SELECT
   generate_series AS id,
   CASE WHEN generate_series % 3 = 0 THEN 'EMEA' ELSE 'APAC' END AS region,
   (generate_series * 7 % 1000) + 1 AS amount
-FROM TABLE(generate_series(1, 5000));
+FROM TABLE(sequence(1, 5000)) AS generate_series(generate_series);
 
 -- query 3
 -- @skip_result_check=true
@@ -81,7 +81,7 @@ ORDER BY region;
 -- INSERT 500 rows: id 5001..5500, region=APAC, amount=600 (all pass amount>500 filter)
 INSERT INTO ice_ivm_ldm_${uuid0}.ns_${uuid0}.orders_${uuid0}
 SELECT generate_series + 5000, 'APAC', 600
-FROM TABLE(generate_series(1, 500));
+FROM TABLE(sequence(1, 500)) AS generate_series(generate_series);
 -- DELETE 100 rows from the base (ids 1..100)
 DELETE FROM ice_ivm_ldm_${uuid0}.ns_${uuid0}.orders_${uuid0} WHERE id >= 1 AND id <= 100;
 

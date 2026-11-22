@@ -1,25 +1,25 @@
 -- query 1
--- legacy
+-- types	array(varchar)
 empty_tail
 ["a"]
 
 -- query 2
--- legacy
+-- types	array(varchar)
 mixed
 ["a","b","c"]
 
 -- query 3
--- legacy
+-- types	array(varchar)
 null_element
 [null,"b"]
 
 -- query 4
--- legacy
+-- types	array(varchar)
 null_array
 NULL
 
 -- query 5
--- legacy
+-- types	array(array(varchar))
 nested
 [["a"],["b"]]
 
@@ -29,11 +29,11 @@ string_value
 ab
 
 -- query 7
--- legacy
+-- types	array(varchar)	array(array(varchar))
 l	nested
 []	[["a"],["b"]]
 
 -- query 8
--- legacy
+-- types	array(bigint)
 exact_integer
 [9223372036854775807,1]

@@ -62,7 +62,17 @@ pub fn append_entry_observed<A: ScalarStateAllocator>(
     work: &mut ScalarWork<'_, '_>,
     inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
-    let key_fp = tracked_key_fingerprint(&key, &state.allocator, work)?;
+    let map_identity = match &key {
+        TrackedAggScalarValue::Float64(value) => Some(TrackedAggScalarValue::Float64(
+            f64::from_bits(super::map_lookup_core::map_float_identity(*value)),
+        )),
+        _ => None,
+    };
+    let key_fp = tracked_key_fingerprint(
+        map_identity.as_ref().unwrap_or(&key),
+        &state.allocator,
+        work,
+    )?;
     work.flush()?;
     let duplicate = state.seen_keys.contains(&key_fp);
     work.flush()?;

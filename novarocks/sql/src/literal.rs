@@ -234,6 +234,7 @@ fn cast_type_is_decimal(data_type: &ast::TypeName) -> bool {
     matches!(&data_type.kind, ast::TypeKind::Generic(value) if matches!(value.name.value.to_ascii_lowercase().as_str(), "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128"))
 }
 
+#[cfg(test)]
 fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, LiteralFailure> {
     let generic = match &data_type.kind {
         ast::TypeKind::Generic(generic) => generic,
@@ -329,6 +330,7 @@ fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, LiteralFa
     }
 }
 
+#[cfg(test)]
 fn type_numeric_argument(
     arguments: &[ast::DataTypeParameter],
     index: usize,
@@ -346,6 +348,7 @@ fn type_numeric_argument(
         .map_err(|_| LiteralFailure::rejected("numeric type parameter must be nonnegative"))
 }
 
+#[cfg(test)]
 fn type_type_argument(
     arguments: &[ast::DataTypeParameter],
     index: usize,
@@ -477,63 +480,8 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
     }
     let args = function_expr_args(&func.arguments)?;
     let name = object_name_lower(&func.name)?;
-    if let Some(value) = try_array_map_cast_string_literal(&name, &args)? {
-        return Ok(value);
-    }
     match name.as_str() {
-        "array_generate" => {
-            let values = args
-                .iter()
-                .map(|arg| expr_to_literal(arg))
-                .collect::<Result<Vec<_>, _>>()?;
-            eval_array_generate_literal(&values)
-        }
-        "array_repeat" => {
-            if args.len() != 2 {
-                return Err(LiteralFailure::rejected("array_repeat expects 2 arguments"));
-            }
-            let value = expr_to_literal(args[0])?;
-            let repeat = match expr_to_literal(args[1])? {
-                Literal::Int(v) => v,
-                other => {
-                    return Err(LiteralFailure::rejected(format_args!(
-                        "array_repeat expects integer count, got {other:?}"
-                    )));
-                }
-            };
-            if repeat <= 0 {
-                return Ok(Literal::Array(Vec::new()));
-            }
-            let required = repeat as u128 * std::mem::size_of::<Literal>() as u128;
-            let repeat = usize::try_from(repeat)
-                .map_err(|source| LiteralFailure::address(required, source))?;
-            std::alloc::Layout::array::<Literal>(repeat)
-                .map_err(|source| LiteralFailure::layout(required, source))?;
-            let mut values = Vec::new();
-            values
-                .try_reserve_exact(repeat)
-                .map_err(|source| LiteralFailure::allocation(required, source))?;
-            values.resize(repeat, value);
-            Ok(Literal::Array(values))
-        }
         "json_object" => json_object_literal(&args),
-        "array_append" => {
-            if args.len() != 2 {
-                return Err(LiteralFailure::rejected("array_append expects 2 arguments"));
-            }
-            let array = expr_to_literal(args[0])?;
-            let value = expr_to_literal(args[1])?;
-            match array {
-                Literal::Null => Ok(Literal::Null),
-                Literal::Array(mut values) => {
-                    values.push(value);
-                    Ok(Literal::Array(values))
-                }
-                other => Err(LiteralFailure::rejected(format_args!(
-                    "array_append expects ARRAY argument, got {other:?}"
-                ))),
-            }
-        }
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
                 return Err(LiteralFailure::rejected(
@@ -600,105 +548,12 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
                 .map(expr_to_literal)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        "named_struct" => {
-            if args.len() % 2 != 0 {
-                return Err(LiteralFailure::rejected(format_args!(
-                    "named_struct literal requires an even number of arguments, got {}",
-                    args.len()
-                )));
-            }
-            Ok(Literal::Struct(
-                args.into_iter()
-                    .skip(1)
-                    .step_by(2)
-                    .map(expr_to_literal)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
-        }
-        "map" => {
-            if args.len() % 2 != 0 {
-                return Err(LiteralFailure::rejected(format_args!(
-                    "MAP literal requires an even number of arguments, got {}",
-                    args.len()
-                )));
-            }
-            let mut entries = Vec::with_capacity(args.len() / 2);
-            for pair in args.as_chunks::<2>().0 {
-                entries.push((expr_to_literal(pair[0])?, expr_to_literal(pair[1])?));
-            }
-            Ok(Literal::Map(entries))
-        }
         _ => Err(LiteralFailure::rejected(format_args!(
             "unsupported expression in INSERT VALUES: {}",
             crate::parser::expression_for_diagnostic(&ast::Expr::FunctionCall(ast::AstBox::new(
                 func.clone()
             )))
         ))),
-    }
-}
-
-fn try_array_map_cast_string_literal(
-    name: &str,
-    args: &[&ast::Expr],
-) -> Result<Option<Literal>, LiteralFailure> {
-    if name != "array_map" && name != "transform" {
-        return Ok(None);
-    }
-    if !array_map_cast_string_lambda_matches(args)? {
-        return Ok(None);
-    }
-    let array_value = expr_to_literal(args[1])?;
-    match array_value {
-        Literal::Null => Ok(Some(Literal::Null)),
-        Literal::Array(values) => values
-            .into_iter()
-            .map(|value| cast_literal(value, &SqlType::String))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Literal::Array)
-            .map(Some),
-        other => Err(LiteralFailure::rejected(format_args!(
-            "array_map expects ARRAY input, got {other:?}"
-        ))),
-    }
-}
-
-fn array_map_cast_string_lambda_matches(args: &[&ast::Expr]) -> Result<bool, LiteralFailure> {
-    if args.len() != 2 {
-        return Ok(false);
-    }
-    let Some((param_name, body)) = parse_single_arrow_lambda(args[0]) else {
-        return Ok(false);
-    };
-    lambda_body_casts_param_to_string(body, &param_name)
-}
-
-fn parse_single_arrow_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
-    match expr {
-        ast::Expr::Lambda(lambda) => lambda
-            .arguments
-            .first()
-            .map(|argument| (argument.name.value.to_lowercase(), &lambda.body)),
-        _ => None,
-    }
-}
-
-fn lambda_body_casts_param_to_string(
-    expr: &ast::Expr,
-    param_name: &str,
-) -> Result<bool, LiteralFailure> {
-    match expr {
-        ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
-            let sql_type = type_name_to_sql_type(&cast.data_type)?;
-            Ok(matches!(sql_type, SqlType::String))
-        }
-        _ => Ok(false),
-    }
-}
-
-fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
-    match expr {
-        ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
-        _ => false,
     }
 }
 
@@ -714,6 +569,7 @@ pub(crate) fn function_expr_args(
 }
 
 /// Cast a `Literal` to the given SQL type without `ManualValue`.
+#[cfg(test)]
 pub(crate) fn cast_literal(
     value: Literal,
     data_type: &novarocks_types::schema::SqlType,
@@ -783,64 +639,6 @@ pub(crate) fn cast_literal(
             other
         ))),
     }
-}
-
-pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, LiteralFailure> {
-    if args.is_empty() || args.len() > 3 {
-        return Err(LiteralFailure::rejected(
-            "array_generate expects 1 to 3 numeric arguments",
-        ));
-    }
-    // SQL NULL propagation: if any argument is NULL, the whole call is NULL.
-    if args.iter().any(|a| matches!(a, Literal::Null)) {
-        return Ok(Literal::Null);
-    }
-    let literal_to_i64 = |value: &Literal| match value {
-        Literal::Int(v) => Ok(*v),
-        other => Err(LiteralFailure::rejected(format_args!(
-            "array_generate expects integer arguments, got {other:?}"
-        ))),
-    };
-    let (start, stop, step) = match args.len() {
-        1 => (1, literal_to_i64(&args[0])?, 1),
-        2 => (literal_to_i64(&args[0])?, literal_to_i64(&args[1])?, 1),
-        3 => (
-            literal_to_i64(&args[0])?,
-            literal_to_i64(&args[1])?,
-            literal_to_i64(&args[2])?,
-        ),
-        _ => unreachable!(),
-    };
-    if step == 0 {
-        return Err(LiteralFailure::rejected(
-            "array_generate step must not be zero",
-        ));
-    }
-
-    let count = if (step > 0 && start > stop) || (step < 0 && start < stop) {
-        0u128
-    } else {
-        i128::from(start).abs_diff(i128::from(stop)) / i128::from(step).unsigned_abs() + 1
-    };
-    let required = count * std::mem::size_of::<Literal>() as u128;
-    let count =
-        usize::try_from(count).map_err(|source| LiteralFailure::address(required, source))?;
-    std::alloc::Layout::array::<Literal>(count)
-        .map_err(|source| LiteralFailure::layout(required, source))?;
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|source| LiteralFailure::allocation(required, source))?;
-    let mut current = start;
-    for ordinal in 0..count {
-        values.push(Literal::Int(current));
-        if ordinal + 1 < count {
-            current = current
-                .checked_add(step)
-                .ok_or_else(|| LiteralFailure::numeric("array_generate value overflow"))?;
-        }
-    }
-    Ok(Literal::Array(values))
 }
 
 // ---------------------------------------------------------------------------
@@ -1863,7 +1661,7 @@ mod source_failure_tests {
         );
     }
     #[test]
-    fn literal_source_integer_overflow_and_wide_repeat_are_explicit_causes() {
+    fn literal_source_integer_overflow_preserves_the_explicit_cause() {
         for sql in [
             "9223372036854775807 + 1",
             "(-9223372036854775807 - 1) - 1",
@@ -1879,46 +1677,6 @@ mod source_failure_tests {
         assert_eq!(
             error.failure_fact(),
             novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
-        );
-        let error = fold("array_repeat(1, 9223372036854775807)").unwrap_err();
-        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
-        assert!(error.source().unwrap().is::<std::alloc::LayoutError>());
-        assert_eq!(
-            error.failure_fact().resource().unwrap().limit,
-            Some(isize::MAX as u64)
-        );
-    }
-    #[test]
-    fn literal_source_inclusive_series_never_advances_past_its_last_value() {
-        assert_eq!(
-            eval_array_generate_literal(&[
-                Literal::Int(i64::MAX),
-                Literal::Int(i64::MAX),
-                Literal::Int(1)
-            ])
-            .unwrap(),
-            Literal::Array(vec![Literal::Int(i64::MAX)])
-        );
-        assert_eq!(
-            eval_array_generate_literal(&[
-                Literal::Int(i64::MIN),
-                Literal::Int(i64::MIN),
-                Literal::Int(-1)
-            ])
-            .unwrap(),
-            Literal::Array(vec![Literal::Int(i64::MIN)])
-        );
-        let error = eval_array_generate_literal(&[
-            Literal::Int(i64::MIN),
-            Literal::Int(i64::MAX),
-            Literal::Int(1),
-        ])
-        .unwrap_err();
-        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
-        assert_eq!(error.failure_fact().resource().unwrap().requested, None);
-        assert_eq!(
-            error.failure_fact().resource().unwrap().limit,
-            Some(isize::MAX as u64)
         );
     }
     #[test]

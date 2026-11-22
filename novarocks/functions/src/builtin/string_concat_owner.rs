@@ -41,12 +41,32 @@ use crate::{
 pub(super) enum ConcatKind {
     String,
     Array,
+    Append,
+    Prepend,
+}
+
+impl ConcatKind {
+    fn element(self) -> Option<usize> {
+        match self {
+            Self::Append => Some(1),
+            Self::Prepend => Some(0),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn overload_kind(name: &str, signature: &str) -> Option<ConcatKind> {
+    match name {
+        "concat" if signature.starts_with("(list<any<T>>,any<T>)") => Some(ConcatKind::Append),
+        "concat" if signature.starts_with("(any<T>,list<any<T>>)") => Some(ConcatKind::Prepend),
+        "concat" if signature.starts_with("(list<") => Some(ConcatKind::Array),
+        _ => operation(name),
+    }
 }
 
 pub(super) fn operation(name: &str) -> Option<ConcatKind> {
     match name {
         "concat" => Some(ConcatKind::String),
-        "array_concat" => Some(ConcatKind::Array),
         _ => None,
     }
 }
@@ -57,8 +77,8 @@ pub(super) fn effects(kind: ConcatKind) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: match kind {
-            ConcatKind::String => FunctionIntrinsicRowError::NoRowError,
             ConcatKind::Array => FunctionIntrinsicRowError::MayRaise,
+            _ => FunctionIntrinsicRowError::NoRowError,
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
@@ -84,7 +104,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct ConcatOwner {
-    kind: ConcatKind,
+    kinds: Box<[ConcatKind]>,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -95,45 +115,68 @@ impl ConcatOwner {
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        let kind = operation(name).ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
-            subject: "uninstalled concatenation",
-            value: name.into(),
-        })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects(kind);
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
-            || declaration.overloads().iter().any(|overload| {
-                overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
-            })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
                 subject: "builtin concatenation pure declaration",
                 value: declaration.function_id().as_str().into(),
             });
         }
-        let implementation =
-            PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
-        let implementations = declaration
-            .overloads()
-            .iter()
-            .map(|overload| PureImplementationDeclaration {
+        let mut kinds = Vec::with_capacity(declaration.overloads().len());
+        let mut implementations = Vec::with_capacity(declaration.overloads().len());
+        for overload in declaration.overloads() {
+            let kind = overload_kind(name, &overload.argument_pattern)
+                .filter(|kind| {
+                    overload.effects.as_ref() == Some(&effects(*kind))
+                        && overload.aggregate.is_none()
+                })
+                .ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
+                    subject: "builtin concatenation overload",
+                    value: overload.identity.as_str().into(),
+                })?;
+            let implementation = match (name, kind) {
+                ("concat", ConcatKind::Array) => {
+                    "builtin.scalar/concat/array-selected-v1".to_string()
+                }
+                ("concat", ConcatKind::Append) => {
+                    "builtin.scalar/concat/append-selected-v1".to_string()
+                }
+                ("concat", ConcatKind::Prepend) => {
+                    "builtin.scalar/concat/prepend-selected-v1".to_string()
+                }
+                _ => format!("builtin.scalar/{name}/selected-v1"),
+            };
+            kinds.push(kind);
+            implementations.push(PureImplementationDeclaration {
                 overload: overload.identity.clone(),
-                implementation: implementation.clone(),
+                implementation: PureImplementationId::try_new(implementation)?,
                 abi: PureKernelAbi::ScalarV1,
-            })
-            .collect();
+            });
+        }
         Ok(Self {
-            kind,
+            kinds: kinds.into_boxed_slice(),
             resolver: Arc::new(resolver),
             declaration,
-            implementations,
+            implementations: implementations.into_boxed_slice(),
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope, arguments: usize) -> CallEffects {
-        let base = effects(self.kind);
+    fn kind(
+        &self,
+        selected: &FunctionBindingSelection,
+    ) -> Result<ConcatKind, FunctionBindingError> {
+        self.declaration
+            .overloads()
+            .iter()
+            .zip(&self.kinds)
+            .find_map(|(overload, kind)| (overload.identity == selected.overload).then_some(*kind))
+            .ok_or_else(|| FunctionBindingError::UnknownOverload(selected.overload.clone()))
+    }
+
+    fn call_effects(kind: ConcatKind, scope: CallProofScope, arguments: usize) -> CallEffects {
+        let base = effects(kind);
         let own_row_error = if arguments == 1 {
             base.own_row_error
         } else {
@@ -271,14 +314,14 @@ impl PreparedScalarKernel for PreparedConcat {
     fn instance_retained_upper_bound(&self) -> usize {
         match self.kind {
             ConcatKind::String => std::mem::size_of::<StringConcatInstance>(),
-            ConcatKind::Array => std::mem::size_of::<ArrayConcatInstance>(),
+            _ => std::mem::size_of::<ArrayConcatInstance>(),
         }
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
         Ok(match self.kind {
             ConcatKind::String => Box::new(StringConcatInstance),
-            ConcatKind::Array => Box::new(ArrayConcatInstance),
+            kind => Box::new(ArrayConcatInstance(kind)),
         })
     }
 }
@@ -298,14 +341,14 @@ impl ScalarKernelInstance for StringConcatInstance {
     }
 }
 
-struct ArrayConcatInstance;
+struct ArrayConcatInstance(ConcatKind);
 impl ScalarKernelInstance for ArrayConcatInstance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::array_concat::evaluate(input, control)
+        super::array_concat::evaluate(input, self.0.element(), control)
     }
 
     fn retained_bytes(&self) -> usize {
@@ -418,7 +461,11 @@ impl ConcatOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            Ok(self.call_effects(input.proof_scope, input.selected.argument_types.len()))
+            Ok(Self::call_effects(
+                self.kind(input.selected)?,
+                input.proof_scope,
+                input.selected.argument_types.len(),
+            ))
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
             return result;
@@ -437,6 +484,9 @@ impl ConcatOwner {
             .map_err(compile_failure)?;
         let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
             work.step().map_err(compile_failure)?;
+            let kind = self
+                .kind(input.selected)
+                .map_err(|_| invalid("unknown concatenation overload"))?;
             if input.function_id != self.declaration.function_id()
                 || input.kind != FunctionKind::Scalar
                 || contract.function_id() != input.function_id
@@ -445,7 +495,11 @@ impl ConcatOwner {
                     != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
                 || contract.effects()
-                    != &self.call_effects(input.proof_scope, input.selected.argument_types.len())
+                    != &Self::call_effects(
+                        kind,
+                        input.proof_scope,
+                        input.selected.argument_types.len(),
+                    )
                 || !input.environment.is_empty()
             {
                 return Err(invalid(
@@ -459,15 +513,12 @@ impl ConcatOwner {
             })?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
-            if matches!(self.kind, ConcatKind::Array) {
-                super::array_concat::validate_profile(&contract, || {
+            if !matches!(kind, ConcatKind::String) {
+                super::array_concat::validate_profile(&contract, kind.element(), || {
                     work.step().map_err(compile_failure)
                 })?;
             }
-            Ok(Arc::new(PreparedConcat {
-                kind: self.kind,
-                contract,
-            }) as Arc<dyn PreparedScalarKernel>)
+            Ok(Arc::new(PreparedConcat { kind, contract }) as Arc<dyn PreparedScalarKernel>)
         })();
         if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;

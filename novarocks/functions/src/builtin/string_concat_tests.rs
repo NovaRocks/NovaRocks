@@ -535,15 +535,24 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
             owner.binding_declaration().function_id().as_str(),
             "builtin.scalar/concat/v1"
         );
-        assert_eq!(owner.implementation_declarations().len(), 1);
+        assert_eq!(owner.implementation_declarations().len(), 4);
+        let string_implementation = owner
+            .implementation_declarations()
+            .iter()
+            .find(|implementation| implementation.overload == selected.overload)
+            .unwrap();
         assert_eq!(
-            owner.implementation_declarations()[0]
-                .implementation
-                .as_str(),
+            string_implementation.implementation.as_str(),
             "builtin.scalar/concat/selected-v1"
         );
+        let string_overload = owner
+            .binding_declaration()
+            .overloads()
+            .iter()
+            .find(|overload| overload.identity == selected.overload)
+            .unwrap();
         assert_eq!(
-            owner.binding_declaration().overloads()[0].effects.as_ref(),
+            string_overload.effects.as_ref(),
             Some(&effects(ConcatKind::String))
         );
         let pattern_arguments = [];
@@ -626,14 +635,6 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Binary, true),
-            FunctionValueType::from_legacy_declared_projection(
-                DataType::List(Arc::new(arrow_schema::Field::new(
-                    "item",
-                    DataType::Int64,
-                    true,
-                ))),
-                true,
-            ),
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap(),
         ] {

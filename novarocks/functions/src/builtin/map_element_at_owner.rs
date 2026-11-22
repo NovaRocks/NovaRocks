@@ -38,7 +38,7 @@ use crate::{
 };
 
 pub(super) fn operation(name: &str) -> bool {
-    name == "__map_element_at"
+    matches!(name, "__map_element_at" | "__map_subscript" | "element_at")
 }
 
 /// A NULL probe may match the final NULL key; missing keys return NULL.
@@ -61,12 +61,17 @@ pub(super) fn definition(
     resolver: BuiltinScalarResolver,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(MapElementAtOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    let visibility = if name == "__map_subscript" {
+        FunctionVisibility::Hidden
+    } else {
+        FunctionVisibility::Public
+    };
+    FunctionDefinition::try_new_pure_scalar(name, visibility, owner).map_err(|error| {
+        FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin __map_element_at pure owner",
             value: error.to_string().into(),
-        },
-    )
+        }
+    })
 }
 
 struct MapElementAtOwner {
@@ -90,7 +95,7 @@ impl MapElementAtOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 2
+            || declaration.overloads().len() != if name == "element_at" { 3 } else { 2 }
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -239,8 +244,15 @@ impl PureScalarImplementation for MapElementAtOwner {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LookupMode {
+    TrinoArray,
+    Map(super::collection_selected::Operation),
+}
+
 #[derive(Debug)]
 struct PreparedMapElementAt {
+    mode: LookupMode,
     contract: Arc<ScalarCallContract>,
 }
 impl PreparedScalarKernel for PreparedMapElementAt {
@@ -253,22 +265,25 @@ impl PreparedScalarKernel for PreparedMapElementAt {
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(MapElementAtInstance))
+        Ok(Box::new(MapElementAtInstance(self.mode)))
     }
 }
 
-struct MapElementAtInstance;
+struct MapElementAtInstance(LookupMode);
 impl ScalarKernelInstance for MapElementAtInstance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::collection_selected::evaluate(
-            super::collection_selected::Operation::MapLookup,
-            input,
-            control,
-        )
+        match self.0 {
+            LookupMode::TrinoArray => {
+                super::array_access_selected::evaluate_with_index_policy(input, true, control)
+            }
+            LookupMode::Map(operation) => {
+                super::collection_selected::evaluate(operation, input, control)
+            }
+        }
     }
 
     fn retained_bytes(&self) -> usize {
@@ -350,15 +365,32 @@ impl MapElementAtOwner {
                 FunctionBindingError::Control(error) => compile_failure(error),
                 _ => invalid("__map_element_at preparation has a stale selected binding"),
             })?;
-            super::collection_selected::validate_profile(
-                super::collection_selected::Operation::MapLookup,
-                &contract,
-                || work.step().map_err(compile_failure),
-            )?;
+            let collection = contract
+                .value_argument_types()
+                .next()
+                .ok_or_else(|| invalid("element_at has no prepared collection"))?;
+            let mode = if matches!(collection.data_type(), arrow_schema::DataType::List(_)) {
+                super::array_access_selected::validate_profile(&contract, || {
+                    work.step().map_err(compile_failure)
+                })?;
+                LookupMode::TrinoArray
+            } else {
+                use super::collection_selected::Operation;
+                let operation =
+                    if contract.function_id().as_str() == "builtin.scalar/__map_subscript/v1" {
+                        Operation::MapSubscript
+                    } else {
+                        Operation::MapLookup
+                    };
+                super::collection_selected::validate_profile(operation, &contract, || {
+                    work.step().map_err(compile_failure)
+                })?;
+                LookupMode::Map(operation)
+            };
             work.step().map_err(compile_failure)?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
-            Ok(Arc::new(PreparedMapElementAt { contract }) as Arc<dyn PreparedScalarKernel>)
+            Ok(Arc::new(PreparedMapElementAt { mode, contract }) as Arc<dyn PreparedScalarKernel>)
         })();
         if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;

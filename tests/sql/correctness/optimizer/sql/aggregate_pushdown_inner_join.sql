@@ -28,9 +28,9 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_pd_b;
 CREATE TABLE ${case_db}.t_agg_pd_a (k INT, v INT);
 CREATE TABLE ${case_db}.t_agg_pd_b (k INT);
 INSERT INTO ${case_db}.t_agg_pd_a
-    SELECT generate_series % 100, generate_series FROM TABLE(generate_series(1, 20000));
+    SELECT generate_series % 100, generate_series FROM TABLE(sequence(1, 20000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t_agg_pd_b
-    SELECT DISTINCT generate_series % 100 FROM TABLE(generate_series(1, 20000));
+    SELECT DISTINCT generate_series % 100 FROM TABLE(sequence(1, 20000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.t_agg_pd_a;
 ANALYZE ${case_db}.t_agg_pd_b;
 -- @skip_result_check=true

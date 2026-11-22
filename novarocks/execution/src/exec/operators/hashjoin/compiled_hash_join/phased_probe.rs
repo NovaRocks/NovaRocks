@@ -174,6 +174,7 @@ impl ProbeDefinition {
                     novarocks_local_program::NestedLoopJoinType::FullOuter => JoinType::FullOuter,
                     novarocks_local_program::NestedLoopJoinType::LeftSemi => JoinType::LeftSemi,
                     novarocks_local_program::NestedLoopJoinType::LeftAnti => JoinType::LeftAnti,
+                    novarocks_local_program::NestedLoopJoinType::LeftMark => JoinType::LeftMark,
                     novarocks_local_program::NestedLoopJoinType::NullAwareLeftAnti => {
                         JoinType::NullAwareLeftAnti
                     }
@@ -251,9 +252,9 @@ enum RowCandidates {
     Physical(Range<usize>),
     Naa(NaaCandidates),
 }
-/// Original per-probe match state. A mark reads its three-valued result from
-/// the admitted single-key presence lookup; ordinary/NAA candidates retain
-/// their existing complete-predicate evaluation and required-error ordering.
+/// Original per-probe match state. Hash mark joins obtain a three-valued
+/// result from the single-key presence lookup. Nested mark joins reduce the
+/// complete predicate over actual build candidates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProbeMatch {
     False,
@@ -524,10 +525,15 @@ impl TransformKernel for JoinProbe {
                 .nodes()
                 .get(self.declaration.node().index())
                 .map(|node| node.kind()),
-            Some(ProgramNodeKind::Join {
-                join_type: novarocks_local_program::JoinType::LeftMark,
-                ..
-            })
+            Some(
+                ProgramNodeKind::Join {
+                    join_type: novarocks_local_program::JoinType::LeftMark,
+                    ..
+                } | ProgramNodeKind::NestedLoopJoin {
+                    join_type: novarocks_local_program::NestedLoopJoinType::LeftMark,
+                    ..
+                }
+            )
         )
     }
 
@@ -1101,6 +1107,17 @@ fn advance_probe(
             }
             None => c,
         };
+        if prep.definition.kind == JoinType::LeftMark {
+            let probe = pairs[position]
+                .probe
+                .expect("mark pair has an actual probe row");
+            if on == Some(true) {
+                cursor.matched[probe] = ProbeMatch::True;
+            } else if on.is_none() && cursor.matched[probe] == ProbeMatch::False {
+                cursor.matched[probe] = ProbeMatch::Unknown;
+            }
+            continue;
+        }
         let suppress = if prep.definition.naa {
             if prep.definition.predicate.is_some() {
                 on == Some(true)

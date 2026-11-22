@@ -39,13 +39,13 @@ CREATE TABLE ${case_db}.rf_active_partial_build (
 -- throughout the input rather than in one adjacent range.
 INSERT INTO ${case_db}.rf_active_partial_probe
 SELECT generate_series AS id, generate_series % 600 AS k
-FROM TABLE(generate_series(1, 6000));
+FROM TABLE(sequence(1, 6000)) AS generate_series(generate_series);
 
 -- The build scan is non-trivial, but only keys 11 and 29 survive into the join.
 INSERT INTO ${case_db}.rf_active_partial_build
 SELECT generate_series % 600 AS k,
        CASE WHEN generate_series % 600 IN (11, 29) THEN 'Y' ELSE 'N' END AS flag
-FROM TABLE(generate_series(1, 600));
+FROM TABLE(sequence(1, 600)) AS generate_series(generate_series);
 
 ANALYZE ${case_db}.rf_active_partial_probe;
 ANALYZE ${case_db}.rf_active_partial_build;

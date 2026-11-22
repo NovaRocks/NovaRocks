@@ -36,7 +36,7 @@ create table base_table (
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into base_table SELECT generate_series % 4, generate_series % 9, generate_series % 9, generate_series %9 FROM TABLE(generate_series(1,  10000));
+insert into base_table SELECT generate_series % 4, generate_series % 9, generate_series % 9, generate_series %9 FROM TABLE(sequence(1,  10000)) AS generate_series(generate_series);
 
 -- query 4
 -- @skip_result_check=true

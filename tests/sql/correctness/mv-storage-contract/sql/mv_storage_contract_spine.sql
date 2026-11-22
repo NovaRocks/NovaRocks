@@ -58,7 +58,7 @@ SELECT
   CASE WHEN n % 2 = 0 THEN 'east' ELSE 'west' END,
   CASE WHEN n % 3 = 0 THEN 'online' ELSE 'store' END,
   CAST(n % 100 AS BIGINT)
-FROM TABLE(generate_series(1, 4000)) t(n);
+FROM TABLE(sequence(1, 4000)) t(n);
 
 -- query 5
 -- @skip_result_check=true

@@ -34,11 +34,11 @@ CREATE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0} (k INT, flag 
 -- l: k in [0,99] over 1000 rows -> NDV(k)=100 ; r: k in [0,79] over 800 -> NDV(k)=80
 -- @skip_result_check=true
 INSERT INTO iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0}
-  SELECT generate_series % 100, generate_series FROM TABLE(generate_series(1, 1000));
+  SELECT generate_series % 100, generate_series FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 
 -- @skip_result_check=true
 INSERT INTO iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0}
-  SELECT generate_series % 80, generate_series % 2 FROM TABLE(generate_series(1, 800));
+  SELECT generate_series % 80, generate_series % 2 FROM TABLE(sequence(1, 800)) AS generate_series(generate_series);
 
 -- @skip_result_check=true
 ANALYZE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0};

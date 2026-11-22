@@ -114,6 +114,7 @@ impl CompileNeedId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NeedKind {
+    TableSequenceArgument,
     CatalogRelation,
     Statistics,
     MaterializedView,
@@ -1099,6 +1100,7 @@ impl SystemTableSnapshotFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SqlNeedBatch {
+    TableSequenceArguments(Box<[super::TableSequenceArgumentNeed]>),
     CatalogRelations(Box<[CatalogRelationNeed]>),
     Statistics(Box<[StatisticsNeed]>),
     MaterializedViews(Box<[MaterializedViewNeed]>),
@@ -1112,6 +1114,7 @@ pub enum SqlNeedBatch {
 impl SqlNeedBatch {
     pub const fn kind(&self) -> NeedKind {
         match self {
+            Self::TableSequenceArguments(_) => NeedKind::TableSequenceArgument,
             Self::CatalogRelations(_) => NeedKind::CatalogRelation,
             Self::Statistics(_) => NeedKind::Statistics,
             Self::MaterializedViews(_) => NeedKind::MaterializedView,
@@ -1122,6 +1125,7 @@ impl SqlNeedBatch {
 
     pub fn len(&self) -> usize {
         match self {
+            Self::TableSequenceArguments(needs) => needs.len(),
             Self::CatalogRelations(needs) => needs.len(),
             Self::Statistics(needs) => needs.len(),
             Self::MaterializedViews(needs) => needs.len(),
@@ -1139,6 +1143,9 @@ impl SqlNeedBatch {
 
     fn ids(&self) -> Box<dyn Iterator<Item = CompileNeedId> + '_> {
         match self {
+            Self::TableSequenceArguments(needs) => {
+                Box::new(needs.iter().map(super::TableSequenceArgumentNeed::id))
+            }
             Self::CatalogRelations(needs) => Box::new(needs.iter().map(CatalogRelationNeed::id)),
             Self::Statistics(needs) => Box::new(needs.iter().map(StatisticsNeed::id)),
             Self::MaterializedViews(needs) => Box::new(needs.iter().map(MaterializedViewNeed::id)),
@@ -1157,6 +1164,11 @@ impl SqlNeedBatch {
 
     pub(super) fn accounted_bytes(&self) -> Result<u64, CompletionProtocolError> {
         match self {
+            // The prepared graph retains its original statement ownership.
+            Self::TableSequenceArguments(needs) => checked_mul(
+                needs.len(),
+                std::mem::size_of::<super::TableSequenceArgumentNeed>(),
+            ),
             Self::CatalogRelations(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<CatalogRelationNeed>()),
                 checked_sum(needs.iter().map(|need| {
@@ -1995,6 +2007,7 @@ impl ProviderReadFact {
 
 #[derive(Debug)]
 pub enum SqlFactBatch {
+    TableSequenceArguments(Box<[super::TableSequenceArgumentFact]>),
     CatalogRelations(Box<[CatalogRelationFact]>),
     Statistics(Box<[StatisticsFact]>),
     MaterializedViews(Box<[MaterializedViewFact]>),
@@ -2008,6 +2021,7 @@ pub enum SqlFactBatch {
 impl SqlFactBatch {
     pub const fn kind(&self) -> NeedKind {
         match self {
+            Self::TableSequenceArguments(_) => NeedKind::TableSequenceArgument,
             Self::CatalogRelations(_) => NeedKind::CatalogRelation,
             Self::Statistics(_) => NeedKind::Statistics,
             Self::MaterializedViews(_) => NeedKind::MaterializedView,
@@ -2018,6 +2032,7 @@ impl SqlFactBatch {
 
     fn len(&self) -> usize {
         match self {
+            Self::TableSequenceArguments(facts) => facts.len(),
             Self::CatalogRelations(facts) => facts.len(),
             Self::Statistics(facts) => facts.len(),
             Self::MaterializedViews(facts) => facts.len(),
@@ -2031,6 +2046,9 @@ impl SqlFactBatch {
 
     fn ids(&self) -> Box<dyn Iterator<Item = CompileNeedId> + '_> {
         match self {
+            Self::TableSequenceArguments(facts) => {
+                Box::new(facts.iter().map(super::TableSequenceArgumentFact::id))
+            }
             Self::CatalogRelations(facts) => Box::new(facts.iter().map(CatalogRelationFact::id)),
             Self::Statistics(facts) => Box::new(facts.iter().map(StatisticsFact::id)),
             Self::MaterializedViews(facts) => Box::new(facts.iter().map(MaterializedViewFact::id)),
@@ -2049,6 +2067,10 @@ impl SqlFactBatch {
 
     fn accounted_bytes(&self) -> Result<u64, SqlCompileProgressError> {
         match self {
+            Self::TableSequenceArguments(facts) => Ok(checked_mul(
+                facts.len(),
+                std::mem::size_of::<super::TableSequenceArgumentFact>(),
+            )?),
             Self::CatalogRelations(facts) => Ok(checked_sum(facts.iter().map(catalog_fact_bytes))?),
             Self::Statistics(facts) => Ok(checked_sum(facts.iter().map(statistics_fact_bytes))?),
             Self::MaterializedViews(facts) => materialized_view_facts_bytes(facts),
@@ -2180,6 +2202,7 @@ impl CatalogExchangeBudget {
 /// Private, move-only compiler state machine. No variant contains a runtime
 /// capability or is visible to an application.
 pub(crate) enum CompilerContinuation {
+    TableSequence(Box<super::completion_driver::SqlTableSequenceCompletionState>),
     Catalog(Box<super::SqlCatalogCompletionState>),
     Statistics(Box<super::SqlStatisticsCompletionState>),
     MaterializedView(Box<super::SqlMaterializedViewCompletionState>),
@@ -2450,6 +2473,10 @@ impl SqlCompiler {
         } = compilation;
         validate_and_account_facts(&needs, &facts, &mut tracking)?;
         let step = match (continuation, facts) {
+            (
+                CompilerContinuation::TableSequence(state),
+                SqlFactBatch::TableSequenceArguments(facts),
+            ) => super::completion_driver::resume_table_sequence(*state, facts, control)?,
             (CompilerContinuation::Catalog(state), SqlFactBatch::CatalogRelations(facts)) => {
                 super::resume_catalog(*state, facts, control)?
             }
@@ -2494,6 +2521,7 @@ impl SqlCompiler {
 impl CompilerContinuation {
     const fn kind(&self) -> NeedKind {
         match self {
+            Self::TableSequence(_) => NeedKind::TableSequenceArgument,
             Self::Catalog(_) => NeedKind::CatalogRelation,
             Self::Statistics(_) => NeedKind::Statistics,
             Self::MaterializedView(_) => NeedKind::MaterializedView,
@@ -3172,6 +3200,23 @@ fn validate_fact_semantics(
     facts: &SqlFactBatch,
 ) -> Result<(), CompletionProtocolError> {
     match (needs, facts) {
+        (
+            SqlNeedBatch::TableSequenceArguments(needs),
+            SqlFactBatch::TableSequenceArguments(facts),
+        ) => {
+            let expected = needs
+                .iter()
+                .map(|need| (need.id(), need))
+                .collect::<BTreeMap<_, _>>();
+            for fact in facts {
+                if !fact.matches(expected[&fact.id()]) {
+                    return Err(CompletionProtocolError::InvalidFact {
+                        id: fact.id(),
+                        reason: "table sequence fact differs from the prepared expression",
+                    });
+                }
+            }
+        }
         (SqlNeedBatch::CatalogRelations(needs), SqlFactBatch::CatalogRelations(facts)) => {
             let expected = needs
                 .iter()

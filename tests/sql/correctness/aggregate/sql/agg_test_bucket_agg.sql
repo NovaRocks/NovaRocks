@@ -40,7 +40,7 @@ CREATE TABLE "t0" (
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(generate_series(1,  4096));
+insert into t0 SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(sequence(1,  4096)) AS generate_series(generate_series);
 
 -- query 5
 -- @skip_result_check=true
@@ -139,7 +139,7 @@ CREATE TABLE "t1" (
 -- query 27
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(generate_series(1,  4096));
+insert into t1 SELECT generate_series, 4096 - generate_series, generate_series FROM TABLE(sequence(1,  4096)) AS generate_series(generate_series);
 
 -- query 28
 -- @skip_result_check=true

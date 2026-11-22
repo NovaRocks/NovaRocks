@@ -293,6 +293,10 @@ impl FrontendQueryCompiler {
             Arc::clone(self.view.view_service()),
             self.system_tables.system_relations().clone(),
             Arc::clone(&self.mv_readiness),
+            Arc::new(crate::RequiredConstantInterpreter::new(
+                Arc::clone(&self.sealed_functions),
+                self.constant_policy,
+            )),
         )
     }
 

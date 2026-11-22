@@ -23,7 +23,7 @@ CREATE TABLE map_aggregate_contract (id INT, m MAP<INT,INT>) WITH (format_versio
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO map_aggregate_contract VALUES ROW(1,NULL),ROW(2,map()),ROW(3,map(1,NULL)),ROW(4,map(1,7));
+INSERT INTO map_aggregate_contract VALUES ROW(1,NULL),ROW(2,map()),ROW(3,MAP(ARRAY[1], ARRAY[NULL])),ROW(4,MAP(ARRAY[1], ARRAY[7]));
 -- query 3
 USE ${case_db};
 SELECT id, m IS NULL AS parent_null, m[1] AS value_at_one FROM map_aggregate_contract ORDER BY id;

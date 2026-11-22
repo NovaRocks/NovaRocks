@@ -4387,6 +4387,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",
+ "novarocks-memory",
  "novarocks-physical-plan",
  "novarocks-plan-codec",
  "novarocks-sql",

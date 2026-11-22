@@ -37,16 +37,16 @@ arr_decimal array<decimal(38,5)>
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t select generate_series, concat('array-key-', CAST(generate_series AS varchar)), array_repeat(generate_series, 128),array_repeat(concat('array-key-', CAST(generate_series AS varchar)), 16), array_repeat(generate_series, 128) from table(generate_series(0, 999));
+insert into t select generate_series, concat('array-key-', CAST(generate_series AS varchar)), repeat(generate_series, 128),repeat(concat('array-key-', CAST(generate_series AS varchar)), 16), repeat(generate_series, 128) from table(sequence(0, 999)) AS generate_series(generate_series);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t values ROW(1000, concat('array-key-', CAST(1000 AS varchar)), array_append(array_generate(128), null), array_append(array_repeat(concat('array-key-', CAST(1000 AS varchar)),16), null),array_append(array_generate(128),null));
+insert into t values ROW(1000, concat('array-key-', CAST(1000 AS varchar)), concat(sequence(1, 128), null), concat(repeat(concat('array-key-', CAST(1000 AS varchar)),16), null),concat(sequence(1, 128),null));
 
 -- query 5
 USE ${case_db};
-select array_contains([1,2,3,4], 1) from t order by pk limit 10;
+select contains([1,2,3,4], 1) from t order by pk limit 10;
 
 -- query 6
 USE ${case_db};
@@ -54,7 +54,7 @@ select array_position([1,2,3,4], 1) from t order by pk limit 10;
 
 -- query 7
 USE ${case_db};
-select array_contains([1,2,3,4], null) from t order by pk limit 10;
+select contains([1,2,3,4], null) from t order by pk limit 10;
 
 -- query 8
 USE ${case_db};
@@ -62,7 +62,7 @@ select array_position([1,2,3,4], null) from t order by pk limit 10;
 
 -- query 9
 USE ${case_db};
-select array_contains([1,2,3,null], null) from t order by pk limit 10;
+select contains([1,2,3,null], null) from t order by pk limit 10;
 
 -- query 10
 USE ${case_db};
@@ -70,7 +70,7 @@ select array_position([1,2,3,null], null) from t order by pk limit 10;
 
 -- query 11
 USE ${case_db};
-select array_contains(null, null) from t order by pk limit 10;
+select contains(null, null) from t order by pk limit 10;
 
 -- query 12
 USE ${case_db};
@@ -78,31 +78,31 @@ select array_position(null, null) from t order by pk limit 10;
 
 -- query 13
 USE ${case_db};
-select sum(array_contains((array_generate(1000)), pk)) from t;
+select sum(contains((sequence(1, 1000)), pk)) from t;
 
 -- query 14
 USE ${case_db};
-select sum(array_contains((array_generate(1000)), 100)) from t;
+select sum(contains((sequence(1, 1000)), 100)) from t;
 
 -- query 15
 USE ${case_db};
-select sum(array_position((array_generate(1000)), pk)) from t;
+select sum(array_position((sequence(1, 1000)), pk)) from t;
 
 -- query 16
 USE ${case_db};
-select sum(array_position((array_generate(1000)), 100)) from t;
+select sum(array_position((sequence(1, 1000)), 100)) from t;
 
 -- query 17
 USE ${case_db};
-select sum(array_contains(array_append((array_generate(1000)), null), pk)) from t;
+select sum(contains(concat((sequence(1, 1000)), null), pk)) from t;
 
 -- query 18
 USE ${case_db};
-select sum(array_contains(array_append((array_generate(1000)), null), null)) from t;
+select sum(contains(concat((sequence(1, 1000)), null), null)) from t;
 
 -- query 19
 USE ${case_db};
-select sum(array_contains(arr_bigint, 100)) from t;
+select sum(contains(arr_bigint, 100)) from t;
 
 -- query 20
 USE ${case_db};
@@ -110,7 +110,7 @@ select sum(array_position(arr_bigint, 100)) from t;
 
 -- query 21
 USE ${case_db};
-select sum(array_contains(arr_str, concat('array-key-', CAST(100 AS varchar)))) from t;
+select sum(contains(arr_str, concat('array-key-', CAST(100 AS varchar)))) from t;
 
 -- query 22
 USE ${case_db};
@@ -118,7 +118,7 @@ select sum(array_position(arr_str, concat('array-key-', CAST(100 AS varchar)))) 
 
 -- query 23
 USE ${case_db};
-select sum(array_contains(arr_decimal, pk)) from t;
+select sum(contains(arr_decimal, pk)) from t;
 
 -- query 24
 USE ${case_db};
@@ -126,7 +126,7 @@ select sum(array_position(arr_decimal, pk)) from t;
 
 -- query 25
 USE ${case_db};
-select sum(array_contains(arr_decimal, 100)) from t;
+select sum(contains(arr_decimal, 100)) from t;
 
 -- query 26
 USE ${case_db};
@@ -134,11 +134,11 @@ select sum(array_position(arr_decimal, 100)) from t;
 
 -- query 27
 USE ${case_db};
-select sum(array_contains((array_repeat('abcdefg', 10000)), 'abcdefg')) from t;
+select sum(contains((repeat('abcdefg', 10000)), 'abcdefg')) from t;
 
 -- query 28
 USE ${case_db};
-select sum(array_contains((array_repeat('abcdefg', 10000)), str)) from t;
+select sum(contains((repeat('abcdefg', 10000)), str)) from t;
 
 -- name: test_array_contains_with_decimal
 -- query 29
@@ -159,23 +159,23 @@ insert into t values ROW(1,[1.1], [[1.1]],[[[1.1]]]);
 
 -- query 31
 USE ${case_db};
-select array_contains(v1, 1.1) from t;
+select contains(v1, 1.1) from t;
 
 -- query 32
 USE ${case_db};
-select array_contains(v2, [1.1]) from t;
+select contains(v2, [1.1]) from t;
 
 -- query 33
 USE ${case_db};
-select array_contains(v3, [[1.1]]) from t;
+select contains(v3, [[1.1]]) from t;
 
 -- query 34
 USE ${case_db};
-select array_contains(v2, v1) from t;
+select contains(v2, v1) from t;
 
 -- query 35
 USE ${case_db};
-select array_contains(v3, v2) from t;
+select contains(v3, v2) from t;
 
 -- query 36
 USE ${case_db};
@@ -225,109 +225,109 @@ ROW(9, [1,1,1,1,1,null,2],[1,null,2],[null,2]);
 
 -- query 43
 USE ${case_db};
-select array_contains_seq(arr_0, arr_1) from t order by k;
+select contains_sequence(arr_0, arr_1) from t order by k;
 
 -- query 44
 USE ${case_db};
-select array_contains_seq(arr_1, arr_0) from t order by k;
+select contains_sequence(arr_1, arr_0) from t order by k;
 
 -- query 45
 USE ${case_db};
-select array_contains_seq(arr_0, arr_2) from t order by k;
+select contains_sequence(arr_0, arr_2) from t order by k;
 
 -- query 46
 USE ${case_db};
-select array_contains_seq(arr_2, arr_0) from t order by k;
+select contains_sequence(arr_2, arr_0) from t order by k;
 
 -- query 47
 USE ${case_db};
-select array_contains_seq(arr_1, arr_2) from t order by k;
+select contains_sequence(arr_1, arr_2) from t order by k;
 
 -- query 48
 USE ${case_db};
-select array_contains_seq(arr_2, arr_1) from t order by k;
+select contains_sequence(arr_2, arr_1) from t order by k;
 
 -- query 49
 USE ${case_db};
-select array_contains_seq([1,2,3,4], arr_0) from t order by k;
+select contains_sequence([1,2,3,4], arr_0) from t order by k;
 
 -- query 50
 USE ${case_db};
-select array_contains_seq([1,2,3,4], arr_1) from t order by k;
+select contains_sequence([1,2,3,4], arr_1) from t order by k;
 
 -- query 51
 USE ${case_db};
-select array_contains_seq([1,2,3,4,null], arr_1) from t order by k;
+select contains_sequence([1,2,3,4,null], arr_1) from t order by k;
 
 -- query 52
 USE ${case_db};
-select array_contains_seq(arr_0, [1,null]) from t order by k;
+select contains_sequence(arr_0, [1,null]) from t order by k;
 
 -- query 53
 USE ${case_db};
-select array_contains_seq(arr_0, []) from t order by k;
+select contains_sequence(arr_0, []) from t order by k;
 
 -- query 54
 USE ${case_db};
-select array_contains_seq(null, arr_0) from t order by k;
+select contains_sequence(null, arr_0) from t order by k;
 
 -- query 55
 USE ${case_db};
-select array_contains_seq(arr_1, null) from t order by k;
+select contains_sequence(arr_1, null) from t order by k;
 
 -- query 56
 USE ${case_db};
-select array_contains_seq([1,1,2,3],[1,1]);
+select contains_sequence([1,1,2,3],[1,1]);
 
 -- query 57
 USE ${case_db};
-select array_contains_seq([1,1,2,3],[1,2]);
+select contains_sequence([1,1,2,3],[1,2]);
 
 -- query 58
 USE ${case_db};
-select array_contains_seq([1,1,2,3],[1,3]);
+select contains_sequence([1,1,2,3],[1,3]);
 
 -- query 59
 USE ${case_db};
-select array_contains_seq([1,1,2,3],[2,3]);
+select contains_sequence([1,1,2,3],[2,3]);
 
 -- query 60
 USE ${case_db};
-select array_contains_seq([1,1,2,3],[1,1,2]);
+select contains_sequence([1,1,2,3],[1,1,2]);
 
 -- query 61
 USE ${case_db};
-select array_contains_seq([null,null,1,2],[null]);
+select contains_sequence([null,null,1,2],[null]);
 
 -- query 62
 USE ${case_db};
-select array_contains_seq([null,null,1,2],[null,null]);
+select contains_sequence([null,null,1,2],[null,null]);
 
 -- query 63
 USE ${case_db};
-select array_contains_seq([null,null,1,2],[null,1]);
+select contains_sequence([null,null,1,2],[null,1]);
 
 -- query 64
 USE ${case_db};
-select array_contains_seq([null,null,1,2],[null,null,1]);
+select contains_sequence([null,null,1,2],[null,null,1]);
 
 -- query 65
 USE ${case_db};
-select array_contains_seq([null,null,1,2],[null,1,2]);
+select contains_sequence([null,null,1,2],[null,1,2]);
 
 -- query 66
 USE ${case_db};
-select array_contains_seq((array_append(array_repeat(1, 1000), 2)), (array_append(array_repeat(1, 500), 2)));
+select contains_sequence((concat(repeat(1, 1000), 2)), (concat(repeat(1, 500), 2)));
 
 -- query 67
 -- @expect_error=2-th input of array_contains_seq should be an array, rather than varchar
 USE ${case_db};
-select array_contains_seq(['abc'],'a');
+select contains_sequence(['abc'],'a');
 
 -- query 68
 -- @expect_error=1-th input of array_contains_seq should be an array, rather than varchar
 USE ${case_db};
-select array_contains_seq('abc',['a']);
+select contains_sequence('abc',['a']);
 
 -- name: test_array_contains_all_type
 -- query 69
@@ -400,186 +400,186 @@ ROW(10, [true, true, NULL], [50, 70, NULL], [750, 850, NULL], [300, 400, NULL], 
 -- query 71
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_boolean, true) ORDER BY idSELECT id FROM test_array_contains WHERE array_contains(array_boolean, true) ORDER BY id;;
+SELECT id FROM test_array_contains WHERE contains(array_boolean, true) ORDER BY idSELECT id FROM test_array_contains WHERE contains(array_boolean, true) ORDER BY id;;
 
 -- query 72
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_boolean, NULL) ORDER BY idSELECT id FROM test_array_contains WHERE array_contains(array_boolean, NULL) ORDER BY id;;
+SELECT id FROM test_array_contains WHERE contains(array_boolean, NULL) ORDER BY idSELECT id FROM test_array_contains WHERE contains(array_boolean, NULL) ORDER BY id;;
 
 -- query 73
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_boolean, false) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_boolean, false) ORDER BY id;
 
 -- query 74
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_tinyint, 5) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_tinyint, 5) ORDER BY id;
 
 -- query 75
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_tinyint, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_tinyint, NULL) ORDER BY id;
 
 -- query 76
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_tinyint, 20) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_tinyint, 20) ORDER BY id;
 
 -- query 77
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_smallint, 100) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_smallint, 100) ORDER BY id;
 
 -- query 78
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_smallint, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_smallint, NULL) ORDER BY id;
 
 -- query 79
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_smallint, 300) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_smallint, 300) ORDER BY id;
 
 -- query 80
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_int, 50) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_int, 50) ORDER BY id;
 
 -- query 81
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_int, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_int, NULL) ORDER BY id;
 
 -- query 82
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_int, 90) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_int, 90) ORDER BY id;
 
 -- query 83
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_bigint, 4000) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_bigint, 4000) ORDER BY id;
 
 -- query 84
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_bigint, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_bigint, NULL) ORDER BY id;
 
 -- query 85
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_bigint, 8000) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_bigint, 8000) ORDER BY id;
 
 -- query 86
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_largeint, 1234567890123456789) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_largeint, 1234567890123456789) ORDER BY id;
 
 -- query 87
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_largeint, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_largeint, NULL) ORDER BY id;
 
 -- query 88
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_largeint, 765432198765432109) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_largeint, 765432198765432109) ORDER BY id;
 
 -- query 89
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimalv2, 12345.67) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimalv2, 12345.67) ORDER BY id;
 
 -- query 90
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimalv2, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimalv2, NULL) ORDER BY id;
 
 -- query 91
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimalv2, 56789.01) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimalv2, 56789.01) ORDER BY id;
 
 -- query 92
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal32, 123.45) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal32, 123.45) ORDER BY id;
 
 -- query 93
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal32, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal32, NULL) ORDER BY id;
 
 -- query 94
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal32, 567.89) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal32, 567.89) ORDER BY id;
 
 -- query 95
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal64, 12345678.90) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal64, 12345678.90) ORDER BY id;
 
 -- query 96
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal64, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal64, NULL) ORDER BY id;
 
 -- query 97
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal64, 7890123.45) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal64, 7890123.45) ORDER BY id;
 
 -- query 98
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal128, 1234567890.1234567890) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal128, 1234567890.1234567890) ORDER BY id;
 
 -- query 99
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal128, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal128, NULL) ORDER BY id;
 
 -- query 100
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_decimal128, 8765432109.8765432109) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_decimal128, 8765432109.8765432109) ORDER BY id;
 
 -- query 101
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_float, 1.23) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_float, 1.23) ORDER BY id;
 
 -- query 102
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_float, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_float, NULL) ORDER BY id;
 
 -- query 103
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_float, 7.89) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_float, 7.89) ORDER BY id;
 
 -- query 104
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_double, 123.456) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_double, 123.456) ORDER BY id;
 
 -- query 105
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_double, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_double, NULL) ORDER BY id;
 
 -- query 106
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_double, 444.333) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_double, 444.333) ORDER BY id;
 
 -- query 107
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_varchar, 'hello') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_varchar, 'hello') ORDER BY id;
 
 -- query 108
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_varchar, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_varchar, NULL) ORDER BY id;
 
 -- query 109
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_varchar, 'starrocks') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_varchar, 'starrocks') ORDER BY id;
 
 -- query 110
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_date, '2025-01-01') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_date, '2025-01-01') ORDER BY id;
 
 -- query 111
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_date, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_date, NULL) ORDER BY id;
 
 -- query 112
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_date, '2025-01-13') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_date, '2025-01-13') ORDER BY id;
 
 -- query 113
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_datetime, '2025-01-01 12:00:00') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_datetime, '2025-01-01 12:00:00') ORDER BY id;
 
 -- query 114
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_datetime, NULL) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_datetime, NULL) ORDER BY id;
 
 -- query 115
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains(array_datetime, '2025-01-17 10:00:00') ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains(array_datetime, '2025-01-17 10:00:00') ORDER BY id;
 
 -- query 116
 USE ${case_db};
@@ -763,174 +763,174 @@ SELECT id, array_position(array_datetime, '2025-01-17 10:00:00') AS position FRO
 
 -- query 161
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_boolean, [true, false]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_boolean, [true, false]) ORDER BY id;
 
 -- query 162
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_tinyint, [5, 10]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_tinyint, [5, 10]) ORDER BY id;
 
 -- query 163
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_smallint, [100, 200]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_smallint, [100, 200]) ORDER BY id;
 
 -- query 164
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_int, [50, 60]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_int, [50, 60]) ORDER BY id;
 
 -- query 165
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_bigint, [4000, 6000]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_bigint, [4000, 6000]) ORDER BY id;
 
 -- query 166
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_largeint, [1234567890123456789, 987654321098765432]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_largeint, [1234567890123456789, 987654321098765432]) ORDER BY id;
 
 -- query 167
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_decimalv2, [12345.67, 78901.23]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_decimalv2, [12345.67, 78901.23]) ORDER BY id;
 
 -- query 168
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_decimal32, [123.45, 567.89]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_decimal32, [123.45, 567.89]) ORDER BY id;
 
 -- query 169
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_decimal64, [12345678.90, 56789012.34]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_decimal64, [12345678.90, 56789012.34]) ORDER BY id;
 
 -- query 170
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_decimal128, [1234567890.1234567890, 8765432109.8765432109]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_decimal128, [1234567890.1234567890, 8765432109.8765432109]) ORDER BY id;
 
 -- query 171
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_float, [1.23, 4.56]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_float, [1.23, 4.56]) ORDER BY id;
 
 -- query 172
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_double, [123.456, 789.012]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_double, [123.456, 789.012]) ORDER BY id;
 
 -- query 173
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_varchar, ['hello', 'world']) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_varchar, ['hello', 'world']) ORDER BY id;
 
 -- query 174
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_date, ['2025-01-01', '2025-01-13']) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_date, ['2025-01-01', '2025-01-13']) ORDER BY id;
 
 -- query 175
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_datetime, ['2025-01-01 12:00:00', '2025-01-17 10:00:00']) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_datetime, ['2025-01-01 12:00:00', '2025-01-17 10:00:00']) ORDER BY id;
 
 -- query 176
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([true, false], array_boolean) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([true, false], array_boolean) ORDER BY id;
 
 -- query 177
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([5, 10], array_tinyint) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([5, 10], array_tinyint) ORDER BY id;
 
 -- query 178
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([100, 200], array_smallint) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([100, 200], array_smallint) ORDER BY id;
 
 -- query 179
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([50, 60], array_int) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([50, 60], array_int) ORDER BY id;
 
 -- query 180
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([4000, 6000], array_bigint) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([4000, 6000], array_bigint) ORDER BY id;
 
 -- query 181
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([1234567890123456789, 987654321098765432], array_largeint) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([1234567890123456789, 987654321098765432], array_largeint) ORDER BY id;
 
 -- query 182
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([12345.67, 78901.23], array_decimalv2) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([12345.67, 78901.23], array_decimalv2) ORDER BY id;
 
 -- query 183
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([123.45, 567.89], array_decimal32) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([123.45, 567.89], array_decimal32) ORDER BY id;
 
 -- query 184
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([12345678.90, 56789012.34], array_decimal64) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([12345678.90, 56789012.34], array_decimal64) ORDER BY id;
 
 -- query 185
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([1234567890.1234567890, 8765432109.8765432109], array_decimal128) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([1234567890.1234567890, 8765432109.8765432109], array_decimal128) ORDER BY id;
 
 -- query 186
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([1.23, 4.56], array_float) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([1.23, 4.56], array_float) ORDER BY id;
 
 -- query 187
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq([123.456, 789.012], array_double) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence([123.456, 789.012], array_double) ORDER BY id;
 
 -- query 188
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(['hello', 'world'], array_varchar) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(['hello', 'world'], array_varchar) ORDER BY id;
 
 -- query 189
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(['2025-01-01', '2025-01-13'], array_date) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(['2025-01-01', '2025-01-13'], array_date) ORDER BY id;
 
 -- query 190
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(['2025-01-01 12:00:00', '2025-01-17 10:00:00'], array_datetime) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(['2025-01-01 12:00:00', '2025-01-17 10:00:00'], array_datetime) ORDER BY id;
 
 -- query 191
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_boolean, []) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_boolean, []) ORDER BY id;
 
 -- query 192
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_tinyint, [1, 2, 3, 4, 5]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_tinyint, [1, 2, 3, 4, 5]) ORDER BY id;
 
 -- query 193
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_smallint, [10, 20, 30, 40, 50]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_smallint, [10, 20, 30, 40, 50]) ORDER BY id;
 
 -- query 194
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_int, [100, 200, 300, 400, 500]) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_int, [100, 200, 300, 400, 500]) ORDER BY id;
 
 -- query 195
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains WHERE array_contains_seq(array_varchar, ['a', 'b', 'c', 'd', 'e']) ORDER BY id;
+SELECT id FROM test_array_contains WHERE contains_sequence(array_varchar, ['a', 'b', 'c', 'd', 'e']) ORDER BY id;
 
 -- name: test_array_contains_complex_type
 -- query 196
@@ -947,115 +947,115 @@ CREATE TABLE test_array_contains_complex_type (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO test_array_contains_complex_type VALUES
-ROW(1, [map('a', 1, 'b', 2), map('c', 3, 'd', 4)], ['{"key1": 100, "key2": 200}', '{"key3": 300}'], [row(10, 'hello'), row(20, 'world')]),
-ROW(2, [map('x', 5, 'y', 6)], ['{"key4": 400}', '{"key5": 500, "key6": 600}'], [row(30,'starrocks'), row(40, 'database')]),
+ROW(1, [MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['c', 'd'], ARRAY[3, 4])], ['{"key1": 100, "key2": 200}', '{"key3": 300}'], [row(10, 'hello'), row(20, 'world')]),
+ROW(2, [MAP(ARRAY['x', 'y'], ARRAY[5, 6])], ['{"key4": 400}', '{"key5": 500, "key6": 600}'], [row(30,'starrocks'), row(40, 'database')]),
 ROW(3, NULL, NULL, NULL),
 ROW(4, [], [], []);
 
 -- query 198
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq([map('c', 3, 'd', 4)], array_map) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([MAP(ARRAY['c', 'd'], ARRAY[3, 4])], array_map) ORDER BY id;
 
 -- query 199
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq([], array_map) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([], array_map) ORDER BY id;
 
 -- query 200
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq(['{"key3": 300}'], array_json) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(['{"key3": 300}'], array_json) ORDER BY id;
 
 -- query 201
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq([NULL], array_json) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([NULL], array_json) ORDER BY id;
 
 -- query 202
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq([row(20,'world')], array_struct) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([row(20,'world')], array_struct) ORDER BY id;
 
 -- query 203
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq([NULL], array_struct) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence([NULL], array_struct) ORDER BY id;
 
 -- query 204
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq(array_json, ['{"key3": 300}']) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(array_json, ['{"key3": 300}']) ORDER BY id;
 
 -- query 205
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains_seq(array_map, []) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains_sequence(array_map, []) ORDER BY id;
 
 -- query 206
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_map, map('a', 1, 'b', 2)) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_map, MAP(ARRAY['a', 'b'], ARRAY[1, 2])) ORDER BY id;
 
 -- query 207
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_map, map('c', 3, 'd', 4)) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_map, MAP(ARRAY['c', 'd'], ARRAY[3, 4])) ORDER BY id;
 
 -- query 208
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_map, map('x', 5, 'y', 6)) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_map, MAP(ARRAY['x', 'y'], ARRAY[5, 6])) ORDER BY id;
 
 -- query 209
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_map, NULL) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_map, NULL) ORDER BY id;
 
 -- query 210
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_map, map()) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_map, map()) ORDER BY id;
 
 -- query 211
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_json, '{"key1": 100, "key2": 200}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key1": 100, "key2": 200}') ORDER BY id;
 
 -- query 212
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_json, '{"key3": 300}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key3": 300}') ORDER BY id;
 
 -- query 213
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_json, '{"key5": 500, "key6": 600}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{"key5": 500, "key6": 600}') ORDER BY id;
 
 -- query 214
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_json, NULL) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, NULL) ORDER BY id;
 
 -- query 215
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_json, '{}') ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_json, '{}') ORDER BY id;
 
 -- query 216
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_struct, row(10, 'hello')) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_struct, row(10, 'hello')) ORDER BY id;
 
 -- query 217
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_struct, row(20, 'world')) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_struct, row(20, 'world')) ORDER BY id;
 
 -- query 218
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_struct, row(40, 'database')) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_struct, row(40, 'database')) ORDER BY id;
 
 -- query 219
 -- @skip_result_check=true
 USE ${case_db};
-SELECT id FROM test_array_contains_complex_type WHERE array_contains(array_struct, NULL) ORDER BY id;
+SELECT id FROM test_array_contains_complex_type WHERE contains(array_struct, NULL) ORDER BY id;
 
 -- query 220
 USE ${case_db};
-SELECT id, array_position(array_map, map('a', 1, 'b', 2)) FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(array_map, MAP(ARRAY['a', 'b'], ARRAY[1, 2])) FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 221
 USE ${case_db};
-SELECT id, array_position(array_map, map('c', 3, 'd', 4)) FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(array_map, MAP(ARRAY['c', 'd'], ARRAY[3, 4])) FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 222
 USE ${case_db};
-SELECT id, array_position(array_map, map('x', 5, 'y', 6)) FROM test_array_contains_complex_type ORDER BY id;
+SELECT id, array_position(array_map, MAP(ARRAY['x', 'y'], ARRAY[5, 6])) FROM test_array_contains_complex_type ORDER BY id;
 
 -- query 223
 USE ${case_db};
@@ -1103,7 +1103,7 @@ SELECT id, array_position(array_struct, NULL) FROM test_array_contains_complex_t
 
 -- query 234
 USE ${case_db};
-select array_contains([null], null), array_position([null], null);
+select contains([null], null), array_position([null], null);
 
 -- name: test_array_contains_with_null
 -- query 235
@@ -1121,7 +1121,7 @@ arr_decimal array<decimal(38,5)>
 -- query 236
 -- @skip_result_check=true
 USE ${case_db};
-insert into t select generate_series, concat('array-key-', CAST(generate_series AS varchar)), array_repeat(generate_series, 10),array_repeat(concat('array-key-', CAST(generate_series AS varchar)), 10), array_repeat(generate_series, 128) from table(generate_series(0, 999));
+insert into t select generate_series, concat('array-key-', CAST(generate_series AS varchar)), repeat(generate_series, 10),repeat(concat('array-key-', CAST(generate_series AS varchar)), 10), repeat(generate_series, 128) from table(sequence(0, 999)) AS generate_series(generate_series);
 
 -- query 237
 -- @skip_result_check=true
@@ -1130,11 +1130,11 @@ insert into t select 1, null, null, null, null;
 
 -- query 238
 USE ${case_db};
-select  pk, array_contains(arr_bigint, 1000), arr_bigint from t order by pk limit 1;
+select  pk, contains(arr_bigint, 1000), arr_bigint from t order by pk limit 1;
 
 -- query 239
 USE ${case_db};
-select  pk, array_length(arr_bigint), arr_bigint from t order by pk limit 1;
+select  pk, cardinality(arr_bigint), arr_bigint from t order by pk limit 1;
 
 -- query 240
 -- @skip_result_check=true

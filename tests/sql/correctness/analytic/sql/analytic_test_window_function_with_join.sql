@@ -28,7 +28,7 @@ CREATE TABLE ${case_db}."nt0" (
   "c2" bigint DEFAULT NULL
 ) WITH (format_version = 3);
 
-INSERT INTO ${case_db}.nt0 SELECT generate_series %4096, 4096 - generate_series, generate_series %4096 FROM TABLE(generate_series(1, 8192));
+INSERT INTO ${case_db}.nt0 SELECT generate_series %4096, 4096 - generate_series, generate_series %4096 FROM TABLE(sequence(1, 8192)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.nt0 SELECT * FROM ${case_db}.nt0;
 
 -- This analytic case runs on the suite's Hadoop Iceberg catalog, which does

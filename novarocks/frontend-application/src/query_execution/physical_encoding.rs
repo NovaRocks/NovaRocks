@@ -1354,8 +1354,8 @@ mod tests {
         // the gather. Table-free series provide exact cardinalities without
         // requiring an external relation or executing the statement.
         let sql = "SELECT COUNT(*) AS row_count \
-            FROM TABLE(generate_series(1, 4096)) AS l(id) \
-            JOIN TABLE(generate_series(1, 4096)) AS r(id) ON l.id = r.id";
+            FROM TABLE(sequence(1, 4096)) AS l(id) \
+            JOIN TABLE(sequence(1, 4096)) AS r(id) ON l.id = r.id";
         let request = request_with_settings(
             sql,
             SessionOptimizerSettings {
@@ -1473,14 +1473,14 @@ mod tests {
 
         let sql = r#"
             SELECT p.id, parse_json(p.txt) IN (
-                SELECT parse_json(CONCAT('{"key":', CAST(generate_series AS STRING), '}'))
-                FROM TABLE(generate_series(0, 1))
+                SELECT parse_json(CONCAT('{"key":', CAST(sequential_number AS STRING), '}'))
+                FROM TABLE(sequence(0, 1))
             ) AS present
             FROM (
-                SELECT generate_series AS id,
-                    CASE WHEN generate_series=2 THEN NULL
-                         ELSE CONCAT('{"key":', CAST(generate_series AS STRING), '}') END AS txt
-                FROM TABLE(generate_series(1, 2))
+                SELECT sequential_number AS id,
+                    CASE WHEN sequential_number=2 THEN NULL
+                         ELSE CONCAT('{"key":', CAST(sequential_number AS STRING), '}') END AS txt
+                FROM TABLE(sequence(1, 2))
             ) p
             ORDER BY p.id
         "#;
@@ -1995,10 +1995,10 @@ mod tests {
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 
         let projection = (0..1024)
-            .map(|index| format!("generate_series + {}", index * 1_000_000))
+            .map(|index| format!("sequential_number + {}", index * 1_000_000))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("SELECT {projection} FROM TABLE(generate_series(1, 4))");
+        let sql = format!("SELECT {projection} FROM TABLE(sequence(1, 4))");
         let control = SqlCompileControl::unbounded();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([19; 16]).expect("plan version"),
@@ -2515,10 +2515,10 @@ mod tests {
         use novarocks_types::schema::ColumnDef;
 
         let projection = (0..1024)
-            .map(|index| format!("generate_series + {}", index * 1_000_000))
+            .map(|index| format!("sequential_number + {}", index * 1_000_000))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("SELECT {projection} FROM TABLE(generate_series(1, 4))");
+        let sql = format!("SELECT {projection} FROM TABLE(sequence(1, 4))");
         let control = SqlCompileControl::unbounded();
         let settings = SessionOptimizerSettings::default();
         let catalog = PlannerMemoryCatalog::default();

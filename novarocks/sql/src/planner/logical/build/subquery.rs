@@ -27,6 +27,36 @@ use novarocks_type_contract::PureCompileControl;
 use super::output::plan_output_columns;
 use super::query::plan_scoped_query;
 
+fn append_mark_projection(
+    input: LogicalPlanNode,
+    projection: ProjectItem,
+) -> Result<LogicalPlanNode, SqlCompileError> {
+    let mut items: Vec<_> = plan_output_columns(&input)?
+        .into_iter()
+        .map(|field| ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: field.column_id,
+                    qualifier: None,
+                    column: field.name.clone(),
+                },
+                value_type: field.value_type,
+            },
+            output_name: field.name,
+            output_column_id: field.column_id,
+        })
+        .collect();
+    items.push(projection);
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Project(PlanProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![input],
+        None,
+    ))
+}
+
 /// Project an already materialized JSON value using its original hidden binding.
 /// The RHS query has finished its own DISTINCT/ORDER/LIMIT semantics first.
 fn project_mark_key(
@@ -122,6 +152,34 @@ pub(super) fn wrap_scalar_applies(
         }
         let right = plan_scoped_query(spec.inner, cte_registry, factory, control)?;
 
+        if let Some(mark) = spec.relation_mark {
+            for projection in mark.demand_projections {
+                current = append_mark_projection(current, projection.into_planner())?;
+            }
+            let probe = spec
+                .mark_probe
+                .ok_or("relation mark has no materialized probe")?;
+            current = append_mark_projection(
+                current,
+                ProjectItem {
+                    expr: probe,
+                    output_name: mark.probe_column.name,
+                    output_column_id: mark.probe_column.column_id,
+                },
+            )?;
+            current = LogicalPlanNode::new(
+                LogicalPlanKind::Join(LogicalJoinNode {
+                    naa_author: None,
+                    join_type: JoinKind::LeftMark {
+                        mark: spec.output_column.column_id,
+                    },
+                    condition: Some(mark.predicate),
+                }),
+                vec![current, right],
+                None,
+            );
+            continue;
+        }
         if let Some(probe) = spec.mark_probe {
             let mut items: Vec<ProjectItem> = plan_output_columns(&current)?
                 .into_iter()
