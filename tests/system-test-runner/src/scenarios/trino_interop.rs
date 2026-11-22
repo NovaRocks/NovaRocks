@@ -177,6 +177,7 @@ impl Scenario for TrinoInterop {
                     "tests/cluster-harness/**",
                     "tests/test-support/**",
                     "novarocks/failpoint/**",
+                    "tests/system-test-runner/Cargo.toml",
                     "tests/system-test-runner/src/scenarios/trino_interop.rs",
                     "tests/system-test-runner/src/scenarios/trino_interop/**",
                     "tests/system-test-runner/src/*.rs",
