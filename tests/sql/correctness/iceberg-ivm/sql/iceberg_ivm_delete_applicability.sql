@@ -105,7 +105,7 @@ try {
   val indexes = Seq(Seq(1L), Seq(1L, 2L)).map(ps => org.apache.iceberg.deletes.Deletes.toPositionIndex(org.apache.iceberg.io.CloseableIterable.withNoopClose[java.lang.Long](ps.map(Long.box).asJava)))
   val destination = output(t, ".puffin")
   val writer = org.apache.iceberg.puffin.Puffin.write(destination).createdBy(IcebergBuild.fullVersion()).build()
-  val blobs = try indexes.map(ix => writer.write(new org.apache.iceberg.puffin.Blob("deletion-vector-v1", Seq(Int.box(MetadataColumns.ROW_POSITION.fieldId())).asJava, -1L, -1L, ix.serialize(), null, MAP(ARRAY["referenced-data-file" -> fresh.location()], ARRAY["cardinality" -> ix.cardinality().toString]).asJava))) finally writer.close()
+  val blobs = try indexes.map(ix => writer.write(new org.apache.iceberg.puffin.Blob("deletion-vector-v1", Seq(Int.box(MetadataColumns.ROW_POSITION.fieldId())).asJava, -1L, -1L, ix.serialize(), null, Map("referenced-data-file" -> fresh.location(), "cardinality" -> ix.cardinality().toString).asJava))) finally writer.close()
   val vectors = indexes.zip(blobs).map { case (ix, blob) => FileMetadata.deleteFileBuilder(t.spec()).ofPositionDeletes().withFormat(FileFormat.PUFFIN).withPath(destination.location()).withPartition(partition(t, 1)).withFileSizeInBytes(writer.fileSize()).withReferencedDataFile(fresh.location()).withContentOffset(blob.offset()).withContentSizeInBytes(blob.length()).withRecordCount(ix.cardinality()).build() }
   val immutableHash = java.security.MessageDigest.getInstance("SHA-256").digest(bytes(t.io(), destination.location())).map(b => f"${b & 0xff}%02x").mkString
   val next = vectors(1)

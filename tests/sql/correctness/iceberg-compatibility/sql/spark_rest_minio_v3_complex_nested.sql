@@ -46,14 +46,14 @@ INSERT INTO ice_rest.${case_db}.spark_v3_complex_${uuid0} VALUES
     1,
     named_struct('name', 'ann', 'city', 'sf'),
     array('blue', 'green'),
-    MAP(ARRAY['score', 'level'], ARRAY[10, 2]),
+    map('score', 10, 'level', 2),
     array(named_struct('kind', 'click', 'weight', 3), named_struct('kind', 'view', 'weight', 4))
   ),
   (
     2,
     named_struct('name', 'bob', 'city', 'ny'),
     array('red'),
-    MAP(ARRAY['score', 'level'], ARRAY[20, 1]),
+    map('score', 20, 'level', 1),
     array(named_struct('kind', 'click', 'weight', 7))
   );
 SPARK_SQL
