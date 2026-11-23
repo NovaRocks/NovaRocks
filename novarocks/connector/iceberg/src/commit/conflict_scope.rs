@@ -20,6 +20,7 @@
 // Design: ADR-0244 (docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::mem::size_of;
@@ -814,6 +815,14 @@ fn legacy_time_partition(
 }
 
 fn projection_arithmetic_is_safe(transform: &Transform, leaf: &BoundPredicate) -> bool {
+    checked_projection_arithmetic(transform, leaf, false)
+}
+
+pub(super) fn checked_projection_arithmetic(
+    transform: &Transform,
+    leaf: &BoundPredicate,
+    strict: bool,
+) -> bool {
     if !matches!(
         transform,
         Transform::Truncate(_)
@@ -864,11 +873,7 @@ fn projection_arithmetic_is_safe(transform: &Transform, leaf: &BoundPredicate) -
     };
     match leaf {
         BoundPredicate::Binary(expression) => {
-            let adjustment = match expression.op() {
-                PredicateOperator::LessThan => -1,
-                PredicateOperator::GreaterThan => 1,
-                _ => 0,
-            };
+            let adjustment = i128::from(projection_boundary_adjustment(expression.op(), strict));
             safe_datum(expression.literal(), adjustment)
         }
         BoundPredicate::Set(expression) => expression
@@ -879,52 +884,69 @@ fn projection_arithmetic_is_safe(transform: &Transform, leaf: &BoundPredicate) -
     }
 }
 
+pub(super) fn projection_boundary_adjustment(operation: PredicateOperator, strict: bool) -> i64 {
+    match (strict, operation) {
+        (false, PredicateOperator::LessThan) | (true, PredicateOperator::GreaterThanOrEq) => -1,
+        (false, PredicateOperator::GreaterThan) | (true, PredicateOperator::LessThanOrEq) => 1,
+        _ => 0,
+    }
+}
+
 fn projected_may_match(predicate: &Predicate, value: Option<&Literal>) -> bool {
+    projected_partition_matches(predicate, value, true, &compare_partition)
+}
+
+pub(super) fn projected_partition_matches(
+    predicate: &Predicate,
+    value: Option<&Literal>,
+    unknown: bool,
+    compare: &impl Fn(&PrimitiveLiteral, &PrimitiveLiteral) -> Option<Ordering>,
+) -> bool {
     match predicate {
         Predicate::AlwaysTrue => true,
         Predicate::AlwaysFalse => false,
         Predicate::And(expression) => expression
             .inputs()
             .iter()
-            .all(|p| projected_may_match(p, value)),
+            .all(|p| projected_partition_matches(p, value, unknown, compare)),
         Predicate::Or(expression) => expression
             .inputs()
             .iter()
-            .any(|p| projected_may_match(p, value)),
+            .any(|p| projected_partition_matches(p, value, unknown, compare)),
         Predicate::Unary(expression) => match expression.op() {
             PredicateOperator::IsNull => value.is_none(),
             PredicateOperator::NotNull => value.is_some(),
             PredicateOperator::IsNan => match value {
                 Some(Literal::Primitive(value)) => value.is_nan(),
                 None => false,
-                _ => true,
+                _ => unknown,
             },
-            _ => true,
+            _ => unknown,
         },
         Predicate::Binary(expression) => {
             let Some(Literal::Primitive(value)) = value else {
-                return value.is_some();
+                return value.is_some() && unknown;
             };
-            compare_partition(value, expression.literal().literal()).is_none_or(|order| {
-                match expression.op() {
-                    PredicateOperator::Eq => order.is_eq(),
-                    PredicateOperator::LessThan => order.is_lt(),
-                    PredicateOperator::LessThanOrEq => order.is_le(),
-                    PredicateOperator::GreaterThan => order.is_gt(),
-                    PredicateOperator::GreaterThanOrEq => order.is_ge(),
-                    _ => true,
-                }
+            compare(value, expression.literal().literal()).map_or(unknown, |order| match expression
+                .op()
+            {
+                PredicateOperator::Eq => order.is_eq(),
+                PredicateOperator::LessThan => order.is_lt(),
+                PredicateOperator::LessThanOrEq => order.is_le(),
+                PredicateOperator::GreaterThan => order.is_gt(),
+                PredicateOperator::GreaterThanOrEq => order.is_ge(),
+                _ => unknown,
             })
         }
         Predicate::Set(expression) if expression.op() == PredicateOperator::In => {
             let Some(Literal::Primitive(value)) = value else {
-                return value.is_some();
+                return value.is_some() && unknown;
             };
             expression.literals().iter().any(|candidate| {
-                compare_partition(value, candidate.literal()).is_none_or(|order| order.is_eq())
+                compare(value, candidate.literal()).map_or(unknown, Ordering::is_eq)
             })
         }
-        _ => true,
+        _ => unknown,
     }
 }
 
@@ -962,26 +984,11 @@ fn metrics_may_match(leaf: &BoundPredicate, file: &DataFile) -> bool {
             let compare_upper = upper
                 .as_deref()
                 .and_then(|bound| bound.partial_cmp(literal));
-            match expression.op() {
-                PredicateOperator::Eq => {
-                    !compare_lower.is_some_and(|order| order.is_gt())
-                        && !compare_upper.is_some_and(|order| order.is_lt())
-                }
-                PredicateOperator::LessThan => !compare_lower.is_some_and(|order| order.is_ge()),
-                PredicateOperator::LessThanOrEq => {
-                    !compare_lower.is_some_and(|order| order.is_gt())
-                }
-                PredicateOperator::GreaterThan => !compare_upper.is_some_and(|order| order.is_le()),
-                PredicateOperator::GreaterThanOrEq => {
-                    !compare_upper.is_some_and(|order| order.is_lt())
-                }
-                _ => true,
-            }
+            binary_bounds_may_match(expression.op(), compare_lower, compare_upper)
         }
         BoundPredicate::Set(expression) => {
             // Match the Java evaluator's metrics short-circuit. The complete
             // set still participates in inclusive partition projection.
-            const IN_PREDICATE_LIMIT: usize = 200;
             let literals = expression.literals();
             let Some(first) = literals.iter().next() else {
                 return false;
@@ -1007,6 +1014,25 @@ fn metrics_may_match(leaf: &BoundPredicate, file: &DataFile) -> bool {
     }
 }
 
+pub(super) const IN_PREDICATE_LIMIT: usize = 200;
+
+pub(super) fn binary_bounds_may_match(
+    operation: PredicateOperator,
+    lower: Option<Ordering>,
+    upper: Option<Ordering>,
+) -> bool {
+    match operation {
+        PredicateOperator::Eq => {
+            !lower.is_some_and(Ordering::is_gt) && !upper.is_some_and(Ordering::is_lt)
+        }
+        PredicateOperator::LessThan => !lower.is_some_and(Ordering::is_ge),
+        PredicateOperator::LessThanOrEq => !lower.is_some_and(Ordering::is_gt),
+        PredicateOperator::GreaterThan => !upper.is_some_and(Ordering::is_le),
+        PredicateOperator::GreaterThanOrEq => !upper.is_some_and(Ordering::is_lt),
+        _ => true,
+    }
+}
+
 fn unary_metrics_may_match(op: PredicateOperator, id: i32, file: &DataFile) -> bool {
     let nulls = file.null_value_counts().get(&id);
     let values = file.value_counts().get(&id);
@@ -1019,7 +1045,7 @@ fn unary_metrics_may_match(op: PredicateOperator, id: i32, file: &DataFile) -> b
     }
 }
 
-type MetricBounds<'a> = (Option<Cow<'a, Datum>>, Option<Cow<'a, Datum>>);
+pub(super) type MetricBounds<'a> = (Option<Cow<'a, Datum>>, Option<Cow<'a, Datum>>);
 
 fn metric_bounds<'a>(
     file: &'a DataFile,
@@ -1032,6 +1058,15 @@ fn metric_bounds<'a>(
     {
         return None;
     }
+    Some(column_metric_bounds(file, id, primitive, |_| true))
+}
+
+pub(super) fn column_metric_bounds<'a>(
+    file: &'a DataFile,
+    id: i32,
+    primitive: &PrimitiveType,
+    admissible_source: impl Fn(&PrimitiveType) -> bool,
+) -> MetricBounds<'a> {
     let decode = |datum: &'a Datum| {
         // Older writers could place NaNs in bounds. An upper NaN in the Java
         // comparator is above every finite literal and cannot narrow it.
@@ -1040,17 +1075,19 @@ fn metric_bounds<'a>(
         }
         if datum.data_type() == primitive {
             Some(Cow::Borrowed(datum))
-        } else {
+        } else if admissible_source(datum.data_type()) {
             let bytes = datum.to_bytes().ok()?;
             Datum::try_from_bytes(bytes.as_ref(), primitive.clone())
                 .ok()
                 .map(Cow::Owned)
+        } else {
+            None
         }
     };
-    Some((
+    (
         file.lower_bounds().get(&id).and_then(decode),
         file.upper_bounds().get(&id).and_then(decode),
-    ))
+    )
 }
 
 #[cfg(test)]

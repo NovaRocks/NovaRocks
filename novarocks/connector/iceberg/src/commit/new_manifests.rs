@@ -35,7 +35,7 @@ use crate::iceberg::{Error, ErrorKind, Result};
 use crate::manifest::source::ManifestSource;
 
 use super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
-use super::model::AddedContent;
+use super::model::{AddedContent, CommitOperation};
 use super::operation::IcebergCommitOperation;
 use super::staging::{
     ManifestEntryWrite, StagedView, write_manifest_with_sources, write_sourced_manifest,
@@ -87,8 +87,15 @@ fn invariant(message: impl Into<String>) -> Error {
 }
 
 pub(crate) fn commit_validation_error(message: impl Into<String>) -> Error {
+    commit_validation_error_for(CommitOperation::Write, message)
+}
+
+pub(super) fn commit_validation_error_for(
+    operation: CommitOperation,
+    message: impl Into<String>,
+) -> Error {
     let message = message.into();
-    let failure = super::conflict::validation_conflict(message.clone());
+    let failure = super::conflict::validation_conflict_for(operation, message.clone());
     Error::new(ErrorKind::DataInvalid, message).with_source(failure)
 }
 
