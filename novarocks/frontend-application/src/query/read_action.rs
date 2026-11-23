@@ -158,8 +158,8 @@ pub(super) async fn prepare_read(
     let result = input
         .compiler
         .prepare_read_async(
-            query,
-            compiler::ReadObservation {
+            compiler::ReadStatementInput {
+                query,
                 principal: input.principal,
                 timing: input.timing,
             },

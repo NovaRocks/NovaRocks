@@ -139,13 +139,15 @@ pub fn resolve_bound_aggregate(
     result
 }
 
+type AggregatePublicSignatures = &'static [(&'static str, &'static str)];
+
 #[derive(Clone, Copy)]
 struct AggregateDeclaration {
     name: &'static str,
     signature: &'static str,
     min_args: usize,
     max_args: usize,
-    public_signatures: &'static [(&'static str, &'static str)],
+    public_signatures: AggregatePublicSignatures,
 }
 
 impl AggregateDeclaration {
@@ -174,7 +176,7 @@ impl AggregateDeclaration {
         }
     }
 
-    const fn public(mut self, signatures: &'static [(&'static str, &'static str)]) -> Self {
+    const fn public(mut self, signatures: AggregatePublicSignatures) -> Self {
         self.public_signatures = signatures;
         self
     }
@@ -673,7 +675,7 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     );
     // These derived binding families retain one stable execution identity
     // even when the SQL owner offers several concrete call shapes.
-    let simple_families: &[(&[&str], &[(&str, &str)])] = &[
+    let simple_families: &[(&[&str], AggregatePublicSignatures)] = &[
         (&["any_value", "min", "max"], &[("T", "T")]),
         (&["approx_count_distinct", "ndv"], &[("T", "bigint")]),
         (&["array_agg", "array_agg_distinct"], &[("T", "array(T)")]),

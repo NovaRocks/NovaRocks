@@ -415,10 +415,7 @@ pub(crate) async fn run(
         Err(DriverFailure::Originating(error)) => Err(error),
         Err(DriverFailure::OriginalCancellation(reason)) => Err(query_error_for_query(
             entry.id.as_str(),
-            TrinoErrorSource::Cancellation {
-                reason: &reason,
-                message: "Statement canceled by its original accepted cause",
-            },
+            TrinoErrorSource::OriginalCancellation(reason),
         )),
     };
     let produced = produced.and_then(|()| {
@@ -445,10 +442,7 @@ pub(crate) async fn run(
                 let error = match owner.cancellation_reason() {
                     Some(reason) => query_error_for_query(
                         entry.id.as_str(),
-                        TrinoErrorSource::Cancellation {
-                            reason: &reason,
-                            message: "Statement canceled before success visibility",
-                        },
+                        TrinoErrorSource::OriginalCancellation(reason),
                     ),
                     None => internal(
                         entry.id.as_str(),
@@ -645,13 +639,7 @@ pub(crate) fn command_receipt(
                 };
                 (
                     disposition,
-                    query_error_for_query(
-                        query_id,
-                        TrinoErrorSource::Cancellation {
-                            reason: &reason,
-                            message: "Statement canceled by its original accepted cause",
-                        },
-                    ),
+                    query_error_for_query(query_id, TrinoErrorSource::OriginalCancellation(reason)),
                 )
             }
             None => (

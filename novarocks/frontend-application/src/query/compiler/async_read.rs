@@ -29,14 +29,14 @@ pub(crate) enum ReadCompilerInput {
     Show(Box<crate::query_execution::completion_facts::ShowInput>),
 }
 
-pub(crate) struct ReadObservation {
+pub(crate) struct ReadStatementInput {
+    pub(crate) query: ReadCompilerInput,
     pub(crate) principal: Option<Arc<str>>,
     pub(crate) timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
 }
 
 struct ReadSqlInput {
-    query: ReadCompilerInput,
-    observation: ReadObservation,
+    statement: ReadStatementInput,
     current_catalog: Option<String>,
     current_database: String,
     family: Option<novarocks_result_contract::ClientPresentationFamily>,
@@ -48,8 +48,7 @@ impl FrontendQueryCompiler {
 
     pub(crate) async fn prepare_read_async(
         &self,
-        query: ReadCompilerInput,
-        observation: ReadObservation,
+        statement: ReadStatementInput,
         purpose: FrontendQueryPurpose,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
@@ -75,8 +74,7 @@ impl FrontendQueryCompiler {
         self.complete_async_read(
             purpose,
             ReadSqlInput {
-                query,
-                observation,
+                statement,
                 current_catalog: context.session().current_catalog().map(str::to_owned),
                 current_database: context.session().current_database().to_owned(),
                 family: context.session().presentation().copied(),
@@ -114,8 +112,12 @@ impl FrontendQueryCompiler {
             cpu: planning_cpu,
         } = ports;
         let ReadSqlInput {
-            query,
-            observation: ReadObservation { principal, timing },
+            statement:
+                ReadStatementInput {
+                    query,
+                    principal,
+                    timing,
+                },
             current_catalog,
             current_database,
             family,

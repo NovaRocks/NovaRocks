@@ -32,6 +32,7 @@ use novarocks_query_application::{
         ManagementCancellationReceipt, USER_CANCELED,
     },
     session_error::{QueryServiceError, QueryServiceErrorKind},
+    session_outcome::cancellation_failure_input,
     session_value::StatementSessionError,
 };
 use novarocks_user_error::UserError;
@@ -56,6 +57,7 @@ pub(crate) enum TrinoErrorSource<'a> {
         reason: &'a QueryCancellationReason,
         message: &'a str,
     },
+    OriginalCancellation(QueryCancellationReason),
     ManagementCancellation(&'a ManagementCancellationReceipt),
     Unsupported {
         message: &'a str,
@@ -386,6 +388,17 @@ fn project_source(
             PublicMessage::Borrowed(message),
             None,
         ),
+        TrinoErrorSource::OriginalCancellation(reason) => {
+            let code = cancellation_code(&reason);
+            let input = cancellation_failure_input(reason);
+            return project_message(
+                query_id,
+                code,
+                PublicMessage::Execution(&input),
+                None,
+                effect,
+            );
+        }
         TrinoErrorSource::ManagementCancellation(receipt) => (
             Code::AdministrativelyKilled,
             PublicMessage::ManagementCancellation(receipt),

@@ -137,7 +137,7 @@ mod async_read;
 pub(crate) use async_explain::{
     ExplainPreparationPorts, PreparedAsyncExplain, PreparedAsyncProfile,
 };
-pub(crate) use async_read::{ReadCompilerInput, ReadObservation};
+pub(crate) use async_read::{ReadCompilerInput, ReadStatementInput};
 
 fn observe_plan_timing(
     control: novarocks_sql::compiler::SqlCompileControl,

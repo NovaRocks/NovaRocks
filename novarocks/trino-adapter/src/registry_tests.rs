@@ -1400,7 +1400,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
             drop(empty);
             fixture.assert_retained_original();
             let captured = fixture.captured();
-            let (expected_reason, expected_name, expected_code) = if shutdown {
+            let (expected_reason, expected_name, expected_code, expected_message) = if shutdown {
                 assert_eq!(
                     fixture.state.host.cancel_active_roots(
                         novarocks_workload_control::CancellationReason::ServerShutdown
@@ -1411,6 +1411,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
                     QueryCancellationReason::ServerShutdown,
                     "SERVER_SHUTTING_DOWN",
                     65545,
+                    "[query.execution.cancelled] Query execution was interrupted because the server is shutting down",
                 )
             } else {
                 // Exercise the original owner's admitted deadline and real
@@ -1421,6 +1422,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
                     QueryCancellationReason::DeadlineExceeded { timeout_ms: 60 },
                     "EXCEEDED_TIME_LIMIT",
                     131075,
+                    "[query.execution.deadline_exceeded] query timed out after 60 ms",
                 )
             };
             assert_eq!(
@@ -1457,6 +1459,7 @@ async fn original_deadline_or_shutdown_wins_before_late_delete_or_idle_abandon()
             let error = &json(&terminal)["error"];
             assert_eq!(error["errorName"], expected_name, "{command:?}");
             assert_eq!(error["errorCode"], expected_code, "{command:?}");
+            assert_eq!(error["message"], expected_message, "{command:?}");
             assert_eq!(captured.cancellation.reason(), Some(expected_reason));
             assert!(
                 !matches!(
