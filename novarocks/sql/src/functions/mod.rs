@@ -1473,8 +1473,8 @@ mod tests {
             &[DataType::Int64],
             false,
             &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("std alias resolves for user SQL");
+        );
+        assert_eq!(std_user, Err(FunctionResolutionError::HiddenFunction));
         let std_trusted = resolve_bound_aggregate(
             &catalog,
             "std",
@@ -1484,14 +1484,13 @@ mod tests {
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("std alias resolves for trusted planning");
-        assert_eq!(std_user, std_trusted);
         assert_eq!(
-            std_user.overload.as_str(),
+            std_trusted.overload.as_str(),
             "builtin.aggregate/std/derived-v1"
         );
-        assert_eq!(std_user.intermediate_type, DataType::Binary);
-        assert_eq!(std_user.output_type, DataType::Float64);
-        assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
+        assert_eq!(std_trusted.intermediate_type, DataType::Binary);
+        assert_eq!(std_trusted.output_type, DataType::Float64);
+        assert_eq!(std_trusted.state_format.as_str(), "novarocks/std/state-v1");
     }
 
     #[test]

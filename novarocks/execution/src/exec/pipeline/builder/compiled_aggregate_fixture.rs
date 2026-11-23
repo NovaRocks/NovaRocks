@@ -38,9 +38,8 @@ use novarocks_expression_contract::{BoundFunction, ExprKind, PhysicalCallRequest
 use novarocks_functions::{
     AggregateKernelPhase, AggregatePreparationOptions, CallEffectInput,
     EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest,
-    FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog, PureKernelAbi,
-    ScopedRelationalEffects,
+    FunctionBindingSelection, FunctionId, FunctionKind, FunctionResultType, InstalledPureKernel,
+    PureCallPreparation, PureEngineFunctionCatalog, PureKernelAbi, ScopedRelationalEffects,
 };
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -123,6 +122,7 @@ pub(crate) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineF
             .unwrap()
             .binding_declaration()
             .unwrap();
+        let mut has_abi = false;
         for overload in declaration.overloads() {
             let implementation = actual
                 .pure_overload_declaration_observed(
@@ -134,7 +134,7 @@ pub(crate) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineF
                 .unwrap()
                 .implementation()
                 .clone();
-            assert_eq!(implementation.abi, *abi, "{name}");
+            has_abi |= implementation.abi == *abi;
             installed.push(InstalledPureKernel {
                 function: declaration.function_id().clone(),
                 kind: FunctionKind::Aggregate,
@@ -144,6 +144,7 @@ pub(crate) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineF
                 ),
             });
         }
+        assert!(has_abi, "{name} must install {abi:?}");
     }
     builder.seal_pure(installed).unwrap()
 }

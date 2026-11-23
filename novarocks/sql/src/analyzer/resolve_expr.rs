@@ -1582,6 +1582,21 @@ impl<'a> super::AnalyzerContext<'a> {
         )
     }
 
+    fn coerce_window_operand(
+        &self,
+        source: TypedExpr,
+        target: &novarocks_type_contract::FunctionValueType,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        if source.value_type.data_type() == &DataType::Null
+            && matches!(&source.kind, ExprKind::Literal(LiteralValue::Null))
+        {
+            let target = super::helpers::with_nullability(target.clone(), true);
+            return self.cast_to_value_type(source, target, span);
+        }
+        self.coerce_common_value(source, target, span)
+    }
+
     fn analyze_binary_op(
         &self,
         binary: &ast::BinaryExpr,
@@ -2615,15 +2630,15 @@ impl<'a> super::AnalyzerContext<'a> {
                         &default.value_type,
                         func.span,
                     )?;
-                    *value = self.coerce_common_value(value.clone(), &common, func.span)?;
-                    *default = self.coerce_common_value(default.clone(), &common, func.span)?;
+                    *value = self.coerce_window_operand(value.clone(), &common, func.span)?;
+                    *default = self.coerce_window_operand(default.clone(), &common, func.span)?;
                 }
                 if let Some(offset) = args_typed.get_mut(1) {
                     let bigint = novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,
                         offset.value_type.nullable(),
                     );
-                    *offset = self.coerce_common_value(offset.clone(), &bigint, func.span)?;
+                    *offset = self.coerce_window_operand(offset.clone(), &bigint, func.span)?;
                 }
             }
             let (partition_by, order_by, window_frame) =
