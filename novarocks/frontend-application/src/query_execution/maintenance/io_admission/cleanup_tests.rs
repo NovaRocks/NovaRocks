@@ -152,6 +152,29 @@ pub(in crate::query_execution::maintenance) fn two_failures(
     (source, first, second)
 }
 #[test]
+fn metadata_stream_loan_requires_transferred_cleanup_custody() {
+    let cell = RequestCell::new(Arc::new(MetadataWake::new()));
+    cell.reserve_stream().unwrap();
+    assert!(cell.loan_cleanup().is_none());
+    cell.stream_closed();
+    assert!(cell.stream_clear());
+
+    cell.reserve_stream().unwrap();
+    let mut cleanup: Option<ConnectorIoCleanupFuture> = Some(Box::pin(std::future::ready(Ok(()))));
+    cell.install_stream_cleanup_in(&mut cleanup).unwrap();
+    assert!(cleanup.is_none());
+    let original = cell.loan_cleanup().expect("transferred cleanup is loaned");
+    assert!(cell.loan_cleanup().is_none(), "cleanup loan is exclusive");
+    drop(original);
+
+    assert!(cell.poll_original(&mut Context::from_waker(std::task::Waker::noop())));
+    let (result, cause) = cell.take_cleanup_completion().unwrap();
+    assert!(result.is_ok());
+    assert!(cause.is_none());
+    assert!(cell.stream_clear());
+}
+
+#[test]
 fn consecutive_exited_abort_errors_are_received_once_and_reuse_same_cell() {
     let (source, first, second) = two_failures(false);
     assert!(source.health_failure().is_none());
