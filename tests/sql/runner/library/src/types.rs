@@ -277,6 +277,12 @@ impl IcebergScanLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UpdateCountExpectation {
+    Counted(u64),
+    NoCount,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryMeta {
     pub order_sensitive: Option<bool>,
@@ -284,6 +290,7 @@ pub struct QueryMeta {
     pub db: Option<String>,
     pub expect_error: Option<String>,
     pub expect_trino_error: Option<TrinoErrorExpectation>,
+    pub expect_update_count: Option<UpdateCountExpectation>,
     pub expect_error_code: Option<String>,
     pub expect_sql_code: Option<String>,
     pub expect_sql_phase: Option<SqlErrorPhase>,
