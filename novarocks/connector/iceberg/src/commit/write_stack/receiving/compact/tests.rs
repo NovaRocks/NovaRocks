@@ -26,7 +26,8 @@ use crate::commit::write_stack::codec::{
 use crate::commit::write_stack::control::publication::written_file_with_historical_partition;
 use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergContentRange, IcebergCreationReceipt, IcebergDataFileArtifact,
-    IcebergDeletionVectorArtifact, IcebergPositionDeleteFileArtifact,
+    IcebergDeletionVectorArtifact, IcebergEqualityDeleteFileArtifact,
+    IcebergPositionDeleteFileArtifact,
 };
 use crate::commit::write_stack::runtime::build_write_adapter;
 use crate::commit::write_stack::test_support::staged_table_metadata;
@@ -310,6 +311,51 @@ fn compact_projection_reuses_null_and_value_partition_backing() {
 }
 
 #[test]
+fn compact_equality_delete_keeps_the_field_ids_and_counts_only_keys() {
+    let adapter = adapter(1);
+    let (window, author) = window();
+    let path = "s3://bucket/data/equality-delete.parquet";
+    let fragment = IcebergCommitFragment::equality_delete_file(
+        IcebergEqualityDeleteFileArtifact::try_new(
+            path.into(),
+            partition(),
+            metrics(7, 256),
+            vec![1, 4],
+        )
+        .unwrap(),
+    );
+    let mut original = Some(decode(&adapter, fragment, &author));
+    let entry = CompactEntry::from_arrival(&adapter, &mut original, 0, &author).unwrap();
+    let addition = entry.addition.as_ref().unwrap();
+    assert_eq!(addition.kind, AdditionKind::EqualityDelete);
+    assert_eq!(addition.data_sequence, SeqField::Inherit);
+    assert!(entry.delete_effect.is_none());
+    assert_eq!(
+        entry.counts,
+        AddedCounters {
+            equality_deletes: PhysicalAdditionCounts {
+                files: 1,
+                rows: 7,
+                bytes: 256
+            },
+            ..AddedCounters::default()
+        }
+    );
+    let (decoded, temporary) = CompactFragmentCodec::for_adapter(&adapter)
+        .decode(&addition.payload, &author)
+        .unwrap();
+    let IcebergCommitArtifact::EqualityDeleteFile(decoded) = decoded.artifact() else {
+        panic!("the compact addition must remain an equality delete");
+    };
+    assert_eq!(decoded.equality_field_ids(), &[1, 4]);
+    assert_eq!(decoded.partition(), &partition());
+    assert_eq!(decoded.metrics(), &metrics(7, 256));
+    drop(temporary);
+    drop(entry);
+    assert_eq!(window.lock().unwrap().live, 0);
+}
+
+#[test]
 fn compact_files_use_the_same_frozen_partition_and_statistics_author() {
     let adapter = adapter(1);
     let (window, author) = window();
@@ -422,7 +468,7 @@ fn final_delete_keeps_only_the_unshared_effect_and_the_admitted_addition() {
     let compact = CompactEntry::from_arrival(&adapter, &mut original, 0, &author).unwrap();
     let addition = compact.addition.as_ref().unwrap();
     assert_eq!(addition.writer, Some(placement()));
-    assert_eq!(addition.content, ManifestContentType::Deletes);
+    assert_eq!(addition.kind, AdditionKind::PositionDelete);
     let effect = compact.delete_effect.as_ref().unwrap();
     assert_eq!(effect.target.data_file_path(), target_path);
     assert_eq!(effect.newly_deleted_rows, 3);

@@ -505,6 +505,24 @@ async fn keyed_data_finish_observed<'a>(
     String,
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let (path, live) = receive_one_writer_row(fixture, plan).await;
+    (
+        ConnectorWriteFinishRequest {
+            commit: plan.commit_session(),
+            row_count: 1,
+            statistics: vec![],
+            publication: ConnectorWriteFinishPublication::KeyedDocuments(prepared.intent.clone()),
+            context: context(),
+        },
+        path,
+        live,
+    )
+}
+
+async fn receive_one_writer_row(
+    fixture: &Fixture,
+    plan: &novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     use crate::commit::write_stack::execution::IcebergWriteStackExecution;
     use crate::commit::write_stack::test_support::{received_write_proof, write_query_identity};
     use novarocks_spi::connector::write_stack::{
@@ -512,7 +530,7 @@ async fn keyed_data_finish_observed<'a>(
     };
 
     let [target] = plan.targets() else {
-        panic!("keyed data publication must seal one writer target");
+        panic!("the test write must seal one writer target");
     };
     let schema = Arc::new(arrow::datatypes::Schema::new(
         target
@@ -574,7 +592,7 @@ async fn keyed_data_finish_observed<'a>(
     let (fragments, author, live) =
         crate::commit::write_stack::test_support::paid_fragments_counted(&adapter, fragments);
     let [fragment] = fragments.as_slice() else {
-        panic!("one keyed data row must produce one commit fragment");
+        panic!("one writer row must produce one commit fragment");
     };
     let path = adapter
         .commit_fragment(fragment)
@@ -596,17 +614,116 @@ async fn keyed_data_finish_observed<'a>(
     control
         .confirm_write_received(plan.commit_session(), &query)
         .unwrap();
-    (
-        ConnectorWriteFinishRequest {
+    (path, live)
+}
+
+#[tokio::test]
+async fn compact_row_delta_publishes_equality_files_with_inherited_sequence() {
+    use crate::iceberg::spec::{DataContentType, ManifestContentType, Operation};
+    use crate::write_codec::{IcebergWrittenOutputFacts, decode_write_receipt_output_facts};
+
+    let fixture = fixture().await;
+    seed_empty_snapshot(&fixture).await;
+    let before = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let control = write_control(&fixture);
+    let plan = control
+        .begin_write(ConnectorWriteBeginRequest {
+            catalog_session: Default::default(),
+            table: Arc::from("db.t"),
+            target_ref: ConnectorWriteTargetRef::main(),
+            intent: ConnectorWriteIntent::RowDelta,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: novarocks_spi::connector::ConnectorWriteInputRequest::EqualityDelete {
+                equality_fields: vec![
+                    ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("id", DataType::Int64, false),
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    )
+                    .unwrap(),
+                ],
+            },
+            base: None,
+            flavor: ConnectorWriteSessionFlavor::Ordinary,
+            context: context(),
+        })
+        .unwrap();
+    let (path, live) = receive_one_writer_row(&fixture, &plan).await;
+    assert!(live.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    let outcome = control
+        .finish_write(ConnectorWriteFinishRequest {
             commit: plan.commit_session(),
             row_count: 1,
             statistics: vec![],
-            publication: ConnectorWriteFinishPublication::KeyedDocuments(prepared.intent.clone()),
+            publication: ConnectorWriteFinishPublication::None,
             context: context(),
-        },
-        path,
-        live,
-    )
+        })
+        .unwrap();
+    let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+        panic!("the equality RowDelta must commit: {outcome:?}");
+    };
+    assert_eq!(
+        decode_write_receipt_output_facts(&receipt).unwrap(),
+        Some(IcebergWrittenOutputFacts {
+            equality_delete_files: 1,
+            ..IcebergWrittenOutputFacts::default()
+        })
+    );
+    assert_eq!(live.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let after = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let snapshot = after.metadata().current_snapshot().unwrap();
+    assert_eq!(
+        snapshot.parent_snapshot_id(),
+        before.metadata().current_snapshot_id()
+    );
+    assert_eq!(snapshot.summary().operation, Operation::Delete);
+    for key in [
+        "added-equality-delete-files",
+        "added-equality-deletes",
+        "total-equality-deletes",
+    ] {
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get(key)
+                .map(String::as_str),
+            Some("1"),
+            "{key}"
+        );
+    }
+    let list = crate::manifest::load_manifest_list(snapshot, after.file_io(), after.metadata())
+        .await
+        .unwrap();
+    let [descriptor] = list.entries() else {
+        panic!("one equality delete file must produce one manifest");
+    };
+    assert_eq!(descriptor.content, ManifestContentType::Deletes);
+    assert_eq!(descriptor.sequence_number, snapshot.sequence_number());
+    let manifest = crate::manifest::load_manifest(descriptor, after.file_io())
+        .await
+        .unwrap();
+    let [entry] = manifest.entries() else {
+        panic!("the compact manifest must contain the original writer file");
+    };
+    let file = entry.data_file();
+    assert_eq!(file.content_type(), DataContentType::EqualityDeletes);
+    assert_eq!(file.equality_ids(), Some(vec![1]));
+    assert_eq!(file.file_path(), path);
+    assert_eq!(file.record_count(), 1);
+    assert_exact_target_mutation(
+        &fixture,
+        before.metadata().current_snapshot_id(),
+        &["AddSnapshot", "SetSnapshotRef"],
+        snapshot.snapshot_id(),
+    );
 }
 
 #[tokio::test]

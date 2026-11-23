@@ -1518,10 +1518,10 @@ impl IcebergEqualityDeleteRecipe {
 /// number covers. That is also why it supersedes nothing and merges nothing.
 #[derive(Clone, Debug)]
 pub struct IcebergEqualityDeleteFileArtifact {
-    path: String,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    equality_field_ids: Vec<i32>,
+    pub(super) path: String,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) equality_field_ids: Vec<i32>,
 }
 
 impl IcebergEqualityDeleteFileArtifact {
@@ -2570,7 +2570,9 @@ impl IcebergWriteCommitSession {
         }
         let compact_receiving = matches!(
             flavor,
-            IcebergWriteFlavor::Append | IcebergWriteFlavor::StagedCreate
+            IcebergWriteFlavor::Append
+                | IcebergWriteFlavor::StagedCreate
+                | IcebergWriteFlavor::EqualityDelete
         ) || flavor.is_distributed_rewrite()
             || document_publication.is_some();
         let rewrite_groups = flavor.is_distributed_rewrite().then_some(targets.len());

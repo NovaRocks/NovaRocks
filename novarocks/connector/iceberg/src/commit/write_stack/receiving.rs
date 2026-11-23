@@ -45,7 +45,7 @@ use super::domain::{
     IcebergWriteCommitSession, IcebergWriteFlavor, invalid,
 };
 use super::runtime::IcebergWriteAdapter;
-use compact::{AddedCounters, CompactEntry};
+use compact::{AddedCounters, AdditionKind, CompactEntry};
 use validation::{FragmentAdmission, StatementIndexes};
 
 pub(crate) mod compact;
@@ -95,19 +95,19 @@ pub(crate) struct ReceivedCompactFiles {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum AdditionGroup {
-    Additions { spec: i32, deletes: bool },
+    Additions { spec: i32, kind: AdditionKind },
     Removals,
 }
 
 impl ReceivedCompactFiles {
     pub(crate) fn has_delete_effects(&self) -> bool {
+        self.has_position_effects() || self.counts.equality_deletes.files != 0
+    }
+
+    pub(crate) fn has_position_effects(&self) -> bool {
         !self.v2_targets.is_empty()
-            || self.groups.keys().any(|group| {
-                matches!(
-                    group,
-                    AdditionGroup::Removals | AdditionGroup::Additions { deletes: true, .. }
-                )
-            })
+            || self.counts.position_deletes.files != 0
+            || self.groups.contains_key(&AdditionGroup::Removals)
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = &CompactEntry> {
@@ -119,14 +119,13 @@ impl ReceivedCompactFiles {
     }
 
     pub(crate) fn push(&mut self, entry: CompactEntry) {
-        use crate::iceberg::spec::ManifestContentType;
         let group = entry
             .addition
             .as_ref()
             .map_or(AdditionGroup::Removals, |addition| {
                 AdditionGroup::Additions {
                     spec: addition.partition_spec_id,
-                    deletes: addition.content == ManifestContentType::Deletes,
+                    kind: addition.kind,
                 }
             });
         self.groups.entry(group).or_default().push_back(entry);

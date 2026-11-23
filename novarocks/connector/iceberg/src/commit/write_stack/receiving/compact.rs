@@ -72,12 +72,28 @@ pub(crate) struct CompactAddition {
     )]
     pub(crate) writer: Option<ConnectorWriterPhysicalContext>,
     pub(crate) partition_spec_id: i32,
-    pub(crate) content: ManifestContentType,
+    pub(crate) kind: AdditionKind,
     pub(crate) encoded_lower_bound: usize,
     pub(crate) data_sequence: SeqField,
     /// A rewrite marker is the smallest explicitly stored source row ID.
     pub(crate) first_row_id: Option<i64>,
     pub(crate) payload: Box<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum AdditionKind {
+    Data,
+    PositionDelete,
+    EqualityDelete,
+}
+
+impl AdditionKind {
+    pub(crate) const fn manifest_content(self) -> ManifestContentType {
+        match self {
+            Self::Data => ManifestContentType::Data,
+            Self::PositionDelete | Self::EqualityDelete => ManifestContentType::Deletes,
+        }
+    }
 }
 
 pub(crate) struct CompactDeleteEffect {
@@ -146,6 +162,7 @@ impl PhysicalAdditionCounts {
 pub(crate) struct AddedCounters {
     pub(crate) data: PhysicalAdditionCounts,
     pub(crate) position_deletes: PhysicalAdditionCounts,
+    pub(crate) equality_deletes: PhysicalAdditionCounts,
     /// Only an original final effect reports newly deleted visible rows.
     pub(crate) newly_deleted_rows: u64,
 }
@@ -155,6 +172,7 @@ impl AddedCounters {
         Ok(Self {
             data: self.data.checked_add(rhs.data)?,
             position_deletes: self.position_deletes.checked_add(rhs.position_deletes)?,
+            equality_deletes: self.equality_deletes.checked_add(rhs.equality_deletes)?,
             newly_deleted_rows: checked_counter(self.newly_deleted_rows, rhs.newly_deleted_rows)?,
         })
     }
@@ -323,7 +341,7 @@ impl PreparedCompactEntry {
                 object_path: addition.object_path,
                 writer: addition.writer,
                 partition_spec_id: addition.partition_spec_id,
-                content: addition.content,
+                kind: addition.kind,
                 encoded_lower_bound: addition.encoded_lower_bound,
                 data_sequence: self.data_sequence,
                 first_row_id: self.first_row_id,
@@ -381,7 +399,7 @@ struct AdditionMetadata {
     object_path: std::sync::Arc<str>,
     writer: Option<ConnectorWriterPhysicalContext>,
     partition_spec_id: i32,
-    content: ManifestContentType,
+    kind: AdditionKind,
     encoded_lower_bound: usize,
 }
 
@@ -399,7 +417,13 @@ fn addition_metadata(
     fragment: &IcebergCommitFragment,
     path: &str,
 ) -> Result<AdditionMetadata, ConnectorError> {
-    let is_data = matches!(fragment.artifact(), IcebergCommitArtifact::DataFile(_));
+    let kind = match fragment.artifact() {
+        IcebergCommitArtifact::DataFile(_) => AdditionKind::Data,
+        IcebergCommitArtifact::EqualityDeleteFile(_) => AdditionKind::EqualityDelete,
+        IcebergCommitArtifact::PositionDeleteFile(_)
+        | IcebergCommitArtifact::DeletionVector(_)
+        | IcebergCommitArtifact::FinalDelete(_) => AdditionKind::PositionDelete,
+    };
     let is_vector = matches!(
         fragment.artifact(),
         IcebergCommitArtifact::DeletionVector(_)
@@ -422,11 +446,7 @@ fn addition_metadata(
         object_path: path.into(),
         writer: fragment.creation().map(|receipt| *receipt.physical()),
         partition_spec_id,
-        content: if is_data {
-            ManifestContentType::Data
-        } else {
-            ManifestContentType::Deletes
-        },
+        kind,
         encoded_lower_bound,
     })
 }
@@ -547,6 +567,14 @@ fn addition_counts(fragment: &IcebergCommitFragment) -> Result<AddedCounters, Co
             };
             return Ok(counts);
         }
+        IcebergCommitArtifact::EqualityDeleteFile(file) => {
+            counts.equality_deletes = PhysicalAdditionCounts {
+                files: 1,
+                rows: file.metrics().record_count(),
+                bytes: file.metrics().file_size_in_bytes(),
+            };
+            return Ok(counts);
+        }
         IcebergCommitArtifact::DeletionVector(vector) => vector,
         IcebergCommitArtifact::FinalDelete(effect) => {
             counts.newly_deleted_rows = effect.newly_deleted_rows();
@@ -554,11 +582,6 @@ fn addition_counts(fragment: &IcebergCommitFragment) -> Result<AddedCounters, Co
                 IcebergFinalDeleteKind::ReplacePositions(vector) => vector,
                 IcebergFinalDeleteKind::RemoveDataFile { .. } => return Ok(counts),
             }
-        }
-        _ => {
-            return Err(invalid(
-                "Iceberg compact arrival does not support this writer artifact",
-            ));
         }
     };
     counts.position_deletes = PhysicalAdditionCounts {

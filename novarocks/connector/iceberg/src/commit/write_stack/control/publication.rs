@@ -308,6 +308,7 @@ struct WriteRecipe<'a> {
     compact_stage: Option<usize>,
     materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
     fixed_mutation: bool,
+    equality_delete: bool,
     session_protocol: WriteSessionCommitProtocol,
     writer: WriterSchemaSpec,
     rewrite_removals: Option<Arc<[crate::commit::model::FrozenEntry]>>,
@@ -483,6 +484,8 @@ impl<'a> WriteRecipe<'a> {
             compact_stage: None,
             materialized,
             fixed_mutation,
+            equality_delete: handle.flavor()
+                == crate::commit::write_stack::domain::IcebergWriteFlavor::EqualityDelete,
             session_protocol: handle.commit_protocol(),
             writer,
             rewrite_removals: handle.frozen_rewrite_removals().cloned(),
@@ -623,7 +626,15 @@ impl<'a> WriteRecipe<'a> {
                 },
             ));
         }
-        if self.compact_stage.is_some() {
+        if let Some(stage) = self.compact_stage {
+            if self.equality_delete {
+                return Ok(Box::new(
+                    crate::commit::row_delta::CompactEqualityDeletePreparer {
+                        operation: operation.clone(),
+                        stage,
+                    },
+                ));
+            }
             return Ok(Box::new(
                 crate::commit::fast_append::CompactFastAppendPreparer(operation.clone()),
             ));
@@ -931,7 +942,13 @@ impl IcebergWriteSessionControl {
             recipe.compact_stage = Some(stage);
             recipe.output_facts.data_files = files.counts.data.files;
             recipe.output_facts.data_rows = files.counts.data.rows;
-            if files.has_delete_effects() {
+            recipe.output_facts.equality_delete_files = files.counts.equality_deletes.files;
+            if files.counts.equality_deletes.files != 0 && !recipe.equality_delete {
+                return Err(corrupt(
+                    "Iceberg equality delete output has no equality delete session",
+                ));
+            }
+            if files.has_position_effects() {
                 if !recipe.fixed_mutation {
                     return Err(internal(
                         "Iceberg compact delete lost its fixed write endpoint",

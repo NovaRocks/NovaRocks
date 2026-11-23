@@ -1693,7 +1693,7 @@ fn projected_addition_len(mut wire: dto::IcebergCommitFragment) -> Option<usize>
     use dto::iceberg_commit_fragment::Artifact;
     use dto::iceberg_final_delete_effect::Effect;
     let artifact = match wire.artifact.take()? {
-        artifact @ Artifact::DataFile(_) => artifact,
+        artifact @ (Artifact::DataFile(_) | Artifact::EqualityDeleteFile(_)) => artifact,
         Artifact::PositionDeleteFile(file) if file.merged_old_references.is_empty() => {
             Artifact::PositionDeleteFile(file)
         }
@@ -1743,6 +1743,14 @@ pub(super) fn encode_compact_addition(
                 merged_old_references: Vec::new(),
             })
         }
+        IcebergCommitArtifact::EqualityDeleteFile(file) => {
+            Artifact::EqualityDeleteFile(dto::IcebergEqualityDeleteFileArtifact {
+                path: file.path,
+                partition: Some(move_partition(file.partition)),
+                metrics: Some(move_metrics(file.metrics)),
+                equality_field_ids: file.equality_field_ids,
+            })
+        }
         IcebergCommitArtifact::DeletionVector(file) => {
             Artifact::DeletionVector(dto::IcebergDeletionVectorArtifact {
                 path: file.path,
@@ -1759,7 +1767,7 @@ pub(super) fn encode_compact_addition(
         }
         _ => {
             return Err(compact_encoding_error(
-                "compact entry is not a data or position artifact",
+                "compact entry has no manifest addition",
             ));
         }
     };
