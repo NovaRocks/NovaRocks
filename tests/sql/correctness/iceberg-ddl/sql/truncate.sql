@@ -241,7 +241,7 @@ TRUNCATE TABLE ${case_db}.t_reject WHERE id = 1;
 
 -- query 39
 -- The v2 table retains its TRUNCATE snapshot after the subsequent INSERT.
-SELECT 'v2' AS table_case,
+SELECT CAST('v2' AS VARCHAR) AS table_case,
        summary[CAST('total-records' AS VARCHAR)] AS total_records,
        summary[CAST('total-files-size' AS VARCHAR)] AS total_files_size,
        summary[CAST('total-data-files' AS VARCHAR)] AS total_data_files,
@@ -253,10 +253,10 @@ WHERE operation = 'delete';
 
 -- query 40
 -- Empty TRUNCATE has no physical removals and therefore no removal counters.
-SELECT element_at(summary, 'deleted-data-files') IS NULL AS no_deleted_files,
-       element_at(summary, 'deleted-records') IS NULL AS no_deleted_rows,
-       element_at(summary, 'removed-files-size') IS NULL AS no_removed_bytes,
-       element_at(summary, 'removed-delete-files') IS NULL AS no_removed_deletes
+SELECT element_at(summary, CAST('deleted-data-files' AS VARCHAR)) IS NULL AS no_deleted_files,
+       element_at(summary, CAST('deleted-records' AS VARCHAR)) IS NULL AS no_deleted_rows,
+       element_at(summary, CAST('removed-files-size' AS VARCHAR)) IS NULL AS no_removed_bytes,
+       element_at(summary, CAST('removed-delete-files' AS VARCHAR)) IS NULL AS no_removed_deletes
 FROM ${case_db}."t_empty$snapshots"
 WHERE operation = 'delete';
 
@@ -269,7 +269,7 @@ WHERE r.name = 'main' AND s.operation = 'delete';
 
 -- query 42
 -- The v3 table retains its TRUNCATE snapshot after the subsequent INSERT.
-SELECT 'v3' AS table_case,
+SELECT CAST('v3' AS VARCHAR) AS table_case,
        summary[CAST('total-records' AS VARCHAR)] AS total_records,
        summary[CAST('total-files-size' AS VARCHAR)] AS total_files_size,
        summary[CAST('total-data-files' AS VARCHAR)] AS total_data_files,
@@ -281,7 +281,7 @@ WHERE operation = 'delete';
 
 -- query 43
 -- TRUNCATE records zero totals even when the original table has no rows.
-SELECT 'empty_v3' AS table_case,
+SELECT CAST('empty_v3' AS VARCHAR) AS table_case,
        summary[CAST('total-records' AS VARCHAR)] AS total_records,
        summary[CAST('total-files-size' AS VARCHAR)] AS total_files_size,
        summary[CAST('total-data-files' AS VARCHAR)] AS total_data_files,
@@ -293,7 +293,7 @@ WHERE operation = 'delete';
 
 -- query 44
 -- The main ref selects the TRUNCATE snapshot after the earlier row DELETE.
-SELECT 'after_dv' AS table_case,
+SELECT CAST('after_dv' AS VARCHAR) AS table_case,
        s.summary[CAST('total-records' AS VARCHAR)] AS total_records,
        s.summary[CAST('total-files-size' AS VARCHAR)] AS total_files_size,
        s.summary[CAST('total-data-files' AS VARCHAR)] AS total_data_files,
