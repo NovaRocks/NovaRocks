@@ -88,15 +88,27 @@ WHERE type_name IN ('array', 'bigint', 'char', 'decimal', 'real')
 ORDER BY type_name;
 
 -- query 11
-SELECT (SELECT count(*) FROM system.jdbc.attributes)
-     + (SELECT count(*) FROM system.jdbc.procedure_columns)
-     + (SELECT count(*) FROM system.jdbc.procedures)
-     + (SELECT count(*) FROM system.jdbc.pseudo_columns)
-     + (SELECT count(*) FROM system.jdbc.super_tables)
-     + (SELECT count(*) FROM system.jdbc.super_types)
-     + (SELECT count(*) FROM system.jdbc.udts) AS empty_rows;
+SELECT count(*) AS attributes_rows FROM system.jdbc.attributes;
 
 -- query 12
+SELECT count(*) AS procedure_columns_rows FROM system.jdbc.procedure_columns;
+
+-- query 13
+SELECT count(*) AS procedures_rows FROM system.jdbc.procedures;
+
+-- query 14
+SELECT count(*) AS pseudo_columns_rows FROM system.jdbc.pseudo_columns;
+
+-- query 15
+SELECT count(*) AS super_tables_rows FROM system.jdbc.super_tables;
+
+-- query 16
+SELECT count(*) AS super_types_rows FROM system.jdbc.super_types;
+
+-- query 17
+SELECT count(*) AS udts_rows FROM system.jdbc.udts;
+
+-- query 18
 -- @cleanup=true
 -- @skip_result_check=true
 DROP VIEW IF EXISTS trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_view;

@@ -61,5 +61,35 @@ real	7	24
 
 -- query 11
 -- types	bigint
-empty_rows
+attributes_rows
+0
+
+-- query 12
+-- types	bigint
+procedure_columns_rows
+0
+
+-- query 13
+-- types	bigint
+procedures_rows
+0
+
+-- query 14
+-- types	bigint
+pseudo_columns_rows
+0
+
+-- query 15
+-- types	bigint
+super_tables_rows
+0
+
+-- query 16
+-- types	bigint
+super_types_rows
+0
+
+-- query 17
+-- types	bigint
+udts_rows
 0

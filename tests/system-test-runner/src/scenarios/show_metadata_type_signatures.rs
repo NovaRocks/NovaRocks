@@ -86,9 +86,15 @@ fn probe_show_signatures(actor: &TrinoClient, create: &str) -> Result<()> {
     )?;
     ensure!(rows.is_empty() && columns.len() == 6);
     for (ordinal, column) in columns.iter().enumerate() {
-        let signature = &column["typeSignature"];
-        ensure!(signature["rawType"] == if ordinal == 4 { "boolean" } else { "varchar" });
-        ensure!(signature["arguments"].as_array().is_some_and(Vec::is_empty));
+        let expected = if ordinal == 4 {
+            serde_json::json!({"rawType": "boolean", "arguments": []})
+        } else {
+            serde_json::json!({
+                "rawType": "varchar",
+                "arguments": [{"kind": "LONG", "value": i32::MAX}],
+            })
+        };
+        ensure!(column["typeSignature"] == expected, "{column}");
     }
 
     let (columns, rows) = query(actor, "SHOW TABLES FROM system.information_schema")?;
