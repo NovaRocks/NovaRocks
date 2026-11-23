@@ -34,6 +34,11 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+mod prepared_description;
+pub(crate) use prepared_description::DescriptionAnalysis;
+pub use prepared_description::{SqlDescribedColumn, SqlPreparedDescription};
+mod prepared_parameters;
+pub use prepared_parameters::{PreparedContextNeed, PreparedParameterError, SqlPreparedParameters};
 mod required_constant;
 pub use required_constant::{
     PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
@@ -750,6 +755,7 @@ impl std::error::Error for SqlConstantEvaluationError {
 #[derive(Clone, Debug)]
 pub struct SqlStatementInput {
     kind: SqlStatementInputKind,
+    prepared_parameters: Option<Arc<SqlPreparedParameters>>,
 }
 
 #[derive(Clone, Debug)]
@@ -779,6 +785,7 @@ impl SqlStatementInput {
     pub fn parsed_query(query: Box<novarocks_parser::ast::Query>) -> Self {
         Self {
             kind: SqlStatementInputKind::ParsedQuery(query),
+            prepared_parameters: None,
         }
     }
 
@@ -787,7 +794,13 @@ impl SqlStatementInput {
     pub fn query_with_admitted_session(query: Box<novarocks_parser::ast::Query>) -> Self {
         Self {
             kind: SqlStatementInputKind::AdmittedSessionQuery(query),
+            prepared_parameters: None,
         }
+    }
+
+    pub fn with_prepared_parameters(mut self, parameters: Arc<SqlPreparedParameters>) -> Self {
+        self.prepared_parameters = Some(parameters);
+        self
     }
 
     fn root_session_admitted(&self) -> bool {
@@ -826,6 +839,7 @@ impl SqlStatementInput {
         )?;
         Ok(Self {
             kind: SqlStatementInputKind::MaterializedValuesQuery { query, source },
+            prepared_parameters: None,
         })
     }
 
@@ -840,6 +854,7 @@ impl SqlStatementInput {
                 factory,
                 root_semantics,
             },
+            prepared_parameters: None,
         }
     }
 }
@@ -1764,6 +1779,7 @@ impl SqlCompiler {
                         },
                         request.write_assignments.as_deref(),
                         request.statement.root_session_admitted(),
+                        request.statement.prepared_parameters.as_deref(),
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
@@ -2068,7 +2084,13 @@ fn parse_query(
     match &statement.kind {
         SqlStatementInputKind::ParsedQuery(query)
         | SqlStatementInputKind::AdmittedSessionQuery(query)
-        | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => Ok((**query).clone()),
+        | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => {
+            if let Some(parameters) = &statement.prepared_parameters {
+                parameters.complete_query((**query).clone())
+            } else {
+                Ok((**query).clone())
+            }
+        }
         SqlStatementInputKind::LogicalPlan { .. } => Err(SqlCompileError::InvalidRequest(
             "logical SQL compiler input must bypass parsing".to_string(),
         )),
@@ -3723,7 +3745,8 @@ mod system_table_completion;
 pub use completion::*;
 pub use root_render_type::{
     ClientRenderSchemaError, RenderFamilyRequest, client_render_schema,
-    client_render_schema_from_port, validate_public_result_logical_identities,
+    client_render_schema_from_port, render_field_for_declaration,
+    validate_public_result_logical_identities,
 };
 pub(crate) mod mv_rewrite;
 

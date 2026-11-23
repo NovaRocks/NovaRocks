@@ -417,6 +417,28 @@ fn validate_trino_type(
     }
     Ok(())
 }
+/// Project one complete declaration for a caller that has its own result budget.
+pub fn render_field_for_declaration(
+    declaration: &novarocks_type_contract::FunctionValueType,
+) -> Result<RenderField, String> {
+    let value = declaration.value_type();
+    let layout = declaration.data_type();
+    let mut bounds = Bounds {
+        backing: 0,
+        wire: 0,
+        nodes: 0,
+    };
+    preflight(value, layout, true, 1, &mut bounds)?;
+    let render = build(value, layout)?;
+    if !novarocks_type_contract::result_render_type::render_field_matches_declaration(
+        &render,
+        declaration,
+    ) {
+        return Err(invalid());
+    }
+    Ok(render)
+}
+
 fn build(value: &ValueTypeRef, layout: &D) -> Result<RenderField, String> {
     let native_type = match kind(value, layout)? {
         Kind::Leaf(value) => value,

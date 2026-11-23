@@ -123,6 +123,153 @@ impl WriteStatementFamily for InsertFamily {
     }
 }
 
+/// Validate the ordinary connector write declaration without beginning a write session.
+pub(crate) async fn describe(
+    kernel: &crate::query_execution::kernels::DmlExecutionKernel,
+    input: crate::query_execution::dml::insert::InsertDescriptionInput,
+) -> Result<
+    crate::query_execution::dml::insert::PreparedInsertDescription,
+    novarocks_query_application::session_error::QueryServiceError,
+> {
+    use crate::query_execution::dml::insert::{InsertOverwriteMode, PreparedInsertDescription};
+    use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
+    use novarocks_spi::connector::{
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorWriteInputRequest, ConnectorWriteIntent,
+    };
+    use novarocks_sql::analyze_error::AnalyzeError;
+    use novarocks_sql::compiler::{SqlWriteAssignmentSite, SqlWriteAssignments};
+
+    let session = input.request.session();
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
+        kernel,
+        &novarocks_sql::semantic::ObjectName {
+            parts: input.command.target.parts,
+        },
+        session.current_catalog(),
+        session.current_database(),
+    )
+    .map_err(crate::catalog_application::resolver::TargetResolutionError::into_service)?;
+    let internal = |message| QueryServiceError::new(QueryServiceErrorKind::Internal, message);
+    let pin = crate::connector::acquire_metadata_planning_pin(
+        kernel.connector_control().as_ref(),
+        &target.catalog,
+    )
+    .map_err(|cause| internal(cause.to_string()))?;
+    let context =
+        crate::connector::context_for_planning_pin(&pin, input.connector).map_err(internal)?;
+    let table = crate::connector::schema_creation::load_frontend_table_async(
+        pin.binding().metadata().as_ref(),
+        ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: pin.binding().descriptor().instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        },
+    )
+    .await
+    .map_err(|cause| {
+        let missing = cause.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound;
+        let original = novarocks_failure_contract::SharedFailureCause::new(cause);
+        if missing {
+            QueryServiceError::from_user_error_with_cause(
+                AnalyzeError::unknown_table(
+                    format!(
+                        "Table '{}.{}.{}' does not exist",
+                        target.catalog, target.namespace, target.table
+                    ),
+                    input.target_span,
+                )
+                .to_user_error(Some(&input.source)),
+                original,
+            )
+        } else {
+            QueryServiceError::from_failure_cause(original)
+        }
+    })?;
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
+        kernel.mv_storage_observation().as_ref(), &pin, kernel.mv_readiness().as_ref(), &target,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert, context.clone(),
+    )
+    .await
+    .map_err(|cause| internal(cause.to_string()))?;
+    let resolved = crate::connector::backend::ResolvedTable {
+        columns: crate::query_execution::dml::insert::insert_columns_from_connector_metadata(
+            &table,
+        )
+        .map_err(internal)?,
+    };
+    if let Some(name) = input.command.columns.iter().find(|name| {
+        !resolved
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(name))
+    }) {
+        return Err(QueryServiceError::from_user_error(
+            AnalyzeError::unknown_column(
+                format!("INSERT target has no column '{name}'"),
+                input.command.source.span,
+            )
+            .to_user_error(Some(&input.source)),
+        ));
+    }
+    let write_target = crate::connector::write_target::ConnectorWriteTargetBinding::new(table, pin);
+    let write_lease = write_target.derive_write_lease().map_err(internal)?;
+    let target_ref = match &input.reference {
+        crate::dml::insert::InsertTargetRef::Main => "main",
+        crate::dml::insert::InsertTargetRef::Branch(name) => name,
+    };
+    let intent = match input.command.overwrite_mode {
+        InsertOverwriteMode::Append => ConnectorWriteIntent::Append,
+        InsertOverwriteMode::FullTable => ConnectorWriteIntent::Overwrite,
+        InsertOverwriteMode::DynamicPartitions => ConnectorWriteIntent::PartitionOverwrite,
+    };
+    let (query, constants, fields) = iceberg_writer::build_iceberg_write_plan(
+        &write_lease,
+        target_ref,
+        intent,
+        &context,
+        &resolved,
+        &input.command.columns,
+        &input.command.source,
+        write_target.metadata(),
+        kernel.constant_policy(),
+        &input.control,
+    )
+    .map_err(internal)?;
+    let ConnectorWriteInputRequest::Data { fields } = fields else {
+        return Err(internal(
+            "INSERT description expected its ordinary data field declaration".to_owned(),
+        ));
+    };
+    let sites = fields
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let binding = field.execution_type().ok_or_else(|| {
+                internal("INSERT description has no exact target declaration".to_owned())
+            })?;
+            SqlWriteAssignmentSite::try_new(
+                ordinal,
+                binding.clone(),
+                field.storage_type().cloned(),
+                &input.control,
+            )
+            .map_err(|cause| internal(cause.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let assignments = SqlWriteAssignments::try_new(sites.into_boxed_slice(), &input.control)
+        .map_err(|cause| internal(cause.to_string()))?;
+    Ok(PreparedInsertDescription {
+        query,
+        assignments,
+        constants,
+    })
+}
+
 struct PreparationInput {
     kernel: crate::query_execution::kernels::DmlExecutionKernel,
     command: crate::dml::insert::command::InsertCommand,

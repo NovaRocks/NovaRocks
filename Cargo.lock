@@ -4443,12 +4443,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "hyper",
  "hyper-util",
  "novarocks-execution-contract",
  "novarocks-failure-contract",
+ "novarocks-memory",
  "novarocks-parser",
  "novarocks-query-application",
  "novarocks-result-contract",
@@ -4465,6 +4467,7 @@ dependencies = [
  "tokio",
  "tower 0.5.2",
  "tracing",
+ "zstd-safe 8.2.0",
 ]
 
 [[package]]

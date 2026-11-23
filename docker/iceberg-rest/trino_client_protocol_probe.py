@@ -435,58 +435,7 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
         sql = f"SELECT {column} FROM {catalog}.{self.namespace}.{table} ORDER BY id"
         return self.query(endpoint, sql, label, capabilities)
 
-    def cleanup(self):
-        errors = []
-        if self.namespace_intent:
-            try:
-                self.spark("\n".join(f"DROP TABLE IF EXISTS ice_rest.{self.namespace}.{table} PURGE;" for table in
-                    ("encoding_values", "time_values", "variant_values", "cli_pages", "cli_ddl")) +
-                    f"\nDROP NAMESPACE IF EXISTS ice_rest.{self.namespace};\n", "cleanup-independent-catalog", cleanup=True)
-                # Only after catalog removal: reclaim this exact original namespace's
-                # uncommitted objects as well as its formerly reachable files.
-                scope = self.scope.replace('"', '\\"') + "/"
-                self.shell('''try {
-  import org.apache.iceberg.aws.s3.S3FileIO
-  import scala.collection.JavaConverters._
-  val io = new S3FileIO()
-  val prefix = "spark.sql.catalog.ice_rest."
-  val properties = spark.conf.getAll.filter { case (key, _) => key.startsWith(prefix) }.map { case (key, value) => (key.substring(prefix.length), value) }.asJava
-  io.initialize(properties)
-  val owned = "''' + scope + '''"
-  try { io.deletePrefix(owned); require(!io.listPrefix(owned).iterator().hasNext(), "owned independent producer objects remain") } finally { io.close() }
-  println("TRC1_OWNED_PREFIX_CLEANUP_OK")
-  System.exit(0)
-} catch { case error: Throwable => error.printStackTrace(); System.exit(1) }
-''', "cleanup-owned-prefix", cleanup=True)
-            except BaseException as error:
-                errors.append(str(error))
-        if self.catalog_owned:
-            try:
-                result = self.query("nova", "DROP CATALOG ice_rest", "cleanup-nova-catalog")
-                if "error" in result:
-                    errors.append("NovaRocks catalog cleanup returned " + result["error"]["errorName"])
-            except BaseException as error:
-                errors.append(str(error))
-        backend = runtime.Docker(timeout=min(90, self.timeout(cleanup=True)))
-        backend.operation_deadline = self.budget.deadline
-        for record in reversed(self.containers):
-            identity = record.get("id")
-            if identity is None:
-                # Unknown start outcome cannot justify deleting a mutable name.
-                errors.append("container creation outcome is unknown: " + record["name"])
-                continue
-            try:
-                info = backend.inspect("container", identity, absent_ok=True)
-                if info:
-                    if info.get("Id") != identity:
-                        raise ProbeFailure("container cleanup lost its exact full ID")
-                    backend.command(["container", "rm", "--force", identity])
-                    if backend.inspect("container", identity, absent_ok=True):
-                        raise ProbeFailure("owned container remains after cleanup")
-                record["state"] = "released"
-            except BaseException as error:
-                record["state"] = "cleanup_failed"
-                errors.append(str(error))
+    def cleanup_client_owners(self, backend, errors):
         for owner_path in self.root.glob("*-container/owner.json"):
             owner = json.loads(owner_path.read_text())
             if owner.get("state") == "released" and owner.get("child_waited"):
@@ -518,6 +467,70 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
                 write_json(owner_path, owner)
             except BaseException as error:
                 errors.append("client owner cleanup failed: " + str(error))
+
+    def cleanup(self):
+        errors = []
+        backend = runtime.Docker(timeout=min(90, self.timeout(cleanup=True)))
+        backend.operation_deadline = self.budget.deadline
+        preserve_jdbc_data = False
+        if self.purpose == "jdbc":
+            self.cleanup_client_owners(backend, errors)
+            # A failed Java client can have admitted an INSERT before it exited.
+            # Recovery runs after the original cluster has actually shut down.
+            if self.args.mode != "cleanup" and (self.root / "jdbc-container").exists() \
+                    and not (self.root / "jdbc-probe.json").is_file():
+                errors.append("JDBC write cleanup awaits original cluster shutdown")
+            preserve_jdbc_data = bool(errors)
+        if self.namespace_intent and not preserve_jdbc_data:
+            try:
+                self.spark("\n".join(f"DROP TABLE IF EXISTS ice_rest.{self.namespace}.{table} PURGE;" for table in
+                    ("encoding_values", "time_values", "variant_values", "cli_pages", "cli_ddl", "jdbc_prepared")) +
+                    f"\nDROP NAMESPACE IF EXISTS ice_rest.{self.namespace};\n", "cleanup-independent-catalog", cleanup=True)
+                # Only after catalog removal: reclaim this exact original namespace's
+                # uncommitted objects as well as its formerly reachable files.
+                scope = self.scope.replace('"', '\\"') + "/"
+                self.shell('''try {
+  import org.apache.iceberg.aws.s3.S3FileIO
+  import scala.collection.JavaConverters._
+  val io = new S3FileIO()
+  val prefix = "spark.sql.catalog.ice_rest."
+  val properties = spark.conf.getAll.filter { case (key, _) => key.startsWith(prefix) }.map { case (key, value) => (key.substring(prefix.length), value) }.asJava
+  io.initialize(properties)
+  val owned = "''' + scope + '''"
+  try { io.deletePrefix(owned); require(!io.listPrefix(owned).iterator().hasNext(), "owned independent producer objects remain") } finally { io.close() }
+  println("TRC1_OWNED_PREFIX_CLEANUP_OK")
+  System.exit(0)
+} catch { case error: Throwable => error.printStackTrace(); System.exit(1) }
+''', "cleanup-owned-prefix", cleanup=True)
+            except BaseException as error:
+                errors.append(str(error))
+        if self.catalog_owned and not preserve_jdbc_data:
+            try:
+                result = self.query("nova", "DROP CATALOG ice_rest", "cleanup-nova-catalog")
+                if "error" in result:
+                    errors.append("NovaRocks catalog cleanup returned " + result["error"]["errorName"])
+            except BaseException as error:
+                errors.append(str(error))
+        for record in reversed(self.containers):
+            identity = record.get("id")
+            if identity is None:
+                # Unknown start outcome cannot justify deleting a mutable name.
+                errors.append("container creation outcome is unknown: " + record["name"])
+                continue
+            try:
+                info = backend.inspect("container", identity, absent_ok=True)
+                if info:
+                    if info.get("Id") != identity:
+                        raise ProbeFailure("container cleanup lost its exact full ID")
+                    backend.command(["container", "rm", "--force", identity])
+                    if backend.inspect("container", identity, absent_ok=True):
+                        raise ProbeFailure("owned container remains after cleanup")
+                record["state"] = "released"
+            except BaseException as error:
+                record["state"] = "cleanup_failed"
+                errors.append(str(error))
+        if self.purpose != "jdbc":
+            self.cleanup_client_owners(backend, errors)
         self.ledger()
         write_json(self.root / "cleanup.json", {"complete": not errors, "errors": errors, "containers": self.containers})
         if errors:
@@ -570,13 +583,25 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
     def jdbc(self):
         if not self.args.trino_jdbc_jar:
             raise ProbeFailure("JDBC requires --trino-jdbc-jar from the run entry's declared reference inputs")
+        self.namespace_intent = True
+        self.ledger()
+        table = f"ice_rest.{self.namespace}.jdbc_prepared"
+        scope = self.scope.replace("'", "''")
+        self.spark(f"CREATE NAMESPACE ice_rest.{self.namespace};\n"
+                   f"CREATE TABLE {table} (id BIGINT) USING iceberg LOCATION '{scope}/jdbc_prepared';\n",
+                   "prepare-jdbc-table")
+        self.setup_catalog()
         source = self.repository / "tests/system-test-runner/src/scenarios/trino_interop/JdbcProbe.java"
         result = self.command([sys.executable, Path(__file__).with_name("trino_run.py"), "jdbc", "--env-file", self.env_file,
             "--image", self.image, "--evidence-dir", self.root / "jdbc-container", "--source", source, "--jdbc-jar", self.args.trino_jdbc_jar,
-            "--", self.args.nova, self.args.user], "jdbc-probe")
+            "--", self.args.nova, self.args.user, table], "jdbc-probe")
         if not re.search(rb"^JDBC_PROBE_OK validated=true server_version=\S[^\r\n]*$", result.stdout, re.MULTILINE):
             raise ProbeFailure("JDBC probe did not confirm validated HEAD /v1/statement and /v1/info version")
-        write_json(self.root / "jdbc-probe.json", {"status": "PASS", "jar": str(self.args.trino_jdbc_jar)})
+        for mode in (b"true", b"false"):
+            if b"JDBC_PREPARED_OK explicitPrepare=" + mode not in result.stdout:
+                raise ProbeFailure("JDBC prepared mode did not finish: " + mode.decode())
+        write_json(self.root / "jdbc-probe.json", {"status": "PASS", "jar": str(self.args.trino_jdbc_jar),
+                                                  "prepared_modes": ["explicit", "immediate"], "table": table})
 
 
 def resume_cleanup(args):

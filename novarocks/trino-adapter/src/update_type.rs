@@ -26,6 +26,8 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         Empty
         | Query
         | Explain
+        | DescribeInput
+        | DescribeOutput
         | ShowProcessList
         | ShowStats
         | ShowCreateTable
@@ -59,6 +61,8 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         Delete => "DELETE",
         Update => "UPDATE",
         Merge => "MERGE",
+        Prepare => "PREPARE",
+        DeallocatePrepare => "DEALLOCATE",
         SetSession => "SET SESSION",
         SetTimeZone => "SET TIME ZONE",
         ResetSession => "RESET SESSION",

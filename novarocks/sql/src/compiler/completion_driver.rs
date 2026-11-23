@@ -183,6 +183,7 @@ impl SqlFinalPlanCompileRequest {
         // Retain the producer's actual checked constants across discovery and
         // catalog rounds. The loan is rebuilt against this normalized query;
         // syntax transformations must validate the original structural sites.
+        let prepared_parameters = statement.prepared_parameters;
         let materialized_source = match statement.kind {
             super::SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
                 source.loan(&query, &control)?;
@@ -202,6 +203,7 @@ impl SqlFinalPlanCompileRequest {
             dop_domain,
             display_intent,
             materialized_source,
+            prepared_parameters,
             root_session_admitted,
             catalog_qualifications,
         };
@@ -304,6 +306,7 @@ struct FinalPlanCommon {
     // Both variants hold Arc-backed constant collections. Cloning this source
     // for analysis preserves original pool/ordinal facts, not AST pointers.
     materialized_source: Option<super::materialized_values::MaterializedValues>,
+    prepared_parameters: Option<Arc<super::SqlPreparedParameters>>,
     root_session_admitted: bool,
     catalog_qualifications: super::CatalogQualifications,
 }
@@ -559,7 +562,7 @@ fn analyze_with_catalog(
 ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
     let catalog = SqlPlannerTableSnapshot::new(catalog);
     let query = Box::new(query);
-    let statement = match &common.materialized_source {
+    let mut statement = match &common.materialized_source {
         Some(source) => {
             // Resolve a fresh loan only over the actual query entering this
             // analysis round, under the original request control. No pointer
@@ -570,6 +573,7 @@ fn analyze_with_catalog(
                     query,
                     source: source.clone(),
                 },
+                prepared_parameters: None,
             }
         }
         None if common.root_session_admitted => {
@@ -577,6 +581,7 @@ fn analyze_with_catalog(
         }
         None => SqlStatementInput::parsed_query(query),
     };
+    statement.prepared_parameters = common.prepared_parameters.clone();
     let request = SqlAnalyzeRequest::new(
         statement,
         common.intent.clone(),

@@ -26,6 +26,9 @@ pub struct ClientSession {
     pub catalog: Option<String>,
     pub schema: Option<String>,
     pub properties: BTreeMap<String, String>,
+    /// Form-decoded statement header values, including original compression
+    /// when a server selected it. The client replays the wire value verbatim.
+    pub prepared_statements: BTreeMap<String, String>,
     pub time_zone: String,
 }
 impl ClientSession {
@@ -34,6 +37,7 @@ impl ClientSession {
             catalog: None,
             schema: None,
             properties: BTreeMap::new(),
+            prepared_statements: BTreeMap::new(),
             time_zone: time_zone.into(),
         }
     }
@@ -44,13 +48,18 @@ impl ClientSession {
         if let Some(schema) = &effects.schema {
             self.schema = Some(schema.clone());
         }
-        for (name, value) in &effects.properties {
-            match value {
-                Some(value) => {
-                    self.properties.insert(name.clone(), value.clone());
-                }
-                None => {
-                    self.properties.remove(name);
+        for (changes, values) in [
+            (&effects.properties, &mut self.properties),
+            (&effects.prepared_statements, &mut self.prepared_statements),
+        ] {
+            for (name, value) in changes {
+                match value {
+                    Some(value) => {
+                        values.insert(name.clone(), value.clone());
+                    }
+                    None => {
+                        values.remove(name);
+                    }
                 }
             }
         }
@@ -80,6 +89,15 @@ impl ClientSession {
                 .join(",");
             insert(&mut headers, "x-trino-session", &value)?;
         }
+        for (name, value) in &self.prepared_statements {
+            let value = format!("{}={}", encode(name), encode(value));
+            headers.append(
+                "x-trino-prepared-statement",
+                HeaderValue::from_str(&value).map_err(|e| {
+                    StatementFailure::protocol(format!("invalid prepared statement: {e}"))
+                })?,
+            );
+        }
         Ok(headers)
     }
 }
@@ -89,14 +107,13 @@ pub struct SessionEffects {
     pub catalog: Option<String>,
     pub schema: Option<String>,
     pub properties: BTreeMap<String, Option<String>>,
+    pub prepared_statements: BTreeMap<String, Option<String>>,
 }
 impl SessionEffects {
     pub(crate) fn absorb(&mut self, headers: &HeaderMap) -> Result<(), StatementFailure> {
         for name in [
             "x-trino-set-path",
             "x-trino-set-role",
-            "x-trino-added-prepare",
-            "x-trino-deallocated-prepare",
             "x-trino-started-transaction-id",
             "x-trino-clear-transaction-id",
             "x-trino-set-authorization-user",
@@ -125,6 +142,25 @@ impl SessionEffects {
         for value in headers.get_all("x-trino-clear-session") {
             for name in header_text(value)?.split(',') {
                 self.properties.insert(decode(name.trim())?, None);
+            }
+        }
+        for value in headers.get_all("x-trino-added-prepare") {
+            for assignment in header_text(value)?.split(',') {
+                let (name, definition) = assignment.trim().split_once('=').ok_or_else(|| {
+                    StatementFailure::protocol("malformed Added-Prepare response header")
+                })?;
+                if definition.contains('=') {
+                    return Err(StatementFailure::protocol(
+                        "malformed Added-Prepare response header",
+                    ));
+                }
+                self.prepared_statements
+                    .insert(decode(name)?, Some(decode(definition)?));
+            }
+        }
+        for value in headers.get_all("x-trino-deallocated-prepare") {
+            for name in header_text(value)?.split(',') {
+                self.prepared_statements.insert(decode(name.trim())?, None);
             }
         }
         Ok(())

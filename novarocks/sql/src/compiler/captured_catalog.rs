@@ -29,6 +29,12 @@ use crate::catalog::PlannerTableProvider;
 pub struct SqlCapturedCatalogPreparation {
     catalog: CatalogCompletionState,
     control: SqlCompileControl,
+    description: Option<Box<DescriptionCapture>>,
+}
+
+struct DescriptionCapture {
+    session: super::SqlSessionContext,
+    parameters: Box<[novarocks_parser::Span]>,
 }
 
 impl SqlCapturedCatalogPreparation {
@@ -61,7 +67,42 @@ impl SqlCapturedCatalogPreparation {
             None,
             control,
             qualifications,
+            &crate::sql_mode::SqlSemanticSettings::default(),
         )
+    }
+
+    /// Requests only the schema facts consulted by the effective statement.
+    /// Unknown query-period selectors are rejected before any lookup is published.
+    pub fn try_new_description(
+        query: novarocks_parser::ast::Query,
+        parameters: &super::SqlPreparedParameters,
+        session: &super::SqlSessionContext,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
+        control.check()?;
+        if !parameters.is_description() {
+            return Err(SqlCompileError::InvalidRequest(
+                "Description requires the unbound parameter input".into(),
+            ));
+        }
+        let query = parameters.complete_query(query)?;
+        let query =
+            crate::sql_mode::normalize_concat_query_with_semantics(query, &session.sql_semantics);
+        let mut preparation = Self::try_new_qualified_catalog(
+            query,
+            session.current_catalog.as_deref(),
+            &session.current_database,
+            None,
+            control,
+            qualifications,
+            &session.sql_semantics,
+        )?;
+        preparation.description = Some(Box::new(DescriptionCapture {
+            session: session.clone(),
+            parameters: parameters.positions().into(),
+        }));
+        Ok(preparation)
     }
 
     pub fn try_new_definition(
@@ -96,6 +137,7 @@ impl SqlCapturedCatalogPreparation {
             Some(target),
             control,
             qualifications,
+            &crate::sql_mode::SqlSemanticSettings::default(),
         )
     }
 
@@ -106,6 +148,7 @@ impl SqlCapturedCatalogPreparation {
         definition: Option<Option<novarocks_types::naming::TableIdentity>>,
         control: SqlCompileControl,
         qualifications: super::CatalogQualifications,
+        sql_semantics: &crate::sql_mode::SqlSemanticSettings,
     ) -> Result<Self, SqlCompileError> {
         control.check()?;
         let catalog = CatalogCompletionState::try_new_with_qualifications(
@@ -116,7 +159,7 @@ impl SqlCapturedCatalogPreparation {
             current_database,
             crate::catalog::TableLookupMode::SchemaOnly,
             0,
-            &crate::sql_mode::SqlSemanticSettings::default(),
+            sql_semantics,
             qualifications,
         )?;
         let catalog = if let Some(target) = definition {
@@ -126,7 +169,11 @@ impl SqlCapturedCatalogPreparation {
         }
         .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         control.check()?;
-        Ok(Self { catalog, control })
+        Ok(Self {
+            catalog,
+            control,
+            description: None,
+        })
     }
 
     pub fn continue_catalog(
@@ -135,6 +182,54 @@ impl SqlCapturedCatalogPreparation {
     ) -> Result<Self, SqlCompileError> {
         self.catalog.accept_facts(facts, &self.control)?;
         Ok(self)
+    }
+
+    /// Analyze using the completed SchemaOnly capture and, for a write
+    /// source, the original target assignment declaration supplied by its owner.
+    pub fn describe(
+        self,
+        parameters: &super::SqlPreparedParameters,
+        session: &super::SqlSessionContext,
+        functions: &dyn super::SqlFunctionCatalog,
+        policy: super::ConstantPolicy,
+        write_assignments: Option<&super::SqlWriteAssignments>,
+        materialized_constants: Option<super::SqlExpressionConstants>,
+    ) -> Result<super::SqlPreparedDescription, SqlCompileError> {
+        self.control.check()?;
+        let capture = self.description.as_deref().ok_or_else(|| {
+            SqlCompileError::InvalidRequest("Description requires its own schema capture".into())
+        })?;
+        if !parameters.is_description()
+            || capture.parameters.as_ref() != parameters.positions()
+            || capture.session != *session
+        {
+            return Err(SqlCompileError::InvalidRequest(
+                "Description input differs from its captured statement".into(),
+            ));
+        }
+        let catalog = self.catalog.completed_catalog()?;
+        let functions = functions.snapshot_for_scalar_presence();
+        let materialized = materialized_constants
+            .map(|constants| {
+                super::materialized_values::MaterializedValues::try_new_expressions(
+                    self.catalog.query(),
+                    constants,
+                    &self.control,
+                )
+            })
+            .transpose()?;
+        crate::analyzer::describe_prepared_query(
+            self.catalog.query(),
+            &catalog,
+            &session.current_database,
+            functions.as_ref(),
+            &session.sql_semantics,
+            policy,
+            &self.control,
+            write_assignments,
+            materialized.as_ref(),
+            parameters,
+        )
     }
 
     /// Analyze the original definition after every exact dependency is known.

@@ -70,6 +70,11 @@ const TYPE_MISMATCH: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const NUMERIC_VALUE_OUT_OF_RANGE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.numeric_value_out_of_range"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INVALID_LITERAL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.invalid_literal"),
     phase: ErrorPhase::Analyze,
@@ -164,6 +169,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     FUNCTION_NOT_AGGREGATE,
     EXPRESSION_NOT_SCALAR,
     INVALID_LITERAL,
+    NUMERIC_VALUE_OUT_OF_RANGE,
     INVALID_ARGUMENT,
     INVALID_TYPE_ARGUMENT,
     INVALID_ANALYZE_PROPERTY,
@@ -194,6 +200,7 @@ pub enum AnalyzeErrorKind {
     FunctionNotAggregate,
     ExpressionNotScalar,
     InvalidLiteral,
+    NumericValueOutOfRange,
     InvalidArgument,
     InvalidTypeArgument,
     InvalidAnalyzeProperty,
@@ -226,6 +233,7 @@ impl AnalyzeErrorKind {
             Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
             Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
             Self::InvalidLiteral => INVALID_LITERAL,
+            Self::NumericValueOutOfRange => NUMERIC_VALUE_OUT_OF_RANGE,
             Self::InvalidArgument => INVALID_ARGUMENT,
             Self::InvalidTypeArgument => INVALID_TYPE_ARGUMENT,
             Self::InvalidAnalyzeProperty => INVALID_ANALYZE_PROPERTY,
@@ -307,6 +315,7 @@ pub struct AnalyzeError {
     kind: AnalyzeErrorKind,
     message: String,
     span: Option<Span>,
+    source_sql: Option<std::sync::Arc<str>>,
     control: Option<novarocks_type_contract::CompileControlError>,
     source: Option<novarocks_failure_contract::SharedFailureCause>,
     view_cause: Option<Box<StoredDefinitionCause>>,
@@ -322,6 +331,7 @@ impl AnalyzeError {
             kind,
             message: message.into(),
             span,
+            source_sql: None,
             control: None,
             source: None,
             view_cause: None,
@@ -481,6 +491,7 @@ impl AnalyzeError {
     pub(crate) fn at_view_reference(self, source_sql: std::sync::Arc<str>, span: Span) -> Self {
         let mut outer = self.clone();
         outer.span = (!span.is_empty()).then_some(span);
+        outer.source_sql = None;
         outer.view_cause = Some(Box::new(StoredDefinitionCause::Analysis(
             StoredViewAnalysisCause {
                 source_sql,
@@ -583,6 +594,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: source.detail().to_owned(),
             span: None,
+            source_sql: None,
             control: None,
             source: Some(source),
             view_cause: None,
@@ -605,6 +617,10 @@ impl AnalyzeError {
         error.span = Some(span);
         error
     }
+    pub(crate) fn numeric_value_out_of_range(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::NumericValueOutOfRange, message, span)
+    }
+
     pub fn invalid_literal(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::InvalidLiteral, message, span)
     }
@@ -635,6 +651,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::UnsupportedExpression,
             message: message.into(),
             span: None,
+            source_sql: None,
             control: None,
             source: None,
             view_cause: None,
@@ -652,6 +669,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: message.into(),
             span: None,
+            source_sql: None,
             control: None,
             source: None,
             view_cause: None,
@@ -665,6 +683,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: error.to_string(),
             span: None,
+            source_sql: None,
             control: Some(error),
             source: None,
             view_cause: None,
@@ -690,6 +709,7 @@ impl AnalyzeError {
                     kind: AnalyzeErrorKind::Internal,
                     message: source.detail().to_owned(),
                     span: None,
+                    source_sql: None,
                     control: None,
                     source: Some(source),
                     view_cause: None,
@@ -705,6 +725,7 @@ impl AnalyzeError {
                     kind: AnalyzeErrorKind::UnavailableImplementation,
                     message: error.to_string(),
                     span: None,
+                    source_sql: None,
                     control: None,
                     source: None,
                     view_cause: None,
@@ -721,6 +742,7 @@ impl AnalyzeError {
                 },
                 message: error.to_string(),
                 span: None,
+                source_sql: None,
                 control: None,
                 source: None,
                 view_cause: None,
@@ -801,6 +823,19 @@ impl AnalyzeError {
         self.span
     }
 
+    pub(crate) fn in_expression_source(mut self, source_sql: std::sync::Arc<str>) -> Self {
+        self.source_sql = Some(source_sql);
+        self
+    }
+
+    pub fn expression_source(&self) -> Option<&str> {
+        self.source_sql.as_deref()
+    }
+
+    pub fn expression_source_arc(&self) -> Option<&std::sync::Arc<str>> {
+        self.source_sql.as_ref()
+    }
+
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -812,7 +847,7 @@ impl AnalyzeError {
         let location = self
             .span
             .filter(|span| !span.is_empty())
-            .zip(source)
+            .zip(self.expression_source().or(source))
             .map(|(span, source)| span.to_user_error_location(source));
         UserError::from_descriptor(
             self.kind.descriptor(),

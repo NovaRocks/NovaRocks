@@ -1091,7 +1091,7 @@ async fn plan_query_for_ctas_source_async(
     .map_err(CtasFailure::from_compile)?;
     let mut preparation =
         novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
-            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+            execution.sql_statement_input(Box::new(query), false),
             novarocks_sql::compiler::SqlSessionContext {
                 sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),

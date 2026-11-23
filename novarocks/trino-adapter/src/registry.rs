@@ -165,6 +165,10 @@ impl TrinoQueryRegistry {
                 }
                 match state.phase {
                     Phase::Registered | Phase::Settled { .. } => {
+                        // An old lookup may still hold the entry. Expiry
+                        // takes the registered request while this transition
+                        // excludes a first GET, releasing its input now.
+                        entry.request.lock().expect("registered request").take();
                         registry
                             .entries
                             .lock()
@@ -257,7 +261,7 @@ impl TrinoQueryRegistry {
                 .lock()
                 .expect("registered request")
                 .take()
-                .expect("first GET owns the original request");
+                .ok_or(StatusCode::NOT_FOUND)?;
             state.phase = Phase::Executing;
             entry.observation.start();
             *entry.started.lock().expect("query start clock") = Some(Instant::now());

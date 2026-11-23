@@ -24,3 +24,16 @@ main_id	main_v	bak_id	bak_v
 1	10	1	10
 2	20	2	20
 3	30	NULL	NULL
+
+-- query 11
+-- types	integer	integer
+id	v
+1	10
+2	20
+
+-- query 12
+-- types	integer	integer
+id	v
+1	10
+2	20
+3	30

@@ -22,11 +22,14 @@ use super::session_property_computation::{
 };
 use super::*;
 use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
-use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
     QuerySessionDeadline, StatementActionValue,
 };
+use novarocks_query_application::{
+    api::StatementNativeHealthFailure, sql::trino_admission::TrinoStatementSource,
+};
+use novarocks_sql::compiler::SqlPreparedParameters;
 use std::task::{Context, Poll};
 
 pub(super) enum QueryFamily {
@@ -92,6 +95,7 @@ pub(super) struct QueryActionInputs {
     pub(super) deadline: Option<Instant>,
     pub(super) cancellation: QueryCancellationView,
     pub(super) window: ResultWindowAlias,
+    pub(super) parameters: Option<Arc<SqlPreparedParameters>>,
     pub(super) planning_cpu: Option<Arc<FrontendPlanningCpuSource>>,
     pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     #[cfg(novarocks_dev_controls)]
@@ -113,7 +117,7 @@ enum QueryFamilyPreparation {
 struct ScopedQueryAction {
     preparation: QueryFamilyPreparation,
     environment: QueryActionEnvironment,
-    source: Arc<str>,
+    source: TrinoStatementSource,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
     action: Option<Box<dyn GovernedStatementAction>>,
     statement_time: novarocks_type_contract::StatementTimeEnvironment,
@@ -187,6 +191,7 @@ impl GovernedStatementAction for ScopedQueryAction {
                     owner.timeout_ms(),
                 ),
                 window,
+                parameters: prepared.parameters,
                 planning_cpu: Some(Arc::clone(&self.planning_cpu)),
                 statement_time: self.statement_time,
                 #[cfg(novarocks_dev_controls)]
@@ -202,7 +207,7 @@ impl GovernedStatementAction for ScopedQueryAction {
                 QueryFamily::Read(query) => read_action::build_read_action(
                     &self.environment,
                     inputs,
-                    Arc::clone(&self.source),
+                    Arc::clone(self.source.sql()),
                     query,
                     prepared.state,
                     FrontendQueryPurpose::ClientRows,
@@ -210,7 +215,7 @@ impl GovernedStatementAction for ScopedQueryAction {
                 QueryFamily::Explain(explain) => explain_action::build_explain_action(
                     &self.environment,
                     inputs,
-                    self.source.to_string(),
+                    self.source.sql().to_string(),
                     explain,
                     prepared.state,
                     family,
@@ -227,7 +232,8 @@ impl GovernedStatementAction for ScopedQueryAction {
 impl FrontendQuerySession {
     pub(super) async fn execute_trino_query_family(
         &self,
-        source: Arc<str>,
+        statement_source: TrinoStatementSource,
+        parameters: Option<Arc<SqlPreparedParameters>>,
         action: novarocks_query_application::sql::trino_admission::TrinoQueryAction,
         statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<StatementResult, QueryServiceError> {
@@ -244,22 +250,33 @@ impl FrontendQuerySession {
             kind,
             shape: StatementOutputShape::ResultSet,
         };
-        self.execute_query_family(source, family, admitted, statement_time)
-            .await
+        self.execute_query_family(
+            statement_source,
+            parameters,
+            family,
+            admitted,
+            statement_time,
+        )
+        .await
     }
 
     async fn execute_query_family(
         &self,
-        source: Arc<str>,
+        statement_source: TrinoStatementSource,
+        parameters: Option<Arc<SqlPreparedParameters>>,
         family: QueryFamily,
         admitted: novarocks_query_application::session::StatementAdmission,
         statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<StatementResult, QueryServiceError> {
+        let source = statement_source.sql().clone();
         self.admission.publish(admitted);
         *self.output_shape.lock().map_err(poisoned_state)? = Some(admitted.shape);
         let class = family.window_class();
         let plain_explain = class == ResultWindowClass::Local;
-        let needs_properties = !family.query().session_properties.is_empty();
+        let needs_properties = !family.query().session_properties.is_empty()
+            || parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.contextual_needs(family.query()).is_empty());
         #[cfg(novarocks_dev_controls)]
         let is_read = class == ResultWindowClass::Client;
         let token = self.token()?;
@@ -335,6 +352,7 @@ impl FrontendQuerySession {
             QueryFamilyPreparation::Declared(QuerySessionPreparation::new(
                 QuerySessionPreparationInput {
                     source: Arc::clone(&source),
+                    parameters,
                     statement: family,
                     original,
                     statement_time,
@@ -348,13 +366,14 @@ impl FrontendQuerySession {
         } else {
             QueryFamilyPreparation::Ready(Some(PreparedQuerySession {
                 statement: family,
+                parameters,
                 state: self.state.lock().map_err(poisoned_state)?.clone(),
             }))
         };
         let action = ScopedQueryAction {
             preparation,
             environment: QueryActionEnvironment::new(&self.service),
-            source,
+            source: statement_source,
             planning_cpu,
             action: None,
             statement_time,

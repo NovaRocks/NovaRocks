@@ -70,6 +70,16 @@ impl QuerySessionStatement {
     pub fn output_owned(output: QuerySessionOutput, kind: StatementKind) -> Self {
         Self::new(output, Box::new(OutputOwnsProtocolTerminal), kind)
     }
+    pub fn with_trino_statement_source(
+        mut self,
+        source: crate::sql::trino_admission::TrinoStatementSource,
+    ) -> Self {
+        if let QuerySessionOutput::GovernedError(error) = &mut self.output {
+            error.attach_trino_statement_source(source);
+        }
+        self
+    }
+
     pub fn session_effects(&self) -> &SessionEffects {
         &self.effects
     }

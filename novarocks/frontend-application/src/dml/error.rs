@@ -154,7 +154,20 @@ impl DmlExecutionError {
             ),
             Self::Analyze(error) => match error.control_error() {
                 Some(error) => DmlError::compile_control(error),
-                None => DmlError::admit(error.to_user_error(source)),
+                None => {
+                    let user = error.to_user_error(source);
+                    match error.expression_source_arc() {
+                        Some(argument_sql) => DmlError::from_application(
+                            novarocks_query_application::session_error::QueryServiceError::from_user_error(user)
+                                .with_trino_statement_source(
+                                    novarocks_query_application::sql::trino_admission::TrinoStatementSource::request(
+                                        argument_sql.clone(),
+                                    ),
+                                ),
+                        ),
+                        None => DmlError::admit(user),
+                    }
+                }
             },
             Self::Control(error) => DmlError::compile_control(error),
         }

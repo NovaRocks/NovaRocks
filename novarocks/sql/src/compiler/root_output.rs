@@ -657,6 +657,7 @@ mod tests {
         let fresh = factory.create(None, "internal".into(), ty.clone());
         let foreign = factory.create(None, "internal".into(), ty.clone());
         let field = |id, name: &str| crate::analysis::AnalyzedOutputField {
+            aliased: false,
             column_id: id,
             name: "internal".into(),
             field_name: Some(name.into()),

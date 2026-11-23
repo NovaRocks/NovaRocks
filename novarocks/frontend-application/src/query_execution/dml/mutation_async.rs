@@ -371,7 +371,7 @@ pub(crate) async fn compile_routed_mutation_write(
     .map_err(DmlError::from_compile)?;
     let mut preparation =
         novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
-            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+            execution.sql_statement_input(Box::new(query), false),
             novarocks_sql::compiler::SqlSessionContext {
                 sql_semantics: execution.sql_semantics().clone(),
                 // The old analyzer materializer supplied this effective catalog

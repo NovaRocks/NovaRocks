@@ -629,6 +629,7 @@ fn recursive_typed_expression_owners_keep_every_child_slot_and_original_allocati
 
 fn output() -> AnalyzedOutputField {
     AnalyzedOutputField {
+        aliased: false,
         column_id: ColumnId(73),
         name: "internal".into(),
         field_name: Some("visible".into()),

@@ -18,6 +18,7 @@
 use crate::{
     body,
     host::base_uri,
+    prepared::PreparedStatementIngress,
     registry::TrinoQueryRegistry,
     request::{ParsedStatementRequest, QueryTextLimit, StatementBody},
 };
@@ -37,9 +38,14 @@ use tokio::sync::Notify;
 struct StatementState {
     registry: Arc<TrinoQueryRegistry>,
     limit: QueryTextLimit,
+    prepared_ingress: PreparedStatementIngress,
 }
 
-pub(crate) fn routes(registry: Arc<TrinoQueryRegistry>, limit: QueryTextLimit) -> Router {
+pub(crate) fn routes(
+    registry: Arc<TrinoQueryRegistry>,
+    limit: QueryTextLimit,
+    prepared_ingress: PreparedStatementIngress,
+) -> Router {
     Router::new()
         .route(
             "/v1/statement",
@@ -49,6 +55,7 @@ pub(crate) fn routes(registry: Arc<TrinoQueryRegistry>, limit: QueryTextLimit) -
         .with_state(StatementState {
             registry: Arc::clone(&registry),
             limit,
+            prepared_ingress,
         })
         .merge(
             Router::new()
@@ -106,11 +113,16 @@ async fn submit(State(state): State<StatementState>, headers: HeaderMap, body: B
         Err(error) => return error.into_response(),
     };
     let registry = state.registry;
-    let request =
-        match ParsedStatementRequest::parse_body(&headers, body, &registry.user, state.limit) {
-            Ok(request) => request,
-            Err(error) => return (error.status, error.message).into_response(),
-        };
+    let request = match ParsedStatementRequest::parse_with_ingress(
+        &headers,
+        body,
+        &registry.user,
+        state.limit,
+        &state.prepared_ingress,
+    ) {
+        Ok(request) => request,
+        Err(error) => return (error.status, error.message).into_response(),
+    };
     // Global Host validation precedes this route, including UTF-8 and multiplicity checks.
     let Some(base) = headers
         .get(HOST)
@@ -292,27 +304,179 @@ mod tests {
         fn cancel_all(&self, _: QueryCancellationReason) {}
     }
     fn registry(opened: Arc<AtomicUsize>) -> Arc<TrinoQueryRegistry> {
+        prepared_registry(Arc::new(RefuseWorkFactory(opened)), Duration::from_secs(60))
+    }
+
+    fn prepared_registry(
+        factory: Arc<dyn QuerySessionFactory>,
+        timeout: Duration,
+    ) -> Arc<TrinoQueryRegistry> {
         let control = QueryControlService::new(Arc::new(
             novarocks_query_application::query_control::QueryApplicationControl::new(
                 novarocks_types::FrontendProcessId::new_v7(),
             ),
         ));
-        TrinoQueryRegistry::new(
-            Arc::new(RefuseWorkFactory(opened)),
-            control,
-            "root".into(),
-            Duration::from_secs(60),
-        )
+        TrinoQueryRegistry::new(factory, control, "root".into(), timeout)
     }
     async fn json(response: Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::OK);
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
     }
+    fn committed(authority: &novarocks_memory::MemoryAuthority) -> u64 {
+        while !authority.maintain(64).complete {}
+        authority.root().committed_bytes()
+    }
+
+    async fn submit_prepared(state: &StatementState, prepared: &'static str) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-trino-user", HeaderValue::from_static("root"));
+        headers.insert(HOST, HeaderValue::from_static("localhost:8080"));
+        headers.insert(crate::prepared::HEADER, HeaderValue::from_static(prepared));
+        submit(State(state.clone()), headers, Body::from("EXECUTE p")).await
+    }
+
+    fn endpoint(page: &serde_json::Value) -> (String, String, String) {
+        let mut parts = page["nextUri"].as_str().unwrap().rsplit('/');
+        let token = parts.next().unwrap().to_owned();
+        let slug = parts.next().unwrap().to_owned();
+        let id = parts.next().unwrap().to_owned();
+        (id, slug, token)
+    }
+
+    #[tokio::test]
+    async fn trino_prepared_ingress_refuses_overload_and_releases_a_cancelled_post() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let registry = registry(Arc::clone(&opened));
+        let (authority, prepared_ingress) = crate::prepared::test_ingress();
+        let capacity = authority.snapshot().capacity_bytes;
+        let mut writer = authority.take_capacity_writer().unwrap();
+        let state = StatementState {
+            registry: Arc::clone(&registry),
+            limit: QueryTextLimit::default(),
+            prepared_ingress,
+        };
+        let baseline = committed(&authority);
+        let malformed = submit_prepared(&state, "p=SELECT+)").await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(committed(&authority), baseline);
+
+        let queued = json(submit_prepared(&state, "p=SELECT+1").await).await;
+        let held = committed(&authority);
+        assert!(held > baseline);
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+
+        writer.set_capacity(held).unwrap();
+        let refused = submit_prepared(&state, "p=SELECT+2").await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(committed(&authority), held);
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+
+        let status = cancel(State(Arc::clone(&registry)), Path(endpoint(&queued))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(committed(&authority), baseline);
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        writer.set_capacity(capacity).unwrap();
+        assert_eq!(
+            submit_prepared(&state, "p=SELECT+2").await.status(),
+            StatusCode::OK
+        );
+        registry.finalize().await;
+        assert_eq!(committed(&authority), baseline);
+    }
+
+    #[derive(Default)]
+    struct ObservePreparedFactory(
+        std::sync::Mutex<
+            Option<novarocks_query_application::session_value::PreparedStatementDefinition>,
+        >,
+    );
+
+    impl QuerySessionFactory for ObservePreparedFactory {
+        fn open_statement_session(
+            &self,
+            request: StatementSessionRequest,
+        ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+            let (_, _, session) = request.into_parts();
+            *self.0.lock().unwrap() = session.prepared_statements().get("p").cloned();
+            Err(StatementSessionError::Service(QueryServiceError::new(
+                QueryServiceErrorKind::InvalidValue,
+                "Test session construction stops after borrowing its exact definition",
+            )))
+        }
+
+        fn cancel_all(&self, _: QueryCancellationReason) {}
+    }
+
+    #[tokio::test]
+    async fn trino_prepared_ingress_first_get_moves_original_capacity_to_the_last_alias() {
+        let observer = Arc::new(ObservePreparedFactory::default());
+        let registry = prepared_registry(observer.clone(), Duration::from_secs(60));
+        let (authority, prepared_ingress) = crate::prepared::test_ingress();
+        let state = StatementState {
+            registry: Arc::clone(&registry),
+            limit: QueryTextLimit::default(),
+            prepared_ingress,
+        };
+        let baseline = committed(&authority);
+        let queued = json(submit_prepared(&state, "p=SELECT+1,other=SELECT+2").await).await;
+        let held = committed(&authority);
+        assert!(held > baseline);
+        assert!(observer.0.lock().unwrap().is_none());
+        let failed = json(next(State(Arc::clone(&registry)), Path(endpoint(&queued))).await).await;
+        assert!(failed.get("error").is_some());
+        registry.finalize().await;
+        let residual = committed(&authority);
+        assert!(residual > baseline && residual < held);
+        let selected = observer.0.lock().unwrap().take().unwrap();
+        assert_eq!(selected.sql().as_ref(), "SELECT 1");
+        drop(selected);
+        assert_eq!(committed(&authority), baseline);
+    }
+
+    #[tokio::test]
+    async fn trino_prepared_ingress_expiry_releases_the_snapshot_with_an_old_lookup() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let timeout = Duration::from_secs(60);
+        let registry = prepared_registry(Arc::new(RefuseWorkFactory(Arc::clone(&opened))), timeout);
+        let (authority, prepared_ingress) = crate::prepared::test_ingress();
+        let state = StatementState {
+            registry: Arc::clone(&registry),
+            limit: QueryTextLimit::default(),
+            prepared_ingress,
+        };
+        let baseline = committed(&authority);
+        let queued = json(submit_prepared(&state, "p=SELECT+1").await).await;
+        let (id, slug, _) = endpoint(&queued);
+        let entry = registry.lookup(&id, &slug).unwrap();
+        assert!(committed(&authority) > baseline);
+        *entry.touched.lock().unwrap() = std::time::Instant::now() - 2 * timeout;
+        entry.requests.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while entry.request.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original registry timer has not expired its queued request");
+        assert_eq!(committed(&authority), baseline);
+        assert_eq!(
+            registry.get(&entry, 0).await.err(),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        let timer = entry.timer.lock().unwrap().take();
+        if let Some(timer) = timer {
+            timer.await.unwrap();
+        }
+        registry.finalize().await;
+    }
+
     #[tokio::test]
     async fn logical_and_byte_oversize_share_registered_error_35_without_opening_a_session() {
         for (text, limit) in [("xx", 1), ("xxxx", 1), ("😀x", 2), ("x", 0)] {
             let opened = Arc::new(AtomicUsize::new(0));
             let registry = registry(Arc::clone(&opened));
+            let (_authority, prepared_ingress) = crate::prepared::test_ingress();
             let mut headers = HeaderMap::new();
             headers.insert("x-trino-user", HeaderValue::from_static("root"));
             headers.insert(HOST, HeaderValue::from_static("localhost:8080"));
@@ -321,6 +485,7 @@ mod tests {
                     State(StatementState {
                         registry: Arc::clone(&registry),
                         limit: QueryTextLimit::new(limit).unwrap(),
+                        prepared_ingress,
                     }),
                     headers,
                     Body::from(text),

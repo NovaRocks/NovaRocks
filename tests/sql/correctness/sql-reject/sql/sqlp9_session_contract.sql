@@ -82,33 +82,21 @@ SET SESSION AUTHORIZATION 'example-user';
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 RESET SESSION AUTHORIZATION;
 
--- query 17
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-PREPARE rejected FROM SELECT 1;
-
 -- query 18
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
 DEALLOCATE PREPARE rejected;
 
 -- query 19
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
 EXECUTE rejected USING 1;
 
--- query 20
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-EXECUTE IMMEDIATE 'SELECT 1';
-
 -- query 21
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
 DESCRIBE INPUT rejected;
 
 -- query 22
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
 DESCRIBE OUTPUT rejected;
-
--- query 23
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-DESCRIBE OUTPUT (SELECT 1 AS id);
 
 -- query 24
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
@@ -145,3 +133,31 @@ ROLLBACK WORK;
 -- query 32
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 RESET SESSION no_such_property;
+
+-- query 33
+-- @expect_trino_error=INVALID_PARAMETER_USAGE,USER_ERROR
+SELECT ?;
+
+-- query 34
+-- @expect_trino_error=INVALID_PARAMETER_USAGE,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT ?, ?' USING 1;
+
+-- query 35
+-- @expect_trino_error=EXPRESSION_NOT_CONSTANT,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT ?' USING unbound_column;
+
+-- query 36
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+PREPARE outer_prepare FROM PREPARE inner_prepare FROM SELECT 1;
+
+-- query 37
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT 1 LIMIT ?' USING DECIMAL '1.0';
+
+-- query 38
+-- @expect_trino_error=INVALID_ARGUMENTS,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT 1 LIMIT ?' USING CAST(NULL AS BIGINT);
+
+-- query 39
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT 1 OFFSET ?' USING -1;

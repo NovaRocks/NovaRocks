@@ -26,6 +26,7 @@ pub struct TrinoExecute {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrinoExecuteImmediate {
     pub statement_text: String,
+    pub statement_text_span: Span,
     pub parameters: AstVec<Expr>,
     pub span: Span,
 }

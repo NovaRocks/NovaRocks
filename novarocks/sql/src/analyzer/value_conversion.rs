@@ -57,6 +57,9 @@ impl super::AnalyzerContext<'_> {
         mode: novarocks_type_contract::TrinoCastMode,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if mode == novarocks_type_contract::TrinoCastMode::Implicit {
+            self.observe_implicit_type(&source, &target)?;
+        }
         cast_with_trino_mode(
             source,
             target,

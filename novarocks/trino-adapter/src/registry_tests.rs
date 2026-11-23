@@ -429,9 +429,19 @@ struct Session {
 }
 #[async_trait::async_trait]
 impl QuerySession for Session {
-    async fn execute_statement(&self, _: &str) -> Result<QuerySessionStatement, QueryServiceError> {
+    async fn execute_statement(
+        &self,
+        sql: &str,
+    ) -> Result<QuerySessionStatement, QueryServiceError> {
         use novarocks_query_application::session::{StatementAdmission, StatementOutputShape};
         let (kind, shape) = match self.state.mode {
+            OutputMode::Completion if sql == "PREPARE p FROM SELECT 17" => {
+                (StatementKind::Prepare, StatementOutputShape::Empty)
+            }
+            OutputMode::Completion if sql == "DEALLOCATE PREPARE p" => (
+                StatementKind::DeallocatePrepare,
+                StatementOutputShape::Empty,
+            ),
             OutputMode::Completion | OutputMode::InvalidHeaders => {
                 (StatementKind::Use, StatementOutputShape::Empty)
             }
@@ -566,30 +576,30 @@ impl QuerySession for Session {
             OutputMode::Completion | OutputMode::InvalidHeaders | OutputMode::CallEmpty
         ) || cancellation.reason().is_some()
         {
-            let effects = if matches!(
-                self.state.mode,
-                OutputMode::Completion | OutputMode::InvalidHeaders
-            ) {
-                SessionEffects::set_catalog_schema(
-                    Some("resolved_lake".into()),
-                    if matches!(self.state.mode, OutputMode::InvalidHeaders) {
-                        "invalid\nschema".into()
-                    } else {
-                        "resolved_schema".into()
-                    },
-                )
-            } else {
-                SessionEffects::default()
+            let effects = match (kind, self.state.mode) {
+                (StatementKind::Prepare, _) => {
+                    SessionEffects::prepare("p".into(), Arc::from("SELECT 17"))
+                }
+                (StatementKind::DeallocatePrepare, _) => {
+                    SessionEffects::deallocate_prepare("p".into())
+                }
+                (_, OutputMode::Completion | OutputMode::InvalidHeaders) => {
+                    SessionEffects::set_catalog_schema(
+                        Some("resolved_lake".into()),
+                        if matches!(self.state.mode, OutputMode::InvalidHeaders) {
+                            "invalid\nschema".into()
+                        } else {
+                            "resolved_schema".into()
+                        },
+                    )
+                }
+                _ => SessionEffects::default(),
             };
             (
                 QuerySessionOutput::GovernedCompletion(
                     GovernedCompletionStatementResult::with_session_effects(statement, effects),
                 ),
-                if matches!(self.state.mode, OutputMode::CallEmpty) {
-                    StatementKind::Call
-                } else {
-                    StatementKind::Use
-                },
+                kind,
             )
         } else {
             let result =
@@ -1130,6 +1140,48 @@ async fn terminal_session_headers_come_from_executor_effects_not_input_name_diff
 }
 
 #[tokio::test]
+async fn prepared_effects_are_frozen_on_the_successful_terminal_page() {
+    let fixture = Fixture::new(false, true, Duration::from_secs(60));
+    for (sql, header, effect, kind) in [
+        (
+            "PREPARE p FROM SELECT 17",
+            "x-trino-added-prepare",
+            "p=SELECT+17",
+            "PREPARE",
+        ),
+        (
+            "DEALLOCATE PREPARE p",
+            "x-trino-deallocated-prepare",
+            "p",
+            "DEALLOCATE",
+        ),
+    ] {
+        let mut input = HeaderMap::new();
+        input.insert("x-trino-user", HeaderValue::from_static("root"));
+        let request = ParsedStatementRequest::parse(&input, sql.into(), "root").unwrap();
+        let submitted = fixture
+            .registry
+            .register(request, "http://localhost:8080".into());
+        assert!(submitted.headers.is_empty());
+        let uri = json(&submitted)["nextUri"].as_str().unwrap().to_owned();
+        let mut parts = uri.rsplit('/');
+        assert_eq!(parts.next(), Some("0"));
+        let slug = parts.next().unwrap();
+        let id = parts.next().unwrap();
+        let entry = fixture.registry.lookup(id, slug).unwrap();
+        let terminal = get(&fixture.registry, &entry, 0).await;
+        assert_eq!(terminal.headers[header], effect);
+        assert_eq!(json(&terminal)["updateType"], kind);
+        assert_eq!(json(&terminal)["columns"], serde_json::json!([]));
+        assert!(json(&terminal).get("updateCount").is_none());
+        let replay = get(&fixture.registry, &entry, 0).await;
+        assert_eq!(replay.headers, terminal.headers);
+        assert_eq!(bytes(&replay), bytes(&terminal));
+    }
+    fixture.registry.finalize().await;
+}
+
+#[tokio::test]
 async fn page_bounds_are_derived_from_the_original_window_and_refuse_oversized_rows() {
     let fixture = Fixture::standard();
     let lease = fixture
@@ -1609,24 +1661,28 @@ async fn malformed_or_overflowing_tokens_are_not_found_without_starting_the_stat
     use tower::ServiceExt;
     let fixture = Fixture::standard();
     let (entry, _) = fixture.register();
+    let (_authority, prepared_ingress) = crate::prepared::test_ingress();
     for token in ["-1", "not-a-token", "18446744073709551616"] {
         for method in ["GET", "HEAD", "DELETE"] {
             let uri = format!(
                 "/v1/statement/executing/{}/{}/{}",
                 entry.id, entry.slug, token
             );
-            let response =
-                crate::routes::routes(fixture.registry.clone(), crate::QueryTextLimit::default())
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method(method)
-                            .uri(uri)
-                            .header("host", "localhost")
-                            .body(axum::body::Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
+            let response = crate::routes::routes(
+                fixture.registry.clone(),
+                crate::QueryTextLimit::default(),
+                prepared_ingress.clone(),
+            )
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", "localhost")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {token}");
         }
     }

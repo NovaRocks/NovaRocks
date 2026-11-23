@@ -59,6 +59,7 @@ impl TrinoListener {
         admission: FrontendServingAdmission,
         sessions: Arc<dyn novarocks_query_application::session::QuerySessionFactory>,
         control: novarocks_query_application::session_control::QueryControlService,
+        prepared_ingress: crate::PreparedStatementIngress,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, settings.port)).await?;
         let bound = listener.local_addr()?;
@@ -79,6 +80,7 @@ impl TrinoListener {
             .merge(crate::routes::routes(
                 Arc::clone(&registry),
                 settings.query_max_length,
+                prepared_ingress,
             ))
             .layer(middleware::from_fn(require_local_host));
         let (shutdown, mut receiver) = watch::channel(false);
@@ -185,6 +187,7 @@ mod tests {
     #[tokio::test]
     async fn info_uses_real_lifecycle_and_host_guard_precedes_routes() {
         let admission = FrontendServingAdmission::new();
+        let (_authority, prepared_ingress) = crate::prepared::test_ingress();
         let mut listener = TrinoListener::bind(
             &TrinoListenerSettings {
                 port: 0,
@@ -198,6 +201,7 @@ mod tests {
                     novarocks_types::FrontendProcessId::new_v7(),
                 ),
             )),
+            prepared_ingress,
         )
         .await
         .unwrap();

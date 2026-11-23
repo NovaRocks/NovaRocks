@@ -105,7 +105,9 @@ pub(crate) struct ColumnMeta {
 #[derive(Clone, Debug)]
 pub(crate) struct ColumnRefFactory {
     next_id: u32,
+
     columns: Vec<Option<ColumnMeta>>,
+    pub(crate) prepared_description: Option<Box<crate::compiler::DescriptionAnalysis>>,
 }
 
 impl ColumnRefFactory {
@@ -113,6 +115,7 @@ impl ColumnRefFactory {
         Self {
             next_id: 1,
             columns: Vec::new(),
+            prepared_description: None,
         }
     }
 
@@ -288,6 +291,9 @@ impl ColumnRefFactory {
         let json_list = original.json_list_provenance;
         self.set_logical_type(target, logical);
         self.set_json_list_provenance(target, json_list);
+        if let Some(description) = &mut self.prepared_description {
+            description.copy_origin(source, target);
+        }
         Ok(())
     }
 

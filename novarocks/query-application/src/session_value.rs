@@ -16,9 +16,120 @@
 // under the License.
 
 //! Immutable per-statement session input, without catalog existence checks.
+use std::{alloc::Layout, fmt, sync::Arc};
+
 use crate::session_error::QueryServiceError;
 use novarocks_result_contract::ClientPresentationFamily;
+use novarocks_type_contract::owned_resources::layout::arc_layout;
 use novarocks_types::naming::{DEFAULT_CATALOG, normalize_identifier};
+
+/// One validated definition together with the authority's original allocation facts.
+#[derive(Clone)]
+pub struct PreparedStatementDefinition {
+    sql: Arc<str>,
+    _retention: Arc<dyn Send + Sync>,
+}
+
+impl PreparedStatementDefinition {
+    /// Requested backing for the retained text and its original allocation fact.
+    pub fn retained_content_bytes<Retention>(sql_bytes: usize) -> Option<usize> {
+        let sql = arc_layout(Layout::array::<u8>(sql_bytes).ok()?).ok()?;
+        let retention = arc_layout(Layout::new::<Retention>()).ok()?;
+        sql.size().checked_add(retention.size())
+    }
+
+    pub fn new(sql: Arc<str>, retention: impl Send + Sync + 'static) -> Self {
+        Self {
+            sql,
+            _retention: Arc::new(retention),
+        }
+    }
+
+    pub fn sql(&self) -> &Arc<str> {
+        &self.sql
+    }
+}
+
+impl fmt::Debug for PreparedStatementDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedStatementDefinition")
+            .field("sql_bytes", &self.sql.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PreparedStatementDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        self.sql == other.sql
+    }
+}
+
+impl Eq for PreparedStatementDefinition {}
+
+/// Names are compared exactly as received. The request map and each selected
+/// definition can release their original allocation facts at different times.
+#[derive(Clone, Debug, Default)]
+pub struct PreparedStatementSnapshot(Option<Arc<PreparedStatementEntries>>);
+
+struct PreparedStatementEntries {
+    definitions: Vec<(String, PreparedStatementDefinition)>,
+    _mapping_retention: Box<dyn Send + Sync>,
+}
+
+impl fmt::Debug for PreparedStatementEntries {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedStatementEntries")
+            .field("count", &self.definitions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DuplicatePreparedStatementName;
+
+impl fmt::Display for DuplicatePreparedStatementName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Prepared statement names must be unique after decoding")
+    }
+}
+
+impl std::error::Error for DuplicatePreparedStatementName {}
+
+impl PreparedStatementSnapshot {
+    /// Requested backing for the shared mapping and its boxed allocation fact.
+    /// The source of the vector and name buffers accounts for their capacities.
+    pub fn retained_metadata_bytes<Retention>() -> Option<usize> {
+        let entries = arc_layout(Layout::new::<PreparedStatementEntries>()).ok()?;
+        entries
+            .size()
+            .checked_add(Layout::new::<Retention>().size())
+    }
+
+    pub fn new(
+        mut definitions: Vec<(String, PreparedStatementDefinition)>,
+        mapping_retention: impl Send + Sync + 'static,
+    ) -> Result<Self, DuplicatePreparedStatementName> {
+        definitions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if definitions.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            drop(definitions);
+            return Err(DuplicatePreparedStatementName);
+        }
+        Ok(Self(Some(Arc::new(PreparedStatementEntries {
+            definitions,
+            _mapping_retention: Box::new(mapping_retention),
+        }))))
+    }
+
+    pub fn get(&self, name: &str) -> Option<&PreparedStatementDefinition> {
+        let definitions = &self.0.as_ref()?.definitions;
+        let index = definitions
+            .binary_search_by(|candidate| candidate.0.as_str().cmp(name))
+            .ok()?;
+        Some(&definitions[index].1)
+    }
+}
 
 pub type SessionTimeZone = novarocks_type_contract::TimeZoneKey;
 
@@ -34,6 +145,7 @@ pub struct SessionValue {
     pub(crate) properties: Vec<(String, String)>,
     pub(crate) time_zone: Option<SessionTimeZone>,
     pub(crate) presentation: ClientPresentationFamily,
+    prepared_statements: PreparedStatementSnapshot,
 }
 impl SessionValue {
     pub fn try_new(
@@ -63,8 +175,21 @@ impl SessionValue {
             properties,
             time_zone,
             presentation,
+            prepared_statements: PreparedStatementSnapshot::default(),
         })
     }
+    pub fn with_prepared_statements(
+        mut self,
+        prepared_statements: PreparedStatementSnapshot,
+    ) -> Self {
+        self.prepared_statements = prepared_statements;
+        self
+    }
+
+    pub fn prepared_statements(&self) -> &PreparedStatementSnapshot {
+        &self.prepared_statements
+    }
+
     pub fn presentation(&self) -> &ClientPresentationFamily {
         &self.presentation
     }
