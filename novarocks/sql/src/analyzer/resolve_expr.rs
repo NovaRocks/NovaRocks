@@ -3921,6 +3921,19 @@ fn coerce_selected_function_argument(
             control,
         );
     }
+    // Equal Arrow carriers can have different SQL declarations. Preserve the
+    // original expression and let the cast publish the selected declaration.
+    if expr.value_type.data_type() == value_type.data_type() {
+        return Ok(TypedExpr {
+            kind: ExprKind::Cast {
+                cast_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(expr),
+                target: value_type.data_type().clone(),
+                decimal_overflow_policy,
+            },
+            value_type,
+        });
+    }
     // Ordinary carrier coercion retains its checked integer-literal
     // normalization and runtime narrowing policy. The selected owner still
     // supplies the complete target domain, including nested field facts.
