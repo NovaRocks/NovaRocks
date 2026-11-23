@@ -51,7 +51,7 @@ bigint
 -- query 11
 -- types	varchar
 _col0
-int
+integer
 
 -- query 12
 -- types	timestamp(12)	timestamp(12)	timestamp(12)

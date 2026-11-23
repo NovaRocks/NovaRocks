@@ -1254,16 +1254,14 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
 fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // -> Utf8 (no args / Utf8 args)
-    for name in [
-        "version",
-        "database",
-        "current_user",
-        "user",
-        "uuid",
-        "typeof",
-    ] {
+    for name in ["version", "database", "current_user", "user", "uuid"] {
         add(m, name, Signature::new(vec![], TypeSpec::Utf8));
     }
+    add(
+        m,
+        "typeof",
+        Signature::new(vec![TypeSpec::AnyType], TypeSpec::Utf8),
+    );
     // cast: preserves first-arg type. (Special — analyzer's type_hint is
     // usually authoritative for cast, so the registry answer is rarely
     // used; we register defensively to avoid UnknownFunction.)

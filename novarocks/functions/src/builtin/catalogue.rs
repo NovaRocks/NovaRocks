@@ -1087,6 +1087,7 @@ fn scalar_result_nullable_from_types(
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
         // A NULL predicate fails the assertion; successful evaluations are true.
         "assert_true"
+        | "typeof"
         | "mv_group_row_id"
         | "state_all_zero"
         | "count_state_visible"

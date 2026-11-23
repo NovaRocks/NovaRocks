@@ -807,7 +807,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "try_variant_get",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
-    ("typeof", BuiltinDisposition::LoweredOnly),
+    (
+        "typeof",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
     (
         "upper",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),

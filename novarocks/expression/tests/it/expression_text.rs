@@ -188,7 +188,7 @@ fn shared_call_keeps_port_order_and_repeated_references() {
     assert!(result.batch.errors.is_empty());
     assert_eq!(
         result.batch.values.to_data(),
-        Int64Array::from(vec![8, 7, 5]).to_data()
+        Int32Array::from(vec![8, 7, 5]).to_data()
     );
 }
 
@@ -498,6 +498,58 @@ fn two_argument_if_preserves_the_selected_type_and_null_branch() {
     assert_eq!(
         result.batch.values.to_data(),
         Int32Array::from(vec![Some(7), None, None]).to_data()
+    );
+}
+
+#[test]
+fn typeof_describes_exact_types_and_demands_the_selected_argument_rows() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for (sql, expected) in [
+        ("typeof(NULL)", "unknown"),
+        ("typeof(INTEGER '7')", "integer"),
+        ("typeof(REAL '1.5')", "real"),
+        ("typeof('é中')", "varchar(2)"),
+        ("typeof(CAST(NULL AS DECIMAL(5,2)))", "decimal(5,2)"),
+        ("typeof(CAST(NULL AS TIMESTAMP(12)))", "timestamp(12)"),
+        (
+            "typeof(CAST(NULL AS ROW(a INTEGER, \"B\" VARCHAR(2))))",
+            "row(\"a\" integer, \"B\" varchar(2))",
+        ),
+        (
+            "typeof(CAST(NULL AS MAP(VARCHAR(3), ARRAY(DECIMAL(5,2)))))",
+            "map(varchar(3), array(decimal(5,2)))",
+        ),
+        ("typeof(JSON 'null')", "json"),
+    ] {
+        let result = constant(sql, &context);
+        assert_eq!(
+            result.batch.result_type,
+            FunctionValueType::new(DataType::Utf8, false)
+        );
+        assert_eq!(
+            result.batch.values.to_data(),
+            StringArray::from(vec![expected]).to_data(),
+            "{sql}"
+        );
+    }
+
+    let columns = [column("denominator", 1, DataType::Int32, true)];
+    let input = batch(
+        &columns,
+        vec![Arc::new(Int32Array::from(vec![Some(2), Some(0), None]))],
+    );
+    let typed = compile("typeof(10 / denominator)", &columns, &context);
+    let result = evaluate(&typed, &input);
+    let [error] = result.batch.errors.as_ref() else {
+        panic!("expected the original failure on the zero row");
+    };
+    assert_eq!(error.selected_ordinal(), 1);
+    assert_eq!(error.reason(), DataFailureReason::DivisionByZero);
+    assert_eq!(
+        result.batch.values.to_data(),
+        StringArray::from(vec![Some("integer"), None, Some("integer")]).to_data()
     );
 }
 

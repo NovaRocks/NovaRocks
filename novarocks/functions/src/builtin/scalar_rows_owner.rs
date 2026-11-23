@@ -42,6 +42,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operation {
     AssertTrue,
+    TypeOf,
     Uuid,
     Bar,
     Bucket,
@@ -51,6 +52,7 @@ pub(super) enum Operation {
 pub(super) fn operation(name: &str) -> Option<Operation> {
     Some(match name {
         "assert_true" => Operation::AssertTrue,
+        "typeof" => Operation::TypeOf,
         "uuid" => Operation::Uuid,
         "bar" => Operation::Bar,
         "width_bucket" => Operation::Bucket,
@@ -314,9 +316,12 @@ impl ScalarKernelInstance for ScalarRowsInstance {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        use super::{assert_true_owner, synopse_owner::TrinoSynopse, vector_distance_owner};
+        use super::{
+            assert_true_owner, synopse_owner::TrinoSynopse, typeof_owner, vector_distance_owner,
+        };
         match self.0 {
             Operation::AssertTrue => assert_true_owner::evaluate(input, control),
+            Operation::TypeOf => typeof_owner::evaluate(input, control),
             Operation::Vector(operation) => {
                 vector_distance_owner::evaluate(operation, input, control)
             }
@@ -402,7 +407,7 @@ impl ScalarRowsOwner {
             })?;
             let result_type = match self.operation {
                 Operation::AssertTrue => DataType::Boolean,
-                Operation::Uuid | Operation::Bar => DataType::Utf8,
+                Operation::TypeOf | Operation::Uuid | Operation::Bar => DataType::Utf8,
                 Operation::Bucket => DataType::Int64,
                 Operation::Vector(_) => DataType::Float64,
             };

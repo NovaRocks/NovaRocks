@@ -32,6 +32,7 @@ mod fixed_binary;
 pub use fixed_binary::preflight_fixed_binary_constructor_extent;
 #[path = "selected_copy/construction.rs"]
 mod construction;
+pub(crate) use construction::preflight_null_extent;
 pub use construction::{
     ValuesCopyKind, copy_nested_values_construction, copy_nested_values_for_layout_construction,
     preflight_arrow_node_structure_construction, preflight_empty_construction,

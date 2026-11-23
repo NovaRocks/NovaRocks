@@ -1030,7 +1030,7 @@ mod tests {
         }
     }
     #[test]
-    fn typed_json_typeof_keeps_the_original_logical_hint_and_clause_refusals() {
+    fn typed_json_typeof_preserves_bad_operands_and_clause_refusals() {
         let control = SqlCompileControl::unbounded();
         let ctx = context(&control);
         let scope = ctx.new_scope();
@@ -1056,17 +1056,15 @@ mod tests {
                     &ordinary_constructor("typeof", vec![typed], Span::new(0, 90)),
                     &scope,
                 )
-                .unwrap();
+                .unwrap_err();
             let expected = ctx
                 .analyze_expr(
                     &ordinary_constructor("typeof", vec![ordinary], Span::new(0, 90)),
                     &scope,
                 )
-                .unwrap();
-            assert_same_typed(&actual, &expected);
-            assert!(
-                matches!(actual.kind, ExprKind::Literal(LiteralValue::String(ref value)) if value == "json")
-            );
+                .unwrap_err();
+            assert_same_refusal(&actual, &expected);
+            assert_eq!(actual.kind(), AnalyzeErrorKind::UnknownColumn);
         }
         let mut unsupported_object = object_node;
         unsupported_object.unique_keys = true;
@@ -1189,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn typeof_cast_declaration_keeps_opaque_ordinary_and_quoted_children_unbound() {
+    fn typeof_cast_preserves_ordinary_and_quoted_child_resolution() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let control = SqlCompileControl::unbounded();
@@ -1224,24 +1222,14 @@ mod tests {
             };
             cast.expression = child.clone();
             resolutions.store(0, Ordering::SeqCst);
-            let actual = ctx.analyze_expr(&expression, &scope).unwrap();
-            assert_eq!(
-                actual.value_type,
-                FunctionValueType::new(DataType::Utf8, false)
-            );
-            assert!(
-                matches!(&actual.kind, ExprKind::Literal(LiteralValue::String(value)) if value == "integer")
-            );
-            assert_eq!(
-                resolutions.load(Ordering::SeqCst),
-                0,
-                "the original declaration shortcut must not bind its opaque child"
-            );
-            let direct = ctx.analyze_expr(&child, &scope).unwrap_err();
+            let actual = ctx.analyze_expr(&expression, &scope).unwrap_err();
             assert!(
                 resolutions.load(Ordering::SeqCst) > 0,
-                "the observation must see actual child resolution"
+                "typeof must resolve its child"
             );
+            let direct = ctx.analyze_expr(&child, &scope).unwrap_err();
+            assert_eq!(actual.kind(), direct.kind());
+            assert_eq!(actual.message(), direct.message());
             if !quoted {
                 assert_eq!(
                     direct.kind(),

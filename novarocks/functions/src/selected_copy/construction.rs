@@ -314,6 +314,20 @@ pub fn preflight_null_structure_construction<H>(
     Ok(facts)
 }
 
+/// Validate the exact null constructor within an already admitted scalar kernel.
+pub(crate) fn preflight_null_extent(
+    ty: &DataType,
+    rows: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<(), CopyError> {
+    let mut invoice = take_host::CopyInvoiceTotals::default();
+    let metadata = null_node(ty, rows, &mut invoice, false, &mut |boundary| {
+        if boundary { work.flush() } else { work.step() }.map_err(CopyError::Control)
+    })?;
+    invoice.finish(metadata)?;
+    work.flush().map_err(CopyError::Control)
+}
+
 pub(super) fn null_node<E: From<CopyError>>(
     ty: &DataType,
     rows: usize,

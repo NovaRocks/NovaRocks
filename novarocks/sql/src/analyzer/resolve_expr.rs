@@ -18,7 +18,7 @@
 #[cfg(test)]
 use std::sync::Arc;
 
-use crate::parser::{expression_for_diagnostic, type_for_diagnostic};
+use crate::parser::expression_for_diagnostic;
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_expression::typing::{NodeShape, ScalarTypingRoute, scalar_typing_route};
 use novarocks_parser::Span;
@@ -27,10 +27,7 @@ use novarocks_parser::printer::print_object_name;
 
 use crate::analysis::*;
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
-use novarocks_type_contract::{
-    ArithmeticOperator, CharacterKind, TemporalType, ValueKind, ValueTypeRef,
-    arithmetic_result_value_type_with_op,
-};
+use novarocks_type_contract::{ArithmeticOperator, arithmetic_result_value_type_with_op};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name};
@@ -2260,30 +2257,6 @@ impl<'a> super::AnalyzerContext<'a> {
         // Canonical calls borrow the actual original argument occurrences.
         let arg_exprs = original_arguments.to_vec();
 
-        if name == "typeof"
-            && let [argument] = arg_exprs.as_slice()
-        {
-            // A CAST declaration supplies the type without inspecting its
-            // child. Other expressions contribute their analyzed value type.
-            let declared_name = match *argument {
-                ast::Expr::Cast(cast) => typeof_cast_name(&cast.data_type, self.control)?,
-                argument => sql_expr_logical_type_name(argument),
-            };
-            let type_name = match declared_name {
-                Some(name) => name,
-                None => {
-                    let argument = self.analyze_expr(argument, scope)?;
-                    typeof_name(
-                        argument.value_type.data_type(),
-                        Some(argument.value_type.value_type()),
-                    )
-                }
-            };
-            return Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::String(type_name)),
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-            });
-        }
         if name == "array_agg" {
             if arg_exprs.is_empty() {
                 return Err(AnalyzeError::invalid_argument(
@@ -4387,97 +4360,18 @@ fn analyzer_aggregate_alias(name: &str) -> Option<&'static str> {
 }
 
 fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
-    typeof_name(dt, None)
-}
-
-fn typeof_name(dt: &DataType, declared: Option<&ValueTypeRef>) -> String {
-    if let Some(ValueKind::BoundedCharacter(character)) = declared.map(ValueTypeRef::kind) {
-        let name = match character.kind() {
-            CharacterKind::Char => "char",
-            CharacterKind::Varchar => "varchar",
-        };
-        return format!("{name}({})", character.length());
-    }
-    fn contains_temporal(ty: &ValueTypeRef) -> bool {
-        ty.temporal().is_some()
-            || (0..ty.child_count())
-                .any(|ordinal| ty.child_type_at(ordinal).is_some_and(contains_temporal))
-    }
-    render_typeof_name(dt, declared, declared.is_some_and(contains_temporal))
-}
-
-fn typeof_cast_name(
-    syntax: &ast::TypeName,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<Option<String>, AnalyzeError> {
-    if let ast::TypeKind::Generic(generic) = &syntax.kind
-        && !generic.arguments.is_empty()
-        && (generic.name.value.eq_ignore_ascii_case("char")
-            || generic.name.value.eq_ignore_ascii_case("varchar"))
-    {
-        let declared = super::helpers::sql_type_to_value_type(syntax, false, control)?;
-        return Ok(Some(typeof_name(
-            declared.data_type(),
-            Some(declared.value_type()),
-        )));
-    }
-
-    struct ContainsTemporal(bool);
-
-    impl ast::Visit for ContainsTemporal {
-        fn visit_type_name(&mut self, name: &ast::TypeName) {
-            if matches!(
-                name.kind,
-                ast::TypeKind::DateTime(_) | ast::TypeKind::Interval(_)
-            ) {
-                self.0 = true;
-            } else if !self.0 {
-                ast::walk_type_name(self, name);
-            }
-        }
-    }
-
-    let mut temporal = ContainsTemporal(false);
-    ast::Visit::visit_type_name(&mut temporal, syntax);
-    if !temporal.0 {
-        return Ok(sql_type_starrocks_name(syntax));
-    }
-    let declared = super::helpers::sql_type_to_value_type(syntax, false, control)?;
-    Ok(Some(render_typeof_name(
-        declared.data_type(),
-        Some(declared.value_type()),
-        true,
-    )))
-}
-
-fn render_typeof_name(dt: &DataType, declared: Option<&ValueTypeRef>, exact: bool) -> String {
-    if let Some(temporal) = declared.and_then(ValueTypeRef::temporal) {
-        return temporal_typeof_name(temporal);
-    }
-    let child_name = |ordinal, field: &DataType| {
-        render_typeof_name(
-            field,
-            declared.and_then(|ty| ty.child_type_at(ordinal)),
-            exact,
-        )
-    };
     match dt {
         DataType::Boolean => "boolean".to_string(),
         DataType::Int8 => "tinyint".to_string(),
         DataType::Int16 => "smallint".to_string(),
-        DataType::Int32 if exact => "integer".to_string(),
         DataType::Int32 => "int".to_string(),
         DataType::Int64 => "bigint".to_string(),
         DataType::UInt8 => "tinyint unsigned".to_string(),
         DataType::UInt16 => "smallint unsigned".to_string(),
         DataType::UInt32 => "int unsigned".to_string(),
         DataType::UInt64 => "bigint unsigned".to_string(),
-        DataType::Float32 if exact => "real".to_string(),
         DataType::Float32 => "float".to_string(),
         DataType::Float64 => "double".to_string(),
-        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) if exact => {
-            format!("decimal({p}, {s})")
-        }
         DataType::Decimal128(p, s) => format!("decimal128({}, {})", p, s),
         DataType::FixedSizeBinary(w) if *w == novarocks_types::largeint::LARGEINT_BYTE_WIDTH => {
             "largeint".to_string()
@@ -4490,87 +4384,29 @@ fn render_typeof_name(dt: &DataType, declared: Option<&ValueTypeRef>, exact: boo
         DataType::Timestamp(_, _) => "datetime".to_string(),
         DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
         DataType::List(field) => {
-            let child = child_name(0, field.data_type());
-            if exact {
-                format!("array({child})")
-            } else {
-                format!("array<{child}>")
-            }
+            format!("array<{}>", arrow_type_to_starrocks_name(field.data_type()))
         }
         DataType::Map(entries, _) => match entries.data_type() {
             DataType::Struct(fields) if fields.len() == 2 => {
-                let key = child_name(0, fields[0].data_type());
-                let value = child_name(1, fields[1].data_type());
-                if exact {
-                    format!("map({key}, {value})")
-                } else {
-                    format!("map<{key},{value}>")
-                }
+                let key = arrow_type_to_starrocks_name(fields[0].data_type());
+                let value = arrow_type_to_starrocks_name(fields[1].data_type());
+                format!("map<{key},{value}>")
             }
             _ => "map".to_string(),
         },
         DataType::Struct(fields) => {
-            let parts: Vec<String> = fields
+            let fields = fields
                 .iter()
-                .enumerate()
-                .map(|(ordinal, field)| {
-                    let ty = child_name(ordinal, field.data_type());
-                    if exact {
-                        let name = field.name().replace('"', "\"\"");
-                        format!("\"{name}\" {ty}")
-                    } else {
-                        format!("{} {ty}", field.name())
-                    }
+                .map(|field| {
+                    let ty = arrow_type_to_starrocks_name(field.data_type());
+                    format!("{} {ty}", field.name())
                 })
-                .collect();
-            let fields = parts.join(", ");
-            if exact {
-                format!("row({fields})")
-            } else {
-                format!("struct<{fields}>")
-            }
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("struct<{fields}>")
         }
         DataType::Null => "null".to_string(),
         other => format!("{:?}", other).to_lowercase(),
-    }
-}
-
-fn temporal_typeof_name(temporal: TemporalType) -> String {
-    let precision = temporal.precision().digits();
-    match temporal {
-        TemporalType::Time(_) => format!("time({precision})"),
-        TemporalType::TimeWithTimeZone(_) => format!("time({precision}) with time zone"),
-        TemporalType::Timestamp(_) => format!("timestamp({precision})"),
-        TemporalType::TimestampWithTimeZone(_) => {
-            format!("timestamp({precision}) with time zone")
-        }
-        TemporalType::Interval(qualifier) => {
-            use novarocks_type_contract::IntervalField;
-            let field = |kind| match kind {
-                IntervalField::Year => "year",
-                IntervalField::Month => "month",
-                IntervalField::Day => "day",
-                IntervalField::Hour => "hour",
-                IntervalField::Minute => "minute",
-                IntervalField::Second => "second",
-            };
-            let start = qualifier.start();
-            let end = qualifier.end();
-            let leading = qualifier.leading_precision();
-            let fractional = qualifier.fractional_precision().digits();
-            let start_name = field(start);
-            let end_name = field(end);
-            match (start, end) {
-                (IntervalField::Second, IntervalField::Second) => {
-                    format!("interval second({leading}, {fractional})")
-                }
-                (start, end) if start == end => format!("interval {start_name}({leading})"),
-                (_, IntervalField::Second) => {
-                    format!("interval {start_name}({leading}) to second({fractional})")
-                }
-                _ => format!("interval {start_name}({leading}) to {end_name}"),
-            }
-        }
     }
 }
 
@@ -4586,65 +4422,6 @@ fn starrocks_error_type_name(dt: &DataType) -> String {
         }
         other => arrow_type_to_starrocks_name(other),
     }
-}
-
-/// Some StarRocks logical types (BITMAP / HLL / JSON) are represented as
-/// BINARY or VARCHAR at the Arrow level but should be reported as their
-/// own type name by `typeof()`. Detect the logical type by inspecting the
-/// producing function in the AST. Also handles the bare `NULL` literal.
-fn sql_expr_logical_type_name(expr: &ast::Expr) -> Option<String> {
-    match expr {
-        ast::Expr::JsonObject(node) if super::is_supported_json_object_profile(node) => {
-            Some("json".to_string())
-        }
-        ast::Expr::JsonArray(node) if super::is_supported_json_array_profile(node) => {
-            Some("json".to_string())
-        }
-
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Null,
-            ..
-        }) => Some("null_type".to_string()),
-        ast::Expr::Literal(_) => None,
-        ast::Expr::FunctionCall(function) => {
-            let name = print_object_name(&function.name).to_ascii_lowercase();
-            let name = name.split('.').next_back().unwrap_or(name.as_str());
-            match name {
-                "parse_json" | "json_object" | "json_array" | "to_json" => Some("json".to_string()),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Render an SQL data type using StarRocks' canonical spelling, used by
-/// `typeof(CAST(x AS T))` so the result preserves the user-supplied SQL
-/// width (CHAR vs VARCHAR, DECIMAL128(p, s), etc.) that is otherwise lost
-/// once the cast target lowers to Arrow.
-fn sql_type_starrocks_name(sql_type: &ast::TypeName) -> Option<String> {
-    let name = match &sql_type.kind {
-        ast::TypeKind::Generic(value) => value.name.value.to_ascii_lowercase(),
-        _ => return None,
-    };
-    let canonical = match name.as_str() {
-        "tinyint" | "smallint" | "int" | "integer" | "bigint" | "float" | "double" | "boolean"
-        | "char" | "date" | "time" | "largeint" | "bitmap" | "hll" => name,
-        "varchar" | "character" | "string" | "text" => "varchar".to_string(),
-        "json" | "jsonb" => "json".to_string(),
-        "varbinary" | "binary" => "varbinary".to_string(),
-        "datetime" | "timestamp" => "datetime".to_string(),
-        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let rendered = type_for_diagnostic(sql_type).to_ascii_lowercase();
-            let suffix = rendered
-                .find('(')
-                .map(|index| &rendered[index..])
-                .unwrap_or("");
-            return Some(format!("decimal128{suffix}"));
-        }
-        _ => return None,
-    };
-    Some(canonical)
 }
 
 /// Render a short, user-facing display name for an expression operand. Used by
@@ -4901,9 +4678,8 @@ mod tests {
             error.message(),
             "Temporal clock precision must be in range [0, 12]: -17"
         );
-        // The original ordinary CAST declaration shortcut remains opaque.
         assert!(
-            analyze_projection_expr("SELECT typeof(CAST(CURRENT_TIMESTAMP AS INTEGER))").is_ok()
+            analyze_projection_expr("SELECT typeof(CAST(CURRENT_TIMESTAMP AS INTEGER))").is_err()
         );
         let query =
             &mut novarocks_parser::parser::parse_query("SELECT typeof(CAST(NULL AS INTEGER))")
@@ -4921,13 +4697,10 @@ mod tests {
             panic!("declaration CAST")
         };
         cast.expression = leaf;
-        let declared = ctx.analyze_expr(&column.expression, &scope).unwrap();
+        let error = ctx.analyze_expr(&column.expression, &scope).unwrap_err();
         assert_eq!(
-            declared.value_type,
-            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false)
-        );
-        assert!(
-            matches!(declared.kind, ExprKind::Literal(LiteralValue::String(name)) if name == "integer")
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::InvalidLiteral
         );
     }
 
@@ -5149,97 +4922,69 @@ mod tests {
     }
 
     #[test]
-    fn typeof_uses_exact_temporal_declarations_and_preserves_legacy_aliases() {
-        for (expression, expected) in [
-            ("CAST(missing_value AS TIMESTAMP(6))", "timestamp(6)"),
-            ("CAST(NULL AS TIMESTAMP(7))", "timestamp(7)"),
-            (
-                "TIMESTAMP '2024-01-01 12:00:00.123 UTC'",
-                "timestamp(3) with time zone",
-            ),
-            ("TIME '12:00:00.1234567 +05:30'", "time(7) with time zone"),
-            ("CAST(NULL AS TIME(12))", "time(12)"),
-            ("INTERVAL '1' DAY", "interval day(1)"),
-            ("INTERVAL '1' MONTH", "interval month(1)"),
-            ("INTERVAL '1.123' SECOND", "interval second(1, 3)"),
-            (
-                "INTERVAL '1 02:03:04.123' DAY TO SECOND",
-                "interval day(1) to second(6)",
-            ),
-            (
-                "CAST(NULL AS INTERVAL SECOND(2, 4))",
-                "interval second(2, 4)",
-            ),
-            (
-                "CAST(NULL AS MAP(TIME(7) WITH TIME ZONE, INTERVAL SECOND(1, 3)))",
-                "map(time(7) with time zone, interval second(1, 3))",
-            ),
-            (
-                "CAST(NULL AS ROW(ts TIMESTAMP(3) WITH TIME ZONE))",
-                "row(\"ts\" timestamp(3) with time zone)",
-            ),
-            (
-                "[TIMESTAMP '2024-01-01 00:00:00.1234567']",
-                "array(timestamp(7))",
-            ),
-            ("CAST(missing_value AS DATETIME)", "datetime"),
-            ("CAST(missing_value AS CHAR)", "char"),
+    fn typeof_preserves_its_original_value_binding() {
+        for argument in [
+            "CAST(NULL AS TIMESTAMP(7))",
+            "TIME '12:00:00.1234567 +05:30'",
+            "CAST(NULL AS INTERVAL SECOND(2, 4))",
+            "CAST(NULL AS MAP(TIME(7) WITH TIME ZONE, INTERVAL SECOND(1, 3)))",
+            "CAST(NULL AS ROW(ts TIMESTAMP(3) WITH TIME ZONE))",
+            "[TIMESTAMP '2024-01-01 00:00:00.1234567']",
+            "'é中'",
+            "CAST(NULL AS CHAR(3))",
+            "CAST(NULL AS VARCHAR(5))",
+            "CAST(NULL AS VARCHAR(2147483647))",
         ] {
-            let source = format!("SELECT typeof({expression})");
-            let typed = analyze_projection_expr(&source)
-                .unwrap_or_else(|error| panic!("{source}: {error}"));
-            let ExprKind::Literal(LiteralValue::String(actual)) = typed.kind else {
-                panic!("expected a type name: {source}");
-            };
-            assert_eq!(actual, expected, "{source}");
-        }
-    }
-
-    #[test]
-    fn typeof_preserves_the_width_of_bounded_character_values() {
-        for (expression, expected) in [
-            ("''", "varchar(0)"),
-            ("'é中'", "varchar(2)"),
-            ("CAST(only_missing_child AS CHAR(3))", "char(3)"),
-            ("CAST(only_missing_child AS VARCHAR(5))", "varchar(5)"),
-            ("CAST(only_missing_child AS VARCHAR(2147483647))", "varchar"),
-        ] {
-            let sql = format!("SELECT typeof({expression})");
-            let actual = analyze_projection_expr(&sql).expect("character type should resolve");
-            let ExprKind::Literal(LiteralValue::String(actual)) = actual.kind else {
-                panic!("expected a type name: {sql}");
-            };
-            assert_eq!(actual, expected, "{sql}");
-        }
-    }
-
-    #[test]
-    fn typeof_parentheses_do_not_change_metadata_argument_analysis() {
-        for (sql, expected) in [
-            (
-                "SELECT typeof(CAST(only_missing_child AS integer))",
-                "integer",
-            ),
-            (
-                "SELECT typeof((CAST(only_missing_child AS integer)))",
-                "integer",
-            ),
-            (
-                "SELECT typeof(((CAST(only_missing_child AS integer))))",
-                "integer",
-            ),
-            ("SELECT typeof(parse_json(only_missing_child))", "json"),
-            ("SELECT typeof((parse_json(only_missing_child)))", "json"),
-        ] {
-            let actual = analyze_projection_expr(sql).expect("metadata argument is opaque");
+            let direct = analyze_projection_expr(&format!("SELECT {argument}")).unwrap();
+            let inspected = analyze_projection_expr(&format!("SELECT typeof({argument})")).unwrap();
             assert_eq!(
-                actual.value_type,
-                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-                "{sql}"
+                typeof_argument(&inspected).value_type,
+                direct.value_type,
+                "{argument}"
             );
-            assert!(
-                matches!(actual.kind, ExprKind::Literal(LiteralValue::String(ref value)) if value == expected),
-                "{sql}"
+        }
+    }
+
+    fn typeof_argument(expression: &TypedExpr) -> &TypedExpr {
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected typeof call");
+        };
+        assert_eq!(name, "typeof");
+        let [argument] = args.as_slice() else {
+            panic!("expected one original typeof operand");
+        };
+        assert_eq!(
+            expression.value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false)
+        );
+        assert_eq!(
+            binding.selected.argument_types[0],
+            novarocks_functions::FunctionArgumentType::Value(argument.value_type.clone())
+        );
+        argument
+    }
+
+    #[test]
+    fn typeof_parentheses_preserve_original_argument_refusals() {
+        for sql in [
+            "SELECT typeof(CAST(only_missing_child AS integer))",
+            "SELECT typeof((CAST(only_missing_child AS integer)))",
+            "SELECT typeof(((CAST(only_missing_child AS integer))))",
+            "SELECT typeof(parse_json(only_missing_child))",
+            "SELECT typeof((parse_json(only_missing_child)))",
+        ] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownColumn,
+                "{sql}: {error}"
             );
         }
     }
@@ -5883,7 +5628,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_string_calls_keep_metadata_and_opaque_casts() {
+    fn canonical_string_calls_keep_metadata_and_typeof_resolves_children() {
         use crate::analyze_error::AnalyzeErrorKind;
         use novarocks_parser::build;
         let control = crate::compiler::SqlCompileControl::unbounded();
@@ -5934,14 +5679,9 @@ mod tests {
                 panic!("cast");
             };
             cast.expression = expression;
-            let actual = ctx.analyze_expr(&opaque, &scope).unwrap();
-            assert_eq!(
-                actual.value_type,
-                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false)
-            );
-            assert!(
-                matches!(actual.kind, ExprKind::Literal(LiteralValue::String(value)) if value == "integer")
-            );
+            let actual = ctx.analyze_expr(&opaque, &scope).unwrap_err();
+            assert_eq!(actual.kind(), missing_kind);
+            assert_eq!(actual.span(), Some(missing.span()));
         }
         let unknown = build::function(
             build::object_name(vec![build::ident("only_unknown_function", false)]).unwrap(),
@@ -6019,10 +5759,12 @@ mod tests {
                 "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32768))))"
             );
             let expression = analyze_projection_expr(&query).unwrap();
-            assert!(matches!(
-                expression.kind,
-                ExprKind::Literal(LiteralValue::String(value)) if value == "char(65536)"
-            ));
+            let novarocks_type_contract::ValueKind::BoundedCharacter(character) =
+                typeof_argument(&expression).value_type.value_type().kind()
+            else {
+                panic!("expected bounded character operand");
+            };
+            assert_eq!(character.length(), 65536);
 
             let query = novarocks_parser::parser::parse_query(&format!(
                 "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32769))))"
@@ -7875,16 +7617,9 @@ mod tests {
             assert_eq!(item.data_type(), &expected, "{literal}");
             let typeof_expression =
                 analyze_projection_expr(&format!("select typeof({literal})")).unwrap();
-            let ExprKind::Literal(LiteralValue::String(name)) = typeof_expression.kind else {
-                panic!("type name");
-            };
             assert_eq!(
-                name,
-                if expected == DataType::Int32 {
-                    "int"
-                } else {
-                    "bigint"
-                }
+                typeof_argument(&typeof_expression).value_type.data_type(),
+                &expected
             );
         }
         for literal in ["9223372036854775808", "-9223372036854775809"] {
@@ -9540,12 +9275,11 @@ mod tests {
             binding.semantics.intrinsic_row_error,
             novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated
         );
-        assert!(matches!(
-            analyze_projection_expr("select typeof(cast(1 as tinyint))")
-                .unwrap()
-                .kind,
-            ExprKind::Literal(LiteralValue::String(_))
-        ));
+        let typeof_call = analyze_projection_expr("select typeof(cast(1 as tinyint))").unwrap();
+        assert_eq!(
+            typeof_argument(&typeof_call).value_type.data_type(),
+            &DataType::Int8
+        );
         let negation = analyze_projection_expr("select -cast(1 as smallint)").unwrap();
         let operand = crate::common::negation::typed_operand(&negation)
             .expect("unary minus selects the dedicated scalar operator");

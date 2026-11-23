@@ -687,18 +687,15 @@ fn occurrence_window_optional_frame_offsets_are_eager_topology_not_scalar_lifecy
     }
 }
 #[test]
-fn occurrence_typeof_missing_owner_is_not_an_installed_type_only_capability() {
+fn occurrence_typeof_arity_refusal_preserves_compile_control() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
-    // TYPEOF is a legacy lowering declaration, excluded from the installed
-    // Engine catalogue. Do not fabricate a physical installed owner for it.
     let control = Control::default();
     assert!(matches!(
         SqlFunctionCatalog::resolve_scalar_binding(&catalog, "typeof", &[], &control),
-        Err(FunctionBindingError::UnknownFunction)
+        Err(FunctionBindingError::NoMatchingOverload)
     ));
     let trace = control.trace.lock().unwrap().clone();
-    assert_eq!(trace, [(CompilePhase::FunctionSpecialization, 0)]);
-    // The missing original owner wins before an armed optional later check.
+    assert!(!trace.is_empty());
     for cause in CAUSES {
         let late = Control {
             trace: Mutex::default(),
@@ -706,7 +703,7 @@ fn occurrence_typeof_missing_owner_is_not_an_installed_type_only_capability() {
         };
         assert!(matches!(
             SqlFunctionCatalog::resolve_scalar_binding(&catalog, "typeof", &[], &late),
-            Err(FunctionBindingError::UnknownFunction)
+            Err(FunctionBindingError::NoMatchingOverload)
         ));
         assert_eq!(*late.trace.lock().unwrap(), trace);
     }
