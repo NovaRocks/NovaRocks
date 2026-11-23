@@ -5348,6 +5348,29 @@ mod tests {
     }
 
     #[test]
+    fn using_rejects_repeated_column_names_at_the_second_identifier() {
+        let sql =
+            "SELECT * FROM (VALUES (1, 10)) a(id, x) JOIN (VALUES (1, 20)) b(id, y) USING (id, ID)";
+        let query = parse_native_query(sql).unwrap();
+        let Err(error) = analyze(&query, &TestCatalog, "default") else {
+            panic!("duplicate USING columns must fail analysis");
+        };
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::DuplicateColumnName
+        );
+        assert_eq!(
+            error.message(),
+            "Column 'ID' appears multiple times in USING clause"
+        );
+        let start = sql.rfind("ID").unwrap();
+        assert_eq!(
+            error.span(),
+            Some(novarocks_parser::Span::new(start, start + 2))
+        );
+    }
+
+    #[test]
     fn using_requires_a_real_column_binding_on_both_sides() {
         for sql in [
             "SELECT 1 FROM (VALUES (1)) l(other) JOIN (VALUES (2)) r(key) USING (key)",

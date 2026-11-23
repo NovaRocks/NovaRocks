@@ -182,9 +182,16 @@ impl<'a> super::AnalyzerContext<'a> {
                 // fragment-builder cannot resolve against the other
                 // child's scope.
                 let mut conds = Vec::new();
+                let mut seen = std::collections::HashSet::new();
                 for col_obj in columns {
                     self.check_control()?;
                     let col_name = col_obj.value.clone();
+                    if !seen.insert(col_name.to_lowercase()) {
+                        return Err(AnalyzeError::duplicate_column_name(
+                            format!("Column '{col_name}' appears multiple times in USING clause"),
+                            col_obj.span,
+                        ));
+                    }
                     let (left_id, left_type) =
                         current_scope.resolve_at(None, &col_name, col_obj.span)?;
                     let (right_id, right_type) =

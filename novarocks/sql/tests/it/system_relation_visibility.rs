@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use novarocks_sql::compiler::{
-    CatalogRelationFact, CatalogRelationNeed, SqlCompilation, SqlCompileControl, SqlCompileIntent,
-    SqlCompileProgress, SqlCompileProgressError, SqlCompiler, SqlFactBatch, SqlNeedBatch,
-    SqlStatementInput, SystemTableSnapshotFact,
+    CatalogRelationFact, CatalogRelationNeed, SqlCompilation, SqlCompileControl, SqlCompileError,
+    SqlCompileIntent, SqlCompileProgress, SqlCompileProgressError, SqlCompiler, SqlFactBatch,
+    SqlNeedBatch, SqlStatementInput, SystemTableSnapshotFact,
 };
 use novarocks_sql::system_table::{
     StatementSystemRelation, SystemTableBinding, SystemTableColumn, SystemTableDeclaration,
@@ -189,6 +189,26 @@ fn hidden_system_field_is_explicitly_resolvable_and_has_original_ordinal() {
             "SELECT * FROM system.metadata.fixture a JOIN system.metadata.fixture b USING(hidden_detail)"
         ).unwrap()),
         ["hidden_detail", "public_name", "public_state", "public_name", "public_state"],
+    );
+}
+
+#[test]
+fn using_rejects_a_repeated_hidden_system_column() {
+    let sql = "SELECT * FROM system.metadata.fixture a JOIN system.metadata.fixture b USING (hidden_detail, hidden_detail)";
+    let Err(SqlCompileProgressError::Compile(SqlCompileError::Analyze(error))) = lookup(sql) else {
+        panic!("duplicate hidden USING columns must fail analysis");
+    };
+    assert_eq!(
+        error.kind(),
+        novarocks_sql::analyze_error::AnalyzeErrorKind::DuplicateColumnName
+    );
+    let start = sql.rfind("hidden_detail").unwrap();
+    assert_eq!(
+        error.span(),
+        Some(novarocks_parser::Span::new(
+            start,
+            start + "hidden_detail".len()
+        ))
     );
 }
 

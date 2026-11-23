@@ -452,6 +452,10 @@ impl ClientQueryTiming {
             lifecycle.record_client_query_event(self.statement, event, time);
         }
     }
+
+    pub fn start_control(self) {
+        self.record(ClientQueryEvent::ControlStarted, ClientQueryTime::now());
+    }
 }
 
 #[derive(Clone)]
@@ -882,6 +886,7 @@ impl QueryControlService {
             session_query_admission: None,
             accepted_delivery_cut: None,
             timeout_ms,
+            control_start_pending: false,
             success_visibility_sealed: false,
             finished: false,
         }
@@ -1003,6 +1008,7 @@ impl QueryControlService {
             session_query_admission: None,
             accepted_delivery_cut: None,
             timeout_ms,
+            control_start_pending: class == WorkClass::Management,
             success_visibility_sealed: false,
             finished: false,
         })
@@ -1461,6 +1467,7 @@ pub struct GovernedQueryStatementOwner {
     session_query_admission: Option<SessionQueryAdmissionSlots>,
     accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
+    control_start_pending: bool,
     success_visibility_sealed: bool,
     finished: bool,
 }
@@ -1524,6 +1531,22 @@ impl GovernedQueryStatementOwner {
 
     pub const fn token(&self) -> StatementToken {
         self.registration.token()
+    }
+
+    /// Transfer the one timing observation to the original command execution edge.
+    pub fn take_control_timing(&mut self) -> Option<ClientQueryTiming> {
+        std::mem::take(&mut self.control_start_pending).then(|| ClientQueryTiming {
+            port: Arc::downgrade(&self.service.port()),
+            statement: self.token(),
+        })
+    }
+
+    pub fn observe_control_start(&mut self) {
+        if let Some(timing) = self.take_control_timing()
+            && self.scope.check().is_ok()
+        {
+            timing.start_control();
+        }
     }
 
     pub fn scope(&self) -> &WorkScope {

@@ -443,6 +443,25 @@ pub(super) fn run(
         epoch,
     )?;
     finishing_delivery(context, &actor)?;
+    with_original_query(
+        &actor,
+        "DROP CATALOG IF EXISTS trc7_absent_timing_probe",
+        |query| {
+            while query.open {
+                context.remaining("observe catalog control command")?;
+                query.get(&actor)?.assert_success()?;
+            }
+            let row = present(&actor, &query.id)?;
+            expect_terminal(&row, "FINISHED", None)?;
+            ensure!(
+                row["started"].is_string()
+                    && row["analysis_time_ms"].is_null()
+                    && row["planning_time_ms"].is_null(),
+                "catalog control action lost its own start or invented a SQL phase: {row:?}"
+            );
+            Ok(())
+        },
+    )?;
     let expired = expiry(context, &actor)?;
 
     failed_query(

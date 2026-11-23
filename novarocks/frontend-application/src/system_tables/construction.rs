@@ -38,7 +38,7 @@ pub(crate) fn control_error(cause: CompileControlError) -> SystemTableError {
     };
     ConnectorError::from_domain_static(kind, cause, "System table construction refused").into()
 }
-fn work_error(error: WorkError) -> SystemTableError {
+pub(super) fn work_error(error: WorkError) -> SystemTableError {
     control_error(CompileControlError::Source(
         novarocks_failure_contract::SharedFailureCause::new(error),
     ))

@@ -24,12 +24,15 @@ use novarocks_mv_application::readiness::{MvKeyedProjectionInventory, MvListedMa
 use novarocks_query_application::system_tables::{SystemTableError, SystemTableSnapshot};
 use novarocks_query_application::view::LocalViewSnapshot;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorRequestContext, DiscoveredRelation,
-    DiscoveryProjection, DiscoveryRelationKind,
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
+    DiscoveredRelation, DiscoveryProjection, DiscoveryRelationKind,
 };
 use novarocks_sql::system_table::SystemTableDeclaration;
-use novarocks_type_contract::ValueTypeStorageLifetime;
+use novarocks_type_contract::{CompileControlError, ValueTypeStorageLifetime};
+use novarocks_workload_control::{ResultPayloadBytes, ResultWindowAlias, WorkError};
 use std::sync::Arc;
+
+use super::construction::{array_layout, work_error};
 
 /// A single batch of requested scalar facts, transferred to the original CPU
 /// creator. It is never a complete, separately materialized system-table copy.
@@ -197,24 +200,71 @@ pub(crate) fn repository_error(
     ConnectorError::from_domain(kind, error).into()
 }
 
+#[derive(Debug)]
 pub(crate) struct MetadataNames {
     names: Vec<String>,
-    _retained: Option<novarocks_workload_control::ResultPayloadBytes>,
+    _retained: Option<ResultPayloadBytes>,
 }
 
 impl MetadataNames {
-    pub(crate) fn new(
-        names: Vec<String>,
-        retained: novarocks_workload_control::ResultPayloadBytes,
-    ) -> Self {
-        Self {
+    /// Keep the FE copies charged while any caller borrows the listing.
+    /// The provider still owns the original listing, pagination, and I/O.
+    pub(crate) fn copy<'a, I: Iterator<Item = &'a str>>(
+        window: &ResultWindowAlias,
+        context: &ConnectorRequestContext,
+        candidates: impl Fn() -> I,
+    ) -> Result<Self, SystemTableError> {
+        let control = context.original_operation_control();
+        control.check_active()?;
+        let overflow = || work_error(WorkError::ArithmeticOverflow);
+        let (count, text_bytes) =
+            candidates().try_fold((0usize, 0usize), |(count, size), name| {
+                control.check_active()?;
+                Ok::<_, SystemTableError>((
+                    count.checked_add(1).ok_or_else(overflow)?,
+                    size.checked_add(name.len()).ok_or_else(overflow)?,
+                ))
+            })?;
+        let extent = array_layout::<String>(count)?
+            .size()
+            .checked_add(text_bytes)
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(overflow)?;
+        let mut retained = window.reserve_payload_bytes(extent).map_err(work_error)?;
+        let exhausted = || super::control_error(CompileControlError::ResourceExhausted);
+        let mut names = Vec::new();
+        names.try_reserve_exact(count).map_err(|_| exhausted())?;
+        for name in candidates() {
+            control.check_active()?;
+            let mut copy = String::new();
+            copy.try_reserve_exact(name.len())
+                .map_err(|_| exhausted())?;
+            copy.push_str(name);
+            names.push(copy);
+        }
+        names.sort_unstable();
+        let mut removed_text = 0usize;
+        names.dedup_by(|later, earlier| {
+            if later == earlier {
+                removed_text += later.len();
+                true
+            } else {
+                false
+            }
+        });
+        retained
+            .release_destroyed(u64::try_from(removed_text).map_err(|_| overflow())?)
+            .map_err(work_error)?;
+        Ok(Self {
             names,
             _retained: Some(retained),
-        }
+        })
     }
 
     #[cfg(test)]
-    pub(super) fn fixture(names: Vec<String>) -> Self {
+    pub(super) fn fixture(mut names: Vec<String>) -> Self {
+        names.sort_unstable();
+        names.dedup();
         Self {
             names,
             _retained: None,
@@ -270,7 +320,7 @@ pub(crate) trait StatementSystemTableSource: Send + Sync {
         &self,
         catalog: &str,
         context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError>;
+    ) -> Result<MetadataNames, SystemTableError>;
     async fn schema_exists(
         &self,
         catalog: &str,
@@ -282,13 +332,13 @@ pub(crate) trait StatementSystemTableSource: Send + Sync {
         catalog: &str,
         schema: &str,
         context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError>;
+    ) -> Result<MetadataNames, SystemTableError>;
     async fn view_names(
         &self,
         catalog: &str,
         schema: &str,
         context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError>;
+    ) -> Result<MetadataNames, SystemTableError>;
     fn local_view_snapshot(&self) -> &LocalViewSnapshot;
     async fn materialized_views(
         &self,

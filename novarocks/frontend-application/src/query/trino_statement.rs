@@ -533,6 +533,7 @@ impl FrontendQuerySession {
             input.request,
             input.command,
             execution_owner,
+            statement.take_control_timing(),
         )) as TypedCommandWorker;
         self.finish_command_worker(
             statement,
@@ -582,6 +583,7 @@ impl FrontendQuerySession {
             input.cancellation.clone(),
             execution_owner,
             input.command.result_window_alias(),
+            statement.take_control_timing(),
             move || {
                 prepare_dml
                     .prepare_truncate(
@@ -1087,7 +1089,13 @@ impl FrontendQuerySession {
             .take_execution_owner()
             .expect("one original materialized view definition owner");
         let context = input.command.connector_context().clone();
+        let timing = statement.take_control_timing();
         let mut worker = Box::pin(async move {
+            if let Some(timing) = timing
+                && input.command.scope().check().is_ok()
+            {
+                timing.start_control();
+            }
             let result =
                 crate::mv::domain::show_create::execute(binding, context, &source, node.span)
                     .await
@@ -1121,6 +1129,7 @@ impl FrontendQuerySession {
             .expect("one original View owner");
         let view = self.service.command_executor.view.clone();
         let executor = self.service.query_blocking_executor.clone();
+        let timing = statement.take_control_timing();
         let mut worker = Box::pin(async move {
             let body = move |request: &RequestContext, context: &CommandContext| {
                 let command = match &command {
@@ -1135,6 +1144,9 @@ impl FrontendQuerySession {
                         ViewCommand::ShowCreate { name: &node.name }
                     }
                 };
+                if let Some(timing) = timing {
+                    timing.start_control();
+                }
                 view.execute_command(
                     command,
                     request.session().current_catalog(),
@@ -1185,7 +1197,13 @@ impl FrontendQuerySession {
             .take_execution_owner()
             .expect("one original CALL owner");
         let specialized = self.service.command_executor.clone();
+        let timing = statement.take_control_timing();
         let mut worker = Box::pin(async move {
+            if let Some(timing) = timing
+                && input.command.scope().check().is_ok()
+            {
+                timing.start_control();
+            }
             let result = specialized
                 .execute_maintenance_call(command, &input.request, &input.command)
                 .await
@@ -1296,6 +1314,7 @@ impl FrontendQuerySession {
             input.cancellation.clone(),
             execution_owner,
             Some(window),
+            statement.take_control_timing(),
             move || {
                 let mut constants = cpu_context.constant_port();
                 engine
@@ -1370,6 +1389,7 @@ impl FrontendQuerySession {
                 .take_execution_owner()
                 .expect("one original table-procedure owner"),
             Some(window),
+            None,
             move || {
                 prepare_trino_table_execute(
                     &maintenance,
@@ -1401,12 +1421,14 @@ impl FrontendQuerySession {
                 let executor = self.service.query_blocking_executor.clone();
                 let cancellation = input.cancellation.clone();
                 let connector = input.command.connector_context().clone();
+                let timing = statement.take_control_timing();
                 let mut worker = Box::pin(async move {
                     execute_synchronous_stage(
                         executor,
                         cancellation,
                         execution_owner,
                         window,
+                        timing,
                         move || prepared.execute(&connector).map_err(product_command_error),
                     )
                     .await
@@ -1466,6 +1488,7 @@ impl FrontendQuerySession {
                 .take_execution_owner()
                 .expect("same original ADD FILES owner"),
             Some(window),
+            statement.take_control_timing(),
             move || {
                 add_files_dml_result(
                     planner.prepare_resolved_add_files(

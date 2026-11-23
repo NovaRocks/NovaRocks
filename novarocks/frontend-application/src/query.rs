@@ -70,10 +70,10 @@ use novarocks_query_application::session::{
     StatementOutputShape, StatementSessionRequest,
 };
 use novarocks_query_application::session_control::{
-    GovernedQueryStatementBeginError, GovernedQueryStatementOwner, GovernedStatementAction,
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementActionReady,
-    StatementActionValue, StatementCommandCompletion, StatementCompletionProjection,
-    StatementToken,
+    ClientQueryTiming, GovernedQueryStatementBeginError, GovernedQueryStatementOwner,
+    GovernedStatementAction, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
+    StatementActionReady, StatementActionValue, StatementCommandCompletion,
+    StatementCompletionProjection, StatementToken,
 };
 use novarocks_query_application::session_effects::SessionEffects;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
@@ -740,6 +740,7 @@ async fn execute_synchronous_stage<T, F>(
     cancellation: QueryCancellationView,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
+    control_timing: Option<ClientQueryTiming>,
     call: F,
 ) -> Result<
     (
@@ -761,6 +762,9 @@ where
                         .to_owned(),
                 ))
             } else {
+                if let Some(timing) = control_timing {
+                    timing.start_control();
+                }
                 call()
             };
             (result, execution_owner, result_window)
@@ -785,6 +789,7 @@ async fn execute_prepared_dml_statement<P, Prepare, Execute>(
     cancellation: QueryCancellationView,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
+    control_timing: Option<ClientQueryTiming>,
     prepare: Prepare,
     execute: Execute,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
@@ -798,6 +803,7 @@ where
         cancellation.clone(),
         execution_owner,
         result_window,
+        control_timing,
         prepare,
     )
     .await?;
@@ -807,6 +813,7 @@ where
             cancellation,
             execution_owner,
             result_window,
+            None,
             move || execute(prepared),
         )
         .await
@@ -821,7 +828,13 @@ async fn execute_product_statement(
     request_context: RequestContext,
     command_context: CommandContext,
     execution_owner: WorkOwner,
+    control_timing: Option<ClientQueryTiming>,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String> {
+    if let Some(timing) = control_timing
+        && command_context.scope().check().is_ok()
+    {
+        timing.start_control();
+    }
     let result = router
         .execute(command, request_context, command_context)
         .await
@@ -1174,11 +1187,6 @@ impl FrontendQuerySession {
 
         let (governed, deadline) =
             self.begin_session_action(&source, matches!(&work, TrinoSessionWork::Mutation(_)))?;
-        self.service.query_control.record_client_query_event(
-            governed.token(),
-            novarocks_query_application::query_control::ClientQueryEvent::ControlStarted,
-            novarocks_query_application::query_control::ClientQueryTime::now(),
-        );
         let output = match work {
             TrinoSessionWork::Use { catalog, schema } => {
                 self.execute_session_use(
@@ -1236,8 +1244,9 @@ impl FrontendQuerySession {
     async fn execute_session_use(
         &self,
         namespace: SessionNamespace<'_>,
-        governed: GovernedQueryStatementOwner,
+        mut governed: GovernedQueryStatementOwner,
     ) -> StatementResult {
+        governed.observe_control_start();
         let cancellation =
             QueryCancellationView::governed(governed.cancellation().clone(), governed.timeout_ms());
         match self
@@ -2457,7 +2466,7 @@ mod tests {
                 assert!(*open, "test worker gate timed out");
                 Ok(StatementResult::Ok)
             };
-            execute_synchronous_stage(executor, cancellation, owner, Some(alias), produce)
+            execute_synchronous_stage(executor, cancellation, owner, Some(alias), None, produce)
                 .await
                 .map(|(result, owner, _window)| (result, owner))
         });

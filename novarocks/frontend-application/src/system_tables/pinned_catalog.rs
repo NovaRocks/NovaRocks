@@ -16,6 +16,8 @@
 // under the License.
 
 //! Typed catalog listings fenced by one statement-selected generation.
+use super::MetadataNames;
+use novarocks_query_application::system_tables::SystemTableError;
 use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
     ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorListViewsRequest,
@@ -25,6 +27,7 @@ use novarocks_spi::connector::{
     DiscoveredRelation, DiscoveryProjection, DiscoveryRelationKind, DiscoveryViewDomainUnavailable,
     ProviderMetadataCpuPort,
 };
+use novarocks_workload_control::ResultWindowAlias;
 use std::sync::Arc;
 
 pub(crate) struct PinnedCatalogListing {
@@ -48,7 +51,10 @@ impl PinnedCatalogListing {
             namespace: name.into(),
         }
     }
-    pub(crate) async fn schema_names(&self) -> Result<Vec<String>, ConnectorError> {
+    pub(crate) async fn schema_names(
+        &self,
+        window: &ResultWindowAlias,
+    ) -> Result<MetadataNames, SystemTableError> {
         let instance_id = self.pin.binding().descriptor().instance_id.clone();
         let namespaces = self
             .pin
@@ -67,12 +73,14 @@ impl PinnedCatalogListing {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "system namespace listing returned another catalog identity",
-            ));
+            )
+            .into());
         }
-        Ok(namespaces
-            .into_iter()
-            .map(|namespace| namespace.namespace.to_string())
-            .collect())
+        MetadataNames::copy(window, &self.context, || {
+            namespaces
+                .iter()
+                .map(|namespace| namespace.namespace.as_ref())
+        })
     }
     pub(crate) async fn schema_exists(&self, schema: &str) -> Result<bool, ConnectorError> {
         self.pin
@@ -84,7 +92,11 @@ impl PinnedCatalogListing {
             })
             .await
     }
-    pub(crate) async fn table_names(&self, schema: &str) -> Result<Vec<String>, ConnectorError> {
+    pub(crate) async fn table_names(
+        &self,
+        schema: &str,
+        window: &ResultWindowAlias,
+    ) -> Result<MetadataNames, SystemTableError> {
         let namespace = self.namespace(schema);
         let tables = self
             .pin
@@ -102,12 +114,12 @@ impl PinnedCatalogListing {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "system table listing returned another namespace identity",
-            ));
+            )
+            .into());
         }
-        Ok(tables
-            .into_iter()
-            .map(|table| table.table.to_string())
-            .collect())
+        MetadataNames::copy(window, &self.context, || {
+            tables.iter().map(|table| table.table.as_ref())
+        })
     }
     pub(crate) fn supports_discovery(&self) -> bool {
         self.pin.binding().metadata().supports_table_discovery()
@@ -211,7 +223,8 @@ impl PinnedCatalogListing {
         &self,
         schema: &str,
         cpu: Arc<dyn ProviderMetadataCpuPort>,
-    ) -> Result<Vec<String>, ConnectorError> {
+        window: &ResultWindowAlias,
+    ) -> Result<MetadataNames, SystemTableError> {
         let namespace = self.namespace(schema);
         let capability = self.pin.binding().view_metadata().ok_or_else(|| {
             ConnectorError::from_domain(
@@ -235,11 +248,11 @@ impl PinnedCatalogListing {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "system view listing returned another namespace identity",
-            ));
+            )
+            .into());
         }
-        Ok(views
-            .into_iter()
-            .map(|view| view.view.to_string())
-            .collect())
+        MetadataNames::copy(window, &self.context, || {
+            views.iter().map(|view| view.view.as_ref())
+        })
     }
 }

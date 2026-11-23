@@ -6,7 +6,7 @@ use crate::query::{
     internal_error,
 };
 use novarocks_query_application::{
-    query_control::{ClientQueryEvent, ClientQueryTime},
+    query_control::ClientQueryTime,
     session_error::QueryServiceError,
     sql::kill_query::{KillQueryCall, control_error},
 };
@@ -47,19 +47,14 @@ impl FrontendQuerySession {
         let root = statement
             .take_execution_owner()
             .expect("original kill_query command owns its Work");
-        let prepare_control = self.service.query_control.clone();
         let control = self.service.query_control.clone();
         let mut worker = Box::pin(execute_prepared_dml_statement(
             self.service.query_blocking_executor.clone(),
             input.cancellation.clone(),
             root,
             Some(window),
+            statement.take_control_timing(),
             move || {
-                prepare_control.record_client_query_event(
-                    token,
-                    ClientQueryEvent::ControlStarted,
-                    ClientQueryTime::now(),
-                );
                 call.evaluate(&source, &mut context.constant_port())
                     .map_err(RoutedExecutionError::Application)
             },

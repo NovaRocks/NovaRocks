@@ -2108,6 +2108,14 @@ pub(crate) mod external_listing_tests {
                 .collect())
         }
 
+        fn list_namespaces_async(
+            &self,
+            request: ConnectorListNamespacesRequest,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorNamespaceIdentity>, ConnectorError>>
+        {
+            Box::pin(async move { self.list_namespaces(request) })
+        }
+
         fn list_tables(
             &self,
             request: ConnectorListTablesRequest,
@@ -2124,6 +2132,14 @@ pub(crate) mod external_listing_tests {
                 namespace: request.namespace.namespace,
                 table: Arc::from("existing_table"),
             }])
+        }
+
+        fn list_tables_async(
+            &self,
+            request: ConnectorListTablesRequest,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorTableIdentity>, ConnectorError>>
+        {
+            Box::pin(async move { self.list_tables(request) })
         }
 
         fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {

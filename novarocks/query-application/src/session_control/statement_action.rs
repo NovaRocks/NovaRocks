@@ -577,6 +577,7 @@ impl ActionBody {
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         match (self, owner) {
             (Self::Sql(action), ActionOwner::Sql(owner)) => {
+                owner.observe_control_start();
                 let window = owner.result_window_alias();
                 let mut context = owner.registered_action_context(window.as_ref(), source);
                 action.poll_action(&mut context, cx)

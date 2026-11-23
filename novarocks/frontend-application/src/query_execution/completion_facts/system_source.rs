@@ -30,8 +30,8 @@ use crate::mv::domain::{
 };
 use crate::system_tables::{
     FrontendSystemTableProvider, ListableMaterializedViews, MaterializedViewFacts,
-    MaterializedViewInventory, PinnedCatalogListing, RowStage, StatementSystemTableSource,
-    repository_error,
+    MaterializedViewInventory, MetadataNames, PinnedCatalogListing, RowStage,
+    StatementSystemTableSource, repository_error,
 };
 use crate::wake::NotifyWake;
 use novarocks_mv_application::{
@@ -84,6 +84,7 @@ impl Drop for StoreLoan<'_> {
 type Operation = Pin<Box<dyn Future<Output = Response> + Send>>;
 enum Response {
     Names(Result<Vec<String>, SystemTableError>),
+    MetadataNames(Result<MetadataNames, SystemTableError>),
     Discovery(Result<Option<Box<DiscoveredRelation>>, SystemTableError>),
     Exists(Result<bool, SystemTableError>),
     Open(Result<Inventory, SystemTableError>),
@@ -178,7 +179,6 @@ pub(super) struct FrontendSystemTableFacts {
     owners: CompletionFactOwners,
     scope: StatementFactScope,
     local_views: novarocks_query_application::view::LocalViewSnapshot,
-    local_schemas: Vec<String>,
     notify: Arc<tokio::sync::Notify>,
     // Strong custody of the original admitted I/O owner; context itself is weak.
     _io: Option<Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>>,
@@ -261,14 +261,6 @@ impl FrontendSystemTableFacts {
         let local_views = scope
             .bindings
             .capture_local_views(|| owners.view_service.catalog_snapshot())?;
-        let local_schemas = owners
-            .catalog_service
-            .local()
-            .read()
-            .expect("local catalog snapshot lock")
-            .database_names()
-            .map(str::to_owned)
-            .collect();
         let io = scope
             .connector_context
             .io_admission()
@@ -277,7 +269,6 @@ impl FrontendSystemTableFacts {
             owners,
             scope,
             local_views,
-            local_schemas,
             notify: Arc::new(tokio::sync::Notify::new()),
             _io: io,
             io: Mutex::new(IoState::default()),
@@ -712,59 +703,19 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
         })
     }
 
-    fn catalog_names(&self) -> Result<crate::system_tables::MetadataNames, SystemTableError> {
+    fn catalog_names(&self) -> Result<MetadataNames, SystemTableError> {
         use novarocks_types::naming::{DEFAULT_CATALOG, SYSTEM_CATALOG};
-        use novarocks_workload_control::WorkError;
 
-        let control = self.scope.connector_context.original_operation_control();
-        control.check_active()?;
+        let window = self.scope.capacity.try_window_alias().map_err(work_error)?;
         let registry = self.owners.catalog_service.registry().read().map_err(|_| {
             SystemTableError::Internal("catalog declaration registry lock poisoned".into())
         })?;
-        let candidates = || {
+        MetadataNames::copy(&window, &self.scope.connector_context, || {
             registry
                 .names()
                 .filter(|name| !matches!(*name, DEFAULT_CATALOG | SYSTEM_CATALOG))
                 .chain([DEFAULT_CATALOG, SYSTEM_CATALOG])
-        };
-        let (count, text_bytes) =
-            candidates().try_fold((0usize, 0usize), |(count, size), name| {
-                control.check_active()?;
-                let add = |left: usize, right| {
-                    left.checked_add(right)
-                        .ok_or_else(|| work_error(WorkError::ArithmeticOverflow))
-                };
-                Ok::<_, SystemTableError>((add(count, 1)?, add(size, name.len())?))
-            })?;
-        let extent = std::alloc::Layout::array::<String>(count)
-            .ok()
-            .and_then(|layout| layout.size().checked_add(text_bytes))
-            .and_then(|size| u64::try_from(size).ok())
-            .ok_or_else(|| work_error(WorkError::ArithmeticOverflow))?;
-        let retained = self
-            .scope
-            .capacity
-            .try_window_alias()
-            .map_err(work_error)?
-            .reserve_payload_bytes(extent)
-            .map_err(work_error)?;
-        let exhausted = || {
-            crate::system_tables::control_error(
-                novarocks_type_contract::CompileControlError::ResourceExhausted,
-            )
-        };
-        let mut names = Vec::new();
-        names.try_reserve_exact(count).map_err(|_| exhausted())?;
-        for name in candidates() {
-            control.check_active()?;
-            let mut copy = String::new();
-            copy.try_reserve_exact(name.len())
-                .map_err(|_| exhausted())?;
-            copy.push_str(name);
-            names.push(copy);
-        }
-        names.sort_unstable();
-        Ok(crate::system_tables::MetadataNames::new(names, retained))
+        })
     }
 
     fn supports_discovery(&self, catalog: &str) -> Result<bool, SystemTableError> {
@@ -904,15 +855,21 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
         &self,
         catalog: &str,
         _: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError> {
+    ) -> Result<MetadataNames, SystemTableError> {
+        let window = self.scope.capacity.try_window_alias().map_err(work_error)?;
         if catalog == novarocks_types::naming::DEFAULT_CATALOG {
-            return Ok(self.local_schemas.clone());
+            let local = self.owners.catalog_service.local().read().map_err(|_| {
+                SystemTableError::Internal("local catalog snapshot lock poisoned".into())
+            })?;
+            return MetadataNames::copy(&window, &self.scope.connector_context, || {
+                local.database_names()
+            });
         }
         let pin = self.pin(catalog)?;
         self.install(Box::pin(async move {
-            Response::Names(pin.schema_names().await.map_err(Into::into))
+            Response::MetadataNames(pin.schema_names(&window).await)
         }))?;
-        let Response::Names(result) = self.receive().await else {
+        let Response::MetadataNames(result) = self.receive().await else {
             panic!("original namespace listing response");
         };
         result
@@ -936,7 +893,10 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
             return Ok(true);
         }
         if catalog == novarocks_types::naming::DEFAULT_CATALOG {
-            return Ok(self.local_schemas.iter().any(|name| name == schema));
+            let local = self.owners.catalog_service.local().read().map_err(|_| {
+                SystemTableError::Internal("local catalog snapshot lock poisoned".into())
+            })?;
+            return Ok(local.database_names().any(|name| name == schema));
         }
         let pin = self.pin(catalog)?;
         let schema = schema.to_owned();
@@ -953,13 +913,14 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
         catalog: &str,
         schema: &str,
         _: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError> {
+    ) -> Result<MetadataNames, SystemTableError> {
+        let window = self.scope.capacity.try_window_alias().map_err(work_error)?;
         let pin = self.pin(catalog)?;
         let schema = schema.to_owned();
         self.install(Box::pin(async move {
-            Response::Names(pin.table_names(&schema).await.map_err(Into::into))
+            Response::MetadataNames(pin.table_names(&schema, &window).await)
         }))?;
-        let Response::Names(result) = self.receive().await else {
+        let Response::MetadataNames(result) = self.receive().await else {
             panic!("original table listing response");
         };
         result
@@ -969,14 +930,15 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
         catalog: &str,
         schema: &str,
         _: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError> {
+    ) -> Result<MetadataNames, SystemTableError> {
+        let window = self.scope.capacity.try_window_alias().map_err(work_error)?;
         let pin = self.pin(catalog)?;
         let schema = schema.to_owned();
         let cpu = self.metadata_cpu(catalog, &pin)?;
         self.install(Box::pin(async move {
-            Response::Names(pin.view_names(&schema, cpu).await.map_err(Into::into))
+            Response::MetadataNames(pin.view_names(&schema, cpu, &window).await)
         }))?;
-        let Response::Names(result) = self.receive().await else {
+        let Response::MetadataNames(result) = self.receive().await else {
             panic!("original view listing response");
         };
         result

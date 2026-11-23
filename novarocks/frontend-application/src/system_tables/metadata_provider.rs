@@ -122,70 +122,84 @@ impl FrontendSystemTableProvider {
         } else {
             SystemTableBinding::Catalog(catalog.to_owned())
         };
-        let schemas = if builtin {
-            let mut names = self.registry.schemas(&binding);
-            names.push(INFORMATION_SCHEMA.into());
-            names
+        if builtin {
+            for schema in self
+                .registry
+                .schemas(&binding)
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(INFORMATION_SCHEMA))
+            {
+                if request.key_constraint.allows(schema_key, schema) {
+                    self.discover_schema(batches, request, &binding, catalog, schema, table, jdbc)
+                        .await?;
+                }
+            }
         } else if let Some(SystemTableKeyValues::Values(values)) =
             request.key_constraint.values_for(schema_key)
         {
-            let mut names = Vec::new();
             let mut inventory = None;
-            for name in values {
-                if name == INFORMATION_SCHEMA {
+            for schema in values {
+                let exists = if schema == INFORMATION_SCHEMA {
                     if !self.source.supports_discovery(catalog)? {
                         self.source.schema_names(catalog, request.context).await?;
                     }
-                    names.push(name.clone());
-                } else if self.source.can_probe_discovery_name(catalog, name)? {
-                    if self
-                        .source
-                        .schema_exists(catalog, name, request.context)
+                    true
+                } else if self.source.can_probe_discovery_name(catalog, schema)? {
+                    self.source
+                        .schema_exists(catalog, schema, request.context)
                         .await?
-                    {
-                        names.push(name.clone());
-                    }
                 } else {
                     if inventory.is_none() {
                         inventory = Some(self.source.schema_names(catalog, request.context).await?);
                     }
-                    if inventory
+                    inventory
                         .as_ref()
-                        .is_some_and(|listed| listed.contains(name))
-                    {
-                        names.push(name.clone());
-                    }
+                        .is_some_and(|listed| listed.contains(schema))
+                };
+                if exists {
+                    self.discover_schema(batches, request, &binding, catalog, schema, table, jdbc)
+                        .await?;
                 }
             }
-            names
         } else {
-            let mut names = self.source.schema_names(catalog, request.context).await?;
-            names.push(INFORMATION_SCHEMA.into());
-            names.sort_unstable();
-            names.dedup();
-            names
-        };
-
-        for schema in schemas {
-            if !request.key_constraint.allows(schema_key, &schema) {
-                continue;
-            }
-            if table == DiscoveryTable::Schemas {
-                let row = if jdbc {
-                    [Some(schema.as_str()), Some(catalog)]
-                } else {
-                    [Some(catalog), Some(schema.as_str())]
-                };
-                batches.push(&row).await?;
-            } else if builtin || schema == INFORMATION_SCHEMA {
-                self.discover_registered(batches, request, &binding, catalog, &schema, table, jdbc)
-                    .await?;
-            } else {
-                self.discover_provider(batches, request, catalog, &schema, table, jdbc)
-                    .await?;
+            let names = self.source.schema_names(catalog, request.context).await?;
+            let information_schema = (!names.iter().any(|name| name == INFORMATION_SCHEMA))
+                .then_some(INFORMATION_SCHEMA);
+            for schema in names.iter().map(String::as_str).chain(information_schema) {
+                if request.key_constraint.allows(schema_key, schema) {
+                    self.discover_schema(batches, request, &binding, catalog, schema, table, jdbc)
+                        .await?;
+                }
             }
         }
         Ok(())
+    }
+
+    async fn discover_schema(
+        &self,
+        batches: &mut Batches<'_>,
+        request: &SystemTableRequest<'_>,
+        binding: &SystemTableBinding,
+        catalog: &str,
+        schema: &str,
+        table: DiscoveryTable,
+        jdbc: bool,
+    ) -> Result<(), SystemTableError> {
+        if table == DiscoveryTable::Schemas {
+            let row = if jdbc {
+                [Some(schema), Some(catalog)]
+            } else {
+                [Some(catalog), Some(schema)]
+            };
+            batches.push(&row).await
+        } else if catalog == SYSTEM_CATALOG || schema == INFORMATION_SCHEMA {
+            self.discover_registered(batches, request, binding, catalog, schema, table, jdbc)
+                .await
+        } else {
+            self.discover_provider(batches, request, catalog, schema, table, jdbc)
+                .await
+        }
     }
 
     async fn discover_registered(
@@ -323,29 +337,24 @@ impl FrontendSystemTableProvider {
             {
                 continue;
             }
-            let mut names = match kind {
+            let listing = match kind {
                 DiscoveryRelationKind::Table
                     if table == DiscoveryTable::ViewDefinitions || catalog == DEFAULT_CATALOG =>
                 {
                     continue;
                 }
-                DiscoveryRelationKind::Table => {
+                DiscoveryRelationKind::Table => Some(
                     self.source
                         .table_names(catalog, schema, request.context)
-                        .await?
-                }
-                DiscoveryRelationKind::View if catalog == DEFAULT_CATALOG => self
-                    .source
-                    .local_view_snapshot()
-                    .names_in_namespace(catalog, schema)
-                    .map(str::to_owned)
-                    .collect(),
+                        .await?,
+                ),
+                DiscoveryRelationKind::View if catalog == DEFAULT_CATALOG => None,
                 DiscoveryRelationKind::View => match self
                     .source
                     .view_names(catalog, schema, request.context)
                     .await
                 {
-                    Ok(names) => names,
+                    Ok(names) => Some(names),
                     Err(SystemTableError::Provider(error))
                         if DiscoveryViewDomainUnavailable::is_reported(&error) =>
                     {
@@ -354,19 +363,25 @@ impl FrontendSystemTableProvider {
                     Err(error) => return Err(error),
                 },
             };
-            names.sort_unstable();
-            names.dedup();
-            for name in names {
-                if !request.key_constraint.allows(2, &name)
-                    || (exact_names && self.source.can_probe_discovery_name(catalog, &name)?)
+            let provider_names = listing
+                .iter()
+                .flat_map(|names| names.iter().map(String::as_str));
+            let local_names = listing.is_none().then(|| {
+                self.source
+                    .local_view_snapshot()
+                    .names_in_namespace(catalog, schema)
+            });
+            for name in provider_names.chain(local_names.into_iter().flatten()) {
+                if !request.key_constraint.allows(2, name)
+                    || (exact_names && self.source.can_probe_discovery_name(catalog, name)?)
                 {
                     continue;
                 }
                 if table == DiscoveryTable::Relations {
-                    emit_relation(batches, request, catalog, schema, &name, kind, jdbc).await?;
+                    emit_relation(batches, request, catalog, schema, name, kind, jdbc).await?;
                 } else if table == DiscoveryTable::ViewDefinitions && !projection.view_definition {
                     batches
-                        .push(&[Some(catalog), Some(schema), Some(&name), None])
+                        .push(&[Some(catalog), Some(schema), Some(name), None])
                         .await?;
                 } else {
                     self.emit_observed(
@@ -374,7 +389,7 @@ impl FrontendSystemTableProvider {
                         request,
                         catalog,
                         schema,
-                        &name,
+                        name,
                         Some(kind),
                         projection,
                         table,

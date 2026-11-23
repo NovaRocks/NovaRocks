@@ -132,9 +132,9 @@ impl StatementSystemTableSource for Source {
         &self,
         _catalog: &str,
         _context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError> {
+    ) -> Result<MetadataNames, SystemTableError> {
         self.call("schemas");
-        Ok(self.schemas.clone())
+        Ok(MetadataNames::fixture(self.schemas.clone()))
     }
     async fn schema_exists(
         &self,
@@ -151,24 +151,27 @@ impl StatementSystemTableSource for Source {
         _catalog: &str,
         schema: &str,
         _context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError> {
+    ) -> Result<MetadataNames, SystemTableError> {
         self.call(format!("tables:{schema}"));
         if let Some(error) = &self.table_error {
             return Err(error.clone().into());
         }
-        Ok(self.tables.clone())
+        Ok(MetadataNames::fixture(self.tables.clone()))
     }
     async fn view_names(
         &self,
         _catalog: &str,
         schema: &str,
         _context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, SystemTableError> {
+    ) -> Result<MetadataNames, SystemTableError> {
         self.call(format!("views:{schema}"));
         if let Some(stop) = &self.stop_after_view {
             stop.request_stop();
         }
-        self.views.clone().map_err(Into::into)
+        self.views
+            .clone()
+            .map(MetadataNames::fixture)
+            .map_err(Into::into)
     }
     fn local_view_snapshot(&self) -> &LocalViewSnapshot {
         &self.local
