@@ -75,6 +75,8 @@ enum ConnectorErrorCause {
         source: novarocks_failure_contract::SharedFailureCause,
     },
     Kind(ConnectorErrorKind),
+    ObservedCancellation,
+    ObservedDeadline,
     TableObjectBinding(ConnectorTableObjectBindingFailure),
     Identity(ConnectorIdentityError),
 }
@@ -89,8 +91,22 @@ pub struct ConnectorError {
 
 impl ConnectorError {
     pub fn new(kind: ConnectorErrorKind, message: impl Into<String>) -> Self {
+        Self::with_cause(ConnectorErrorCause::Kind(kind), message)
+    }
+
+    /// Report a stop observed on the original caller's cancellation signal.
+    pub fn observed_cancellation(message: impl Into<String>) -> Self {
+        Self::with_cause(ConnectorErrorCause::ObservedCancellation, message)
+    }
+
+    /// Report expiration observed against the original caller's deadline.
+    pub fn observed_deadline(message: impl Into<String>) -> Self {
+        Self::with_cause(ConnectorErrorCause::ObservedDeadline, message)
+    }
+
+    fn with_cause(cause: ConnectorErrorCause, message: impl Into<String>) -> Self {
         Self {
-            cause: ConnectorErrorCause::Kind(kind),
+            cause,
             message: message.into(),
             retryable_before_progress: false,
             cleanup_context: None,
@@ -186,6 +202,8 @@ impl ConnectorError {
     pub const fn kind(&self) -> ConnectorErrorKind {
         match &self.cause {
             ConnectorErrorCause::Kind(kind) => *kind,
+            ConnectorErrorCause::ObservedCancellation => ConnectorErrorKind::Cancelled,
+            ConnectorErrorCause::ObservedDeadline => ConnectorErrorKind::DeadlineExceeded,
             ConnectorErrorCause::Domain { kind, .. } => *kind,
             ConnectorErrorCause::Identity(_) => ConnectorErrorKind::InvalidRequest,
             ConnectorErrorCause::TableObjectBinding(
@@ -375,7 +393,14 @@ impl novarocks_failure_contract::FailureProjection for ConnectorError {
                 },
             )
         } else {
-            return self.kind().failure_fact();
+            let fact = self.kind().failure_fact();
+            return match self.cause {
+                ConnectorErrorCause::ObservedCancellation
+                | ConnectorErrorCause::ObservedDeadline => {
+                    FailureFact::stop_observation(fact.reason())
+                }
+                _ => fact,
+            };
         };
         FailureFact::new(
             class,
@@ -422,6 +447,35 @@ impl novarocks_failure_contract::FailureProjection for ConnectorErrorKind {
 mod failure_projection_tests {
     use super::*;
     use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn caller_stop_observations_preserve_the_original_connector_fact_and_detail() {
+        use novarocks_failure_contract::{FailureEvidence, SharedFailureCause};
+        for error in [
+            ConnectorError::observed_cancellation("caller stop"),
+            ConnectorError::observed_deadline("caller deadline"),
+        ] {
+            let originating = ConnectorError::new(error.kind(), error.message());
+            let fact = error.failure_fact();
+            assert_eq!(fact.reason(), originating.failure_fact().reason());
+            assert_eq!(fact.class(), FailureClass::Control);
+            assert_eq!(fact.evidence(), FailureEvidence::StopObservation);
+            assert_eq!(
+                originating.failure_fact().evidence(),
+                FailureEvidence::Originating
+            );
+            assert_eq!(error.to_string(), originating.to_string());
+            assert!(
+                !error
+                    .clone()
+                    .with_retryable_before_progress()
+                    .retryable_before_progress()
+            );
+            let shared = SharedFailureCause::new(error.clone());
+            assert_eq!(shared.failure_fact(), fact);
+            assert_eq!(shared.downcast_ref::<ConnectorError>(), Some(&error));
+        }
+    }
+
     #[test]
     fn unsupported_retains_its_connector_reason_without_reclassifying_a_domain_source() {
         let error = ConnectorError::new(

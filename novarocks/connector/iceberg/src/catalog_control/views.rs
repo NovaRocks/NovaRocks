@@ -705,14 +705,12 @@ fn ensure_request(
         ));
     }
     if context.is_cancelled() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Cancelled,
+        return Err(ConnectorError::observed_cancellation(
             "connector request was cancelled",
         ));
     }
     if std::time::Instant::now() >= context.deadline() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::DeadlineExceeded,
+        return Err(ConnectorError::observed_deadline(
             "connector request deadline elapsed",
         ));
     }
