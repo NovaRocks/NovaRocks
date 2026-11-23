@@ -8059,8 +8059,7 @@ mod tests {
     #[test]
     fn length_requires_an_explicit_varchar_cast_for_numeric_input() {
         let error = parse_and_analyze("select length(o_orderkey) from orders")
-            .err()
-            .expect("length requires a character argument");
+            .expect_err("length requires a character argument");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze("select length(CAST(o_orderkey AS VARCHAR)) from orders")
             .expect("length accepts the explicit text value");
@@ -8191,8 +8190,7 @@ mod tests {
     #[test]
     fn split_returns_varchar_array_after_explicit_argument_casts() {
         let error = parse_and_analyze("select split(o_orderkey, 1) from orders")
-            .err()
-            .expect("split requires character arguments");
+            .expect_err("split requires character arguments");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze(
             "select split(CAST(o_orderkey AS VARCHAR), CAST(1 AS VARCHAR)) from orders",
