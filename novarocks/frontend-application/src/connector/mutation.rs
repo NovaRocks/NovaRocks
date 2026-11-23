@@ -785,12 +785,20 @@ mod tests {
         use std::error::Error;
 
         let source = ConnectorError::new(ConnectorErrorKind::InvalidRequest, "original source");
-        let failure = ConnectorMutationFailure::new(
+        let unclassified = ConnectorMutationFailure::new(
             ConnectorMutationFailureKind::AlreadyExists,
             "original name collision",
-        )
-        .with_connector_source(source.clone())
-        .with_existing_object(ConnectorObjectKind::View);
+        );
+        let failure = unclassified
+            .clone()
+            .with_connector_source(source.clone())
+            .with_existing_object(ConnectorObjectKind::View);
+        assert_eq!(
+            failure,
+            unclassified
+                .with_existing_object(ConnectorObjectKind::View)
+                .with_connector_source(source.clone())
+        );
         let command =
             present_catalog_mutation_command_result(ResolvedCatalogMutation::KnownUncommitted {
                 failure,
