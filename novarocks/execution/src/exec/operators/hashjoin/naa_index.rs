@@ -524,5 +524,4 @@ impl NaaCandidates {
 }
 
 #[cfg(test)]
-#[path = "naa_index_tests.rs"]
 mod tests;

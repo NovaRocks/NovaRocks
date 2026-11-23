@@ -23,7 +23,7 @@ DROP TABLE IF EXISTS ${case_db}.t_delete_complex_where;
 CREATE TABLE ${case_db}.t_delete_complex_where (
   id INT,
   k INT,
-  label STRING
+  label VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_delete_complex_where VALUES ROW(1, 10, 'X'), ROW(2, 20, 'Y'), ROW(3, 30, 'Z');
 DELETE FROM ${case_db}.t_delete_complex_where WHERE LOWER(label) = 'y';

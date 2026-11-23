@@ -37,7 +37,7 @@ use crate::iceberg::spec::{
 use novarocks_spi::connector::ConnectorWriteAdmissionPurpose;
 
 fn register(metadata: &TableMetadata) -> IcebergReceiving {
-    let mut receiving = IcebergReceiving::with_compact_mode(true);
+    let mut receiving = IcebergReceiving::with_compact_mode(true, None);
     let original = binding(metadata);
     receiving
         .bind_rewritten_target(owner("unit", [1; 16]), original, metadata)
@@ -210,7 +210,7 @@ fn receiving_freezes_partition_values_for_every_row_delta_artifact() {
             base_version_digest: None,
             staged_metadata: None,
             data: data_branch_plan(),
-            deletes: vec![delete_branch_plan(IcebergWriteBranch::PositionDelete, None)],
+            deletes: vec![delete_branch_plan(IcebergWriteBranch::PositionDelete)],
         },
     )
     .unwrap();

@@ -22,11 +22,10 @@ pub use domain_resources::{
     value_type_decode_resource_facts,
 };
 pub use handle::{
-    CatalogTableHandle, ConnectorRelation, ConnectorRelationKind, TableExecuteProcedure,
+    CatalogTableHandle, ConnectorRelation, ConnectorRelationKind,
     ValidatedConnectorChangeWindowHandle, ValidatedConnectorMergeTableHandle,
-    ValidatedConnectorSystemTableReference, ValidatedConnectorTableExecuteHandle,
-    ValidatedConnectorTableFunctionHandle, ValidatedConnectorTableHandle,
-    ValidatedTransactionHandle,
+    ValidatedConnectorSystemTableReference, ValidatedConnectorTableFunctionHandle,
+    ValidatedConnectorTableHandle, ValidatedTransactionHandle,
 };
 pub use predicate::{
     ValidatedColumnHandle, decode_connector_expression, decode_domain, decode_tuple_domain,

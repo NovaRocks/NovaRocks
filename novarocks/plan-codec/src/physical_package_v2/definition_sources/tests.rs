@@ -367,6 +367,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         .into_iter()
         .zip([a, b])
         .map(|(id, output)| p::AggregateCall {
+            filter_root: None,
             id: p::AggregateCallId::new(id),
             binding: p::AggregateBinding {
                 state_interpretation: None,

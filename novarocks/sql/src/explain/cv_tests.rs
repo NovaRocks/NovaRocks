@@ -229,6 +229,7 @@ fn diagnostic_recursive_and_byte_work_preserve_entry_quantum_tail_refusals() {
 
     let case = TypedExpr {
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (0..320)
                 .map(|_| {

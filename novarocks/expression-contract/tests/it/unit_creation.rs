@@ -247,7 +247,6 @@ fn call_unit(environment: bool) -> BoundExprSet {
             SemanticParameterKey::StatementStartUtc,
             SemanticParameterKey::TimeZone,
             SemanticParameterKey::AllowThrowException,
-            SemanticParameterKey::DecimalOverflowToDouble,
             SemanticParameterKey::GroupConcatLegacy,
             SemanticParameterKey::GroupConcatMaxLen,
         ]
@@ -277,14 +276,9 @@ fn temporal_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
                 None,
                 integer(false),
                 ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                     expr: normal,
                     target: DataType::Int64,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: SemanticParameterRef {
-                        id: SemanticParameterId::new(0),
-                        expected_key: SemanticParameterKey::AllowThrowException,
-                    },
                 },
             )
             .unwrap();
@@ -512,7 +506,7 @@ fn each_actual_scratch_request_preserves_the_first_host_refusal_and_input_identi
         // These two independent vocabulary extents belong to the hidden
         // environment and temporal authors, rather than the graph Vec headers.
         let expected = match fixture {
-            2 => Some(Layout::array::<SemanticParameterKey>(6).unwrap()),
+            2 => Some(Layout::array::<SemanticParameterKey>(5).unwrap()),
             3 => Some(Layout::array::<TemporalCastKind>(3).unwrap()),
             _ => None,
         };

@@ -498,9 +498,7 @@ impl Fixture {
                 K::Cast(wire::CastExpression {
                     expr_id: Some(17),
                     target_carrier_type_id: Some(self.carrier_i64),
-                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
-                    allow_throw_exception: Some(allow()),
-                    array_failure_mode: None,
+                    cast_mode: Some(wire::TrinoCastMode::Implicit as i32),
                 }),
             ),
             expression(
@@ -535,6 +533,7 @@ impl Fixture {
                 12,
                 1,
                 K::CaseExpression(wire::CaseExpression {
+                    ieee_float_equality: Some(false),
                     operand_expr_id: None,
                     arms: vec![wire::WhenThen {
                         when_expr_id: Some(4),
@@ -774,6 +773,7 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     }
     let mut bad = valid.clone();
     bad[0].kind = Some(K::CaseExpression(wire::CaseExpression {
+        ieee_float_equality: Some(false),
         arms: vec![wire::WhenThen {
             when_expr_id: None,
             then_expr_id: Some(1),
@@ -1058,40 +1058,13 @@ fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
         K::Cast(wire::CastExpression {
             expr_id: Some(1),
             target_carrier_type_id: Some(fixture.carrier_i64),
-            decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
-            allow_throw_exception: Some(allow()),
-            array_failure_mode: None,
+            cast_mode: Some(wire::TrinoCastMode::Implicit as i32),
         }),
     );
     let mut defs = vec![cast, small().pop().unwrap()];
-    for reference in [
-        semantics::SemanticParameterRef {
-            id: None,
-            ..allow()
-        },
-        semantics::SemanticParameterRef {
-            id: Some(404),
-            ..allow()
-        },
-        semantics::SemanticParameterRef {
-            id: Some(5),
-            ..allow()
-        },
-        semantics::SemanticParameterRef {
-            expected_key: semantics::SemanticParameterKey::TimeZone as i32,
-            ..allow()
-        },
-    ] {
-        let Some(K::Cast(value)) = defs[0].kind.as_mut() else {
-            unreachable!()
-        };
-        value.allow_throw_exception = Some(reference);
-        assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_err());
-    }
     let Some(K::Cast(value)) = defs[0].kind.as_mut() else {
         unreachable!()
     };
-    value.allow_throw_exception = Some(allow());
     value.target_carrier_type_id = Some(404);
     assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_err());
     // None and present-empty timezone are separate same-unit full carriers.
@@ -1273,7 +1246,7 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
 }
 
 #[test]
-fn explicit_array_cast_wire_modes_require_known_values_and_actual_array_declarations() {
+fn cast_wire_modes_require_known_values_and_exact_result_carriers() {
     use wire::expression_definition::Kind as K;
     let fixture = Fixture::with_array_types(true);
     let carrier = fixture
@@ -1283,7 +1256,7 @@ fn explicit_array_cast_wire_modes_require_known_values_and_actual_array_declarat
         .find(|(_, ty)| &ty.value == fixture.types.value_type(12).unwrap().data_type())
         .map(|(id, _)| *id)
         .unwrap();
-    for mode in [None, Some(1), Some(2)] {
+    for mode in [1, 2, 3, 4] {
         let defs = vec![
             expression(0, 11, K::ValueId(3)),
             expression(
@@ -1292,42 +1265,46 @@ fn explicit_array_cast_wire_modes_require_known_values_and_actual_array_declarat
                 K::Cast(wire::CastExpression {
                     expr_id: Some(0),
                     target_carrier_type_id: Some(carrier),
-                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
-                    allow_throw_exception: Some(allow()),
-                    array_failure_mode: mode,
+                    cast_mode: Some(mode),
                 }),
             ),
         ];
         assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_ok());
         // The optional enum is never decoded as absent when a present tag is invalid.
-        for bad in [0, -1, 3, i32::MAX] {
+        for bad in [None, Some(0), Some(-1), Some(5), Some(i32::MAX)] {
             let mut forged = defs.clone();
             let Some(K::Cast(cast)) = forged[1].kind.as_mut() else {
                 unreachable!()
             };
-            cast.array_failure_mode = Some(bad);
+            cast.cast_mode = bad;
             assert!(run(&fixture, &forged, SOURCE, limits(), &Control::default()).is_err());
         }
-        if mode.is_some() {
-            let mut scalar = defs.clone();
-            scalar[0] = expression(0, 0, K::ValueId(0));
-            assert!(run(&fixture, &scalar, SOURCE, limits(), &Control::default()).is_err());
-            let mut scalar_result = defs.clone();
-            scalar_result[1].value_type_id = Some(1);
-            let Some(K::Cast(cast)) = scalar_result[1].kind.as_mut() else {
-                unreachable!()
-            };
-            cast.target_carrier_type_id = Some(fixture.carrier_i64);
-            assert!(
-                run(
-                    &fixture,
-                    &scalar_result,
-                    SOURCE,
-                    limits(),
-                    &Control::default()
-                )
-                .is_err()
-            );
-        }
+        let mut wrong_carrier = defs.clone();
+        let Some(K::Cast(cast)) = wrong_carrier[1].kind.as_mut() else {
+            unreachable!()
+        };
+        cast.target_carrier_type_id = Some(fixture.carrier_i64);
+        assert!(
+            run(
+                &fixture,
+                &wrong_carrier,
+                SOURCE,
+                limits(),
+                &Control::default()
+            )
+            .is_err()
+        );
+        let mut wrong_result = defs.clone();
+        wrong_result[1].value_type_id = Some(1);
+        assert!(
+            run(
+                &fixture,
+                &wrong_result,
+                SOURCE,
+                limits(),
+                &Control::default()
+            )
+            .is_err()
+        );
     }
 }

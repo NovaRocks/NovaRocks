@@ -23,12 +23,14 @@ mod fields;
 mod identity;
 mod intent;
 mod outcome;
+mod protocol;
 mod request;
 mod reuse;
 pub(crate) use request::{canonical_json, validate_document_expiry_update};
 pub use reuse::{
     AddedManifestAuthor, ManifestReuseBasis, ManifestReuseIndex, ManifestRewriteReuse,
 };
+pub(crate) use reuse::{ReusableStatisticsFile, StatisticsReuseBasis};
 
 pub use artifacts::{
     ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactReferences, ArtifactWriter,
@@ -48,6 +50,10 @@ pub use intent::{
 pub use outcome::{
     CleanupRemainingReason, IcebergCleanupReport, PublicationOutcome, PublicationReport,
     RemainingArtifact,
+};
+pub(crate) use protocol::{
+    CommitOperation, CommitProtocol, CommitStyle, WindowValidation, WriteSessionCommitProtocol,
+    WriterSchemaSpec, validate_target_branch,
 };
 pub use request::{
     BaseIdentity, FrozenBaseFacts, FrozenRequest, FrozenRequestParts, RequestShape,

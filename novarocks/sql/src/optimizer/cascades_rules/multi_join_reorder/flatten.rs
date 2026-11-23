@@ -65,6 +65,14 @@ pub(crate) fn flatten_join_chain(
     let mut predicates: Vec<(ScalarId, u32)> = Vec::new();
 
     for &pred in &raw_predicates {
+        if crate::optimizer::scalar_expr::can_fail(&memo.scalars, pred)
+            || crate::optimizer::scalar_expr::contains_non_replica_deterministic_function(
+                &memo.scalars,
+                pred,
+            )
+        {
+            return Ok(None);
+        }
         let mask = relation_mask(&memo.scalars, pred, &atom_cols);
         if mask.count_ones() < 2 {
             // A single-relation or constant predicate left inside a join
@@ -314,6 +322,7 @@ fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut Hash
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_scalar_column_ids(arena, *operand, out);

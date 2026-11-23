@@ -27,7 +27,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.ctas_db_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.ctas_db_${uuid0}.src_${uuid0} (
   id INT,
-  name STRING
+  name VARCHAR
 );
 
 -- query 3

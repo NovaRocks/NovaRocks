@@ -37,9 +37,9 @@ SELECT
     'Test1_BASIC_STRING_CONVERSION' as test_name,
     id,
     d50_15,
-    CAST(d50_15 AS STRING) as d50_as_string,
-    CONCAT('Value: ', CAST(d50_15 AS STRING)) as formatted_d50,
-    CONCAT('D50=', CAST(d50_15 AS STRING), ', D76=', CAST(d76_20 AS STRING)) as combined_string
+    CAST(d50_15 AS VARCHAR) as d50_as_string,
+    CONCAT('Value: ', CAST(d50_15 AS VARCHAR)) as formatted_d50,
+    CONCAT('D50=', CAST(d50_15 AS VARCHAR), ', D76=', CAST(d76_20 AS VARCHAR)) as combined_string
 FROM ${case_db}.decimal_string_test
 ORDER BY id;
 
@@ -48,11 +48,11 @@ SELECT
     'Test2_STRING_LENGTH_TRUNCATION' as test_name,
     id,
     d76_0,
-    CAST(d76_0 AS STRING) as d76_string,
-    LENGTH(CAST(d76_0 AS STRING)) as string_length,
-    STRLEFT(CAST(d76_0 AS STRING), 10) as left_10_chars,
-    STRRIGHT(CAST(d76_0 AS STRING), 10) as right_10_chars,
-    SUBSTR(CAST(d76_0 AS STRING), 1, 20) as first_20_chars
+    CAST(d76_0 AS VARCHAR) as d76_string,
+    LENGTH(CAST(d76_0 AS VARCHAR)) as string_length,
+    STRLEFT(CAST(d76_0 AS VARCHAR), 10) as left_10_chars,
+    STRRIGHT(CAST(d76_0 AS VARCHAR), 10) as right_10_chars,
+    SUBSTR(CAST(d76_0 AS VARCHAR), 1, 20) as first_20_chars
 FROM ${case_db}.decimal_string_test
 ORDER BY id;
 
@@ -61,12 +61,12 @@ SELECT
     'Test3_STRING_PATTERN_MATCHING' as test_name,
     id,
     d50_15,
-    CAST(d50_15 AS STRING) as decimal_string,
-    LOCATE('.', CAST(d50_15 AS STRING)) as decimal_point_position,
-    LOCATE('-', CAST(d50_15 AS STRING)) as negative_sign_position,
-    CASE WHEN CAST(d50_15 AS STRING) LIKE '%-%.%' THEN 'NEGATIVE_DECIMAL'
-         WHEN CAST(d50_15 AS STRING) LIKE '%.%' THEN 'POSITIVE_DECIMAL'
-         WHEN CAST(d50_15 AS STRING) LIKE '-%' THEN 'NEGATIVE_INTEGER'
+    CAST(d50_15 AS VARCHAR) as decimal_string,
+    LOCATE('.', CAST(d50_15 AS VARCHAR)) as decimal_point_position,
+    LOCATE('-', CAST(d50_15 AS VARCHAR)) as negative_sign_position,
+    CASE WHEN CAST(d50_15 AS VARCHAR) LIKE '%-%.%' THEN 'NEGATIVE_DECIMAL'
+         WHEN CAST(d50_15 AS VARCHAR) LIKE '%.%' THEN 'POSITIVE_DECIMAL'
+         WHEN CAST(d50_15 AS VARCHAR) LIKE '-%' THEN 'NEGATIVE_INTEGER'
          ELSE 'POSITIVE_INTEGER'
     END as number_type
 FROM ${case_db}.decimal_string_test
@@ -77,11 +77,11 @@ SELECT
     'Test4_REGEX_OPERATIONS' as test_name,
     id,
     d76_20,
-    CAST(d76_20 AS STRING) as decimal_string,
-    REGEXP_EXTRACT(CAST(d76_20 AS STRING), '^(-?[0-9]+)', 1) as integer_part,
-    REGEXP_EXTRACT(CAST(d76_20 AS STRING), '\.([0-9]+)$', 1) as decimal_part,
-    REGEXP_REPLACE(CAST(d76_20 AS STRING), '0+$', '') as trimmed_trailing_zeros,
-    REGEXP_EXTRACT(CAST(d76_20 AS STRING), '^(-?[0-9]+\.[0-9]{0,5})', 1) as first_5_decimal_places
+    CAST(d76_20 AS VARCHAR) as decimal_string,
+    REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '^(-?[0-9]+)', 1) as integer_part,
+    REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '\.([0-9]+)$', 1) as decimal_part,
+    REGEXP_REPLACE(CAST(d76_20 AS VARCHAR), '0+$', '') as trimmed_trailing_zeros,
+    REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '^(-?[0-9]+\.[0-9]{0,5})', 1) as first_5_decimal_places
 FROM ${case_db}.decimal_string_test
 WHERE d76_20 != 0
 ORDER BY id;
@@ -91,9 +91,9 @@ SELECT
     'Test5_STRING_SPLITTING' as test_name,
     id,
     d50_15,
-    CAST(d50_15 AS STRING) as original_string,
-    SPLIT_PART(CAST(ABS(d50_15) AS STRING), '.', 1) as integer_part_split,
-    SPLIT_PART(CAST(ABS(d50_15) AS STRING), '.', 2) as decimal_part_split,
+    CAST(d50_15 AS VARCHAR) as original_string,
+    SPLIT_PART(CAST(ABS(d50_15) AS VARCHAR), '.', 1) as integer_part_split,
+    SPLIT_PART(CAST(ABS(d50_15) AS VARCHAR), '.', 2) as decimal_part_split,
     CASE WHEN d50_15 < 0 THEN '-' ELSE '+' END as sign_part
 FROM ${case_db}.decimal_string_test
 ORDER BY id;
@@ -103,9 +103,9 @@ SELECT
     'Test6_STRING_FORMATTING' as test_name,
     id,
     d76_0,
-    CAST(d76_0 AS STRING) as original_string,
-    LPAD(CAST(ABS(d76_0) AS STRING), 80, '0') as zero_padded,
-    RPAD(CAST(d76_0 AS STRING), 20, ' ') as space_padded
+    CAST(d76_0 AS VARCHAR) as original_string,
+    LPAD(CAST(ABS(d76_0) AS VARCHAR), 80, '0') as zero_padded,
+    RPAD(CAST(d76_0 AS VARCHAR), 20, ' ') as space_padded
 FROM ${case_db}.decimal_string_test
 ORDER BY id;
 
@@ -115,8 +115,8 @@ SELECT
     id,
     category,
     d50_15,
-    UPPER(CONCAT(category, '_', CAST(d50_15 AS STRING))) as upper_formatted,
-    LOWER(CONCAT(category, '_', CAST(d50_15 AS STRING))) as lower_formatted
+    UPPER(CONCAT(category, '_', CAST(d50_15 AS VARCHAR))) as upper_formatted,
+    LOWER(CONCAT(category, '_', CAST(d50_15 AS VARCHAR))) as lower_formatted
 FROM ${case_db}.decimal_string_test
 ORDER BY id;
 
@@ -128,14 +128,14 @@ SELECT
     d76_20,
     d76_0,
     CONCAT_WS(' | ',
-        CONCAT('D50: ', CAST(d50_15 AS STRING)),
-        CONCAT('D76_20: ', CAST(d76_20 AS STRING)),
-        CONCAT('D76_0: ', CAST(d76_0 AS STRING))
+        CONCAT('D50: ', CAST(d50_15 AS VARCHAR)),
+        CONCAT('D76_20: ', CAST(d76_20 AS VARCHAR)),
+        CONCAT('D76_0: ', CAST(d76_0 AS VARCHAR))
     ) as pipe_separated,
     REPLACE(
-        REPLACE(CAST(d50_15 AS STRING), '.', '_DOT_'),
+        REPLACE(CAST(d50_15 AS VARCHAR), '.', '_DOT_'),
         '-', '_MINUS_'
     ) as symbol_replaced,
-    REVERSE(CAST(ABS(d50_15) AS STRING)) as reversed_string
+    REVERSE(CAST(ABS(d50_15) AS VARCHAR)) as reversed_string
 FROM ${case_db}.decimal_string_test
 ORDER BY id;

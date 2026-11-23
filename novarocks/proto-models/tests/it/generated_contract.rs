@@ -424,14 +424,12 @@ fn typed_connector_read_handles_use_provider_owned_payloads() {
         "novarocks.connector_read.ConnectorTableFunctionHandle",
         "novarocks.connector_read.ConnectorChangeWindowHandle",
         "novarocks.connector_read.ConnectorSystemTableReference",
-        "novarocks.connector_read.ConnectorTableExecuteHandle",
         "novarocks.connector_read.ConnectorMergeTableHandle",
         "novarocks.connector_read.DataSplit",
         "novarocks.connector_read.TableChangesSplitCategory",
         "novarocks.connector_read.ChangeWindowSplitCategory",
         "novarocks.connector_read.SystemManifestSplitCategory",
         "novarocks.connector_read.SystemRelationSplitCategory",
-        "novarocks.connector_read.RewritePositionDeleteFilesSplitCategory",
     ] {
         let message = pool
             .get_message_by_name(message_name)
@@ -459,7 +457,6 @@ fn typed_connector_read_handles_use_provider_owned_payloads() {
                 "table_changes",
                 "change_window",
                 "system_manifest",
-                "rewrite_position_delete_files",
                 "system_relation",
             ][..],
         ),
@@ -471,7 +468,6 @@ fn typed_connector_read_handles_use_provider_owned_payloads() {
                 "table_function",
                 "change_window",
                 "system_table",
-                "table_execute",
                 "merge_table",
             ][..],
         ),
@@ -492,6 +488,41 @@ fn typed_connector_read_handles_use_provider_owned_payloads() {
             "{message_name}.{oneof_name} variant set changed"
         );
     }
+
+    for (message, retired_name) in [
+        (
+            "novarocks.connector_read.ConnectorSplit",
+            "rewrite_position_delete_files",
+        ),
+        (
+            "novarocks.connector_read.CatalogTableHandle",
+            "table_execute",
+        ),
+    ] {
+        let descriptor = pool.get_message_by_name(message).unwrap();
+        assert!(
+            descriptor
+                .reserved_ranges()
+                .any(|range| range.contains(&14))
+        );
+        assert!(descriptor.reserved_names().any(|name| name == retired_name));
+    }
+    let relation = pool
+        .get_enum_by_name("novarocks.physical_package_v2.ConnectorRelationKind")
+        .unwrap();
+    assert!(relation.reserved_ranges().any(|range| range.contains(&5)));
+    assert!(
+        relation
+            .reserved_names()
+            .any(|name| name == "CONNECTOR_RELATION_KIND_TABLE_EXECUTE")
+    );
+    assert_eq!(
+        relation
+            .values()
+            .map(|value| value.number())
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4, 6]
+    );
 
     for private_message in [
         "SchemaTableName",

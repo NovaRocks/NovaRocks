@@ -742,6 +742,7 @@ fn build_key_shape_assert_join(
 fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
                 binary(column_ref(net_column), op, int_literal(0, DataType::Int64)),
@@ -1096,6 +1097,7 @@ fn build_final_coalesce_project(
 fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
     let case = TypedExpr {
         kind: ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
                 binary(
@@ -1115,7 +1117,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
     };
     TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(case),
             target: DataType::Int8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1383,7 +1385,7 @@ fn project_item_for_mapping(
                     validate_input_column(input_columns, &desc.action_column)?;
                     TypedExpr {
                         kind: ExprKind::Cast {
-                            array_failure_mode: None,
+                            cast_mode: None,
                             expr: novarocks_parser::ast::AstBox::new(column_ref(
                                 &desc.action_column,
                             )),
@@ -1399,7 +1401,7 @@ fn project_item_for_mapping(
                 }
                 JoinApplyActionProjection::ConstantInsert => TypedExpr {
                     kind: ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: None,
                         expr: novarocks_parser::ast::AstBox::new(int_literal(
                             i64::from(crate::common::CHANGE_OP_INSERT),
                             DataType::Int8,
@@ -2347,6 +2349,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 operand
                     .as_deref()
@@ -2574,6 +2577,7 @@ mod tests {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(operand) = operand {
                     collect_column_refs(operand, refs);

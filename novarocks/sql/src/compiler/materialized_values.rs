@@ -442,41 +442,17 @@ pub(crate) struct MaterializedSourceBorrow<'a> {
     // Expression addresses belong to this exact query borrow.
     _query: std::marker::PhantomData<&'a ast::Query>,
     expressions: std::collections::BTreeMap<usize, novarocks_functions::ConstantValue>,
-    write_assignments:
-        std::collections::BTreeMap<usize, std::borrow::Cow<'a, super::SqlWriteAssignmentSite>>,
 }
 
 impl<'a> MaterializedSourceBorrow<'a> {
+    #[cfg(test)]
     pub(crate) fn empty(_query: &'a ast::Query) -> Self {
         Self {
             _query: std::marker::PhantomData,
             expressions: std::collections::BTreeMap::new(),
-            write_assignments: std::collections::BTreeMap::new(),
         }
     }
-    pub(crate) fn insert_write_assignment(
-        &mut self,
-        expression: &'a ast::Expr,
-        assignment: std::borrow::Cow<'a, super::SqlWriteAssignmentSite>,
-        control: &super::SqlCompileControl,
-    ) -> Result<(), SqlCompileError> {
-        control.checkpoint(CompilePhase::Validate, 1)?;
-        if self
-            .write_assignments
-            .insert(std::ptr::from_ref(expression) as usize, assignment)
-            .is_some()
-        {
-            return Err(invalid(
-                "write source assignment repeats an original occurrence",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn has_expression(&self, expression: &ast::Expr) -> bool {
-        self.expressions
-            .contains_key(&(std::ptr::from_ref(expression) as usize))
-    }
+    #[cfg(test)]
     pub(crate) fn insert_context_constant(
         &mut self,
         expression: &'a ast::Expr,
@@ -501,26 +477,14 @@ impl MaterializedSourceBorrow<'_> {
     pub(crate) fn view(&self) -> MaterializedValuesLoan<'_> {
         MaterializedValuesLoan {
             expressions: &self.expressions,
-            write_assignments: &self.write_assignments,
         }
     }
 }
 #[derive(Clone, Copy)]
 pub(crate) struct MaterializedValuesLoan<'a> {
     expressions: &'a std::collections::BTreeMap<usize, novarocks_functions::ConstantValue>,
-    write_assignments:
-        &'a std::collections::BTreeMap<usize, std::borrow::Cow<'a, super::SqlWriteAssignmentSite>>,
 }
 impl<'a> MaterializedValuesLoan<'a> {
-    pub(crate) fn write_assignment_at(
-        self,
-        expression: &ast::Expr,
-    ) -> Option<&'a super::SqlWriteAssignmentSite> {
-        self.write_assignments
-            .get(&(std::ptr::from_ref(expression) as usize))
-            .map(std::borrow::Cow::as_ref)
-    }
-
     pub(crate) fn constant_at(
         self,
         expr: &ast::Expr,
@@ -569,7 +533,6 @@ impl MaterializedValues {
         Ok(MaterializedSourceBorrow {
             _query: std::marker::PhantomData,
             expressions,
-            write_assignments: std::collections::BTreeMap::new(),
         })
     }
 }

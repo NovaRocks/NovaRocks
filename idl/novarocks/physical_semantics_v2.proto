@@ -31,12 +31,13 @@ message SemanticParameter {
   reserved 2;
   reserved "statement_start_utc_micros";
   uint32 id = 1;
+  reserved 5;
+  reserved "decimal_overflow_to_double";
   // The value variant determines the one stable key. No separate key or type
   // may override it; runtime settings and process defaults do not fill gaps.
   oneof value {
     string time_zone = 3;
     bool allow_throw_exception = 4;
-    bool decimal_overflow_to_double = 5;
     bool group_concat_legacy = 6;
     sint64 group_concat_max_len = 7;
     StatementStartUtc statement_start_utc = 8;
@@ -51,7 +52,8 @@ enum SemanticParameterKey {
   SEMANTIC_PARAMETER_KEY_STATEMENT_START_UTC = 1;
   SEMANTIC_PARAMETER_KEY_TIME_ZONE = 2;
   SEMANTIC_PARAMETER_KEY_ALLOW_THROW_EXCEPTION = 3;
-  SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE = 4;
+  reserved 4;
+  reserved "SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE";
   SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_LEGACY = 5;
   SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_MAX_LEN = 6;
 }
@@ -95,7 +97,7 @@ message FrozenCall {
   RelationEffectContext relation_context = 9;
   CallEffects effects = 3;
   // Required for every real call. It belongs to the original SQL scope, not
-  // to CallEffects, ALLOW_THROW_EXCEPTION or DecimalOverflowToDouble. Typed
+  // to CallEffects or ALLOW_THROW_EXCEPTION. Typed
   // decode rejects absence, UNSPECIFIED and unknown values without a default.
   optional DecimalOverflowPolicy decimal_overflow_policy = 4;
 
@@ -196,6 +198,7 @@ enum SimpleArgumentControl {
   SIMPLE_ARGUMENT_CONTROL_WINDOW = 8;
   SIMPLE_ARGUMENT_CONTROL_TABLE = 9;
   SIMPLE_ARGUMENT_CONTROL_NO_ARGUMENTS = 10;
+  SIMPLE_ARGUMENT_CONTROL_TRY = 11;
 }
 enum InstanceState {
   INSTANCE_STATE_UNSPECIFIED = 0;

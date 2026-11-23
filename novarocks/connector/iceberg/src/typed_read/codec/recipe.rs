@@ -240,9 +240,6 @@ fn recipe_kind(
         Category::ChangeWindow => ConnectorReadRecipeSplitKind::ChangeWindow,
         Category::SystemManifest => ConnectorReadRecipeSplitKind::SystemManifest,
         Category::SystemRelation => ConnectorReadRecipeSplitKind::SystemRelation,
-        Category::RewritePositionDeleteFiles => {
-            ConnectorReadRecipeSplitKind::RewritePositionDeleteFiles
-        }
     }
 }
 

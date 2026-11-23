@@ -28,7 +28,7 @@ DROP TABLE IF EXISTS ${case_db}.t_filter_null_or_predicate;
 CREATE TABLE ${case_db}.t_filter_null_or_predicate (
   id INT,
   a INT,
-  b STRING
+  b VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_null_or_predicate VALUES
   ROW(1, 1, 'x'),

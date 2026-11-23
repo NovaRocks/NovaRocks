@@ -345,60 +345,73 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
 #[test]
 fn intrinsic_allow_throw_references_use_dedicated_v2_messages_and_presence() {
     let pool = pool();
-    for (name, number) in [
-        ("novarocks.physical_package_v2.BinaryExpression", 5),
-        ("novarocks.physical_package_v2.CastExpression", 4),
-    ] {
-        let descriptor = pool.get_message_by_name(name).unwrap();
-        let field = descriptor
-            .get_field_by_name("allow_throw_exception")
-            .unwrap();
-        assert_eq!(field.number(), number);
-        assert!(field.supports_presence());
-        assert!(!field.is_list());
-        let Kind::Message(reference) = field.kind() else {
-            panic!("intrinsic uses a typed reference");
-        };
-        assert_eq!(
-            reference.full_name(),
-            "novarocks.physical_semantics_v2.SemanticParameterRef"
-        );
-        assert_eq!(
-            reference.get_field_by_name("id").unwrap().kind(),
-            Kind::Uint32
-        );
+    let descriptor = pool
+        .get_message_by_name("novarocks.physical_package_v2.BinaryExpression")
+        .unwrap();
+    let field = descriptor
+        .get_field_by_name("allow_throw_exception")
+        .unwrap();
+    assert_eq!(field.number(), 5);
+    assert!(field.supports_presence());
+    assert!(!field.is_list());
+    let Kind::Message(reference) = field.kind() else {
+        panic!("intrinsic uses a typed reference");
+    };
+    assert_eq!(
+        reference.full_name(),
+        "novarocks.physical_semantics_v2.SemanticParameterRef"
+    );
+    assert_eq!(
+        reference.get_field_by_name("id").unwrap().kind(),
+        Kind::Uint32
+    );
+    assert!(
+        reference
+            .get_field_by_name("id")
+            .unwrap()
+            .supports_presence()
+    );
+}
+
+#[test]
+fn cast_mode_has_presence_and_retired_conversion_fields_remain_reserved() {
+    use novarocks_proto_models::physical_package_v2 as v2;
+    let descriptor = pool()
+        .get_message_by_name("novarocks.physical_package_v2.CastExpression")
+        .unwrap();
+    let mode = descriptor.get_field_by_name("cast_mode").unwrap();
+    assert_eq!(mode.number(), 6);
+    assert!(mode.supports_presence());
+    for tag in [3, 4, 5] {
         assert!(
-            reference
-                .get_field_by_name("id")
-                .unwrap()
-                .supports_presence()
+            descriptor
+                .reserved_ranges()
+                .any(|range| range.contains(&tag))
         );
     }
+    for name in ["decimal_overflow_policy", "allow_throw_exception"] {
+        assert!(descriptor.reserved_names().any(|reserved| reserved == name));
+    }
+
+    let cast = v2::CastExpression::decode(&[0x18, 2, 0x22, 0, 0x30, 3][..]).unwrap();
+    assert_eq!(cast.cast_mode, Some(v2::TrinoCastMode::Implicit as i32));
+    assert_eq!(cast.encode_to_vec(), [0x30, 3]);
+    assert!(v2::CastExpression::default().cast_mode.is_none());
 }
 
 #[test]
 fn intrinsic_reference_raw_wire_distinguishes_absence_zero_max_and_unknown_key() {
     use novarocks_proto_models::{physical_package_v2 as v2, physical_semantics_v2 as semantics};
-    // Independent raw field tags: v2 Binary field 5 and Cast field 4 wrap an
-    // explicit zero ID and the closed AllowThrowException key (3).
+    // Binary field 5 wraps an explicit zero ID and the closed ALLOW key (3).
     let binary = v2::BinaryExpression::decode(&[0x2a, 4, 8, 0, 16, 3][..]).unwrap();
-    let cast = v2::CastExpression::decode(&[0x22, 4, 8, 0, 16, 3][..]).unwrap();
     let zero = semantics::SemanticParameterRef {
         id: Some(0),
         expected_key: semantics::SemanticParameterKey::AllowThrowException as i32,
     };
     assert_eq!(binary.allow_throw_exception, Some(zero));
-    assert_eq!(cast.allow_throw_exception, Some(zero));
     assert_eq!(binary.encode_to_vec(), [0x2a, 4, 8, 0, 16, 3]);
-    assert_eq!(cast.encode_to_vec(), [0x22, 4, 8, 0, 16, 3]);
     assert!(
         v2::BinaryExpression::decode(&[][..])
-            .unwrap()
-            .allow_throw_exception
-            .is_none()
-    );
-    assert!(
-        v2::CastExpression::decode(&[][..])
             .unwrap()
             .allow_throw_exception
             .is_none()
@@ -427,7 +440,6 @@ fn intrinsic_reference_raw_wire_distinguishes_absence_zero_max_and_unknown_key()
                 ..Default::default()
             };
             let cast = v2::CastExpression {
-                allow_throw_exception: Some(reference),
                 ..Default::default()
             };
             assert_eq!(
@@ -470,9 +482,7 @@ fn intrinsic_scoped_refs_and_false_true_parameters_survive_one_package_carrier()
             kind: Some(v2::expression_definition::Kind::Cast(v2::CastExpression {
                 expr_id: Some(0),
                 target_carrier_type_id: Some(u32::MAX),
-                decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
-                allow_throw_exception: Some(reference(u32::MAX)),
-                array_failure_mode: None,
+                cast_mode: Some(v2::TrinoCastMode::Implicit as i32),
             })),
             ..Default::default()
         },

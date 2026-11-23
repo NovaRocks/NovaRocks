@@ -33,7 +33,7 @@ DROP TABLE IF EXISTS ${case_db}.t_v3_merge_matched_delete ;
 DROP TABLE IF EXISTS ${case_db}.s_v3_merge_matched_delete ;
 CREATE TABLE ${case_db}.t_v3_merge_matched_delete (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.t_v3_merge_matched_delete VALUES
   ROW(1, 'a'),
@@ -41,7 +41,7 @@ INSERT INTO ${case_db}.t_v3_merge_matched_delete VALUES
   ROW(3, 'c');
 CREATE TABLE ${case_db}.s_v3_merge_matched_delete (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.s_v3_merge_matched_delete VALUES
   ROW(2, 'b');

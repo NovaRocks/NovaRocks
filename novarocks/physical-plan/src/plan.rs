@@ -538,6 +538,7 @@ pub enum NestLoopJoinDistribution {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregateCall {
+    pub filter_root: Option<RootOrdinal>,
     pub id: AggregateCallId,
     pub binding: AggregateBinding,
     pub arguments: Box<[RootOrdinal]>,
@@ -717,6 +718,7 @@ pub struct JoinKey {
     pub left: RootOrdinal,
     pub right: RootOrdinal,
     pub null_safe: bool,
+    pub match_relation: novarocks_type_contract::JoinKeyMatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

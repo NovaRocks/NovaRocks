@@ -20,7 +20,8 @@ use crate::testkit::claim_author::{legacy_scalar_function, physical_call_request
 use crate::typing::{
     CarrierConversion, ChildForm, ChildTyping, Conversion, LiteralEmission, LiteralSyntax,
     LiteralValue, NodeShape, NodeTyping, ScalarTypingRoute, TypedLiteral, TypingContext,
-    TypingError, finish_call, scalar_typing_route, type_node,
+    TypingError, finish_call, scalar_typing_route, syntax_arithmetic, syntax_comparison,
+    syntax_distinct_from, type_node,
 };
 use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantPools;
@@ -95,6 +96,14 @@ impl<'a> TextTyping<'a> {
         let span = expr.span();
         let next = depth + 1;
         if let Some(call) = canonical_call(expr).map_err(TextError::UnsupportedSyntax)? {
+            if matches!(expr, ast::Expr::Coalesce(_)) {
+                let children = call
+                    .arguments
+                    .into_iter()
+                    .map(|arg| self.lower(arg, work, next))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return self.type_call(NodeShape::Coalesce, children, span, work);
+            }
             return self.lower_call(call.name, call.arguments, span, work, next);
         }
         if let Some((syntax, target)) =
@@ -163,31 +172,28 @@ impl<'a> TextTyping<'a> {
             }
             ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
                 let child = self.lower(&unary.expression, work, next)?;
-                crate::typing::validate_temporal_unary_plus(&child.typing.value_type)
-                    .map_err(|cause| typing_error(cause, span))?;
-                Err(legacy("unary plus", span))
+                let (_, mut children) =
+                    self.type_value(NodeShape::UnaryPlus, vec![child], span, work)?;
+                Ok(children.pop().expect("one unary plus operand"))
             }
             ast::Expr::Binary(binary) => {
-                use ast::BinaryOperator as O;
-                use novarocks_type_contract::ArithmeticOperator as A;
                 let left = self.lower(&binary.left, work, next)?;
                 let right = self.lower(&binary.right, work, next)?;
+                use novarocks_type_contract::ArithmeticOperator as A;
                 let operation = match binary.operator {
-                    O::Add => A::Add,
-                    O::Subtract => A::Subtract,
-                    O::Multiply => A::Multiply,
-                    O::Divide => A::Divide,
-                    O::Modulo => A::Modulo,
+                    ast::BinaryOperator::Add => A::Add,
+                    ast::BinaryOperator::Subtract => A::Subtract,
+                    ast::BinaryOperator::Multiply => A::Multiply,
+                    ast::BinaryOperator::Divide => A::Divide,
+                    ast::BinaryOperator::Modulo => A::Modulo,
                 };
-                let Some(operator) = crate::typing::temporal_binary_operator(
+                let operator = crate::typing::temporal_binary_operator(
                     operation,
                     &left.typing.value_type,
                     &right.typing.value_type,
                 )
                 .map_err(|cause| typing_error(cause, span))?
-                else {
-                    return Err(legacy("binary operator", span));
-                };
+                .unwrap_or_else(|| syntax_arithmetic(binary.operator));
                 self.type_call(NodeShape::Operator(operator), vec![left, right], span, work)
             }
             ast::Expr::AtLocal(node) => {
@@ -219,47 +225,59 @@ impl<'a> TextTyping<'a> {
                 self.qualified_cast(difference, target, span, work)
             }
             ast::Expr::Cast(cast) => {
-                let child = self.lower(&cast.expression, work, next)?;
-                let nullable = cast.safe || child.typing.value_type.nullable();
-                let native = crate::typing::declared_temporal_type(&cast.data_type)
-                    .map_err(|cause| typing_error(cause, span))?;
-                let declared = if let Some(native) = native {
-                    crate::typing::temporal_function_value_type(native, nullable)
-                        .map_err(|cause| typing_error(cause, span))?
+                use crate::typing::declaration::resolve_trino_type;
+                use novarocks_type_contract::TrinoCastMode;
+
+                let input = self.lower(&cast.expression, work, next)?;
+                let target =
+                    resolve_trino_type(&cast.data_type, true, work.control()).map_err(|cause| {
+                        let span = cause.span;
+                        let error = if let Some(control) = cause.control.clone() {
+                            TypingError::Control(control)
+                        } else {
+                            TypingError::TypeMismatch(cause.to_string())
+                        };
+                        typing_error(error, span)
+                    })?;
+                let mode = if cast.safe {
+                    TrinoCastMode::Try
                 } else {
-                    let ast::TypeKind::Generic(declaration) = &cast.data_type.kind else {
-                        return Err(legacy("CAST", span));
-                    };
-                    let carrier = if declaration.name.value.eq_ignore_ascii_case("date") {
-                        DataType::Date32
-                    } else if declaration.name.value.eq_ignore_ascii_case("varchar")
-                        && declaration.arguments.is_empty()
-                    {
-                        DataType::Utf8
-                    } else if declaration.name.value.eq_ignore_ascii_case("bigint")
-                        && declaration.arguments.is_empty()
-                    {
-                        DataType::Int64
-                    } else if declaration.name.value.eq_ignore_ascii_case("integer")
-                        && declaration.arguments.is_empty()
-                    {
-                        DataType::Int32
-                    } else {
-                        return Err(legacy("CAST", span));
-                    };
-                    FunctionValueType::new(carrier, nullable)
+                    TrinoCastMode::Explicit
                 };
+                let temporal_target = target
+                    .with_nullable(cast.safe || input.typing.value_type.nullable())
+                    .map_err(|cause| typing_error(cause.into(), span))?;
                 work.flush()?;
-                let binding = crate::typing::select_temporal_cast(
+                if let Some(binding) = crate::typing::select_temporal_cast(
                     self.context.catalog,
-                    &child.typing.argument(),
-                    &declared,
+                    &input.typing.argument(),
+                    &temporal_target,
                     cast.safe,
                     work.control(),
                 )
                 .map_err(|cause| typing_error(cause, span))?
-                .ok_or_else(|| legacy("CAST", span))?;
-                Ok(TextNode::call(binding, Some(declared), vec![child]))
+                {
+                    return Ok(TextNode::call(binding, Some(temporal_target), vec![input]));
+                }
+                let conversion = crate::typing::type_cast(
+                    &self.context,
+                    &input.typing.value_type,
+                    target,
+                    mode,
+                    work,
+                )
+                .map_err(|cause| typing_error(cause, span))?;
+                Ok(TextNode::cast(input, conversion))
+            }
+            ast::Expr::Subscript(subscript) => {
+                let base = self.lower(&subscript.base, work, next)?;
+                let index = self.lower(&subscript.index, work, next)?;
+                self.type_call(
+                    NodeShape::Operator(OperatorFunction::ArraySubscript),
+                    vec![base, index],
+                    span,
+                    work,
+                )
             }
             ast::Expr::Logical(logical) => {
                 let operator = logical.operator;
@@ -283,6 +301,26 @@ impl<'a> TextTyping<'a> {
                 Ok(TextNode::new(ty, TextKind::Logical(operator, children)))
             }
             ast::Expr::Predicated(node) => match &node.predicate {
+                ast::Predicate::Comparison(predicate) => {
+                    let left = self.lower(&node.value, work, next)?;
+                    let right = self.lower(&predicate.right, work, next)?;
+                    self.type_call(
+                        NodeShape::Operator(syntax_comparison(predicate.operator)),
+                        vec![left, right],
+                        span,
+                        work,
+                    )
+                }
+                ast::Predicate::DistinctFrom(predicate) => {
+                    let left = self.lower(&node.value, work, next)?;
+                    let right = self.lower(&predicate.right, work, next)?;
+                    self.type_call(
+                        NodeShape::Operator(syntax_distinct_from(predicate.negated)),
+                        vec![left, right],
+                        span,
+                        work,
+                    )
+                }
                 ast::Predicate::IsNull(predicate) => {
                     let child = self.lower(&node.value, work, next)?;
                     let (ty, mut children) =
@@ -703,9 +741,9 @@ impl TextNode {
                 ExprKind::Cast {
                     expr,
                     target: ty.data_type().clone(),
-                    decimal_overflow_policy: conversion.decimal_overflow_policy,
-                    allow_throw_exception: context.allow_throw_exception,
-                    array_failure_mode: None,
+                    cast_mode: conversion
+                        .mode
+                        .unwrap_or(novarocks_type_contract::TrinoCastMode::Implicit),
                 }
             }
             TextKind::IsNull(input, negated) => ExprKind::IsNull {
@@ -741,6 +779,7 @@ impl TextNode {
                     .map(|child| child.emit(draft, constants, context, work))
                     .transpose()?;
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then,
                     else_expr,
@@ -766,13 +805,33 @@ impl TextNode {
                         constant: argument.typing.constant.clone(),
                     });
                 }
+                let widened_target;
+                let expected_result = if changed
+                    && binding.selected.overload.as_str()
+                        == novarocks_functions::builtin::value_conversion::OPERATOR_DECIMAL_FLOAT_COERCION
+                {
+                    let [FunctionArgument::Value { value_type, .. }] = &request_args[..] else {
+                        return Err(typing_error(
+                            TypingError::InvalidShape("operator coercion requires its original operand"),
+                            novarocks_parser::SYNTHETIC,
+                        ));
+                    };
+                    widened_target = expected_result
+                        .as_ref()
+                        .map(|target| target.with_nullable(target.nullable() || value_type.nullable()))
+                        .transpose()
+                        .map_err(TextError::ValueType)?;
+                    widened_target.as_ref()
+                } else {
+                    expected_result.as_ref()
+                };
                 let revised;
                 let binding = if changed {
                     work.flush()?;
                     let request = novarocks_functions::FunctionBindingRequest {
                         arguments: &request_args,
                         logical_argument_count: request_args.len(),
-                        expected_result_type: expected_result.as_ref(),
+                        expected_result_type: expected_result,
                     };
                     revised = context
                         .functions
@@ -838,7 +897,7 @@ impl TextNode {
                 let id = draft.add(None, ty, ExprKind::FunctionCall { function, args })?;
                 let request = physical_call_request(
                     &request_args,
-                    expected_result.as_ref(),
+                    expected_result,
                     context.constant_policy,
                     constants,
                 );

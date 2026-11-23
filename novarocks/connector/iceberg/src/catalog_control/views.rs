@@ -1372,7 +1372,10 @@ mod declaration_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, TimeUnit};
     use novarocks_spi::connector::ConnectorViewColumn;
-    use novarocks_type_contract::{FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime};
+    use novarocks_type_contract::{
+        CharacterKind, CharacterType, FunctionValueType, ValueKind, ValueLayout, ValueLogicalType,
+        ValueTypeRef, ValueTypeStorageLifetime,
+    };
 
     fn definition(value: FunctionValueType) -> ConnectorViewDefinition {
         let mut result = super::tests::novarocks_definition(
@@ -1579,6 +1582,58 @@ mod declaration_tests {
                     .kind(),
                 value.value_type().kind()
             );
+        }
+    }
+
+    fn character_view_value(kind: CharacterKind, list: bool) -> FunctionValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        let character = ValueTypeRef::try_new(
+            ValueKind::BoundedCharacter(CharacterType::new(kind, 6).unwrap()),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let (declaration, layout) = if list {
+            (
+                ValueTypeRef::try_new(ValueKind::List(character), true, storage.clone()).unwrap(),
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            )
+        } else {
+            (character, DataType::Utf8)
+        };
+        FunctionValueType::try_from_value(
+            declaration,
+            ValueLayout::try_new(&layout, storage).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn icebergs_standard_view_schema_publishes_unbounded_varchar_recursively() {
+        for nested in [false, true] {
+            let value = character_view_value(CharacterKind::Varchar, nested);
+            let stored = metadata(prepared(value), 1);
+            let observed = load(&stored).unwrap();
+            let ty = observed.definition.columns[0].value_type.value_type();
+            if nested {
+                let ValueKind::List(child) = ty.kind() else {
+                    panic!("expected a persisted list");
+                };
+                assert_eq!(child.kind(), &ValueKind::String);
+            } else {
+                assert_eq!(ty.kind(), &ValueKind::String);
+            }
+        }
+    }
+
+    #[test]
+    fn iceberg_view_char_is_unsupported_before_preparing_publication() {
+        for nested in [false, true] {
+            let original = character_view_value(CharacterKind::Char, nested);
+            let error = prepare_definition(&definition(original), None, &[], &request().context)
+                .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert!(error.message().contains("view types do not support CHAR"));
         }
     }
     #[test]

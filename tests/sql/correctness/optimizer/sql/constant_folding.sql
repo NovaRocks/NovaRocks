@@ -19,7 +19,7 @@
 -- Test Objective:
 -- 1. FoldConstant evaluates constant scalar sub-trees during LogicalNormalize,
 --    so the plan carries literals instead of arithmetic / cast / function nodes.
--- 2. A string literal compared against a DATE column folds to the same scan
+-- 2. An explicitly cast string compared against a DATE column folds to the same scan
 --    predicate the typed DATE literal produces. That equality is the point of
 --    the rule: static-predicate lowering only accepts a bare literal, so the
 --    unfolded CAST shape never reached partition / row-group / page pruning.
@@ -34,9 +34,9 @@
 DROP TABLE IF EXISTS ${case_db}.t_fold_dates;
 CREATE TABLE ${case_db}.t_fold_dates (id INT, dt DATE);
 INSERT INTO ${case_db}.t_fold_dates VALUES
-    ROW(1, '2019-12-31'),
-    ROW(2, '2020-01-01'),
-    ROW(3, '2020-01-02');
+    ROW(1, DATE '2019-12-31'),
+    ROW(2, DATE '2020-01-01'),
+    ROW(3, DATE '2020-01-02');
 
 -- ---------------------------------------------------------------------------
 -- 1. Constant arithmetic collapses to one literal.
@@ -46,21 +46,20 @@ INSERT INTO ${case_db}.t_fold_dates VALUES
 SELECT 40000 + 2000 + 96;
 
 -- ---------------------------------------------------------------------------
--- 2. A constant function call collapses to its result literal. The string
---    argument binds to the DATE overload, so the intermediate cast folds to a
---    Date32 literal first and the whole call folds afterwards.
+-- 2. A constant function call collapses to its result literal. The DATE cast
+--    folds first, followed by the function call.
 -- ---------------------------------------------------------------------------
 -- @explain_contains=['2020-01' AS
 -- @explain_not_contains=[date_format(
-SELECT date_format('2020-01-01', '%Y-%m');
+SELECT date_format(CAST('2020-01-01' AS DATE), '%Y-%m');
 
 -- ---------------------------------------------------------------------------
--- 3. A string literal against a DATE column folds to a DATE constant,
+-- 3. An explicit CAST against a DATE column folds to a DATE constant,
 --    rendered as a calendar date with no CAST left in the scan predicate.
 -- ---------------------------------------------------------------------------
 -- @explain_contains=predicates: dt = 2020-01-01
 -- @explain_not_contains=CAST(
-SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
+SELECT id FROM ${case_db}.t_fold_dates WHERE dt = CAST('2020-01-01' AS DATE);
 
 -- ---------------------------------------------------------------------------
 -- 4. The typed DATE literal must produce exactly the same scan predicate.
@@ -105,7 +104,7 @@ SET SESSION disable_optimizer_rules = 'FoldConstant';
 SELECT 40000 + 2000 + 96;
 
 -- @explain_contains=predicates: dt = CAST('2020-01-01' AS Date32)
-SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
+SELECT id FROM ${case_db}.t_fold_dates WHERE dt = CAST('2020-01-01' AS DATE);
 
 -- ---------------------------------------------------------------------------
 -- 9. Each supported folding family keeps its value and constant plan shape.
@@ -147,7 +146,7 @@ SELECT NOT CAST(NULL AS BOOLEAN) AS folded_not;
 SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decimal_compare;
 
 -- @explain_contains=[true AS folded_temporal_compare]
-SELECT CAST('2020-01-01' AS DATE) = '2020-01-01' AS folded_temporal_compare;
+SELECT CAST('2020-01-01' AS DATE) = DATE '2020-01-01' AS folded_temporal_compare;
 
 -- @explain_contains=[true AS folded_nullsafe_equal]
 SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(NULL AS INT) AS folded_nullsafe_equal;
@@ -207,12 +206,12 @@ SELECT NOT CAST(NULL AS BOOLEAN) AS folded_not;
 SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decimal_compare;
 
 -- @explain_contains= = CAST(
-SELECT CAST('2020-01-01' AS DATE) = '2020-01-01' AS folded_temporal_compare;
+SELECT CAST('2020-01-01' AS DATE) = DATE '2020-01-01' AS folded_temporal_compare;
 
--- @explain_contains=<=>
+-- @explain_contains=IS NOT DISTINCT FROM
 SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(NULL AS INT) AS folded_nullsafe_equal;
 
--- @explain_contains=<=>
+-- @explain_contains=IS NOT DISTINCT FROM
 SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(1 AS INT) AS folded_nullsafe_distinct;
 
 -- @explain_contains=[CAST(12 AS

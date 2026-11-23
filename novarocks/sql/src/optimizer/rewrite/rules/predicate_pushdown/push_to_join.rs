@@ -752,18 +752,14 @@ fn is_cross_side_eq(
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
 ) -> bool {
-    if let ScalarNode::BinaryOp {
-        left,
-        op: BinOp::Eq,
-        right,
-        ..
-    } = arena.node(expr)
+    if let Some((BinOp::Eq, [left, right])) =
+        crate::common::binary_operator::scalar_comparison(arena, expr)
     {
-        let l_id = match arena.node(*left) {
+        let l_id = match arena.node(left) {
             ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
             _ => None,
         };
-        let r_id = match arena.node(*right) {
+        let r_id = match arena.node(right) {
             ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
             _ => None,
         };
@@ -1016,7 +1012,7 @@ mod tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     child: source,
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: policy,

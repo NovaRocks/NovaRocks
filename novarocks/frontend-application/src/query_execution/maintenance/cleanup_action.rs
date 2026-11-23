@@ -31,9 +31,9 @@ use novarocks_query_application::{
 use novarocks_spi::connector::{
     ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation, ConnectorCleanupAsyncStart,
     ConnectorCleanupMaintenanceSession, ConnectorCleanupOperationId, ConnectorControlPlanningPin,
-    ConnectorError, ConnectorErrorKind, ConnectorMaintenanceRetention,
-    ConnectorOriginalResultScope, ConnectorRequestContext, ConnectorTableObjectId,
-    LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
+    ConnectorError, ConnectorMaintenanceRetention, ConnectorOriginalResultScope,
+    ConnectorRequestContext, ConnectorTableObjectId, LakePublicationDisposition,
+    ProviderMetadataCpuPort, SharedDependency,
 };
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, ProcedureMetrics,
@@ -67,16 +67,12 @@ impl crate::wake::StatusIntakeWake for Wake {
         self.waker.wake()
     }
 }
-pub(super) enum CleanupEntry {
-    TableExecute(ConnectorMaintenanceRetention),
-    LegacyCall,
-}
 struct Body {
     engine: RequestScopedMaintenanceEngine,
     product: Arc<TableMaintenanceProduct>,
     target: MaintenanceTarget,
     older_than: i64,
-    entry: CleanupEntry,
+    retention: ConnectorMaintenanceRetention,
     cleanup_session: ConnectorCleanupMaintenanceSession,
     planning: ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
@@ -129,7 +125,7 @@ pub(super) fn prepare(
     kernel: &MaintenanceExecutionKernel,
     target: MaintenanceTarget,
     older_than: i64,
-    entry: CleanupEntry,
+    retention: ConnectorMaintenanceRetention,
     planning: ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     connector: &ConnectorRequestContext,
@@ -175,7 +171,7 @@ pub(super) fn prepare(
         product,
         target,
         older_than,
-        entry,
+        retention,
         cleanup_session,
         planning,
         context: connector.clone(),
@@ -586,7 +582,7 @@ async fn execute_cleanup(
         context,
         target,
         older_than,
-        entry,
+        retention,
         guarded_object,
         start,
         session,
@@ -597,14 +593,6 @@ async fn execute_cleanup(
         ..
     } = &mut *body;
     // The Product has admitted this exact target and run the MV guard.
-    let CleanupEntry::TableExecute(retention) = entry else {
-        let error = ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "CALL remove_orphan_files is not supported. Use ALTER TABLE EXECUTE remove_orphan_files",
-        )
-        .with_public_failure_detail();
-        return Err(source_terminal(error, None, false));
-    };
     *start = Some(ConnectorCleanupAsyncStart {
         table: RequestScopedMaintenanceEngine::target_identity(target)?,
         expected_object: guarded_object.take().ok_or_else(|| {
@@ -693,12 +681,12 @@ fn produce_local(
     producer: LocalResultProducer,
     outcome: MaintenanceActionOutcome,
 ) -> Result<novarocks_query_application::api::OwnedLocalResult, String> {
-    producer.produce(
-        || match crate::table_maintenance::result::action_result(outcome)? {
-            super::MaintenanceStatementResult::Query(result) => Ok(result),
-            _ => Err("cleanup result author returned no rows".into()),
-        },
-    )
+    producer.produce(|| {
+        let MaintenanceActionOutcome::Procedure { metrics } = outcome else {
+            return Err("cleanup result author returned no rows".into());
+        };
+        crate::table_maintenance::result::procedure_metrics_result(metrics)
+    })
 }
 
 #[cfg(test)]

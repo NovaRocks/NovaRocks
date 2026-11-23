@@ -161,9 +161,9 @@ impl InternalResultRetention {
             && window.root_scope().id() == other.binding.window_alias().root_scope().id()
     }
 }
-impl novarocks_spi::connector::ConnectorPayloadByteBudget for InternalResultRetention {
-    fn reserve_bytes(
-        &self,
+impl InternalResultRetention {
+    pub(crate) fn reserve_for_binding(
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         bytes: usize,
     ) -> Result<
         novarocks_spi::connector::ConnectorPayloadRetentionGuard,
@@ -178,7 +178,7 @@ impl novarocks_spi::connector::ConnectorPayloadByteBudget for InternalResultRete
                 WorkError::ArithmeticOverflow,
             )
         })?;
-        let window = self.binding.try_window_alias().map_err(|error| {
+        let window = binding.try_window_alias().map_err(|error| {
             ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
         })?;
         let receipt = window.reserve_payload_bytes(bytes).map_err(|error| {
@@ -187,6 +187,17 @@ impl novarocks_spi::connector::ConnectorPayloadByteBudget for InternalResultRete
         // This receipt, rather than the whole collector's other buffers,
         // follows this one actual allocation through its final Arrow alias.
         Ok(ConnectorPayloadRetentionGuard::new(receipt))
+    }
+}
+impl novarocks_spi::connector::ConnectorPayloadByteBudget for InternalResultRetention {
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Self::reserve_for_binding(&self.binding, bytes)
     }
 }
 impl std::fmt::Debug for InternalResultRetention {

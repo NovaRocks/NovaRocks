@@ -94,6 +94,7 @@ enum Code {
     PermissionDenied,
     NotFound,
     FunctionNotFound,
+    AmbiguousFunctionCall,
     InvalidFunctionArgument,
     DivisionByZero,
     InvalidCastArgument,
@@ -105,6 +106,7 @@ enum Code {
     NotInTransaction,
     InvalidAnalyzeProperty,
     InvalidCatalogProperty,
+    InvalidDefaultColumnValue,
     InvalidSchemaProperty,
     InvalidTableProperty,
     InvalidMaterializedViewProperty,
@@ -124,6 +126,9 @@ enum Code {
     DuplicateColumnName,
     MissingColumnName,
     TypeMismatch,
+    FunctionNotAggregate,
+    ExpressionNotScalar,
+    TypeNotFound,
     InvalidLiteral,
     MismatchedColumnAliases,
     InvalidArguments,
@@ -169,6 +174,7 @@ impl Code {
             PermissionDenied => (4, "PERMISSION_DENIED", "USER_ERROR"),
             NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
+            AmbiguousFunctionCall => (32, "AMBIGUOUS_FUNCTION_CALL", "USER_ERROR"),
             InvalidFunctionArgument => (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
             DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
             InvalidCastArgument => (9, "INVALID_CAST_ARGUMENT", "USER_ERROR"),
@@ -184,6 +190,7 @@ impl Code {
             AdministrativelyKilled => (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
             InvalidAnalyzeProperty => (42, "INVALID_ANALYZE_PROPERTY", "USER_ERROR"),
             InvalidCatalogProperty => (124, "INVALID_CATALOG_PROPERTY", "USER_ERROR"),
+            InvalidDefaultColumnValue => (137, "INVALID_DEFAULT_COLUMN_VALUE", "USER_ERROR"),
             InvalidSchemaProperty => (33, "INVALID_SCHEMA_PROPERTY", "USER_ERROR"),
             InvalidTableProperty => (18, "INVALID_TABLE_PROPERTY", "USER_ERROR"),
             InvalidMaterializedViewProperty => {
@@ -200,6 +207,9 @@ impl Code {
             DuplicateColumnName => (54, "DUPLICATE_COLUMN_NAME", "USER_ERROR"),
             MissingColumnName => (55, "MISSING_COLUMN_NAME", "USER_ERROR"),
             TypeMismatch => (58, "TYPE_MISMATCH", "USER_ERROR"),
+            FunctionNotAggregate => (72, "FUNCTION_NOT_AGGREGATE", "USER_ERROR"),
+            ExpressionNotScalar => (74, "EXPRESSION_NOT_SCALAR", "USER_ERROR"),
+            TypeNotFound => (43, "TYPE_NOT_FOUND", "USER_ERROR"),
             InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
             MismatchedColumnAliases => (61, "MISMATCHED_COLUMN_ALIASES", "USER_ERROR"),
             InvalidArguments => (76, "INVALID_ARGUMENTS", "USER_ERROR"),
@@ -267,14 +277,7 @@ enum PublicMessage<'a> {
     AddFilesUnknown(&'a str),
     Session(&'a StatementSessionError),
     Execution(&'a ExecutionFailureInput),
-    CommitFailure {
-        input: &'a ExecutionFailureInput,
-        unknown: bool,
-    },
-    OpenPartitionLimit {
-        limit: u64,
-        opening: u64,
-    },
+    OpenPartitionLimit { limit: u64, opening: u64 },
 }
 impl fmt::Display for PublicMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -282,13 +285,6 @@ impl fmt::Display for PublicMessage<'_> {
             Self::Borrowed(message) => formatter.write_str(message),
             Self::AddFilesUnknown(message) => write!(formatter, "Failed to add files: {message}"),
             Self::Session(error) => fmt::Display::fmt(error, formatter),
-            Self::CommitFailure { input, unknown } => {
-                formatter.write_str("Failed to commit the transaction during write: ")?;
-                if *unknown && !input.detail().as_str().starts_with("[CommitUnknown]") {
-                    formatter.write_str("[CommitUnknown] ")?;
-                }
-                fmt::Display::fmt(input.detail(), formatter)
-            }
             Self::OpenPartitionLimit { limit, opening } => write!(
                 formatter,
                 "Exceeded limit of {limit} open writers for partitions: {opening}"
@@ -517,9 +513,30 @@ fn service_error(
             .expect("declared row match SQL identity has a standard message");
         return project(code, diagnostics::bound_display(message), None);
     }
+    if let Some(user) = error.user_error()
+        && user.code().as_str() == "sql.admit.procedure_not_found"
+    {
+        return project_message(
+            query_id,
+            code,
+            PublicMessage::Borrowed(user.message()),
+            user_location(user, sql),
+            StatementExternalEffectDisposition::combine(
+                error.external_effect_disposition(),
+                effect,
+            ),
+        );
+    }
     if let Some(input) = error.execution_failure() {
-        let message = execution_message(input, code);
-        if matches!(message, PublicMessage::CommitFailure { .. }) {
+        let has_publication_suffix = commit_failure_code(input).is_some();
+        let message = if has_publication_suffix || code == Code::IcebergCommitError {
+            novarocks_query_application::execution_error::prefixed_connector_failure_detail(error)
+                .map(PublicMessage::Borrowed)
+                .unwrap_or_else(|| execution_message(input, code))
+        } else {
+            execution_message(input, code)
+        };
+        if has_publication_suffix {
             let public = error.diagnostic_with_execution_detail(&message, effect);
             return project_public_diagnostic(query_id, code, &public, None);
         }
@@ -605,7 +622,7 @@ fn add_files_execution_code(input: &ExecutionFailureInput, registration: bool) -
     })
 }
 
-fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
+fn commit_failure_code(input: &ExecutionFailureInput) -> Option<Code> {
     use novarocks_execution_contract::failure::{
         FailureEvidence,
         connector_reason::{
@@ -623,9 +640,10 @@ fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
         return None;
     }
     match fact.reason() {
-        COMMIT_TRANSACTION_CONFLICT => Some((Code::TransactionConflict, false)),
-        ICEBERG_COMMIT_VALIDATION_CONFLICT => Some((Code::IcebergCommitError, false)),
-        ICEBERG_COMMIT_STATE_UNKNOWN => Some((Code::IcebergCommitError, true)),
+        COMMIT_TRANSACTION_CONFLICT => Some(Code::TransactionConflict),
+        ICEBERG_COMMIT_VALIDATION_CONFLICT | ICEBERG_COMMIT_STATE_UNKNOWN => {
+            Some(Code::IcebergCommitError)
+        }
         _ => None,
     }
 }
@@ -642,10 +660,7 @@ fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage
             "Interval map keys collide at millisecond precision; use a client supporting PARAMETRIC_INTERVAL",
         );
     }
-    if let Some((_, unknown)) = commit_failure(input) {
-        return PublicMessage::CommitFailure { input, unknown };
-    }
-    if code.uses_iceberg_maintenance_detail() {
+    if commit_failure_code(input).is_some() || code.uses_iceberg_maintenance_detail() {
         return PublicMessage::Borrowed(input.detail().as_str());
     }
     match open_partition_limit(input) {
@@ -658,7 +673,7 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
     if is_legacy_interval_key_collision(input) {
         return Code::NotSupported;
     }
-    if let Some((code, _)) = commit_failure(input) {
+    if let Some(code) = commit_failure_code(input) {
         return code;
     }
     if open_partition_limit(input).is_some() {
@@ -742,6 +757,7 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.unknown_table" => TableNotFound,
         "sql.analyze.unknown_column" => ColumnNotFound,
         "sql.analyze.unknown_function" => FunctionNotFound,
+        "sql.analyze.ambiguous_function_call" => AmbiguousFunctionCall,
         "sql.analyze.missing_column_name" => MissingColumnName,
         "sql.analyze.duplicate_column_name" => DuplicateColumnName,
         "sql.analyze.mismatched_column_aliases" => MismatchedColumnAliases,
@@ -749,14 +765,21 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.view_is_stale" => ViewIsStale,
         "sql.analyze.view_is_recursive" => ViewIsRecursive,
         "sql.analyze.type_mismatch" => TypeMismatch,
+        "sql.analyze.function_not_aggregate" => FunctionNotAggregate,
+        "sql.analyze.expression_not_scalar" => ExpressionNotScalar,
+        "sql.admit.unknown_type" => TypeNotFound,
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.invalid_argument" => InvalidArguments,
+        "sql.analyze.invalid_type_argument" => InvalidFunctionArgument,
         "sql.admit.invalid_table_procedure_arguments" => InvalidArguments,
-        "sql.admit.table_procedure_not_found" => ProcedureNotFound,
+        "sql.admit.table_procedure_not_found" | "sql.admit.procedure_not_found" => {
+            ProcedureNotFound
+        }
         "sql.admit.invalid_table_procedure_argument" => InvalidProcedureArgument,
         "sql.admit.duplicate_table_procedure_argument" => DuplicateProperty,
         "sql.analyze.invalid_analyze_property" => InvalidAnalyzeProperty,
         "sql.admit.invalid_catalog_property" => InvalidCatalogProperty,
+        "sql.admit.invalid_default_column_value" => InvalidDefaultColumnValue,
         "sql.admit.invalid_schema_property" => InvalidSchemaProperty,
         "sql.admit.invalid_table_property" => InvalidTableProperty,
         "sql.admit.invalid_materialized_view_property" => InvalidMaterializedViewProperty,

@@ -21,9 +21,14 @@ use crate::compiler::SqlCompileError;
 use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
+use novarocks_functions::FunctionResultType;
+use novarocks_type_contract::{
+    FunctionArgumentType, FunctionKind, FunctionVolatility, OperatorFunction,
+    OrderedComparisonAlgorithm, ValueLogicalType,
+};
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, JoinKind};
+use crate::common::{BinOp, JoinKind, binary_operator};
 use crate::optimizer::operator::{
     FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp,
 };
@@ -373,55 +378,124 @@ fn collect_join_equality_pairs(
     right_names: &HashMap<ColumnId, String>,
     pairs: &mut Vec<(String, String)>,
 ) -> Option<()> {
-    match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-            ..
-        } => {
-            collect_join_equality_pairs(
-                arena,
-                *left,
-                left_ids,
-                right_ids,
-                left_names,
-                right_names,
-                pairs,
-            )?;
-            collect_join_equality_pairs(
-                arena,
-                *right,
-                left_ids,
-                right_ids,
-                left_names,
-                right_names,
-                pairs,
-            )
-        }
+    if let ScalarNode::BinaryOp {
+        left,
+        op: BinOp::And,
+        right,
+        ..
+    } = arena.node(expr)
+    {
+        collect_join_equality_pairs(
+            arena,
+            *left,
+            left_ids,
+            right_ids,
+            left_names,
+            right_names,
+            pairs,
+        )?;
+        return collect_join_equality_pairs(
+            arena,
+            *right,
+            left_ids,
+            right_ids,
+            left_names,
+            right_names,
+            pairs,
+        );
+    }
+
+    let (left, right) = match arena.node(expr) {
         ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
             ..
-        } => {
-            let left_ref =
-                classify_column_ref(arena, *left, left_ids, right_ids, left_names, right_names)?;
-            let right_ref =
-                classify_column_ref(arena, *right, left_ids, right_ids, left_names, right_names)?;
-            match (left_ref, right_ref) {
-                ((Side::Left, left_col), (Side::Right, right_col)) => {
-                    pairs.push((left_col, right_col));
-                    Some(())
-                }
-                ((Side::Right, right_col), (Side::Left, left_col)) => {
-                    pairs.push((left_col, right_col));
-                    Some(())
-                }
-                _ => None,
-            }
+        } => (*left, *right),
+        _ => selected_equality_columns(arena, expr)?,
+    };
+    let left_ref = classify_column_ref(arena, left, left_ids, right_ids, left_names, right_names)?;
+    let right_ref =
+        classify_column_ref(arena, right, left_ids, right_ids, left_names, right_names)?;
+    match (left_ref, right_ref) {
+        ((Side::Left, left_col), (Side::Right, right_col))
+        | ((Side::Right, right_col), (Side::Left, left_col)) => {
+            pairs.push((left_col, right_col));
+            Some(())
         }
         _ => None,
+    }
+}
+
+fn selected_equality_columns(arena: &ScalarArena, expr: ScalarId) -> Option<(ScalarId, ScalarId)> {
+    let ScalarNode::FunctionCall {
+        distinct: false,
+        binding,
+        ..
+    } = arena.node(expr)
+    else {
+        return None;
+    };
+    let (OperatorFunction::Equal, [left, right]) = binary_operator::scalar_operands(arena, expr)?
+    else {
+        return None;
+    };
+    let [
+        FunctionArgumentType::Value(left_type),
+        FunctionArgumentType::Value(right_type),
+    ] = binding.selected.argument_types.as_slice()
+    else {
+        return None;
+    };
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        return None;
+    };
+    if OperatorFunction::Equal.comparison_overload_text()
+        != Some(binding.selected.overload.as_str())
+        || binding.kind != FunctionKind::Scalar
+        || binding.semantics.volatility != FunctionVolatility::Immutable
+        || scalar_expr::scalar_call_can_fail(binding)
+        || left_type != arena.value_type(left)
+        || right_type != arena.value_type(right)
+        || left_type.data_type() != right_type.data_type()
+        || left_type.logical_type() != right_type.logical_type()
+        || !OrderedComparisonAlgorithm::NativeScalarOrderV1.supports_value_type(left_type)
+        || result != arena.value_type(expr)
+        || result.data_type() != &DataType::Boolean
+        || result.logical_type() != ValueLogicalType::Physical
+        || result.nullable() != (left_type.nullable() || right_type.nullable())
+    {
+        return None;
+    }
+
+    Some((
+        selected_equality_column_operand(arena, left)?,
+        selected_equality_column_operand(arena, right)?,
+    ))
+}
+
+/// An original key still certifies the selected comparison after an identity
+/// cast or a total, injective signed widening. Other conversions can merge
+/// distinct keys, change NULLs, or fail before the join.
+fn selected_equality_column_operand(arena: &ScalarArena, mut expr: ScalarId) -> Option<ScalarId> {
+    loop {
+        let result = arena.value_type(expr);
+        expr = match arena.node(expr) {
+            ScalarNode::ColumnRef(_) => return Some(expr),
+            ScalarNode::Nested(child) if arena.value_type(*child) == result => *child,
+            ScalarNode::Cast {
+                cast_mode: None | Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                child,
+                target,
+                ..
+            } if target == result.data_type()
+                && (arena.value_type(*child) == result
+                    || scalar_expr::lossless_signed_widening(arena.value_type(*child), result)) =>
+            {
+                *child
+            }
+            _ => return None,
+        };
     }
 }
 
@@ -471,7 +545,7 @@ fn classify_column_ref(
         }
         ScalarNode::Cast {
             child,
-            array_failure_mode: None,
+            cast_mode: None,
             ..
         }
         | ScalarNode::Nested(child) => {
@@ -650,6 +724,7 @@ fn eliminated_count_value(
     if !aggregate.name.eq_ignore_ascii_case("count")
         || !is_builtin_count_binding(aggregate.source.binding())
         || aggregate.distinct
+        || aggregate.source.has_projected_inputs()
         || !aggregate.source.order_by().is_empty()
     {
         return Ok(None);
@@ -716,7 +791,10 @@ fn rewrite_eliminated_aggregate_expr(
             order_by,
             args,
             resolved,
-        } if name.eq_ignore_ascii_case("count")
+            filter,
+            ..
+        } if filter.is_none()
+            && name.eq_ignore_ascii_case("count")
             && is_builtin_count_binding(&resolved)
             && !distinct
             && order_by.is_empty() =>
@@ -938,7 +1016,7 @@ mod tests {
         );
         let cast_right = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: right_key,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -967,10 +1045,137 @@ mod tests {
     }
 
     #[test]
+    fn ukfk_pairs_require_exact_selected_ordinary_equality_over_original_keys() {
+        use novarocks_functions::{FunctionArgument, FunctionBindingRequest};
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+
+        let mut arena = ScalarArena::new();
+        let left_ids = HashSet::from([ColumnId::new_for_test(1)]);
+        let right_ids = HashSet::from([ColumnId::new_for_test(2)]);
+        let left_names = HashMap::from([(ColumnId::new_for_test(1), "left_key".to_string())]);
+        let right_names = HashMap::from([(ColumnId::new_for_test(2), "right_key".to_string())]);
+        let control = crate::optimizer::test_optimizer_control();
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        for (operator, original_left, original_right, selected, accepted) in [
+            (
+                OperatorFunction::Equal,
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int32,
+                true,
+            ),
+            (
+                OperatorFunction::Equal,
+                DataType::Int32,
+                DataType::Int64,
+                DataType::Int64,
+                true,
+            ),
+            (
+                OperatorFunction::Equal,
+                DataType::Int64,
+                DataType::Int32,
+                DataType::Int32,
+                false,
+            ),
+            (
+                OperatorFunction::Equal,
+                DataType::Float64,
+                DataType::Float64,
+                DataType::Float64,
+                false,
+            ),
+            (
+                OperatorFunction::Identical,
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int32,
+                false,
+            ),
+        ] {
+            let left = arena.intern(
+                ScalarNode::ColumnRef(ColumnId::new_for_test(1)),
+                FunctionValueType::new(original_left.clone(), true),
+            );
+            let right = arena.intern(
+                ScalarNode::ColumnRef(ColumnId::new_for_test(2)),
+                FunctionValueType::new(original_right, false),
+            );
+            let left = if original_left == selected {
+                left
+            } else {
+                arena.intern(
+                    ScalarNode::Cast {
+                        cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                        child: left,
+                        target: selected.clone(),
+                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    },
+                    FunctionValueType::new(selected, true),
+                )
+            };
+            let args = [right, left];
+            let arguments = args.map(|arg| FunctionArgument::Value {
+                value_type: arena.value_type(arg).clone(),
+                constant: None,
+            });
+            let binding = catalog
+                .resolve_scalar_operator_binding(
+                    operator,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                        expected_result_type: None,
+                    },
+                    control,
+                )
+                .expect("installed comparison for the fixture arguments");
+            let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+                panic!("comparison has a scalar result");
+            };
+            let result = result.clone();
+            let condition = arena.intern(
+                ScalarNode::FunctionCall {
+                    name: operator.catalog_name().into(),
+                    args: args.into(),
+                    distinct: false,
+                    volatility: binding.semantics.volatility,
+                    binding: crate::binding::SqlFunctionBinding::new(
+                        binding,
+                        DecimalOverflowPolicy::OutputNull,
+                    ),
+                },
+                result,
+            );
+            let mut pairs = Vec::new();
+            let matched = collect_join_equality_pairs(
+                &arena,
+                condition,
+                &left_ids,
+                &right_ids,
+                &left_names,
+                &right_names,
+                &mut pairs,
+            );
+            assert_eq!(
+                matched.is_some(),
+                accepted,
+                "{operator:?} over {original_left:?}"
+            );
+            if accepted {
+                assert_eq!(
+                    pairs,
+                    vec![("left_key".to_string(), "right_key".to_string())]
+                );
+            } else {
+                assert!(pairs.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn join_equality_pairs_keep_explicit_array_cast_boundaries_out_of_ukfk_proofs() {
-        use novarocks_type_contract::{
-            ArrayCastFailureMode, DecimalOverflowPolicy, FunctionValueType,
-        };
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
         let list_type = |item| {
             FunctionValueType::new(
                 DataType::List(Arc::new(Field::new("item", item, true))),
@@ -1000,16 +1205,13 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId::new_for_test(2)),
             source.clone(),
         );
-        for mode in [
-            ArrayCastFailureMode::ReportError,
-            ArrayCastFailureMode::OutputNull,
-        ] {
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
             let cast = arena.intern(
                 ScalarNode::Cast {
                     child: right_key,
                     target: target.data_type().clone(),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    array_failure_mode: Some(mode),
+                    cast_mode: Some(mode),
                 },
                 target.clone(),
             );
@@ -1034,15 +1236,13 @@ mod tests {
                 "an explicit conversion cannot become a bare-key uniqueness proof"
             );
             let ScalarNode::Cast {
-                child,
-                array_failure_mode,
-                ..
+                child, cast_mode, ..
             } = arena.node(cast)
             else {
                 panic!("original CAST remains in the condition")
             };
             assert_eq!(*child, right_key);
-            assert_eq!(*array_failure_mode, Some(mode));
+            assert_eq!(*cast_mode, Some(mode));
             assert_eq!(arena.value_type(cast), &target);
             assert_eq!(arena.value_type(right_key), &source);
         }
@@ -1316,6 +1516,8 @@ mod tests {
             );
             let direct = arena.borrow_mut().intern(
                 ScalarNode::AggregateCall {
+                    occurrence: None,
+                    filter: None,
                     name: spec.name.clone(),
                     args: spec.source.arguments().to_vec(),
                     distinct: false,
@@ -1377,6 +1579,8 @@ mod tests {
         let spec = &aggregate.aggregates[0];
         let direct = arena.borrow_mut().intern(
             ScalarNode::AggregateCall {
+                occurrence: None,
+                filter: None,
                 name: spec.name.clone(),
                 args: spec.source.arguments().to_vec(),
                 distinct: false,

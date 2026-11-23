@@ -28,11 +28,21 @@ use crate::exec::chunk::{
 use crate::exec::operators::compiled_expression::prepare_project_factory_for_test;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::test_driver::TestDriver;
-use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::{
+    execution_runtime::test_memory_authority,
+    mem_tracker::MemTracker,
+    query_memory::QueryMemoryBinding,
+    runtime_state::{RuntimeErrorState, RuntimeState},
+};
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, StaticSinkProgram};
+use novarocks_memory::{AccountKind, ExternalRef};
+use novarocks_types::{
+    QueryId,
+    identity::{AttemptId, QueryExecutionId},
+};
 use std::sync::Arc;
 
 // Preserve each SQL source declaration through the real package extraction and
@@ -82,17 +92,27 @@ fn programs(
 }
 
 fn run_project(program: Arc<LocalProgram>, node: Option<ProgramNodeId>, input: Chunk) -> Chunk {
-    let errors = Arc::new(RuntimeErrorState::default());
+    let authority = test_memory_authority();
+    let account = authority
+        .create_account(AccountKind::Work, ExternalRef::NONE)
+        .unwrap();
+    let execution =
+        QueryExecutionId::new(QueryId::new(37, 307), AttemptId::new(1).unwrap()).unwrap();
+    let binding = QueryMemoryBinding::try_new(execution, authority, account).unwrap();
+    let state = RuntimeState::default().with_query_memory(Some(binding));
+
+    let tracker = MemTracker::new_root("compiled numeric project");
+    let errors = state.error_state();
     let factory = prepare_project_factory_for_test(program, node, errors.clone()).unwrap();
     let mut operator = factory.create(1, 0);
+    operator.set_mem_tracker(tracker.clone());
     operator.set_construction_factory(
         crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            crate::runtime::mem_tracker::MemTracker::new_root("compiled numeric project"),
+            tracker,
             errors,
         ).unwrap(),
     );
-    let state = RuntimeState::default();
     operator.prepare().unwrap();
     operator.bind_runtime_state(&state).unwrap();
     let mut output = TestDriver::new(operator.as_mut(), &state)

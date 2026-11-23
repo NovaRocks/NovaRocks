@@ -41,7 +41,9 @@ enum RenderTypeKind {
   LIST = 17;
   MAP = 18;
   STRUCT = 19;
-  TEMPORAL = 20;
+  CHAR = 20;
+  VARCHAR = 21;
+  TEMPORAL = 22;
 }
 enum RenderTimeUnit {
   RENDER_TIME_UNIT_UNSPECIFIED = 0;
@@ -86,7 +88,8 @@ message NativeRenderType {
   OpaqueKind opaque_kind = 7;
   // List: one child named item. Map: key then value. Struct: ordered names.
   repeated NamedRenderField children = 8;
-  novarocks.value_type.TemporalType temporal_type = 9;
+  optional uint32 character_length = 9;
+  novarocks.value_type.TemporalType temporal_type = 10;
 }
 message RenderColumn {
   uint32 source_ordinal = 1;

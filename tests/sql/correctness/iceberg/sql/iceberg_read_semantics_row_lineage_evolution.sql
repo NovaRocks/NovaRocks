@@ -25,7 +25,7 @@
 DROP TABLE IF EXISTS ${case_db}.read_sem_rl ;
 CREATE TABLE ${case_db}.read_sem_rl (
   id BIGINT NOT NULL,
-  amount FLOAT
+  amount REAL
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.read_sem_rl VALUES
   ROW(1, 10.5),

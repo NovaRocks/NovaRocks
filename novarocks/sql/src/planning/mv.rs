@@ -350,6 +350,29 @@ mod refresh_property_facade_tests {
     }
 
     #[test]
+    fn refresh_contract_rejects_a_typed_aggregate_filter() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let plain = analyzed_refresh_input(
+            "SELECT region, sum(amount) AS total FROM fact_east GROUP BY region",
+        );
+        plain.refresh_contract(&control).unwrap();
+
+        let filtered = analyzed_refresh_input(
+            "SELECT region, sum(amount) FILTER (WHERE amount > 0) AS total
+             FROM fact_east GROUP BY region",
+        );
+        let error = filtered.refresh_contract(&control).unwrap_err();
+        let SqlCompileError::Analyze(error) = error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(error.to_string().contains("aggregate FILTER"));
+    }
+
+    #[test]
     fn union_aggregate_uses_root_names_with_anonymous_later_branch() {
         let input = analyzed_refresh_input(
             "SELECT id + 1 AS K, count(*) AS C FROM fact_east GROUP BY id + 1 UNION ALL SELECT id + 1, count(*) FROM fact_west GROUP BY id + 1",
@@ -5932,8 +5955,17 @@ fn count_aggregate_projection_outputs(
                 args,
                 distinct,
                 order_by,
+                filter,
                 ..
             } => {
+                if filter.is_some() {
+                    return Err(
+                        crate::analyze_error::AnalyzeError::unsupported_expression_without_span(
+                            "Iceberg IMV refresh contract does not support aggregate FILTER",
+                        )
+                        .into(),
+                    );
+                }
                 work.flush()?;
                 validate_supported_aggregate_call(name, args.len(), *distinct, order_by)?;
                 validate_aggregate_argument_exprs(args)?;
@@ -6052,6 +6084,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 validate_non_contract_aggregate_projection_expr(operand)?;
@@ -6215,6 +6248,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 validate_projection_filter_expr(operand)?;
@@ -6282,6 +6316,18 @@ fn count_equality_join_keys(
     left_qualifiers: &[String],
     right_qualifiers: &[String],
 ) -> Result<usize, String> {
+    if let Some((BinOp::Eq, [left, right])) = crate::common::binary_operator::typed_comparison(expr)
+    {
+        let left_side = join_key_side(left, left_qualifiers, right_qualifiers)?;
+        let right_side = join_key_side(right, left_qualifiers, right_qualifiers)?;
+        if left_side == right_side {
+            return Err(
+                "Iceberg IMV refresh contract equi-join predicates must compare left and right join inputs"
+                    .to_string(),
+            );
+        }
+        return Ok(1);
+    }
     match &expr.kind {
         ExprKind::BinaryOp {
             left,
@@ -6292,22 +6338,6 @@ fn count_equality_join_keys(
             count_equality_join_keys(left, left_qualifiers, right_qualifiers)?
                 + count_equality_join_keys(right, left_qualifiers, right_qualifiers)?,
         ),
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } => {
-            let left_side = join_key_side(left, left_qualifiers, right_qualifiers)?;
-            let right_side = join_key_side(right, left_qualifiers, right_qualifiers)?;
-            if left_side == right_side {
-                return Err(
-                    "Iceberg IMV refresh contract equi-join predicates must compare left and right join inputs"
-                        .to_string(),
-                );
-            }
-            Ok(1)
-        }
         ExprKind::Nested(expr) => count_equality_join_keys(expr, left_qualifiers, right_qualifiers),
         _ => Err(
             "Iceberg IMV refresh contract supports only AND-combined equi-join predicates"

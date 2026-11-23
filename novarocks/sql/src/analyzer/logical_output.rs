@@ -199,6 +199,23 @@ mod scalar_domain_tests {
             .map(|column| factory.logical_type(column.column_id))
             .collect()
     }
+    fn assert_public_variant_cast_unsupported(sql: &str) {
+        let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+        let offset = sql.find(" as variant").unwrap() + " as ".len();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression,
+            "{sql}: {error}"
+        );
+        assert_eq!(error.message(), "SQL type variant is not supported");
+        assert_eq!(
+            error.span(),
+            Some(novarocks_parser::Span::new(
+                offset,
+                offset + "variant".len()
+            ))
+        );
+    }
     fn fixture_control() -> &'static crate::compiler::SqlCompileControl {
         static CONTROL: std::sync::OnceLock<crate::compiler::SqlCompileControl> =
             std::sync::OnceLock::new();
@@ -260,28 +277,26 @@ mod scalar_domain_tests {
         for (sql, mode) in [
             (
                 "select cast(['plain'] as array<json>)",
-                novarocks_type_contract::ArrayCastFailureMode::ReportError,
+                novarocks_type_contract::TrinoCastMode::Explicit,
             ),
             (
                 "select try_cast(['plain'] as array<json>)",
-                novarocks_type_contract::ArrayCastFailureMode::OutputNull,
+                novarocks_type_contract::TrinoCastMode::Try,
             ),
         ] {
             let expressions = output_expressions(sql);
             let expression = &expressions[0];
             assert_eq!(
                 expression.value_type,
-                crate::test_value_types::string_list(true, true, true)
+                crate::test_value_types::string_list(true, true, false)
             );
             let ExprKind::Cast {
-                expr,
-                array_failure_mode,
-                ..
+                expr, cast_mode, ..
             } = &expression.kind
             else {
                 panic!("explicit array CAST");
             };
-            assert_eq!(*array_failure_mode, Some(mode));
+            assert_eq!(*cast_mode, Some(mode));
             assert_eq!(domain_at(expr, &[0]), None);
             let ExprKind::FunctionCall { binding, args, .. } = &expr.kind else {
                 panic!("original array literal owner");
@@ -319,16 +334,14 @@ mod scalar_domain_tests {
                 Some(novarocks_type_contract::ValueLogicalType::Json)
             );
             let ExprKind::Cast {
-                expr,
-                array_failure_mode,
-                ..
+                expr, cast_mode, ..
             } = &expression.kind
             else {
                 panic!("ordinary outer array CAST");
             };
             assert_eq!(
-                *array_failure_mode,
-                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+                *cast_mode,
+                Some(novarocks_type_contract::TrinoCastMode::Explicit)
             );
             assert_eq!(domain_at(expr, &[0]), source_domain);
             let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
@@ -501,9 +514,15 @@ mod scalar_domain_tests {
             output_domains("select null union all select b from t"),
             vec![Some(SqlType::Bitmap)]
         );
+        let error = super::super::analyze(
+            &query("select h from t union all select b from t"),
+            &Catalog,
+            "db",
+        )
+        .unwrap_err();
         assert_eq!(
-            output_domains("select h from t union all select b from t"),
-            vec![None]
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
     }
 
@@ -552,117 +571,58 @@ mod scalar_domain_tests {
     }
 
     #[test]
-    fn m07_scalar_mixed_values_and_explicit_string_cast_never_guess_json_or_opaque() {
-        // IF's installed selection still refuses distinct nominal arguments;
-        // the CASE syntax owner independently selects explicit byte erasure.
+    fn m07_scalar_mixed_domains_refuse_coercion_and_keep_explicit_json_identity() {
+        use crate::analyze_error::AnalyzeErrorKind;
         let error = super::super::analyze(&query("select if(true,h,b) from t"), &Catalog, "db")
             .unwrap_err();
         assert!(
             error.to_string().contains("no matching declared overload"),
             "{error}"
         );
-        let sql = "select case when true then h else b end from t";
-        assert_eq!(output_domains(sql), vec![Some(SqlType::Binary)]);
-        let expression = output_expressions(sql).remove(0);
-        assert_eq!(
-            expression.value_type,
-            novarocks_type_contract::FunctionValueType::new(DataType::Binary, true)
-        );
-        let ExprKind::Case {
-            when_then,
-            else_expr,
-            ..
-        } = &expression.kind
-        else {
-            panic!("actual CASE owner");
-        };
-        for (converted, original_domain) in [
-            (
-                &when_then[0].1,
-                novarocks_type_contract::ValueLogicalType::Hll,
-            ),
-            (
-                else_expr.as_deref().unwrap(),
-                novarocks_type_contract::ValueLogicalType::Bitmap,
-            ),
+        for sql in [
+            "select case when true then h else b end from t",
+            "select coalesce(j,s) from t",
+            "select cast(h as varbinary) from t",
         ] {
-            let ExprKind::FunctionCall { binding, args, .. } = &converted.kind else {
-                panic!("real selected erasure");
-            };
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
             assert_eq!(
-                binding.function_id.as_str(),
-                novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+                error.kind(),
+                AnalyzeErrorKind::TypeMismatch,
+                "{sql}: {error}"
             );
-            assert_eq!(
-                binding.selected.overload.as_str(),
-                "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/v1"
-            );
-            let novarocks_functions::FunctionResultType::Scalar(result) =
-                &binding.selected.result_type
-            else {
-                panic!("scalar");
-            };
-            assert_eq!(result, &converted.value_type);
-            assert_eq!(converted.value_type, expression.value_type);
-            assert_eq!(args[0].value_type.logical_type(), original_domain);
-            let novarocks_functions::FunctionArgumentType::Value(formal) =
-                &binding.selected.argument_types[0]
-            else {
-                panic!("value formal");
-            };
-            assert_eq!(&args[0].value_type, formal);
-            let original_arguments = args
-                .iter()
-                .map(|argument| {
-                    crate::analysis::function_argument(
-                        argument,
-                        crate::constant::test_constant_policy(),
-                        fixture_control(),
-                    )
-                    .unwrap()
-                })
-                .collect::<Vec<_>>();
-            crate::functions::build_builtin_engine_function_catalog()
-                .unwrap()
-                .validate_bound(
-                    binding.resolved(),
-                    novarocks_functions::FunctionBindingRequest {
-                        arguments: &original_arguments,
-                        logical_argument_count: original_arguments.len(),
-                        expected_result_type: Some(result),
-                    },
-                    fixture_control(),
-                )
-                .unwrap();
         }
         assert_eq!(
             output_domains(
-                "select coalesce(j,s),ifnull(j,'plain'),cast(j as varchar),cast(h as varbinary),cast(s as json) from t"
+                "select cast(j as varchar),cast(s as json),cast(j as json),coalesce(cast(j as json),null) from t"
             ),
             vec![
                 Some(SqlType::String),
-                Some(SqlType::String),
-                Some(SqlType::String),
-                Some(SqlType::Binary),
-                Some(SqlType::String)
+                Some(SqlType::Json),
+                Some(SqlType::Json),
+                Some(SqlType::Json)
             ]
         );
-        assert_eq!(
-            output_domains("select cast(j as json),coalesce(cast(j as json),null) from t"),
-            vec![Some(SqlType::Json); 2]
-        );
-        // A JSON target declaration alone does not validate ordinary text.
-        // The actual existing parse_json owner is the independently checked
-        // author of a JSON value; no carrier Cast may sign that domain.
+
         let value = output_expressions("select cast('plain' as json)").remove(0);
         assert_eq!(
             value.value_type.logical_type(),
-            novarocks_type_contract::ValueLogicalType::Physical
+            novarocks_type_contract::ValueLogicalType::Json
+        );
+        let ExprKind::Cast {
+            expr, cast_mode, ..
+        } = &value.kind
+        else {
+            panic!("expected the explicitly authored JSON conversion");
+        };
+        assert_eq!(
+            *cast_mode,
+            Some(novarocks_type_contract::TrinoCastMode::Explicit)
         );
         assert_eq!(
-            output_domains("select cast('plain' as json)"),
-            vec![Some(SqlType::String)]
+            expr.value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical
         );
+
         let parsed = output_expressions("select parse_json('{}')").remove(0);
         assert_eq!(
             parsed.value_type.logical_type(),
@@ -975,33 +935,26 @@ mod scalar_domain_tests {
     }
 
     #[test]
-    fn m07_window_variant_typed_null_defaults_are_neutral_without_admitting_unproven_values() {
+    fn m07_window_json_defaults_keep_identity_and_variant_casts_are_rejected() {
         assert_eq!(
             output_domains(
-                "select lead(v,1,cast(null as variant)) over (),lag(v,1,cast(null as variant)) over () from t"
+                "select lead(j,1,cast(null as json)) over (),lag(j,1,cast(null as json)) over () from t"
             ),
-            vec![Some(SqlType::Variant); 2]
+            vec![Some(SqlType::Json); 2]
         );
-        // Same-domain public CAST is an actual LargeBinary identity operation,
-        // not an unproven payload. Both value and default contributions retain
-        // the independently established catalog Variant fact.
         assert_eq!(
             output_domains(
-                "select lead(v,1,cast(v as variant)) over (),lag(v,1,cast(v as variant)) over (),first_value(cast(v as variant)) over () from t"
+                "select lead(j,1,cast(j as json)) over (),lag(j,1,cast(j as json)) over (),first_value(cast(j as json)) over () from t"
             ),
-            vec![Some(SqlType::Variant); 3]
+            vec![Some(SqlType::Json); 3]
         );
         for sql in [
-            "select lead(v,1,cast(s as variant)) over () from t",
-            "select lag(v,1,cast(s as variant)) over () from t",
+            "select lead(v,1,cast(null as variant)) over () from t",
+            "select lag(v,1,cast(v as variant)) over () from t",
             "select first_value(cast(X'AB01' as variant)) over ()",
-            "select first_value(cast(cast(v as varbinary) as variant)) over () from t",
+            "select first_value(cast(cast(X'AB01' as varbinary) as variant)) over ()",
         ] {
-            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
-            assert!(
-                error.to_string().contains("no matching declared overload"),
-                "{error}"
-            );
+            assert_public_variant_cast_unsupported(sql);
         }
         // A NULL default cannot erase a known sibling in a partial Struct or
         // a nested Map value. SqlType has no complete Null-bearing counterpart.
@@ -1048,34 +1001,36 @@ mod scalar_domain_tests {
     }
 
     #[test]
-    fn m07_variant_public_identity_cast_requires_independent_exact_source_fact() {
-        assert_eq!(
-            output_domains(
-                "select cast(v as variant),cast(cast(v as variant) as variant),cast((v) as variant) from t"
-            ),
-            vec![Some(SqlType::Variant); 3]
-        );
+    fn m07_public_variant_cast_is_refused_even_with_a_known_input_domain() {
         for sql in [
+            "select cast(v as variant) from t",
+            "select cast((v) as variant) from t",
             "select cast(s as variant) from t",
             "select cast(j as variant) from t",
             "select cast(X'AB01' as variant)",
-            "select cast(cast(v as varbinary) as variant) from t",
+            "select cast(cast(X'AB01' as varbinary) as variant)",
         ] {
-            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
-            assert_eq!(
-                error.kind(),
-                crate::analyze_error::AnalyzeErrorKind::TypeMismatch
-            );
+            assert_public_variant_cast_unsupported(sql);
         }
+        let sql = "select cast(cast(v as varbinary) as variant) from t";
+        let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
         assert_eq!(
-            output_domains("select cast(v as varbinary) from t"),
-            vec![Some(SqlType::Binary)]
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+        );
+        let inner = "cast(v as varbinary)";
+        let offset = sql.find(inner).unwrap();
+        assert_eq!(
+            error.span(),
+            Some(novarocks_parser::Span::new(offset, offset + inner.len()))
         );
         assert_eq!(
-            output_domains(
-                "select first_value(cast(variant_get(v,'$.a') as variant)) over (),last_value(cast(variant_get(v,'$.a') as variant)) over () from t"
-            ),
-            vec![Some(SqlType::Variant); 2]
+            output_domains("select v,cast(j as json),cast(s as json) from t"),
+            vec![
+                Some(SqlType::Variant),
+                Some(SqlType::Json),
+                Some(SqlType::Json)
+            ]
         );
     }
 
@@ -1313,7 +1268,7 @@ mod scalar_domain_tests {
         let target = crate::test_value_types::string_list(false, false, false);
         let coerced = TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(original),
                 target: target.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1355,34 +1310,24 @@ mod scalar_domain_tests {
                 .domain(),
             None
         );
-        let mut conversion = &args[0];
-        while let ExprKind::Cast { expr, .. } = &conversion.kind {
-            conversion = expr;
-        }
-        let ExprKind::FunctionCall {
-            binding: conversion_binding,
-            args: original,
+        let ExprKind::Cast {
+            expr: original,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+            target: DataType::Utf8,
             ..
-        } = &conversion.kind
+        } = &args[0].kind
         else {
-            panic!("selected explicit conversion");
+            panic!("expected explicit JSON to VARCHAR CAST");
         };
         assert_eq!(
-            conversion_binding.function_id.as_str(),
-            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
-        );
-        assert_eq!(
-            conversion_binding.selected.overload.as_str(),
-            "builtin.scalar/value_domain_conversion/json_text_same_structure/v1"
-        );
-        assert_eq!(
-            original[0].value_type.logical_type(),
+            original.value_type.logical_type(),
             novarocks_type_contract::ValueLogicalType::Json
         );
-        assert_eq!(
-            conversion.value_type.logical_type(),
-            novarocks_type_contract::ValueLogicalType::Physical
-        );
+        assert!(matches!(
+            &original.kind,
+            ExprKind::FunctionCall { binding, .. }
+                if binding.function_id.as_str() == "builtin.scalar/parse_json/v1"
+        ));
     }
 
     #[test]
@@ -1401,7 +1346,7 @@ mod scalar_domain_tests {
         assert_eq!(result, &original.value_type);
         let value = TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(original.clone()),
                 target: original.value_type.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1741,9 +1686,9 @@ mod scalar_domain_tests {
         let error =
             super::super::analyze(&query("select element_at([b,h],1) from t"), &Catalog, "db")
                 .unwrap_err();
-        assert!(
-            error.to_string().contains("no matching declared overload"),
-            "{error}"
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
         let mixed_error = super::super::analyze(
             &query("select element_at([parse_json('{}'),'plain'],1)"),
@@ -1770,9 +1715,15 @@ mod scalar_domain_tests {
                 )]))
             ]
         );
+        let error = super::super::analyze(
+            &query("select cast(element_at([b],1) as varbinary) from t"),
+            &Catalog,
+            "db",
+        )
+        .unwrap_err();
         assert_eq!(
-            output_domains("select cast(element_at([b],1) as varbinary) from t"),
-            vec![Some(SqlType::Binary)]
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
     }
 
@@ -1987,36 +1938,32 @@ mod scalar_domain_tests {
     }
 
     #[test]
-    fn m07_container_trusted_and_null_variant_preserve_identity_unknown_cast_is_rejected() {
-        let expression =
-            output_expressions("select array_repeat(cast(null as variant),2)").remove(0);
-        let DataType::List(item) = &expression.value_type.data_type() else {
+    fn m07_container_keeps_json_casts_and_rejects_public_variant_casts() {
+        let expression = output_expressions("select array_repeat(cast(null as json),2)").remove(0);
+        let DataType::List(item) = expression.value_type.data_type() else {
             panic!("typed NULL List");
         };
-        assert_eq!(item.data_type(), &DataType::LargeBinary);
+        assert_eq!(item.data_type(), &DataType::Utf8);
         assert!(item.metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&expression, &[0]),
-            Some(novarocks_type_contract::ValueLogicalType::Variant)
+            Some(novarocks_type_contract::ValueLogicalType::Json)
         );
-        // Same-carrier CAST preserves an independently established Variant
-        // identity. Target spelling alone does not establish serialized bytes.
         assert_eq!(
             output_domains(
-                "select array_repeat(cast(v as variant),2),element_at(array_repeat(cast(v as variant),2),1) from t"
+                "select array_repeat(cast(j as json),2),element_at(array_repeat(cast(j as json),2),1) from t"
             ),
             vec![
-                Some(SqlType::Array(Box::new(SqlType::Variant))),
-                Some(SqlType::Variant)
+                Some(SqlType::Array(Box::new(SqlType::Json))),
+                Some(SqlType::Json)
             ],
         );
-        {
-            let sql = "select array_repeat(cast('x' as variant),2)";
-            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
-            assert!(
-                error.to_string().contains("no matching declared overload"),
-                "{error}"
-            );
+        for sql in [
+            "select array_repeat(cast(null as variant),2)",
+            "select array_repeat(cast(v as variant),2) from t",
+            "select array_repeat(cast('x' as variant),2)",
+        ] {
+            assert_public_variant_cast_unsupported(sql);
         }
     }
 

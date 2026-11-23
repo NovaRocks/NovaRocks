@@ -33,9 +33,9 @@ CREATE CATALOG ice_ivm_repart_${uuid0} USING iceberg WITH ("iceberg.catalog.type
 CREATE SCHEMA ice_ivm_repart_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_repart_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT,
-  category STRING
+  category VARCHAR
 ) WITH (format_version = 3);
 USE ice_ivm_repart_${uuid0}.ns_${uuid0};
 
@@ -123,7 +123,7 @@ ORDER BY region;
 -- @skip_result_check=true
 CREATE TABLE ice_ivm_repart_${uuid0}.ns_${uuid0}.customers (
   customer_id BIGINT NOT NULL,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_repart_${uuid0}.ns_${uuid0}.customers VALUES
   ROW(10, 'east'),

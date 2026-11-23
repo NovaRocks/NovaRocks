@@ -140,9 +140,7 @@ mod tests {
     use super::*;
     use crate::commit::dependency::ValidationInputs;
     use crate::commit::overwrite::preparer_tests::{Fixture, data};
-    use crate::commit::selected_rewrite::{
-        SelectedRewriteFiles, SelectedRewriteKind, SelectedRewritePreparer,
-    };
+    use crate::commit::selected_rewrite::{SelectedRewriteFiles, SelectedRewritePreparer};
     use crate::commit::write_stack::domain::{
         IcebergArtifactMetrics, IcebergDataBranchRecipe, IcebergDataFileArtifact,
         IcebergWriterHandle, IcebergWriterOutput,
@@ -356,7 +354,7 @@ mod tests {
                 removed: live.values().map(|e| e.frozen.clone()).collect(),
             },
             dependencies: vec![crate::commit::model::Dependency::RefUnchanged],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),
             token: fixture.operation.token(),
@@ -368,7 +366,6 @@ mod tests {
                 &intent,
                 &SelectedRewritePreparer {
                     files: SelectedRewriteFiles {
-                        kind: SelectedRewriteKind::Data,
                         data_paths,
                         delete_paths: BTreeSet::new(),
                     },

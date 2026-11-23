@@ -50,7 +50,6 @@ pub struct TableMaintenanceStats {
     pub total_data_files: Option<u64>,
     pub max_compactable_data_files: Option<u64>,
     pub total_files_size_bytes: Option<u64>,
-    pub total_delete_files: Option<u64>,
     /// Typed maintenance policy facts declared by the table. `None` means the
     /// table declares no usable value for that key; defaults and clamping are
     /// policy and belong to the frontend, never to this fact layer.
@@ -346,7 +345,6 @@ fn finish_table_stats_original(
         total_data_files: observed.total_data_files(),
         max_compactable_data_files,
         total_files_size_bytes: observed.total_files_size_bytes(),
-        total_delete_files: observed.total_delete_files(),
         maintenance_enabled: policy.maintenance_enabled,
         expire_max_snapshot_age_ms: policy.expire_max_snapshot_age_ms,
         expire_min_snapshots_to_keep: policy.expire_min_snapshots_to_keep,

@@ -312,6 +312,7 @@ fn static_case_keeps_exact_branches_implicit_null_and_type_only_checks() {
     for hidden in [false, true] {
         for simple in [false, true] {
             let case = |ids: &[ExprId], has_else: bool| ExprKind::Case {
+                ieee_float_equality: false,
                 operand: simple.then_some(ids[0]),
                 when_then: Box::new([(ids[usize::from(simple)], ids[usize::from(simple) + 1])]),
                 else_expr: has_else.then(|| ids[usize::from(simple) + 2]),
@@ -567,17 +568,12 @@ fn checked_array_cast(
     source: ValueType,
     result: ValueType,
     source_kind: ExprKind,
-    mode: Option<ArrayCastFailureMode>,
-    policy: DecimalOverflowPolicy,
+    mode: TrinoCastMode,
     unused: bool,
 ) -> Result<(BoundExprSet, ExprId), UnitError> {
     let input = ValueId::new(0);
     let mut builder = BoundExprSetBuilder::new(limits());
     let child = builder.add(None, source.clone(), source_kind).unwrap();
-    let allow = SemanticParameterRef {
-        id: SemanticParameterId::new(7),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
     let cast = builder
         .add(
             None,
@@ -585,9 +581,7 @@ fn checked_array_cast(
             ExprKind::Cast {
                 expr: child,
                 target: result.data_type().clone(),
-                decimal_overflow_policy: policy,
-                allow_throw_exception: allow,
-                array_failure_mode: mode,
+                cast_mode: mode,
             },
         )
         .unwrap();
@@ -615,14 +609,10 @@ fn checked_array_cast(
         ExprKind::Cast {
             expr,
             target,
-            decimal_overflow_policy,
-            allow_throw_exception,
-            array_failure_mode,
+            cast_mode,
         } if *expr == child
             && target == result.data_type()
-            && *decimal_overflow_policy == policy
-            && *allow_throw_exception == allow
-            && *array_failure_mode == mode
+            && *cast_mode == mode
     ));
     assert_eq!(unit.control_flow().uses().len(), if unused { 1 } else { 2 });
     assert_eq!(
@@ -636,60 +626,34 @@ fn checked_array_cast(
 }
 
 #[test]
-fn explicit_array_cast_modes_check_live_and_unused_definitions() {
-    use ArrayCastFailureMode as Mode;
+fn array_cast_modes_preserve_live_and_unused_declarations() {
+    use TrinoCastMode as Mode;
     let list = |item, nullable| cast_list_type(item, true, nullable);
-    let nested = |item, nullable| {
-        list(
-            DataType::List(Arc::new(Field::new("inner", item, nullable))),
-            true,
-        )
-    };
     for unused in [false, true] {
-        for mode in [Mode::ReportError, Mode::OutputNull] {
-            for (source, result, accepted) in [
-                (
-                    list(DataType::Int32, true),
-                    list(DataType::Int64, true),
-                    true,
-                ),
-                (
-                    list(DataType::Int32, false),
-                    list(DataType::Int64, false),
-                    mode == Mode::ReportError,
-                ),
-                (
-                    list(DataType::Int32, true),
-                    cast_list_type(DataType::Int64, false, true),
-                    false,
-                ),
-                (
-                    nested(DataType::Int32, true),
-                    nested(DataType::Int64, false),
-                    false,
-                ),
-                (integer(true), list(DataType::Int64, true), false),
-                (list(DataType::Int32, true), integer(true), false),
-                (
+        for mode in [
+            Mode::Explicit,
+            Mode::Try,
+            Mode::Implicit,
+            Mode::StoreAssignment,
+        ] {
+            checked_array_cast(
+                list(DataType::Int32, true),
+                list(DataType::Int64, true),
+                ExprKind::Value(ValueId::new(0)),
+                mode,
+                unused,
+            )
+            .unwrap();
+            type_error(
+                checked_array_cast(
                     list(DataType::Int32, true),
                     list(DataType::Int64, false),
-                    false,
-                ),
-            ] {
-                let actual = checked_array_cast(
-                    source,
-                    result,
                     ExprKind::Value(ValueId::new(0)),
-                    Some(mode),
-                    DecimalOverflowPolicy::ReportError,
+                    mode,
                     unused,
-                );
-                if accepted {
-                    actual.unwrap();
-                } else {
-                    type_error(actual, "explicit array CAST mode differs");
-                }
-            }
+                ),
+                "cast stops admitting null its input admits",
+            );
         }
     }
 }
@@ -699,20 +663,14 @@ fn null_list_json_cast_checks_live_and_unused_definitions_and_full_types() {
     let input = ExprKind::Value(ValueId::new(0));
     for unused in [false, true] {
         for (source_nullable, result_nullable) in [(false, false), (false, true), (true, true)] {
-            for policy in [
-                DecimalOverflowPolicy::OutputNull,
-                DecimalOverflowPolicy::ReportError,
-            ] {
-                checked_array_cast(
-                    cast_list_type(DataType::Null, true, source_nullable),
-                    cast_json_list_type(true, result_nullable),
-                    input.clone(),
-                    None,
-                    policy,
-                    unused,
-                )
-                .unwrap();
-            }
+            checked_array_cast(
+                cast_list_type(DataType::Null, true, source_nullable),
+                cast_json_list_type(true, result_nullable),
+                input.clone(),
+                TrinoCastMode::Implicit,
+                unused,
+            )
+            .unwrap();
         }
         for (source, result) in [
             (
@@ -733,8 +691,7 @@ fn null_list_json_cast_checks_live_and_unused_definitions_and_full_types() {
                     source,
                     result,
                     input.clone(),
-                    None,
-                    DecimalOverflowPolicy::OutputNull,
+                    TrinoCastMode::Implicit,
                     unused,
                 ),
                 "carrier CAST cannot establish or erase a logical identity",
@@ -793,8 +750,7 @@ fn checked_nonempty_utf8_constant_cannot_gain_json_identity_in_live_or_unused_ca
                 original.value_type().clone(),
                 target.clone(),
                 ExprKind::Constant(reference),
-                None,
-                DecimalOverflowPolicy::OutputNull,
+                TrinoCastMode::Implicit,
                 unused,
             ),
             "carrier CAST cannot establish or erase a logical identity",

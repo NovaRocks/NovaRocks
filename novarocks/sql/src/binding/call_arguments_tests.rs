@@ -150,7 +150,7 @@ fn logical_capture_identity_cast_and_nested_keep_original_nonconstant_none() {
     let source = literal(LiteralValue::Int(17), ty(DataType::Int64, false));
     let cast = TypedExpr {
         kind: crate::analysis::ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(source.clone()),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

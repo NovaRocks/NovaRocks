@@ -110,7 +110,95 @@ impl PredicateGroup {
 }
 
 pub(crate) fn predicate_key(arena: &ScalarArena, expr: ScalarId) -> PredicateKey {
-    PredicateKey(canonical_expr_key(arena, expr))
+    PredicateKey(
+        signed_column_literal_equality_key(arena, expr)
+            .unwrap_or_else(|| canonical_expr_key(arena, expr)),
+    )
+}
+
+/// A propagated signed column equality can return in the optimizer's binary
+/// representation. Recognize the original bound equality without changing
+/// either expression or comparing the semantics of other operator domains.
+fn signed_column_literal_equality_key(arena: &ScalarArena, expr: ScalarId) -> Option<String> {
+    use arrow::datatypes::DataType;
+    use novarocks_functions::{FunctionKind, FunctionResultType};
+    use novarocks_type_contract::{
+        DecimalOverflowPolicy, FunctionArgumentType, FunctionValueType, OperatorFunction,
+        ValueLogicalType,
+    };
+
+    let result = arena.value_type(expr);
+    let operands = match arena.node(expr) {
+        ScalarNode::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        } => [*left, *right],
+        ScalarNode::FunctionCall {
+            args,
+            binding,
+            distinct: false,
+            volatility,
+            ..
+        } if binding.function_id.as_str() == OperatorFunction::Equal.function_id_text()
+            && Some(binding.selected.overload.as_str())
+                == OperatorFunction::Equal.comparison_overload_text()
+            && binding.kind == FunctionKind::Scalar
+            && binding.logical_argument_count == 2
+            && volatility.is_replica_deterministic()
+            && binding.semantics.volatility.is_replica_deterministic()
+            && !scalar_expr::scalar_call_can_fail(binding) =>
+        {
+            let [left, right] = args.as_slice() else {
+                return None;
+            };
+            let [
+                FunctionArgumentType::Value(selected_left),
+                FunctionArgumentType::Value(selected_right),
+            ] = binding.selected.argument_types.as_slice()
+            else {
+                return None;
+            };
+            let FunctionResultType::Scalar(selected_result) = &binding.selected.result_type else {
+                return None;
+            };
+            if selected_left != arena.value_type(*left)
+                || selected_right != arena.value_type(*right)
+                || selected_result != result
+            {
+                return None;
+            }
+            [*left, *right]
+        }
+        _ => return None,
+    };
+
+    let [left, right] = operands;
+    let (column, literal) = if scalar_expr::column_id(arena, left).is_some() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let column_id = scalar_expr::column_id(arena, column)?;
+    let column_type = arena.value_type(column);
+    let literal_type = arena.value_type(literal);
+    if column_type.logical_type() != ValueLogicalType::Physical
+        || literal_type.logical_type() != ValueLogicalType::Physical
+        || column_type.data_type() != literal_type.data_type()
+        || result
+            != &FunctionValueType::new(
+                DataType::Boolean,
+                column_type.nullable() || literal_type.nullable(),
+            )
+        || scalar_expr::can_fail(arena, literal)
+    {
+        return None;
+    }
+    let value = scalar_expr::signed_integer_literal(arena, literal)?;
+    Some(format!(
+        "SignedColumnLiteralEquality({column_id:?},{column_type:?},{result:?},{value})"
+    ))
 }
 
 fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
@@ -175,13 +263,13 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             canonical_expr_list_key(arena, args)
         ),
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => {
             format!(
-                "Cast({},{target:?},{decimal_overflow_policy:?},{array_failure_mode:?})",
+                "Cast({},{target:?},{decimal_overflow_policy:?},{cast_mode:?})",
                 canonical_expr_key(arena, *child)
             )
         }
@@ -221,6 +309,7 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             let operand_key = operand
                 .as_ref()

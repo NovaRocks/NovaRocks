@@ -26,7 +26,6 @@ use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use crate::catalog::{
     PlannerTableProvider, QuotedMetadataTable, ResolvedAnalyzerTable, SqlViewDefinition,
 };
-use arrow::datatypes::DataType as D;
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueKind as K, ValueTypeRef};
 
@@ -141,11 +140,12 @@ impl AnalyzerContext<'_> {
                     .map_err(AnalyzeError::function_binding)?;
             if !same_public_name(field.field_name.as_deref(), &declared.name, &mut work)?
                 || (!fits
-                    && !store_compatible(
+                    && !novarocks_type_contract::trino_can_store_assign(
                         field.value_type.value_type(),
                         declared.value_type.value_type(),
                         &mut work,
-                    )?)
+                    )
+                    .map_err(AnalyzeError::control)?)
             {
                 return Err(AnalyzeError::view_is_stale(
                     format!(
@@ -213,38 +213,22 @@ impl AnalyzerContext<'_> {
                             span,
                         ));
                     }
-                    let mode = self.sql_semantics.sql_mode();
-                    if novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                        field.value_type.data_type(),
-                        target.data_type(),
-                        mode.decimal_overflow_policy(),
-                        mode.allow_throw_exception(),
-                    ) {
-                        return Err(unsupported_assignment(
-                            "Stored-view assignment requires an error-preserving conversion; the current CAST can produce a successful NULL",
-                            span,
-                        ));
-                    }
-                    novarocks_functions::PreparedCastRecipe::try_new(
-                        novarocks_functions::CastOperation::Carrier,
-                        &field.value_type,
-                        &target,
-                        mode.decimal_overflow_policy(),
-                        mode.allow_throw_exception(),
-                        None,
-                        self.control,
-                    )
-                    .map_err(AnalyzeError::view_cast_preparation)?;
                 }
                 let expression = if passthrough {
                     expression
                 } else {
-                    self.cast_to_value_type(expression, target.clone(), span)?
+                    self.cast_with_trino_mode(
+                        expression,
+                        target,
+                        novarocks_type_contract::TrinoCastMode::StoreAssignment,
+                        span,
+                    )?
                 };
+                let value_type = expression.value_type.clone();
                 let id = if passthrough {
                     field.column_id
                 } else {
-                    let id = self.alloc_column_id(None, field.name.clone(), target.clone());
+                    let id = self.alloc_column_id(None, field.name.clone(), value_type.clone());
                     let logical = self.logical_output_type(None, &expression, &self.new_scope())?;
                     self.factory.borrow_mut().set_logical_type(id, logical);
                     id
@@ -259,7 +243,7 @@ impl AnalyzerContext<'_> {
                     column_id: id,
                     name: field.name.clone(),
                     field_name: Some(declared.name.to_string()),
-                    value_type: target,
+                    value_type,
                     is_internal: false,
                 });
             }
@@ -459,96 +443,6 @@ impl crate::catalog::IcebergMetadataTableProvider for SavedViewCatalog<'_> {
     }
 }
 
-/// Trino TypeCoercion compatibility over the public view type. Its value
-/// nodes are nullable; required MAP keys retain their structural role.
-fn store_compatible(
-    source: &ValueTypeRef,
-    target: &ValueTypeRef,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<bool, AnalyzeError> {
-    work.step().map_err(AnalyzeError::control)?;
-    if source.nullable() && !target.nullable() {
-        return Ok(false);
-    }
-    match (source.kind(), target.kind()) {
-        (K::Scalar(D::Null), _) | (_, K::Scalar(D::Null)) => Ok(true),
-        (K::String, K::String) | (K::Binary, K::Binary) => Ok(true),
-        (K::Nominal(left), K::Nominal(right)) => Ok(left == right),
-        (K::List(left), K::List(right)) => store_compatible(left, right, work),
-        (
-            K::Map {
-                key: left_key,
-                value: left_value,
-            },
-            K::Map {
-                key: right_key,
-                value: right_value,
-            },
-        ) => Ok(store_compatible(left_key, right_key, work)?
-            && store_compatible(left_value, right_value, work)?),
-        (K::Struct(left), K::Struct(right)) => {
-            if left.len() != right.len() {
-                return Ok(false);
-            }
-            for (left, right) in left.iter().zip(right.iter()) {
-                if !store_compatible(left.value_type(), right.value_type(), work)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        (K::Scalar(left), K::Scalar(right)) if left == right => Ok(true),
-        (K::Scalar(left), K::Scalar(right)) if trino_numeric(left) && trino_numeric(right) => {
-            Ok(true)
-        }
-        (K::Scalar(left), K::Scalar(right)) if date_timestamp(left) && date_timestamp(right) => {
-            Ok(true)
-        }
-        (K::Scalar(D::Time32(_) | D::Time64(_)), K::Scalar(D::Time32(_) | D::Time64(_))) => {
-            Ok(true)
-        }
-
-        (K::Scalar(left), K::Scalar(right))
-            if exact_only_scalar(left) || exact_only_scalar(right) =>
-        {
-            Err(AnalyzeError::unsupported_expression_without_span(
-                "Stored-view non-identity assignment has no exact Trino type correspondence",
-            ))
-        }
-        (K::FixedSizeList { .. } | K::Union(_), _) | (_, K::FixedSizeList { .. } | K::Union(_)) => {
-            Err(AnalyzeError::unsupported_expression_without_span(
-                "Stored-view non-identity assignment is unsupported for this type",
-            ))
-        }
-        _ => Ok(false),
-    }
-}
-fn trino_numeric(value: &D) -> bool {
-    match value {
-        D::Int8 | D::Int16 | D::Int32 | D::Int64 | D::Float32 | D::Float64 => true,
-        D::Decimal128(precision, scale) => {
-            (1..=38).contains(precision) && *scale >= 0 && (*scale as u8) <= *precision
-        }
-        _ => false,
-    }
-}
-fn date_timestamp(value: &D) -> bool {
-    matches!(value, D::Date32 | D::Date64 | D::Timestamp(..))
-}
-fn exact_only_scalar(value: &D) -> bool {
-    matches!(
-        value,
-        D::UInt8
-            | D::UInt16
-            | D::UInt32
-            | D::UInt64
-            | D::Float16
-            | D::Decimal256(..)
-            | D::FixedSizeBinary(_)
-            | D::Duration(_)
-            | D::Interval(_)
-    ) || matches!(value, D::Decimal128(..)) && !trino_numeric(value)
-}
 fn name_reordering_cast(
     source: &ValueTypeRef,
     target: &ValueTypeRef,
@@ -596,6 +490,7 @@ mod tests {
         ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
         SqlTableVersionSelector, TableDef,
     };
+    use arrow::datatypes::DataType as D;
     use novarocks_type_contract::{FunctionValueType, PureCompileControl};
     use novarocks_types::{naming::TableIdentity, schema::ColumnDef};
     use std::{cell::RefCell, collections::HashMap, sync::Arc};
@@ -889,10 +784,6 @@ mod tests {
     fn stored_replay_keeps_the_existing_uncaptured_semantics_refusals() {
         for (hint, feature) in [
             ("sql_mode='GROUP_CONCAT_LEGACY'", "GROUP_CONCAT_LEGACY"),
-            (
-                "decimal_overflow_to_double=true",
-                "decimal_overflow_to_double",
-            ),
             ("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW"),
         ] {
             let catalog = catalog(declaration(
@@ -1048,8 +939,11 @@ mod tests {
             assert_eq!(error.control_error(), Some(cause));
             assert_eq!(error.span(), None);
         }
-        let original =
-            AnalyzeError::view_cast_preparation(novarocks_functions::CastPrepareError::Unsupported);
+        let original = AnalyzeError::control(novarocks_type_contract::CompileControlError::Source(
+            novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_functions::CastPrepareError::Unsupported,
+            ),
+        ));
         catalog.lookup_error = Some(original.clone());
         let error = analyze("SELECT x FROM v", &catalog).unwrap_err();
         assert_eq!(error.control_error(), original.control_error());
@@ -1077,29 +971,28 @@ mod tests {
 
     #[test]
     fn numeric_assignment_preserves_public_type_for_select_values_and_set_roots() {
-        for (sql, target, runtime_nullable) in [
-            ("SELECT CAST(1 AS INT) AS x", D::Int64, true),
-            (
-                "SELECT x FROM (VALUES (CAST(1 AS INT))) AS t(x)",
-                D::Int64,
-                true,
-            ),
-            ("SELECT 1 AS x UNION ALL SELECT 2", D::Int64, true),
+        for sql in [
+            "SELECT CAST(1 AS INT) AS x",
+            "SELECT x FROM (VALUES (CAST(1 AS INT))) AS t(x)",
+            "SELECT 1 AS x UNION ALL SELECT 2",
         ] {
+            let body = novarocks_parser::parser::parse_query(sql).unwrap();
+            let (source, _, _) =
+                crate::analyzer::analyze(&body, &Catalog::default(), "db").unwrap();
             let catalog = catalog(declaration(
                 sql,
                 "x",
-                FunctionValueType::new(target.clone(), true),
+                FunctionValueType::new(D::Int64, true),
             ));
             let resolved = analyze("SELECT x FROM v", &catalog).unwrap();
             assert_eq!(
                 resolved.output_columns[0].value_type.data_type(),
-                &target,
+                &D::Int64,
                 "{sql}"
             );
             assert_eq!(
                 resolved.output_columns[0].value_type.nullable(),
-                runtime_nullable,
+                source.output_columns[0].value_type.nullable(),
                 "{sql}"
             );
         }
@@ -1334,16 +1227,45 @@ mod tests {
     }
 
     #[test]
-    fn signed_narrowing_never_turns_assignment_overflow_into_a_successful_null() {
-        for value in ["1", "2147483648"] {
+    fn view_assignment_keeps_the_cast_mode_and_actual_source_nullability() {
+        for (value, declared_nullable, source_nullable) in [
+            ("1", true, false),
+            ("2147483648", true, false),
+            ("NULL", false, true),
+        ] {
             let catalog = catalog(declaration(
                 &format!("SELECT CAST({value} AS BIGINT) AS x"),
                 "x",
-                FunctionValueType::new(D::Int32, true),
+                FunctionValueType::new(D::Int32, declared_nullable),
             ));
-            let error = analyze("SELECT x FROM v", &catalog).unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert!(error.message().contains("error-preserving conversion"));
+            let resolved = analyze("SELECT x FROM v", &catalog).unwrap();
+            let QueryBody::Select(outer) = &resolved.body else {
+                panic!("outer query");
+            };
+            let Some(Relation::Subquery { query: view, .. }) = &outer.from else {
+                panic!("stored view");
+            };
+            let QueryBody::Select(wrapper) = &view.body else {
+                panic!("stored view assignment projection");
+            };
+            let expression = &wrapper.projection[0].expr;
+            let ExprKind::Cast {
+                cast_mode, expr, ..
+            } = &expression.kind
+            else {
+                panic!("expected an assignment CAST");
+            };
+            assert_eq!(
+                *cast_mode,
+                Some(novarocks_type_contract::TrinoCastMode::StoreAssignment)
+            );
+            assert_eq!(expr.value_type.data_type(), &D::Int64);
+            assert_eq!(
+                expression.value_type,
+                FunctionValueType::new(D::Int32, source_nullable)
+            );
+            assert_eq!(view.output_columns[0].value_type, expression.value_type);
+            assert_eq!(resolved.output_columns[0].value_type, expression.value_type);
         }
     }
 
@@ -1446,7 +1368,14 @@ mod tests {
             false,
         );
         let target = crate::analyzer::view_value_type(&target, &control).unwrap();
-        assert!(store_compatible(source.value_type(), target.value_type(), &mut work).unwrap());
+        assert!(
+            novarocks_type_contract::trino_can_store_assign(
+                source.value_type(),
+                target.value_type(),
+                &mut work
+            )
+            .unwrap()
+        );
         let source = FunctionValueType::new(
             D::Struct(
                 vec![
@@ -1467,7 +1396,14 @@ mod tests {
             ),
             false,
         );
-        assert!(store_compatible(source.value_type(), target.value_type(), &mut work).unwrap());
+        assert!(
+            novarocks_type_contract::trino_can_store_assign(
+                source.value_type(),
+                target.value_type(),
+                &mut work
+            )
+            .unwrap()
+        );
         assert!(name_reordering_cast(source.value_type(), target.value_type(), &mut work).unwrap());
         work.finish().unwrap();
     }
@@ -1684,11 +1620,15 @@ mod tests {
             observed: AtomicU32::new(0),
         };
         let mut work = CompileCheckpoints::try_new(&stop, CompilePhase::Validate).unwrap();
-        let error =
-            store_compatible(source.value_type(), target.value_type(), &mut work).unwrap_err();
+        let error = novarocks_type_contract::trino_can_store_assign(
+            source.value_type(),
+            target.value_type(),
+            &mut work,
+        )
+        .unwrap_err();
         assert_eq!(
-            error.control_error(),
-            Some(novarocks_type_contract::CompileControlError::Cancelled)
+            error,
+            novarocks_type_contract::CompileControlError::Cancelled
         );
         assert!(stop.observed.load(Ordering::SeqCst) > 0);
     }

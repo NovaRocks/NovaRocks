@@ -229,6 +229,7 @@ fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_typed_expr_column_ids(op, out);
@@ -458,6 +459,7 @@ fn bind_expression_to_columns(
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(operand) = operand {
                     **operand = bind(operand, columns_by_id)?;
@@ -1392,11 +1394,13 @@ mod tests {
             left: col_ref(1, "a"),
             right: col_ref(2, "b"),
             null_safe: false,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         }));
         assert!(!rf_key_types_match(&PhysicalHashJoinEqCondition {
             left: col_ref(1, "a"),
             right: col_ref_with_type(2, "b", DataType::Utf8),
             null_safe: false,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         }));
     }
 
@@ -2182,6 +2186,8 @@ mod tests {
         let args = vec![
             unset_col_ref("unset"),
             typed_expr(ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "sum".to_string(),
                 args: (vec![col_ref(7, "agg_arg")]).into(),
                 distinct: false,
@@ -2193,6 +2199,7 @@ mod tests {
                 ),
             }),
             typed_expr(ExprKind::Case {
+                ieee_float_equality: false,
                 operand: Some(novarocks_parser::ast::AstBox::new(col_ref(
                     6,
                     "case_operand",
@@ -2344,6 +2351,7 @@ mod tests {
             left,
             right,
             null_safe,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         }
     }
 

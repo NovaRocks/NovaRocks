@@ -284,6 +284,15 @@ pub enum ConnectorColumnDefault {
     Map(Vec<(ConnectorColumnDefault, ConnectorColumnDefault)>),
 }
 
+/// A persisted field that the provider can identify but SQL may no longer read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorRetiredReadField {
+    /// Exact path beginning with the corresponding Arrow top-level field.
+    pub field_path: Vec<String>,
+    pub field_id: i32,
+    pub sql_type: &'static str,
+}
+
 /// Provider-neutral planning facts for one Arrow schema field. The ordinal is
 /// deliberately explicit so Core can project facts without inspecting a
 /// provider-private table-handle payload.
@@ -294,6 +303,7 @@ pub struct ConnectorTableColumnPlanningFact {
     semantic_kind: ConnectorTableColumnSemanticKind,
     role: ConnectorTableColumnRole,
     write_default: Option<ConnectorColumnDefault>,
+    retired_read_fields: Vec<ConnectorRetiredReadField>,
     write_input: Option<super::ConnectorWriteFieldRequest>,
 }
 
@@ -310,6 +320,7 @@ impl ConnectorTableColumnPlanningFact {
             semantic_kind,
             role,
             write_default: None,
+            retired_read_fields: Vec::new(),
             write_input: None,
         }
     }
@@ -350,6 +361,16 @@ impl ConnectorTableColumnPlanningFact {
     ) -> Self {
         self.write_input = write_input;
         self
+    }
+
+    #[must_use]
+    pub fn with_retired_read_fields(mut self, fields: Vec<ConnectorRetiredReadField>) -> Self {
+        self.retired_read_fields = fields;
+        self
+    }
+
+    pub fn retired_read_fields(&self) -> &[ConnectorRetiredReadField] {
+        &self.retired_read_fields
     }
 
     pub const fn write_input(&self) -> Option<&super::ConnectorWriteFieldRequest> {
@@ -581,6 +602,20 @@ fn validate_column_facts(
                 super::ConnectorErrorKind::CorruptData,
                 "connector table planning facts contain a duplicate or misaligned schema ordinal",
             ));
+        }
+        for retired in fact.retired_read_fields() {
+            if retired.field_id <= 0
+                || retired.sql_type.is_empty()
+                || !retired
+                    .field_path
+                    .first()
+                    .is_some_and(|field| field == schema.field(expected as usize).name())
+                || retired.field_path.iter().any(String::is_empty)
+            {
+                return Err(corrupt_definition(
+                    "connector retired read field differs from its source declaration",
+                ));
+            }
         }
         if let Some(input) = &fact.write_input {
             let field = schema.field(expected as usize);
@@ -957,6 +992,21 @@ fn planning_facts_bytes(
         .len()
         .saturating_mul(TABLE_PLANNING_FACT_COLUMN_BYTES)
         .saturating_add(
+            column_facts
+                .iter()
+                .flat_map(|fact| fact.retired_read_fields())
+                .fold(0usize, |bytes, field| {
+                    field.field_path.iter().fold(
+                        bytes.saturating_add(std::mem::size_of::<ConnectorRetiredReadField>()),
+                        |bytes, name| {
+                            bytes
+                                .saturating_add(std::mem::size_of::<String>())
+                                .saturating_add(name.len())
+                        },
+                    )
+                }),
+        )
+        .saturating_add(
             partition_source_column_ordinals
                 .len()
                 .saturating_mul(std::mem::size_of::<u32>()),
@@ -1313,22 +1363,24 @@ impl ConnectorTableMetadata {
         execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
         creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
     ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
-        Self::try_new_typed_with_format_projection(
+        Self::try_new_with_read_projection(
             header,
             format_schema,
             execution_schema,
+            None,
             creation,
             |_, _, _, _| Ok(false),
         )
     }
 
-    /// Publish a catalog schema with an explicitly authored format conversion.
-    /// The provider must prove each changed layout from its format declaration.
-    /// The existing normalized equality is sufficient for unchanged layouts.
-    pub fn try_new_typed_with_format_projection(
+    /// Check format and writer storage against the original binding. The
+    /// provider proves any format conversion against its declaration. An
+    /// original schema also supplies proof of a plain Fixed read projection.
+    pub fn try_new_with_read_projection(
         header: ConnectorTableMetadataHeader,
         format_schema: SchemaRef,
         execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
+        original_schema: Option<&novarocks_connector_contract::ConnectorReadExecutionSchema>,
         creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
         mut matches_projection: impl FnMut(
             usize,
@@ -1341,7 +1393,10 @@ impl ConnectorTableMetadata {
         >,
     ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
         creation.work(1)?;
-        if format_schema.fields().len() != execution_schema.bindings().len() {
+        let count = format_schema.fields().len();
+        if count != execution_schema.bindings().len()
+            || original_schema.is_some_and(|schema| schema.bindings().len() != count)
+        {
             return Err(ConnectorError::new(
                 super::ConnectorErrorKind::InvalidRequest,
                 "catalog source/execution schema field counts differ",
@@ -1359,6 +1414,29 @@ impl ConnectorTableMetadata {
                 )
                 .into());
             }
+            let read = binding.typed_binding().borrowed();
+            let original_binding = if let Some(original) = original_schema {
+                let original_field = &original.schema().fields()[ordinal];
+                creation.work(original_field.name().len() + source.name().len() + 1)?;
+                let storage = original.bindings()[ordinal].typed_binding().borrowed();
+                let proof = novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                    storage,
+                    read,
+                    Some(storage),
+                    || creation.work(1),
+                )?;
+                if original_field.name() != source.name() || proof.is_none() {
+                    return Err(ConnectorError::new(
+                        super::ConnectorErrorKind::InvalidRequest,
+                        "catalog execution declaration differs from its checked fixed byte projection",
+                    )
+                    .into());
+                }
+                &original.bindings()[ordinal]
+            } else {
+                binding
+            };
+            let original = original_binding.typed_binding().borrowed();
             if let Some(input) = header
                 .planning_facts
                 .column_facts()
@@ -1371,26 +1449,39 @@ impl ConnectorTableMetadata {
                         "catalog write input lacks its complete declaration",
                     )
                 })?;
-                let original = input.storage_type().unwrap_or(input_value);
-                let matches = original
+                let storage_matches = input
+                    .storage_type()
+                    .unwrap_or(input_value)
                     .typed_binding()
                     .borrowed()
-                    .exactly_equals_observed(binding.typed_binding().borrowed(), || {
+                    .exactly_equals_observed(original, || {
                         creation.work(1).map_err(CatalogLayoutError::Caller)
                     })
                     .map_err(CatalogLayoutError::into_failure)?;
-                if !matches {
+                let read_matches = if original_schema.is_some()
+                    && !read.exactly_equals_observed(original, || creation.work(1))?
+                {
+                    input_value
+                        .typed_binding()
+                        .borrowed()
+                        .exactly_equals_observed(read, || creation.work(1))?
+                } else {
+                    true
+                };
+                if !storage_matches || !read_matches {
                     return Err(ConnectorError::new(super::ConnectorErrorKind::InvalidRequest,
-                        "catalog write input storage declaration differs from its original complete read binding").into());
+                        "catalog writer declaration differs from its original storage or checked read binding").into());
                 }
             }
             let same = novarocks_type_contract::value_layout_matches_carrier_observed(
-                binding.typed_binding().layout(),
+                original_binding.typed_binding().layout(),
                 source.data_type(),
                 |units| creation.work(units).map_err(CatalogLayoutError::Caller),
             )
             .map_err(CatalogLayoutError::into_failure)?;
-            if !same && !matches_projection(ordinal, source.data_type(), binding, creation)? {
+            if !same
+                && !matches_projection(ordinal, source.data_type(), original_binding, creation)?
+            {
                 return Err(ConnectorError::new(
                     super::ConnectorErrorKind::InvalidRequest,
                     "catalog source/execution normalized layouts differ",
@@ -2304,6 +2395,69 @@ mod tests {
             assert!(
                 matches!(result, Err(novarocks_connector_contract::PureProviderCompileError::Provider(ref cause)) if cause.kind()==super::super::ConnectorErrorKind::InvalidRequest)
             );
+        }
+    }
+
+    #[test]
+    fn catalog_metadata_checks_fixed_byte_projection_against_original_domain_and_width() {
+        use novarocks_type_contract::{
+            FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime,
+        };
+        let storage = ValueTypeStorageLifetime::pure();
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+            storage.clone(),
+            &mut request,
+            &mut work,
+        );
+        let format = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::FixedSizeBinary(16),
+            true,
+        )]));
+        for (width, domain, accepted) in [
+            (16, ValueLogicalType::Physical, true),
+            (4, ValueLogicalType::Physical, false),
+            (16, ValueLogicalType::Uuid, false),
+            (16, ValueLogicalType::LargeInt, false),
+        ] {
+            let carrier = DataType::FixedSizeBinary(width);
+            let original = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "payload",
+                    carrier.clone(),
+                    true,
+                )])),
+                vec![FunctionValueType::try_with_logical_type(carrier, true, domain).unwrap()]
+                    .into_boxed_slice(),
+                storage.clone(),
+            )
+            .unwrap();
+            let result = ConnectorTableMetadata::try_new_with_read_projection(
+                typed_catalog_header(),
+                format.clone(),
+                typed_catalog_execution(storage.clone()),
+                Some(&original),
+                &mut creation,
+                |_, _, _, _| Ok(false),
+            );
+            if accepted {
+                let metadata = result.unwrap();
+                assert_eq!(
+                    metadata.format_schema().field(0).data_type(),
+                    &DataType::FixedSizeBinary(16)
+                );
+                assert_eq!(
+                    metadata.execution_schema().binding(0).unwrap().data_type(),
+                    &DataType::Binary
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "accepted an invalid source domain or width"
+                );
+            }
         }
     }
     #[test]

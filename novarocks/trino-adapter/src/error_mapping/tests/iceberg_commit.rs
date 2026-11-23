@@ -19,7 +19,7 @@ use super::*;
 use novarocks_failure_contract::{
     FailureReason,
     connector_reason::{
-        COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_STATE_UNKNOWN,
+        COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_ERROR, ICEBERG_COMMIT_STATE_UNKNOWN,
         ICEBERG_COMMIT_VALIDATION_CONFLICT,
     },
 };
@@ -34,33 +34,25 @@ fn commit_input(reason: FailureReason, detail: &str) -> ExecutionFailureInput {
 
 #[test]
 fn typed_commit_failures_project_the_trino_code_and_original_detail() {
-    for (reason, detail, expected, public_detail) in [
+    for (reason, body, expected) in [
         (
             ICEBERG_COMMIT_VALIDATION_CONFLICT,
             "Found conflicting files that can contain records matching true",
             (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
-            "Found conflicting files that can contain records matching true",
         ),
         (
             ICEBERG_COMMIT_STATE_UNKNOWN,
             "[CommitUnknown] catalog response was lost",
             (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
-            "[CommitUnknown] catalog response was lost",
-        ),
-        (
-            ICEBERG_COMMIT_STATE_UNKNOWN,
-            "catalog response was lost",
-            (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
-            "[CommitUnknown] catalog response was lost",
         ),
         (
             COMMIT_TRANSACTION_CONFLICT,
             "Catalog rejected the commit after four attempts",
             (17, "TRANSACTION_CONFLICT", "USER_ERROR"),
-            "Catalog rejected the commit after four attempts",
         ),
     ] {
-        let input = commit_input(reason, detail);
+        let detail = format!("Failed to commit the transaction during write: {body}");
+        let input = commit_input(reason, &detail);
         let execution = QueryExecutionError::from_execution(input.clone());
         let service = QueryServiceError::from_execution_failure(input);
         let from_execution = query_error(TrinoErrorSource::Execution {
@@ -75,10 +67,7 @@ fn typed_commit_failures_project_the_trino_code_and_original_detail() {
             ),
             expected
         );
-        assert_eq!(
-            from_execution.message,
-            format!("Failed to commit the transaction during write: {public_detail}")
-        );
+        assert_eq!(from_execution.message, detail);
         assert_eq!(
             query_error(TrinoErrorSource::Service {
                 error: &service,
@@ -93,7 +82,7 @@ fn typed_commit_failures_project_the_trino_code_and_original_detail() {
 fn typed_unknown_preserves_the_accumulated_effect() {
     let service = QueryServiceError::from_execution_failure(commit_input(
         ICEBERG_COMMIT_STATE_UNKNOWN,
-        "original catalog error",
+        "Failed to commit the transaction during write: [CommitUnknown] original catalog error",
     ))
     .attach_external_effect_disposition(StatementExternalEffectDisposition::CommitUnknown);
     let wire = query_error_for_query_with_effect(
@@ -113,4 +102,185 @@ fn typed_unknown_preserves_the_accumulated_effect() {
         1
     );
     assert!(wire.message.contains("CommitUnknown do_not_retry=true"));
+}
+
+#[test]
+fn maintenance_commit_messages_are_forwarded_as_authored() {
+    for (reason, code, message) in [
+        (
+            COMMIT_TRANSACTION_CONFLICT,
+            (17, "TRANSACTION_CONFLICT", "USER_ERROR"),
+            "Failed to commit the transaction during optimize: Catalog conflict (after 1 commit attempts)",
+        ),
+        (
+            ICEBERG_COMMIT_VALIDATION_CONFLICT,
+            (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
+            "Failed to commit the transaction during optimize: Missing required files to delete: old.parquet",
+        ),
+        (
+            ICEBERG_COMMIT_ERROR,
+            (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
+            "Failed to commit during truncate: Catalog conflict (after 1 commit attempts)",
+        ),
+        (
+            ICEBERG_COMMIT_STATE_UNKNOWN,
+            (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
+            "Failed to commit during truncate: [CommitUnknown] Catalog did not confirm the commit",
+        ),
+    ] {
+        let input = commit_input(reason, message);
+        let service = QueryServiceError::from_execution_failure(input);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "",
+        });
+        assert_eq!((wire.error_code, wire.error_name, wire.error_type), code);
+        assert_eq!(wire.message, message);
+    }
+}
+
+#[test]
+fn commit_reasons_keep_their_publication_and_effect_diagnostic_paths() {
+    use novarocks_spi::connector::{
+        LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
+        LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationTarget,
+        LakePublicationTerminal,
+    };
+
+    for reason in [
+        COMMIT_TRANSACTION_CONFLICT,
+        ICEBERG_COMMIT_VALIDATION_CONFLICT,
+        ICEBERG_COMMIT_STATE_UNKNOWN,
+        ICEBERG_COMMIT_ERROR,
+    ] {
+        let detail = "Provider-authored commit diagnostic";
+        let (disposition, next_action, effect) = if reason == ICEBERG_COMMIT_STATE_UNKNOWN {
+            (
+                LakePublicationDisposition::CommitUnknown,
+                LakePublicationNextAction::InspectPublishedState,
+                StatementExternalEffectDisposition::CommitUnknown,
+            )
+        } else {
+            (
+                LakePublicationDisposition::KnownUncommitted,
+                LakePublicationNextAction::RetryStatement,
+                StatementExternalEffectDisposition::KnownCommitted,
+            )
+        };
+        let publication_id = LakePublicationId::new_v7();
+        let service = QueryServiceError::from_execution_failure(commit_input(reason, detail))
+            .attach_external_effect_disposition(effect)
+            .attach_publication_terminal(LakePublicationTerminal::new(
+                LakePublicationMarkerHeader::new(publication_id, LakePublicationFamily::Write),
+                LakePublicationTarget::try_new(
+                    "ice".to_owned(),
+                    "db".to_owned(),
+                    Some("t".to_owned()),
+                    Some("main".to_owned()),
+                )
+                .unwrap(),
+                disposition,
+                next_action,
+                None,
+            ));
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "",
+        });
+        assert!(wire.message.starts_with(detail));
+        assert_eq!(
+            wire.message.matches("external effect disposition=").count(),
+            1
+        );
+        let publication_suffix = format!("lake publication id={publication_id} family=write");
+        assert_eq!(
+            wire.message.contains(&publication_suffix),
+            reason != ICEBERG_COMMIT_ERROR
+        );
+    }
+}
+
+#[test]
+fn retained_provider_detail_preserves_the_full_original_utf8_body_and_suffixes() {
+    use novarocks_failure_contract::{BoundedDetail, SharedFailureCause};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, LakePublicationDisposition, LakePublicationFamily,
+        LakePublicationId, LakePublicationMarkerHeader, LakePublicationNextAction,
+        LakePublicationTarget, LakePublicationTerminal,
+    };
+
+    #[derive(Debug)]
+    struct ProviderOrigin;
+
+    impl std::fmt::Display for ProviderOrigin {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("an explicit public diagnostic must not call its origin formatter")
+        }
+    }
+
+    impl std::error::Error for ProviderOrigin {}
+
+    impl FailureProjection for ProviderOrigin {
+        fn failure_fact(&self) -> FailureFact {
+            FailureFact::new(FailureClass::Dependency, ICEBERG_COMMIT_STATE_UNKNOWN)
+        }
+    }
+
+    let original_body = format!("{}é discarded tail", "x".repeat(510));
+    let bounded_body = BoundedDetail::truncating(&original_body);
+    assert_eq!(bounded_body.as_str().len(), 512);
+    let prefix = "Failed to commit the transaction during write: ";
+    let marker = "[CommitUnknown] ";
+    let expected = format!("{prefix}{marker}{bounded_body}");
+    let cause = SharedFailureCause::from_prefixed_public_detail(
+        ProviderOrigin,
+        prefix,
+        marker,
+        bounded_body,
+    );
+    assert_eq!(cause.prefixed_public_detail(), Some(expected.as_str()));
+    assert!(cause.detail().len() <= 512);
+    assert!(cause.downcast_ref::<ProviderOrigin>().is_some());
+    let connector = ConnectorError::from_domain(ConnectorErrorKind::Unavailable, cause.clone())
+        .with_public_failure_detail();
+    let original = std::error::Error::source(&connector)
+        .unwrap()
+        .downcast_ref::<SharedFailureCause>()
+        .unwrap();
+    assert_eq!(original, &cause);
+    let connector_wrapper = SharedFailureCause::from_bounded_detail(
+        connector,
+        BoundedDetail::truncating(cause.detail()),
+    );
+    for origin in [cause, connector_wrapper] {
+        let publication_id = LakePublicationId::new_v7();
+        let service = QueryServiceError::from_failure_cause(origin)
+            .attach_external_effect_disposition(StatementExternalEffectDisposition::CommitUnknown)
+            .attach_publication_terminal(LakePublicationTerminal::new(
+                LakePublicationMarkerHeader::new(publication_id, LakePublicationFamily::Write),
+                LakePublicationTarget::try_new(
+                    "ice".to_owned(),
+                    "db".to_owned(),
+                    Some("t".to_owned()),
+                    Some("main".to_owned()),
+                )
+                .unwrap(),
+                LakePublicationDisposition::CommitUnknown,
+                LakePublicationNextAction::InspectPublishedState,
+                None,
+            ));
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "DELETE FROM t WHERE id = 1",
+        });
+        assert_eq!(wire.error_name, "ICEBERG_COMMIT_ERROR");
+        let suffix = wire
+            .message
+            .strip_prefix(&expected)
+            .expect("the author's complete UTF-8 body reaches Trino");
+        assert!(suffix.starts_with(&format!(" (lake publication id={publication_id}")));
+        assert!(suffix.ends_with(
+            " (external effect disposition=CommitUnknown do_not_retry=true; do not retry statement)"
+        ));
+    }
 }

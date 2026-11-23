@@ -79,8 +79,7 @@ impl Fixture {
             )])
             .unwrap(),
             sql_semantics: SqlSemanticSettings::default()
-                .with_sql_mode(SqlMode::from_assignment("ALLOW_THROW_EXCEPTION"))
-                .with_decimal_overflow_to_double(false),
+                .with_sql_mode(SqlMode::from_assignment("ALLOW_THROW_EXCEPTION")),
         }
     }
 
@@ -273,11 +272,7 @@ fn resolved_definition(
     let mut kind = kind.clone();
     let mut values = Vec::new();
     match &mut kind {
-        ExprKind::Cast {
-            allow_throw_exception,
-            ..
-        }
-        | ExprKind::Binary {
+        ExprKind::Binary {
             allow_throw_exception: Some(allow_throw_exception),
             ..
         } => {
@@ -515,20 +510,19 @@ fn identical_local_constant_addresses_do_not_hide_different_values() {
 }
 
 #[test]
-fn actual_semantic_parameter_values_are_checked() {
-    let mut fixture = Fixture::new();
-    let source = "CASE WHEN TRUE THEN 2147483648 ELSE 1 END";
-    let sql = fixture.sql(source, &[]).unwrap();
-    fixture.parameters = SemanticParameters::try_new([(
-        ALLOW_THROW.id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
-    let text = fixture.text(source, &[]).unwrap();
+fn actual_cast_modes_are_checked() {
+    let fixture = Fixture::new();
+    let columns = [column("input_text", 34, DataType::Utf8, true)];
+    let sql = fixture
+        .sql("CAST(input_text AS INTEGER)", &columns)
+        .unwrap();
+    let text = fixture
+        .text("TRY_CAST(input_text AS INTEGER)", &columns)
+        .unwrap();
     let error = compare_units(&sql, &text).unwrap_err();
     assert!(error.contains("shape and parameters differs"), "{error}");
-    assert!(error.contains("AllowThrowException(true)"), "{error}");
-    assert!(error.contains("AllowThrowException(false)"), "{error}");
+    assert!(error.contains("cast_mode: Explicit"), "{error}");
+    assert!(error.contains("cast_mode: Try"), "{error}");
 }
 
 #[test]

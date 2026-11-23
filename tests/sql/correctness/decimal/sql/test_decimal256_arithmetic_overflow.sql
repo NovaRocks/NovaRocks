@@ -152,87 +152,87 @@ ROW(7, 38, 99999999999999);
 
 -- query 2
 -- INT_256MAX
-select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 as string) from ${case_db}.powers_of_2;
+select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 3
 -- INT_256MIN
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 4
 -- INT_256MAX + 1 (overflow)
-select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 + 1 as string) from ${case_db}.powers_of_2;
+select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 + 1 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 5
 -- INT_256MAX - 1
-select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 - 1 as string) from ${case_db}.powers_of_2;
+select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 - 1 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 6
 -- INT_256MAX * 0
-select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * 0 as string) from ${case_db}.powers_of_2;
+select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * 0 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 7
 -- INT_256MAX * -1
-select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * -1 as string) from ${case_db}.powers_of_2;
+select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * -1 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 8
 -- INT_256MAX * 2 (overflow)
-select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * 2 as string) from ${case_db}.powers_of_2;
+select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * 2 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 9
 -- INT_256MAX * -2 (overflow)
-select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * -2 as string) from ${case_db}.powers_of_2;
+select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * -2 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 10
 -- INT_256MIN - 1 (overflow)
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) - 1 as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) - 1 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 11
 -- INT_256MIN + 1 (not overflow)
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) + 1 as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) + 1 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 12
 -- INT_256MIN * 1
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * 1 as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * 1 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 13
 -- INT_256MIN * -1 (overflow. special case)
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * -1 as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * -1 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 14
 -- INT_256MIN * -2 (overflow)
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * -2 as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * -2 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 15
 -- INT_256MIN * 2 (overflow)
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * 2 as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * 2 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 16
 -- INT_256MIN * 0
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * 0 as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * 0 as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 17
 -- INT_256MIN + INT256_MAX(-1)
-select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 + (-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as string) from ${case_db}.powers_of_2;
+select cast(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322 + (-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 18
 -- INT_256MAX * INT_256MIN (overflow)
-select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * (-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as string) from ${case_db}.powers_of_2;
+select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * (-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 19
 -- INT_256MAX * INT_256MAX (overflow)
-select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * (power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) as string) from ${case_db}.powers_of_2;
+select cast((power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) * (power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 20
 -- INT_256MIN * INT_256MIN (overflow)
-select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * (-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as string) from ${case_db}.powers_of_2;
+select cast((-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) * (-(power_250 * 16 + 72370055773322 + 72370055773322 + 72370055773322 + 72370055773322) - 1) as VARCHAR) from ${case_db}.powers_of_2;
 
 -- query 21
 -- TEST INT_256MAX result (bit count is 256)
-select cast(d1 * 38685626227668 as string) from ${case_db}.test_256max_result;
+select cast(d1 * 38685626227668 as VARCHAR) from ${case_db}.test_256max_result;
 
 -- query 22
 -- TEST INT_256MIN result (bit count is 257)
-select cast(d1 * d2 as string) from ${case_db}.test_256min_result;
+select cast(d1 * d2 as VARCHAR) from ${case_db}.test_256min_result;
 
 -- =============================================================================
 -- Test 1: Positive number multiplication overflow
@@ -242,8 +242,8 @@ select cast(d1 * d2 as string) from ${case_db}.test_256min_result;
 -- Test 1.1: 76-digit max * 76-digit max (definite overflow)
 SELECT
     'Test 1.1: 76-digit max * 76-digit max (definite overflow)' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * val_76_0 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * val_76_0 as VARCHAR) as result,
     'Should overflow: 10^75 * 10^75 = 10^150, way beyond int256' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -251,8 +251,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 1.2: 38-digit max * 38-digit max (may overflow)
 SELECT
     'Test 1.2: 38-digit max * 38-digit max (may overflow)' as test_case,
-    cast(val_38_0 as string),
-    cast(cast(val_38_0 as decimal(38,0)) * val_38_0 as string) as result,
+    cast(val_38_0 as VARCHAR),
+    cast(cast(val_38_0 as decimal(38,0)) * val_38_0 as VARCHAR) as result,
     'not overflow' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -260,8 +260,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 1.3: 19-digit * 19-digit (should not overflow)
 SELECT
     'Test 1.3: 19-digit * 19-digit (should not overflow)' as test_case,
-    cast(val_19_0 as string),
-    cast(val_19_0 * val_19_0 as string) as result,
+    cast(val_19_0 as VARCHAR),
+    cast(val_19_0 * val_19_0 as VARCHAR) as result,
     'Should not overflow: 10^18 * 10^18 = 10^36, within int256' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -269,8 +269,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 1.4: Large value * 2
 SELECT
     'Test 1.4: Large value * 2' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * 2 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * 2 as VARCHAR) as result,
     'Should overflow: near-max * 2' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -278,8 +278,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 1.5: Large value * 5
 SELECT
     'Test 1.5: Large value * 5' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * 5 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * 5 as VARCHAR) as result,
     'Should overflow: near-max * 5' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -287,8 +287,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 1.6: Large value * 5.1 (overflow)
 SELECT
     'Test 1.6: Large value * 5.1' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * 5.1 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * 5.1 as VARCHAR) as result,
     'Should overflow: near-max * 5.1' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -296,8 +296,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 1.7: Large value * 6 (overflow)
 SELECT
     'Test 1.7: Large value * 6' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * 6 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * 6 as VARCHAR) as result,
     'Should overflow: near-max * 6' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -309,8 +309,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 2.1: Large negative * Large negative (positive overflow)
 SELECT
     'Test 2.1: Large negative * Large negative (positive overflow)' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * val_76_0 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * val_76_0 as VARCHAR) as result,
     'Should overflow: (-10^75) * (-10^75) = +10^150' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 2;
 
@@ -318,9 +318,9 @@ FROM ${case_db}.test_boundary_values WHERE id = 2;
 -- Test 2.2: Large negative * Large positive (negative overflow)
 SELECT
     'Test 2.2: Large negative * Large positive (negative overflow)' as test_case,
-    cast(a.val_76_0 as string) as neg_val,
-    cast(b.val_76_0 as string) as pos_val,
-    cast(a.val_76_0 * b.val_76_0 as string) as result,
+    cast(a.val_76_0 as VARCHAR) as neg_val,
+    cast(b.val_76_0 as VARCHAR) as pos_val,
+    cast(a.val_76_0 * b.val_76_0 as VARCHAR) as result,
     'Should overflow: (-10^75) * (+10^75) = -10^150' as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 2 AND b.id = 1;
@@ -329,8 +329,8 @@ WHERE a.id = 2 AND b.id = 1;
 -- Test 2.3: Negative boundary * 5
 SELECT
     'Test 2.3: Negative boundary * 5' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * 5 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * 5 as VARCHAR) as result,
     'Should not overflow' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 2;
 
@@ -338,8 +338,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 2;
 -- Test 2.4: Negative boundary * 6
 SELECT
     'Test 2.4: Negative boundary * 6' as test_case,
-    cast(val_76_0 as string),
-    cast(val_76_0 * 6 as string) as result,
+    cast(val_76_0 as VARCHAR),
+    cast(val_76_0 * 6 as VARCHAR) as result,
     'Should overflow' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 2;
 
@@ -351,9 +351,9 @@ FROM ${case_db}.test_boundary_values WHERE id = 2;
 -- Test 3.1: 76-digit * 38-digit
 SELECT
     'Test 3.1: 76-digit * 38-digit' as test_case,
-    cast(a.val_76_0 as string),
-    cast(b.val_38_0 as string),
-    cast(a.val_76_0 * b.val_38_0 as string) as result,
+    cast(a.val_76_0 as VARCHAR),
+    cast(b.val_38_0 as VARCHAR),
+    cast(a.val_76_0 * b.val_38_0 as VARCHAR) as result,
     'Should overflow: 10^75 * 10^37 = 10^112' as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 1 AND b.id = 1;
@@ -362,9 +362,9 @@ WHERE a.id = 1 AND b.id = 1;
 -- Test 3.2: 38-digit * 25-digit (can't auto scale up now)
 SELECT
     'Test 3.2: 38-digit * 25-digit' as test_case,
-    cast(a.val_38_0 as string),
-    cast(b.val_25_0 as string),
-    cast(a.val_38_0 * b.val_25_0 as string) as result,
+    cast(a.val_38_0 as VARCHAR),
+    cast(b.val_25_0 as VARCHAR),
+    cast(a.val_38_0 * b.val_25_0 as VARCHAR) as result,
     'overflow' as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 1 AND b.id = 1;
@@ -373,9 +373,9 @@ WHERE a.id = 1 AND b.id = 1;
 -- Test 3.2: 38-digit * 25-digit (with explicit cast)
 SELECT
     'Test 3.2: 38-digit * 25-digit' as test_case,
-    cast(a.val_38_0 as string),
-    cast(b.val_25_0 as string),
-    cast(cast(a.val_38_0 as decimal(38,10)) * b.val_25_0 as string) as result,
+    cast(a.val_38_0 as VARCHAR),
+    cast(b.val_25_0 as VARCHAR),
+    cast(cast(a.val_38_0 as decimal(38,10)) * b.val_25_0 as VARCHAR) as result,
     'should not overflow' as expected
 FROM ${case_db}.test_boundary_values a, ${case_db}.test_boundary_values b
 WHERE a.id = 1 AND b.id = 1;
@@ -384,8 +384,8 @@ WHERE a.id = 1 AND b.id = 1;
 -- Test 3.3: 25-digit * 25-digit (can't auto scale up now)
 SELECT
     'Test 3.3: 25-digit * 25-digit' as test_case,
-    cast(val_25_0 as string),
-    cast(val_25_0 * val_25_0 as string) as result,
+    cast(val_25_0 as VARCHAR),
+    cast(val_25_0 * val_25_0 as VARCHAR) as result,
     'overflow' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -393,8 +393,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 3.3: 25-digit * 25-digit (with explicit cast)
 SELECT
     'Test 3.3: 25-digit * 25-digit' as test_case,
-    cast(val_25_0 as string),
-    cast(cast(val_25_0 as decimal(18,0)) * cast(val_25_0 as decimal(18,0)) as string) as result,
+    cast(val_25_0 as VARCHAR),
+    cast(cast(val_25_0 as decimal(18,0)) * cast(val_25_0 as decimal(18,0)) as VARCHAR) as result,
     'should not overflow' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -406,8 +406,8 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 SELECT
     id,
     digits,
-    cast(test_val as string),
-    cast(test_val * test_val as string) as result,
+    cast(test_val as VARCHAR),
+    cast(test_val * test_val as VARCHAR) as result,
     CASE
         WHEN digits <= 19 THEN 'Should succeed'
         WHEN digits <= 25 THEN 'May succeed'
@@ -421,19 +421,18 @@ FROM ${case_db}.test_progressive_boundary ORDER BY id;
 -- =============================================================================
 
 -- query 40
--- @expect_error=arithmetic operator `Multiply` has no frozen result rule for Decimal128(38, 38) and Decimal128(38, 38)
--- Test 5.1: Scale overflow, tiny value (throw exception)
+-- Test 5.1: Exact zero at high scale
 SELECT
-    'Test 5.1: Scale overflow, tiny value' as test_case,
+    'Test 5.1: Exact zero at high scale' as test_case,
     cast(val_high_scale * val_high_scale as string) as result,
-    'Should fail due to scale=100 > 76' as expected
+    'Zero remains exactly representable' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
 -- query 41
 -- Test 5.2: Value overflow but reasonable scale
 SELECT
     'Test 5.2: Value overflow, scale OK' as test_case,
-        cast(val_38_0 * val_38_0 as string) as result,
+        cast(val_38_0 * val_38_0 as VARCHAR) as result,
     'Should fail due to value overflow, scale=0 is fine' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -445,7 +444,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 6.1: Large * 0
 SELECT
     'Test 6.1: Large * 0' as test_case,
-    cast(val_76_0 * 0 as string) as result,
+    cast(val_76_0 * 0 as VARCHAR) as result,
     'Should return 0, no overflow' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -453,7 +452,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 6.2: Large * 1
 SELECT
     'Test 6.2: Large * 1' as test_case,
-    cast(val_76_0 * 1 as string) as result,
+    cast(val_76_0 * 1 as VARCHAR) as result,
     'Should return original value' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -461,7 +460,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 6.3: Large * 0.1
 SELECT
     'Test 6.3: Large * 0.1' as test_case,
-    cast(val_76_0 * 0.1 as string) as result,
+    cast(val_76_0 * 0.1 as VARCHAR) as result,
     'Should succeed, reduces magnitude' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -469,7 +468,7 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- Test 6.4: Large * -1
 SELECT
     'Test 6.4: Large * -1' as test_case,
-    cast(val_76_0 * (-1) as string) as result,
+    cast(val_76_0 * (-1) as VARCHAR) as result,
     'Should return negative of original' as expected
 FROM ${case_db}.test_boundary_values WHERE id = 1;
 
@@ -478,9 +477,10 @@ FROM ${case_db}.test_boundary_values WHERE id = 1;
 -- =============================================================================
 
 -- query 46
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 -- Test 7.2: Scientific calculation
 SELECT
     'Test 7.2: Scientific calculation' as test_case,
-    cast(d76_10 * d76_10 as string) as result,
+    cast(d76_10 * d76_10 as VARCHAR) as result,
     'Simulates scientific computation overflow' as expected
 FROM ${case_db}.test_decimal_multiply_overflow WHERE id = 3;

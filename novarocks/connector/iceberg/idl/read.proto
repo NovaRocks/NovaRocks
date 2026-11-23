@@ -169,6 +169,13 @@ message IcebergReadViewPayload {
 
 message IcebergPinnedDataFileSet {
   repeated string paths = 1;
+  IcebergPinnedDataReadPurpose purpose = 2;
+}
+
+enum IcebergPinnedDataReadPurpose {
+  ICEBERG_PINNED_DATA_READ_PURPOSE_UNSPECIFIED = 0;
+  ICEBERG_PINNED_DATA_READ_PURPOSE_QUERY = 1;
+  ICEBERG_PINNED_DATA_READ_PURPOSE_DATA_REWRITE = 2;
 }
 
 message IcebergReadDomain {
@@ -246,45 +253,6 @@ message IcebergSystemTableReference {
   optional int64 snapshot_id = 5;
 }
 
-enum IcebergProcedureId {
-  ICEBERG_PROCEDURE_ID_UNSPECIFIED = 0;
-  ICEBERG_PROCEDURE_ID_OPTIMIZE = 1;
-  ICEBERG_PROCEDURE_ID_OPTIMIZE_MANIFESTS = 2;
-  ICEBERG_PROCEDURE_ID_DROP_EXTENDED_STATS = 3;
-  ICEBERG_PROCEDURE_ID_ROLLBACK_TO_SNAPSHOT = 4;
-  ICEBERG_PROCEDURE_ID_EXPIRE_SNAPSHOTS = 5;
-  ICEBERG_PROCEDURE_ID_REMOVE_ORPHAN_FILES = 6;
-  ICEBERG_PROCEDURE_ID_ADD_FILES = 7;
-  ICEBERG_PROCEDURE_ID_ADD_FILES_FROM_TABLE = 8;
-  ICEBERG_PROCEDURE_ID_REWRITE_POSITION_DELETE_FILES = 9;
-}
-
-message IcebergOptimizeHandle {
-  IcebergTableHandle table_handle = 1;
-  uint64 min_file_size_bytes = 2;
-}
-
-message IcebergRewriteArtifactContentId {
-  bytes operation_id = 1;
-  string artifact_digest_hex = 2;
-}
-
-message IcebergRewritePositionDeleteFilesHandle {
-  IcebergTableHandle table_handle = 1;
-  IcebergRewriteArtifactContentId artifact = 2;
-  string group_digest_hex = 3;
-}
-
-message IcebergTableExecuteHandle {
-  SchemaTableName schema_table_name = 1;
-  IcebergProcedureId procedure_id = 2;
-  string table_location = 3;
-  oneof procedure_handle {
-    IcebergOptimizeHandle optimize = 10;
-    IcebergRewritePositionDeleteFilesHandle rewrite_position_delete_files = 11;
-  }
-}
-
 message IcebergInsertTableHandle {
   SchemaTableName schema_table_name = 1;
   string table_schema_json = 2;
@@ -299,13 +267,14 @@ message IcebergMergeTableHandle {
 }
 
 message IcebergReadTablePayload {
+  reserved 14;
+  reserved "table_execute";
   IcebergReadExecution execution = 1;
   oneof relation {
     IcebergTableHandle table = 10;
     TableChangesFunctionHandle table_function = 11;
     IcebergChangeWindowHandle change_window = 12;
     IcebergSystemTableReference system_table = 13;
-    IcebergTableExecuteHandle table_execute = 14;
     IcebergMergeTableHandle merge_table = 15;
   }
 }
@@ -459,21 +428,14 @@ message SystemRelationSplit {
   IcebergSystemTableReference reference = 1;
 }
 
-message IcebergRewritePositionDeleteFilesSplit {
-  string data_file_path = 1;
-  int64 data_file_size = 2;
-  int32 partition_spec_id = 3;
-  string partition_data_json = 4;
-  repeated IcebergDeleteFile selected_position_deletes = 5;
-}
-
 message IcebergReadSplitPayload {
+  reserved 14;
+  reserved "rewrite_position_delete_files";
   oneof split {
     IcebergSplit data = 10;
     TableChangesSplit table_changes = 11;
     IcebergChangeSplit change_window = 12;
     SystemManifestSplit system_manifest = 13;
     SystemRelationSplit system_relation = 15;
-    IcebergRewritePositionDeleteFilesSplit rewrite_position_delete_files = 14;
   }
 }

@@ -25,8 +25,7 @@ use crate::query_execution::dml::insert::InsertTargetName;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
 pub(crate) use shaping::{
-    attach_write_literal_contexts, capture_typed_write_constants, omitted_insert_expr,
-    shape_typed_write_source,
+    capture_typed_write_constants, omitted_insert_expr, shape_typed_write_source,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

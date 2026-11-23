@@ -1350,9 +1350,12 @@ mod tests {
         use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 
+        // Give the optimizer enough rows for a partial COUNT to reduce
+        // the gather. Table-free series provide exact cardinalities without
+        // requiring an external relation or executing the statement.
         let sql = "SELECT COUNT(*) AS row_count \
-            FROM (VALUES (7), (19)) AS l(id) \
-            JOIN (VALUES (7), (19)) AS r(id) ON l.id = r.id";
+            FROM TABLE(generate_series(1, 4096)) AS l(id) \
+            JOIN TABLE(generate_series(1, 4096)) AS r(id) ON l.id = r.id";
         let request = request_with_settings(
             sql,
             SessionOptimizerSettings {
@@ -1470,13 +1473,13 @@ mod tests {
 
         let sql = r#"
             SELECT p.id, parse_json(p.txt) IN (
-                SELECT parse_json(CONCAT('{"key":', CAST(generate_series AS STRING), '}'))
+                SELECT parse_json(CONCAT('{"key":', CAST(generate_series AS VARCHAR), '}'))
                 FROM TABLE(generate_series(0, 1))
             ) AS present
             FROM (
                 SELECT generate_series AS id,
                     CASE WHEN generate_series=2 THEN NULL
-                         ELSE CONCAT('{"key":', CAST(generate_series AS STRING), '}') END AS txt
+                         ELSE CONCAT('{"key":', CAST(generate_series AS VARCHAR), '}') END AS txt
                 FROM TABLE(generate_series(1, 2))
             ) p
             ORDER BY p.id
@@ -1541,51 +1544,6 @@ mod tests {
                 .encode_to_vec();
             assert_eq!(&again, bytes, "fragment {id:?} roundtrips byte-identically");
         }
-    }
-
-    /// A real sealed RAND-only subset; a table-free statement binds no
-    /// function, but the compiler refuses an empty pure catalog. This is not
-    /// the Server catalogue.
-    fn sealed_rand_subset() -> novarocks_functions::PureEngineFunctionCatalog {
-        use novarocks_functions::{
-            EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
-            InstalledPureKernel, PureImplementationDeclaration, PureImplementationId,
-            PureKernelAbi,
-        };
-        let actual =
-            novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
-                .expect("builtin catalogue");
-        let mut builder = EngineFunctionCatalogBuilder::new();
-        builder
-            .register(
-                actual
-                    .definition("rand", FunctionKind::Scalar)
-                    .expect("rand definition")
-                    .clone(),
-            )
-            .expect("register rand");
-        builder
-            .seal_pure(
-                [
-                    "builtin.scalar/rand/()->f64;strict;legacy",
-                    "builtin.scalar/rand/(i64)->f64;strict;legacy",
-                ]
-                .into_iter()
-                .map(|overload| InstalledPureKernel {
-                    function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
-                    kind: FunctionKind::Scalar,
-                    implementation: PureImplementationDeclaration {
-                        overload: FunctionOverloadId::try_new(overload).unwrap(),
-                        implementation: PureImplementationId::try_new(
-                            "builtin.scalar/rand/selected-v1",
-                        )
-                        .unwrap(),
-                        abi: PureKernelAbi::ScalarV1,
-                    },
-                    aggregate_state_format: None,
-                }),
-            )
-            .expect("sealed rand subset")
     }
 
     /// Package admission within the test encode limits' source/coexistence
@@ -1873,7 +1831,10 @@ mod tests {
         novarocks_physical_plan::FragmentId,
         novarocks_local_program::LocalProgram,
     > {
-        compiled_programs_with_functions(sql, &sealed_rand_subset())
+        compiled_programs_with_functions(
+            sql,
+            &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        )
     }
 
     fn compiled_programs_with_functions(
@@ -3159,7 +3120,7 @@ mod tests {
             .unwrap();
         let (_root, scope) = query_scope();
         let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete_for_test(
-            request_for("SELECT CAST(NULL AS HLL) AS h, CAST(NULL AS BITMAP) AS b, parse_json('{}') AS j, CAST(NULL AS VARBINARY) AS raw"), &scope,
+            request_for("SELECT CAST(NULL AS UUID) AS u, CAST(JSON '7' AS VARCHAR(8)) AS text_value, parse_json('{}') AS j, CAST(NULL AS VARBINARY) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();
@@ -3172,14 +3133,14 @@ mod tests {
                 .iter()
                 .map(|column| column.logical_type())
                 .collect::<Vec<_>>(),
-            vec![D::Hll, D::Bitmap, D::Json, D::Physical]
+            vec![D::Uuid, D::Physical, D::Json, D::Physical]
         );
         assert_eq!(
             outputs
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["h", "b", "j", "raw"]
+            vec!["u", "text_value", "j", "raw"]
         );
         for (output, original) in outputs.iter().zip(result.fields.iter()) {
             assert_eq!(output.ty, original.ty);

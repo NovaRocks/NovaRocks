@@ -17,14 +17,15 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field};
 use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
 use novarocks_functions::temporal_value::{
     ParsedTemporal, parse_time_literal, parse_timestamp_literal,
 };
+use novarocks_functions::{KernelFailure, validate_trino_json_literal};
 use novarocks_parser::ast;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, FunctionValueType, ValueLogicalType,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, ValueLogicalType,
 };
 
 use super::{CarrierConversion, LiteralValue, TypingError, admit_syntax_constant};
@@ -81,22 +82,8 @@ pub enum LiteralEmission {
     },
 }
 
-fn typed_string(name: &str) -> Option<DataType> {
-    if name.eq_ignore_ascii_case("date") {
-        Some(DataType::Date32)
-    } else if name.eq_ignore_ascii_case("time") {
-        Some(DataType::Time64(TimeUnit::Microsecond))
-    } else if name.eq_ignore_ascii_case("timestamp") || name.eq_ignore_ascii_case("datetime") {
-        Some(DataType::Timestamp(TimeUnit::Microsecond, None))
-    } else if name.eq_ignore_ascii_case("json") {
-        Some(DataType::Utf8)
-    } else {
-        None
-    }
-}
-
 pub fn supports_typed_string(name: &str) -> bool {
-    typed_string(name).is_some()
+    super::declaration::supports_literal_type_name(name)
 }
 
 pub(super) fn type_literal(
@@ -127,11 +114,9 @@ pub(super) fn type_literal(
                 false,
             )
         }
-        LiteralSyntax::String(value) => (
-            LiteralValue::String(value.to_owned()),
-            DataType::Utf8,
-            false,
-        ),
+        LiteralSyntax::String(value) => {
+            return string_literal(context, value, work).map(LiteralEmission::Direct);
+        }
         LiteralSyntax::Binary(value) => (
             LiteralValue::Binary(value.to_vec()),
             DataType::Binary,
@@ -155,24 +140,49 @@ pub(super) fn type_literal(
                 })?;
                 return temporal_constant(context, parsed, work);
             }
-            let target = typed_string(name).ok_or_else(|| {
-                TypingError::Unsupported(format!("generic literal type {name} is not supported"))
-            })?;
-            if name.eq_ignore_ascii_case("json") {
-                let result = FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
-                    false,
-                    ValueLogicalType::Json,
+            use super::declaration::{TypeDeclarationProblem, resolve_trino_type};
+            use novarocks_type_contract::TrinoCastMode;
+
+            let syntax = novarocks_parser::build::simple_type(name);
+            let target =
+                resolve_trino_type(&syntax, false, work.control()).map_err(|error| match error
+                    .problem
+                {
+                    TypeDeclarationProblem::UnknownType
+                    | TypeDeclarationProblem::InvalidParameters
+                    | TypeDeclarationProblem::InvalidDecimalParameters => {
+                        TypingError::TypeMismatch(error.to_string())
+                    }
+                    TypeDeclarationProblem::Unsupported => {
+                        TypingError::Unsupported(error.to_string())
+                    }
+                    TypeDeclarationProblem::Control => TypingError::Control(
+                        error.control.expect("original type declaration control"),
+                    ),
+                })?;
+            if target.logical_type() == ValueLogicalType::Json {
+                work.flush()?;
+                let valid = validate_trino_json_literal(value, work.control()).map_err(
+                    |error| match error {
+                        KernelFailure::CompileControl(error) => TypingError::Control(error),
+                        KernelFailure::ResourceExhausted => {
+                            TypingError::Control(CompileControlError::ResourceExhausted)
+                        }
+                        error => TypingError::JsonLiteralValidation(error),
+                    },
                 )?;
+                if !valid {
+                    return Err(TypingError::InvalidLiteral("Invalid JSON literal".into()));
+                }
                 return TypedLiteral::checked(
                     LiteralValue::String(value.to_owned()),
-                    result,
+                    target,
                     context.constant_policy,
                     work,
                 )
                 .map(LiteralEmission::Direct);
             }
-            if target == DataType::Date32 {
+            if target.data_type() == &DataType::Date32 {
                 let days = novarocks_functions::temporal_value::parse_date_literal_observed(
                     value,
                     || work.step(),
@@ -180,30 +190,27 @@ pub(super) fn type_literal(
                 .ok_or_else(|| {
                     TypingError::InvalidLiteral(format!("invalid DATE literal '{value}'"))
                 })?;
-                (LiteralValue::Int(i64::from(days)), target, false)
-            } else {
-                // SQL has a non-null temporal literal declaration. The checked
-                // physical text cast can produce NULL and must retain that fact.
-                let nullable = novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                    &DataType::Utf8,
-                    &target,
-                    context.decimal_overflow_policy,
-                    false,
-                );
-                return Ok(LiteralEmission::Cast {
-                    input: TypedLiteral::checked(
-                        LiteralValue::String(value.to_owned()),
-                        FunctionValueType::new(DataType::Utf8, false),
-                        context.constant_policy,
-                        work,
-                    )?,
-                    declared_result: FunctionValueType::new(target.clone(), false),
-                    conversion: CarrierConversion {
-                        target: FunctionValueType::new(target, nullable),
-                        decimal_overflow_policy: context.decimal_overflow_policy,
-                    },
-                });
+                return TypedLiteral::checked(
+                    LiteralValue::Int(i64::from(days)),
+                    target,
+                    context.constant_policy,
+                    work,
+                )
+                .map(LiteralEmission::Direct);
             }
+            let input = string_literal(context, value, work)?;
+            let conversion = super::type_cast(
+                context,
+                &input.value_type,
+                target,
+                TrinoCastMode::Explicit,
+                work,
+            )?;
+            return Ok(LiteralEmission::Cast {
+                input,
+                declared_result: conversion.target.clone(),
+                conversion,
+            });
         }
         LiteralSyntax::Interval(interval) => {
             for _ in interval.value.bytes() {
@@ -243,27 +250,56 @@ fn temporal_constant(
     Ok(LiteralEmission::Constant { value_type, value })
 }
 
+fn string_literal(
+    context: &super::TypingContext<'_>,
+    text: &str,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<TypedLiteral, TypingError> {
+    use novarocks_type_contract::{
+        CharacterKind, CharacterType, ValueKind, ValueLayout, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+
+    let mut length = 0usize;
+    for _ in text.chars() {
+        work.step()?;
+        length += 1;
+    }
+    let kind = u32::try_from(length)
+        .ok()
+        .and_then(|length| CharacterType::new(CharacterKind::Varchar, length))
+        .map_or(ValueKind::String, ValueKind::BoundedCharacter);
+    let storage = ValueTypeStorageLifetime::pure();
+    let ty = ValueTypeRef::try_new(kind, false, storage.clone())
+        .map_err(novarocks_type_contract::ValueTypeError::from)?;
+    let layout = ValueLayout::try_from_normalized_arrow(DataType::Utf8, storage)
+        .map_err(novarocks_type_contract::ValueTypeError::from)?;
+    let ty = FunctionValueType::try_from_value(ty, layout)?;
+    TypedLiteral::checked(
+        LiteralValue::String(text.to_owned()),
+        ty,
+        context.constant_policy,
+        work,
+    )
+}
+
 fn infer_decimal_literal_type(s: &str) -> Result<DataType, TypingError> {
     let raw = s.trim().trim_start_matches('+').trim_start_matches('-');
     let (integer, fraction) = raw.split_once('.').unwrap_or((raw, ""));
-    let int_digits = integer.trim_start_matches('0').len().max(1);
+    let int_digits = integer.trim_start_matches('0').len();
     let scale = fraction.len();
-    let precision = int_digits + scale;
-    if scale > 76 {
+    let precision = (int_digits + scale).max(1);
+    if scale > 38 {
         return Err(TypingError::InvalidLiteral(format!(
-            "decimal literal scale {scale} exceeds maximum scale 76: {s}"
+            "decimal literal scale {scale} exceeds maximum scale 38: {s}"
         )));
     }
-    if precision > 76 {
+    if precision > 38 {
         return Err(TypingError::InvalidLiteral(format!(
-            "decimal literal precision {precision} exceeds maximum precision 76: {s}"
+            "decimal literal precision {precision} exceeds maximum precision 38: {s}"
         )));
     }
     let precision = precision as u8;
     let scale = scale as i8;
-    if precision > 38 {
-        Ok(DataType::Decimal256(precision, scale))
-    } else {
-        Ok(DataType::Decimal128(precision, scale))
-    }
+    Ok(DataType::Decimal128(precision, scale))
 }

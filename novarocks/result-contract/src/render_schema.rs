@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{RootContractError, RootProfileV1};
+use crate::{CharacterType, RootContractError, RootProfileV1};
 use std::mem::size_of;
 
 /// Semantic types, independent of Arrow carrier choices. In particular a
@@ -35,6 +35,7 @@ pub enum NativeRenderType {
         scale: i8,
     },
     String,
+    BoundedCharacter(CharacterType),
     Binary,
     Date,
     Time {

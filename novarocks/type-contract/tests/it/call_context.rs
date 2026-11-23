@@ -98,7 +98,6 @@ fn declaration_environment_rejects_each_duplicate_after_original_header_checks()
         SemanticParameterKey::StatementStartUtc,
         SemanticParameterKey::TimeZone,
         SemanticParameterKey::AllowThrowException,
-        SemanticParameterKey::DecimalOverflowToDouble,
         SemanticParameterKey::GroupConcatLegacy,
         SemanticParameterKey::GroupConcatMaxLen,
     ];

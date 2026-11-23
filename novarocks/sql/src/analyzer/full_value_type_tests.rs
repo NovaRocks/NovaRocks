@@ -23,7 +23,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Fields};
 use novarocks_parser::ast;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
+    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, TrinoCastMode,
+    ValueLogicalType,
 };
 use novarocks_types::schema::{ColumnDef, SqlType};
 
@@ -218,17 +219,26 @@ fn unnest_uses_complete_selected_relation_domain() {
 }
 
 #[test]
-fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
+fn retired_largeint_syntax_does_not_redeclare_an_ordinary_fixed_carrier() {
     for sql in [
         "SELECT CAST('9223372036854775808' AS LARGEINT)",
         "SELECT CAST(NULL AS LARGEINT)",
+        "SELECT CAST(NULL AS ARRAY(LARGEINT))",
     ] {
-        let resolved = analyze(sql);
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let error = super::analyze(&query, &SourceCatalog, "default").unwrap_err();
         assert_eq!(
-            resolved.output_columns[0].value_type.logical_type(),
-            ValueLogicalType::LargeInt
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
+        assert_eq!(error.message(), "Unknown type: largeint");
     }
+    assert_eq!(
+        analyze("SELECT CAST('9223372036854775808' AS DECIMAL(38,0))").output_columns[0]
+            .value_type
+            .data_type(),
+        &DataType::Decimal128(38, 0)
+    );
     assert_eq!(
         analyze("SELECT raw FROM source").output_columns[0]
             .value_type
@@ -245,7 +255,7 @@ fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
         analyze("SELECT CAST('not JSON' AS JSON)").output_columns[0]
             .value_type
             .logical_type(),
-        ValueLogicalType::Physical
+        ValueLogicalType::Json
     );
 }
 
@@ -253,7 +263,7 @@ fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
 fn typed_empty_array_uses_the_original_unknown_constructor_and_complete_json_cast() {
     for sql in [
         "SELECT CAST([] AS ARRAY<JSON>)",
-        "SELECT CAST([] AS ARRAY<JSON>)",
+        "SELECT CAST(ARRAY[] AS ARRAY(JSON))",
     ] {
         let resolved = analyze(sql);
         let QueryBody::Select(select) = resolved.body else {
@@ -263,17 +273,17 @@ fn typed_empty_array_uses_the_original_unknown_constructor_and_complete_json_cas
         let ExprKind::Cast {
             expr,
             target,
-            array_failure_mode,
+            cast_mode,
             ..
         } = &expression.kind
         else {
             panic!("expected ordinary outer CAST");
         };
         assert_eq!(
-            *array_failure_mode,
-            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+            *cast_mode,
+            Some(novarocks_type_contract::TrinoCastMode::Explicit)
         );
-        let expected = crate::test_value_types::string_list(true, true, true);
+        let expected = crate::test_value_types::string_list(true, true, false);
         assert_eq!(expression.value_type, expected);
         assert_eq!(target, expected.data_type());
         assert_eq!(
@@ -763,79 +773,69 @@ fn same_spelling_custom_round_result_is_not_reauthored_by_analyzer() {
     assert_eq!(&expression.value_type, selected);
 }
 
-fn assert_selected_conversion(expression: &crate::analysis::TypedExpr, suffix: &str) {
-    let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
-        panic!(
-            "expected selected value conversion, got {:?}",
-            expression.kind
-        );
-    };
-    assert_eq!(
-        binding.function_id.as_str(),
-        novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
-    );
-    assert!(binding.selected.overload.as_str().ends_with(suffix));
-    let [novarocks_functions::FunctionArgumentType::Value(source)] =
-        binding.selected.argument_types.as_ref()
+fn explicit_cast_source(expression: &crate::analysis::TypedExpr) -> &crate::analysis::TypedExpr {
+    let ExprKind::Cast {
+        expr,
+        target,
+        cast_mode,
+        ..
+    } = &expression.kind
     else {
-        panic!("expected exact value argument");
+        panic!("expected an explicit SQL cast, got {:?}", expression.kind);
     };
-    assert_eq!(source, &args[0].value_type);
-    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
-    else {
-        panic!("expected scalar result");
-    };
-    assert_eq!(result, &expression.value_type);
+    assert_eq!(*cast_mode, Some(TrinoCastMode::Explicit));
+    assert_eq!(target, expression.value_type.data_type());
+    expr
 }
 
 #[test]
-fn explicit_logical_casts_use_exact_selected_conversion_bindings() {
-    for (sql, suffix, logical) in [
+fn explicit_logical_casts_keep_the_original_source_and_target_domain() {
+    for (sql, original_domain, result_domain) in [
         (
             "SELECT CAST(j AS VARCHAR) FROM source",
-            "json_text_same_structure/v1",
+            ValueLogicalType::Json,
             ValueLogicalType::Physical,
         ),
         (
-            "SELECT CAST(i AS BIGINT) FROM source",
-            "largeint_to_signed_null_overflow/v1",
-            ValueLogicalType::Physical,
+            "SELECT CAST(j AS JSON) FROM source",
+            ValueLogicalType::Json,
+            ValueLogicalType::Json,
         ),
         (
-            "SELECT CAST(i AS DOUBLE) FROM source",
-            "largeint_to_float_round/v1",
+            "SELECT CAST('not JSON' AS JSON)",
             ValueLogicalType::Physical,
+            ValueLogicalType::Json,
         ),
         (
-            "SELECT CAST(1 AS LARGEINT)",
-            "signed_to_largeint/v1",
-            ValueLogicalType::LargeInt,
+            "SELECT CAST(1 AS BIGINT)",
+            ValueLogicalType::Physical,
+            ValueLogicalType::Physical,
         ),
     ] {
         let expression = projection(sql);
-        assert_selected_conversion(&expression, suffix);
-        assert_eq!(expression.value_type.logical_type(), logical);
+        assert_eq!(
+            explicit_cast_source(&expression).value_type.logical_type(),
+            original_domain,
+            "{sql}"
+        );
+        assert_eq!(expression.value_type.logical_type(), result_domain, "{sql}");
     }
-    assert!(matches!(
-        projection("SELECT CAST(j AS JSON) FROM source").kind,
-        ExprKind::Cast { .. }
-    ));
-    assert!(matches!(
-        projection("SELECT CAST(1 AS BIGINT)").kind,
-        ExprKind::Cast { .. }
-    ));
 }
 
 #[test]
-fn mixed_case_and_typed_array_convert_actual_json_sources() {
-    let expression = projection("SELECT CASE WHEN TRUE THEN j ELSE 'text' END FROM source");
-    let ExprKind::Case { when_then, .. } = expression.kind else {
-        panic!("expected CASE");
-    };
-    assert_selected_conversion(&when_then[0].1, "json_text_same_structure/v1");
+fn mixed_case_requires_explicit_conversion_and_arrays_keep_the_original_json_source() {
+    let query = novarocks_parser::parser::parse_query(
+        "SELECT CASE WHEN TRUE THEN j ELSE 'text' END FROM source",
+    )
+    .unwrap();
+    let error = super::analyze(&query, &SourceCatalog, "default").unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+    );
     for sql in [
         "SELECT CAST([j] AS ARRAY<VARCHAR>) FROM source",
-        "SELECT CAST([j] AS ARRAY<VARCHAR>) FROM source",
+        "SELECT CAST(ARRAY[j] AS ARRAY(VARCHAR)) FROM source",
     ] {
         let expression = projection(sql);
         assert_eq!(
@@ -843,16 +843,14 @@ fn mixed_case_and_typed_array_convert_actual_json_sources() {
             ValueLogicalType::Physical
         );
         let ExprKind::Cast {
-            expr,
-            array_failure_mode,
-            ..
+            expr, cast_mode, ..
         } = &expression.kind
         else {
             panic!("ordinary outer array CAST");
         };
         assert_eq!(
-            *array_failure_mode,
-            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+            *cast_mode,
+            Some(novarocks_type_contract::TrinoCastMode::Explicit)
         );
         let ExprKind::FunctionCall { args, binding, .. } = &expr.kind else {
             panic!("original independent ARRAY source");
@@ -878,21 +876,20 @@ fn mixed_case_and_typed_array_convert_actual_json_sources() {
 }
 
 #[test]
-fn only_literal_null_is_declared_without_running_its_source() {
+fn explicit_cast_keeps_literal_and_evaluated_null_sources() {
     let literal = projection("SELECT CAST(NULL AS JSON)");
     assert!(matches!(
-        literal.kind,
+        explicit_cast_source(&literal).kind,
         ExprKind::Literal(crate::analysis::LiteralValue::Null)
     ));
     assert_eq!(literal.value_type.logical_type(), ValueLogicalType::Json);
     assert!(literal.value_type.nullable());
     let expression = projection("SELECT CAST(element_at([], 1) AS JSON)");
-    assert_selected_conversion(&expression, "null_to_typed_nullable/v1");
-    let ExprKind::FunctionCall { args, .. } = expression.kind else {
-        panic!("expected evaluated NULL lift");
-    };
-    assert!(matches!(args[0].kind, ExprKind::FunctionCall { .. }));
-    assert_eq!(args[0].value_type.data_type().clone(), DataType::Null);
+    let source = explicit_cast_source(&expression);
+    assert!(matches!(source.kind, ExprKind::FunctionCall { .. }));
+    assert_eq!(source.value_type.data_type(), &DataType::Null);
+    assert_eq!(expression.value_type.logical_type(), ValueLogicalType::Json);
+    assert!(expression.value_type.nullable());
 }
 
 #[test]
@@ -954,36 +951,38 @@ impl crate::compiler::SqlFunctionCatalog for MissingConversionPort {
 }
 
 #[test]
-fn actual_request_catalog_missing_conversion_port_has_no_fallback() {
-    let query =
-        &novarocks_parser::parser::parse_query("SELECT CAST(j AS VARCHAR) FROM source").unwrap();
-    let error = super::analyze_with_function_catalog(
-        query,
-        &SourceCatalog,
-        "default",
+fn internal_value_conversion_preserves_the_supplied_catalog_boundary() {
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let error = super::value_conversion::convert_value_domain_with_catalog(
         &MissingConversionPort,
+        projection("SELECT j FROM source"),
+        FunctionValueType::new(DataType::Utf8, false),
+        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         crate::constant::test_constant_policy(),
-        &crate::compiler::SqlCompileControl::unbounded(),
+        &control,
     )
     .unwrap_err();
     assert!(error.to_string().contains("binding declaration"), "{error}");
 }
 
 #[test]
-fn selected_scalar_text_argument_converts_source_json_before_rebinding() {
-    for sql in [
-        "SELECT parse_json(j) FROM source",
-        "SELECT length(j) FROM source",
-    ] {
-        let expression = projection(sql);
-        let ExprKind::FunctionCall { binding, args, .. } = expression.kind else {
-            panic!("expected scalar owner");
-        };
-        assert_ne!(
-            binding.function_id.as_str(),
-            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+fn scalar_text_arguments_require_explicit_json_conversion() {
+    for name in ["parse_json", "length"] {
+        let query = novarocks_parser::parser::parse_query(&format!("SELECT {name}(j) FROM source"))
+            .unwrap();
+        let error = super::analyze(&query, &SourceCatalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction
         );
-        assert_selected_conversion(&args[0], "json_text_same_structure/v1");
+        let expression = projection(&format!("SELECT {name}(CAST(j AS VARCHAR)) FROM source"));
+        let ExprKind::FunctionCall { args, .. } = &expression.kind else {
+            panic!("expected the bound scalar call");
+        };
+        assert_eq!(
+            explicit_cast_source(&args[0]).value_type.logical_type(),
+            ValueLogicalType::Json
+        );
         assert_eq!(
             args[0].value_type.logical_type(),
             ValueLogicalType::Physical
@@ -1018,14 +1017,8 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         Some("retained-source")
     );
     for (cast, mode) in [
-        (
-            "CAST",
-            novarocks_type_contract::ArrayCastFailureMode::ReportError,
-        ),
-        (
-            "TRY_CAST",
-            novarocks_type_contract::ArrayCastFailureMode::OutputNull,
-        ),
+        ("CAST", novarocks_type_contract::TrinoCastMode::Explicit),
+        ("TRY_CAST", novarocks_type_contract::TrinoCastMode::Try),
     ] {
         let expression = projection(&format!(
             "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT {cast}(ja_meta AS ARRAY<VARCHAR>) FROM source"
@@ -1033,13 +1026,13 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         let ExprKind::Cast {
             expr,
             decimal_overflow_policy,
-            array_failure_mode,
+            cast_mode,
             ..
         } = &expression.kind
         else {
             panic!("expected explicit array conversion owner");
         };
-        assert_eq!(*array_failure_mode, Some(mode));
+        assert_eq!(*cast_mode, Some(mode));
         assert_eq!(
             *decimal_overflow_policy,
             novarocks_type_contract::DecimalOverflowPolicy::ReportError
@@ -1064,7 +1057,7 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         );
         assert_eq!(
             expression.value_type,
-            crate::test_value_types::string_list(true, false, true)
+            crate::test_value_types::string_list(true, false, mode == TrinoCastMode::Try)
         );
         let DataType::List(target) = expression.value_type.data_type() else {
             panic!("target list");
@@ -1245,38 +1238,36 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
 }
 
 #[test]
-fn exact_value_conversion_call_inherits_query_sql_mode_policy() {
-    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-    let strict = "WITH SESSION sql_mode='ERROR_IF_OVERFLOW'";
-    let relaxed = "WITH SESSION sql_mode=32";
-    for (outer, policy) in [(strict, ReportError), (relaxed, OutputNull)] {
+fn explicit_cast_preserves_the_original_json_source_across_legacy_sql_modes() {
+    for settings in [
+        "WITH SESSION sql_mode='ERROR_IF_OVERFLOW'",
+        "WITH SESSION sql_mode=32",
+    ] {
         let sql = format!(
-            "{outer} SELECT CAST(q.j AS VARCHAR) AS x FROM (SELECT j,CAST(j AS VARCHAR) AS y FROM source) q"
+            "{settings} SELECT CAST(q.j AS VARCHAR) AS x FROM (SELECT j,CAST(j AS VARCHAR) AS y FROM source) q"
         );
         let query = analyze(&sql);
         let QueryBody::Select(select) = &query.body else {
             panic!("select");
         };
-        let ExprKind::FunctionCall { binding: outer, .. } = &select.projection[0].expr.kind else {
-            panic!("exact conversion");
-        };
+        let outer = &select.projection[0].expr;
         let Some(crate::analysis::Relation::Subquery { query: inner, .. }) = &select.from else {
             panic!("derived query");
         };
         let QueryBody::Select(inner) = &inner.body else {
             panic!("inner select");
         };
-        let ExprKind::FunctionCall { binding: inner, .. } = &inner.projection[1].expr.kind else {
-            panic!("inner exact conversion");
-        };
+        let inner = &inner.projection[1].expr;
         assert_eq!(
-            outer.function_id.as_str(),
-            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+            explicit_cast_source(outer).value_type,
+            explicit_cast_source(inner).value_type
         );
-        assert_eq!(outer.function_id, inner.function_id);
-        assert_eq!(outer.selected, inner.selected);
-        assert_eq!(outer.decimal_overflow_policy(), policy, "{sql}");
-        assert_eq!(inner.decimal_overflow_policy(), policy, "{sql}");
+        assert_eq!(
+            explicit_cast_source(outer).value_type.logical_type(),
+            ValueLogicalType::Json
+        );
+        assert_eq!(outer.value_type, inner.value_type);
+        assert_eq!(outer.value_type.logical_type(), ValueLogicalType::Physical);
     }
 }
 
@@ -1298,10 +1289,10 @@ fn variant_get_text_admission_preserves_parse_json_and_original_union_common_typ
             UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
             UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
             UNION ALL SELECT 4, parse_json('{"a":1.5}')
-            UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+            UNION ALL SELECT 5, NULL
             UNION ALL SELECT 6, parse_json('{"a":"abc"}')
         ) SELECT id, try_variant_get(v, '$.a', 'bigint') FROM source_values ORDER BY id"#,
-            ValueLogicalType::Physical,
+            ValueLogicalType::Json,
         ),
     ] {
         let query = analyze(sql);

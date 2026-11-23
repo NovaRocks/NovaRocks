@@ -32,7 +32,7 @@ CREATE CATALOG ice_ivm_minmax_decimal_db_${uuid0} USING iceberg WITH ("iceberg.c
 CREATE SCHEMA ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0}.sales (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   amount DECIMAL(18, 2)
 ) WITH (format_version = 3);
 USE ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0};

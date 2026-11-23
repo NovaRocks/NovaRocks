@@ -28,11 +28,11 @@ DROP TABLE IF EXISTS ${case_db}.t_join_null_safe_equal_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_null_safe_equal_r;
 CREATE TABLE ${case_db}.t_join_null_safe_equal_l (
   k INT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_null_safe_equal_r (
   k INT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_null_safe_equal_l VALUES
   ROW(1, 'l1'),

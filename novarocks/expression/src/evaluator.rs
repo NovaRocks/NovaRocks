@@ -1071,7 +1071,10 @@ fn admit_call_protocol(
             PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_),
         ) => call.call_contract().effects().null_behavior != FunctionNullBehavior::ControlDefined,
         (
-            ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_),
+            ControlShape::If
+            | ControlShape::Coalesce
+            | ControlShape::Try
+            | ControlShape::TemporalSource(_),
             PreparedPureKernel::ControlIntrinsic(_),
         ) => {
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined

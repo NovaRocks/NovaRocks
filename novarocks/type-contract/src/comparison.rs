@@ -43,6 +43,31 @@ impl ComparisonOperator {
     }
 }
 
+/// The equality relation proved by the author of an extracted join key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum JoinKeyMatch {
+    Grouping,
+    IeeeFloat,
+}
+
+impl JoinKeyMatch {
+    pub fn supports(
+        self,
+        carrier: &DataType,
+        domain: crate::ValueLogicalType,
+        null_safe: bool,
+    ) -> bool {
+        match self {
+            Self::Grouping => true,
+            Self::IeeeFloat => {
+                !null_safe
+                    && domain == crate::ValueLogicalType::Physical
+                    && matches!(carrier, DataType::Float32 | DataType::Float64)
+            }
+        }
+    }
+}
+
 /// Complete identity of an ordered value comparison algorithm.
 ///
 /// A variant freezes scalar interpretation and equality consistency. Direction

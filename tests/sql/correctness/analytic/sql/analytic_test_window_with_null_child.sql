@@ -23,13 +23,13 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}."test_window_with_null_child" (
-  "c0" string NOT NULL,
+  "c0" VARCHAR NOT NULL,
   "c1" bigint NOT NULL,
   "c2" bigint NOT NULL
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}."tsmall" (
-  "c0" string NOT NULL,
+  "c0" VARCHAR NOT NULL,
   "c1" bigint NOT NULL,
   "c2" bigint NOT NULL
 ) WITH (format_version = 3);

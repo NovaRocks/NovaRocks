@@ -82,11 +82,21 @@ impl Account {
         let shared = &self.0.shared;
         let record = Arc::new(Domain {
             id: shared.next_identity()?,
-            lane: Lane::new(self, crate::lane::RecordRegion::Funding).map_err(|_| {
-                CapacityError::Invalid {
-                    detail: "lane record storage unavailable",
-                }
-            })?,
+            lane: Lane::new(self, crate::lane::RecordRegion::Funding).map_err(
+                |error| match error {
+                    crate::lane::CoverageError::RecordStoreExhausted {
+                        region: crate::lane::RecordRegion::Funding,
+                    } => CapacityError::MetadataExhausted {
+                        registry: MetadataRegistryLabel::FundingRecords,
+                        limit: u64::from(crate::lane::store::funding_record_capacity(
+                            shared.record_store.store().capacity(),
+                        )),
+                    },
+                    _ => CapacityError::Invalid {
+                        detail: "lane record storage unavailable",
+                    },
+                },
+            )?,
             covered_sequence: AtomicU64::new(0),
             covered_epoch: AtomicU64::new(0),
             metadata: OWNER_METADATA_BYTES,

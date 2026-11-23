@@ -29,6 +29,8 @@ use crate::planner::table::{
     ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
 };
 use arrow::datatypes::DataType;
+use novarocks_functions::FunctionResultType;
+use novarocks_type_contract::{FunctionArgumentType, FunctionIntrinsicRowError, OperatorFunction};
 use novarocks_types::schema::ColumnDef;
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -454,17 +456,70 @@ fn root_strip_sort_inner_project(
     (outer_proj, sort, inner_proj)
 }
 
-fn binary_left_column_id(expr: &TypedExpr) -> ColumnId {
-    let ExprKind::BinaryOp { left, .. } = &expr.kind else {
-        panic!("expected BinaryOp, got {:?}", expr.kind);
-    };
-    let ExprKind::ColumnRef { column_id, .. } = &left.kind else {
+#[track_caller]
+fn assert_bound_binary_operator(
+    expr: &TypedExpr,
+    operator: OperatorFunction,
+    right_literal: i64,
+) -> &TypedExpr {
+    let ExprKind::FunctionCall {
+        binding,
+        args,
+        distinct: false,
+        ..
+    } = &expr.kind
+    else {
         panic!(
-            "expected BinaryOp left side to be ColumnRef, got {:?}",
-            left.kind
+            "expected the {operator:?} operator call, got {:?}",
+            expr.kind
         );
     };
-    *column_id
+    let [left, right] = &args[..] else {
+        panic!("expected two ordered operands for {operator:?}");
+    };
+    assert_eq!(binding.function_id, operator.function_id());
+    let original_right = match &right.kind {
+        ExprKind::Cast {
+            expr,
+            target,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            ..
+        } => {
+            assert_eq!(target, right.value_type.data_type());
+            assert!(crate::optimizer::scalar_expr::lossless_signed_widening(
+                &expr.value_type,
+                &right.value_type
+            ));
+            expr.as_ref()
+        }
+        _ => right,
+    };
+    assert!(matches!(
+        original_right.kind,
+        ExprKind::Literal(LiteralValue::Int(value)) if value == right_literal
+    ));
+    let [
+        FunctionArgumentType::Value(left_ty),
+        FunctionArgumentType::Value(right_ty),
+    ] = &binding.selected.argument_types[..]
+    else {
+        panic!("expected two selected value types for {operator:?}");
+    };
+    assert_eq!(left_ty, &left.value_type);
+    assert_eq!(right_ty, &right.value_type);
+    assert_eq!(
+        binding.selected.result_type,
+        FunctionResultType::Scalar(expr.value_type.clone())
+    );
+    assert_eq!(
+        binding.semantics.intrinsic_row_error,
+        if operator.arithmetic().is_some() {
+            FunctionIntrinsicRowError::MayRaise
+        } else {
+            FunctionIntrinsicRowError::NoRowError
+        }
+    );
+    left
 }
 
 fn first_window_exprs(plan: &LogicalPlanNode) -> Vec<WindowExpr> {
@@ -967,12 +1022,7 @@ fn p2_aggregate_projection_rewrites_agg_call_to_output_id_ref() {
         "AggregateCall must have a real output id"
     );
 
-    let ExprKind::BinaryOp { left, .. } = &project.items[0].expr.kind else {
-        panic!(
-            "expected sum(b)+1 to remain a BinaryOp over the aggregate output, got {:?}",
-            project.items[0].expr.kind
-        );
-    };
+    let left = assert_bound_binary_operator(&project.items[0].expr, OperatorFunction::Add, 1);
     let ExprKind::ColumnRef {
         column_id, column, ..
     } = &left.kind
@@ -1067,7 +1117,7 @@ fn p2_computed_group_key_rewrites_to_group_output_id() {
         "computed group key projection must reference the Aggregate output id"
     );
     assert_eq!(
-        column, "a + 1",
+        column, "a + (cast(1 as Int64))",
         "computed group key ColumnRef must preserve the group expression display name"
     );
 }
@@ -1088,12 +1138,7 @@ fn p2_having_rewrites_agg_call_to_output_id_ref() {
         "AggregateCall must have a real output id"
     );
 
-    let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
-        panic!(
-            "expected HAVING sum(b)>10 to remain a BinaryOp over the aggregate output, got {:?}",
-            filter.predicate.kind
-        );
-    };
+    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::GreaterThan, 10);
     let ExprKind::ColumnRef {
         column_id, column, ..
     } = &left.kind
@@ -1147,7 +1192,7 @@ fn order_by_only_aggregates_are_added_to_aggregate_outputs() {
 #[test]
 fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
     let plan =
-        plan_test_query("SELECT abs(a) AS k, sum(b) AS s FROM t GROUP BY abs(a) HAVING abs(a) > 1");
+        plan_test_query("SELECT a % 3 AS k, sum(b) AS s FROM t GROUP BY a % 3 HAVING a % 3 > 1");
     let (project, filter, aggregate) = root_project_filter_aggregate(&plan);
     assert_eq!(
         aggregate.group_by.len(),
@@ -1179,16 +1224,11 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
         "computed group key projection must reference the Aggregate output id"
     );
     assert_eq!(
-        column, "abs(a)",
+        column, "a % (cast(3 as Int64))",
         "computed group key ColumnRef must preserve the group expression display name"
     );
 
-    let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
-        panic!(
-            "expected HAVING abs(a)>1 to remain a BinaryOp over the group key output, got {:?}",
-            filter.predicate.kind
-        );
-    };
+    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::GreaterThan, 1);
     let ExprKind::ColumnRef {
         column_id, column, ..
     } = &left.kind
@@ -1203,7 +1243,7 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
         "HAVING computed group key must reference the Aggregate output id"
     );
     assert_eq!(
-        column, "abs(a)",
+        column, "a % (cast(3 as Int64))",
         "HAVING computed group key ColumnRef must preserve the group expression display name"
     );
 }
@@ -1241,12 +1281,12 @@ fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
         grouping.value_type.data_type(),
         &arrow::datatypes::DataType::Int32
     );
-    assert!(
-        grouping.value_type.nullable(),
-        "original narrowing CAST NULL law"
-    );
+    assert!(!grouping.value_type.nullable());
     let ExprKind::Cast {
-        expr: mask, target, ..
+        expr: mask,
+        target,
+        cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+        ..
     } = &grouping.kind
     else {
         panic!("public GROUPING needs a real typed INTEGER projection");
@@ -1524,12 +1564,7 @@ fn p2_window_call_rewrites_to_window_output_id() {
         "WindowExpr must have a real output id"
     );
 
-    let ExprKind::BinaryOp { left, .. } = &project.items[0].expr.kind else {
-        panic!(
-            "expected row_number()+1 to remain a BinaryOp over the window output, got {:?}",
-            project.items[0].expr.kind
-        );
-    };
+    let left = assert_bound_binary_operator(&project.items[0].expr, OperatorFunction::Add, 1);
     let ExprKind::ColumnRef {
         column_id, column, ..
     } = &left.kind
@@ -1584,7 +1619,9 @@ fn group_by_alias_expression_projects_aggregate_group_key() {
         panic!("expected Project under Sort");
     };
     let ExprKind::ColumnRef {
-        qualifier, column, ..
+        qualifier,
+        column,
+        column_id,
     } = &project.items[0].expr.kind
     else {
         panic!(
@@ -1593,7 +1630,11 @@ fn group_by_alias_expression_projects_aggregate_group_key() {
         );
     };
     assert!(qualifier.is_none());
-    assert_eq!(column, "o_orderkey % 2");
+    let (_, aggregate) = root_project_over_aggregate(plan.unary_input());
+    let key_output = &aggregate.output_columns[0];
+    assert_eq!(*column_id, key_output.column_id);
+    assert_eq!(key_output.name, "g");
+    assert_eq!(column, "o_orderkey % (cast(2 as Int64))");
 }
 
 #[test]
@@ -2233,7 +2274,11 @@ fn p2_order_by_derived_values_extra_preserves_source_column_id() {
         .last()
         .expect("sort-extra ProjectItem should be appended");
     assert_eq!(
-        binary_left_column_id(&extra_item.expr),
+        column_ref_id(assert_bound_binary_operator(
+            &extra_item.expr,
+            OperatorFunction::Add,
+            1,
+        )),
         b_output_id,
         "ORDER BY v.b + 1 extra must reference the derived VALUES source ColumnId"
     );
@@ -2267,7 +2312,11 @@ fn p2_order_by_generate_series_extra_preserves_source_column_id() {
         .last()
         .expect("sort-extra ProjectItem should be appended");
     assert_eq!(
-        binary_left_column_id(&extra_item.expr),
+        column_ref_id(assert_bound_binary_operator(
+            &extra_item.expr,
+            OperatorFunction::Add,
+            1,
+        )),
         source_output_id,
         "ORDER BY gs.x + 1 extra must reference the GenerateSeries source ColumnId"
     );
@@ -2413,10 +2462,7 @@ fn plan_with_computed_repeat_key(sql: &str, key_index: usize) -> LogicalPlanNode
     // Keep the analyzed levels and mask. Supply the bound projection expression
     // as the key to exercise the planner's computed Repeat input directly.
     let computed_key = select.projection[key_index].expr.clone();
-    assert!(matches!(
-        computed_key.kind,
-        ExprKind::BinaryOp { op: BinOp::Add, .. }
-    ));
+    assert_bound_binary_operator(&computed_key, OperatorFunction::Add, 1);
     *key = computed_key;
     plan_query(
         resolved,
@@ -2543,10 +2589,8 @@ fn grouping_input_computed_key_does_not_replace_aggregate_arithmetic() {
     let [arg] = call.source.arguments() else {
         panic!("expected SUM input expression");
     };
-    assert!(
-        matches!(&arg.kind, ExprKind::BinaryOp { op: BinOp::Add, right, .. }
-        if matches!(&right.kind, ExprKind::Literal(LiteralValue::Int(1))))
-    );
+    let left = assert_bound_binary_operator(arg, OperatorFunction::Add, 1);
+    assert_eq!(column_ref_id(left), source_id);
     assert_eq!(grouping_input_expr_column_ids(arg), [source_id].into());
 }
 
@@ -2757,12 +2801,7 @@ fn p2_subquery_alias_reexposes_producing_id() {
         ColumnId::UNSET,
         "subquery alias producer must expose a real ColumnId"
     );
-    let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
-        panic!(
-            "expected WHERE x > 1 binary predicate, got {:?}",
-            filter.predicate.kind
-        );
-    };
+    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::GreaterThan, 1);
     assert_eq!(
         column_ref_id(left),
         producing_id,
@@ -3402,35 +3441,32 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
 fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
     use novarocks_types::schema::SqlType as S;
     for (sql, domain) in [
-        ("select any_value(CAST(NULL AS HLL)) from orders", S::Hll),
-        (
-            "select any_value(CAST(NULL AS BITMAP)) from orders",
-            S::Bitmap,
-        ),
+        ("select any_value(CAST(NULL AS UUID)) from orders", S::Uuid),
+        ("select any_value(CAST(NULL AS JSON)) from orders", S::Json),
         ("select any_value(parse_json('{}')) from orders", S::Json),
     ] {
         assert_m07_planned_domains(sql, vec![Some(domain)]);
     }
     assert_m07_planned_domains(
-        "select o_custkey,any_value(CAST(NULL AS HLL)) as h,any_value(CAST(NULL AS BITMAP)) as b,any_value(parse_json('{}')) as p from orders group by o_custkey",
-        vec![None, Some(S::Hll), Some(S::Bitmap), Some(S::Json)],
+        "select o_custkey,any_value(CAST(NULL AS UUID)) as u,any_value(CAST(NULL AS JSON)) as j,any_value(parse_json('{}')) as p from orders group by o_custkey",
+        vec![None, Some(S::Uuid), Some(S::Json), Some(S::Json)],
     );
     assert_m07_planned_domains(
-        "select any_value(CAST(NULL AS HLL)) as x,any_value(CAST(NULL AS HLL)) as y from orders",
-        vec![Some(S::Hll); 2],
+        "select any_value(CAST(NULL AS JSON)) as x,any_value(CAST(NULL AS JSON)) as y from orders",
+        vec![Some(S::Json); 2],
     );
     assert_m07_planned_domains(
-        "select count(*),sum(o_orderkey),cast(any_value(CAST(NULL AS HLL)) as varbinary) from orders",
+        "select count(*),sum(o_orderkey),cast(any_value(CAST(NULL AS JSON)) as varchar) from orders",
         vec![None; 3],
     );
     for (sql, expected) in [
         (
-            "select any_value(CAST(NULL AS HLL)) as h,cast(any_value(CAST(NULL AS HLL)) as varbinary) as raw from orders",
-            vec![Some(S::Hll), None],
+            "select any_value(CAST(NULL AS JSON)) as j,cast(any_value(CAST(NULL AS JSON)) as varchar) as raw from orders",
+            vec![Some(S::Json), None],
         ),
         (
-            "select cast(any_value(CAST(NULL AS HLL)) as varbinary) as raw,any_value(CAST(NULL AS HLL)) as h from orders",
-            vec![None, Some(S::Hll)],
+            "select cast(any_value(CAST(NULL AS JSON)) as varchar) as raw,any_value(CAST(NULL AS JSON)) as j from orders",
+            vec![None, Some(S::Json)],
         ),
     ] {
         assert_m07_planned_domains(sql, expected);
@@ -3506,29 +3542,25 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
 
 #[test]
 fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
-    use novarocks_types::schema::SqlType;
     let sql =
-        "select any_value(CAST(NULL AS HLL)) as x,any_value(CAST(NULL AS HLL)) as y from orders";
-    for conflict in [None, Some(SqlType::Bitmap)] {
+        "select any_value(CAST(NULL AS JSON)) as x,any_value(CAST(NULL AS JSON)) as y from orders";
+    let incompatible = [
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            novarocks_type_contract::ValueLogicalType::Uuid,
+        )
+        .unwrap(),
+    ];
+    for conflict in incompatible {
         for ordinal in [0, 1] {
             let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
             let mut resolved = resolved;
             let QueryBody::Select(select) = &mut resolved.body else {
                 unreachable!()
             };
-            select.projection[ordinal].expr.value_type = if conflict.is_some() {
-                novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                    arrow::datatypes::DataType::Binary,
-                    true,
-                    novarocks_type_contract::ValueLogicalType::Bitmap,
-                )
-                .unwrap()
-            } else {
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Binary,
-                    true,
-                )
-            };
+            select.projection[ordinal].expr.value_type = conflict.clone();
             let error = plan_query(
                 resolved,
                 registry,

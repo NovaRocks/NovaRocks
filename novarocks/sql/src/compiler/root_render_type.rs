@@ -240,6 +240,9 @@ fn unit(unit: TimeUnit) -> U {
 fn kind(value: &ValueTypeRef, layout: &D) -> Result<Kind, String> {
     Ok(match value.kind() {
         ValueKind::String if matches!(layout, D::Utf8 | D::LargeUtf8) => Kind::Leaf(N::String),
+        ValueKind::BoundedCharacter(character) if matches!(layout, D::Utf8 | D::LargeUtf8) => {
+            Kind::Leaf(N::BoundedCharacter(*character))
+        }
         ValueKind::Binary if matches!(layout, D::Binary | D::LargeBinary) => Kind::Leaf(N::Binary),
         ValueKind::Nominal(domain) => Kind::Leaf(match (domain, layout) {
             (V::Json, D::Utf8) => N::Json,

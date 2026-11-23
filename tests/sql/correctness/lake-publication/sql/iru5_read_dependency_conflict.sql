@@ -18,8 +18,8 @@
 
 -- @sequential=true
 -- @order_sensitive=true
--- A v3 DELETE can reprepare on a disjoint append. OPTIMIZE keeps the
--- dependency on the exact files and snapshot it selected for rewriting.
+-- DELETE and OPTIMIZE retry after a concurrent append. OPTIMIZE replaces
+-- the files selected before the append and keeps the concurrent file.
 
 -- query 1
 -- @skip_result_check=true
@@ -62,14 +62,14 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows OR
 -- Two seed files ensure this is an actual rewrite, not a no-op.
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/iru5-optimize-companion-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.optimize_rows VALUES (3, 30);" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
--- @expect_error=dependency: RefUnchanged
+-- @skip_result_check=true
 ALTER TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows EXECUTE optimize;
 
 -- query 6
 SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows ORDER BY id;
 
 -- query 7
--- @result_contains=IRU5_READ_DEPENDENCY_CONFLICT_OK
+-- @result_contains=IRU5_READ_REPREPARATION_OK
 shell: set -eu
 artifact_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/native-lake-${uuid0}"
 traffic_file="$artifact_dir/traffic-before.json"
@@ -86,7 +86,7 @@ with open(sys.argv[3], 'w') as saved:
 print('IRU5_TRAFFIC_BEFORE ' + json.dumps(before, sort_keys=True))
 print('IRU5_TRAFFIC_AFTER ' + json.dumps(after, sort_keys=True))
 assert after['by_status'].get('409', 0) - before['by_status'].get('409', 0) == 2, (before, after)
-assert after['table_commit_requests'] - before['table_commit_requests'] == 3, (before, after)
+assert after['table_commit_requests'] - before['table_commit_requests'] == 4, (before, after)
 print('IRU5_READ_TWO_REAL_409_OK')
 PYTHON
 cat > "$tmp_scala" <<'SPARK_SCALA'
@@ -94,7 +94,7 @@ import scala.jdk.CollectionConverters._
 import org.apache.iceberg.spark.Spark3Util
 for (suffix <- Seq("delete_rows", "optimize_rows")) {
   val deleting = suffix == "delete_rows"
-  val operations = if (deleting) Seq("append", "append", "delete") else Seq("append", "append", "append")
+  val operations = if (deleting) Seq("append", "append", "delete") else Seq("append", "append", "append", "replace")
   val expectedRows = if (deleting) Seq((2L, 20L), (3L, 30L)) else Seq((1L, 10L), (2L, 20L), (3L, 30L))
   val name = s"ice_rest.ns_${uuid0}.$suffix"
   val table = Spark3Util.loadIcebergTable(spark, name)
@@ -103,22 +103,22 @@ for (suffix <- Seq("delete_rows", "optimize_rows")) {
   require(snapshots.map(_.operation()) == operations, s"unexpected snapshot history for $suffix")
   val current = table.currentSnapshot()
   require(current.snapshotId() == snapshots.last.snapshotId(), s"main lost the actual $suffix snapshot")
-  require(current.parentId() == java.lang.Long.valueOf(snapshots(1).snapshotId()), s"parent changed in $suffix")
+  val externalAppend = snapshots(if (deleting) 1 else 2)
+  require(current.parentId() == java.lang.Long.valueOf(externalAppend.snapshotId()), s"parent changed in $suffix")
   val rows = spark.sql(s"SELECT id, value, _row_id, _last_updated_sequence_number FROM $name ORDER BY id").collect().toSeq
   require(rows.map(r => (r.getLong(0), r.getLong(1))) == expectedRows, s"lost or resurrected rows in $suffix")
   require(rows.forall(r => !r.isNullAt(2) && !r.isNullAt(3)), s"lost stored lineage in $suffix")
   require(rows.map(_.getLong(2)).distinct.size == expectedRows.size, s"duplicate row IDs in $suffix")
-  val externalAppend = snapshots(if (deleting) 1 else 2)
   require(rows.last.getLong(3) == externalAppend.sequenceNumber(), s"Spark new row has wrong actual sequence in $suffix")
 }
-println("IRU5_READ_DEPENDENCY_CONFLICT_OK")
+println("IRU5_READ_REPREPARATION_OK")
 SPARK_SCALA
 spark_status=0
 spark_out=$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1) || spark_status=$?
 printf '%s\n' "$spark_out" > "$artifact_dir/spark-readback.log"
 printf '%s\n' "$spark_out"
 [ "$spark_status" -eq 0 ]
-printf '%s\n' "$spark_out" | grep -F IRU5_READ_DEPENDENCY_CONFLICT_OK
+printf '%s\n' "$spark_out" | grep -F IRU5_READ_REPREPARATION_OK
 
 -- query 8
 -- @skip_result_check=true

@@ -27,8 +27,8 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 create table t0 (
-    c0 STRING,
-    c1 STRING NOT NULL,
+    c0 VARCHAR,
+    c1 VARCHAR NOT NULL,
     c2 int,
     c3 int NOT NULL
 ) WITH (format_version = 3);
@@ -36,24 +36,24 @@ create table t0 (
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1,  20000));
+INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(generate_series(1,  20000));
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1,  20000));
+INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(generate_series(1,  20000));
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1,  20000));
+INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(generate_series(1,  20000));
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
 create table t1 (
-    c0 STRING NOT NULL,
-    c1 STRING,
+    c0 VARCHAR NOT NULL,
+    c1 VARCHAR,
     c2 int,
     c3 int
 ) WITH (format_version = 3);
@@ -64,7 +64,7 @@ USE ${case_db};
 create table t2 (
     c0 int NOT NULL,
     c1 int,
-    c2 string,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 
@@ -74,7 +74,7 @@ USE ${case_db};
 create table t3 (
     c0 int,
     c1 int NOT NULL,
-    c2 string,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 
@@ -86,12 +86,12 @@ insert into t1 select * from t0;
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-insert into t2 select * from t0;
+INSERT INTO t2 SELECT CAST(c0 AS INTEGER), CAST(c1 AS INTEGER), CAST(c2 AS VARCHAR), c3 FROM t0;
 
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-insert into t3 select * from t0;
+INSERT INTO t3 SELECT CAST(c0 AS INTEGER), CAST(c1 AS INTEGER), CAST(c2 AS VARCHAR), c3 FROM t0;
 
 -- query 12
 USE ${case_db};
@@ -103,11 +103,11 @@ with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10), cte
 
 -- query 14
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 15
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 16
 USE ${case_db};
@@ -119,11 +119,11 @@ with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), 
 
 -- query 18
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 19
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 20
 USE ${case_db};
@@ -135,11 +135,11 @@ with cte0 as (select avg(c3), sum(c3) sc3, c1 from t1 group by c1 limit 10), cte
 
 -- query 22
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t2 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1  IS NOT DISTINCT FROM  r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t2 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1 IS NOT DISTINCT FROM CAST(r.c1 AS INTEGER)) t ;
 
 -- query 23
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t3 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1  IS NOT DISTINCT FROM  r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t3 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1 IS NOT DISTINCT FROM CAST(r.c1 AS INTEGER)) t ;
 
 -- query 24
 USE ${case_db};
@@ -151,11 +151,11 @@ with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), 
 
 -- query 26
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 27
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 28
 -- @skip_result_check=true
@@ -171,11 +171,11 @@ with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), 
 
 -- query 31
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 32
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0 IS NOT DISTINCT FROM CAST(r.c0 AS INTEGER)) t ;
 
 -- query 33
 -- @skip_result_check=true
@@ -183,14 +183,14 @@ USE ${case_db};
 create table t4 (
     c0 int,
     c1 int,
-    c2 string,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 
 -- query 34
 -- @skip_result_check=true
 USE ${case_db};
-insert into t4 SELECT generate_series % 4, generate_series % 9, generate_series % 9, generate_series %9 FROM TABLE(generate_series(1,  9000));
+insert into t4 SELECT generate_series % 4, generate_series % 9, CAST(generate_series % 9 AS VARCHAR), generate_series % 9 FROM TABLE(generate_series(1,  9000));
 
 -- query 35
 -- @skip_result_check=true
@@ -203,7 +203,7 @@ USE ${case_db};
 create table t5 (
     c0 int,
     c1 int,
-    c2 string,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 
@@ -249,15 +249,15 @@ USE ${case_db};
 USE ${case_db};
 create table t6 (
     c0 int,
-    c1 float,
-    c2 string,
+    c1 REAL,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 
 -- query 47
 -- @skip_result_check=true
 USE ${case_db};
-insert into t6 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1,  10000));
+INSERT INTO t6 SELECT generate_series, generate_series, CAST(generate_series AS VARCHAR), generate_series FROM TABLE(generate_series(1,  10000));
 
 -- query 48
 USE ${case_db};
@@ -276,8 +276,8 @@ select count(*) from (select sum(c3) from t6 group by c2, c1 limit 10) t;
 USE ${case_db};
 create table tempty (
     c0 int,
-    c1 float,
-    c2 string,
+    c1 REAL,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 
@@ -305,7 +305,7 @@ create table tarray (
 -- query 56
 -- @skip_result_check=true
 USE ${case_db};
-insert into tarray SELECT generate_series, [generate_series], generate_series FROM TABLE(generate_series(1,  10000));
+insert into tarray SELECT generate_series, ARRAY[CAST(generate_series AS INTEGER)], generate_series FROM TABLE(generate_series(1,  10000));
 
 -- query 57
 USE ${case_db};

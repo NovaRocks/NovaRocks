@@ -380,6 +380,7 @@ fn fixture_with_source_parameters(
             .unwrap();
         outputs.push(output);
         calls.push(AggregateCall {
+            filter_root: None,
             id,
             binding: bound.binding(phase),
             arguments: Box::from([argument]),

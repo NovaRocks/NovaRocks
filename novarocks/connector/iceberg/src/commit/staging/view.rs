@@ -59,6 +59,18 @@ impl<'a> StagedView<'a> {
     pub(crate) fn metadata_ref(&self) -> Arc<TableMetadata> {
         Arc::clone(self.metadata)
     }
+    pub(crate) fn rewrite_source_sequence(&self) -> Result<Option<i64>> {
+        if let crate::commit::model::CommitProtocol::RewriteFiles { .. } = self.intent.protocol() {
+            let sequence = self.intent.start().ok_or_else(|| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "Iceberg compact rewrite has no frozen source snapshot",
+                )
+            })?;
+            return Ok(Some(sequence.sequence_number));
+        }
+        Ok(None)
+    }
     pub(crate) fn stage_key(&self) -> usize {
         self.stage
     }

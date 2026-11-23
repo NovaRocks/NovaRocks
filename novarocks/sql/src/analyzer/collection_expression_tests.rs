@@ -119,7 +119,7 @@ fn null_child_arrays_cast_to_the_complete_json_list_declaration() {
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    let expected = json_list_target();
+    let expected = json_list_target().with_nullable(false).unwrap();
     for (sql, len) in [
         ("SELECT CAST([] AS ARRAY<JSON>)", 0),
         ("SELECT CAST([NULL,NULL] AS ARRAY<JSON>)", 2),
@@ -151,100 +151,12 @@ fn null_child_arrays_cast_to_the_complete_json_list_declaration() {
         assert_eq!(item.logical_type(), ValueLogicalType::Json);
         assert_eq!(item.data_type(), &DataType::Utf8);
         assert!(item.nullable());
-        assert!(actual.value_type.nullable());
+        assert!(!actual.value_type.nullable());
         let ExprKind::Cast { expr, target, .. } = &actual.kind else {
             panic!("original intrinsic CAST");
         };
         assert_eq!(target, expected.data_type());
         same_typed(expr, &original, &control);
-    }
-}
-
-#[test]
-fn null_list_cast_retains_selected_constant_field_and_write_assignment_source() {
-    use crate::{
-        analysis::ExprKind,
-        compiler::{SqlWriteAssignmentSite, materialized_values::MaterializedSourceBorrow},
-    };
-    use arrow::{
-        array::{Array, ListArray, NullArray},
-        buffer::OffsetBuffer,
-        datatypes::{DataType, Field},
-    };
-    use novarocks_functions::ConstantPool;
-    use novarocks_type_contract::{CompilePhase, FunctionValueType};
-    use std::{borrow::Cow, sync::Arc};
-    let control = SqlCompileControl::unbounded();
-    let item = Arc::new(Field::new("original_null_item", DataType::Null, true));
-    let array = ListArray::try_new(
-        item,
-        OffsetBuffer::new(vec![0_i32, 0, 2].into()),
-        Arc::new(NullArray::new(2)),
-        None,
-    )
-    .unwrap();
-    let field = Arc::new(Field::new(
-        "original_null_list",
-        array.data_type().clone(),
-        false,
-    ));
-    let source_type = FunctionValueType::new(array.data_type().clone(), false);
-    let pool = ConstantPool::try_new(
-        field.clone(),
-        source_type.clone(),
-        array.to_data(),
-        crate::constant::test_constant_policy(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let value = pool.value(1).unwrap();
-    for sql in [
-        "SELECT CAST(original_null_list AS ARRAY<JSON>)",
-        "SELECT CAST([NULL,NULL] AS ARRAY<JSON>)",
-    ] {
-        let query = query(sql);
-        let ast::Expr::Cast(cast) = projection(&query) else {
-            panic!("ordinary CAST");
-        };
-        let mut source = MaterializedSourceBorrow::empty(&query);
-        source
-            .insert_context_constant(&cast.expression, value.clone(), &control)
-            .unwrap();
-        source
-            .insert_write_assignment(
-                &cast.expression,
-                Cow::Owned(
-                    SqlWriteAssignmentSite::try_new(0, source_type.clone(), None, &control)
-                        .unwrap()
-                        .with_source_span(cast.expression.span()),
-                ),
-                &control,
-            )
-            .unwrap();
-        assert!(
-            source
-                .view()
-                .constant_at(&cast.expression.clone())
-                .is_none()
-        );
-        let mut ctx = context(&control);
-        ctx.materialized_values = Some(source.view());
-        let scope = ctx.new_scope();
-        let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
-        assert_eq!(actual.value_type, json_list_target());
-        let ExprKind::Cast { expr, .. } = &actual.kind else {
-            panic!("intrinsic outer cast");
-        };
-        assert_eq!(expr.value_type, source_type);
-        let ExprKind::Constant(retained) = &expr.kind else {
-            panic!("original materialized source");
-        };
-        assert_eq!(retained.ordinal(), 1);
-        assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
-        assert!(Arc::ptr_eq(retained.pool().field_ref(), &field));
-        assert_eq!(retained.field(), field.as_ref());
-        assert_eq!(retained.value_type(), value.value_type());
     }
 }
 
@@ -286,7 +198,7 @@ fn root_null_keeps_the_explicit_array_boundary_and_original_null_source() {
     assert_eq!(actual.value_type, json_list_target());
     let ExprKind::Cast {
         expr,
-        array_failure_mode,
+        cast_mode,
         target,
         ..
     } = actual.kind
@@ -294,8 +206,8 @@ fn root_null_keeps_the_explicit_array_boundary_and_original_null_source() {
         panic!("explicit array conversion retains its source before optional folding")
     };
     assert_eq!(
-        array_failure_mode,
-        Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+        cast_mode,
+        Some(novarocks_type_contract::TrinoCastMode::Explicit)
     );
     assert_eq!(target, json_list_target().data_type().clone());
     assert!(matches!(expr.kind, ExprKind::Literal(LiteralValue::Null)));
@@ -405,8 +317,8 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
     };
     assert_eq!(step.target(), &target);
     assert_eq!(
-        step.decimal_overflow_policy(),
-        DecimalOverflowPolicy::OutputNull
+        step.cast_mode(),
+        novarocks_type_contract::TrinoCastMode::Implicit
     );
     let text = ctx
         .analyze_expr(projection(&query("SELECT ['not json']")), &ctx.new_scope())
@@ -427,22 +339,30 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
 #[test]
 fn explicit_array_cast_modes_preserve_independent_source_and_full_declared_target() {
     use crate::analysis::ExprKind;
-    use novarocks_type_contract::ArrayCastFailureMode;
+    use novarocks_type_contract::TrinoCastMode;
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for (sql, mode) in [
+    for (sql, mode, nullable) in [
         (
             "SELECT CAST([] AS ARRAY<JSON>)",
-            ArrayCastFailureMode::ReportError,
+            TrinoCastMode::Explicit,
+            false,
         ),
         (
             "SELECT TRY_CAST([NULL,NULL] AS ARRAY<JSON>)",
-            ArrayCastFailureMode::OutputNull,
+            TrinoCastMode::Try,
+            false,
+        ),
+        (
+            "SELECT TRY_CAST(['invalid'] AS ARRAY<INT>)",
+            TrinoCastMode::Try,
+            true,
         ),
         (
             "SELECT CAST([1,2] AS ARRAY<INT>)",
-            ArrayCastFailureMode::ReportError,
+            TrinoCastMode::Explicit,
+            false,
         ),
     ] {
         let query = query(sql);
@@ -451,7 +371,7 @@ fn explicit_array_cast_modes_preserve_independent_source_and_full_declared_targe
         };
         let original = ctx.analyze_expr(&cast.expression, &scope).unwrap();
         let declared =
-            super::helpers::sql_type_to_value_type(&cast.data_type, true, &control).unwrap();
+            super::helpers::sql_type_to_value_type(&cast.data_type, nullable, &control).unwrap();
         let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
         assert_eq!(actual.value_type, declared);
         assert_eq!(
@@ -461,13 +381,13 @@ fn explicit_array_cast_modes_preserve_independent_source_and_full_declared_targe
         let ExprKind::Cast {
             expr,
             target,
-            array_failure_mode,
+            cast_mode,
             ..
         } = &actual.kind
         else {
             panic!("explicit boundary survives analysis")
         };
-        assert_eq!(*array_failure_mode, Some(mode));
+        assert_eq!(*cast_mode, Some(mode));
         assert_eq!(target, declared.data_type());
         same_typed(expr, &original, &control);
         if sql.contains("[1,2]") {
@@ -485,7 +405,7 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
     use crate::analysis::{ExprKind, TypedExpr};
     use crate::optimizer::scalar::ScalarArena;
     use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
-    use novarocks_type_contract::{ArrayCastFailureMode, DecimalOverflowPolicy};
+    use novarocks_type_contract::{DecimalOverflowPolicy, TrinoCastMode};
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
@@ -498,15 +418,15 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
     let mut typed = Vec::new();
     for mode in [
         None,
-        Some(ArrayCastFailureMode::ReportError),
-        Some(ArrayCastFailureMode::OutputNull),
+        Some(TrinoCastMode::Explicit),
+        Some(TrinoCastMode::Try),
     ] {
         let actual = TypedExpr {
             kind: ExprKind::Cast {
                 expr: novarocks_parser::ast::AstBox::new(source.clone()),
                 target: target.data_type().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                array_failure_mode: mode,
+                cast_mode: mode,
             },
             value_type: target.clone(),
         };
@@ -516,7 +436,7 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
         assert_eq!(id, intern_typed(&mut arena, &rebuilt, &control).unwrap());
         let display =
             crate::analysis::expr_display::typed_expr_display_name(&actual, &control).unwrap();
-        if mode == Some(ArrayCastFailureMode::OutputNull) {
+        if mode == Some(TrinoCastMode::Try) {
             assert!(display.starts_with("try_cast("));
         } else if mode.is_some() {
             assert!(display.starts_with("cast("));
@@ -529,7 +449,7 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
             expr: novarocks_parser::ast::AstBox::new(typed[1].clone()),
             target: target.data_type().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            array_failure_mode: Some(ArrayCastFailureMode::OutputNull),
+            cast_mode: Some(TrinoCastMode::Try),
         },
         value_type: target.clone(),
     };
@@ -560,6 +480,7 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
 #[test]
 fn ordinary_array_common_targets_preserve_original_operands_and_use_trino_rules() {
     use crate::analysis::ExprKind;
+    use novarocks_type_contract::TrinoCastMode;
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
@@ -603,30 +524,28 @@ fn ordinary_array_common_targets_preserve_original_operands_and_use_trino_rules(
         assert_eq!(args.len(), originals.len());
         assert_eq!(binding.selected.argument_types.len(), originals.len());
         for (argument, original) in args.iter().zip(&originals) {
-            if let ExprKind::FunctionCall { binding, args, .. } = &argument.kind
-                && binding.selected.overload.as_str()
-                    == novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
+            // An existing explicit CAST is part of the original source.
+            if original.value_type.data_type() == item.data_type()
+                || original.value_type.data_type() == &DataType::Null
             {
-                assert_eq!(args.len(), 1);
-                same_typed(&args[0], original, &control);
-                assert_eq!(
-                    argument.value_type.nullable(),
-                    original.value_type.nullable()
-                );
-                assert_eq!(binding.result_constraint(), Some(&argument.value_type));
-                assert!(matches!(
-                    binding.result_constraint_origin(),
-                    crate::binding::SqlResultConstraintOrigin::ArrayCommonCoercion
-                ));
-                assert_eq!(
-                    binding.selected.argument_types.as_ref(),
-                    &[novarocks_functions::FunctionArgumentType::Value(
-                        original.value_type.clone()
-                    )]
-                );
-            } else {
                 same_typed(argument, original, &control);
+                continue;
             }
+            let ExprKind::Cast {
+                cast_mode: Some(TrinoCastMode::Implicit),
+                expr,
+                target,
+                ..
+            } = &argument.kind
+            else {
+                panic!("the original array item requires a common-type conversion: {sql}");
+            };
+            same_typed(expr, original, &control);
+            assert_eq!(target, item.data_type());
+            assert_eq!(
+                argument.value_type.nullable(),
+                original.value_type.nullable()
+            );
         }
     }
 }

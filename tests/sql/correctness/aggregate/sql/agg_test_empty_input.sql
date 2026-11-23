@@ -27,9 +27,9 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t0" (
-  "v1" bigint(20),
-  "v2" bigint(20),
-  "v3" bigint(20),
+  "v1" BIGINT,
+  "v2" BIGINT,
+  "v3" BIGINT,
   "v4" varchar
 ) WITH (format_version = 3);
 
@@ -58,10 +58,10 @@ select count(distinct v1) from t0;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "tt0" (
-  "c0" int(11),
+  "c0" INTEGER,
   "c1" varchar(20) not NULL,
   "c2" varchar(200) not NULL,
-  "c3" int(11)
+  "c3" INTEGER
 ) WITH (format_version = 3);
 
 -- query 9

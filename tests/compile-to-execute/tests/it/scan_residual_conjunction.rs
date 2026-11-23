@@ -205,3 +205,59 @@ fn scan_ordered_required_actual_indexed_roots_and_sparse_empty_slices() {
         );
     }
 }
+
+#[test]
+fn unsafe_decimal_join_keeps_the_closed_provider_equality_and_original_join_predicate() {
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_physical_plan::NodeKind;
+    use novarocks_sql_testkit::sql_source_with_declared_fields;
+    use novarocks_test_compile_to_execute::compiler_results::source_packages;
+    use novarocks_type_contract::OperatorFunction;
+
+    let decimal = DataType::Decimal128(2, 1);
+    let source = sql_source_with_declared_fields(
+        "SELECT l.id AS left_id, r.id AS right_id \
+         FROM (SELECT id, k FROM fixture WHERE id = 0) l \
+         JOIN fixture r ON l.k = r.n / r.d",
+        &[
+            Field::new("id", DataType::Int32, true),
+            Field::new("k", decimal.clone(), true),
+            Field::new("n", decimal.clone(), true),
+            Field::new("d", decimal, true),
+        ],
+    );
+    let packages = source_packages(&source);
+    assert_eq!(packages.len(), source.plan().fragments().len());
+
+    let mut joins = 0;
+    let mut exact_guarantees = 0;
+    for fragment in source.plan().fragments().values() {
+        for node in fragment.nodes().values() {
+            match &node.kind {
+                NodeKind::NestLoopJoin { .. } => joins += 1,
+                NodeKind::Scan { relation, .. } => {
+                    for guarantee in relation.predicate_guarantees() {
+                        assert_eq!(
+                            guarantee.kind,
+                            novarocks_physical_plan::PredicateGuaranteeKind::Exact
+                        );
+                        let root = guarantee.predicate;
+                        let unit = fragment.unit(node.id).unwrap();
+                        let expression = unit
+                            .definition(unit.root(root).unwrap().definition)
+                            .unwrap();
+                        if matches!(&expression.kind, ExprKind::FunctionCall { function, .. }
+                            if function.function_id == OperatorFunction::Equal.function_id())
+                        {
+                            exact_guarantees += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(joins, 1);
+    assert_eq!(exact_guarantees, 1);
+}

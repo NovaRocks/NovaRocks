@@ -117,7 +117,21 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
 
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
-        if scalar_expr::can_fail(&arena, filter_op.predicate) {
+        if scalar_expr::can_fail(&arena, filter_op.predicate)
+            || agg.aggregates.iter().any(|call| {
+                call.source.filter().is_some_and(|predicate| {
+                    !crate::analysis::expr_identity::expression_can_share_evaluation(predicate)
+                }) || call
+                    .source
+                    .arguments()
+                    .iter()
+                    .chain(call.source.order_by().iter().map(|key| &key.expr))
+                    .any(|&id| {
+                        scalar_expr::can_fail(&arena, id)
+                            || scalar_expr::contains_non_deterministic_function(&arena, id)
+                    })
+            })
+        {
             return Ok(RewriteResult::Unchanged);
         }
 

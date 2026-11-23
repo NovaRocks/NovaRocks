@@ -28,11 +28,11 @@ DROP TABLE IF EXISTS ${case_db}.t_join_null_key_left_outer_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_null_key_left_outer_r;
 CREATE TABLE ${case_db}.t_join_null_key_left_outer_l (
   k INT,
-  vl STRING
+  vl VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_null_key_left_outer_r (
   k INT,
-  vr STRING
+  vr VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_null_key_left_outer_l VALUES
   ROW(NULL, 'LN'),
@@ -41,7 +41,7 @@ INSERT INTO ${case_db}.t_join_null_key_left_outer_r VALUES
   ROW(NULL, 'RN'),
   ROW(2, 'R2');
 SELECT
-  COALESCE(CAST(l.k AS STRING), 'NULL') AS lk,
+  COALESCE(CAST(l.k AS VARCHAR), 'NULL') AS lk,
   l.vl,
   r.vr
 FROM ${case_db}.t_join_null_key_left_outer_l l

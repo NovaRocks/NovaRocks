@@ -511,6 +511,7 @@ fn add_join(
     let left_type = key_type(builder, probe.1[0]);
     let right_type = key_type(builder, build.1);
     let key = JoinKey {
+        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         left: builder
             .fixture_value_root(JOIN, left_type, ExprKind::Value(probe.1[0]))
             .unwrap(),
@@ -1751,6 +1752,7 @@ impl CountStar {
             semantic_parameters: Box::default(),
         });
         AggregateCall {
+            filter_root: None,
             id: AggregateCallId::new(id),
             binding: AggregateBinding {
                 state_interpretation: None,

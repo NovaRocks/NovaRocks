@@ -813,16 +813,6 @@ async fn begin_original(
         } => ConnectorRewriteSelection::Optimize {
             file_size_threshold_bytes,
         },
-        novarocks_table_maintenance::product::RewriteIntent::DataFiles { rewrite_all } => {
-            ConnectorRewriteSelection::DataFiles { rewrite_all }
-        }
-        novarocks_table_maintenance::product::RewriteIntent::PositionDeletes {
-            rewrite_all,
-            min_input_files,
-        } => ConnectorRewriteSelection::PositionDeletes {
-            rewrite_all,
-            min_input_files,
-        },
     };
     let mut request = Some(ConnectorRewriteSourceRequest {
         operation_id,
@@ -1305,22 +1295,6 @@ impl novarocks_table_maintenance::product::TableMaintenanceEffectPort
     > {
         Box::pin(product_port_begin_rewrite(self, target, intent))
     }
-    fn begin_rewrite_with_id<'a>(
-        &'a self,
-        target: &'a MaintenanceTarget,
-        intent: novarocks_table_maintenance::product::RewriteIntent,
-        effect: novarocks_table_maintenance::MaintenanceEffectId,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<
-            Box<dyn novarocks_table_maintenance::product::DistributedRewriteSession + 'a>,
-            TerminalError,
-        >,
-    > {
-        Box::pin(product_port_begin_rewrite_with_id(
-            self, target, intent, effect,
-        ))
-    }
 }
 
 async fn product_session_execute_cohort(
@@ -1448,25 +1422,6 @@ async fn product_port_begin_rewrite<'a>(
         }
     }
 }
-async fn product_port_begin_rewrite_with_id<'a>(
-    this: &'a GovernedRewriteEffectPort,
-    target: &'a MaintenanceTarget,
-    intent: novarocks_table_maintenance::product::RewriteIntent,
-    effect: novarocks_table_maintenance::MaintenanceEffectId,
-) -> Result<
-    Box<dyn novarocks_table_maintenance::product::DistributedRewriteSession + 'a>,
-    TerminalError,
-> {
-    begin_original(
-        &this.original,
-        target,
-        intent,
-        novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(effect.to_bytes()),
-    )
-    .await
-    .map(|s| Box::new(s) as _)
-}
-
 async fn close_refused_cohort(
     source: RewriteDomainAlias,
 ) -> Result<(), StatementNativeHealthFailure> {

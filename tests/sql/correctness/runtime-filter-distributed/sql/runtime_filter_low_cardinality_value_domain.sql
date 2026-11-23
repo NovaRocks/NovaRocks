@@ -21,13 +21,13 @@
 -- must stay value-domain correct with runtime dictionary carriers.
 
 CREATE TABLE ${case_db}.rf_dist_lc_probe (
-  status STRING,
+  status VARCHAR,
   payload INT
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_dist_lc_build (
-  status STRING,
-  flag STRING
+  status VARCHAR,
+  flag VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.rf_dist_lc_probe

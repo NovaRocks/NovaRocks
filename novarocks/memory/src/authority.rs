@@ -126,18 +126,27 @@ pub struct MemoryAuthority {
 }
 impl MemoryAuthority {
     pub fn new(config: AuthorityConfig) -> Result<Self, ConfigError> {
+        #[cfg(not(loom))]
+        let record_store = crate::lane::RecordStorePin::Global;
+        #[cfg(loom)]
+        let record_store = crate::lane::RecordStorePin::owned(256);
+        Self::with_record_store(config, record_store)
+    }
+
+    fn with_record_store(
+        config: AuthorityConfig,
+        record_store: crate::lane::RecordStorePin,
+    ) -> Result<Self, ConfigError> {
         config.validate()?;
-        let shared = Arc::new(Shared {
+        let record_capacity = match &record_store {
             #[cfg(not(loom))]
-            record_store: crate::lane::RecordStorePin::Global,
-            #[cfg(loom)]
-            record_store: crate::lane::RecordStorePin::owned(256),
+            crate::lane::RecordStorePin::Global => crate::lane::MAX_RECORDS as usize,
+            crate::lane::RecordStorePin::Owned(store) => store.capacity() as usize,
+        };
+        let shared = Arc::new(Shared {
+            record_store,
             observation_lanes: Mutex::new(crate::lane::registry::ObservationRegistry::new(
-                if cfg!(loom) {
-                    256
-                } else {
-                    crate::lane::MAX_RECORDS as usize
-                },
+                record_capacity,
             )),
             ceiling: config.capacity_bytes,
             top_up: config.top_up,
@@ -539,5 +548,97 @@ mod lifetime_tests {
         drop(domain);
         drop(account);
         assert!(shared.upgrade().is_none());
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod funding_record_pressure_tests {
+    use super::*;
+    use crate::{FundingDomain, RequestOutcome, lane::UNATTRIBUTED_RECORDS};
+
+    fn authority() -> MemoryAuthority {
+        let mut config = AuthorityConfig::new(4 * 1024 * 1024, 4 * 1024 * 1024, 0);
+        config.max_accounts = 8;
+        config.max_active_owners = 2;
+        config.metadata_budget_bytes = 16 * 1024;
+        let store = crate::lane::RecordStorePin::owned(UNATTRIBUTED_RECORDS + 4);
+        MemoryAuthority::with_record_store(config, store).unwrap()
+    }
+
+    fn grant(authority: &MemoryAuthority, budget: usize) -> FundingDomain {
+        match authority.request_domain(authority.root(), 64, budget) {
+            RequestOutcome::Granted(domain) => domain,
+            outcome => panic!("expected a funding grant, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn stopped_funding_domains_reuse_records_without_byte_shortage() {
+        let authority = authority();
+        let budget = authority.maintenance_scan_bound().unwrap();
+        let first = grant(&authority, budget);
+        let first_reference = first.lane().reference();
+        first.stop_producing().unwrap();
+        drop(first);
+        for _ in 0..7 {
+            let domain = grant(&authority, budget);
+            domain.stop_producing().unwrap();
+        }
+        assert!(
+            authority
+                .shared
+                .record_store
+                .store()
+                .snapshot_ref(first_reference)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn full_funding_records_keep_live_owners_and_report_typed_metadata_pressure() {
+        let authority = authority();
+        let budget = authority.maintenance_scan_bound().unwrap();
+        let active = grant(&authority, budget);
+        let active_reference = active.lane().reference();
+        let scope = active.activate(64, 0).unwrap();
+
+        let retained = grant(&authority, budget);
+        let retained_reference = retained.lane().reference();
+        retained.stop_producing().unwrap();
+        let lane = retained.lane().clone();
+        drop(retained);
+
+        assert!(matches!(
+            authority.request_domain(authority.root(), 64, budget),
+            RequestOutcome::Refused(CapacityError::MetadataExhausted {
+                registry: MetadataRegistryLabel::FundingRecords,
+                limit: 2,
+            }),
+        ));
+        assert_eq!(active.lane().reference(), active_reference);
+        assert!(active.snapshot().active);
+        assert_eq!(lane.reference(), retained_reference);
+
+        drop(lane);
+        let replacement = grant(&authority, budget);
+        assert_ne!(replacement.lane().reference(), retained_reference);
+        assert!(active.snapshot().active);
+        replacement.stop_producing().unwrap();
+        scope.finish();
+        active.stop_producing().unwrap();
+    }
+
+    #[test]
+    fn zero_budget_leaves_funding_record_maintenance_pending() {
+        let authority = authority();
+        let budget = authority.maintenance_scan_bound().unwrap();
+        for _ in 0..2 {
+            grant(&authority, budget).stop_producing().unwrap();
+        }
+        assert!(matches!(
+            authority.request_domain(authority.root(), 64, 0),
+            RequestOutcome::SettlementPending(coverage) if !coverage.complete
+        ));
+        grant(&authority, budget).stop_producing().unwrap();
     }
 }

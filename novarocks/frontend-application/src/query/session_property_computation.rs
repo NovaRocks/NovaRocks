@@ -707,7 +707,7 @@ mod tests {
         let window = ResultWindowAlias::from_root_owner(&root.owner).unwrap();
         let registry = Arc::new(SessionPropertyRegistry::new().unwrap());
         let live = SessionSqlState::default();
-        let source = "WITH SESSION query_timeout = 1 + 2, decimal_overflow_to_double = true AND true, explain_detail = 'LOGICAL_COSTS' SELECT 1 AS answer";
+        let source = "WITH SESSION query_timeout = 1 + 2, enable_scan_datacache = true AND true, explain_detail = 'LOGICAL_COSTS' SELECT 1 AS answer";
         let parsed = novarocks_parser::parser::parse_query(source).unwrap();
         let catalogs = Arc::new(
             crate::query_execution::kernels::SessionCatalogResolver::new(
@@ -744,13 +744,13 @@ mod tests {
             prepared.state.execution_settings().query_timeout_secs(),
             Some(3)
         );
-        assert!(prepared.state.sql_semantics().decimal_overflow_to_double());
+        assert!(prepared.state.execution_settings().enable_scan_datacache());
         assert_eq!(
             prepared.state.execution_settings().explain_detail(),
             novarocks_query_application::sql::session::ExplainDetail::LogicalCosts
         );
         assert_eq!(live.execution_settings().query_timeout_secs(), None);
-        assert!(!live.sql_semantics().decimal_overflow_to_double());
+        assert!(!live.execution_settings().enable_scan_datacache());
         assert_eq!(window.retained_payload_bytes(), 0);
         drop(window);
         root.owner.complete();
@@ -807,6 +807,7 @@ mod tests {
         let fixture = Fixture::new();
         for (sql, location) in [
             ("SET SESSION trc_unknown = 1", true),
+            ("SET SESSION decimal_overflow_to_double = 1 / 0", true),
             ("SET SESSION query_timeout = -1", true),
             ("SET SESSION pipeline_dop = 1.5", false),
             ("SET SESSION pipeline_dop = NULL", true),

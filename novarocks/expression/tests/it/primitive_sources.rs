@@ -131,9 +131,7 @@ fn every_unsupported_recipe_keeps_its_exact_owner() {
             CastOperation::Carrier,
             &FunctionValueType::new(DataType::Date32, true),
             &FunctionValueType::new(DataType::Int8, true),
-            DecimalOverflowPolicy::ReportError,
-            true,
-            None,
+            novarocks_type_contract::TrinoCastMode::Explicit,
             &RecipeControl,
         )
         .unwrap_err(),
@@ -145,7 +143,7 @@ fn every_unsupported_recipe_keeps_its_exact_owner() {
         errors[0],
         PrimitiveError::Arithmetic(A::Unsupported)
     ));
-    assert!(matches!(errors[1], PrimitiveError::Cast(C::Unsupported)));
+    assert!(matches!(errors[1], PrimitiveError::Cast(C::Illegal)));
     assert!(matches!(
         errors[2],
         PrimitiveError::Comparison(B::Unsupported)
@@ -180,9 +178,7 @@ fn every_recipe_type_mismatch_preserves_original_primitive_error() {
             CastOperation::Carrier,
             &nullable,
             &integer,
-            DecimalOverflowPolicy::ReportError,
-            true,
-            None,
+            novarocks_type_contract::TrinoCastMode::Explicit,
             &RecipeControl,
         )
         .unwrap_err(),

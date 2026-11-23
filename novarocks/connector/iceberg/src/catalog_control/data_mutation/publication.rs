@@ -37,7 +37,7 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::{CatalogPublisher, PublicationPreparer};
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    ArtifactWriter, Dependency, FileChanges, FrozenRequest, IsolationLevel, OperationIntent,
+    ArtifactWriter, CommitProtocol, Dependency, FileChanges, FrozenRequest, OperationIntent,
     OperationIntentParts, RequestShape, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
@@ -135,6 +135,7 @@ fn freeze_intent(
             "Data mutation lost its exact admitted source metadata",
         )));
     }
+    let main_truncate = planned.is_main_truncate();
     OperationIntent::new(OperationIntentParts {
         target: TableTarget {
             ident: TableIdent::new(
@@ -144,13 +145,21 @@ fn freeze_intent(
             uuid: Some(source.uuid()),
         },
         target_ref: payload.target_ref.clone(),
-        start,
+        start: if main_truncate { None } else { start },
         changes: FileChanges {
             added: vec![],
             removed: vec![],
         },
-        dependencies: vec![Dependency::RefUnchanged],
-        isolation: IsolationLevel::Serializable,
+        dependencies: if main_truncate {
+            vec![]
+        } else {
+            vec![Dependency::RefUnchanged]
+        },
+        protocol: if main_truncate {
+            CommitProtocol::Truncate
+        } else {
+            CommitProtocol::Legacy
+        },
         shape: RequestShape::SnapshotProducing,
         summary: marker_summary(marker)?,
         token: operation.token(),
@@ -176,7 +185,7 @@ fn freeze_registration_intent(
             removed: vec![],
         },
         dependencies: vec![],
-        isolation: IsolationLevel::Serializable,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: marker_summary(marker)?,
         token: operation.token(),
@@ -243,9 +252,12 @@ impl RegisteredIcebergDataMutationBackend {
             .catalog_runtime()
             .observe_preparation(
                 || {
-                    let table = self.reload_table(&payload.namespace, &payload.table, context)?;
-                    validate_frozen_table(&table, payload)?;
-                    anchor_committed_write(&self.runtime, &table)?;
+                    if !planned.is_main_truncate() {
+                        let table =
+                            self.reload_table(&payload.namespace, &payload.table, context)?;
+                        validate_frozen_table(&table, payload)?;
+                        anchor_committed_write(&self.runtime, &table)?;
+                    }
                     let intent = freeze_intent(planned, &operation, marker)
                         .map_err(|error| corrupt(error.to_string()))?;
                     let policy = RetryPolicy::from_properties(source.properties())
@@ -274,30 +286,44 @@ impl RegisteredIcebergDataMutationBackend {
             &operation,
             CatalogOperation::Truncate,
         );
-        let publisher = journal.observe_prepared(Arc::new(MutationPublisher {
-            inner: direct,
-            payload: payload.clone(),
-            runtime: Arc::clone(&self.runtime),
-        }));
-        let prefix = PreparedChange {
-            updates: vec![],
-            requirements: vec![
-                crate::iceberg::TableRequirement::CurrentSchemaIdMatch {
-                    current_schema_id: payload.schema_id,
+        let main_truncate = planned.is_main_truncate();
+        let (publisher, prefix): (Arc<dyn PublicationPreparer>, PreparedChange) = if main_truncate {
+            (direct, PreparedChange::default())
+        } else {
+            (
+                Arc::new(MutationPublisher {
+                    inner: direct,
+                    payload: payload.clone(),
+                    runtime: Arc::clone(&self.runtime),
+                }),
+                PreparedChange {
+                    updates: vec![],
+                    requirements: vec![
+                        crate::iceberg::TableRequirement::CurrentSchemaIdMatch {
+                            current_schema_id: payload.schema_id,
+                        },
+                        crate::iceberg::TableRequirement::DefaultSpecIdMatch {
+                            default_spec_id: payload.default_spec_id,
+                        },
+                    ],
                 },
-                crate::iceberg::TableRequirement::DefaultSpecIdMatch {
-                    default_spec_id: payload.default_spec_id,
-                },
-            ],
+            )
         };
-        let preparer = crate::commit::truncate::TruncatePreparer;
+        let publisher = journal.observe_prepared(publisher);
         let running_operation = operation.clone();
         let report = operation.runtime().block_on(async move {
+            let filtered =
+                main_truncate.then(crate::commit::filter_delete::FilterDeletePreparer::always_true);
+            let legacy = crate::commit::truncate::TruncatePreparer;
+            let preparer: &dyn crate::commit::staging::Preparer = match &filtered {
+                Some(filtered) => filtered,
+                None => &legacy,
+            };
             attempt::run(
                 &running_operation,
                 &intent,
                 &prefix,
-                &[&preparer],
+                &[preparer],
                 &publisher,
                 policy,
             )

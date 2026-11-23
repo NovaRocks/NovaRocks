@@ -494,9 +494,6 @@ pub enum ProviderReadRelationNeed {
     PinnedFileSet {
         relation: TableIdentity,
     },
-    TableExecute {
-        relation: TableIdentity,
-    },
 }
 
 /// Which admission-frozen input one provider read names.
@@ -526,8 +523,7 @@ impl ProviderReadRelationNeed {
             | Self::Metadata { relation, .. }
             | Self::Delta { relation, .. }
             | Self::MvTarget { relation, .. }
-            | Self::PinnedFileSet { relation }
-            | Self::TableExecute { relation, .. } => relation,
+            | Self::PinnedFileSet { relation } => relation,
         }
     }
 
@@ -539,7 +535,6 @@ impl ProviderReadRelationNeed {
             | Self::MvTarget { .. } => ConnectorReadRelationKind::Table,
             Self::Metadata { .. } => ConnectorReadRelationKind::SystemTable,
             Self::Delta { .. } => ConnectorReadRelationKind::ChangeWindow,
-            Self::TableExecute { .. } => ConnectorReadRelationKind::TableExecute,
         }
     }
 }
@@ -578,7 +573,7 @@ impl fmt::Debug for ProviderReadRelationNeed {
                     .field("target_snapshot_id", target_snapshot_id)
                     .field("use_affected_partitions", use_affected_partitions);
             }
-            Self::PinnedFileSet { .. } | Self::TableExecute { .. } => {}
+            Self::PinnedFileSet { .. } => {}
         }
         debug.finish()
     }
@@ -878,8 +873,7 @@ fn validate_provider_relation(
         ProviderReadRelationNeed::MvTarget {
             target_snapshot_id, ..
         } => target_snapshot_id.is_some_and(|snapshot| snapshot < 0),
-        ProviderReadRelationNeed::PinnedFileSet { .. }
-        | ProviderReadRelationNeed::TableExecute { .. } => false,
+        ProviderReadRelationNeed::PinnedFileSet { .. } => false,
     };
     if invalid_snapshot {
         return Err(CompletionProtocolError::InvalidNeed {
@@ -919,7 +913,6 @@ pub(super) fn provider_relation_need_from_sql_scan(
             to_snapshot_id: *to_snapshot_id,
         },
         SqlScanKind::PinnedFileSet => ProviderReadRelationNeed::PinnedFileSet { relation },
-        SqlScanKind::TableExecute => ProviderReadRelationNeed::TableExecute { relation },
         SqlScanKind::MvTargetState { facts } => ProviderReadRelationNeed::MvTarget {
             relation,
             target_table_uuid: facts.target_table_uuid.clone(),
@@ -3636,8 +3629,7 @@ fn provider_relation_dynamic_bytes(
         | ProviderReadRelationNeed::FrozenInputSet { .. }
         | ProviderReadRelationNeed::Metadata { .. }
         | ProviderReadRelationNeed::Delta { .. }
-        | ProviderReadRelationNeed::PinnedFileSet { .. }
-        | ProviderReadRelationNeed::TableExecute { .. } => 0,
+        | ProviderReadRelationNeed::PinnedFileSet { .. } => 0,
         ProviderReadRelationNeed::MvTarget {
             target_table_uuid, ..
         } => checked_size(target_table_uuid.len())?,

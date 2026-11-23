@@ -27,8 +27,8 @@ use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Timelike};
 use novarocks_result_contract::{
-    ClientRenderSchema, FrozenRootOutput, NativeRenderType as N, RenderField, RenderTimeUnit,
-    RootOutputContract, RootProfileV1 as V,
+    CharacterKind, CharacterType, ClientRenderSchema, FrozenRootOutput, NativeRenderType as N,
+    RenderField, RenderTimeUnit, RootOutputContract, RootProfileV1 as V,
 };
 use std::mem::size_of;
 use std::ops::Range;
@@ -181,6 +181,7 @@ struct Stream {
     pending_len: usize,
     json: Option<JsonCursor>,
     utf8: Option<Utf8>,
+    character: Option<(CharacterType, u32)>,
 }
 impl Stream {
     fn new(source: Source, mode: Mode) -> Self {
@@ -193,6 +194,7 @@ impl Stream {
             pending_len: 0,
             json: None,
             utf8: None,
+            character: None,
         }
     }
 }
@@ -330,6 +332,14 @@ fn stream_next(
             if let Some(u) = stream.utf8 {
                 u.finish()?;
             }
+            if let Some((character, remaining)) = &mut stream.character
+                && character.kind() == CharacterKind::Char
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                b.scan(1);
+                return Ok(Poll::Byte(b' '));
+            }
             return Ok(Poll::Done);
         }
         stream.pending_at = 0;
@@ -377,6 +387,11 @@ fn stream_next(
                 }
                 if let Some(u) = &mut stream.utf8 {
                     u.feed(c)?;
+                }
+                if let Some((_, remaining)) = &mut stream.character
+                    && c & 0xc0 != 0x80
+                {
+                    *remaining = remaining.checked_sub(1).ok_or_else(invalid_value)?;
                 }
                 if matches!(stream.mode, Mode::RawUtf8) {
                     return Ok(Poll::Byte(c));
@@ -1283,7 +1298,7 @@ fn validate_field(f: &RenderField, d: &DataType, nested: bool) -> Result<(), Ren
     if let DataType::Dictionary(k, v) = d {
         if matches!(k.as_ref(), DataType::Int32)
             && matches!(v.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
-            && matches!(f.native_type, N::String | N::Json)
+            && matches!(f.native_type, N::String | N::Json | N::BoundedCharacter(_))
         {
             return Ok(());
         }
@@ -1303,7 +1318,7 @@ fn validate_field(f: &RenderField, d: &DataType, nested: bool) -> Result<(), Ren
         | (N::LargeInt, DataType::FixedSizeBinary(16))
         | (N::Float32, DataType::Float32)
         | (N::Float64, DataType::Float64)
-        | (N::String | N::Json, DataType::Utf8 | DataType::LargeUtf8)
+        | (N::String | N::Json | N::BoundedCharacter(_), DataType::Utf8 | DataType::LargeUtf8)
         | (N::Binary, DataType::Binary | DataType::LargeBinary)
         | (N::Opaque(_), DataType::Binary)
         | (N::Variant, DataType::LargeBinary)

@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use crate::commit::model::{
     ArtifactWriter, AttemptArtifacts, AttemptToken, BaseIdentity, FileChanges, FrozenRequest,
-    FrozenRequestParts, IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts,
-    RequestShape, StagedCreateIdentity, TableTarget,
+    FrozenRequestParts, ObjectIdentity, OperationIntent, OperationIntentParts, RequestShape,
+    StagedCreateIdentity, TableTarget,
 };
 use crate::commit::preparation::{CapturedMergePolicy, ManifestMergePolicy, PreparationContext};
 use crate::iceberg::spec::{ManifestList, TableMetadata};
@@ -411,7 +411,7 @@ pub(crate) fn freeze_existing_change(
         start: None,
         changes: FileChanges::default(),
         dependencies: Vec::new(),
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape,
         summary: Default::default(),
         token: attempt.operation(),

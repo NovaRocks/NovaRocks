@@ -211,9 +211,7 @@ pub enum ExprKind {
     Cast {
         expr: ExprId,
         target: DataType,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        allow_throw_exception: SemanticParameterRef,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: novarocks_type_contract::TrinoCastMode,
     },
     IsNull {
         expr: ExprId,
@@ -236,6 +234,8 @@ pub enum ExprKind {
         negated: bool,
     },
     Case {
+        /// Use ordinary IEEE equality for the original floating comparison domain.
+        ieee_float_equality: bool,
         operand: Option<ExprId>,
         when_then: Box<[(ExprId, ExprId)]>,
         else_expr: Option<ExprId>,
@@ -267,6 +267,7 @@ impl ExprKind {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => Some(ControlShape::Case {
                 simple: operand.is_some(),
                 arms: u32::try_from(when_then.len()).map_err(|_| {
@@ -326,10 +327,6 @@ impl ExprKind {
                 allow_throw_exception,
                 ..
             } => allow_throw_exception.as_ref(),
-            Self::Cast {
-                allow_throw_exception,
-                ..
-            } => Some(allow_throw_exception),
             _ => None,
         }
         .into_iter()
@@ -381,6 +378,7 @@ impl ExprKind {
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(id) = operand {
                     visit(*id)?;

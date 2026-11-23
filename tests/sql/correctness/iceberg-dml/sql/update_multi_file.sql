@@ -26,7 +26,7 @@
 DROP TABLE IF EXISTS ${case_db}.t_v3_update_multi_file ;
 CREATE TABLE ${case_db}.t_v3_update_multi_file (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_v3_update_multi_file VALUES ROW(1, 'a');
 INSERT INTO ${case_db}.t_v3_update_multi_file VALUES ROW(2, 'b');

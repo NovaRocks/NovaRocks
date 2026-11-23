@@ -47,9 +47,9 @@ use std::alloc::Layout;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, BooleanArray};
 #[cfg(test)]
 use arrow::datatypes::DataType;
 use novarocks_functions::{
@@ -141,6 +141,70 @@ fn aggregate_vector<T>(
     })?;
     Ok(values)
 }
+// Design: ADR-0253 (docs/adr/ADR-0253-aggregate-filters-select-original-rows-per-call.md)
+#[derive(Default)]
+struct AggregateFilterScratch {
+    rows: Vec<usize>,
+    groups: Vec<usize>,
+}
+
+impl AggregateFilterScratch {
+    fn select<'a>(
+        &'a mut self,
+        mask: &BooleanArray,
+        mapping: &'a [usize],
+        owner: &dyn InputConstructionOwner,
+        control: &RuntimeKernelControl,
+    ) -> ExecutionResult<(Selection<'a>, &'a [usize])> {
+        let rows = mapping.len();
+        if mask.len() != rows {
+            return Err(group_contract(
+                "aggregate FILTER length differs from the group mapping",
+            ));
+        }
+        // All and none use the original group map or the empty slice. Sparse
+        // scratch is reserved from the same batch construction owner.
+        let mut work = novarocks_functions::EvaluationCheckpoints::new(control);
+        let failure = |cause: KernelFailure| control.project_required_failure(cause.into());
+        let mut count = 0;
+        for value in mask {
+            work.step().map_err(failure)?;
+            count += usize::from(value == Some(true));
+        }
+        work.flush().map_err(failure)?;
+        if count == rows {
+            return Ok((Selection::all(rows), mapping));
+        }
+        if count == 0 {
+            let selection =
+                Selection::try_sparse_observed(rows, &[], || work.step()).map_err(failure)?;
+            work.finish().map_err(failure)?;
+            return Ok((selection, &[]));
+        }
+        let capacity = self.rows.capacity().min(self.groups.capacity());
+        if capacity < count {
+            let target = count.max(capacity.saturating_mul(2)).min(rows);
+            let selected_rows = aggregate_vector(owner, target)?;
+            let selected_groups = aggregate_vector(owner, target)?;
+            self.rows = selected_rows;
+            self.groups = selected_groups;
+        }
+        self.rows.clear();
+        self.groups.clear();
+        for (row, (value, &group)) in mask.iter().zip(mapping).enumerate() {
+            work.step().map_err(failure)?;
+            if value == Some(true) {
+                self.rows.push(row);
+                self.groups.push(group);
+            }
+        }
+        let selection =
+            Selection::try_sparse_observed(rows, &self.rows, || work.step()).map_err(failure)?;
+        work.finish().map_err(failure)?;
+        Ok((selection, &self.groups))
+    }
+}
+
 fn aggregate_value_failure<E: Into<ExecutionFailure>>(cause: ValueFailure<E>) -> ExecutionFailure {
     match cause {
         ValueFailure::Value(cause) => ExecutionFailure::from_domain(cause),
@@ -162,6 +226,7 @@ struct CallPlan {
     /// Offset of this call's roots in the processor's root list.
     first_root: usize,
     roots: usize,
+    filter_column: Option<usize>,
 }
 
 /// The source layout owns names/IDs and complete final values. Local partial
@@ -390,6 +455,24 @@ impl CompiledAggregateProcessorFactory {
                     ),
                 ));
             }
+            let filter_column = function
+                .filter_root
+                .map(|reference| {
+                    if !merge
+                        && let Some(unit) = program.unit(reference.unit)
+                        && let Some(root) = unit.root(reference.root)
+                        && root.scope == novarocks_expression_contract::RootScope::Port(0)
+                        && root.demand == novarocks_type_contract::EvaluationDemand::TruthOnly
+                        && let Some(input) = unit.input(root.use_id)
+                    {
+                        return Ok(input.ordinal as usize);
+                    }
+                    Err(program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        "compiled aggregate FILTER lacks its direct update input",
+                    ))
+                })
+                .transpose()?;
             let first_root = sites.len();
             sites.extend_from_slice(&function.inputs);
             calls.push(CallPlan {
@@ -398,6 +481,7 @@ impl CompiledAggregateProcessorFactory {
                 merge,
                 first_root,
                 roots,
+                filter_column,
             });
         }
         let output_layout = graph_node.output_layout().clone();
@@ -486,6 +570,7 @@ impl CompiledAggregateProcessorFactory {
                 merge: false,
                 first_root: original.first_root,
                 roots: original.roots,
+                filter_column: original.filter_column,
             });
             let handle = stages.final_stage().clone();
             final_calls.push(CallPlan {
@@ -494,6 +579,7 @@ impl CompiledAggregateProcessorFactory {
                 merge: true,
                 first_root: self.groups + ordinal,
                 roots: 1,
+                filter_column: None,
             });
         }
         let partial = Self {
@@ -930,9 +1016,24 @@ impl CompiledAggregateProcessor {
             )
             .map_err(|cause| self.control.project_required_failure(cause))?;
         self.grow_states()?;
-        let selection = Selection::all(rows);
+        let mut scratch = AggregateFilterScratch::default();
         let states = self.states.as_mut().expect("states were created");
         for (call, column) in self.calls.iter().zip(states.iter_mut()) {
+            let (selection, groups) = if let Some(ordinal) = call.filter_column {
+                let filter = chunk
+                    .columns()
+                    .get(ordinal)
+                    .and_then(|array| array.as_any().downcast_ref::<BooleanArray>())
+                    .ok_or_else(|| group_contract("aggregate FILTER input is not BOOLEAN"))?;
+                let (selection, groups) =
+                    scratch.select(filter, &mapping, owner.as_ref(), &self.control)?;
+                if selection.is_empty() {
+                    continue;
+                }
+                (selection, groups)
+            } else {
+                (Selection::all(rows), mapping.as_slice())
+            };
             let arguments = values[call.first_root..call.first_root + call.roots]
                 .iter()
                 .map(EvaluatedArgument::Column)
@@ -944,7 +1045,7 @@ impl CompiledAggregateProcessor {
                     arguments[0],
                     &self.control,
                 )?;
-                column.prepare_merge_batch_evaluation(&mapping, input, &self.control)?
+                column.prepare_merge_batch_evaluation(groups, input, &self.control)?
             } else {
                 // State construction retained this exact installed handle. Its
                 // phase and input capability belong to the BE implementation.
@@ -973,7 +1074,7 @@ impl CompiledAggregateProcessor {
                     |ordinal| call.handle.argument_encoding(ordinal),
                     &self.control,
                 )?;
-                column.prepare_update_batch_evaluation(&mapping, input, &self.control)?
+                column.prepare_update_batch_evaluation(groups, input, &self.control)?
             };
             frame.run(&self.control)?;
         }
@@ -1453,6 +1554,59 @@ mod failure_latch_tests {
             .expect("prepare actual aggregate schema");
         (processor, input, error, tracker)
     }
+    #[test]
+    fn aggregate_filter_pairs_original_rows_with_compact_groups() {
+        let (processor, _, _, _) = processor();
+        let schema = processor.prepared_output().unwrap();
+        let owner = processor.control.construction_owner(schema).unwrap();
+        let mut scratch = AggregateFilterScratch::default();
+        let groups = [0, 2, 1, 2, 0];
+        let mask = BooleanArray::from(vec![None, Some(true), Some(false), Some(true), Some(true)]);
+        let (selection, compact) = scratch
+            .select(&mask, &groups, owner.as_ref(), &processor.control)
+            .unwrap();
+        assert_eq!(selection.iter().collect::<Vec<_>>(), [1, 3, 4]);
+        assert_eq!(compact, [2, 2, 0]);
+
+        let mask = BooleanArray::from(vec![Some(false), None, Some(false), None, None]);
+        let (selection, compact) = scratch
+            .select(&mask, &groups, owner.as_ref(), &processor.control)
+            .unwrap();
+        assert!(selection.is_empty());
+        assert!(compact.is_empty());
+
+        let mask = BooleanArray::from(vec![true; 5]);
+        let (selection, dense) = scratch
+            .select(&mask, &groups, owner.as_ref(), &processor.control)
+            .unwrap();
+        assert!(selection.is_all());
+        assert!(std::ptr::eq(dense, groups.as_slice()));
+    }
+
+    #[test]
+    fn aggregate_filter_preserves_the_batch_memory_refusal() {
+        use novarocks_failure_contract::FailureProjection;
+
+        let (processor, _, _, tracker) = processor();
+        let schema = processor.prepared_output().unwrap();
+        let owner = processor.control.construction_owner(schema).unwrap();
+        let before = tracker.current();
+        tracker.install_limit_once(before + 1).unwrap();
+        let mask = BooleanArray::from(vec![Some(true), None]);
+        let mut scratch = AggregateFilterScratch::default();
+        let error = scratch
+            .select(&mask, &[0, 1], owner.as_ref(), &processor.control)
+            .unwrap_err();
+
+        assert_eq!(
+            error.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
+        assert!(scratch.rows.is_empty());
+        assert!(scratch.groups.is_empty());
+        assert_eq!(tracker.current(), before);
+    }
+
     #[test]
     fn compiled_aggregate_k_cross_dictionary_generations_share_dense_states_and_export_declared_offsets()
      {

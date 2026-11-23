@@ -25,21 +25,21 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-  c1 STRING,
-  c2 STRING,
-  c3 STRING
+  c1 VARCHAR,
+  c2 VARCHAR,
+  c3 VARCHAR
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t2 (
-  c1 STRING,
-  c2 STRING,
-  c3 STRING
+  c1 VARCHAR,
+  c2 VARCHAR,
+  c3 VARCHAR
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t3 (
-  c1 STRING,
-  c2 STRING,
-  c3 STRING
+  c1 VARCHAR,
+  c2 VARCHAR,
+  c3 VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t3 SELECT 'c1-1', 'unknown', 'c3';

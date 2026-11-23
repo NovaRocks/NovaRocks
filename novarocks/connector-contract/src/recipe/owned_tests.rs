@@ -216,7 +216,6 @@ fn observed_read_recipe_all_relation_kinds_and_empty_columns_keep_empty_arc_requ
         ConnectorReadRelationKind::TableFunction,
         ConnectorReadRelationKind::ChangeWindow,
         ConnectorReadRelationKind::SystemTable,
-        ConnectorReadRelationKind::TableExecute,
         ConnectorReadRelationKind::MergeTable,
     ] {
         let input = relation(&binding, Bytes::new(), Bytes::new());

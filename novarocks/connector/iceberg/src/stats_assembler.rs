@@ -377,6 +377,172 @@ pub(crate) async fn write_puffin_artifacts_allocated_scoped(
     Ok(result)
 }
 
+/// Geometry from the original registration. For plaintext the framing is
+/// verified from the paid bytes, without decoding or normalizing the footer.
+pub(crate) struct PuffinCopyGeometry {
+    file_bytes: u64,
+    footer_bytes: u64,
+}
+
+impl PuffinCopyGeometry {
+    pub(crate) fn from_registration(source: &StatisticsFile) -> crate::iceberg::Result<Self> {
+        let file_bytes =
+            u64::try_from(source.file_size_in_bytes).map_err(|_| invalid_copy_extent())?;
+        let footer_bytes =
+            u64::try_from(source.file_footer_size_in_bytes).map_err(|_| invalid_copy_extent())?;
+        if footer_bytes < 16
+            || file_bytes
+                .checked_sub(4)
+                .is_none_or(|after_header| footer_bytes > after_header)
+        {
+            return Err(invalid_copy_extent());
+        }
+        Ok(Self {
+            file_bytes,
+            footer_bytes,
+        })
+    }
+
+    pub(crate) fn file_bytes(&self) -> u64 {
+        self.file_bytes
+    }
+
+    pub(crate) fn verify(
+        &self,
+        bytes: &[u8],
+        key_metadata: Option<&str>,
+    ) -> crate::iceberg::Result<()> {
+        if u64::try_from(bytes.len()).ok() != Some(self.file_bytes) {
+            return Err(invalid_copy_extent());
+        }
+        // Encryption metadata is implementation-specific. Copy the verified
+        // physical extent and keep the original key metadata; footer positions
+        // in an encrypted Puffin describe the source plaintext.
+        if key_metadata.is_some() {
+            return Ok(());
+        }
+
+        let trailer = bytes.last_chunk::<12>().ok_or_else(invalid_copy_extent)?;
+        let footer_start = bytes.len() - self.footer_bytes as usize;
+        let payload_bytes = u32::from_le_bytes(trailer[..4].try_into().expect("four-byte length"));
+        if u64::from(payload_bytes) + 16 != self.footer_bytes
+            || !bytes.starts_with(b"PFA1")
+            || &bytes[footer_start..footer_start + 4] != b"PFA1"
+            || &trailer[8..] != b"PFA1"
+        {
+            return Err(invalid_copy_extent());
+        }
+        Ok(())
+    }
+}
+
+fn invalid_copy_extent() -> crate::iceberg::Error {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    let message = "Iceberg statistics file or footer differs from its registration";
+    crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message).with_source(
+        ConnectorError::new(ConnectorErrorKind::CorruptData, message),
+    )
+}
+
+pub(crate) struct StatisticsCarryBacking {
+    pub(crate) registration: usize,
+    pub(crate) reuse: usize,
+}
+
+pub(crate) fn statistics_carry_backing(
+    source: &StatisticsFile,
+    output_path: usize,
+) -> crate::iceberg::Result<StatisticsCarryBacking> {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    use std::mem::size_of;
+    let overflow = || {
+        let message = "Iceberg statistics registration backing is not representable";
+        crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, message).with_source(
+            ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message),
+        )
+    };
+    let key = source.key_metadata.as_ref().map_or(0, String::len);
+    let mut registration = size_of::<StatisticsFile>()
+        .checked_add(output_path.max(source.statistics_path.len()))
+        .and_then(|bytes| bytes.checked_add(key))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                source
+                    .blob_metadata
+                    .len()
+                    .checked_mul(size_of::<BlobMetadata>())?,
+            )
+        })
+        .ok_or_else(overflow)?;
+    for blob in &source.blob_metadata {
+        let properties = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+            String,
+            String,
+        >(blob.properties.len())
+        .map_err(|_| overflow())?;
+        registration = registration
+            .checked_add(blob.r#type.len())
+            .and_then(|bytes| bytes.checked_add(blob.fields.len().checked_mul(size_of::<i32>())?))
+            .and_then(|bytes| bytes.checked_add(properties.request_bytes_upper_bound))
+            .ok_or_else(overflow)?;
+        for (key, value) in &blob.properties {
+            registration = registration
+                .checked_add(key.len())
+                .and_then(|bytes| bytes.checked_add(value.len()))
+                .ok_or_else(overflow)?;
+        }
+    }
+    // Account for the original update, replay-builder copies, frozen request
+    // and canonical REST value/JSON encoding using the statistics publication
+    // layout. This charge is incremental to the Root's other live receipts.
+    let registration = registration.checked_mul(8 * 6).ok_or_else(overflow)?;
+    let reuse = source
+        .statistics_path
+        .len()
+        .checked_add(key)
+        .and_then(|bytes| bytes.checked_add(output_path.checked_mul(2)?))
+        .and_then(|bytes| {
+            bytes.checked_add(size_of::<(
+                crate::commit::model::StatisticsReuseBasis,
+                crate::commit::model::ReusableStatisticsFile,
+            )>())
+        })
+        .ok_or_else(overflow)?;
+    Ok(StatisticsCarryBacking {
+        registration,
+        reuse,
+    })
+}
+
+pub(crate) fn carried_statistics_registration(
+    source: &StatisticsFile,
+    copy: &crate::commit::model::ReusableStatisticsFile,
+) -> StatisticsFile {
+    StatisticsFile {
+        snapshot_id: copy.snapshot_id,
+        statistics_path: copy.object.path().to_owned(),
+        file_size_in_bytes: copy.file_size_in_bytes,
+        file_footer_size_in_bytes: copy.file_footer_size_in_bytes,
+        key_metadata: source.key_metadata.clone(),
+        blob_metadata: source
+            .blob_metadata
+            .iter()
+            .map(|blob| BlobMetadata {
+                r#type: blob.r#type.clone(),
+                snapshot_id: blob.snapshot_id,
+                sequence_number: blob.sequence_number,
+                fields: blob.fields.clone(),
+                // A freshly sized table, as quoted by statistics_carry_backing.
+                properties: blob
+                    .properties
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod scoped_refusal_tests {
     use super::*;

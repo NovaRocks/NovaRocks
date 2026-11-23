@@ -150,6 +150,7 @@ pub(super) fn compare_prepared_pairs(
                         }};
                     }
                     match left.spec.equalities()[column] {
+                        KeyEquality::IeeeFloat => return Err(invariant(ValueViolation::Carrier)),
                         KeyEquality::SqlGrouping(_) => complex!(false),
                         KeyEquality::ResultContent => complex!(true),
                     }
@@ -307,6 +308,7 @@ pub(super) fn compare_value_pairs(
                         }};
                     }
                     match left.spec.equalities()[column] {
+                        KeyEquality::IeeeFloat => return Err(invariant(ValueViolation::Carrier)),
                         KeyEquality::SqlGrouping(_) => complex!(false),
                         KeyEquality::ResultContent => complex!(true),
                     }
@@ -390,7 +392,10 @@ pub(super) fn compare_fixed_pairs(
         return Ok(());
     }
     macro_rules! primitive {
-        ($ty:ty, $canonical:expr) => {{
+        ($ty:ty, $canonical:expr) => {
+            primitive!($ty, |a, b| ($canonical)(a) == ($canonical)(b), compare)
+        };
+        ($ty:ty, $compare:expr, compare) => {{
             let a = a
                 .as_any()
                 .downcast_ref::<$ty>()
@@ -413,7 +418,7 @@ pub(super) fn compare_fixed_pairs(
                 let br = physical_row(bm, br)?;
                 *result = u8::from(
                     null_equal(a.is_null(ar), b.is_null(br), nulls)
-                        .unwrap_or_else(|| ($canonical)(a.value(ar)) == ($canonical)(b.value(br))),
+                        .unwrap_or_else(|| ($compare)(a.value(ar), b.value(br))),
                 );
             }
             Ok(())
@@ -438,10 +443,12 @@ pub(super) fn compare_fixed_pairs(
         DataType::UInt64 => primitive!(UInt64Array, |v: u64| v),
         DataType::Float32 => match equality {
             KeyEquality::SqlGrouping(_) => primitive!(Float32Array, canonical_f32_bits),
+            KeyEquality::IeeeFloat => primitive!(Float32Array, |a, b| a == b, compare),
             KeyEquality::ResultContent => primitive!(Float32Array, content_f32_bits),
         },
         DataType::Float64 => match equality {
             KeyEquality::SqlGrouping(_) => primitive!(Float64Array, canonical_f64_bits),
+            KeyEquality::IeeeFloat => primitive!(Float64Array, |a, b| a == b, compare),
             KeyEquality::ResultContent => primitive!(Float64Array, content_f64_bits),
         },
         DataType::Decimal128(..) => primitive!(Decimal128Array, |v: i128| v),

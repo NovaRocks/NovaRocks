@@ -23,7 +23,7 @@ use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
 use crate::compiler::SqlCompileControl;
 use arrow::datatypes::DataType;
 use novarocks_parser::{Span, ast, build};
-use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+use novarocks_type_contract::{FunctionValueType, OperatorFunction};
 
 struct NoTables;
 impl PlannerTableProvider for NoTables {
@@ -84,56 +84,47 @@ fn same_typed(actual: &TypedExpr, expected: &TypedExpr, control: &SqlCompileCont
 }
 
 #[test]
-fn distinct_from_retains_null_safe_equality_and_not_results() {
+fn distinct_from_retains_null_safe_operands_and_exact_operator_identities() {
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for (left, right) in [
-        ("NULL", "NULL"),
-        ("NULL", "1"),
-        ("1", "NULL"),
-        ("1", "1"),
-        ("[1,NULL]", "[1,NULL]"),
-    ] {
-        let standard = query(&format!("SELECT {left} IS NOT DISTINCT FROM {right}"));
-        let actual_equal = ctx.analyze_expr(projection(&standard), &scope).unwrap();
-        assert_eq!(
-            actual_equal.value_type,
-            FunctionValueType::new(DataType::Boolean, false)
-        );
-        assert!(matches!(
-            actual_equal.kind,
-            ExprKind::BinaryOp {
-                op: BinOp::EqForNull,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                ..
-            }
-        ));
-        let old_not = query(&format!("SELECT NOT ({left} IS NOT DISTINCT FROM {right})"));
-        let old_not = ctx.analyze_expr(projection(&old_not), &scope).unwrap();
-        let standard = query(&format!("SELECT {left} IS DISTINCT FROM {right}"));
-        let actual_not = ctx.analyze_expr(projection(&standard), &scope).unwrap();
-        assert_eq!(actual_not.value_type, old_not.value_type);
-        assert_eq!(
-            actual_not.value_type,
-            FunctionValueType::new(DataType::Boolean, false)
-        );
-        let ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr: actual_inner,
-        } = &actual_not.kind
-        else {
-            panic!("typed NOT")
-        };
-        let ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr: original_inner,
-        } = &old_not.kind
-        else {
-            panic!("original typed NOT")
-        };
-        same_typed(actual_inner, original_inner, &control);
+    for (left, right) in [("NULL", "NULL"), ("NULL", "1"), ("1", "NULL"), ("1", "1")] {
+        let equal = query(&format!("SELECT {left} IS NOT DISTINCT FROM {right}"));
+        let unequal = query(&format!("SELECT {left} IS DISTINCT FROM {right}"));
+        let actual_equal = ctx.analyze_expr(projection(&equal), &scope).unwrap();
+        let actual_unequal = ctx.analyze_expr(projection(&unequal), &scope).unwrap();
+        for actual in [&actual_equal, &actual_unequal] {
+            assert_eq!(
+                actual.value_type,
+                FunctionValueType::new(DataType::Boolean, false)
+            );
+        }
+        let operator = crate::common::binary_operator::typed_operands;
+        let (equal, operands) = operator(&actual_equal).unwrap();
+        let (unequal, compared) = operator(&actual_unequal).unwrap();
+        assert_eq!(equal, OperatorFunction::Identical);
+        assert_eq!(unequal, OperatorFunction::Distinct);
+        for (actual, expected) in compared.into_iter().zip(operands) {
+            same_typed(actual, expected, &control);
+        }
     }
+    let legacy = query("SELECT [1,NULL] IS DISTINCT FROM [1,NULL]");
+    let actual = ctx.analyze_expr(projection(&legacy), &scope).unwrap();
+    assert!(!actual.value_type.nullable());
+    let ExprKind::UnaryOp {
+        op: UnOp::Not,
+        expr,
+    } = actual.kind
+    else {
+        panic!("legacy collection comparison still uses NOT over its original equality");
+    };
+    assert!(matches!(
+        expr.kind,
+        ExprKind::BinaryOp {
+            op: BinOp::EqForNull,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -246,16 +237,22 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
         let expected_probe = ctx.analyze_expr(&node.value, &scope).unwrap();
         let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
         let probe = match &actual.kind {
-            ExprKind::BinaryOp { left, .. }
-            | ExprKind::Between { expr: left, .. }
+            ExprKind::FunctionCall { binding, args, .. }
+                if binding.function_id == OperatorFunction::Equal.function_id() =>
+            {
+                &args[0]
+            }
+            ExprKind::Between { expr: left, .. }
             | ExprKind::InList { expr: left, .. }
             | ExprKind::Like { expr: left, .. } => left,
             _ => panic!("the admitted profile keeps its original typed IR kind"),
         };
         same_typed(probe, &expected_probe, &control);
         let pairs: Vec<(&TypedExpr, &ast::Expr)> = match (&actual.kind, &node.predicate) {
-            (ExprKind::BinaryOp { right, .. }, ast::Predicate::Comparison(p)) => {
-                vec![(right, &p.right)]
+            (ExprKind::FunctionCall { binding, args, .. }, ast::Predicate::Comparison(p))
+                if binding.function_id == OperatorFunction::Equal.function_id() =>
+            {
+                vec![(&args[1], &p.right)]
             }
             (ExprKind::Between { low, high, .. }, ast::Predicate::Between(p)) => {
                 vec![(low, &p.min), (high, &p.max)]
@@ -294,133 +291,4 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
     let like = query("SELECT 'ab' LIKE 'a%'");
     let typed = ctx.analyze_expr(projection(&like), &scope).unwrap();
     assert!(matches!(typed.kind, ExprKind::Like { negated: false, .. }));
-}
-
-#[test]
-fn in_predicate_children_retain_actual_source_and_write_conversion_loans() {
-    use crate::compiler::SqlWriteAssignmentSite;
-    use crate::compiler::materialized_values::{
-        MaterializedValues, SqlConstantExpressionSite, SqlConstantExpressionStep,
-        SqlExpressionConstant,
-    };
-    use arrow::array::{Array, Int64Array};
-    use novarocks_functions::ConstantPool;
-    use novarocks_type_contract::CompilePhase;
-    use std::{borrow::Cow, sync::Arc};
-    let control = SqlCompileControl::unbounded();
-    let field = Arc::new(arrow::datatypes::Field::new(
-        "predicate_source",
-        DataType::Int64,
-        false,
-    ));
-    let value_type = FunctionValueType::new(DataType::Int64, false);
-    let pool = ConstantPool::try_new(
-        field.clone(),
-        value_type.clone(),
-        Int64Array::from(vec![99, 2]).to_data(),
-        crate::constant::test_constant_policy(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let value = pool.value(1).unwrap();
-    let query = query("SELECT only_original_probe IN (1,2)");
-    let ast::Expr::Predicated(node) = projection(&query) else {
-        panic!("predicate")
-    };
-    let ast::Predicate::In(predicate) = &node.predicate else {
-        panic!("IN")
-    };
-    let ast::Expr::InList(list) = &predicate.value_list else {
-        panic!("list")
-    };
-    let constants = vec![
-        SqlExpressionConstant::new(
-            vec![],
-            SqlConstantExpressionSite::SelectProjection { column: 0 },
-            value.clone(),
-        )
-        .with_expression_path(vec![SqlConstantExpressionStep::PredicatedValue]),
-    ]
-    .into();
-    let source = MaterializedValues::try_new_expressions(&query, constants, &control).unwrap();
-    let mut original = source.loan(&query, &control).unwrap();
-    original
-        .insert_write_assignment(
-            &list.values[0],
-            Cow::Owned(
-                SqlWriteAssignmentSite::try_new(0, value_type.clone(), None, &control)
-                    .unwrap()
-                    .with_source_span(list.values[0].span()),
-            ),
-            &control,
-        )
-        .unwrap();
-    assert!(original.view().constant_at(&node.value.clone()).is_none());
-    assert!(
-        original
-            .view()
-            .write_assignment_at(&list.values[0].clone())
-            .is_none()
-    );
-    let mut ctx = context(&control);
-    ctx.materialized_values = Some(original.view());
-    let scope = ctx.new_scope();
-    let expected_probe = ctx.analyze_expr(&node.value, &scope).unwrap();
-    let expected_assignment = ctx.analyze_expr(&list.values[0], &scope).unwrap();
-    let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
-    assert_eq!(
-        actual.value_type,
-        FunctionValueType::new(DataType::Boolean, true)
-    );
-    let ExprKind::InList {
-        expr,
-        list: actual_values,
-        negated: false,
-    } = &actual.kind
-    else {
-        panic!("original IN owner")
-    };
-    same_typed(expr, &expected_probe, &control);
-    same_typed(&actual_values[0], &expected_assignment, &control);
-    let ExprKind::Constant(retained) = &expr.kind else {
-        panic!("retained source")
-    };
-    assert_eq!(retained.ordinal(), 1);
-    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
-    assert_eq!(retained.field(), field.as_ref());
-    assert_eq!(retained.value_type(), &value_type);
-    assert_eq!(
-        original
-            .view()
-            .write_assignment_at(&list.values[0])
-            .unwrap()
-            .input(),
-        &value_type
-    );
-    assert_eq!(
-        actual_values[0].value_type,
-        FunctionValueType::new(DataType::Int64, true)
-    );
-    let ExprKind::Cast {
-        array_failure_mode: None,
-        expr: input,
-        target,
-        decimal_overflow_policy,
-    } = &actual_values[0].kind
-    else {
-        panic!("original nullable source conversion")
-    };
-    assert_eq!(target, value_type.data_type());
-    assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
-    assert!(matches!(
-        input.kind,
-        ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
-    ));
-    assert_eq!(
-        ctx.analyze_expr(&projection(&query).clone(), &scope)
-            .unwrap_err()
-            .kind(),
-        AnalyzeErrorKind::UnknownColumn
-    );
 }

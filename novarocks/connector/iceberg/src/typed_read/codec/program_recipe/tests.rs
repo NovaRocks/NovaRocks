@@ -46,11 +46,8 @@ use crate::typed_read::table_handle::tests::{
 use crate::typed_read::{
     HiveTransactionHandle, IcebergChangeWindowHandle, IcebergChangeWindowHandleParams,
     IcebergColumnHandle, IcebergInsertTableHandle, IcebergInsertTableHandleParams,
-    IcebergMergeTableHandle, IcebergRewriteArtifactContentId,
-    IcebergRewritePositionDeleteFilesHandle, IcebergSystemTableReference,
-    IcebergSystemTableReferenceParams, IcebergSystemTableType, IcebergTableExecuteHandle,
-    IcebergTableExecuteHandleParams, IcebergTableExecuteProcedureHandle, IcebergTableHandle,
-    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, TableChangesFunctionHandle,
+    IcebergMergeTableHandle, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
+    IcebergSystemTableType, IcebergTableHandle, TableChangesFunctionHandle,
     TableChangesFunctionHandleParams, change_op_column_handle,
 };
 
@@ -538,48 +535,6 @@ fn window_fixture() -> Fixture {
         metadata: None,
     }
 }
-fn rewrite_fixture() -> Fixture {
-    let handle = partitioned_handle();
-    let execute = IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
-        schema_table_name: handle.schema_table_name().clone(),
-        procedure_id: crate::typed_read::IcebergProcedureId::RewritePositionDeleteFiles,
-        table_location: handle.table_location().into(),
-        procedure_handle: Some(
-            IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
-                IcebergRewritePositionDeleteFilesHandle::try_new(
-                    handle,
-                    IcebergRewriteArtifactContentId::try_new(
-                        novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
-                        "12".repeat(32),
-                    )
-                    .unwrap(),
-                    "34".repeat(32),
-                )
-                .unwrap(),
-            ),
-        ),
-    })
-    .unwrap();
-    let relation = IcebergRuntimeRelation::TableExecute(execute);
-    let columns = REWRITE_POSITION_DELETE_OUTPUT_COLUMNS
-        .into_iter()
-        .map(|(name, metadata)| {
-            crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    Fixture {
-        source: source_for(&relation),
-        domains: BTreeMap::new(),
-        published_source: None,
-        published_bindings: None,
-        fields: columns.iter().map(column_field).collect(),
-        relation,
-        columns,
-        metadata: None,
-    }
-}
-
 #[test]
 fn complete_system_read_uses_actual_metadata_schema_kind_evidence_and_execution_mode() {
     for kind in [
@@ -609,21 +564,6 @@ fn complete_change_window_retains_exact_required_change_sign_and_endpoint_facts(
     assert_unchanged(&fixture.build());
     let mut wrong = fixture.clone();
     wrong.fields[2] = Arc::new(sign.as_ref().clone().with_nullable(true));
-    assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
-}
-
-#[test]
-fn complete_table_execute_rewrite_retains_two_required_pseudo_columns_and_exact_coverage() {
-    let fixture = rewrite_fixture();
-    assert_eq!(fixture.columns.len(), 2);
-    assert!(fixture.fields.iter().all(|field| !field.is_nullable()));
-    assert!(matches!(
-        fixture.source.artifact_coverage(),
-        ConnectorReadArtifactCoverage::Exact { .. }
-    ));
-    assert_unchanged(&fixture.build());
-    let mut wrong = fixture.clone();
-    wrong.fields[0] = Arc::new(wrong.fields[0].as_ref().clone().with_nullable(true));
     assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
 }
 
@@ -1230,7 +1170,7 @@ fn published(fixture: &Fixture) -> Fixture {
 #[test]
 fn every_final_relation_kind_publishes_a_schema_its_pure_compiler_accepts() {
     let catalog = iceberg_catalog();
-    let mut fixtures = vec![Fixture::table(), window_fixture(), rewrite_fixture()];
+    let mut fixtures = vec![Fixture::table(), window_fixture()];
     for kind in [
         IcebergSystemTableType::Files,
         IcebergSystemTableType::Entries,
@@ -1314,10 +1254,13 @@ fn published_schema_carries_ids_defaults_and_nested_domains_and_passes_the_pure_
         .build()
         .unwrap();
     let base = |id| IcebergColumnHandle::base_column_of(&schema, id).unwrap();
-    let file = crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(
-        "_file",
-        IcebergMetadataColumn::Path,
-    )
+    let metadata = IcebergMetadataColumn::Path;
+    let file = IcebergColumnHandle::base_column(&NestedField::new(
+        metadata.field_id(),
+        metadata.column_name(),
+        Type::Primitive(metadata.declared_type()),
+        !metadata.nullable(),
+    ))
     .unwrap();
     let columns = vec![
         base(1),
@@ -1469,7 +1412,7 @@ fn relations_without_a_public_field_author_refuse_explicitly() {
 }
 
 #[test]
-fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete_read() {
+fn frozen_provider_nominal_properties_distinguish_supported_and_retired_read_domains() {
     use crate::iceberg::spec::{
         FormatVersion, ListType, MapType, SortOrder, StructType, TableMetadataBuilder,
     };
@@ -1550,7 +1493,12 @@ fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete
         .with_nominal_declarations(declarations)
         .unwrap();
     let relation = IcebergRuntimeRelation::Table(table);
-    let columns = (1..=4)
+    let retired = IcebergColumnHandle::base_column_of(&schema, 3).unwrap();
+    let error = fixture_public_read_schema(&relation, &[retired]).unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert!(error.message().contains("wide_integer (ID 3)"));
+    let columns = [1, 2, 4]
+        .into_iter()
         .map(|id| IcebergColumnHandle::base_column_of(&schema, id).unwrap())
         .collect::<Vec<_>>();
     let public = fixture_public_read_schema(&relation, &columns).unwrap();
@@ -1563,11 +1511,7 @@ fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete
         execution.binding(1).unwrap().logical_type(),
         ValueLogicalType::Bitmap
     );
-    assert_eq!(
-        execution.binding(2).unwrap().logical_type(),
-        ValueLogicalType::LargeInt
-    );
-    let nested = execution.binding(3).unwrap();
+    let nested = execution.binding(2).unwrap();
     assert_eq!(
         nested.child_at(0).unwrap().logical_type(),
         ValueLogicalType::Uuid
@@ -1589,8 +1533,8 @@ fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete
         ValueLogicalType::Uuid
     );
     let source = public.source_schema_facts().unwrap();
-    assert_eq!(source.field_fact(&[3, 1, 0]).unwrap().field_id(), Some(7));
-    assert!(source.field_fact(&[3, 2, 0]).is_none());
+    assert_eq!(source.field_fact(&[2, 1, 0]).unwrap().field_id(), Some(7));
+    assert!(source.field_fact(&[2, 2, 0]).is_none());
     let fixture = Fixture {
         source: source_for(&relation),
         domains: BTreeMap::new(),
@@ -1641,7 +1585,7 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
         .unwrap()
         .with_nominal_declarations(domains.clone())
         .unwrap();
-    let columns = [3, 1, 2, 1]
+    let columns = [3, 2, 3]
         .map(|id| IcebergColumnHandle::base_column_of(&schema, id).unwrap())
         .to_vec();
     let fields = columns.iter().map(column_field).collect::<Vec<_>>();
@@ -1711,7 +1655,7 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
     let window = IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
         schema_table_name: handle.schema_table_name().clone(),
         table_schema_json: handle.table_schema_json().into(),
-        columns: columns[..3].to_vec(),
+        columns: columns[..2].to_vec(),
         name_mapping_json: None,
         from_snapshot_id_exclusive: 10,
         to_snapshot_id_inclusive: 11,
@@ -1729,8 +1673,8 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
         published_source: None,
         published_bindings: None,
         relation,
-        columns,
-        fields,
+        columns: columns[..2].to_vec(),
+        fields: fields[..2].to_vec(),
         metadata: None,
     };
     assert_unchanged(&published(&window_fixture).build());
@@ -1741,12 +1685,23 @@ fn recursive_nominal_table_window_and_projected_struct_field_keep_exact_frozen_d
     use crate::schema_mapping::nominal_declaration::{self, NominalSourceDomain};
     let metadata = nominal_declaration::recursive_tests::metadata();
     let schema = metadata.current_schema();
-    let declarations = nominal_declaration::from_metadata(&metadata).unwrap();
+    let mut declarations = nominal_declaration::from_metadata(&metadata).unwrap();
     let table = IcebergTableHandle::try_new(table_handle_params(schema, None))
         .unwrap()
         .with_nominal_declarations(declarations.clone())
         .unwrap();
     let root = IcebergColumnHandle::base_column_of(schema, 1).unwrap();
+    let legacy_relation = IcebergRuntimeRelation::Table(table.clone());
+    let error =
+        fixture_public_read_schema(&legacy_relation, std::slice::from_ref(&root)).unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert!(error.message().contains("retired SQL type LARGEINT"));
+    // Use a distinct source declaration without a nominal domain at this
+    // occurrence. Its same-width bytes belong to the plain Fixed projection.
+    declarations.retain(|_, domain| *domain != NominalSourceDomain::LargeInt);
+    let table = table
+        .with_nominal_declarations(declarations.clone())
+        .unwrap();
     let hll_id = *declarations
         .iter()
         .find(|(_, domain)| **domain == NominalSourceDomain::Hll)
@@ -1768,8 +1723,9 @@ fn recursive_nominal_table_window_and_projected_struct_field_keep_exact_frozen_d
             .unwrap()
             .child_at(0)
             .unwrap()
-            .logical_type(),
-        novarocks_type_contract::ValueLogicalType::LargeInt
+            .value_type()
+            .kind(),
+        &novarocks_type_contract::ValueKind::Binary
     );
     let fixture = Fixture {
         source: source_for(&relation),
@@ -1832,8 +1788,9 @@ fn recursive_nominal_table_window_and_projected_struct_field_keep_exact_frozen_d
             .unwrap()
             .child_at(0)
             .unwrap()
-            .logical_type(),
-        novarocks_type_contract::ValueLogicalType::LargeInt
+            .value_type()
+            .kind(),
+        &novarocks_type_contract::ValueKind::Binary
     );
     assert_eq!(
         bindings[1].logical_type(),

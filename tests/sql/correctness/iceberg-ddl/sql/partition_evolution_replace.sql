@@ -30,19 +30,19 @@
 DROP TABLE IF EXISTS ${case_db}.t_replace_partition;
 CREATE TABLE ${case_db}.t_replace_partition (
   id BIGINT,
-  ts DATETIME,
+  ts TIMESTAMP(6),
   val DOUBLE
 ) WITH (partitioning = ARRAY['month(ts)']);
 INSERT INTO ${case_db}.t_replace_partition VALUES
-  ROW(1, '2024-01-15 10:00:00', 10.0),
-  ROW(2, '2024-01-20 11:00:00', 20.0),
-  ROW(3, '2024-02-10 12:00:00', 30.0);
+  ROW(1, TIMESTAMP '2024-01-15 10:00:00', 10.0),
+  ROW(2, TIMESTAMP '2024-01-20 11:00:00', 20.0),
+  ROW(3, TIMESTAMP '2024-02-10 12:00:00', 30.0);
 ALTER TABLE ${case_db}.t_replace_partition SET PROPERTIES partitioning = ARRAY[];
 ALTER TABLE ${case_db}.t_replace_partition SET PROPERTIES partitioning = ARRAY['day(ts)'];
 INSERT INTO ${case_db}.t_replace_partition VALUES
-  ROW(4, '2024-01-15 13:00:00', 40.0),
-  ROW(5, '2024-02-10 14:00:00', 50.0),
-  ROW(6, '2024-03-05 15:00:00', 60.0);
+  ROW(4, TIMESTAMP '2024-01-15 13:00:00', 40.0),
+  ROW(5, TIMESTAMP '2024-02-10 14:00:00', 50.0),
+  ROW(6, TIMESTAMP '2024-03-05 15:00:00', 60.0);
 SELECT COUNT(*) AS cnt, SUM(val) AS sum_val FROM ${case_db}.t_replace_partition;
 
 -- query 2
@@ -63,7 +63,7 @@ ORDER BY id;
 DROP TABLE IF EXISTS ${case_db}.t_replace_identity_to_bucket;
 CREATE TABLE ${case_db}.t_replace_identity_to_bucket (
   id BIGINT,
-  city STRING,
+  city VARCHAR,
   amount DOUBLE
 ) WITH (partitioning = ARRAY['city']);
 INSERT INTO ${case_db}.t_replace_identity_to_bucket VALUES

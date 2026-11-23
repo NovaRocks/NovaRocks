@@ -223,3 +223,15 @@ SELECT n FROM numbers ORDER BY n;
 
 -- query 52
 WITH SESSION query_mem_limit = 1073741824 SELECT /*+ SET_VAR(query_mem_limit = 1073741824) */ 1;
+
+-- query 53
+-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
+SET SESSION decimal_overflow_to_double = true;
+
+-- query 54
+-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
+RESET SESSION decimal_overflow_to_double;
+
+-- query 55
+-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
+WITH SESSION decimal_overflow_to_double = true SELECT 1;

@@ -144,19 +144,6 @@ pub(super) fn system_declarations() -> Result<Vec<PropertyDeclaration>, SessionP
         }
     );
     declaration!(
-        "decimal_overflow_to_double",
-        Boolean,
-        Some(V::Boolean(semantics.decimal_overflow_to_double())),
-        "Promote decimal overflow to double",
-        Any,
-        |state, value| {
-            state.sql_semantics = state
-                .sql_semantics
-                .clone()
-                .with_decimal_overflow_to_double(*value);
-        }
-    );
-    declaration!(
         "explain_detail",
         Varchar,
         Some(V::Varchar(execution.explain_detail().sql_value().into())),

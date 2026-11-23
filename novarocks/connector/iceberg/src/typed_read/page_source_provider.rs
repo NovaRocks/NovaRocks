@@ -58,13 +58,7 @@ use super::page_source::{
 };
 use super::preparation::PreparedRangeCandidate;
 use super::preparation::{PlannedInput, SuccessorPreparationGroup};
-use super::rewrite_position_page_source::{
-    IcebergRewritePositionDeleteFilesPageSourceRequest,
-    create_iceberg_rewrite_position_delete_files_page_stream,
-};
 use super::runtime::{IcebergReadExecution, IcebergReadLayout};
-use super::table_execute::IcebergRewritePositionDeleteFilesSplit;
-use super::table_execute::{IcebergTableExecuteHandle, IcebergTableExecuteProcedureHandle};
 use super::{IcebergReadSplit, IcebergRuntimeRelation};
 
 /// File and cache capabilities of the exact fragment scan binding.
@@ -652,16 +646,6 @@ where
                 ),
                 budget,
             ),
-            (
-                IcebergRuntimeRelation::TableExecute(handle),
-                IcebergReadSplit::RewritePositionDeleteFiles(split),
-            ) => {
-                expect_rewrite_position_delete_files(handle)?;
-                create_iceberg_rewrite_position_delete_files_page_stream(
-                    self.rewrite_position_request(split, &columns),
-                    budget,
-                )
-            }
             (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) => {
                 let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?
                     .with_output_layout(settings.layout);
@@ -749,19 +733,6 @@ impl IcebergPageSourceProvider {
         }
     }
 
-    fn rewrite_position_request<'a>(
-        &self,
-        split: &'a IcebergRewritePositionDeleteFilesSplit,
-        columns: &'a [IcebergColumnHandle],
-    ) -> IcebergRewritePositionDeleteFilesPageSourceRequest<'a> {
-        IcebergRewritePositionDeleteFilesPageSourceRequest {
-            split,
-            columns,
-            access_binding: self.access_binding.clone(),
-            context: self.context.clone(),
-        }
-    }
-
     fn data_request<'a>(
         &self,
         relation: &'a IcebergReadRelation,
@@ -791,17 +762,6 @@ impl IcebergPageSourceProvider {
             pending_preparation_control: None,
             output_projection: None,
         }
-    }
-}
-
-fn expect_rewrite_position_delete_files(
-    handle: &IcebergTableExecuteHandle,
-) -> Result<(), ConnectorError> {
-    match handle.procedure_handle() {
-        Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => Ok(()),
-        Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => Err(invalid(
-            "a rewrite-position split names a table execute target that does not rewrite position deletes",
-        )),
     }
 }
 

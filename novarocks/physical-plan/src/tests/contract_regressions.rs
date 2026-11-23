@@ -327,6 +327,7 @@ fn null_safe_join_filter(
                         left: left_key,
                         right: right_key,
                         null_safe: true,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }]),
                     residual: None,
                 },
@@ -672,6 +673,7 @@ pub(super) fn scan_lineage_filter(
                             left: left_key,
                             right: right_key,
                             null_safe: false,
+                            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                         }]),
                         residual: None,
                     },
@@ -753,6 +755,7 @@ pub(super) fn scan_lineage_filter(
                         left: probe_key,
                         right: build_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }]),
                     residual: None,
                 },
@@ -1939,6 +1942,7 @@ fn append_partitioned_inner_join(
                         left: left_key,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }]),
                     residual: None,
                 },
@@ -2109,6 +2113,7 @@ fn append_inner_join_with_properties(
                         left: left_key,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }]),
                     residual: None,
                 },
@@ -3249,16 +3254,9 @@ fn grouped_writer_fragment_with_sources(
                     finish,
                     ty,
                     ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                         expr: literal,
                         target: DataType::Utf8,
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
-                            id: novarocks_type_contract::SemanticParameterId::new(0),
-                            expected_key:
-                                novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                        },
                     },
                 )
                 .unwrap()

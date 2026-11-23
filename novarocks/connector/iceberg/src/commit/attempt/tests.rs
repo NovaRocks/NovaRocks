@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod rewrite_files;
 mod row_delta_window;
+mod truncate;
 
 use super::super::fast_append::FastAppendPreparer;
 use super::super::model::{
-    AddedContent, Dependency, FileChanges, IsolationLevel, OperationIntentParts, TableTarget,
+    AddedContent, Dependency, FileChanges, OperationIntentParts, TableTarget,
 };
 use super::super::overwrite::preparer_tests::{Fixture, data};
 use super::*;
@@ -33,6 +35,7 @@ use std::sync::{
 enum Dispatch {
     Commit,
     ConflictThen(Box<TableMetadata>),
+    UpdateBeforeRequirements(Box<TableMetadata>),
     ConflictSequence(Vec<TableMetadata>),
     Unknown,
     AlwaysConflict,
@@ -173,7 +176,15 @@ impl Publisher for ControlledPublisher<'_> {
             }
             _ => {}
         }
-        let metadata = self.metadata.lock().unwrap().clone();
+        let metadata = {
+            let mut metadata = self.metadata.lock().unwrap();
+            if let Dispatch::UpdateBeforeRequirements(update) = &self.dispatch
+                && call == 1
+            {
+                *metadata = update.as_ref().clone();
+            }
+            metadata.clone()
+        };
         for requirement in request.requirements() {
             if let Err(error) = requirement.check(Some(&metadata)) {
                 return CatalogOutcome::uncommitted(
@@ -236,7 +247,7 @@ fn append_intent(
             removed: Vec::new(),
         },
         dependencies,
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: Default::default(),
         token: fixture.operation.token(),
@@ -377,7 +388,7 @@ async fn mor_frozen_before_another_branch_commit_inherits_actual_publication_seq
             removed: vec![],
         },
         dependencies: vec![Dependency::RefUnchanged],
-        isolation: IsolationLevel::Serializable,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: Default::default(),
         token: fixture.operation.token(),
@@ -913,7 +924,7 @@ async fn document_expiry_uses_only_pinned_full_base_and_never_retries_conflict()
             start: None,
             changes: FileChanges::default(),
             dependencies: vec![Dependency::NoRead],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::DocumentExpiry,
             summary: std::collections::BTreeMap::new(),
             token: fixture.operation.token(),
@@ -975,7 +986,7 @@ async fn document_expiry_without_a_full_base_is_rejected_without_load_or_dispatc
         start: None,
         changes: FileChanges::default(),
         dependencies: vec![Dependency::NoRead],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::DocumentExpiry,
         summary: std::collections::BTreeMap::new(),
         token: fixture.operation.token(),
@@ -1481,12 +1492,12 @@ impl Preparer for RemoveAfterAppend {
             start: intent.start(),
             changes: FileChanges::default(),
             dependencies: intent.dependencies().to_vec(),
-            isolation: intent.isolation(),
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: intent.shape(),
             summary: intent.summary().clone(),
             token: intent.token(),
         })?;
-        super::super::truncate::TruncatePreparer
+        super::super::filter_delete::FilterDeletePreparer::always_true()
             .prepare(view, &remove_intent)
             .await
     }
@@ -1882,7 +1893,7 @@ async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_clea
         }),
         changes: FileChanges::default(),
         dependencies: vec![Dependency::RefUnchanged],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: Default::default(),
         token: fixture.operation.token(),
@@ -2312,7 +2323,7 @@ async fn filter_retry_skips_unchanged_source_reads_and_output_writes() {
             removed: vec![selection.frozen.clone()],
         },
         dependencies: vec![Dependency::NoRead],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: Default::default(),
         token: fixture.operation.token(),
@@ -2801,4 +2812,5 @@ async fn rewrite_policy_reuses_its_previous_group_before_considering_concurrent_
 }
 
 mod new_manifest_reuse;
+mod statistics_carry_ledger;
 mod terminal_cleanup;

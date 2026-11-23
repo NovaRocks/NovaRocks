@@ -27,10 +27,10 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t" (
-  "k" bigint(20) NOT NULL,
-  "arr_0" array<bigint(20)> NOT NULL,
-  "arr_1" array<bigint(20)>,
-  "arr_2" array<bigint(20)>
+  "k" BIGINT NOT NULL,
+  "arr_0" array<BIGINT> NOT NULL,
+  "arr_1" array<BIGINT>,
+  "arr_2" array<BIGINT>
 ) WITH (format_version = 3);
 
 -- query 3

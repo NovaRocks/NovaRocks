@@ -33,7 +33,7 @@ CREATE TABLE ${case_db}.t_join_right_semi_residual_l (
 CREATE TABLE ${case_db}.t_join_right_semi_residual_r (
   id INT,
   threshold INT,
-  tag STRING
+  tag VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_right_semi_residual_l VALUES
   ROW(1, 10),

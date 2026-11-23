@@ -25,7 +25,7 @@
 DROP TABLE IF EXISTS ${case_db}.read_sem_eq_part ;
 CREATE TABLE ${case_db}.read_sem_eq_part (
   id BIGINT NOT NULL,
-  city STRING,
+  city VARCHAR,
   amount BIGINT
 ) WITH (format_version = 2);
 INSERT INTO ${case_db}.read_sem_eq_part VALUES

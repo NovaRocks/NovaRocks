@@ -24,6 +24,7 @@ use std::{fmt, num::NonZeroU16};
 
 pub mod connector_reason;
 pub mod execution_reason;
+pub mod kernel_reason;
 /// LocalCompiler-owned IDs shared only for their existing public consumers.
 /// Their projection and meaning remain defined by the producing compiler.
 pub mod local_compiler_reason;

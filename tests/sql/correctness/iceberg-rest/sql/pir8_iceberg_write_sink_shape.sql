@@ -30,7 +30,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.pir8_sink_db_${uuid0}.t_sink_${uuid0} (
   id INT,
-  region STRING,
+  region VARCHAR,
   amount INT
 ) WITH (partitioning = ARRAY['region'], format_version = 3);
 

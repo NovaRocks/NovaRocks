@@ -28,11 +28,11 @@ DROP TABLE IF EXISTS ${case_db}.t_join_left_semi_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_left_semi_r;
 CREATE TABLE ${case_db}.t_join_left_semi_l (
   id INT,
-  lv STRING
+  lv VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_left_semi_r (
   id INT,
-  rv STRING
+  rv VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_left_semi_l VALUES
   ROW(1, 'L1'),

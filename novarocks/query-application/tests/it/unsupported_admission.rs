@@ -192,7 +192,12 @@ fn assert_refusal(line: usize, source: &str, owner: Owner, subject: &str) {
             trino_table_command::lower_trino_rename_table(source, &node).map(drop)
         }
         (Owner::Alter, Ok(Prepare(Prep::AddColumn(node)))) => {
-            trino_table_command::lower_trino_add_column(source, &node).map(drop)
+            trino_table_command::lower_trino_add_column(
+                source,
+                &node,
+                &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            )
+            .map(drop)
         }
         (Owner::Alter, Ok(Prepare(Prep::RenameColumn(node)))) => {
             trino_table_command::lower_trino_rename_column(source, &node).map(drop)
@@ -201,7 +206,12 @@ fn assert_refusal(line: usize, source: &str, owner: Owner, subject: &str) {
             trino_table_command::lower_trino_drop_column(source, &node).map(drop)
         }
         (Owner::Alter, Ok(Prepare(Prep::SetColumnType(node)))) => {
-            trino_table_command::lower_trino_set_column_type(source, &node).map(drop)
+            trino_table_command::lower_trino_set_column_type(
+                source,
+                &node,
+                &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            )
+            .map(drop)
         }
         (Owner::Alter, Ok(Prepare(Prep::DropNotNullConstraint(node)))) => {
             trino_table_command::lower_trino_drop_not_null(source, &node).map(drop)

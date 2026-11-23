@@ -479,6 +479,7 @@ fn faulty_argument(
             None,
             list_type(),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(condition, then)]),
                 else_expr: Some(otherwise),

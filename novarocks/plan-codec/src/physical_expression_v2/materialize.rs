@@ -685,20 +685,7 @@ fn owned_kind(
             K::Cast(v) => novarocks_expression_contract::ExprKind::Cast {
                 expr: expr(v.expr_id, "cast operand is absent", w)?,
                 target: copy_value_projection(ty, w)?,
-                decimal_overflow_policy: completed(
-                    decode_decimal_policy(v.decimal_overflow_policy).map_err(Error::from),
-                    w,
-                )?,
-                allow_throw_exception: decode_reference(
-                    v.allow_throw_exception
-                        .as_ref()
-                        .ok_or_else(|| shape("cast ALLOW reference is absent"))?,
-                    w,
-                )?,
-                array_failure_mode: completed(
-                    super::decode_array_cast_failure_mode(v.array_failure_mode),
-                    w,
-                )?,
+                cast_mode: completed(super::decode_trino_cast_mode(v.cast_mode), w)?,
             },
             K::IsNull(v) => novarocks_expression_contract::ExprKind::IsNull {
                 expr: expr(v.expr_id, "null-test operand is absent", w)?,
@@ -730,6 +717,9 @@ fn owned_kind(
                     w.step()?;
                 }
                 novarocks_expression_contract::ExprKind::Case {
+                    ieee_float_equality: v.ieee_float_equality.ok_or_else(|| {
+                        shape("CASE expression is missing its authored equality mode")
+                    })?,
                     operand: v.operand_expr_id.map(p::ExprId::new),
                     when_then: boxed(arms, w)?,
                     else_expr: v.else_expr_id.map(p::ExprId::new),

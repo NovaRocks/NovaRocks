@@ -23,11 +23,11 @@ use futures::channel::oneshot;
 use super::packing::{Layout, plan};
 use super::*;
 use crate::commit::preparation::ManifestMergePolicy;
-use crate::commit::staging::{TestWriter, write_manifest};
+use crate::commit::staging::{TestWriter, write_manifest, write_manifest_list};
 use crate::iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Manifest,
-    ManifestContentType, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
-    TableMetadataBuilder, Type, UNASSIGNED_SEQUENCE_NUMBER,
+    ManifestContentType, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
+    SortOrder, Summary, TableMetadataBuilder, Type, UNASSIGNED_SEQUENCE_NUMBER,
 };
 
 fn descriptor(name: &str, bytes: i64, spec_id: i32, content: ManifestContentType) -> ManifestFile {
@@ -391,6 +391,9 @@ async fn merge_preserves_current_status_and_old_identity_at_capacity_one() {
     let [manifest] = outputs.as_slice() else {
         panic!("expected the selected bin's output");
     };
+    // This merge has both preserved and unassigned live files. The list still
+    // owns allocation for the unassigned files.
+    assert_eq!(manifest.first_row_id, None);
     let bytes = artifacts
         .file_io()
         .new_input(&manifest.manifest_path)
@@ -800,4 +803,208 @@ fn rolled_full_manifests_are_kept_alone_and_small_tail_uses_the_existing_merge_p
         inspect(plan(first_short, policy).unwrap()),
         [(false, vec!["tail".into(), "retained".into()])],
     );
+}
+
+fn snapshot_with_row_range(
+    metadata: &TableMetadata,
+    id: i64,
+    operation: Operation,
+    list: &str,
+    (first, rows): (u64, u64),
+) -> Snapshot {
+    Snapshot::builder()
+        .with_snapshot_id(id)
+        .with_parent_snapshot_id(metadata.current_snapshot_id())
+        .with_sequence_number(metadata.next_sequence_number())
+        .with_timestamp_ms(metadata.last_updated_ms() + 1)
+        .with_manifest_list(list)
+        .with_summary(Summary {
+            operation,
+            additional_properties: HashMap::new(),
+        })
+        .with_schema_id(metadata.current_schema_id())
+        .with_row_range(first, rows)
+        .build()
+}
+
+#[tokio::test]
+async fn merging_preserved_rewrite_files_does_not_allocate_new_row_ids() {
+    use crate::manifest::{load_manifest, load_manifest_list};
+
+    let artifacts = TestWriter::new();
+    let metadata = table(FormatVersion::V3);
+    let mut seed_manifests = Vec::new();
+    for name in ["survivor", "replaced"] {
+        seed_manifests.push(
+            write_manifest(
+                &artifacts,
+                FormatVersion::V3,
+                10,
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().as_ref().clone(),
+                ManifestContentType::Data,
+                [added(data(name, None), None)],
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let list = write_manifest_list(&artifacts, &metadata, 10, None, seed_manifests)
+        .await
+        .unwrap();
+    let original = snapshot_with_row_range(
+        &metadata,
+        10,
+        Operation::Append,
+        list.object.path(),
+        list.row_range.unwrap(),
+    );
+    let base = metadata
+        .into_builder(None)
+        .set_branch_snapshot(original.clone(), "main")
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    assert_eq!(base.next_row_id(), 4);
+    let original_list = load_manifest_list(&original, artifacts.file_io(), &base)
+        .await
+        .unwrap();
+    let [survivor, replaced] = original_list.entries() else {
+        panic!("expected separate seed manifests");
+    };
+    let expected_first = replaced.first_row_id.unwrap();
+    let mut addition = write_manifest(
+        &artifacts,
+        FormatVersion::V3,
+        20,
+        base.current_schema().clone(),
+        base.default_partition_spec().as_ref().clone(),
+        ManifestContentType::Data,
+        [added(
+            data("rewritten", Some(i64::try_from(expected_first).unwrap())),
+            Some(original.sequence_number()),
+        )],
+    )
+    .await
+    .unwrap();
+    // This is the descriptor authored by a compact stage that certified
+    // stored row IDs. Only the survivor is carried from the old list.
+    addition.first_row_id = Some(expected_first);
+    let merged = merge_manifests(
+        &artifacts,
+        &base,
+        20,
+        context(),
+        0,
+        vec![
+            MergeCandidate::pending(addition),
+            MergeCandidate::committed(survivor.clone(), 10, original.manifest_list()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(merged.len(), 1, "force the standard merge path");
+    let list = write_manifest_list(&artifacts, &base, 20, Some(10), merged)
+        .await
+        .unwrap();
+    assert_eq!(list.row_range, Some((base.next_row_id(), 0)));
+    let replace = snapshot_with_row_range(
+        &base,
+        20,
+        Operation::Replace,
+        list.object.path(),
+        list.row_range.unwrap(),
+    );
+    assert_eq!(replace.added_rows_count(), Some(0));
+    let next = base
+        .clone()
+        .into_builder(None)
+        .set_branch_snapshot(replace.clone(), "main")
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    assert_eq!(next.next_row_id(), base.next_row_id());
+
+    let list = load_manifest_list(&replace, artifacts.file_io(), &next)
+        .await
+        .unwrap();
+    let [descriptor] = list.entries() else {
+        panic!("expected one merged manifest in the replacement list");
+    };
+    assert_eq!(descriptor.first_row_id, survivor.first_row_id);
+    let manifest = load_manifest(descriptor, artifacts.file_io())
+        .await
+        .unwrap();
+    let entries = ManifestSource::committed(20, replace.manifest_list(), descriptor)
+        .bind(&manifest)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.raw.file_path(),
+                entry.first_row_id,
+                entry.sequences.data_sequence,
+            )
+        })
+        .collect::<Vec<_>>();
+    let e = Some(original.sequence_number());
+    assert_eq!(
+        entries,
+        [
+            ("s3://bucket/rewritten.parquet", Some(2), e),
+            ("s3://bucket/survivor.parquet", Some(0), e),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn merging_tombstones_or_empty_unassigned_data_consumes_no_row_ids() {
+    let artifacts = TestWriter::new();
+    let metadata = table(FormatVersion::V3);
+    for include_empty_file in [false, true] {
+        let mut candidates = Vec::new();
+        for name in ["a", "b"] {
+            let entry = if include_empty_file && name == "b" {
+                let empty = DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path("s3://bucket/empty.parquet".to_owned())
+                    .file_format(DataFileFormat::Parquet)
+                    .record_count(0)
+                    .file_size_in_bytes(10)
+                    .build()
+                    .unwrap();
+                added(empty, None)
+            } else {
+                deleted(data(name, Some(10)))
+            };
+            candidates.push(MergeCandidate::pending(
+                write_manifest(
+                    &artifacts,
+                    FormatVersion::V3,
+                    20,
+                    metadata.current_schema().clone(),
+                    metadata.default_partition_spec().as_ref().clone(),
+                    ManifestContentType::Data,
+                    [entry],
+                )
+                .await
+                .unwrap(),
+            ));
+        }
+        let manifests = merge_manifests(&artifacts, &metadata, 20, context(), 0, candidates)
+            .await
+            .unwrap();
+        let [manifest] = manifests.as_slice() else {
+            panic!("expected one merged manifest");
+        };
+        assert_eq!(manifest.first_row_id, None);
+        assert_eq!(manifest.added_rows_count, Some(0));
+        assert_eq!(manifest.existing_rows_count, Some(0));
+        let list = write_manifest_list(&artifacts, &metadata, 20, None, manifests)
+            .await
+            .unwrap();
+        assert_eq!(list.row_range, Some((metadata.next_row_id(), 0)));
+    }
 }

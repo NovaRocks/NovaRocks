@@ -265,14 +265,6 @@ message ConnectorSystemTableReference {
 }
 
 // ---------------------------------------------------------------------------
-// Table execute handles
-// ---------------------------------------------------------------------------
-
-message ConnectorTableExecuteHandle {
-  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
-}
-
-// ---------------------------------------------------------------------------
 // Merge table handles
 // ---------------------------------------------------------------------------
 
@@ -304,10 +296,6 @@ message SystemManifestSplitCategory {
   novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
-message RewritePositionDeleteFilesSplitCategory {
-  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
-}
-
 // ---------------------------------------------------------------------------
 // The scheduled split envelope
 // ---------------------------------------------------------------------------
@@ -315,6 +303,8 @@ message RewritePositionDeleteFilesSplitCategory {
 // Fields 1..=5 are the neutral view the generic scheduler consumes. The
 // category oneof is provider data the scheduler must not interpret.
 message ConnectorSplit {
+  reserved 14;
+  reserved "rewrite_position_delete_files";
   uint64 split_weight_raw = 1;         // positive; 100 is one standard split.
   bool remotely_accessible = 2;
   repeated HostAddress addresses = 3;  // <= 256.
@@ -325,7 +315,6 @@ message ConnectorSplit {
     TableChangesSplitCategory table_changes = 11;
     ChangeWindowSplitCategory change_window = 12;
     SystemManifestSplitCategory system_manifest = 13;
-    RewritePositionDeleteFilesSplitCategory rewrite_position_delete_files = 14;
     SystemRelationSplitCategory system_relation = 15;
   }
 }
@@ -337,6 +326,8 @@ message ConnectorSplit {
 // The catalog-scoped, transaction-bound relation a scan reads. Exactly one
 // relation kind is present.
 message CatalogTableHandle {
+  reserved 14;
+  reserved "table_execute";
   // Immutable content identity for the catalog runtime this relation requires.
   // It is deliberately distinct from any Frontend-local control runtime.
   novarocks.catalog.CatalogHandle catalog_handle = 1;
@@ -346,7 +337,6 @@ message CatalogTableHandle {
     ConnectorTableFunctionHandle table_function = 11;
     ConnectorChangeWindowHandle change_window = 12;
     ConnectorSystemTableReference system_table = 13;
-    ConnectorTableExecuteHandle table_execute = 14;
     ConnectorMergeTableHandle merge_table = 15;
   }
 }

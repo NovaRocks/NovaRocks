@@ -63,7 +63,7 @@ pub(super) enum Leaf {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FloatWidth {
+pub(crate) enum FloatWidth {
     F32,
     F64,
 }
@@ -407,7 +407,7 @@ fn valid_common_decimal(
 
 /// Exact coefficient conversion shared by signed-to-decimal and rescale leaves.
 /// The original scalar array/NULL/policy authors are intentionally not invoked.
-fn rescale_coefficient(
+pub(super) fn rescale_coefficient(
     value: i128,
     source_scale: u8,
     target_precision: u8,
@@ -518,7 +518,7 @@ fn shortest_integer_decimal(value: f64) -> u128 {
 /// A valid decimal(p,s), 1<=p<=38 and 0<=s<=p, is finite in both target widths.
 /// Integer normalization retains all remainder bits, including Float32's
 /// subnormal boundary; narrowing an intermediate double would lose them.
-fn decimal_to_float_bits(value: i128, scale: u8, width: FloatWidth) -> u64 {
+pub(crate) fn decimal_to_float_bits(value: i128, scale: u8, width: FloatWidth) -> u64 {
     let magnitude = value.unsigned_abs();
     if magnitude == 0 {
         return 0;

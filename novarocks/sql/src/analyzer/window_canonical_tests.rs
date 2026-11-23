@@ -304,6 +304,54 @@ fn window_canonical_default_parameter_keeps_independent_domain_and_original_refu
 }
 
 #[test]
+fn window_canonical_arithmetic_default_retains_the_selected_shape_and_refusals() {
+    use novarocks_type_contract::OperatorFunction;
+
+    let source = SourceCatalog {
+        offset_nullable: false,
+    };
+    let functions = crate::functions::builtin_sql_function_catalog();
+    let query = analyze(
+        "SELECT lag(d, 5, 1+2+3) OVER () FROM source",
+        &source,
+        functions,
+    )
+    .unwrap();
+    let default = &args(projection(&query, 0))[2];
+    assert_eq!(
+        default.value_type,
+        FunctionValueType::new(DataType::Int32, false)
+    );
+    let (outer, [left, _]) =
+        crate::common::binary_operator::typed_operands(default).expect("outer default addition");
+    assert_eq!(outer, OperatorFunction::Add);
+    let (inner, _) =
+        crate::common::binary_operator::typed_operands(left).expect("inner default addition");
+    assert_eq!(inner, OperatorFunction::Add);
+
+    for (sql, value_type) in [
+        (
+            "SELECT lag(d, 5, abs(1)) OVER (ORDER BY missing) FROM source",
+            "INT",
+        ),
+        ("SELECT lag(d, 5, abs(1)+2) OVER () FROM source", "INT"),
+        ("SELECT lag(d, 5, d+1) OVER () FROM source", "INT"),
+        (
+            "SELECT lag(CAST(v AS REAL), 5, 1+2+3) OVER () FROM source",
+            "FLOAT",
+        ),
+    ] {
+        let error = analyze(sql, &source, functions).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
+        assert_eq!(
+            error.message(),
+            format!("The type of the third parameter of LEAD/LAG not match the type {value_type}."),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn window_canonical_first_last_normalization_keeps_complete_selected_result() {
     let query = analyze("SELECT first_value(j) IGNORE NULLS OVER (ORDER BY v ASC NULLS LAST ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), last_value(nested) OVER (ORDER BY v DESC NULLS FIRST ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), nested FROM source",
         &SourceCatalog { offset_nullable: false }, crate::functions::builtin_sql_function_catalog()).unwrap();

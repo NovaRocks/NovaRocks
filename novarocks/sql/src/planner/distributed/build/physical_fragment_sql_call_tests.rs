@@ -114,7 +114,7 @@ fn scopes<'a>(
 fn scalar_expression() -> crate::analysis::TypedExpr {
     let argument = crate::analysis::TypedExpr {
         kind: crate::analysis::ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(text("MiXeD")),
             target: arrow::datatypes::DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

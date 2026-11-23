@@ -239,6 +239,48 @@ pub(crate) async fn prepare_snapshot_change(
     properties: HashMap<String, String>,
     truncate_full_table: bool,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+    prepare_snapshot_change_with_summary(
+        view,
+        intent,
+        snapshot_id,
+        operation,
+        manifests,
+        properties,
+        |properties, parent| finalize_snapshot_summary(properties, parent, truncate_full_table),
+    )
+    .await
+}
+
+pub(super) async fn prepare_filtered_delete_snapshot_change(
+    view: &super::staging::StagedView<'_>,
+    intent: &super::model::OperationIntent,
+    snapshot_id: i64,
+    manifests: super::manifest_transform::OrdinaryManifests,
+    removed: &[&super::manifest_sources::LocatedEntry],
+) -> crate::iceberg::Result<super::staging::PreparedChange> {
+    let mut properties = snapshot_file_summary_with_mode(&[], removed, true)?;
+    let manifests = manifests.into_snapshot_manifests(&mut properties);
+    prepare_snapshot_change_with_summary(
+        view,
+        intent,
+        snapshot_id,
+        Operation::Delete,
+        manifests,
+        properties,
+        super::helpers::finalize_filtered_delete_summary,
+    )
+    .await
+}
+
+async fn prepare_snapshot_change_with_summary(
+    view: &super::staging::StagedView<'_>,
+    intent: &super::model::OperationIntent,
+    snapshot_id: i64,
+    operation: Operation,
+    manifests: Vec<ManifestFile>,
+    properties: HashMap<String, String>,
+    finalize: impl FnOnce(HashMap<String, String>, Option<&Summary>) -> HashMap<String, String>,
+) -> crate::iceberg::Result<super::staging::PreparedChange> {
     let metadata = view.metadata();
     let parent = metadata
         .snapshot_for_ref(intent.target_ref())
@@ -249,7 +291,7 @@ pub(crate) async fn prepare_snapshot_change(
     // A preparer may supply an exact physical data-record total, including for
     // a full overwrite whose parent total is absent.
     let exact_records = properties.get("total-records").cloned();
-    let mut finalized = finalize_snapshot_summary(properties, parent_summary, truncate_full_table);
+    let mut finalized = finalize(properties, parent_summary);
     if let Some(total) = exact_records {
         finalized.insert("total-records".into(), total);
     }
@@ -287,6 +329,24 @@ pub(crate) async fn prepare_snapshot_change(
             max_snapshot_age_ms: None,
             max_ref_age_ms: None,
         });
+    let mut requirements = Vec::new();
+    if !matches!(
+        intent.protocol(),
+        super::model::CommitProtocol::RewriteFiles { .. }
+    ) {
+        requirements.extend([
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: metadata.current_schema_id(),
+            },
+            TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: metadata.default_partition_spec_id(),
+            },
+        ]);
+    }
+    requirements.push(TableRequirement::RefSnapshotIdMatch {
+        r#ref: intent.target_ref().to_string(),
+        snapshot_id: parent,
+    });
     Ok(super::staging::PreparedChange {
         updates: vec![
             TableUpdate::AddSnapshot { snapshot },
@@ -298,18 +358,7 @@ pub(crate) async fn prepare_snapshot_change(
                 },
             },
         ],
-        requirements: vec![
-            TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: metadata.current_schema_id(),
-            },
-            TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: metadata.default_partition_spec_id(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: intent.target_ref().to_string(),
-                snapshot_id: parent,
-            },
-        ],
+        requirements,
     })
 }
 
@@ -359,23 +408,44 @@ pub(crate) fn snapshot_file_summary(
     added: &[super::model::AddedContent],
     removed: &[&super::manifest_sources::LocatedEntry],
 ) -> crate::iceberg::Result<HashMap<String, String>> {
+    snapshot_file_summary_with_mode(added, removed, false)
+}
+
+fn snapshot_file_summary_with_mode(
+    added: &[super::model::AddedContent],
+    removed: &[&super::manifest_sources::LocatedEntry],
+    iceberg_metrics: bool,
+) -> crate::iceberg::Result<HashMap<String, String>> {
+    use crate::iceberg::spec::DataFileFormat;
+
     let mut counters = BTreeMap::<&str, u64>::new();
     let additions = added.iter().map(|added| {
         let file = added.file();
-        super::row_delta_dv_metadata::logical_file_size(file)
-            .map(|size| (file.content_type(), file.record_count(), size, true))
+        super::row_delta_dv_metadata::logical_file_size(file).map(|size| {
+            (
+                file.content_type(),
+                file.file_format(),
+                file.record_count(),
+                size,
+                true,
+            )
+        })
     });
     let removals = removed.iter().map(|entry| {
         Ok((
             entry.content_type,
+            entry.file_format,
             entry.frozen.facts().record_count,
             entry.logical_size,
             false,
         ))
     });
     for effect in additions.chain(removals) {
-        let (content, records, size, is_added) = effect?;
+        let (content, format, records, size, is_added) = effect?;
         let mut bump = |key, value| -> crate::iceberg::Result<()> {
+            if iceberg_metrics && value == 0 {
+                return Ok(());
+            }
             let total = counters.entry(key).or_default();
             *total = total.checked_add(value).ok_or_else(|| {
                 crate::iceberg::Error::new(
@@ -422,10 +492,14 @@ pub(crate) fn snapshot_file_summary(
                     1,
                 )?;
                 bump(
-                    if is_added {
-                        "added-position-delete-files"
-                    } else {
-                        "removed-position-delete-files"
+                    match (
+                        is_added,
+                        iceberg_metrics && format == DataFileFormat::Puffin,
+                    ) {
+                        (true, true) => "added-dvs",
+                        (false, true) => "removed-dvs",
+                        (true, false) => "added-position-delete-files",
+                        (false, false) => "removed-position-delete-files",
                     },
                     1,
                 )?;
@@ -466,25 +540,27 @@ pub(crate) fn snapshot_file_summary(
             }
         }
     }
-    for key in [
-        "added-data-files",
-        "added-records",
-        "added-files-size",
-        "added-delete-files",
-        "deleted-data-files",
-        "deleted-records",
-        "removed-files-size",
-        "removed-delete-files",
-        "added-position-delete-files",
-        "removed-position-delete-files",
-        "added-position-deletes",
-        "removed-position-deletes",
-        "added-equality-delete-files",
-        "removed-equality-delete-files",
-        "added-equality-deletes",
-        "removed-equality-deletes",
-    ] {
-        counters.entry(key).or_default();
+    if !iceberg_metrics {
+        for key in [
+            "added-data-files",
+            "added-records",
+            "added-files-size",
+            "added-delete-files",
+            "deleted-data-files",
+            "deleted-records",
+            "removed-files-size",
+            "removed-delete-files",
+            "added-position-delete-files",
+            "removed-position-delete-files",
+            "added-position-deletes",
+            "removed-position-deletes",
+            "added-equality-delete-files",
+            "removed-equality-delete-files",
+            "added-equality-deletes",
+            "removed-equality-deletes",
+        ] {
+            counters.entry(key).or_default();
+        }
     }
     Ok(counters
         .into_iter()
@@ -505,9 +581,9 @@ mod tests {
     use super::*;
     use crate::commit::attempt::{self, RetryPolicy};
     use crate::commit::model::{
-        AddedContent, Dependency, FileChanges, IcebergCleanupReport, IsolationLevel,
-        OperationIntent, OperationIntentParts, OperationToken, PublicationOutcome, RequestShape,
-        StartSnapshot, TableTarget,
+        AddedContent, Dependency, FileChanges, IcebergCleanupReport, OperationIntent,
+        OperationIntentParts, OperationToken, PublicationOutcome, RequestShape, StartSnapshot,
+        TableTarget,
     };
     use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
     use crate::commit::staging::PreparedChange;
@@ -642,7 +718,7 @@ mod tests {
                 removed: Vec::new(),
             },
             dependencies: vec![Dependency::NoRead],
-            isolation: IsolationLevel::Snapshot,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary,
             token,
@@ -966,7 +1042,7 @@ mod tests {
 pub(crate) mod preparer_tests {
     use super::*;
     use crate::commit::model::{
-        AddedContent, Dependency, FileChanges, FrozenRequest, IsolationLevel, OperationIntent,
+        AddedContent, Dependency, FileChanges, FrozenRequest, OperationIntent,
         OperationIntentParts, OperationToken, RequestShape, TableTarget,
     };
     use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
@@ -1100,7 +1176,7 @@ pub(crate) mod preparer_tests {
                     removed: Vec::new(),
                 },
                 dependencies: vec![Dependency::NoRead],
-                isolation: IsolationLevel::Snapshot,
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: RequestShape::SnapshotProducing,
                 summary: BTreeMap::new(),
                 token: self.operation.token(),
@@ -1130,7 +1206,7 @@ pub(crate) mod preparer_tests {
                 start: intent.start(),
                 changes: intent.changes().clone(),
                 dependencies: intent.dependencies().to_vec(),
-                isolation: intent.isolation(),
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: intent.shape(),
                 summary: intent.summary().clone(),
                 token: operation.token(),
@@ -2027,7 +2103,7 @@ pub(crate) mod preparer_tests {
                     }),
                 changes: FileChanges::default(),
                 dependencies: vec![Dependency::RefUnchanged],
-                isolation: IsolationLevel::Snapshot,
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: RequestShape::SnapshotProducing,
                 summary: BTreeMap::from([(
                     "novarocks.doc.v2.record.novarocks.test~publication".into(),

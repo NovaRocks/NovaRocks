@@ -27,7 +27,7 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE IF NOT EXISTS "lineorder" (
-    "lo_orderkey" int(11) NOT NULL,
+    "lo_orderkey" INTEGER NOT NULL,
     "lo_shipmode" varchar(11) NOT NULL
 ) WITH (format_version = 3);
 
@@ -39,10 +39,10 @@ SELECT GROUP_CONCAT(lo_shipmode) orgs FROM lineorder WHERE 1 = 2;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "ss" (
-  "id" int(11),
+  "id" INTEGER,
   "name" varchar(255),
   "subject" varchar(255),
-  "score" int(11)
+  "score" INTEGER
 ) WITH (format_version = 3);
 
 -- query 5
@@ -1197,7 +1197,7 @@ select group_concat(name,subject order by 1,2) from ss group by id order by 1;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1 (
-    id        tinyint(4)      ,
+    id        TINYINT      ,
     value   varchar(65533)
 ) WITH (format_version = 3);
 

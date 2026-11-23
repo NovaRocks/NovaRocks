@@ -29,12 +29,13 @@ use crate::typed_read::schema_binding::{
 };
 use crate::typed_read::{
     ColumnIdentity, ICEBERG_CHANGE_OP_FIELD_ID, IcebergColumnHandle, IcebergRuntimeRelation,
-    IcebergSystemTableType, IcebergTableExecuteProcedureHandle, IcebergTableHandle,
-    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, change_op_column_handle,
+    IcebergSystemTableType, IcebergTableHandle, change_op_column_handle,
 };
 use arrow::datatypes::{DataType, Field, FieldRef};
 use novarocks_connector_contract::{ConnectorReadPublicFacts, PureProviderCompileError};
-use novarocks_spi::connector::read_stack::ConnectorReadPublicSchema;
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadPublicSchema, ConnectorTableHandle, SchemaTableName,
+};
 use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorFieldPath,
 };
@@ -47,6 +48,16 @@ use std::{collections::BTreeMap, sync::Arc};
 type Failure = PureProviderCompileError<ConnectorCodecError>;
 mod typed_compare;
 mod typed_source;
+
+fn sql_table_name(relation: &IcebergRuntimeRelation) -> Option<&SchemaTableName> {
+    match relation {
+        IcebergRuntimeRelation::Table(table) if !table.is_data_rewrite_read() => {
+            Some(table.schema_table_name())
+        }
+        IcebergRuntimeRelation::ChangeWindow(window) => Some(window.schema_table_name()),
+        _ => None,
+    }
+}
 
 /// Complete-input correspondence only. Public source properties/coverage and
 /// unsupported relation kinds are also checked by the enclosing source owner.
@@ -273,42 +284,6 @@ fn visit_source_fields(
         IcebergRuntimeRelation::SystemTable(_) => Err(unsupported(
             "Iceberg metadata relation fields are mirrored from their frozen system schema",
         )),
-        IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
-            Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
-                visit_table(optimize.table_handle(), columns, work, visit)
-            }
-            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
-                for (ordinal, column) in columns.iter().enumerate() {
-                    let mut expected = None;
-                    for (name, metadata) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
-                        if column.base_field_id() == metadata.field_id() {
-                            expected = Some(opaque_source(work, || {
-                                crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
-                            })?);
-                        }
-                        work.step()?;
-                    }
-                    let expected = expected.ok_or_else(|| {
-                        invalid("rewrite-position reader has no such output column")
-                    })?;
-                    compare_handle(column, &expected, work)?;
-                    let field = projected_field(&expected, work)?;
-                    visit(
-                        ordinal,
-                        &field,
-                        expected.nullable(),
-                        None,
-                        column.type_json().len(),
-                        work,
-                    )?;
-                    work.step()?;
-                }
-                Ok(())
-            }
-            None => Err(unsupported(
-                "Iceberg table execute has no static read schema",
-            )),
-        },
         IcebergRuntimeRelation::TableFunction(_) | IcebergRuntimeRelation::MergeTable(_) => Err(
             unsupported("Iceberg relation does not publish final static read facts"),
         ),
@@ -650,6 +625,17 @@ fn compare_public(
         .last()
         .copied()
         .unwrap_or(column.base_field_id());
+    if let (Some(table), Some(declaration)) = (sql_table_name(relation), declaration)
+        && let Some(field) = crate::schema_mapping::nominal_declaration::retired_largeint_field(
+            declaration,
+            nominals,
+            &mut || work.step(),
+        )?
+    {
+        return Err(source_error(
+            crate::schema_mapping::nominal_declaration::retired_largeint_error(table, field),
+        ));
+    }
     typed_compare::value(
         &value_declaration,
         actual.value_type(),
@@ -657,7 +643,7 @@ fn compare_public(
         nominals.get(&value_id).map(|domain| domain.logical_type()),
         column.scalar_integer_domain(),
         nominals,
-        read_layout,
+        relation.read_projection(read_layout),
         work,
     )?;
     if let Some(declaration) = declaration {
@@ -1213,7 +1199,7 @@ mod tests {
             .map(|id| IcebergColumnHandle::base_column_of(&schema, id).unwrap())
             .collect::<Vec<_>>();
         let relation = IcebergRuntimeRelation::Table(table(&schema, BTreeMap::new()));
-        let original = public(
+        let unprojected = public(
             arrow.fields().iter().cloned().collect(),
             vec![
                 ValueLogicalType::Uuid,
@@ -1223,10 +1209,40 @@ mod tests {
                 ValueLogicalType::Physical,
             ],
         );
+        use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let storage = ValueTypeStorageLifetime::pure();
+        let mut request = |_| Ok(());
+        let mut observe = |_| Ok(());
+        let mut creation =
+            ConnectorReadSchemaCreation::new(storage.clone(), &mut request, &mut observe);
+        let (execution, source) = public_read_schema(
+            &relation,
+            &columns.iter().collect::<Vec<_>>(),
+            crate::typed_read::runtime::IcebergReadLayout::Offsets,
+            &mut creation,
+        )
+        .unwrap()
+        .into_typed_parts()
+        .unwrap();
+        assert_eq!(execution.binding(2).unwrap().data_type(), &DataType::Binary);
+        assert_eq!(
+            source.shape().schema().field(2).data_type(),
+            &DataType::FixedSizeBinary(16)
+        );
+        let original = ConnectorReadPublicFacts::try_new_typed(
+            unprojected.source().clone(),
+            None,
+            execution,
+            source,
+            storage,
+        )
+        .unwrap();
         assert_eq!(original.logical_types()[0], ValueLogicalType::Uuid);
         assert_eq!(original.logical_types()[1], ValueLogicalType::Variant);
         assert_eq!(original.logical_types()[2], ValueLogicalType::Physical);
         run(&relation, &columns, &original, &Control::default()).unwrap();
+        rejected(&relation, &columns, &unprojected);
         // Same physical shape and complete value declaration cannot repair a
         // changed known source attribute. Empty is not the SDK's absent key.
         let mut variant_attrs = arrow.fields()[1].metadata().clone();
@@ -1293,6 +1309,115 @@ mod tests {
     }
 
     #[test]
+    fn pinned_data_rewrites_preserve_fixed_and_nominal_storage_without_exposing_it_in_sql() {
+        use crate::iceberg::spec::StructType;
+        use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
+        use crate::typed_read::IcebergPinnedDataFileSet;
+        use crate::typed_read::runtime::IcebergReadLayout;
+        use novarocks_type_contract::ValueKind;
+        let schema = schema(vec![NestedField::optional(
+            1,
+            "pair",
+            Type::Struct(StructType::new(vec![
+                Arc::new(NestedField::required(
+                    2,
+                    "legacy",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "raw",
+                    Type::Primitive(PrimitiveType::Fixed(16)),
+                )),
+            ])),
+        )]);
+        let table = table(&schema, BTreeMap::new())
+            .with_nominal_declarations(BTreeMap::from([(2, NominalSourceDomain::LargeInt)]))
+            .unwrap();
+        // MV partition reads pin files too. Their SQL projection and the
+        // retirement rule are independent of that restriction.
+        let files = ["s3://warehouse/db/events/data/file.parquet"];
+        let mut wire = table.to_proto();
+        wire.pinned_data_files = Some(IcebergPinnedDataFileSet::try_new(files).unwrap().to_proto());
+        let query = IcebergRuntimeRelation::Table(IcebergTableHandle::from_proto(&wire).unwrap());
+        wire.pinned_data_files = Some(
+            IcebergPinnedDataFileSet::for_data_rewrite(files)
+                .unwrap()
+                .to_proto(),
+        );
+        let rewrite = IcebergRuntimeRelation::Table(IcebergTableHandle::from_proto(&wire).unwrap());
+        let pair = IcebergColumnHandle::base_column_of(&schema, 1).unwrap();
+        let legacy = pair.dereference(&[2]).unwrap();
+        let raw = pair.dereference(&[3]).unwrap();
+        let mut request = |_| Ok(());
+        let mut observe = |_| Ok(());
+        let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            storage.clone(),
+            &mut request,
+            &mut observe,
+        );
+        let mut publish = |relation: &IcebergRuntimeRelation, column: &IcebergColumnHandle| {
+            public_read_schema(
+                relation,
+                &[column],
+                IcebergReadLayout::Offsets,
+                &mut creation,
+            )
+        };
+        let sql = IcebergRuntimeRelation::Table(table);
+        for relation in [&sql, &query] {
+            let projected = publish(relation, &raw).unwrap();
+            assert_eq!(projected.schema().field(0).data_type(), &DataType::Binary);
+            for selected in [&legacy, &pair] {
+                let error = publish(relation, selected).unwrap_err();
+                let PureProviderCompileError::Provider(error) = error else {
+                    panic!("expected typed provider rejection");
+                };
+                assert_eq!(
+                    error.kind(),
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported
+                );
+                assert!(error.message().contains("db.events field legacy (ID 2)"));
+            }
+        }
+
+        let (execution, source) = publish(&rewrite, &pair)
+            .unwrap()
+            .into_typed_parts()
+            .unwrap();
+        let value = execution.binding(0).unwrap();
+        let DataType::Struct(fields) = value.data_type() else {
+            panic!("expected the stored pair");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(fields[1].data_type(), &DataType::FixedSizeBinary(16));
+        assert!(!fields[0].is_nullable());
+        assert!(fields[1].is_nullable());
+        assert!(value.nullable());
+        assert_eq!(
+            value.value_type().child_type_at(0).unwrap().kind(),
+            &ValueKind::Nominal(ValueLogicalType::LargeInt)
+        );
+        let exact = ConnectorReadPublicFacts::try_new_typed(
+            public(vec![], vec![]).source().clone(),
+            None,
+            execution,
+            source,
+            storage,
+        )
+        .unwrap();
+        run(
+            &rewrite,
+            std::slice::from_ref(&pair),
+            &exact,
+            &Control::default(),
+        )
+        .unwrap();
+        rejected(&query, &[pair], &exact);
+    }
+
+    #[test]
     fn metadata_target_uses_the_real_pure_rules_without_runtime_lineage_defaults() {
         let schema = schema(vec![NestedField::required(
             1,
@@ -1300,12 +1425,15 @@ mod tests {
             Type::Primitive(PrimitiveType::Long),
         )]);
         let relation = IcebergRuntimeRelation::Table(table(&schema, BTreeMap::new()));
-        let column = crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(
-            "_file",
-            IcebergMetadataColumn::Path,
-        )
+        let metadata = IcebergMetadataColumn::Path;
+        let column = IcebergColumnHandle::base_column(&NestedField::new(
+            metadata.field_id(),
+            metadata.column_name(),
+            Type::Primitive(metadata.declared_type()),
+            !metadata.nullable(),
+        ))
         .unwrap();
-        let field = metadata_target_field(&column, IcebergMetadataColumn::Path).unwrap();
+        let field = metadata_target_field(&column, metadata).unwrap();
         run(
             &relation,
             std::slice::from_ref(&column),

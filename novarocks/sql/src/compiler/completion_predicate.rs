@@ -53,6 +53,9 @@ pub(super) fn lower_provider_predicates(
     let mut predicates = Vec::new();
     for (ordinal, predicate) in scan.predicates.iter().enumerate() {
         work.step()?;
+        if !provider_guarantee_supports_atom(predicate, scan, columns) {
+            continue;
+        }
         let Ok(occurrence) = u32::try_from(ordinal) else {
             continue;
         };
@@ -177,39 +180,73 @@ fn complete_datetime_offer(
     ))
 }
 
-/// Shared exact atom author. Each caller supplies its original column identity
-/// and complete type checks; this function never resolves names or scans.
-pub(super) fn lower_atom_with_column(
+fn provider_guarantee_supports_atom(
     predicate: &TypedExpr,
-    resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
-) -> Option<(u32, Domain)> {
-    lower_atom_with_literal(predicate, resolve_column, lower_literal)
+    scan: &PlanScanNode,
+    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+) -> bool {
+    let predicate = unnest(predicate);
+    let ExprKind::FunctionCall { binding, .. } = &predicate.kind else {
+        return true;
+    };
+    let Some((operator, operands)) = crate::common::binary_operator::typed_operands(predicate)
+    else {
+        return false;
+    };
+    if operator.comparison().is_none()
+        || operator.comparison_overload_text() != Some(binding.selected.overload.as_str())
+    {
+        return false;
+    }
+    let [left, right] = operands.map(unnest);
+    if !novarocks_physical_plan::supports_provider_scan_comparison(&left.value_type)
+        || !novarocks_physical_plan::supports_provider_scan_comparison(&right.value_type)
+    {
+        return false;
+    }
+    let is_literal = |expression: &TypedExpr| {
+        !expression.value_type.nullable()
+            && matches!(
+                expression.kind,
+                ExprKind::Literal(_) | ExprKind::Constant(_)
+            )
+    };
+    (lower_column(scan, columns, left).is_some() && is_literal(right))
+        || (is_literal(left) && lower_column(scan, columns, right).is_some())
 }
 
-fn lower_atom_with_literal(
+/// Shared exact atom author. Each caller supplies its original column identity
+/// and complete type checks; this function never resolves names or scans.
+pub(super) fn lower_atom_with_literal(
     predicate: &TypedExpr,
     resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
     mut lower_literal: impl FnMut(&TypedExpr, ConnectorValueType) -> Option<ConnectorValue>,
 ) -> Option<(u32, Domain)> {
-    match &unnest(predicate).kind {
-        ExprKind::BinaryOp {
-            left, op, right, ..
-        } => {
-            let (column, op, literal) = if let Some(column) = resolve_column(left) {
-                (column, *op, right.as_ref())
-            } else {
-                (
-                    resolve_column(right)?,
-                    reverse_comparison(*op),
-                    left.as_ref(),
+    let predicate = unnest(predicate);
+    if let Some((op, [left, right])) = crate::common::binary_operator::typed_comparison(predicate) {
+        // A standard floating predicate can exclude NaN or distinguish the
+        // value relation from Provider metadata ordering. Keep its own evaluation.
+        if crate::common::binary_operator::typed_operands(predicate).is_some()
+            && [left, right].iter().any(|operand| {
+                !crate::common::binary_operator::permits_equality_substitution(
+                    operand.value_type.data_type(),
                 )
-            };
-            let value = lower_literal(literal, column.value_type)?;
-            Some((
-                column.ordinal,
-                comparison_domain(column.value_type, op, value)?,
-            ))
+            })
+        {
+            return None;
         }
+        let (column, op, literal) = if let Some(column) = resolve_column(left) {
+            (column, op, right)
+        } else {
+            (resolve_column(right)?, reverse_comparison(op), left)
+        };
+        let value = lower_literal(literal, column.value_type)?;
+        return Some((
+            column.ordinal,
+            comparison_domain(column.value_type, op, value)?,
+        ));
+    }
+    match &predicate.kind {
         ExprKind::IsNull { expr, negated } => {
             let column = resolve_column(expr)?;
             Some((
@@ -365,29 +402,52 @@ fn signed_integer_value(value: i64, expected: ConnectorValueType) -> Option<Conn
     }
 }
 
-fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option<ConnectorValue> {
+pub(super) fn lower_literal(
+    expression: &TypedExpr,
+    expected: ConnectorValueType,
+) -> Option<ConnectorValue> {
+    use novarocks_type_contract::{CharacterKind, ValueKind, trino_can_coerce_scalar};
+
+    let varchar = |kind: &ValueKind| match kind {
+        ValueKind::String => true,
+        ValueKind::BoundedCharacter(character) => character.kind() == CharacterKind::Varchar,
+        _ => false,
+    };
     let expression = unnest(expression);
     if (expression.value_type.nullable() && !matches!(expression.kind, ExprKind::Cast { .. }))
         || exact_predicate_value_type(expression.value_type.data_type())? != expected
+        || (expected == ConnectorValueType::Varchar
+            && !varchar(expression.value_type.value_type().kind()))
     {
         return None;
     }
-    // The original analyzer retains its real I32 -> I64 conversion. A fixed
-    // signed widening of a non-null integer literal has the same exact value
-    // in the declared provider domain, without evaluating a scalar function.
+    // The original analyzer retains the coercion. A non-null signed integer
+    // or VARCHAR widening preserves the value in the declared provider domain
+    // without evaluating a scalar function.
     let mut source = expression;
     while let ExprKind::Cast { expr, target, .. } = &source.kind {
-        if target != source.value_type.data_type()
-            || !crate::optimizer::scalar_expr::nonnull_signed_literal_widening(
+        if target != source.value_type.data_type() {
+            return None;
+        }
+        let preserving = if expected == ConnectorValueType::Varchar {
+            let from = expr.value_type.value_type().kind();
+            let to = source.value_type.value_type().kind();
+            !expr.value_type.nullable()
+                && varchar(from)
+                && varchar(to)
+                && trino_can_coerce_scalar(from, to)
+        } else {
+            crate::optimizer::scalar_expr::nonnull_signed_literal_widening(
                 &expr.value_type,
                 &source.value_type,
             )
-        {
+        };
+        if !preserving {
             return None;
         }
         source = unnest(expr);
     }
-    if !std::ptr::eq(source, expression) {
+    if !std::ptr::eq(source, expression) && expected != ConnectorValueType::Varchar {
         let ExprKind::Literal(LiteralValue::Int(value)) = &source.kind else {
             return None;
         };
@@ -399,7 +459,16 @@ fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option
         }
         return signed_integer_value(*value, expected);
     }
-    let ExprKind::Literal(literal) = &expression.kind else {
+    if let ExprKind::Constant(constant) = &source.kind
+        && expected == ConnectorValueType::Varchar
+        && constant.value_type() == &source.value_type
+        && source.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+    {
+        let text = constant.try_utf8().ok().flatten()?;
+        return (text.len() <= MAX_CONNECTOR_VALUE_BYTES)
+            .then(|| ConnectorValue::Varchar(Arc::from(text)));
+    }
+    let ExprKind::Literal(literal) = &source.kind else {
         return None;
     };
     let value = match (expected, literal) {

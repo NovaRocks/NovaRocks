@@ -27,7 +27,7 @@
 DROP TABLE IF EXISTS ${case_db}.t_filter_in_between_like;
 CREATE TABLE ${case_db}.t_filter_in_between_like (
   id INT,
-  name STRING,
+  name VARCHAR,
   score INT
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_in_between_like VALUES

@@ -122,6 +122,41 @@ impl SqlFunctionCatalog for ProbeCatalog {
         self.inner
             .resolve_scalar_signature(name, arg_types, control)
     }
+    fn resolve_scalar_operator_binding(
+        &self,
+        operator: novarocks_type_contract::OperatorFunction,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.observations
+            .bindings
+            .lock()
+            .unwrap()
+            .push((operator.catalog_name().to_owned(), self.scoped));
+        self.inner
+            .resolve_scalar_operator_binding(operator, request, control)
+    }
+    fn finish_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.observations
+            .bindings
+            .lock()
+            .unwrap()
+            .push((function.as_str().to_owned(), self.scoped));
+        self.inner
+            .finish_scalar_binding(function, overload, request, control)
+    }
     fn resolve_scalar_binding(
         &self,
         name: &str,
@@ -280,16 +315,35 @@ impl SqlFunctionCatalog for LoanDeniedCatalog {
             inner: self.inner.clone(),
         })
     }
+    fn select_exact_overload_observed(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        kind: novarocks_functions::FunctionKind,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        Arc<novarocks_functions::FunctionBindingSelection>,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.inner
+            .select_exact_overload_observed(function, kind, overload, request, control)
+    }
     fn pure_overload_declaration_observed<'a>(
         &'a self,
-        _function: &novarocks_functions::FunctionId,
-        _kind: novarocks_functions::FunctionKind,
+        function: &novarocks_functions::FunctionId,
+        kind: novarocks_functions::FunctionKind,
         overload: &novarocks_functions::FunctionOverloadId,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::PureOverloadDeclaration<'a>,
         novarocks_functions::FunctionSpecializationFailure,
     > {
+        if function.as_str() != "builtin.scalar/join_row_key/v1" {
+            return self
+                .inner
+                .pure_overload_declaration_observed(function, kind, overload, control);
+        }
         control
             .checkpoint(
                 novarocks_type_contract::CompilePhase::FunctionSpecialization,
@@ -313,6 +367,31 @@ impl SqlFunctionCatalog for LoanDeniedCatalog {
     > {
         self.inner
             .resolve_scalar_signature(name, arg_types, control)
+    }
+    fn resolve_scalar_operator_binding(
+        &self,
+        operator: novarocks_type_contract::OperatorFunction,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.inner
+            .resolve_scalar_operator_binding(operator, request, control)
+    }
+    fn finish_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.inner
+            .finish_scalar_binding(function, overload, request, control)
     }
     fn resolve_scalar_binding(
         &self,

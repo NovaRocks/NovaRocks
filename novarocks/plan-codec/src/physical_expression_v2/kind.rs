@@ -102,19 +102,13 @@ pub(super) fn encode_kind(
             })
         }
         ExprKind::Cast {
-            expr,
-            decimal_overflow_policy,
-            allow_throw_exception,
-            array_failure_mode,
-            ..
+            expr, cast_mode, ..
         } => Kind::Cast(wire::CastExpression {
             expr_id: Some(expr.get()),
             target_carrier_type_id: Some(authored.root_carrier_type_id.ok_or(
                 ExpressionCodecError::InvalidShape("cast is missing its authored root carrier ID"),
             )?),
-            decimal_overflow_policy: encode_decimal_policy(*decimal_overflow_policy),
-            allow_throw_exception: Some(allow_throw(allow_throw_exception, work)?),
-            array_failure_mode: super::encode_array_cast_failure_mode(*array_failure_mode),
+            cast_mode: super::encode_trino_cast_mode(*cast_mode),
         }),
         ExprKind::IsNull { expr, negated } => Kind::IsNull(wire::IsNullExpression {
             expr_id: Some(expr.get()),
@@ -150,10 +144,12 @@ pub(super) fn encode_kind(
             negated: *negated,
         }),
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => Kind::CaseExpression(wire::CaseExpression {
+            ieee_float_equality: Some(*ieee_float_equality),
             operand_expr_id: operand.map(ExprId::get),
             arms: project(when_then, work, |(when, then)| wire::WhenThen {
                 when_expr_id: Some(when.get()),

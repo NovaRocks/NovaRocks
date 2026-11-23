@@ -180,7 +180,7 @@ impl CellCursor {
                 })?;
                 self.literal(b"[")?;
             }
-            N::String | N::Json | N::Binary => {
+            N::String | N::Json | N::Binary | N::BoundedCharacter(_) => {
                 let mut stream = Stream::new(
                     Source::array(array, row),
                     if matches!(field.native_type, N::Binary) {
@@ -196,6 +196,9 @@ impl CellCursor {
                 }
                 if !matches!(field.native_type, N::Binary) {
                     stream.utf8 = Some(Utf8::default());
+                }
+                if let N::BoundedCharacter(character) = field.native_type {
+                    stream.character = Some((character, character.length()));
                 }
                 if !key {
                     self.literal(b"\"")?;

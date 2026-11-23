@@ -205,17 +205,12 @@ fn sql_call_dependency_loan_empty_array_keeps_unknown_source_and_outer_json_targ
             panic!("one actual outer CAST of the original constructor")
         };
         let ExprKind::Cast {
-            target,
-            array_failure_mode,
-            ..
+            target, cast_mode, ..
         } = &cast.kind
         else {
             unreachable!()
         };
-        assert_eq!(
-            *array_failure_mode,
-            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
-        );
+        assert_eq!(*cast_mode, novarocks_type_contract::TrinoCastMode::Explicit);
         assert_eq!(target, cast.ty.data_type());
         let DataType::List(item) = cast.ty.data_type() else {
             panic!("outer complete JSON target")

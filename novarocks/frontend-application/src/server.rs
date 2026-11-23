@@ -445,7 +445,6 @@ async fn build_frontend_role_products(
         Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_readiness),
         Arc::clone(&maintenance_service),
-        Handle::current(),
         host.constant_policy(),
         host.static_plan_carrier(),
         host.required_constant_interpreter().sealed_functions(),
@@ -679,13 +678,8 @@ fn build_frontend_query_session_factory_from_role_products(
         view_command_executor.clone(),
         iceberg_ref_command_executor.clone(),
         statistics_command_executor.clone(),
-        maintenance_command_executor.clone(),
         host.query_blocking_executor(),
         host.state_store_original_binding(),
-        #[cfg(novarocks_dev_controls)]
-        host.test_session
-            .as_ref()
-            .and_then(|session| session.statement.clone()),
     );
     let alter_mv_guard = crate::query::table_mutation_action::AlterTableMvGuard::new(
         Arc::clone(&mv_storage_observation),

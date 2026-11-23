@@ -208,7 +208,7 @@ pub(crate) fn decode_partition_descriptor_with_type(
                 index: idx,
                 message: e.to_string(),
             })?;
-        let literal = datum.literal().clone();
+        let literal: PrimitiveLiteral = datum.into();
         validate_decoded_primitive_literal(&literal, primitive_type, idx)?;
         decoded.push(Some(Literal::Primitive(literal)));
     }

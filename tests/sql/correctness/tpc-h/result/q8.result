@@ -1,5 +1,5 @@
 -- query 1
--- types	integer	decimal(38, 10)
+-- types	integer	decimal(38, 6)
 o_year	mkt_share
-1995	0.0291527311
-1996	0.0435307832
+1995	0.029153
+1996	0.043531

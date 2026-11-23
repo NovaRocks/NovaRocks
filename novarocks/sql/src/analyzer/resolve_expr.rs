@@ -25,14 +25,13 @@ use novarocks_parser::ast;
 use novarocks_parser::printer::print_object_name;
 
 use crate::analysis::*;
-use crate::analyze_error::AnalyzeError;
+use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use novarocks_type_contract::{
     ArithmeticOperator, TemporalType, ValueTypeRef, arithmetic_result_value_type_with_op,
-    comparison_common_value_type, wider_comparison_value_type,
 };
 
 use super::functions::*;
-use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
+use super::helpers::{eval_const_i64, expr_display_name};
 use super::scope::AnalyzerScope;
 
 type WindowSpecAnalysis = (Vec<TypedExpr>, Vec<SortItem>, Option<WindowFrame>);
@@ -182,96 +181,6 @@ fn string_literal_expr(value: String, span: Span) -> ast::Expr {
     })
 }
 
-#[recursive::recursive]
-fn validate_nested_decimal_cast_policy(expr: &TypedExpr) -> Result<(), &'static str> {
-    let visit = validate_nested_decimal_cast_policy;
-    match &expr.kind {
-        ExprKind::Cast {
-            array_failure_mode,
-            expr: child,
-            target,
-            decimal_overflow_policy,
-        } => {
-            if array_failure_mode.is_none()
-                && !novarocks_type_contract::decimal_error_policy_cast_supported(
-                    child.value_type.data_type(),
-                    target,
-                    *decimal_overflow_policy,
-                )
-            {
-                return Err("ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST");
-            }
-            visit(child)
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            visit(left)?;
-            visit(right)
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::Lambda { body: expr, .. }
-        | ExprKind::LambdaFunction { body: expr, .. } => visit(expr),
-        ExprKind::FunctionCall { args, .. } => args.iter().try_for_each(visit),
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            args.iter().try_for_each(visit)?;
-            order_by.iter().try_for_each(|sort| visit(&sort.expr))
-        }
-        ExprKind::WindowCall {
-            args,
-            function_order_by,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().try_for_each(visit)?;
-            partition_by.iter().try_for_each(visit)?;
-            function_order_by
-                .iter()
-                .chain(order_by)
-                .try_for_each(|sort| visit(&sort.expr))
-        }
-        ExprKind::InList { expr, list, .. } => {
-            visit(expr)?;
-            list.iter().try_for_each(visit)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            visit(expr)?;
-            visit(low)?;
-            visit(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            visit(expr)?;
-            visit(pattern)
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(expr) = operand {
-                visit(expr)?;
-            }
-            for (when, then) in when_then {
-                visit(when)?;
-                visit(then)?;
-            }
-            if let Some(expr) = else_expr {
-                visit(expr)?;
-            }
-            Ok(())
-        }
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::Constant(_)
-        | ExprKind::SubqueryPlaceholder { .. } => Ok(()),
-    }
-}
-
 /// Neutral facts for the original function author. Dedicated syntax supplies
 /// an explicit builtin; ordinary calls retain their actual metadata owner.
 
@@ -328,15 +237,6 @@ impl<'a> super::AnalyzerContext<'a> {
             None => self.analyze_expr_impl(expr, scope)?,
         };
         self.check_control()?;
-        let resolved = match self
-            .materialized_values
-            .and_then(|source| source.write_assignment_at(expr))
-        {
-            // Analyze the whole cell, including its explicit CAST, before
-            // applying its producer-authored ordinary assignment.
-            Some(site) => self.bind_write_assignment_value(resolved, site, expr.span())?,
-            None => resolved,
-        };
         // Borrow only this root's original authored binding. Child analysis has
         // already used this same recursion; do not rescan or rebind its graph.
         let binding = match &resolved.kind {
@@ -352,12 +252,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map_err(|error| {
                     AnalyzeError::function_binding(error).at_type_mismatch(expr.span())
                 })?;
-        }
-        if self.sql_semantics.sql_mode().decimal_overflow_policy()
-            == novarocks_type_contract::DecimalOverflowPolicy::ReportError
-        {
-            validate_nested_decimal_cast_policy(&resolved)
-                .map_err(|message| AnalyzeError::unsupported_expression(message, expr.span()))?;
         }
         Ok(resolved)
     }
@@ -385,6 +279,7 @@ impl<'a> super::AnalyzerContext<'a> {
             | ast::Expr::If(_)
             | ast::Expr::NullIf(_)
             | ast::Expr::Coalesce(_)
+            | ast::Expr::Try(_)
             | ast::Expr::Extract(_) => unreachable!("canonical syntax call was already mapped"),
             ast::Expr::JsonQuery(node) => self.analyze_json_query_syntax(node, scope),
             ast::Expr::JsonObject(node) => self.analyze_json_object_syntax(node, scope),
@@ -507,15 +402,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // Signed INTEGER unary plus is a value identity. Keep the original
-            // producer, full binding and failure effects of the operand.
+            // Unary plus preserves the original producer and exact value type.
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Plus) => {
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
-                novarocks_expression::typing::validate_temporal_unary_plus(&inner_typed.value_type)
-                    .map_err(|error| {
-                        super::expression_typing::analyze_typing_error(error, unary.span)
-                    })?;
-                signed_unary_plus_identity(inner_typed, expr)
+                let (_, mut operands) =
+                    self.type_value_node(NodeShape::UnaryPlus, vec![inner_typed], unary.span)?;
+                Ok(operands.pop().expect("one unary plus operand"))
             }
 
             // Unary minus
@@ -539,36 +431,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 list.span,
             )),
 
-            // CAST
             ast::Expr::Cast(cast) => {
-                let inner_typed = self.analyze_expr(&cast.expression, scope)?;
-                let declared =
+                use novarocks_type_contract::TrinoCastMode;
+                let source = self.analyze_expr(&cast.expression, scope)?;
+                let target =
                     super::helpers::sql_type_to_value_type(&cast.data_type, true, self.control)?;
-                if inner_typed.value_type.value_type().temporal().is_some()
-                    || declared.value_type().temporal().is_some()
-                {
-                    return self.type_temporal_cast(inner_typed, declared, cast.safe, cast.span);
-                }
-                if matches!(
-                    inner_typed.value_type.data_type(),
-                    DataType::List(_) | DataType::Null
-                ) && matches!(declared.data_type(), DataType::List(_))
-                {
-                    let mode = if cast.safe {
-                        novarocks_type_contract::ArrayCastFailureMode::OutputNull
-                    } else {
-                        novarocks_type_contract::ArrayCastFailureMode::ReportError
-                    };
-                    return self.cast_explicit_array_to_value_type(
-                        inner_typed,
-                        declared,
-                        mode,
-                        cast.span,
-                    );
-                }
-                let value_type =
-                    super::helpers::declared_cast_value_type(&inner_typed, declared, self.control)?;
-                self.cast_to_value_type(inner_typed, value_type, cast.span)
+                let mode = if cast.safe {
+                    TrinoCastMode::Try
+                } else {
+                    TrinoCastMode::Explicit
+                };
+                self.cast_with_trino_mode(source, target, mode, cast.span)
             }
 
             // CASE WHEN
@@ -586,10 +459,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 case.span,
             ),
 
-            ast::Expr::Try(node) => Err(AnalyzeError::unsupported_expression(
-                "TRY expressions are not supported",
-                node.span,
-            )),
             ast::Expr::Format(node) => Err(AnalyzeError::unsupported_expression(
                 "FORMAT expressions are not supported",
                 node.span,
@@ -603,10 +472,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 let chain = ast::identifier_chain_observed(expr, |occurrence| {
                     self.check_control()?;
                     if !std::ptr::eq(occurrence, expr)
-                        && self.materialized_values.is_some_and(|source| {
-                            source.constant_at(occurrence).is_some()
-                                || source.write_assignment_at(occurrence).is_some()
-                        })
+                        && self
+                            .materialized_values
+                            .is_some_and(|source| source.constant_at(occurrence).is_some())
                     {
                         interior_source = true;
                     }
@@ -689,15 +557,26 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
-        let mut index_typed = self.analyze_expr(index, scope)?;
+        let index_typed = self.analyze_expr(index, scope)?;
         let output_type = match &base.value_type.data_type() {
-            DataType::List(item) => {
-                index_typed = cast_null_preserving_target_type(
-                    index_typed,
-                    &DataType::Int32,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                );
-                item.data_type().clone()
+            DataType::List(_) => {
+                let operator = novarocks_type_contract::OperatorFunction::ArraySubscript;
+                let bound = self.type_scalar_call(
+                    novarocks_expression::typing::NodeShape::Operator(operator),
+                    vec![base, index_typed],
+                    span,
+                )?;
+                let value_type = bound.value_type().clone();
+                return Ok(TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: operator.catalog_name().into(),
+                        volatility: bound.binding.semantics.volatility,
+                        args: bound.args.into(),
+                        distinct: false,
+                        binding: bound.binding,
+                    },
+                    value_type,
+                });
             }
             DataType::Map(entries, _) => {
                 let DataType::Struct(fields) = entries.data_type() else {
@@ -711,15 +590,6 @@ impl<'a> super::AnalyzerContext<'a> {
                         "map subscript expects key/value entries",
                         span,
                     ));
-                }
-                // The map owns its complete key declaration. Its carrier
-                // alone cannot author the probe's nominal identity.
-                let key = container_child_value_type_observed(&base.value_type, 0, self.control)?;
-                if !novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
-                    &base.value_type,
-                ) {
-                    let target = self.implicit_common_cast_target(&index_typed.value_type, &key);
-                    index_typed = self.cast_to_value_type(index_typed, target, index.span())?;
                 }
                 fields[1].data_type().clone()
             }
@@ -764,22 +634,27 @@ impl<'a> super::AnalyzerContext<'a> {
                 ));
             }
         };
-        let function_name = match &base.value_type.data_type() {
-            DataType::List(_) => "__array_element_at",
-            DataType::Map(_, _) => "__map_element_at",
-            _ => unreachable!("only array/map subscripts reach this branch"),
-        };
-        let result = resolved_scalar_call_at(
-            self.function_catalog,
-            function_name,
+        let name = "__map_element_at";
+        let bound = self.type_scalar_call(
+            NodeShape::CatalogCall {
+                name,
+                expected_result: None,
+            },
             vec![base, index_typed],
             span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
         )?;
-        debug_assert_eq!(result.value_type.data_type(), &output_type);
-        Ok(result)
+        let value_type = bound.value_type().clone();
+        debug_assert_eq!(value_type.data_type(), &output_type);
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: name.into(),
+                volatility: bound.binding.semantics.volatility,
+                args: bound.args.into(),
+                distinct: false,
+                binding: bound.binding,
+            },
+            value_type,
+        })
     }
 
     fn infer_scalar_subquery_value_type(
@@ -872,6 +747,7 @@ impl<'a> super::AnalyzerContext<'a> {
             let col_name = &parts[1].value;
             if let Ok((column_id, value_type)) = scope.resolve_value_type(Some(qualifier), col_name)
             {
+                scope.check_read_column(column_id, &parts[2..], parts[1].span)?;
                 let mut current = build_column_ref(
                     column_id,
                     value_type,
@@ -893,6 +769,7 @@ impl<'a> super::AnalyzerContext<'a> {
             let col_name = &parts[2].value;
             if let Ok((column_id, value_type)) = scope.resolve_value_type(Some(qualifier), col_name)
             {
+                scope.check_read_column(column_id, &parts[3..], parts[2].span)?;
                 let mut current = build_column_ref(
                     column_id,
                     value_type,
@@ -910,7 +787,10 @@ impl<'a> super::AnalyzerContext<'a> {
         // Form 3: leading identifier is the column itself, the rest walk a
         // STRUCT. Falls back to producing a `Column 'X' cannot be resolved`
         // error from `scope.resolve` if even this fails.
-        let (column_id, value_type) = scope.resolve_at(None, base_name, parts[0].span)?;
+        let (column_id, value_type) = scope
+            .resolve_value_type(None, base_name)
+            .map_err(|message| AnalyzeError::unknown_column(message, parts[0].span))?;
+        scope.check_read_column(column_id, &parts[1..], parts[0].span)?;
         let mut current = build_column_ref(column_id, value_type, None, base_name);
         for field in &parts[1..] {
             current = self.analyze_struct_field_access(current, field.value.clone(), field.span)?;
@@ -973,9 +853,23 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         let mut args = Vec::with_capacity(array.values.len());
+        let mut common = novarocks_type_contract::FunctionValueType::new(DataType::Null, true);
         for item in &array.values {
-            args.push(self.analyze_expr(item, scope)?);
+            let value = self.analyze_expr(item, scope)?;
+            common = self.require_common_trino_type(&common, &value.value_type, item.span())?;
+            args.push(value);
         }
+        let args = args
+            .into_iter()
+            .map(|source| {
+                // The array owner materializes unknown elements in their exact
+                // selected layout, including a NULL nested list beside [NULL].
+                if source.value_type.data_type() == &DataType::Null {
+                    return Ok(source);
+                }
+                self.coerce_common_value(source, &common, array.span)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         resolved_scalar_call_at(
             self.function_catalog,
             "__array_literal",
@@ -998,37 +892,18 @@ impl<'a> super::AnalyzerContext<'a> {
         let value = &node.value;
         let span = node.span;
         match &node.predicate {
-            ast::Predicate::Comparison(predicate) => {
-                let op = match predicate.operator {
-                    ast::ComparisonOperator::Equal => BinOp::Eq,
-                    ast::ComparisonOperator::NotEqual => BinOp::Ne,
-                    ast::ComparisonOperator::LessThan => BinOp::Lt,
-                    ast::ComparisonOperator::LessThanOrEqual => BinOp::Le,
-                    ast::ComparisonOperator::GreaterThan => BinOp::Gt,
-                    ast::ComparisonOperator::GreaterThanOrEqual => BinOp::Ge,
-                };
-                self.analyze_comparison_predicate(value, op, &predicate.right, scope)
-            }
-            ast::Predicate::DistinctFrom(predicate) => {
-                let equal = self.analyze_comparison_predicate(
-                    value,
-                    BinOp::EqForNull,
-                    &predicate.right,
-                    scope,
-                )?;
-                if predicate.negated {
-                    Ok(equal)
-                } else {
-                    let value_type = equal.value_type.clone();
-                    Ok(TypedExpr {
-                        kind: ExprKind::UnaryOp {
-                            op: UnOp::Not,
-                            expr: novarocks_parser::ast::AstBox::new(equal),
-                        },
-                        value_type,
-                    })
-                }
-            }
+            ast::Predicate::Comparison(predicate) => self.analyze_comparison_predicate(
+                value,
+                novarocks_expression::typing::syntax_comparison(predicate.operator),
+                &predicate.right,
+                scope,
+            ),
+            ast::Predicate::DistinctFrom(predicate) => self.analyze_comparison_predicate(
+                value,
+                novarocks_expression::typing::syntax_distinct_from(predicate.negated),
+                &predicate.right,
+                scope,
+            ),
             ast::Predicate::IsNull(predicate) => {
                 let inner = self.analyze_expr(value, scope)?;
                 let (value_type, mut children) =
@@ -1044,31 +919,21 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
             ast::Predicate::BooleanTest(predicate) => {
-                use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-
-                let inner = self.analyze_expr(value, scope)?;
-                let inner = if is_strict_null_value_type(&inner.value_type) {
-                    self.cast_to_value_type(
-                        inner,
-                        FunctionValueType::new(DataType::Boolean, true),
-                        value.span(),
-                    )?
-                } else if inner.value_type.logical_type() == ValueLogicalType::Physical
-                    && inner.value_type.data_type() == &DataType::Boolean
-                {
-                    inner
-                } else {
-                    return Err(AnalyzeError::type_mismatch(
-                        "Boolean test operand must be BOOLEAN",
-                        value.span(),
-                    ));
-                };
-                let value_type = FunctionValueType::new(DataType::Boolean, false);
-                let kind = match predicate.truth_value {
-                    ast::TruthValue::Unknown => ExprKind::IsNull {
-                        expr: novarocks_parser::ast::AstBox::new(inner),
-                        negated: predicate.negated,
-                    },
+                let inner = self.require_boolean(
+                    self.analyze_expr(value, scope)?,
+                    value.span(),
+                    "Boolean test operand must be BOOLEAN",
+                )?;
+                let value_type =
+                    novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false);
+                match predicate.truth_value {
+                    ast::TruthValue::Unknown => Ok(TypedExpr {
+                        value_type,
+                        kind: ExprKind::IsNull {
+                            expr: novarocks_parser::ast::AstBox::new(inner),
+                            negated: predicate.negated,
+                        },
+                    }),
                     ast::TruthValue::True | ast::TruthValue::False => {
                         let literal = TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Bool(
@@ -1076,27 +941,24 @@ impl<'a> super::AnalyzerContext<'a> {
                             )),
                             value_type: value_type.clone(),
                         };
-                        let equal = ExprKind::BinaryOp {
-                            left: novarocks_parser::ast::AstBox::new(inner),
-                            op: BinOp::EqForNull,
-                            right: novarocks_parser::ast::AstBox::new(literal),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        };
-                        if predicate.negated {
-                            ExprKind::UnaryOp {
-                                op: UnOp::Not,
-                                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
-                                    kind: equal,
-                                    value_type: value_type.clone(),
-                                }),
-                            }
-                        } else {
-                            equal
+                        let equality = self.analyze_binary_operator(
+                            novarocks_type_contract::OperatorFunction::Identical,
+                            inner,
+                            literal,
+                            span,
+                        )?;
+                        if !predicate.negated {
+                            return Ok(equality);
                         }
+                        Ok(TypedExpr {
+                            value_type,
+                            kind: ExprKind::UnaryOp {
+                                op: UnOp::Not,
+                                expr: novarocks_parser::ast::AstBox::new(equality),
+                            },
+                        })
                     }
-                };
-                Ok(TypedExpr { kind, value_type })
+                }
             }
             ast::Predicate::Between(predicate) => {
                 self.analyze_between_predicate(value, predicate, span, scope)
@@ -1134,12 +996,7 @@ impl<'a> super::AnalyzerContext<'a> {
         span: Span,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        use super::literal_coercion::coerce_literal_for_comparison;
         let mut expr_typed = self.analyze_expr(value, scope)?;
-        // StarRocks-aligned implicit literal coercion: when the IN
-        // expression is `column IN (lit, lit, ...)`, coerce each
-        // string literal to the column's type before emitting the
-        // InList. Mirrors the binary-op comparison coercion.
         let mut list_typed = Vec::with_capacity(values.len());
         for item in values {
             let item_typed = self.analyze_expr(item, scope)?;
@@ -1149,7 +1006,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 "IN",
                 span,
             )?;
-            list_typed.push(coerce_literal_for_comparison(&expr_typed, item_typed));
+            list_typed.push(item_typed);
         }
         // BITMAP / HLL operands cannot participate in IN / NOT IN
         // because they have no scalar identity. Reject upfront so the
@@ -1200,16 +1057,13 @@ impl<'a> super::AnalyzerContext<'a> {
         let mut common_type = expr_typed.value_type.clone();
         for item in &list_typed {
             self.check_control()?;
-            common_type = wider_comparison_value_type(&common_type, &item.value_type)
-                .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
+            common_type = self.require_common_trino_type(&common_type, &item.value_type, span)?;
         }
-        let target = self.implicit_common_cast_target(&expr_typed.value_type, &common_type);
-        expr_typed = self.cast_to_value_type(expr_typed, target, span)?;
+        expr_typed = self.coerce_common_value(expr_typed, &common_type, span)?;
         let mut coerced_list = Vec::with_capacity(list_typed.len());
         for item in list_typed {
             self.check_control()?;
-            let target = self.implicit_common_cast_target(&item.value_type, &common_type);
-            coerced_list.push(self.cast_to_value_type(item, target, span)?);
+            coerced_list.push(self.coerce_common_value(item, &common_type, span)?);
         }
         let list_typed = coerced_list;
         // Three-valued: `NULL IN (1, 2)` and `1 IN (NULL, 2)` are both
@@ -1237,7 +1091,6 @@ impl<'a> super::AnalyzerContext<'a> {
         span: Span,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        use super::literal_coercion::coerce_literal_for_comparison;
         let expr_typed = self.analyze_expr(value, scope)?;
         let low_typed = self.analyze_expr(&predicate.min, scope)?;
         let high_typed = self.analyze_expr(&predicate.max, scope)?;
@@ -1248,14 +1101,6 @@ impl<'a> super::AnalyzerContext<'a> {
         ] {
             check_json_comparison_domains(&left.value_type, &right.value_type, "BETWEEN", span)?;
         }
-        // StarRocks-aligned implicit literal coercion: for
-        // `column BETWEEN lit AND lit`, coerce each string literal
-        // to the column's type. The helper gates on the LHS being a
-        // column ref (same convention as binary-op comparisons), so
-        // `expr_typed BETWEEN ...` where the LHS is a non-column
-        // expression is left unchanged.
-        let low_typed = coerce_literal_for_comparison(&expr_typed, low_typed);
-        let high_typed = coerce_literal_for_comparison(&expr_typed, high_typed);
         // BITMAP / HLL operands cannot participate in BETWEEN because
         // they have no ordering. Reject upfront so the user sees a
         // clear error before lowering / codegen.
@@ -1273,14 +1118,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 ));
             }
         }
-        let common_type =
-            wider_comparison_value_type(&expr_typed.value_type, &low_typed.value_type)
-                .and_then(|common| wider_comparison_value_type(&common, &high_typed.value_type))
-                .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
-        let cast = |operand: TypedExpr| {
-            let target = self.implicit_common_cast_target(&operand.value_type, &common_type);
-            self.cast_to_value_type(operand, target, span)
-        };
+        let common =
+            self.require_common_trino_type(&expr_typed.value_type, &low_typed.value_type, span)?;
+        let common = self.require_common_trino_type(&common, &high_typed.value_type, span)?;
+        let cast = |operand: TypedExpr| self.coerce_common_value(operand, &common, span);
         let expr_typed = cast(expr_typed)?;
         let low_typed = cast(low_typed)?;
         let high_typed = cast(high_typed)?;
@@ -1309,7 +1150,9 @@ impl<'a> super::AnalyzerContext<'a> {
         predicate: &ast::LikePredicate,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        use novarocks_type_contract::{
+            CharacterKind, FunctionValueType, ValueKind, ValueLogicalType,
+        };
 
         let operand = |syntax: &ast::Expr| {
             let expr = self.analyze_expr(syntax, scope)?;
@@ -1330,10 +1173,38 @@ impl<'a> super::AnalyzerContext<'a> {
                 ))
             }
         };
-        let expr_typed = operand(value)?;
+        let mut expr_typed = operand(value)?;
+        let varchar = FunctionValueType::new(DataType::Utf8, false);
+        if let ValueKind::BoundedCharacter(character) = expr_typed.value_type.value_type().kind()
+            && character.kind() == CharacterKind::Char
+        {
+            // LIKE matches the CHAR value with spaces up to its declared width.
+            let width = TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(i64::from(character.length()))),
+                value_type: FunctionValueType::new(DataType::Int64, false),
+            };
+            let space = TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::String(" ".to_owned())),
+                value_type: varchar.clone(),
+            };
+            let text = self.coerce_common_value(expr_typed, &varchar, value.span())?;
+            expr_typed = resolved_scalar_call_at(
+                self.function_catalog,
+                "rpad",
+                vec![text, width, space],
+                value.span(),
+                self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                self.constant_policy,
+                self.control,
+            )?;
+        }
         let pattern_typed = operand(&predicate.pattern)?;
         if let Some(escape) = &predicate.escape {
-            let args = vec![expr_typed, pattern_typed, operand(escape)?];
+            let args = vec![
+                self.coerce_common_value(expr_typed, &varchar, value.span())?,
+                self.coerce_common_value(pattern_typed, &varchar, predicate.pattern.span())?,
+                self.coerce_common_value(operand(escape)?, &varchar, escape.span())?,
+            ];
             let arguments = args
                 .iter()
                 .map(|arg| {
@@ -1474,14 +1345,20 @@ impl<'a> super::AnalyzerContext<'a> {
     fn analyze_comparison_predicate(
         &self,
         left: &ast::Expr,
-        op: BinOp,
+        operator: novarocks_type_contract::OperatorFunction,
         right: &ast::Expr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        use novarocks_type_contract::OperatorFunction;
+        let op = crate::common::binary_operator::comparison_op(operator);
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
+        let legacy_wide = crate::common::binary_operator::requires_legacy_wide(
+            left_typed.value_type.value_type(),
+        ) || crate::common::binary_operator::requires_legacy_wide(
+            right_typed.value_type.value_type(),
+        );
         let (left_typed, right_typed) = {
-            use super::literal_coercion::coerce_literal_for_comparison;
             // BITMAP / HLL columns have no scalar identity and cannot be
             // compared with `=`, `<`, etc. Reject before the operand type
             // is dropped to `Boolean` so the user sees a clear error.
@@ -1529,7 +1406,9 @@ impl<'a> super::AnalyzerContext<'a> {
             // ordering predicates at analysis time so join predicates fail
             // before reaching execution.
             let is_ordering_op = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
-            if is_ordering_op {
+            let has_temporal = left_typed.value_type.value_type().temporal().is_some()
+                || right_typed.value_type.value_type().temporal().is_some();
+            if is_ordering_op && !has_temporal {
                 let unsupported_complex_kind = |dt: &DataType| match dt {
                     DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
                         Some("ARRAY")
@@ -1554,10 +1433,12 @@ impl<'a> super::AnalyzerContext<'a> {
             // Cases like `array<int> = [map{...}, null]` would otherwise
             // fall through to a runtime CAST that produces a confusing
             // error; surface a clear analyzer-level message instead.
-            if let Some(reason) = incompatible_complex_compare(
-                left_typed.value_type.data_type(),
-                right_typed.value_type.data_type(),
-            ) {
+            if !has_temporal
+                && let Some(reason) = incompatible_complex_compare(
+                    left_typed.value_type.data_type(),
+                    right_typed.value_type.data_type(),
+                )
+            {
                 return Err(AnalyzeError::type_mismatch(
                     format!(
                         "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
@@ -1565,37 +1446,37 @@ impl<'a> super::AnalyzerContext<'a> {
                     left.span(),
                 ));
             }
-            let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
-            let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
-            // StarRocks ImplicitCastRule analog for `col op col`: coerce the
-            // two operands to a common numeric/decimal type and materialize a
-            // Cast on each differing side, BEFORE the optimizer / runtime-filter
-            // pass. This lets mixed-type equi-joins (e.g. int32 = int64) carry
-            // matching key types so the RF gate (rf_key_types_match) passes.
-            // Non-numeric pairs return None and are left to literal coercion /
-            // execution-time comparison coercion.
-            match comparison_common_value_type(&left_coerced.value_type, &right_coerced.value_type)
-                .map_err(|message| AnalyzeError::type_mismatch_source(message, left.span()))?
+            if !legacy_wide
+                && !crate::common::binary_operator::uses_structural_comparison(
+                    left_typed.value_type.value_type(),
+                )
+                && !crate::common::binary_operator::uses_structural_comparison(
+                    right_typed.value_type.value_type(),
+                )
             {
-                Some(common) => {
-                    let left_target =
-                        self.implicit_common_cast_target(&left_coerced.value_type, &common);
-                    let right_target =
-                        self.implicit_common_cast_target(&right_coerced.value_type, &common);
-                    (
-                        self.cast_to_value_type(left_coerced, left_target, left.span())?,
-                        self.cast_to_value_type(right_coerced, right_target, right.span())?,
-                    )
-                }
-                None => (left_coerced, right_coerced),
+                return self.analyze_binary_operator(
+                    operator,
+                    left_typed,
+                    right_typed,
+                    left.span(),
+                );
             }
+            let common = self.require_common_trino_type(
+                &left_typed.value_type,
+                &right_typed.value_type,
+                left.span(),
+            )?;
+            (
+                self.coerce_common_value(left_typed, &common, left.span())?,
+                self.coerce_common_value(right_typed, &common, right.span())?,
+            )
         };
         let nullable = op != BinOp::EqForNull
             && (left_typed.value_type.nullable()
                 || right_typed.value_type.nullable()
                 || compares_element_wise_with_nulls(left_typed.value_type.data_type())
                 || compares_element_wise_with_nulls(right_typed.value_type.data_type()));
-        Ok(TypedExpr {
+        let equality = TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: novarocks_parser::ast::AstBox::new(left_typed),
                 op,
@@ -1606,7 +1487,34 @@ impl<'a> super::AnalyzerContext<'a> {
                 DataType::Boolean,
                 nullable,
             ),
-        })
+        };
+        if operator == OperatorFunction::Distinct {
+            let value_type = equality.value_type.clone();
+            Ok(TypedExpr {
+                kind: ExprKind::UnaryOp {
+                    op: UnOp::Not,
+                    expr: novarocks_parser::ast::AstBox::new(equality),
+                },
+                value_type,
+            })
+        } else {
+            Ok(equality)
+        }
+    }
+
+    pub(super) fn analyze_binary_operator(
+        &self,
+        operator: novarocks_type_contract::OperatorFunction,
+        left: TypedExpr,
+        right: TypedExpr,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let call = self.type_scalar_call(NodeShape::Operator(operator), vec![left, right], span)?;
+        Ok(crate::common::binary_operator::typed_call(
+            operator,
+            call.binding,
+            call.args,
+        ))
     }
 
     /// Analyze original logical terms in source order, then balance only the
@@ -1663,29 +1571,32 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(result)
     }
 
-    /// Common-type coercion is an implicit CAST, not an exact output
-    /// declaration. Freeze its NULL upper bound from the real cast owner
-    /// before optional folding can consume the declaration.
-    fn implicit_common_cast_target(
+    pub(super) fn require_common_trino_type(
         &self,
-        source: &novarocks_type_contract::FunctionValueType,
+        left: &novarocks_type_contract::FunctionValueType,
+        right: &novarocks_type_contract::FunctionValueType,
+        span: Span,
+    ) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
+        super::helpers::assignment_common_value_type(left, right, self.control)
+            .map_err(|error| error.at_type_mismatch(span))
+    }
+
+    pub(super) fn coerce_common_value(
+        &self,
+        source: TypedExpr,
         common: &novarocks_type_contract::FunctionValueType,
-    ) -> novarocks_type_contract::FunctionValueType {
-        let target = super::helpers::with_nullability(common.clone(), source.nullable());
-        if source == &target {
-            return target;
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let target = super::helpers::with_nullability(common.clone(), source.value_type.nullable());
+        if source.value_type == target {
+            return Ok(source);
         }
-        let mode = self.sql_semantics.sql_mode();
-        let nullable = source.nullable()
-            || (source.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
-                && target.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
-                && novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                    source.data_type(),
-                    target.data_type(),
-                    mode.decimal_overflow_policy(),
-                    mode.allow_throw_exception(),
-                ));
-        super::helpers::with_nullability(target, nullable)
+        self.cast_with_trino_mode(
+            source,
+            target,
+            novarocks_type_contract::TrinoCastMode::Implicit,
+            span,
+        )
     }
 
     fn analyze_binary_op(
@@ -1712,6 +1623,27 @@ impl<'a> super::AnalyzerContext<'a> {
                 binary.span,
             );
         }
+        let legacy = |value: &TypedExpr| {
+            crate::common::binary_operator::requires_legacy_wide(value.value_type.value_type())
+                || matches!(
+                    value.value_type.data_type(),
+                    DataType::Date32
+                        | DataType::Date64
+                        | DataType::Timestamp(..)
+                        | DataType::Time32(_)
+                        | DataType::Time64(_)
+                        | DataType::Duration(_)
+                        | DataType::Interval(_)
+                )
+        };
+        if !legacy(&left_typed) && !legacy(&right_typed) {
+            return self.analyze_binary_operator(
+                novarocks_expression::typing::syntax_arithmetic(*op),
+                left_typed,
+                right_typed,
+                binary.left_operand_span,
+            );
+        }
 
         // A boolean is a one-bit number once it reaches arithmetic: TRUE is 1
         // and FALSE is 0, and `x + any_match(...)` is how a lambda counts the
@@ -1726,29 +1658,18 @@ impl<'a> super::AnalyzerContext<'a> {
             binary.left_operand_span,
         )?;
 
-        // The SQL owner freezes promotion from declared metadata before any
-        // values are evaluated. Both operands must carry the float cast.
-        let (left_typed, right_typed) = if *op == ast::BinaryOperator::Multiply
-            && self.sql_semantics.decimal_overflow_to_double()
-            && novarocks_type_contract::decimal_multiplication_requires_float64(
-                left_typed.value_type.data_type(),
-                right_typed.value_type.data_type(),
-            ) {
-            (
-                cast_null_preserving_target_type(
-                    left_typed,
-                    &DataType::Float64,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                ),
-                cast_null_preserving_target_type(
-                    right_typed,
-                    &DataType::Float64,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                ),
-            )
-        } else {
-            (left_typed, right_typed)
-        };
+        if let Some(date_shift) = date_day_arithmetic_expr(
+            self.function_catalog,
+            &left_typed,
+            op,
+            &right_typed,
+            binary.left_operand_span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
+        )? {
+            return Ok(date_shift);
+        }
 
         let arithmetic_type = |operator| {
             arithmetic_result_value_type_with_op(
@@ -1939,6 +1860,7 @@ impl<'a> super::AnalyzerContext<'a> {
         .collect::<Vec<_>>();
         Ok(TypedExpr {
             kind: ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: when_then.into(),
                 else_expr,
@@ -1992,56 +1914,54 @@ impl<'a> super::AnalyzerContext<'a> {
             None => None,
         };
 
-        if *result_type.data_type() == DataType::Null {
-            result_type = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true); // Existing all-NULL CASE rule.
-        }
-
+        let mut ieee_float_equality = false;
         if let Some(value) = operand_typed.take() {
+            use crate::common::binary_operator::requires_legacy_wide;
+
+            let mut legacy_wide = requires_legacy_wide(value.value_type.value_type());
             let mut common = value.value_type.clone();
             for (label, _) in &when_then {
                 self.check_control()?;
+                legacy_wide |= requires_legacy_wide(label.value_type.value_type());
                 check_json_comparison_domains(&common, &label.value_type, "=", span)?;
-                common = wider_comparison_value_type(&common, &label.value_type)
-                    .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
+                common = self.require_common_trino_type(&common, &label.value_type, span)?;
             }
-            let target = self.implicit_common_cast_target(&value.value_type, &common);
-            operand_typed = Some(Box::new(self.cast_to_value_type(*value, target, span)?));
+            ieee_float_equality = !legacy_wide
+                && common.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && matches!(common.data_type(), DataType::Float32 | DataType::Float64);
+
+            let cast = |input: TypedExpr| {
+                if ieee_float_equality
+                    && matches!(input.value_type.data_type(), DataType::Decimal128(..))
+                {
+                    self.coerce_simple_case_float_operand(input, &common, span)
+                } else {
+                    self.coerce_common_value(input, &common, span)
+                }
+            };
+            operand_typed = Some(Box::new(cast(*value)?));
             let mut coerced_when_then = Vec::with_capacity(when_then.len());
             for (label, result) in when_then {
                 self.check_control()?;
-                let target = self.implicit_common_cast_target(&label.value_type, &common);
-                coerced_when_then.push((self.cast_to_value_type(label, target, span)?, result));
+                coerced_when_then.push((cast(label)?, result));
             }
             when_then = coerced_when_then;
         }
 
-        // Insert implicit CASTs for THEN/ELSE branches whose types don't
-        // match the unified result_type.  Without this, the execution
-        // engine's CASE may output the branch's original type (e.g., INT 0)
-        // instead of the wider type (e.g., DOUBLE 0.0), causing truncation.
-        let cast_if_needed = |expr: TypedExpr,
-                              target: &novarocks_type_contract::FunctionValueType|
-         -> Result<TypedExpr, AnalyzeError> {
-            if !expr.value_type.same_value_domain(target) {
-                self.cast_to_value_type(
-                    expr,
-                    super::helpers::with_nullability(target.clone(), true),
-                    span,
-                )
-            } else {
-                Ok(expr)
-            }
-        };
         let when_then: Vec<(TypedExpr, TypedExpr)> = when_then
             .into_iter()
-            .map(|(w, t)| Ok((w, cast_if_needed(t, &result_type)?)))
+            .map(|(w, t)| Ok((w, self.coerce_common_value(t, &result_type, span)?)))
             .collect::<Result<_, AnalyzeError>>()?;
         let else_typed = else_typed
-            .map(|e| cast_if_needed(*e, &result_type).map(Box::new))
+            .map(|e| {
+                self.coerce_common_value(*e, &result_type, span)
+                    .map(Box::new)
+            })
             .transpose()?;
 
         Ok(TypedExpr {
             kind: ExprKind::Case {
+                ieee_float_equality,
                 operand: operand_typed.map(novarocks_parser::ast::AstBox::from_box),
                 when_then: (when_then).into(),
                 else_expr: else_typed.map(novarocks_parser::ast::AstBox::from_box),
@@ -2116,22 +2036,155 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
-        if original_name == "grouping" {
-            return self.analyze_grouping_function(func, scope);
+        let original_input = if func.filter.is_some()
+            && func.window.is_none()
+            && (is_aggregate_function(self.function_catalog, &original_name)
+                || is_analyzer_aggregate_syntax(&original_name))
+        {
+            self.grouping_scope
+                .borrow()
+                .as_ref()
+                .and_then(|state| state.from_scope.borrow().clone())
+        } else {
+            None
+        };
+        let mut call = if original_name == "grouping" {
+            self.analyze_grouping_function(func, scope)?
+        } else {
+            self.analyze_function_from_metadata(
+                FunctionMetadata {
+                    original: Some(func),
+                    span: func.span,
+                    distinct: func.distinct,
+                    order_by: func.order_by.as_ref(),
+                    window: func.window.as_ref(),
+                    null_treatment: func.null_treatment,
+                },
+                original_name,
+                original_arguments,
+                original_input.as_ref().unwrap_or(scope),
+            )?
+        };
+        if let Some(predicate) = &func.filter {
+            match &mut call.kind {
+                ExprKind::AggregateCall { filter, .. } => {
+                    *filter = Some(ast::AstBox::new(
+                        self.analyze_aggregate_filter(predicate, scope)?,
+                    ));
+                }
+                ExprKind::WindowCall { .. } => {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "FILTER is not supported for window functions",
+                        predicate.span(),
+                    ));
+                }
+                _ => {
+                    return Err(AnalyzeError::at(
+                        AnalyzeErrorKind::FunctionNotAggregate,
+                        "FILTER requires an aggregate function",
+                        predicate.span(),
+                    ));
+                }
+            }
         }
-        self.analyze_function_from_metadata(
-            FunctionMetadata {
-                original: Some(func),
-                span: func.span,
-                distinct: func.distinct,
-                order_by: func.order_by.as_ref(),
-                window: func.window.as_ref(),
-                null_treatment: func.null_treatment,
-            },
-            original_name,
-            original_arguments,
-            scope,
+        Ok(call)
+    }
+
+    fn analyze_aggregate_filter(
+        &self,
+        predicate: &ast::Expr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        struct ScalarCheck<'a, 'catalog> {
+            analyzer: &'a super::AnalyzerContext<'catalog>,
+            error: Option<AnalyzeError>,
+        }
+        impl ast::Visit for ScalarCheck<'_, '_> {
+            fn visit_query(&mut self, _: &ast::Query) {}
+
+            #[recursive::recursive]
+            fn visit_expr(&mut self, expression: &ast::Expr) {
+                if self.error.is_some() {
+                    return;
+                }
+                if let Err(error) = self.analyzer.check_control() {
+                    self.error = Some(error);
+                    return;
+                }
+                let relation_predicate = match expression {
+                    ast::Expr::Exists(_) => true,
+                    ast::Expr::Predicated(node) => matches!(
+                        &node.predicate,
+                        ast::Predicate::In(input) if matches!(input.value_list, ast::Expr::Subquery(_))
+                    ),
+                    _ => false,
+                };
+                if relation_predicate {
+                    self.error = Some(AnalyzeError::unsupported_expression(
+                        "Relational EXISTS and IN subqueries are not supported in aggregate FILTER",
+                        expression.span(),
+                    ));
+                    return;
+                }
+                let non_scalar = match expression {
+                    ast::Expr::GroupingOperation(_) | ast::Expr::WindowOperation(_) => true,
+                    ast::Expr::FunctionCall(call) => {
+                        let name = print_object_name(&call.name).to_ascii_lowercase();
+                        call.window.is_some()
+                            || name == "grouping"
+                            || is_aggregate_function(self.analyzer.function_catalog, &name)
+                            || is_analyzer_aggregate_syntax(&name)
+                    }
+                    _ => false,
+                };
+                if non_scalar {
+                    self.error = Some(AnalyzeError::at(
+                        AnalyzeErrorKind::ExpressionNotScalar,
+                        "Aggregate FILTER must contain only scalar expressions",
+                        expression.span(),
+                    ));
+                } else {
+                    ast::walk_expr(self, expression);
+                }
+            }
+        }
+        let mut check = ScalarCheck {
+            analyzer: self,
+            error: None,
+        };
+        ast::Visit::visit_expr(&mut check, predicate);
+        if let Some(error) = check.error {
+            return Err(error);
+        }
+        let from_scope = self
+            .grouping_scope
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.from_scope.borrow().clone());
+        let typed = self.analyze_expr(predicate, from_scope.as_ref().unwrap_or(scope))?;
+        self.require_boolean(
+            typed,
+            predicate.span(),
+            "Aggregate FILTER predicate must be BOOLEAN",
         )
+    }
+
+    fn require_boolean(
+        &self,
+        value: TypedExpr,
+        span: Span,
+        message: &str,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        if is_strict_null_value_type(&value.value_type) {
+            self.cast_to_value_type(value, FunctionValueType::new(DataType::Boolean, true), span)
+        } else if value.value_type.logical_type() == ValueLogicalType::Physical
+            && value.value_type.data_type() == &DataType::Boolean
+        {
+            Ok(value)
+        } else {
+            Err(AnalyzeError::type_mismatch(message, span))
+        }
     }
 
     #[recursive::recursive]
@@ -2389,7 +2442,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     );
                     *arg = TypedExpr {
                         kind: ExprKind::Cast {
-                            array_failure_mode: None,
+                            cast_mode: None,
                             expr: novarocks_parser::ast::AstBox::new(inner),
                             target: DataType::Float64,
                             decimal_overflow_policy: self
@@ -2454,38 +2507,20 @@ impl<'a> super::AnalyzerContext<'a> {
             "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" | "count_if"
         );
         if needs_boolean_args {
-            for arg in &mut args_typed {
-                if arg.value_type.data_type() != &DataType::Boolean {
-                    let inner = std::mem::replace(
-                        arg,
-                        TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Null),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Null,
-                                true,
-                            ),
-                        },
-                    );
-                    *arg = TypedExpr {
-                        kind: ExprKind::Cast {
-                            array_failure_mode: None,
-                            expr: novarocks_parser::ast::AstBox::new(inner),
-                            target: DataType::Boolean,
-                            decimal_overflow_policy: self
-                                .sql_semantics
-                                .sql_mode()
-                                .decimal_overflow_policy(),
-                        },
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Boolean,
-                            true,
-                        ),
-                    };
-                }
-            }
+            let boolean = novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true);
+            args_typed = args_typed
+                .into_iter()
+                .map(|arg| {
+                    if arg.value_type.data_type() == &DataType::Null {
+                        self.coerce_common_value(arg, &boolean, func.span)
+                    } else {
+                        Ok(arg)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             arg_types = args_typed
                 .iter()
-                .map(|a| a.value_type.data_type().clone())
+                .map(|arg| arg.value_type.data_type().clone())
                 .collect();
         }
 
@@ -2654,92 +2689,14 @@ impl<'a> super::AnalyzerContext<'a> {
             });
         }
 
-        if apply_implicit_string_function_casts(&name, &mut args_typed) {
-            arg_types = args_typed
-                .iter()
-                .map(|a| a.value_type.data_type().clone())
-                .collect();
-        }
-
-        if name == "date_trunc"
-            && let Some(value_arg) = args_typed.get_mut(1)
-            && !matches!(
-                value_arg.value_type.data_type(),
-                DataType::Date32
-                    | DataType::Timestamp(_, _)
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Null
-            )
-        {
-            let target = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
-            let inner = std::mem::replace(
-                value_arg,
-                TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Null),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Null,
-                        true,
-                    ),
-                },
-            );
-            *value_arg = TypedExpr {
-                kind: ExprKind::Cast {
-                    array_failure_mode: None,
-                    expr: novarocks_parser::ast::AstBox::new(inner),
-                    target: target.clone(),
-                    decimal_overflow_policy: self
-                        .sql_semantics
-                        .sql_mode()
-                        .decimal_overflow_policy(),
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(target, true),
-            };
-            arg_types = args_typed
-                .iter()
-                .map(|a| a.value_type.data_type().clone())
-                .collect();
-        }
-
-        // IF(cond, then, else): cast first arg to Boolean if needed
-        if name == "if"
-            && !args_typed.is_empty()
-            && args_typed[0].value_type.data_type() != &DataType::Boolean
-        {
-            let inner = std::mem::replace(
-                &mut args_typed[0],
-                TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Null),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Null,
-                        true,
-                    ),
-                },
-            );
-            args_typed[0] = TypedExpr {
-                kind: ExprKind::Cast {
-                    array_failure_mode: None,
-                    expr: novarocks_parser::ast::AstBox::new(inner),
-                    target: DataType::Boolean,
-                    decimal_overflow_policy: self
-                        .sql_semantics
-                        .sql_mode()
-                        .decimal_overflow_policy(),
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            };
-        }
-
-        if is_aggregate_function(self.function_catalog, &name)
-            && apply_implicit_aggregate_casts(&name, &mut args_typed)
-        {
-            arg_types = args_typed
-                .iter()
-                .map(|a| a.value_type.data_type().clone())
-                .collect();
+        if name == "if" && !args_typed.is_empty() {
+            let condition = self.require_boolean_predicate(
+                args_typed.remove(0),
+                "IF condition",
+                original_arguments[0].span(),
+            )?;
+            args_typed.insert(0, condition);
+            arg_types[0] = DataType::Boolean;
         }
 
         let mut bound_scalar = None;
@@ -2834,14 +2791,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             }
             let bound = match route {
-                ScalarTypingRoute::Shared => self.type_scalar_call(
-                    NodeShape::CatalogCall {
-                        name: &name,
-                        expected_result: None,
-                    },
-                    args_typed,
-                    func.span,
-                )?,
+                ScalarTypingRoute::Shared => {
+                    let shape = if func.original.is_none() && name == "coalesce" {
+                        NodeShape::Coalesce
+                    } else {
+                        NodeShape::CatalogCall {
+                            name: &name,
+                            expected_result: None,
+                        }
+                    };
+                    self.type_scalar_call(shape, args_typed, func.span)?
+                }
                 ScalarTypingRoute::Legacy => bind_scalar_function_call_with_catalog(
                     self.function_catalog,
                     &name,
@@ -2914,6 +2874,8 @@ impl<'a> super::AnalyzerContext<'a> {
             let value_type = crate::functions::aggregate_result_type(&signature).clone();
             Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
+                    occurrence: crate::analysis::AggregateOccurrence::new(),
+                    filter: None,
                     name,
                     args: (args_typed).into(),
                     distinct: is_distinct,
@@ -3556,7 +3518,7 @@ impl<'a> super::AnalyzerContext<'a> {
         )));
         Ok(Some(TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(array_expr),
                 target: target.clone(),
                 decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
@@ -4116,42 +4078,6 @@ fn is_non_groupable_map_constructor(expr: &TypedExpr) -> bool {
     }
 }
 
-/// Implicit cast: if `expr` is Utf8 and `target` is a date/timestamp type,
-/// wrap `expr` in a Cast to the target type. This matches StarRocks FE
-/// behavior where string literals are implicitly cast to date/timestamp
-/// in comparison contexts (BETWEEN, WHERE, etc.).
-pub(crate) fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
-    let needs_cast = matches!(
-        expr.value_type.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8
-    ) && matches!(
-        target,
-        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
-    );
-    if needs_cast {
-        // Match the same false-ALLOW declaration bound as implicit Boolean
-        // coercion. Occurrence preparation still consumes its frozen ALLOW.
-        let nullable = expr.value_type.nullable()
-            || novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                expr.value_type.data_type(),
-                target,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                false,
-            );
-        TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(target.clone(), nullable),
-            kind: ExprKind::Cast {
-                array_failure_mode: None,
-                expr: novarocks_parser::ast::AstBox::new(expr),
-                target: target.clone(),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        }
-    } else {
-        expr
-    }
-}
-
 /// The frozen numeric rule an operator answers by, or `None` when the
 /// operator's result does not come from those rules at all.
 const fn arithmetic_operator_of(op: &ast::BinaryOperator) -> ArithmeticOperator {
@@ -4434,7 +4360,7 @@ pub(super) fn cast_null_preserving_target_type(
         );
     TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(expr),
             target: target.clone(),
             decimal_overflow_policy,
@@ -4443,49 +4369,100 @@ pub(super) fn cast_null_preserving_target_type(
     }
 }
 
-fn cast_to_utf8_if_needed(expr: &mut TypedExpr) -> bool {
-    if matches!(
-        expr.value_type.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8
-    ) {
-        return false;
+fn date_day_arithmetic_expr(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    left: &TypedExpr,
+    op: &ast::BinaryOperator,
+    right: &TypedExpr,
+    span: Span,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<TypedExpr>, AnalyzeError> {
+    match op {
+        ast::BinaryOperator::Add if is_temporal_day_base(left.value_type.data_type()) => {
+            date_day_shift_expr(
+                function_catalog,
+                "days_add",
+                left.clone(),
+                right.clone(),
+                span,
+                decimal_overflow_policy,
+                constant_policy,
+                control,
+            )
+        }
+        ast::BinaryOperator::Add if is_temporal_day_base(right.value_type.data_type()) => {
+            date_day_shift_expr(
+                function_catalog,
+                "days_add",
+                right.clone(),
+                left.clone(),
+                span,
+                decimal_overflow_policy,
+                constant_policy,
+                control,
+            )
+        }
+        ast::BinaryOperator::Subtract if is_temporal_day_base(left.value_type.data_type()) => {
+            date_day_shift_expr(
+                function_catalog,
+                "days_sub",
+                left.clone(),
+                right.clone(),
+                span,
+                decimal_overflow_policy,
+                constant_policy,
+                control,
+            )
+        }
+        _ => Ok(None),
     }
-    if matches!(expr.value_type.data_type(), DataType::Null) {
-        expr.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
-        expr.value_type = expr
-            .value_type
-            .with_nullable(true)
-            .expect("validated root NULL contract");
-        return true;
-    }
-    let nullable = expr.value_type.nullable();
-    let inner = std::mem::replace(
-        expr,
-        TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Null),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
-        },
-    );
-    *expr = TypedExpr {
-        kind: ExprKind::Cast {
-            array_failure_mode: None,
-            expr: novarocks_parser::ast::AstBox::new(inner),
-            target: DataType::Utf8,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, nullable),
-    };
-    true
 }
 
-fn cast_utf8_args(args: &mut [TypedExpr], indexes: &[usize]) -> bool {
-    let mut changed = false;
-    for index in indexes {
-        if let Some(arg) = args.get_mut(*index) {
-            changed |= cast_to_utf8_if_needed(arg);
-        }
+fn date_day_shift_expr(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    function_name: &str,
+    date_expr: TypedExpr,
+    offset_expr: TypedExpr,
+    span: Span,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<TypedExpr>, AnalyzeError> {
+    if !is_integer_day_offset(offset_expr.value_type.data_type()) {
+        return Ok(None);
     }
-    changed
+    if !matches!(
+        &date_expr.value_type.data_type(),
+        DataType::Date32 | DataType::Timestamp(_, _)
+    ) {
+        return Ok(None);
+    }
+    let offset_expr =
+        cast_null_preserving_target_type(offset_expr, &DataType::Int64, decimal_overflow_policy);
+    let args = vec![date_expr, offset_expr];
+    resolved_scalar_call_at(
+        function_catalog,
+        function_name,
+        args,
+        span,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+    )
+    .map(Some)
+}
+
+fn is_temporal_day_base(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Date32 | DataType::Timestamp(_, _))
+}
+
+fn is_integer_day_offset(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
 }
 
 fn is_array_carrier(data_type: &DataType) -> bool {
@@ -4493,37 +4470,6 @@ fn is_array_carrier(data_type: &DataType) -> bool {
         data_type,
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
     )
-}
-
-fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> bool {
-    match name {
-        // Array CONCAT must already have been normalized by the SQL owner.
-        // A direct typed caller cannot stringify an array to bypass that fact.
-        "concat"
-            if args
-                .iter()
-                .any(|arg| is_array_carrier(arg.value_type.data_type())) =>
-        {
-            false
-        }
-        "concat" | "concat_ws" | "group_concat" | "string_agg" => {
-            let mut changed = false;
-            for arg in args.iter_mut() {
-                let arg_changed = cast_to_utf8_if_needed(arg);
-                changed = changed || arg_changed;
-            }
-            changed
-        }
-        "instr" | "locate" | "split" | "starts_with" | "ends_with" => cast_utf8_args(args, &[0, 1]),
-        "regexp_extract" | "regexp_extract_all" => cast_utf8_args(args, &[0, 1]),
-        "regexp_replace" => cast_utf8_args(args, &[0, 1, 2]),
-        "lpad" | "rpad" => cast_utf8_args(args, &[0, 2]),
-        "replace" => cast_utf8_args(args, &[0, 1, 2]),
-        "ascii" | "char_length" | "character_length" | "initcap" | "left" | "length" | "lower"
-        | "ltrim" | "repeat" | "reverse" | "right" | "rtrim" | "strleft" | "strright"
-        | "substr" | "substring" | "trim" | "upper" => cast_utf8_args(args, &[0]),
-        _ => false,
-    }
 }
 
 pub(super) struct BoundScalarCall {
@@ -4579,6 +4525,32 @@ pub(super) fn resolve_scalar_binding_at(
         control,
     )
     .map_err(|error| error.at_type_mismatch(span))
+}
+
+fn finish_selected_scalar_call(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    selected: &crate::binding::SqlFunctionBinding,
+    args: &[TypedExpr],
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_functions::ResolvedFunctionBinding, AnalyzeError> {
+    let arguments = args
+        .iter()
+        .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AnalyzeError::function_binding)?;
+    catalog
+        .finish_scalar_binding(
+            &selected.function_id,
+            &selected.selected.overload,
+            novarocks_functions::FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: args.len(),
+                expected_result_type: None,
+            },
+            control,
+        )
+        .map_err(AnalyzeError::function_binding)
 }
 
 pub(super) fn resolved_scalar_call_at(
@@ -4657,22 +4629,16 @@ pub(super) fn resolved_scalar_call_at(
         })
         .collect::<Result<Vec<_>, AnalyzeError>>()
         .map_err(|error| error.at_type_mismatch(span))?;
-    let exact = resolve_scalar_binding_at(
-        function_catalog,
-        name,
-        &args,
-        span,
-        decimal_overflow_policy,
-        constant_policy,
-        control,
-    )?;
-    if !rebound_call_matches_observed(binding.resolved(), exact.resolved(), &args, control)? {
+    let exact =
+        finish_selected_scalar_call(function_catalog, &binding, &args, constant_policy, control)
+            .map_err(|error| error.at_type_mismatch(span))?;
+    if !rebound_call_matches_observed(binding.resolved(), &exact, &args, control)? {
         return Err(AnalyzeError::type_mismatch(
-            format!("function `{name}` changed selected identity after argument coercion"),
+            format!("function `{name}` lost the exact selected argument declaration"),
             span,
         ));
     }
-    let binding = exact;
+    let binding = crate::binding::SqlFunctionBinding::new(exact, decimal_overflow_policy);
     let result = match &binding.selected.result_type {
         novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
         novarocks_functions::FunctionResultType::Relation(_) => {
@@ -4689,32 +4655,6 @@ pub(super) fn resolved_scalar_call_at(
         },
         value_type: result,
     })
-}
-
-/// Unary plus has no new evaluator or conversion. Its admitted signed domain
-/// is a semantic fact; a physical layout alone cannot authorize the identity.
-fn signed_unary_plus_identity(
-    source: TypedExpr,
-    syntax: &ast::Expr,
-) -> Result<TypedExpr, AnalyzeError> {
-    if source.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
-        && matches!(
-            source.value_type.value_type().kind(),
-            novarocks_type_contract::ValueKind::Scalar(
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-            )
-        )
-    {
-        Ok(source)
-    } else {
-        Err(AnalyzeError::unsupported_expression(
-            format!(
-                "unsupported expression: {}",
-                expression_for_diagnostic(syntax)
-            ),
-            syntax.span(),
-        ))
-    }
 }
 
 pub(super) fn signed_int_literal_value(expr: &TypedExpr) -> Option<i64> {
@@ -4787,7 +4727,7 @@ fn coerce_function_argument(
     if matches!(expr.value_type.data_type(), DataType::Null) {
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy,
@@ -4806,7 +4746,7 @@ fn coerce_function_argument(
         || timestamp_unit_cast_can_return_null(expr.value_type.data_type(), target);
     Ok(TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(expr),
             target: target.clone(),
             decimal_overflow_policy,
@@ -5118,12 +5058,11 @@ pub(super) fn bind_window_function_call_with_catalog(
 pub(super) fn bind_scalar_function_call_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
-    mut args: Vec<TypedExpr>,
+    args: Vec<TypedExpr>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<BoundScalarCall, AnalyzeError> {
-    apply_implicit_string_function_casts(name, &mut args);
     let arg_types = args
         .iter()
         .map(|arg| arg.value_type.data_type().clone())
@@ -5183,30 +5122,32 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             validate_scalar_function_call_typed(name, &args).map_err(AnalyzeError::internal)?;
-            let exact = resolve_scalar_binding(
+            let exact = finish_selected_scalar_call(
                 function_catalog,
-                name,
+                &binding,
                 &args,
-                decimal_overflow_policy,
                 constant_policy,
                 control,
             )?;
-            if !rebound_call_matches_observed(binding.resolved(), exact.resolved(), &args, control)?
-            {
+            if !rebound_call_matches_observed(binding.resolved(), &exact, &args, control)? {
                 return Err(AnalyzeError::internal(format!(
-                    "function `{name}` changed selected identity after argument coercion"
+                    "function `{name}` lost the exact selected argument declaration"
                 )));
             }
             Ok(BoundScalarCall {
                 args,
-                binding: exact,
+                binding: crate::binding::SqlFunctionBinding::new(exact, decimal_overflow_policy),
             })
         }
         Err(error)
             if error.control_error().is_some()
                 || error.source_failure().is_some()
-                || error.kind()
-                    == crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
+                || matches!(
+                    error.kind(),
+                    crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+                        | crate::analyze_error::AnalyzeErrorKind::UnknownFunction
+                        | crate::analyze_error::AnalyzeErrorKind::AmbiguousFunctionCall
+                ) =>
         {
             Err(error)
         }
@@ -5288,50 +5229,17 @@ fn resolve_aggregate_function_call_with_order(
                 span,
             );
         }
-        AnalyzeError::type_mismatch(
-            format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}"),
-            span,
-        )
+        let message = format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}");
+        if error == novarocks_functions::FunctionBindingError::NoMatchingOverload {
+            AnalyzeError::unknown_function(message, span)
+        } else {
+            AnalyzeError::type_mismatch(message, span)
+        }
     })
 }
 
 fn is_analyzer_aggregate_syntax(name: &str) -> bool {
     name == "every"
-}
-
-fn aggregate_arg_cast_type(name: &str, input_type: &DataType) -> Option<DataType> {
-    if matches!(name, "sum" | "avg") && matches!(input_type, DataType::Utf8 | DataType::LargeUtf8) {
-        Some(DataType::Float64)
-    } else {
-        None
-    }
-}
-
-fn apply_implicit_aggregate_casts(name: &str, args: &mut [TypedExpr]) -> bool {
-    let mut changed = false;
-    for arg in args {
-        let Some(target) = aggregate_arg_cast_type(name, arg.value_type.data_type()) else {
-            continue;
-        };
-        let inner = std::mem::replace(
-            arg,
-            TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Null),
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
-            },
-        );
-        *arg = TypedExpr {
-            kind: ExprKind::Cast {
-                array_failure_mode: None,
-                expr: novarocks_parser::ast::AstBox::new(inner),
-                target: target.clone(),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(target, true),
-        };
-        changed = true;
-    }
-    changed
 }
 
 fn validate_group_concat_separator_argument(
@@ -5642,6 +5550,10 @@ fn is_constant_default_expression(expr: &TypedExpr) -> bool {
         ExprKind::BinaryOp { left, right, .. } => {
             is_constant_default_expression(left) && is_constant_default_expression(right)
         }
+        ExprKind::FunctionCall { .. } => crate::common::binary_operator::typed_operands(expr)
+            .is_some_and(|(_, [left, right])| {
+                is_constant_default_expression(left) && is_constant_default_expression(right)
+            }),
         ExprKind::UnaryOp { expr, .. } => is_constant_default_expression(expr),
         _ => false,
     }
@@ -5827,8 +5739,15 @@ fn lambda_body_casts_param_to_utf8(expr: &ast::Expr, param_name: &str) -> bool {
     match expr {
         ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
             matches!(
-                sql_type_to_arrow(&cast.data_type),
-                Ok(DataType::Utf8 | DataType::LargeUtf8)
+                super::helpers::sql_type_to_value_type(
+                    &cast.data_type,
+                    true,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                ),
+                Ok(ref ty) if matches!(ty.value_type().kind(),
+                    novarocks_type_contract::ValueKind::String
+                    | novarocks_type_contract::ValueKind::BoundedCharacter(_)
+                )
             )
         }
         _ => false,
@@ -6174,13 +6093,24 @@ fn typed_expr_contains_column_ref(expr: &TypedExpr) -> bool {
         | ExprKind::Nested(expr)
         | ExprKind::IsNull { expr, .. }
         | ExprKind::IsTruthValue { expr, .. } => typed_expr_contains_column_ref(expr),
-        ExprKind::FunctionCall { args, .. }
-        | ExprKind::AggregateCall { args, .. }
-        | ExprKind::WindowCall { args, .. } => args.iter().any(typed_expr_contains_column_ref),
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => args
+            .iter()
+            .chain(order_by.iter().map(|item| &item.expr))
+            .chain(filter.as_deref())
+            .any(typed_expr_contains_column_ref),
+        ExprKind::FunctionCall { args, .. } | ExprKind::WindowCall { args, .. } => {
+            args.iter().any(typed_expr_contains_column_ref)
+        }
         ExprKind::Case {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand
                 .as_ref()
@@ -6242,6 +6172,7 @@ fn typed_expr_contains_nondeterministic_call(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.as_ref().is_some_and(|expr| {
                 typed_expr_contains_nondeterministic_call(function_catalog, expr)
@@ -6313,6 +6244,7 @@ fn collect_lambda_param_refs<'a>(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_lambda_param_refs(operand, referenced);
@@ -6445,7 +6377,7 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::super::analyze;
-    use super::{AnalyzeError, BinOp, TypedExpr, string_literal_expr};
+    use super::{BinOp, TypedExpr, string_literal_expr};
     use crate::analysis::{ExprKind, LiteralValue, QueryBody};
     use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::catalog::PlannerTableProvider;
@@ -6656,12 +6588,8 @@ mod tests {
             let original_order: Vec<_> = operands
                 .iter()
                 .map(|operand| {
-                    let ExprKind::BinaryOp {
-                        left,
-                        right,
-                        op: BinOp::Eq,
-                        ..
-                    } = &operand.kind
+                    let Some((BinOp::Eq, [left, right])) =
+                        crate::common::binary_operator::typed_comparison(operand)
                     else {
                         panic!("comparison term")
                     };
@@ -6774,165 +6702,6 @@ mod tests {
             panic!("independent scalar call")
         };
         assert_eq!(actual_binding, expected_binding);
-    }
-
-    #[test]
-    fn logical_original_terms_keep_nonzero_constant_ordinal_and_write_assignment() {
-        use crate::compiler::materialized_values::{
-            MaterializedValues, SqlConstantExpressionSite, SqlConstantExpressionStep,
-            SqlExpressionConstant,
-        };
-        use crate::compiler::{SqlCompileControl, SqlWriteAssignmentSite};
-        use arrow::array::{Array, BooleanArray};
-        use novarocks_functions::ConstantPool;
-        use novarocks_type_contract::{CompilePhase, FunctionValueType};
-        use std::{borrow::Cow, sync::Arc};
-        let control = SqlCompileControl::unbounded();
-        let policy = crate::constant::test_constant_policy();
-        let field = Arc::new(arrow::datatypes::Field::new(
-            "logical_source",
-            DataType::Boolean,
-            false,
-        ));
-        let pool = ConstantPool::try_new(
-            field.clone(),
-            FunctionValueType::new(DataType::Boolean, false),
-            BooleanArray::from(vec![false, true]).to_data(),
-            policy,
-            CompilePhase::Validate,
-            &control,
-        )
-        .unwrap();
-        let value = pool.value(1).unwrap();
-        let query =
-            &novarocks_parser::parser::parse_query("SELECT only_original_source AND 1 AND NULL")
-                .unwrap();
-        let ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("select")
-        };
-        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
-            panic!("logical")
-        };
-        assert!(projection_column.alias.is_none(), "anonymous projection");
-        let expression @ ast::Expr::Logical(logical) = &projection_column.expression else {
-            panic!("logical")
-        };
-        let constants = vec![
-            SqlExpressionConstant::new(
-                vec![],
-                SqlConstantExpressionSite::SelectProjection { column: 0 },
-                value.clone(),
-            )
-            .with_expression_path(vec![SqlConstantExpressionStep::LogicalTerm(0)]),
-        ]
-        .into();
-        let source = MaterializedValues::try_new_expressions(query, constants, &control).unwrap();
-        let mut owned = source.loan(query, &control).unwrap();
-        let assignment = SqlWriteAssignmentSite::try_new(
-            0,
-            FunctionValueType::new(DataType::Boolean, false),
-            None,
-            &control,
-        )
-        .unwrap()
-        .with_source_span(logical.terms[1].span());
-        owned
-            .insert_write_assignment(&logical.terms[1], Cow::Owned(assignment), &control)
-            .unwrap();
-        assert!(
-            owned
-                .view()
-                .write_assignment_at(&logical.terms[1].clone())
-                .is_none()
-        );
-        let mut ctx = logical_context(&control);
-        ctx.materialized_values = Some(owned.view());
-        let scope = ctx.new_scope();
-        let expected: Vec<_> = logical
-            .terms
-            .iter()
-            .map(|term| ctx.analyze_expr(term, &scope).unwrap())
-            .collect();
-        let actual = ctx.analyze_expr(expression, &scope).unwrap();
-        assert_eq!(
-            actual.value_type,
-            FunctionValueType::new(DataType::Boolean, true)
-        );
-        let ExprKind::BinaryOp {
-            left,
-            right,
-            op: BinOp::And,
-            ..
-        } = &actual.kind
-        else {
-            panic!("balanced root")
-        };
-        assert!(matches!(right.kind, ExprKind::Literal(LiteralValue::Null)));
-        assert_eq!(expected[2].value_type.data_type(), &DataType::Null);
-        assert_eq!(
-            right.value_type,
-            FunctionValueType::new(DataType::Boolean, true)
-        );
-        let ExprKind::BinaryOp {
-            left,
-            right,
-            op: BinOp::And,
-            ..
-        } = &left.kind
-        else {
-            panic!("adjacent terms")
-        };
-        let ExprKind::Constant(retained) = &left.kind else {
-            panic!("original constant")
-        };
-        assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
-        assert_eq!(retained.ordinal(), 1);
-        assert_eq!(retained.field(), field.as_ref());
-        assert_eq!(retained.value_type(), value.value_type());
-        let declared = owned.view().write_assignment_at(&logical.terms[1]).unwrap();
-        assert_eq!(
-            declared.input(),
-            &FunctionValueType::new(DataType::Boolean, false)
-        );
-        assert_eq!(
-            right.value_type,
-            FunctionValueType::new(DataType::Boolean, true)
-        );
-        for (actual_term, expected_term) in
-            [left.as_ref(), right.as_ref()].into_iter().zip(&expected)
-        {
-            assert_eq!(actual_term.value_type, expected_term.value_type);
-            assert!(
-                crate::analysis::expr_identity::typed_expr_semantically_eq(
-                    actual_term,
-                    expected_term,
-                    &control
-                )
-                .unwrap(),
-                "balancing retains the original term's complete typed source conversion"
-            );
-        }
-        let ExprKind::Cast {
-            array_failure_mode: None,
-            expr,
-            target,
-            decimal_overflow_policy,
-        } = &right.kind
-        else {
-            panic!("original write assignment cast")
-        };
-        assert_eq!(target, right.value_type.data_type());
-        assert_eq!(target, declared.input().data_type());
-        assert_eq!(
-            *decimal_overflow_policy,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
-        );
-        assert!(matches!(expr.kind, ExprKind::Literal(LiteralValue::Int(1))));
-        let independent = expression.clone();
-        assert!(
-            ctx.analyze_expr(&independent, &ctx.new_scope()).is_err(),
-            "equal syntax must not acquire this occurrence's source loan"
-        );
     }
 
     #[test]
@@ -7088,7 +6857,7 @@ mod tests {
 
     #[test]
     fn explicit_boolean_casts_keep_types_and_original_bound_children() {
-        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+        use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
 
         // The nullable and required STRING declarations represent c8 and c20
         // in aggregate/sql/compressed_key.sql, not a guessed carrier domain.
@@ -7134,7 +6903,6 @@ mod tests {
                 logical_type: None,
             };
             let control = crate::compiler::SqlCompileControl::unbounded();
-            let expected = FunctionValueType::new(DataType::Boolean, true);
             let boolean =
                 format!("CAST({left_source} AS BOOLEAN) OR CAST({right_source} AS BOOLEAN)");
             let sql = format!(
@@ -7160,6 +6928,12 @@ mod tests {
                 select.projection[0].field_name.as_deref(),
                 Some("boolean_result")
             );
+            let expected = FunctionValueType::new(
+                DataType::Boolean,
+                select.projection[1..]
+                    .iter()
+                    .any(|item| item.expr.value_type.nullable()),
+            );
             assert_eq!(
                 select.projection[0].expr.value_type, expected,
                 "{profile}: {sql}"
@@ -7169,29 +6943,31 @@ mod tests {
                 left,
                 right,
                 op: BinOp::Or,
-                decimal_overflow_policy,
+                ..
             } = &boolean.kind
             else {
                 panic!("actual Boolean OR binding");
             };
-            assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
             for (operand, original) in [left.as_ref(), right.as_ref()]
                 .into_iter()
                 .zip(&select.projection[1..])
             {
-                assert_eq!(operand.value_type, expected, "{profile}");
+                assert_eq!(
+                    operand.value_type,
+                    FunctionValueType::new(DataType::Boolean, original.expr.value_type.nullable()),
+                    "{profile}"
+                );
                 let ExprKind::Cast {
                     expr,
                     target,
-                    array_failure_mode,
-                    decimal_overflow_policy,
+                    cast_mode,
+                    ..
                 } = &operand.kind
                 else {
                     panic!("one actual String-to-Boolean conversion per source");
                 };
                 assert_eq!(*target, DataType::Boolean);
-                assert_eq!(*array_failure_mode, None);
-                assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+                assert_eq!(*cast_mode, Some(TrinoCastMode::Explicit));
                 assert_eq!(
                     expr.value_type, original.expr.value_type,
                     "complete original child declaration"
@@ -7366,7 +7142,7 @@ mod tests {
         let actual = context.analyze_expr(expression, &scope).unwrap();
         assert_eq!(
             actual.value_type,
-            FunctionValueType::new(DataType::Boolean, true)
+            FunctionValueType::new(DataType::Boolean, false)
         );
         let boolean = &actual;
         let ExprKind::BinaryOp {
@@ -7401,7 +7177,7 @@ mod tests {
 
     #[test]
     fn computed_arithmetic_operands_keep_complete_types_source_bindings_and_effects() {
-        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, OperatorFunction};
         for nullable in [false, true] {
             let catalog = UnaryInputCatalog {
                 key_type: DataType::Int32,
@@ -7417,15 +7193,15 @@ mod tests {
                         "SELECT (k+1)*(v-2) AS result, k, v FROM unary_input",
                         false,
                         DataType::Int64,
-                        BinOp::Mul,
-                        BinOp::Sub,
+                        OperatorFunction::Multiply,
+                        OperatorFunction::Subtract,
                     ),
                     (
                         "SELECT (CAST(k AS DECIMAL(4,1))+CAST(1 AS DECIMAL(4,1)))+(CAST(v AS DECIMAL(4,1))+CAST(2 AS DECIMAL(4,1))) AS result, k, v FROM unary_input",
                         true,
                         DataType::Decimal128(6, 1),
-                        BinOp::Add,
-                        BinOp::Add,
+                        OperatorFunction::Add,
+                        OperatorFunction::Add,
                     ),
                 ] {
                     let query = &novarocks_parser::parser::parse_query(sql).unwrap();
@@ -7458,36 +7234,30 @@ mod tests {
                         panic!("resolved SELECT");
                     };
                     let actual = &select.projection[0].expr;
-                    let expected = FunctionValueType::new(expected_type, true);
+                    let expected = FunctionValueType::new(expected_type, decimal || nullable);
                     assert_eq!(actual.value_type, expected, "{mode}: {sql}");
                     assert_eq!(resolved.output_columns[0].value_type, expected);
                     assert_eq!(select.projection[0].field_name.as_deref(), Some("result"));
-                    let ExprKind::BinaryOp {
-                        left,
-                        right,
-                        op,
-                        decimal_overflow_policy,
-                    } = &actual.kind
-                    else {
-                        panic!("outer arithmetic");
-                    };
-                    assert_eq!(*op, expected_op);
-                    assert_eq!(*decimal_overflow_policy, policy);
+                    let (operator, [left, right]) =
+                        crate::common::binary_operator::typed_operands(actual)
+                            .expect("original outer arithmetic");
+                    assert_eq!(operator, expected_op);
                     for (computed, source, expected_op) in [
-                        (left.as_ref(), &select.projection[1].expr, BinOp::Add),
-                        (right.as_ref(), &select.projection[2].expr, right_op),
+                        (left, &select.projection[1].expr, OperatorFunction::Add),
+                        (right, &select.projection[2].expr, right_op),
                     ] {
-                        let ExprKind::BinaryOp {
-                            left,
-                            op,
-                            decimal_overflow_policy,
-                            ..
-                        } = &computed.kind
-                        else {
-                            panic!("original computed child");
+                        let computed = match &computed.kind {
+                            ExprKind::Cast {
+                                expr,
+                                target: DataType::Int64,
+                                ..
+                            } => expr.as_ref(),
+                            _ => computed,
                         };
-                        assert_eq!(*op, expected_op);
-                        assert_eq!(*decimal_overflow_policy, policy);
+                        let (operator, [left, _]) =
+                            crate::common::binary_operator::typed_operands(computed)
+                                .expect("original computed child");
+                        assert_eq!(operator, expected_op);
                         let source_child = if decimal {
                             assert_eq!(
                                 computed.value_type,
@@ -7496,18 +7266,18 @@ mod tests {
                             let ExprKind::Cast {
                                 expr,
                                 target,
-                                array_failure_mode,
+                                cast_mode,
                                 decimal_overflow_policy,
                             } = &left.kind
                             else {
                                 panic!("original explicit Decimal cast");
                             };
                             assert_eq!(*target, DataType::Decimal128(4, 1));
-                            assert_eq!(*array_failure_mode, None);
+                            assert_eq!(*cast_mode, None);
                             assert_eq!(*decimal_overflow_policy, policy);
                             expr.as_ref()
                         } else {
-                            left.as_ref()
+                            left
                         };
                         assert_eq!(source_child.value_type, source.value_type);
                         assert!(
@@ -7534,10 +7304,7 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(arena.value_type(scalar), &expected);
-                    assert_eq!(
-                        crate::optimizer::scalar_expr::can_fail(&arena, scalar),
-                        decimal && policy == DecimalOverflowPolicy::ReportError
-                    );
+                    assert!(crate::optimizer::scalar_expr::can_fail(&arena, scalar));
                     let rebuilt = crate::planner::optimizer_bridge::scalar::materialize_exprs(
                         &arena,
                         &[scalar],
@@ -7662,32 +7429,24 @@ mod tests {
         let actual = context.analyze_expr(&column.expression, &scope).unwrap();
         assert_eq!(
             actual.value_type,
-            FunctionValueType::new(DataType::Int32, true)
+            FunctionValueType::new(DataType::Int32, false)
         );
         let mut arena = crate::optimizer::scalar::ScalarArena::new();
         let scalar =
             crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &actual, &control)
                 .unwrap();
-        assert!(!crate::optimizer::scalar_expr::can_fail(&arena, scalar));
+        assert!(crate::optimizer::scalar_expr::can_fail(&arena, scalar));
         let rebuilt =
             crate::planner::optimizer_bridge::scalar::materialize_exprs(&arena, &[scalar]);
         for expression in [&actual, &rebuilt[0]] {
-            let ExprKind::BinaryOp {
-                left,
-                op: BinOp::Mul,
-                ..
-            } = &expression.kind
-            else {
-                panic!("original product");
-            };
-            let ExprKind::BinaryOp {
-                left,
-                op: BinOp::Add,
-                ..
-            } = &left.kind
-            else {
-                panic!("original computed sum");
-            };
+            let operands = crate::common::binary_operator::typed_operands;
+            let (operator, [left, _]) = operands(expression).expect("original product");
+            assert_eq!(
+                operator,
+                novarocks_type_contract::OperatorFunction::Multiply
+            );
+            let (operator, [left, _]) = operands(left).expect("original computed sum");
+            assert_eq!(operator, novarocks_type_contract::OperatorFunction::Add);
             let ExprKind::Constant(retained) = &left.kind else {
                 panic!("original source");
             };
@@ -7702,33 +7461,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_boolean_or_preserves_successful_null_cast_obligations() {
+    fn try_cast_boolean_or_preserves_runtime_nullability() {
         for sql in [
-            "select CAST('DHL' AS BOOLEAN) OR CAST(',' AS BOOLEAN) OR CAST('BARIAN' AS BOOLEAN)",
-            "select CAST(coalesce(NULL, '') AS BOOLEAN) OR CAST(', ' AS BOOLEAN) OR CAST(coalesce(NULL, '') AS BOOLEAN)",
-            "select CAST(1 AS BOOLEAN) OR CAST(0 AS BOOLEAN)",
+            "select TRY_CAST('DHL' AS BOOLEAN) OR TRY_CAST(',' AS BOOLEAN) OR TRY_CAST('BARIAN' AS BOOLEAN)",
+            "select TRY_CAST(coalesce(NULL, '') AS BOOLEAN) OR TRY_CAST(', ' AS BOOLEAN) OR TRY_CAST(coalesce(NULL, '') AS BOOLEAN)",
         ] {
             let expression = analyze_projection_expr(sql).expect("analyze string boolean coercion");
-            assert_eq!(
-                *expression.value_type.data_type(),
-                DataType::Boolean,
-                "{sql}"
-            );
             assert_eq!(
                 expression.value_type,
                 novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
                 "complete nullable Boolean declaration: {sql}",
             );
-            assert!(
-                expression.value_type.nullable(),
-                "explicit casts retain the nullable Boolean declaration: {sql}"
+        }
+        for sql in [
+            "SELECT TRUE OR FALSE",
+            "SELECT CAST(1 AS BOOLEAN) OR CAST(0 AS BOOLEAN)",
+            "SELECT CAST('DHL' AS BOOLEAN) OR CAST(',' AS BOOLEAN)",
+        ] {
+            let expression = analyze_projection_expr(sql).unwrap();
+            assert_eq!(
+                expression.value_type,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+                "{sql}"
             );
         }
-        let total = analyze_projection_expr("SELECT TRUE OR FALSE").unwrap();
-        assert_eq!(
-            total.value_type,
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        );
     }
 
     #[test]
@@ -8082,16 +7838,14 @@ mod tests {
             let expression = analyze_projection_expr(sql).unwrap();
             assert_json_list_declaration(&expression);
             let ExprKind::Cast {
-                expr,
-                array_failure_mode,
-                ..
+                expr, cast_mode, ..
             } = &expression.kind
             else {
                 panic!("ordinary outer CAST")
             };
             assert_eq!(
-                *array_failure_mode,
-                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+                *cast_mode,
+                Some(novarocks_type_contract::TrinoCastMode::Explicit)
             );
             assert_exact_list_scalar_owner(expr, "builtin.scalar/__array_literal/v1");
             let child = expr.value_type.child_at(0).unwrap();
@@ -8149,16 +7903,14 @@ mod tests {
             );
             if cast_boundary {
                 let ExprKind::Cast {
-                    expr,
-                    array_failure_mode,
-                    ..
+                    expr, cast_mode, ..
                 } = &expression.kind
                 else {
                     panic!("ordinary outer CAST")
                 };
                 assert_eq!(
-                    *array_failure_mode,
-                    Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+                    *cast_mode,
+                    Some(novarocks_type_contract::TrinoCastMode::Explicit)
                 );
                 assert_json_list_scalar_owner(expr, owner_id);
             } else {
@@ -8291,14 +8043,13 @@ mod tests {
 
     #[test]
     fn array_agg_string_values_do_not_gain_json_semantics() {
-        use novarocks_types::logical::logical_type_of_field;
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
         for sql in [
             "select array_agg('{\"k\":1}')",
-            "select array_agg(cast('not JSON' as json))",
-            "with q as (select cast('not JSON' as json) as j) select array_agg(j) from q",
-            "select array_agg(j2) from (select cast('not JSON' as json) as j, j as j2) q",
+            "select array_agg(cast(cast('not JSON' as json) as varchar))",
+            "with q as (select cast(cast('not JSON' as json) as varchar) as j) select array_agg(j) from q",
+            "select array_agg(j2) from (select cast(cast('not JSON' as json) as varchar) as j, j as j2) q",
             "select array_agg(j) from (values (cast('{\"k\":1}' as varchar)), (null)) q(j)",
-            "select array_agg(j) from (values (cast(json_object('k':1) as json)), ('{\"k\":2}')) q(j)",
             "select array_agg(cast(json_object('k':1) as varchar))",
             "select array_agg(case when true then cast(json_object('k':1) as varchar) else cast(json_object('k':2) as varchar) end)",
             "select array_agg(j) from (select cast(json_object('k':1) as varchar) as j) s",
@@ -8306,12 +8057,28 @@ mod tests {
         ] {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
-            let DataType::List(item) = &expression.value_type.data_type() else {
+            let ValueKind::List(item) = expression.value_type.value_type().kind() else {
                 panic!("expected List");
             };
-            assert_eq!(logical_type_of_field(item), None);
+            assert!(
+                matches!(
+                    item.kind(),
+                    ValueKind::String | ValueKind::BoundedCharacter(_)
+                ),
+                "{sql}"
+            );
             assert!(matches!(expression.kind, ExprKind::AggregateCall { .. }));
         }
+        let typed_json =
+            analyze_projection_expr("select array_agg(cast('not JSON' as json))").unwrap();
+        assert_eq!(
+            typed_json.value_type.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Json
+        );
+        let mixed = analyze_projection_expr(
+            "select array_agg(j) from (values (cast(json_object('k':1) as json)), ('{\"k\":2}')) q(j)",
+        ).unwrap_err();
+        assert!(mixed.contains("do not have a common Trino type"), "{mixed}");
     }
 
     #[test]
@@ -8690,16 +8457,22 @@ mod tests {
             FunctionValueType::new(DataType::Null, true)
         );
         assert!(matches!(args[0].kind, ExprKind::FunctionCall { .. }));
-        let result = analyze_projection_expr("select NULL+NULL").unwrap();
+        let error = analyze_projection_expr("select NULL+NULL").unwrap_err();
+        assert_eq!(error, "multiple declared overloads match ambiguously");
+        let result = analyze_projection_expr("select NULL%NULL").unwrap();
         assert_eq!(
             result.value_type,
-            FunctionValueType::new(DataType::Int64, true)
+            FunctionValueType::new(DataType::Int8, true)
         );
     }
 
     fn comparison_operands(expression: &TypedExpr) -> Vec<&TypedExpr> {
+        if let Some((_, [left, right])) =
+            crate::common::binary_operator::typed_comparison(expression)
+        {
+            return vec![left, right];
+        }
         match &expression.kind {
-            ExprKind::BinaryOp { left, right, .. } => vec![left, right],
             ExprKind::InList { expr, list, .. } => {
                 std::iter::once(expr.as_ref()).chain(list.iter()).collect()
             }
@@ -8905,10 +8678,10 @@ mod tests {
             logical_type: Some(novarocks_types::schema::SqlType::Json),
         };
         for sql in [
-            "select CAST(k AS STRING)='text' from unary_input",
-            "select CAST(k AS STRING) IN ('text','other') from unary_input",
-            "select CAST(k AS STRING) BETWEEN 'a' AND 'z' from unary_input",
-            "select CASE CAST(k AS STRING) WHEN 'text' THEN 7 ELSE 9 END from unary_input",
+            "select CAST(k AS VARCHAR)='text' from unary_input",
+            "select CAST(k AS VARCHAR) IN ('text','other') from unary_input",
+            "select CAST(k AS VARCHAR) BETWEEN 'a' AND 'z' from unary_input",
+            "select CASE CAST(k AS VARCHAR) WHEN 'text' THEN 7 ELSE 9 END from unary_input",
         ] {
             let expression = analyze_projection_expr_with_catalog(
                 sql,
@@ -8932,20 +8705,34 @@ mod tests {
                 // retain their original non-null declaration.
                 assert_eq!(operand.value_type.nullable(), ordinal == 0, "{sql}");
             }
-            let ExprKind::FunctionCall { binding, args, .. } = &operands[0].kind else {
-                panic!("JSON identity cannot be erased by a carrier CAST: {sql}");
+            let ExprKind::Cast {
+                expr: original,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                target: DataType::Utf8,
+                ..
+            } = &operands[0].kind
+            else {
+                panic!("expected explicit JSON to VARCHAR CAST: {sql}");
             };
-            assert_eq!(
-                binding.function_id.as_str(),
-                "builtin.scalar/value_domain_conversion/v1"
-            );
-            assert_eq!(args[0].value_type.logical_type(), ValueLogicalType::Json);
-            assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
+            assert_eq!(original.value_type.logical_type(), ValueLogicalType::Json);
+            assert!(matches!(original.kind, ExprKind::ColumnRef { .. }));
             for label in operands.iter().skip(1) {
-                assert!(
-                    matches!(label.kind, ExprKind::Literal(LiteralValue::String(_))),
-                    "{sql}"
-                );
+                let ExprKind::Cast {
+                    expr: original,
+                    cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                    ..
+                } = &label.kind
+                else {
+                    panic!("expected the selected comparison type for {sql}");
+                };
+                assert!(matches!(
+                    original.kind,
+                    ExprKind::Literal(LiteralValue::String(_))
+                ));
+                assert!(matches!(
+                    original.value_type.value_type().kind(),
+                    novarocks_type_contract::ValueKind::BoundedCharacter(_)
+                ));
             }
         }
     }
@@ -8992,12 +8779,9 @@ mod tests {
             .expect_err("untyped negation operand");
             assert_eq!(
                 error.kind(),
-                crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+                crate::analyze_error::AnalyzeErrorKind::AmbiguousFunctionCall
             );
-            assert!(
-                error.message().contains("specified numeric type"),
-                "{sql}: {error}"
-            );
+            assert!(error.message().contains("ambiguously"), "{sql}: {error}");
         }
 
         let expected = novarocks_type_contract::FunctionValueType::new(DataType::Int16, true);
@@ -9303,7 +9087,17 @@ mod tests {
                 kind: ExprKind::Constant(original.clone()),
                 value_type: value_type.clone(),
             };
-            let actual = super::signed_unary_plus_identity(source, syntax).unwrap();
+            let (_, mut operands) = super::super::expression_typing::type_value_node_with_catalog(
+                crate::functions::builtin_sql_function_catalog(),
+                novarocks_expression::typing::NodeShape::UnaryPlus,
+                vec![source],
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
+                &control,
+                syntax.span(),
+            )
+            .unwrap();
+            let actual = operands.pop().expect("original unary operand");
             assert_eq!(
                 actual.value_type, value_type,
                 "do not strengthen the original NULL promise"
@@ -9324,20 +9118,13 @@ mod tests {
     }
 
     #[test]
-    fn signed_unary_plus_keeps_noninteger_domains_explicitly_unsupported() {
-        for sql in [
-            "SELECT +1.5",
-            "SELECT +1e0",
-            "SELECT +'x'",
-            "SELECT +true",
-            "SELECT +NULL",
-            "SELECT +CAST(1 AS LARGEINT)",
-        ] {
+    fn unary_plus_rejects_unsupported_domains() {
+        for sql in ["SELECT +1.5", "SELECT +'x'", "SELECT +true", "SELECT +NULL"] {
             let query = &novarocks_parser::parser::parse_query(sql).unwrap();
             let error = super::super::analyze(query, &EmptyCatalog, "default").unwrap_err();
             assert_eq!(
                 error.kind(),
-                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression,
+                crate::analyze_error::AnalyzeErrorKind::TypeMismatch,
                 "{sql}"
             );
             let ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -9349,6 +9136,16 @@ mod tests {
                 "original unary source span"
             );
         }
+        let sql = "SELECT +CAST(1 AS LARGEINT)";
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+        );
+        let span = error.span().expect("retired type's source span");
+        assert_eq!(&sql[span.start()..span.end()], "LARGEINT");
+
         let catalog = UnaryInputCatalog {
             key_type: DataType::FixedSizeBinary(16),
             nullable: false,
@@ -9361,7 +9158,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog()
             )
             .unwrap_err()
-            .contains("unsupported expression")
+            .contains("unary plus requires")
         );
     }
 
@@ -9515,9 +9312,9 @@ mod tests {
     }
 
     #[test]
-    fn sql_decimal_type_producer_freezes_wide_cast_before_explicit_string_output() {
+    fn sql_decimal_type_producer_freezes_standard_cast_before_explicit_string_output() {
         use crate::analysis::ExprKind;
-        let expression = analyze_projection_expr("SELECT CAST(CAST('1000000000000000000000000000000000000000000000000.00' AS DECIMAL(60,2)) AS VARCHAR)").unwrap();
+        let expression = analyze_projection_expr("SELECT CAST(CAST('100000000000000000000000000000000000.00' AS DECIMAL(38,2)) AS VARCHAR)").unwrap();
         assert_eq!(expression.value_type.data_type().clone(), DataType::Utf8);
         let ExprKind::Cast {
             expr: decimal,
@@ -9529,30 +9326,30 @@ mod tests {
         };
         assert_eq!(
             decimal.value_type.data_type().clone(),
-            DataType::Decimal256(60, 2)
+            DataType::Decimal128(38, 2)
         );
         assert!(matches!(
             decimal.kind,
             ExprKind::Cast {
-                target: DataType::Decimal256(60, 2),
+                target: DataType::Decimal128(38, 2),
                 ..
             }
         ));
         let expression =
-            analyze_projection_expr("SELECT array_agg(CAST('1.00' AS DECIMAL(60,2)))").unwrap();
+            analyze_projection_expr("SELECT array_agg(CAST('1.00' AS DECIMAL(38,2)))").unwrap();
         let ExprKind::AggregateCall { args, resolved, .. } = expression.kind else {
             panic!("expected aggregate");
         };
         assert_eq!(
             args[0].value_type.data_type().clone(),
-            DataType::Decimal256(60, 2)
+            DataType::Decimal128(38, 2)
         );
         let novarocks_functions::FunctionArgumentType::Value(bound) =
             &resolved.selected.argument_types[0]
         else {
             panic!("expected bound value argument");
         };
-        assert_eq!(bound.data_type().clone(), DataType::Decimal256(60, 2));
+        assert_eq!(bound.data_type().clone(), DataType::Decimal128(38, 2));
         assert_eq!(bound.nullable(), args[0].value_type.nullable());
     }
 
@@ -9752,73 +9549,32 @@ mod tests {
 
     #[test]
     fn substring_normal_and_special_syntax_bind_identical_arguments() {
-        let normal = super::bind_scalar_function_call(
-            "substring",
-            vec![
-                crate::analysis::TypedExpr {
-                    kind: crate::analysis::ExprKind::Literal(
-                        crate::analysis::LiteralValue::String("x".to_string()),
-                    ),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Utf8,
-                        false,
-                    ),
-                },
-                crate::analysis::TypedExpr {
-                    kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(2)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                },
-                crate::analysis::TypedExpr {
-                    kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(3)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                },
-            ],
-        )
-        .expect("ordinary function call should bind");
-        let special = analyze_projection_expr("select substring('x' from 2 for 3)")
-            .expect("special function syntax should analyze");
-        let crate::analysis::ExprKind::FunctionCall {
-            name: special_name,
-            args: special_args,
-            ..
-        } = special.kind
-        else {
-            panic!("expected special FunctionCall, got {:?}", special.kind);
-        };
+        use novarocks_type_contract::ValueKind;
 
-        assert_eq!(special_name, "substr");
-        assert_eq!(normal.value_type().data_type(), &DataType::Utf8);
-        assert_eq!(normal.args.len(), special_args.len());
-        for (normal, special) in normal.args.iter().zip(special_args.iter()) {
+        let ordinary = analyze_projection_expr("SELECT substring('x', 2, 3)").unwrap();
+        let special = analyze_projection_expr("SELECT substring('x' FROM 2 FOR 3)").unwrap();
+        assert_eq!(ordinary.value_type, special.value_type);
+        for (expression, expected_name) in [(ordinary, "substring"), (special, "substr")] {
+            let ExprKind::FunctionCall { name, args, .. } = &expression.kind else {
+                panic!("expected the selected substring overload");
+            };
+            assert_eq!(name, expected_name);
+            assert_eq!(args.len(), 3);
             assert_eq!(
-                normal.value_type.data_type(),
-                special.value_type.data_type()
+                args[0].value_type.value_type().kind(),
+                &ValueKind::String,
+                "{name}"
             );
-            assert_eq!(normal.value_type.nullable(), special.value_type.nullable());
-            match (&normal.kind, &special.kind) {
-                (
-                    crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::String(
-                        normal_value,
-                    )),
-                    crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::String(
-                        special_value,
-                    )),
-                ) => assert_eq!(normal_value, special_value),
-                (
-                    crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
-                        normal_value,
-                    )),
-                    crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
-                        special_value,
-                    )),
-                ) => assert_eq!(normal_value, special_value),
-                other => panic!("expected equivalent normalized literal arguments, got {other:?}"),
+            assert!(!args[0].value_type.nullable());
+            assert!(
+                matches!(&args[0].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "x")
+            );
+            for (argument, expected) in args.iter().skip(1).zip([2, 3]) {
+                assert_eq!(argument.value_type.data_type(), &DataType::Int32);
+                assert!(!argument.value_type.nullable());
+                assert!(
+                    matches!(argument.kind, ExprKind::Literal(LiteralValue::Int(value)) if value == expected)
+                );
             }
         }
     }
@@ -9863,90 +9619,76 @@ mod tests {
     }
 
     #[test]
-    fn substring_rejects_positive_literal_outside_int32() {
-        let err = analyze_projection_expr("select substring('x', 2147483648)")
-            .expect_err("overflowing literal must fail during analysis");
-        assert_eq!(err, "Cast argument 2147483648 to int type failed");
-    }
+    fn substring_keeps_explicit_integer_casts_for_out_of_range_positions() {
+        use novarocks_type_contract::TrinoCastMode;
 
-    #[test]
-    fn substring_special_syntax_rejects_negative_literal_outside_int32() {
-        let err = analyze_projection_expr("select substring('x' from -2147483649 for 1)")
-            .expect_err("overflowing negative literal must fail during analysis");
-        assert_eq!(err, "Cast argument -2147483649 to int type failed");
-    }
-
-    #[test]
-    fn substring_non_literal_bigint_gets_runtime_int32_cast() {
-        let expr = analyze_projection_expr("select substring('x', cast(1 as bigint))")
-            .expect("BIGINT expression should bind through a runtime cast");
-        let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
-            panic!("expected FunctionCall, got {:?}", expr.kind);
-        };
-        assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
-        assert!(matches!(
-            args[1].kind,
-            crate::analysis::ExprKind::Cast {
+        for (sql, value) in [
+            (
+                "SELECT substring('x', CAST(2147483648 AS INTEGER))",
+                2147483648,
+            ),
+            (
+                "SELECT substring('x' FROM CAST(-2147483649 AS INTEGER) FOR 1)",
+                -2147483649,
+            ),
+        ] {
+            let expression = analyze_projection_expr(sql).unwrap();
+            let ExprKind::FunctionCall { args, .. } = &expression.kind else {
+                panic!("expected substring: {sql}");
+            };
+            let ExprKind::Cast {
+                expr: original,
+                cast_mode: Some(TrinoCastMode::Explicit),
                 target: DataType::Int32,
                 ..
-            }
-        ));
+            } = &args[1].kind
+            else {
+                panic!("expected explicit CAST to INTEGER: {sql}");
+            };
+            assert_eq!(original.value_type.data_type(), &DataType::Int64);
+            assert!(
+                matches!(original.kind, ExprKind::Literal(LiteralValue::Int(actual)) if actual == value)
+            );
+            assert!(!args[1].value_type.nullable());
+        }
     }
 
     #[test]
-    fn scalar_binder_marks_narrowing_nonnull_bigint_column_cast_nullable() {
-        let bound = super::bind_scalar_function_call(
+    fn scalar_binder_never_inserts_implicit_narrowing_for_substring() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_type_contract::FunctionValueType;
+
+        let error = super::bind_scalar_function_call(
             "substring",
             vec![
-                crate::analysis::TypedExpr {
-                    kind: crate::analysis::ExprKind::Literal(
-                        crate::analysis::LiteralValue::String("x".to_string()),
-                    ),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Utf8,
-                        false,
-                    ),
+                TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
+                    value_type: FunctionValueType::new(DataType::Utf8, false),
                 },
-                crate::analysis::TypedExpr {
-                    kind: crate::analysis::ExprKind::ColumnRef {
+                TypedExpr {
+                    kind: ExprKind::ColumnRef {
                         column_id: crate::column_id::ColumnId(42),
                         qualifier: None,
                         column: "offset".to_string(),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
+                    value_type: FunctionValueType::new(DataType::Int64, false),
                 },
             ],
         )
-        .expect("non-null BIGINT column should bind to substring INT32 offset");
-
-        let offset = &bound.args[1];
-        assert_eq!(offset.value_type.data_type().clone(), DataType::Int32);
-        assert!(offset.value_type.nullable());
-        let crate::analysis::ExprKind::Cast {
-            expr,
-            target: DataType::Int32,
-            ..
-        } = &offset.kind
-        else {
-            panic!("expected a BIGINT-to-INT32 runtime cast");
-        };
-        assert!(!expr.value_type.nullable());
-        assert!(matches!(
-            expr.kind,
-            crate::analysis::ExprKind::ColumnRef { .. }
-        ));
+        .err()
+        .expect("the declared INTEGER overload must not implicitly narrow BIGINT");
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
+        assert_eq!(error.message(), "no matching declared overload");
     }
 
     #[test]
-    fn substring_bigint_column_offset_gets_runtime_int32_cast() {
-        let query =
-            &novarocks_parser::parser::parse_query("select substring('x', offset) from offsets")
-                .expect("substring query should parse");
+    fn substring_keeps_the_explicit_integer_cast_of_a_bigint_column() {
+        let query = &novarocks_parser::parser::parse_query(
+            "SELECT substring('x', CAST(offset AS INTEGER)) FROM offsets",
+        )
+        .expect("substring query should parse");
         let (resolved, _registry, _factory) = analyze(query, &BigintOffsetCatalog, "default")
-            .expect("BIGINT column should bind through a runtime cast");
+            .expect("the explicit CAST supplies the declared INTEGER parameter");
         let QueryBody::Select(select) = resolved.body else {
             panic!("expected select");
         };
@@ -9961,13 +9703,11 @@ mod tests {
         };
         let offset = args.into_iter().nth(1).expect("expected offset argument");
         assert_eq!(offset.value_type.data_type().clone(), DataType::Int32);
-        assert!(
-            offset.value_type.nullable(),
-            "a narrowing runtime cast can produce NULL when BIGINT overflows INT32"
-        );
+        assert!(!offset.value_type.nullable());
         let crate::analysis::ExprKind::Cast {
             expr,
             target: DataType::Int32,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
             ..
         } = offset.kind
         else {
@@ -10213,13 +9953,9 @@ mod tests {
             panic!("expected FunctionCall, got {:?}", expr.kind);
         };
         assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
-        let crate::analysis::ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &args[1].kind
-        else {
-            panic!("runtime arithmetic must not fold into a literal");
-        };
-        assert_eq!(*op, crate::analysis::BinOp::Add);
+        let (operator, [left, right]) =
+            crate::common::binary_operator::typed_operands(&args[1]).expect("runtime arithmetic");
+        assert_eq!(operator, novarocks_type_contract::OperatorFunction::Add);
         assert_eq!(left.value_type.data_type(), &DataType::Int32);
         assert_eq!(right.value_type.data_type(), &DataType::Int32);
         assert!(matches!(
@@ -10258,8 +9994,8 @@ mod tests {
         let expr = analyze_projection_expr("select cast(1 as int) = cast(1 as bigint)")
             .expect("comparison should analyze");
         assert_eq!(expr.value_type.data_type().clone(), DataType::Boolean);
-        match expr.kind {
-            crate::analysis::ExprKind::BinaryOp { left, right, .. } => {
+        match crate::common::binary_operator::typed_comparison(&expr) {
+            Some((_, [left, right])) => {
                 assert_eq!(
                     left.value_type.data_type().clone(),
                     DataType::Int64,
@@ -10271,7 +10007,7 @@ mod tests {
                     "right operand coerced to common type"
                 );
             }
-            other => panic!("expected BinaryOp comparison, got {:?}", other),
+            other => panic!("expected bound comparison, got {:?}", other),
         }
     }
 
@@ -10298,12 +10034,12 @@ mod tests {
         .expect("date comparison should analyze");
 
         assert_eq!(expr.value_type.data_type().clone(), DataType::Boolean);
-        match expr.kind {
-            crate::analysis::ExprKind::BinaryOp { left, right, .. } => {
+        match crate::common::binary_operator::typed_comparison(&expr) {
+            Some((_, [left, right])) => {
                 assert_eq!(left.value_type.data_type().clone(), DataType::Date32);
                 assert_eq!(right.value_type.data_type().clone(), DataType::Date32);
             }
-            other => panic!("expected BinaryOp comparison, got {:?}", other),
+            other => panic!("expected bound comparison, got {:?}", other),
         }
     }
 
@@ -10640,100 +10376,42 @@ mod tests {
     }
 
     #[test]
-    fn decimal_promotion_freezes_float_result_and_both_operand_casts() {
-        fn projection(sql: &str, enabled: bool) -> Result<TypedExpr, AnalyzeError> {
-            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
-            let (query, _, _) = super::super::analyze_with_function_catalog_and_sql_semantics(
-                query,
-                &EmptyCatalog,
-                "default",
-                crate::functions::builtin_sql_function_catalog(),
-                &crate::sql_mode::SqlSemanticSettings::default()
-                    .with_decimal_overflow_to_double(enabled),
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )?;
-            let QueryBody::Select(select) = query.body else {
-                panic!("select");
-            };
-            Ok(select.projection.into_iter().next().unwrap().expr)
-        }
-        let expression = "CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))";
-        let checked = projection(&format!("SELECT {expression}"), false).unwrap();
-        assert_eq!(
-            checked.value_type.data_type().clone(),
-            DataType::Decimal128(38, 19)
-        );
-        for sql in [
-            format!("SELECT {expression}"),
-            "SELECT CAST(NULL AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9))".into(),
-            "SELECT CAST(1 AS DECIMAL(20,0))*CAST(1 AS INT)".into(),
-        ] {
-            let promoted = projection(&sql, true).unwrap();
-            assert_eq!(promoted.value_type.data_type().clone(), DataType::Float64);
-            let ExprKind::BinaryOp {
-                left, op, right, ..
-            } = promoted.kind
-            else {
-                panic!("binary");
-            };
-            assert_eq!(op, BinOp::Mul);
-            for operand in [left, right] {
-                assert_eq!(operand.value_type.data_type().clone(), DataType::Float64);
-                assert!(matches!(
-                    operand.kind,
-                    ExprKind::Cast {
-                        target: DataType::Float64,
-                        ..
-                    }
-                ));
-            }
-        }
-        assert_eq!(
-            projection(
-                "SELECT CAST(1 AS DECIMAL(18,9))*CAST(1 AS DECIMAL(18,9))",
-                true
-            )
-            .unwrap()
-            .value_type
-            .data_type()
-            .clone(),
-            DataType::Decimal128(36, 18)
-        );
-        assert_eq!(
-            projection(
-                "SELECT CAST(1 AS DECIMAL(30,10))+CAST(1 AS DECIMAL(18,9))",
-                true
-            )
-            .unwrap()
-            .value_type
-            .data_type(),
-            projection(
-                "SELECT CAST(1 AS DECIMAL(30,10))+CAST(1 AS DECIMAL(18,9))",
-                false
-            )
-            .unwrap()
-            .value_type
-            .data_type()
-        );
-        assert!(
-            projection(
+    fn standard_decimal_multiply_preserves_the_original_overload_and_result_scale() {
+        for (sql, expected) in [
+            (
+                "SELECT CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))",
+                DataType::Decimal128(38, 9),
+            ),
+            (
+                "SELECT CAST(NULL AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9))",
+                DataType::Decimal128(38, 9),
+            ),
+            (
+                "SELECT CAST(1 AS DECIMAL(20,0))*CAST(1 AS INT)",
+                DataType::Decimal128(30, 0),
+            ),
+            (
                 "SELECT CAST(1 AS DECIMAL(38,20))*CAST(1 AS DECIMAL(20,19))",
-                true
-            )
-            .is_err()
-        );
+                DataType::Decimal128(38, 19),
+            ),
+        ] {
+            let expression = analyze_projection_expr(sql).unwrap();
+            assert_eq!(expression.value_type.data_type(), &expected, "{sql}");
+            let (operator, _) = crate::common::binary_operator::typed_operands(&expression)
+                .expect("original selected multiplication");
+            assert_eq!(
+                operator,
+                novarocks_type_contract::OperatorFunction::Multiply
+            );
+        }
         assert!(
-            projection(
-                "SELECT CAST(1 AS DECIMAL(76,0))*CAST(1 AS DECIMAL(76,0))",
-                true
-            )
-            .is_err()
+            analyze_projection_expr("SELECT CAST(1 AS DECIMAL(76,0))*CAST(1 AS DECIMAL(76,0))")
+                .is_err()
         );
     }
 
     #[test]
-    fn decimal_query_policy_covers_cte_derived_correlated_and_union_siblings() {
+    fn standard_decimal_multiply_covers_cte_derived_correlated_and_union_siblings() {
         fn resolved(
             sql: &str,
             settings: &crate::sql_mode::SqlSemanticSettings,
@@ -10758,122 +10436,116 @@ mod tests {
             (query, registry)
         }
         let product = "CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))";
-        for (promote, expected_type) in [
-            (false, DataType::Decimal128(38, 19)),
-            (true, DataType::Float64),
-        ] {
-            let settings = crate::sql_mode::SqlSemanticSettings::default()
-                .with_decimal_overflow_to_double(promote);
-            // All producers inherit the same query policy; identities stay independent.
-            let (query, registry) = resolved(
-                &format!(
-                    "WITH a AS (SELECT {product} x), b AS (SELECT {product} y) SELECT a.x,b.y,{product} z FROM a CROSS JOIN b"
-                ),
-                &settings,
-            );
+        let expected_type = DataType::Decimal128(38, 9);
+        let settings = crate::sql_mode::SqlSemanticSettings::default();
+        // All producers inherit the same query policy; identities stay independent.
+        let (query, registry) = resolved(
+            &format!(
+                "WITH a AS (SELECT {product} x), b AS (SELECT {product} y) SELECT a.x,b.y,{product} z FROM a CROSS JOIN b"
+            ),
+            &settings,
+        );
+        assert_eq!(
+            query
+                .output_columns
+                .iter()
+                .map(|c| c.value_type.data_type().clone())
+                .collect::<Vec<_>>(),
+            vec![expected_type.clone(); 3]
+        );
+        assert_eq!(query.local_cte_ids.len(), 2);
+        assert_ne!(query.local_cte_ids[0], query.local_cte_ids[1]);
+        for id in &query.local_cte_ids {
+            assert!(registry.get(*id).is_some());
+        }
+        let (query, _) = resolved(
+            &format!("SELECT t.x,{product} y FROM (SELECT {product} x) t"),
+            &settings,
+        );
+        assert_eq!(
+            query.output_columns[0].value_type.data_type(),
+            &expected_type
+        );
+        assert_eq!(
+            query.output_columns[1].value_type.data_type(),
+            &expected_type
+        );
+        let (query, _) = resolved(
+            &format!("SELECT (SELECT {product}) x,(SELECT {product}) y,{product} z"),
+            &settings,
+        );
+        assert_eq!(
+            query
+                .output_columns
+                .iter()
+                .map(|c| c.value_type.data_type().clone())
+                .collect::<Vec<_>>(),
+            vec![expected_type.clone(); 3]
+        );
+        let QueryBody::Select(select) = &query.body else {
+            panic!("select");
+        };
+        assert_eq!(select.apply_specs.len(), 2);
+        assert_ne!(
+            select.apply_specs[0].subquery_id,
+            select.apply_specs[1].subquery_id
+        );
+        assert_ne!(
+            select.apply_specs[0].output_column.column_id,
+            select.apply_specs[1].output_column.column_id
+        );
+        let (query, _) = resolved(
+            "SELECT (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) x, (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) y FROM (SELECT 1 n) o",
+            &settings,
+        );
+        assert_eq!(
+            query.output_columns[0].value_type.data_type(),
+            &expected_type
+        );
+        assert_eq!(
+            query.output_columns[1].value_type.data_type(),
+            &expected_type
+        );
+        let QueryBody::Select(select) = &query.body else {
+            panic!("select");
+        };
+        assert_eq!(select.apply_specs.len(), 2);
+        let Some(crate::analysis::Relation::Subquery { output_columns, .. }) = &select.from else {
+            panic!("outer derived relation");
+        };
+        assert_eq!(output_columns.len(), 1);
+        for spec in &select.apply_specs {
             assert_eq!(
-                query
-                    .output_columns
-                    .iter()
-                    .map(|c| c.value_type.data_type().clone())
-                    .collect::<Vec<_>>(),
-                vec![expected_type.clone(); 3]
-            );
-            assert_eq!(query.local_cte_ids.len(), 2);
-            assert_ne!(query.local_cte_ids[0], query.local_cte_ids[1]);
-            for id in &query.local_cte_ids {
-                assert!(registry.get(*id).is_some());
-            }
-            let (query, _) = resolved(
-                &format!("SELECT t.x,{product} y FROM (SELECT {product} x) t"),
-                &settings,
-            );
-            assert_eq!(
-                query.output_columns[0].value_type.data_type(),
-                &expected_type
-            );
-            assert_eq!(
-                query.output_columns[1].value_type.data_type(),
-                &expected_type
-            );
-            let (query, _) = resolved(
-                &format!("SELECT (SELECT {product}) x,(SELECT {product}) y,{product} z"),
-                &settings,
-            );
-            assert_eq!(
-                query
-                    .output_columns
-                    .iter()
-                    .map(|c| c.value_type.data_type().clone())
-                    .collect::<Vec<_>>(),
-                vec![expected_type.clone(); 3]
-            );
-            let QueryBody::Select(select) = &query.body else {
-                panic!("select");
-            };
-            assert_eq!(select.apply_specs.len(), 2);
-            assert_ne!(
-                select.apply_specs[0].subquery_id,
-                select.apply_specs[1].subquery_id
-            );
-            assert_ne!(
-                select.apply_specs[0].output_column.column_id,
-                select.apply_specs[1].output_column.column_id
-            );
-            let (query, _) = resolved(
-                "SELECT (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) x, (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) y FROM (SELECT 1 n) o",
-                &settings,
-            );
-            assert_eq!(
-                query.output_columns[0].value_type.data_type(),
-                &expected_type
-            );
-            assert_eq!(
-                query.output_columns[1].value_type.data_type(),
-                &expected_type
-            );
-            let QueryBody::Select(select) = &query.body else {
-                panic!("select");
-            };
-            assert_eq!(select.apply_specs.len(), 2);
-            let Some(crate::analysis::Relation::Subquery { output_columns, .. }) = &select.from
-            else {
-                panic!("outer derived relation");
-            };
-            assert_eq!(output_columns.len(), 1);
-            for spec in &select.apply_specs {
-                assert_eq!(
-                    spec.correlation_column_ids,
-                    vec![output_columns[0].column_id]
-                );
-            }
-            assert_ne!(
-                select.apply_specs[0].subquery_id,
-                select.apply_specs[1].subquery_id
-            );
-            // UNION policy is an explicit analysis input, never a first-branch hint.
-            let (query, _) = resolved(
-                &format!("SELECT {product} x UNION ALL SELECT {product} x"),
-                &settings,
-            );
-            let QueryBody::SetOperation(set) = query.body else {
-                panic!("set operation");
-            };
-            let QueryBody::Select(left) = set.left.into_inner().body else {
-                panic!("left select");
-            };
-            let QueryBody::Select(right) = set.right.into_inner().body else {
-                panic!("right select");
-            };
-            assert_eq!(
-                left.projection[0].expr.value_type.data_type(),
-                &expected_type
-            );
-            assert_eq!(
-                right.projection[0].expr.value_type.data_type(),
-                &expected_type
+                spec.correlation_column_ids,
+                vec![output_columns[0].column_id]
             );
         }
+        assert_ne!(
+            select.apply_specs[0].subquery_id,
+            select.apply_specs[1].subquery_id
+        );
+        // UNION policy is an explicit analysis input, never a first-branch hint.
+        let (query, _) = resolved(
+            &format!("SELECT {product} x UNION ALL SELECT {product} x"),
+            &settings,
+        );
+        let QueryBody::SetOperation(set) = query.body else {
+            panic!("set operation");
+        };
+        let QueryBody::Select(left) = set.left.into_inner().body else {
+            panic!("left select");
+        };
+        let QueryBody::Select(right) = set.right.into_inner().body else {
+            panic!("right select");
+        };
+        assert_eq!(
+            left.projection[0].expr.value_type.data_type(),
+            &expected_type
+        );
+        assert_eq!(
+            right.projection[0].expr.value_type.data_type(),
+            &expected_type
+        );
         let legacy = crate::sql_mode::SqlSemanticSettings::default().with_sql_mode(
             crate::sql_mode::SqlMode::from_assignment("GROUP_CONCAT_LEGACY"),
         );
@@ -10885,9 +10557,10 @@ mod tests {
             resolved(sql, &legacy);
         }
     }
+
     #[test]
-    fn overflow_query_policy_is_frozen_for_every_arithmetic_and_cast() {
-        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+    fn standard_arithmetic_and_cast_types_survive_root_mode_inheritance() {
+        use novarocks_type_contract::{OperatorFunction, TrinoCastMode};
         fn resolve(
             sql: &str,
             settings: &crate::sql_mode::SqlSemanticSettings,
@@ -10911,36 +10584,37 @@ mod tests {
             assert_eq!(settings, &original_settings);
             (query, registry)
         }
-        fn product_policy(
-            query: &crate::analysis::ResolvedQuery,
-        ) -> novarocks_type_contract::DecimalOverflowPolicy {
-            let QueryBody::Select(select) = &query.body else {
-                panic!("select")
+        fn assert_standard_product(expression: &TypedExpr) {
+            let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+                panic!("expected selected addition");
             };
-            let ExprKind::BinaryOp {
-                left,
-                decimal_overflow_policy,
-                ..
-            } = &select.projection[0].expr.kind
-            else {
-                panic!("arithmetic")
-            };
-            let ExprKind::Cast {
-                decimal_overflow_policy: cast_policy,
-                ..
-            } = &left.kind
-            else {
-                panic!("cast")
-            };
-            assert_eq!(cast_policy, decimal_overflow_policy);
-            *decimal_overflow_policy
+            assert_eq!(binding.function_id, OperatorFunction::Add.function_id());
+            assert_eq!(
+                expression.value_type.data_type(),
+                &DataType::Decimal128(38, 0)
+            );
+            for arg in args {
+                assert!(matches!(
+                    arg.kind,
+                    ExprKind::Cast {
+                        cast_mode: Some(TrinoCastMode::Explicit),
+                        ..
+                    }
+                ));
+            }
         }
-        let expression = "CAST(1 AS DECIMAL(38,0))+1";
-        for (mode, expected) in [("32", OutputNull), ("ERROR_IF_OVERFLOW", ReportError)] {
+        fn assert_project(query: &crate::analysis::ResolvedQuery) {
+            let QueryBody::Select(select) = &query.body else {
+                panic!("select");
+            };
+            assert_standard_product(&select.projection[0].expr);
+        }
+        let expression = "CAST(1 AS DECIMAL(38,0))+CAST(1 AS DECIMAL(9,0))";
+        for mode in ["32", "ERROR_IF_OVERFLOW", "34359738368"] {
             let settings = crate::sql_mode::SqlSemanticSettings::default()
                 .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode));
             let (query, _) = resolve(&format!("SELECT {expression} x"), &settings);
-            assert_eq!(product_policy(&query), expected);
+            assert_project(&query);
             let (query, _) = resolve(
                 &format!("SELECT {expression} x UNION ALL SELECT {expression} x"),
                 &settings,
@@ -10948,8 +10622,8 @@ mod tests {
             let QueryBody::SetOperation(set) = &query.body else {
                 panic!("union")
             };
-            assert_eq!(product_policy(&set.left), expected);
-            assert_eq!(product_policy(&set.right), expected);
+            assert_project(&set.left);
+            assert_project(&set.right);
             let (query, registry) = resolve(
                 &format!(
                     "WITH a AS (SELECT {expression} x), b AS (SELECT {expression} y) SELECT a.x,b.y FROM a CROSS JOIN b"
@@ -10968,8 +10642,8 @@ mod tests {
                 .iter()
                 .find(|entry| entry.name == "b")
                 .unwrap();
-            assert_eq!(product_policy(&a.resolved_query), expected);
-            assert_eq!(product_policy(&b.resolved_query), expected);
+            assert_project(&a.resolved_query);
+            assert_project(&b.resolved_query);
             let (query, _) = resolve(
                 &format!("SELECT ({expression}) x FROM (SELECT {expression} y) t"),
                 &settings,
@@ -10981,25 +10655,8 @@ mod tests {
             else {
                 panic!("derived")
             };
-            assert_eq!(product_policy(inner), expected);
-            let outer = &select.projection[0].expr;
-            let ExprKind::BinaryOp {
-                left,
-                decimal_overflow_policy,
-                ..
-            } = &outer.kind
-            else {
-                panic!("outer arithmetic")
-            };
-            let ExprKind::Cast {
-                decimal_overflow_policy: cast_policy,
-                ..
-            } = &left.kind
-            else {
-                panic!("outer cast")
-            };
-            assert_eq!(*decimal_overflow_policy, expected);
-            assert_eq!(*cast_policy, expected);
+            assert_project(inner);
+            assert_standard_product(&select.projection[0].expr);
         }
     }
     #[test]
@@ -11026,14 +10683,14 @@ mod tests {
                 expr,
                 target,
                 decimal_overflow_policy,
-                array_failure_mode,
+                cast_mode,
             } = &expression.kind
             else {
                 panic!("explicit array conversion")
             };
             assert_eq!(
-                *array_failure_mode,
-                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+                *cast_mode,
+                Some(novarocks_type_contract::TrinoCastMode::Explicit)
             );
             assert_eq!(
                 *decimal_overflow_policy,
@@ -11055,14 +10712,14 @@ mod tests {
     }
 
     #[test]
-    fn non_array_nested_report_decimal_numeric_cast_is_rejected_with_the_original_sql_span() {
+    fn nested_decimal_cast_preserves_array_admission_and_map_row_capability_errors() {
         for sql in [
-            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(CAST(map(1,1) AS MAP<INT,DECIMAL(4,0)>) AS MAP<INT,DECIMAL(3,0)>)",
-            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(CAST(ROW(1) AS ROW(a DECIMAL(4,0))) AS ROW(a DECIMAL(3,0)))",
+            "SELECT CAST(map(1, DECIMAL '123.5') AS MAP(INTEGER, DECIMAL(3,0)))",
+            "SELECT CAST(ROW(DECIMAL '123.5') AS ROW(a DECIMAL(3,0)))",
         ] {
-            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
             let error = super::super::analyze_with_function_catalog_and_sql_semantics(
-                query,
+                &query,
                 &EmptyCatalog,
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
@@ -11071,21 +10728,39 @@ mod tests {
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+            );
             assert!(
                 error
                     .message()
-                    .contains("ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST"),
+                    .contains("cast requires an implemented exact Physical scalar domain"),
                 "{error}"
             );
-            assert!(error.span().is_some(), "{error}");
+            assert_eq!(
+                error.span(),
+                Some(novarocks_parser::Span::new(7, sql.len()))
+            );
         }
-        for sql in [
-            "SELECT CAST(CAST([1] AS ARRAY<DECIMAL(4,0)>) AS ARRAY<DECIMAL(3,0)>)",
-            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT CAST(CAST(['1'] AS ARRAY<DECIMAL(4,0)>) AS ARRAY<DECIMAL(4,0)>)",
+        use novarocks_type_contract::TrinoCastMode;
+        for (name, mode) in [
+            ("CAST", TrinoCastMode::Explicit),
+            ("TRY_CAST", TrinoCastMode::Try),
         ] {
-            analyze_projection_expr(sql).unwrap();
+            let sql = format!("SELECT {name}(ARRAY[DECIMAL '123.5'] AS ARRAY(DECIMAL(3,0)))");
+            let expression = analyze_projection_expr(&sql).unwrap();
+            assert!(
+                matches!(expression.kind, ExprKind::Cast { cast_mode: Some(actual), .. } if actual == mode)
+            );
+            assert_eq!(
+                expression.value_type.child_at(0).unwrap().data_type(),
+                &DataType::Decimal128(3, 0)
+            );
+            assert_eq!(expression.value_type.nullable(), mode == TrinoCastMode::Try);
         }
     }
+
     #[test]
     fn decimal_largeint_add_sub_seal_exact_result_without_operand_retagging() {
         let largeint = DataType::FixedSizeBinary(16);
@@ -11217,69 +10892,51 @@ mod tests {
     }
 
     #[test]
-    fn full_outer_using_implicit_decimal_cast_inherits_the_query_policy() {
+    fn full_outer_using_freezes_the_common_decimal_type_and_operand_conversions() {
         use crate::analysis::ExprKind;
-        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-        let strict = "WITH SESSION sql_mode='ERROR_IF_OVERFLOW'";
-        let relaxed = "WITH SESSION sql_mode=32";
-        for (root, expected) in [
-            ("", OutputNull),
-            (strict, ReportError),
-            (relaxed, OutputNull),
-        ] {
-            let sql = format!(
-                "{root} SELECT k AS merged FROM (SELECT CAST(1 AS DECIMAL(3,0)) k) l FULL OUTER JOIN (SELECT CAST(1000 AS BIGINT) k) r USING(k)"
-            );
-            let typed = analyze_projection_expr(&sql).unwrap();
-            assert_eq!(
-                typed.value_type.data_type().clone(),
-                DataType::Decimal128(19, 0)
-            );
-            let ExprKind::FunctionCall {
-                name,
-                args,
-                binding,
+        use novarocks_type_contract::TrinoCastMode;
+
+        let sql = "SELECT k AS merged FROM (SELECT CAST(1 AS DECIMAL(3,0)) k) l FULL OUTER JOIN (SELECT CAST(1000 AS BIGINT) k) r USING(k)";
+        let typed = analyze_projection_expr(sql).unwrap();
+        let common_type = DataType::Decimal128(19, 0);
+        assert_eq!(typed.value_type.data_type(), &common_type);
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = typed.kind
+        else {
+            panic!("expected synthesized COALESCE: {sql}");
+        };
+        assert_eq!(name, "coalesce");
+        assert_eq!(args.len(), 2);
+        assert!(
+            binding
+                .selected
+                .argument_types
+                .iter()
+                .all(|arg| matches!(arg,
+                    novarocks_functions::FunctionArgumentType::Value(value)
+                        if value.data_type() == &common_type
+                ))
+        );
+        for (arg, original_type) in args
+            .iter()
+            .zip([DataType::Decimal128(3, 0), DataType::Int64])
+        {
+            let ExprKind::Cast {
+                cast_mode: Some(TrinoCastMode::Implicit),
+                expr,
+                target,
                 ..
-            } = typed.kind
+            } = &arg.kind
             else {
-                panic!("expected synthesized COALESCE: {sql}")
-            };
-            assert_eq!(name, "coalesce");
-            assert_eq!(args.len(), 2);
-            assert!(
-                binding
-                    .selected
-                    .argument_types
-                    .iter()
-                    .all(|arg| matches!(arg,
-                novarocks_functions::FunctionArgumentType::Value(value)
-                    if *value.data_type() == DataType::Decimal128(19, 0)))
-            );
-            let ExprKind::Cast {
-                array_failure_mode: None,
-                expr,
-                target,
-                decimal_overflow_policy,
-            } = &args[0].kind
-            else {
-                panic!("expected widening decimal cast: {sql}")
+                panic!("expected widening implicit cast: {arg:?}");
             };
             assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
-            assert_eq!(*target, DataType::Decimal128(19, 0));
-            assert_eq!(*decimal_overflow_policy, expected);
-            let ExprKind::Cast {
-                array_failure_mode: None,
-                expr,
-                target,
-                decimal_overflow_policy,
-            } = &args[1].kind
-            else {
-                panic!("expected right BIGINT-to-DECIMAL automatic cast: {sql}")
-            };
-            assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
-            assert_eq!(expr.value_type.data_type().clone(), DataType::Int64);
-            assert_eq!(*target, DataType::Decimal128(19, 0));
-            assert_eq!(*decimal_overflow_policy, expected, "{sql}");
+            assert_eq!(expr.value_type.data_type(), &original_type);
+            assert_eq!(target, &common_type);
         }
     }
 
@@ -11398,8 +11055,8 @@ mod tests {
         }
     }
     #[test]
-    fn implicit_common_numeric_coercions_freeze_nullable_casts_before_folding() {
-        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+    fn implicit_common_numeric_coercions_preserve_nonnull_literals_before_folding() {
+        use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
         let control = crate::compiler::SqlCompileControl::unbounded();
         for sql in [
             "SELECT 0.1 = 0.25",
@@ -11413,9 +11070,15 @@ mod tests {
             };
             let output = &select.projection[0].expr;
             let coerced = match &output.kind {
-                ExprKind::BinaryOp { left, .. }
-                | ExprKind::InList { expr: left, .. }
-                | ExprKind::Between { expr: left, .. } => left.as_ref(),
+                ExprKind::FunctionCall { binding, args, .. }
+                    if binding.function_id
+                        == novarocks_type_contract::OperatorFunction::Equal.function_id() =>
+                {
+                    &args[0]
+                }
+                ExprKind::InList { expr: left, .. } | ExprKind::Between { expr: left, .. } => {
+                    left.as_ref()
+                }
                 ExprKind::Case {
                     operand: Some(left),
                     ..
@@ -11423,37 +11086,31 @@ mod tests {
                 other => panic!("actual common-type consumer: {other:?}"),
             };
             if !matches!(output.kind, ExprKind::Case { .. }) {
-                assert!(output.value_type.nullable(), "{sql}");
+                assert!(!output.value_type.nullable(), "{sql}");
             }
-            // CASE result NULLs are authored independently of its operand
-            // and labels. This CAST regression preserves that existing contract.
             assert_eq!(
                 coerced.value_type,
-                FunctionValueType::new(DataType::Decimal128(3, 2), true),
+                FunctionValueType::new(DataType::Decimal128(2, 2), false),
                 "{sql}"
             );
             let ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: Some(TrinoCastMode::Implicit),
                 expr,
                 target,
-                decimal_overflow_policy,
+                ..
             } = &coerced.kind
             else {
                 panic!("real CAST")
             };
             assert_eq!(
                 expr.value_type,
-                FunctionValueType::new(DataType::Decimal128(2, 1), false)
+                FunctionValueType::new(DataType::Decimal128(1, 1), false)
             );
-            assert_eq!(target, &DataType::Decimal128(3, 2));
-            assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
-            novarocks_functions::PreparedCastRecipe::try_new(
-                novarocks_functions::CastOperation::Carrier,
+            assert_eq!(target, &DataType::Decimal128(2, 2));
+            novarocks_functions::PreparedCastRecipe::try_new_trino(
                 &expr.value_type,
                 &coerced.value_type,
-                *decimal_overflow_policy,
-                false,
-                None,
+                TrinoCastMode::Implicit,
                 &control,
             )
             .expect("real prepared cast accepts the common-type producer declaration");
@@ -11467,7 +11124,9 @@ mod tests {
             !output.value_type.nullable(),
             "equal carriers need no new row operation"
         );
-        let ExprKind::BinaryOp { left, right, .. } = &output.kind else {
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(output)
+        else {
             panic!("comparison")
         };
         assert!(matches!(left.kind, ExprKind::Literal(_)));
@@ -11483,14 +11142,22 @@ mod tests {
         let QueryBody::Select(select) = &query.body else {
             panic!("SELECT")
         };
-        let ExprKind::BinaryOp { right, .. } = &select.projection[0].expr.kind else {
+        let Some((BinOp::Gt, [_, right])) =
+            crate::common::binary_operator::typed_comparison(&select.projection[0].expr)
+        else {
             panic!("comparison")
         };
         assert_eq!(
             right.value_type,
-            FunctionValueType::new(DataType::Decimal128(13, 4), true)
+            FunctionValueType::new(DataType::Decimal128(13, 4), false)
         );
-        let ExprKind::Cast { expr, .. } = &right.kind else {
+        let ExprKind::Cast {
+            expr,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            target: DataType::Decimal128(13, 4),
+            ..
+        } = &right.kind
+        else {
             panic!("literal's genuine common-type CAST")
         };
         assert_eq!(

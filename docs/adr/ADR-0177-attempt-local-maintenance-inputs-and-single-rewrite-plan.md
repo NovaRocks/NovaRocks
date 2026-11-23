@@ -5,6 +5,10 @@ domain: [provider-spi, table-maintenance]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0251
+    scope: "The DV-only execution carrier and rules 3 and 4's OPTIMIZE ref check at writer begin and RefUnchanged on commit"
+    link: "ADR-0251-iceberg-maintenance-commits-by-operation.md"
 partially-supersedes: [ADR-0028]
 date: 2026-10-14
 provenance:
@@ -12,13 +16,11 @@ provenance:
 code-anchors:
   - "novarocks/spi/src/connector/process_local.rs (ConnectorProcessLocalPayload)"
   - "novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs (IcebergMetadataMaintenanceAdapter::plan_maintenance, payload_for_plan)"
-  - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs (FrozenCleanupManifest, IcebergCleanupMaintenanceAdapter::manifest)"
+  - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs (IcebergCleanupMaintenanceAdapter::begin_async_in)"
   - "novarocks/connector/iceberg/src/distributed_rewrite.rs (IcebergDistributedRewriteControl::build_plan, FrozenRewritePlanContent, canonical_bytes)"
-  - "novarocks/connector/iceberg/src/typed_boundary.rs (get_table_execute_plan, table_execute_runtime_split_source)"
-  - "novarocks/connector/iceberg/src/typed_read/table_execute.rs (IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle)"
-  - "novarocks/connector/iceberg/src/commit/write_stack/control.rs (IcebergWriteSessionControl::admit, rewrite_branches_from_frozen)"
+  - "novarocks/connector/iceberg/src/commit/write_stack/control.rs (IcebergWriteSessionControl::admit_async_with_rewrite_scope)"
   - "novarocks/connector/iceberg/src/commit/write_stack/control/publication.rs (WriteRecipe::freeze)"
-  - "novarocks/frontend-application/src/query_execution/distributed_rewrite.rs (ConnectorDistributedRewriteSession::try_begin, rewrite_begin_request)"
+  - "novarocks/frontend-application/src/query_execution/distributed_rewrite.rs (ConnectorDistributedRewriteSession::from_original_session, validate_rewrite_target_groups)"
   - "novarocks/table-maintenance/src/product.rs (run_rewrite_session_terminal, execute_cleanup)"
 ---
 

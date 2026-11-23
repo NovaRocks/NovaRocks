@@ -118,7 +118,9 @@ pub(crate) fn iceberg_type(
                 ))
             })
         }
-        ConnectorDataType::String | ConnectorDataType::Json => primitive(PrimitiveType::String),
+        ConnectorDataType::String
+        | ConnectorDataType::BoundedCharacter(_)
+        | ConnectorDataType::Json => primitive(PrimitiveType::String),
         ConnectorDataType::Binary | ConnectorDataType::Bitmap | ConnectorDataType::Hll => {
             primitive(PrimitiveType::Binary)
         }

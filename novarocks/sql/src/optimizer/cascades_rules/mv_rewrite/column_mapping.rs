@@ -157,12 +157,17 @@ fn rewrite_children(
             volatility,
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => {
+            if filter.is_some() {
+                return Ok(None);
+            }
             let args = mapped!(
                 args.into_iter()
                     .map(|arg| rewrite(arena, arg))
@@ -180,6 +185,8 @@ fn rewrite_children(
                 mapped_order_by.push(key);
             }
             ScalarNode::AggregateCall {
+                occurrence,
+                filter,
                 name,
                 args,
                 distinct,
@@ -188,12 +195,12 @@ fn rewrite_children(
             }
         }
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child: mapped!(rewrite(arena, child)),
             target,
             decimal_overflow_policy,
@@ -238,6 +245,7 @@ fn rewrite_children(
             negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
@@ -256,6 +264,7 @@ fn rewrite_children(
                 None => None,
             };
             ScalarNode::Case {
+                ieee_float_equality,
                 operand,
                 when_then: mapped_when_then,
                 else_expr,
@@ -453,6 +462,8 @@ mod tests {
         let nm = names(&[(1, "a")]);
         let agg = |distinct: bool| TypedExpr {
             kind: ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "count".to_string(),
                 args: (vec![col_ref(&a)]).into(),
                 distinct,
@@ -556,6 +567,7 @@ mod tests {
     fn case_when(when: TypedExpr, then: TypedExpr, else_expr: Option<TypedExpr>) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: (vec![(when, then)]).into(),
                 else_expr: else_expr.map(novarocks_parser::ast::AstBox::new),
@@ -798,6 +810,8 @@ mod tests {
         TypedExpr {
             value_type: value_type.clone(),
             kind: ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "array_agg".into(),
                 args: (args).into(),
                 distinct: false,
@@ -910,7 +924,7 @@ mod tests {
                     true,
                 ),
                 kind: ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     expr: novarocks_parser::ast::AstBox::new(col_ref(a)),
                     target: DataType::Decimal128(3, 0),
                     decimal_overflow_policy: policy,

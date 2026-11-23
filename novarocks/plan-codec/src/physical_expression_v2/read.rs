@@ -877,41 +877,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 )?;
             }
             K::Cast(value) => {
-                decode_decimal_policy(value.decimal_overflow_policy)?;
-                if let Some(mode) = super::decode_array_cast_failure_mode(value.array_failure_mode)?
-                {
-                    self.charge(tree_lookup_work(self.definitions.len())?, admission, work)?;
-                    let child = self.required_expression(
-                        required(value.expr_id, "cast operand is absent")?,
-                        work,
-                    )?;
-                    let source = self.type_root(
-                        required(child.value_type_id, "cast source value type is absent")?,
-                        admission,
-                        work,
-                    )?;
-                    preflight_types(source, header, &mut self.facts, admission, work)?;
-                    let valid = novarocks_type_contract::array_cast_mode_types_valid_observed(
-                        source,
-                        header,
-                        mode,
-                        || work.step().map_err(Error::from),
-                    )?;
-                    work.step()?;
-                    if !valid {
-                        return Err(shape(
-                            "explicit array CAST mode differs from its source and result declarations",
-                        ));
-                    }
-                }
-                self.allow_throw(
-                    value
-                        .allow_throw_exception
-                        .as_ref()
-                        .ok_or_else(|| shape("cast ALLOW reference is absent"))?,
-                    admission,
-                    work,
-                )?;
+                super::decode_trino_cast_mode(value.cast_mode)?;
                 let carrier_id =
                     required(value.target_carrier_type_id, "cast carrier ID is absent")?;
                 self.charge(tree_lookup_work(types.carriers.len())?, admission, work)?;

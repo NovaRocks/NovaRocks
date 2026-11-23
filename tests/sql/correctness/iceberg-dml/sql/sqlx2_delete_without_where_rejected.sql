@@ -24,7 +24,7 @@
 DROP TABLE IF EXISTS ${case_db}.sqlx2_delete_without_where ;
 CREATE TABLE ${case_db}.sqlx2_delete_without_where (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.sqlx2_delete_without_where VALUES ROW(1, 'a');
 

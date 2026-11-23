@@ -126,21 +126,7 @@ pub fn validate_parquet_read_block_rows(rows: i32) -> Result<u32, String> {
 
 pub fn parse_parquet_read_block_size(size: &str) -> Result<i64, String> {
     use crate::table_properties::DataSizeParseFailure;
-    crate::table_properties::parse_airlift_data_size(
-        size,
-        || Ok(()),
-        |failure, field| match failure {
-            DataSizeParseFailure::Syntax => {
-                format!("size is not a valid data size string: {field}")
-            }
-            DataSizeParseFailure::Unit => format!("Unknown unit: {field}"),
-            DataSizeParseFailure::IntegerOverflow if field.parse::<i64>().is_err() => {
-                format!("For input string: \"{field}\"")
-            }
-            DataSizeParseFailure::IntegerOverflow => "long overflow".to_owned(),
-            DataSizeParseFailure::DecimalOverflow => format!("size is too large: {field}"),
-        },
-    )
+    crate::table_properties::parse_airlift_data_size(size, || Ok(()), DataSizeParseFailure::message)
 }
 
 /// Catalog-local defaults for writer settings frozen when a write begins.

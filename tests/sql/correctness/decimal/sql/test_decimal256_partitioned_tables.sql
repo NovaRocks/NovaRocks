@@ -66,7 +66,7 @@ CREATE TABLE ${case_db}.decimal_amount_partition (
     amount DECIMAL(38,15),
     large_amount DECIMAL(38,0),
     category VARCHAR(20),
-    amount_range STRING
+    amount_range VARCHAR
 ) WITH (format_version = 3);
 
 -- Insert test data with different amount ranges - using Iceberg-compatible decimal values

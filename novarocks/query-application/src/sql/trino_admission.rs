@@ -15,7 +15,7 @@ use super::{
     session_admit::SessionAdmitError,
 };
 
-const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+pub(super) const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.unsupported_statement"),
     phase: ErrorPhase::Admit,
     status: ErrorCodeStatus::Active,
@@ -26,8 +26,49 @@ const NOT_IN_TRANSACTION: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
-pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] =
-    &[UNSUPPORTED_STATEMENT, NOT_IN_TRANSACTION];
+const PROCEDURE_NOT_REGISTERED: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.procedure_not_found"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
+const UNKNOWN_TYPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.unknown_type"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
+pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
+    UNSUPPORTED_STATEMENT,
+    NOT_IN_TRANSACTION,
+    PROCEDURE_NOT_REGISTERED,
+    UNKNOWN_TYPE,
+];
+
+pub fn procedure_not_registered(name: &ast::ObjectName) -> QueryServiceError {
+    let procedure = name
+        .parts
+        .last()
+        .expect("parsed CALL name has an identifier");
+    QueryServiceError::from_user_error(UserError::from_descriptor(
+        PROCEDURE_NOT_REGISTERED,
+        format!(
+            "Procedure not registered: system.{}",
+            procedure.value.to_ascii_lowercase()
+        ),
+        None,
+        RetryClass::Never,
+    ))
+}
+
+pub(super) fn type_not_found(source: &str, span: Span, message: String) -> QueryServiceError {
+    QueryServiceError::from_user_error(UserError::from_descriptor(
+        UNKNOWN_TYPE,
+        message,
+        Some(span.to_user_error_location(source)),
+        RetryClass::Never,
+    ))
+}
 
 pub fn unsupported_statement(source: &str, span: Span, subject: &str) -> QueryServiceError {
     unsupported_statement_detail(source, span, format!("{subject} is not supported"))
@@ -171,27 +212,22 @@ pub fn admit_persisted_definition_semantics(
         }
         _ => return Ok(()),
     };
-    let (legacy, numeric, strict) = match definition {
+    let (legacy, strict) = match definition {
         Some(query) => {
             let map_error = |error: novarocks_sql::analyze_error::AnalyzeError| {
                 QueryServiceError::from_user_error(error.to_user_error(Some(source)))
             };
             (
                 sql_mode::query_uses_group_concat_legacy(caller, query).map_err(map_error)?,
-                sql_mode::query_uses_decimal_overflow_to_double(caller, query)
-                    .map_err(map_error)?,
                 sql_mode::query_uses_error_if_overflow(caller, query).map_err(map_error)?,
             )
         }
         None => (
             caller.sql_mode().group_concat_legacy(),
-            caller.decimal_overflow_to_double(),
             caller.sql_mode().error_if_overflow(),
         ),
     };
-    let setting = if numeric {
-        "decimal_overflow_to_double=true"
-    } else if legacy {
+    let setting = if legacy {
         "GROUP_CONCAT_LEGACY"
     } else if strict {
         "ERROR_IF_OVERFLOW"
@@ -579,7 +615,6 @@ mod tests {
         let legacy = default
             .clone()
             .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
-        let numeric = default.clone().with_decimal_overflow_to_double(true);
         let strict = default
             .clone()
             .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
@@ -597,7 +632,6 @@ mod tests {
             assert!(admit_persisted_definition_semantics(source, &preparation, &default).is_ok());
             for (settings, feature) in [
                 (&legacy, "GROUP_CONCAT_LEGACY"),
-                (&numeric, "decimal_overflow_to_double=true"),
                 (&strict, "ERROR_IF_OVERFLOW"),
             ] {
                 let error = admit_persisted_definition_semantics(source, &preparation, settings)

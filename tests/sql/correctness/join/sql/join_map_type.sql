@@ -31,12 +31,12 @@ DROP TABLE IF EXISTS ${case_db}.map_test;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.map_test (
   pk BIGINT NOT NULL,
-  map0 MAP<INT, STRING>,
+  map0 MAP<INT, VARCHAR>,
   map1 MAP<DECIMAL(16,3), VARCHAR(30)>,
-  map2 MAP<INT, ARRAY<STRING>>,
-  map3 MAP<STRING, MAP<INT, VARCHAR(30)>>,
+  map2 MAP<INT, ARRAY<VARCHAR>>,
+  map3 MAP<VARCHAR, MAP<INT, VARCHAR(30)>>,
   map4 MAP<INT, JSON>,
-  map5 MAP<INT, ROW(c INT, b STRING)>
+  map5 MAP<INT, ROW(c INT, b VARCHAR)>
 ) WITH (format_version = 3);
 
 -- query 3

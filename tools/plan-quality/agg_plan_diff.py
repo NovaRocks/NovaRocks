@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Collect FE-vs-NovaRocks aggregate split-shape EXPLAIN VERBOSE differences."""
+"""Collect FE-vs-NovaRocks aggregate split-shape EXPLAIN differences."""
 
 from __future__ import annotations
 
@@ -97,9 +97,10 @@ def case_default_database(case_id: str) -> str | None:
     return DEFAULT_DATABASES.get(case_id.split("/", 1)[0])
 
 
-def explain_sql(raw_sql: str) -> str:
+def explain_sql(raw_sql: str, *, trino: bool = False) -> str:
     stripped = raw_sql.strip().rstrip(";").strip()
-    return f"EXPLAIN VERBOSE {stripped};"
+    prefix = "EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT)" if trino else "EXPLAIN VERBOSE"
+    return f"{prefix} {stripped};"
 
 
 def run_mysql(endpoint: Endpoint, sql: str, timeout: int, database: str | None) -> str:
@@ -119,7 +120,7 @@ def safe_file_name(case_id: str) -> str:
 
 def run_novarocks(endpoint: Endpoint, raw_sql: str, timeout: float, database: str | None = None, *,
                    artifact_receipt: str | None = None, nr_catalog: str | None = None) -> str:
-    return run_text_column(endpoint, explain_sql(raw_sql), timeout, database,
+    return run_text_column(endpoint, explain_sql(raw_sql, trino=True), timeout, database,
                            receipt=artifact_receipt, catalog=nr_catalog)
 
 

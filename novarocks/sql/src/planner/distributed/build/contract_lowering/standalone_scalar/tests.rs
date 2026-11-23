@@ -226,12 +226,12 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
     }
     let cast = TypedExpr {
         kind: ExprKind::Cast {
-            array_failure_mode: None,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Try),
             expr: AstBox::new(text("not-an-integer")),
             target: DataType::Int64,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },
-        value_type: ValueType::new(DataType::Int64, false),
+        value_type: ValueType::new(DataType::Int64, true),
     };
     let negate = crate::analyzer::negation_for_test(
         TypedExpr {
@@ -323,7 +323,7 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
     // the original root. Do not invent an installed TypeOnly owner or an
     // unrooted definition, which the unit contract would independently reject.
     let query = novarocks_parser::parser::parse_query(
-        "SELECT CASE WHEN FALSE THEN ARRAY_MAP(x -> LOWER(x), ARRAY['AA','BB']) ELSE NULL END AS mapped",
+        "SELECT CASE WHEN FALSE THEN ARRAY_MAP(x -> LOWER(x), CAST(ARRAY['AA','BB'] AS ARRAY(VARCHAR))) ELSE NULL END AS mapped",
     )
     .unwrap();
     let (query, _, _) = crate::analyzer::analyze(

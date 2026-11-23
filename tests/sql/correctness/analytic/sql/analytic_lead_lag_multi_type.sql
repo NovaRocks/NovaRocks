@@ -29,8 +29,8 @@ CREATE TABLE ${case_db}.t_ll_types (
   c1 INT NOT NULL,
   c2 VARCHAR(500) NOT NULL,
   c3 VARCHAR(500),
-  c4 FLOAT,
-  c5 DECIMAL128(38, 20) NOT NULL,
+  c4 REAL,
+  c5 DECIMAL(38, 20) NOT NULL,
   c6 DATE NOT NULL
 ) WITH (format_version = 3);
 

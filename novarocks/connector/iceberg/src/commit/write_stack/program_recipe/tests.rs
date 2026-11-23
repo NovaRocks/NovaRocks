@@ -17,10 +17,7 @@
 
 //! Actual handle authors and the complete-input pure seal; no runtime factory.
 
-use super::super::{
-    domain::*,
-    test_support::{sample_partition, table_facts},
-};
+use super::super::{domain::*, test_support::table_facts};
 use super::*;
 use crate::delete_file::IcebergFileFormat;
 use crate::scan_model::IcebergSchemaFieldDef;
@@ -475,33 +472,6 @@ fn fixed_delete_recipes_require_their_signed_raw_or_shard_layout() {
         ),
         "wrong layout",
     );
-}
-
-#[test]
-fn standalone_position_rewrite_keeps_its_positional_input() {
-    let rewrite = IcebergPositionRewriteTarget::try_new(
-        "s3://b/wh/db/t/data/selected.parquet".into(),
-        3,
-        sample_partition(),
-    )
-    .unwrap();
-    let handle = IcebergWriterHandle::try_new_delete(
-        IcebergWriteBranch::DeletionVector,
-        table_facts(),
-        output(IcebergFileFormat::Puffin),
-    )
-    .unwrap()
-    .try_with_position_rewrite(rewrite)
-    .unwrap();
-    let raw = encode(&handle);
-    let input = |identity_fields| ConnectorWriteInputShape::DeletionVector {
-        identity_fields,
-        partition_source_fields: vec![],
-    };
-    assert_unchanged(&draft(&raw, input(identity())));
-    let mut reversed = identity();
-    reversed.reverse();
-    assert_provider_failure(&draft(&raw, input(reversed)), "first input columns");
 }
 
 #[test]

@@ -138,6 +138,8 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
                 output_columns.push(ImvActionColumn::output_column(action_column));
             }
 
+            // Both branches retain the definition's selected predicate, including
+            // IEEE equality. Key lineage identifies fields for refresh metadata.
             let left_delta_branch = normalize_branch_output(
                 LogicalPlanNode::new(
                     LogicalPlanKind::Join(LogicalJoinNode {
@@ -1785,6 +1787,93 @@ mod tests {
         assert_condition_refs(right_join.condition.as_ref());
         assert_version(right.left(), "left", ImvVersionRole::To);
         assert_delta(right.right(), "right", ColumnId(100));
+    }
+
+    #[test]
+    fn pure_join_delta_preserves_bound_ieee_equality_on_both_branches() {
+        use novarocks_functions::{FunctionArgument, FunctionBindingRequest};
+        use novarocks_type_contract::{DecimalOverflowPolicy, OperatorFunction};
+
+        let mut ctx = build_ctx();
+        let float_key = |name, id| {
+            let mut plan = scan(name, id);
+            let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
+                unreachable!("test scan")
+            };
+            scan.table.columns[0].data_type = DataType::Float64;
+            scan.columns[0].value_type =
+                novarocks_type_contract::FunctionValueType::new(DataType::Float64, false);
+            plan
+        };
+        let left = float_key("left", 1);
+        let right = float_key("right", 10);
+        let operands = [10, 1]
+            .into_iter()
+            .zip(["right_k", "left_k"])
+            .map(|(id, name)| {
+                let mut column = col_expr(id, name);
+                column.value_type =
+                    novarocks_type_contract::FunctionValueType::new(DataType::Float64, false);
+                column
+            })
+            .collect::<Vec<_>>();
+        let arguments = operands
+            .iter()
+            .map(|operand| FunctionArgument::Value {
+                value_type: operand.value_type.clone(),
+                constant: None,
+            })
+            .collect::<Vec<_>>();
+        let operator = OperatorFunction::Equal;
+        let binding = crate::functions::builtin_sql_function_catalog()
+            .resolve_scalar_operator_binding(
+                operator,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: None,
+                },
+                &ctx.control_view(),
+            )
+            .expect("installed DOUBLE equality");
+        let condition = crate::common::binary_operator::typed_call(
+            operator,
+            crate::binding::SqlFunctionBinding::new(binding, DecimalOverflowPolicy::OutputNull),
+            operands,
+        );
+        let plan = delta(LogicalPlanNode::new(
+            LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
+                join_type: JoinKind::Inner,
+                condition: Some(condition.clone()),
+            }),
+            vec![left, right],
+            None,
+        ));
+        let arena = ctx.scalar_arena();
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
+        let RewriteResult::Changed(changed) = RewriteJoinDeltaRule.apply(expr, &mut ctx).unwrap()
+        else {
+            panic!("expected join delta expansion")
+        };
+        let changed =
+            crate::planner::optimizer_bridge::logical::to_logical_plan(changed, &arena.borrow());
+
+        assert_eq!(changed.children.len(), 2);
+        for branch in &changed.children {
+            let LogicalPlanKind::Join(join) = &branch.unary_input().kind else {
+                panic!("expected delta Project over Join")
+            };
+            let actual = join.condition.as_ref().unwrap();
+            assert!(
+                crate::analysis::expr_identity::typed_expr_semantically_eq(
+                    &condition,
+                    actual,
+                    &ctx.control_view(),
+                )
+                .unwrap()
+            );
+        }
     }
 
     #[test]

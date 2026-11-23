@@ -75,8 +75,8 @@ pub(crate) async fn append_contents_for_test(
     summary: std::collections::BTreeMap<String, String>,
 ) -> crate::iceberg::Result<i64> {
     use super::model::{
-        Dependency, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
-        RequestShape, StartSnapshot, TableTarget,
+        Dependency, FileChanges, OperationIntent, OperationIntentParts, RequestShape,
+        StartSnapshot, TableTarget,
     };
     use super::staging::{StagingBase, StagingEngine};
     let runtime = provider.runtime();
@@ -100,7 +100,7 @@ pub(crate) async fn append_contents_for_test(
             removed: Vec::new(),
         },
         dependencies: vec![Dependency::NoRead],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: summary.clone(),
         token: operation.token(),

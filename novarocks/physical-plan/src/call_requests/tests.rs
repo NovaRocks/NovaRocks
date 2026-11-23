@@ -609,6 +609,7 @@ fn aggregate_fragment() -> Fragment {
             .unwrap();
         output.push(value);
         calls.push(AggregateCall {
+            filter_root: None,
             id,
             binding: AggregateBinding {
                 state_interpretation: None,

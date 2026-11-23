@@ -31,9 +31,9 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineitem (
-  "l_orderkey" int(11) NOT NULL,
-  "l_partkey" int(11) NOT NULL,
-  "l_suppkey" int(11),
+  "l_orderkey" INTEGER NOT NULL,
+  "l_partkey" INTEGER NOT NULL,
+  "l_suppkey" INTEGER,
   "l_shipdate" date
 ) WITH (format_version = 3);
 

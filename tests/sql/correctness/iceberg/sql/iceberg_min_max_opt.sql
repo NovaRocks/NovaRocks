@@ -25,14 +25,14 @@ CREATE TABLE iceberg_cat_${suite_uuid0}.iceberg_mm_db_${uuid0}.iceberg_mm_tbl_${
   c_int INT,
   c_bigint BIGINT,
   c_bool BOOLEAN,
-  c_float FLOAT,
+  c_float REAL,
   c_double DOUBLE,
   c_date DATE
 );
 INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_mm_db_${uuid0}.iceberg_mm_tbl_${uuid0} VALUES
-  ROW(1, 10, 100, 1000, true, 1.1, 2.2, '2025-06-29'),
-  ROW(2, 20, 200, 2000, false, 2.2, 3.3, '2025-06-30'),
-  ROW(3, 30, 300, 3000, true, 3.3, 4.4, '2025-07-01');
+  ROW(1, 10, 100, 1000, true, 1.1, 2.2, DATE '2025-06-29'),
+  ROW(2, 20, 200, 2000, false, 2.2, 3.3, DATE '2025-06-30'),
+  ROW(3, 30, 300, 3000, true, 3.3, 4.4, DATE '2025-07-01');
 SELECT
   MIN(c_tinyint) AS min_tinyint,
   MAX(c_tinyint) AS max_tinyint,

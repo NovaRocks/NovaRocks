@@ -26,7 +26,7 @@
 DROP TABLE IF EXISTS ${case_db}.t_table_lifecycle;
 CREATE TABLE ${case_db}.t_table_lifecycle (
   k1 INT,
-  v1 STRING
+  v1 VARCHAR
 );
 INSERT INTO ${case_db}.t_table_lifecycle VALUES
   ROW(1, 'a'),

@@ -31,12 +31,12 @@ CREATE CATALOG ice_ivm_bunion_${uuid0} USING iceberg WITH ("iceberg.catalog.type
 CREATE SCHEMA ice_ivm_bunion_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t2 (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 USE ice_ivm_bunion_${uuid0}.ns_${uuid0};

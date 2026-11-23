@@ -43,9 +43,9 @@ CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags (
-  dt STRING,
+  dt VARCHAR,
   user_id INT,
-  user_name STRING,
+  user_name VARCHAR,
   tag_id INT
 ) WITH (format_version = 3);
 
@@ -55,7 +55,7 @@ INSERT INTO mvrw_${uuid0}.ns_${uuid0}.user_tags
 SELECT
   '2023-04-13',
   CAST(n % 5 AS INT) AS user_id,
-  concat('u', CAST(n % 25 AS STRING)) AS user_name,
+  concat('u', CAST(n % 25 AS VARCHAR)) AS user_name,
   CAST(n % 7 AS INT) AS tag_id
 FROM TABLE(generate_series(1, 3000)) t(n);
 

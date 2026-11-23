@@ -589,7 +589,7 @@ mod tests {
                 start: None,
                 changes: FileChanges::default(),
                 dependencies: vec![],
-                isolation: IsolationLevel::Snapshot,
+                protocol: crate::commit::model::CommitProtocol::Legacy,
                 shape: RequestShape::MetadataOnly,
                 summary: BTreeMap::new(),
                 token: fixture.operation.token(),

@@ -24,8 +24,7 @@
 use novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime;
 use novarocks_spi::connector::read_stack::{
     ConnectorMergeTableHandle as _, ConnectorReadRelationKind, ConnectorSession, ConnectorSplit,
-    ConnectorTableExecuteHandle as _, ConnectorTableHandle as _, HostAddress, SchemaTableName,
-    SessionPropertyValue, SplitWeight,
+    ConnectorTableHandle as _, HostAddress, SchemaTableName, SessionPropertyValue, SplitWeight,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
@@ -39,9 +38,8 @@ use crate::catalog_config::{
 
 use super::{
     IcebergChangeSplit, IcebergChangeWindowHandle, IcebergMergeTableHandle,
-    IcebergRewritePositionDeleteFilesSplit, IcebergSystemTableReference, IcebergTableExecuteHandle,
-    IcebergTableHandle, SystemManifestSplit, SystemRelationSplit, TableChangesFunctionHandle,
-    TableChangesSplit,
+    IcebergSystemTableReference, IcebergTableHandle, SystemManifestSplit, SystemRelationSplit,
+    TableChangesFunctionHandle, TableChangesSplit,
 };
 
 #[cfg_attr(novarocks_dev_controls, derive(serde::Deserialize))]
@@ -69,10 +67,44 @@ impl IcebergReadLayout {
     }
 
     pub(crate) fn applies_to(relation: &IcebergRuntimeRelation) -> bool {
-        matches!(
-            relation,
-            IcebergRuntimeRelation::Table(_) | IcebergRuntimeRelation::ChangeWindow(_)
-        )
+        match relation {
+            IcebergRuntimeRelation::Table(table) => !table.is_data_rewrite_read(),
+            IcebergRuntimeRelation::ChangeWindow(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// A data rewrite reads storage values for its exact writer binding. Ordinary
+/// reads publish SQL values and may choose a view layout for variable bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IcebergReadProjection {
+    Sql(IcebergReadLayout),
+    DataRewrite,
+}
+
+impl IcebergReadProjection {
+    pub(crate) fn for_table(table: &IcebergTableHandle, layout: IcebergReadLayout) -> Self {
+        if table.is_data_rewrite_read() {
+            Self::DataRewrite
+        } else {
+            Self::Sql(layout)
+        }
+    }
+
+    pub(crate) const fn projects_fixed_as_binary(self) -> bool {
+        matches!(self, Self::Sql(_))
+    }
+
+    pub(crate) fn byte_carrier(
+        self,
+        data_type: &arrow::datatypes::DataType,
+        domain: novarocks_type_contract::ValueLogicalType,
+    ) -> arrow::datatypes::DataType {
+        match self {
+            Self::Sql(layout) => layout.byte_carrier(data_type, domain),
+            Self::DataRewrite => data_type.clone(),
+        }
     }
 }
 
@@ -123,7 +155,6 @@ pub enum IcebergRuntimeRelation {
     TableFunction(TableChangesFunctionHandle),
     ChangeWindow(IcebergChangeWindowHandle),
     SystemTable(IcebergSystemTableReference),
-    TableExecute(IcebergTableExecuteHandle),
     MergeTable(IcebergMergeTableHandle),
 }
 
@@ -134,7 +165,6 @@ impl IcebergRuntimeRelation {
             Self::TableFunction(_) => ConnectorReadRelationKind::TableFunction,
             Self::ChangeWindow(_) => ConnectorReadRelationKind::ChangeWindow,
             Self::SystemTable(_) => ConnectorReadRelationKind::SystemTable,
-            Self::TableExecute(_) => ConnectorReadRelationKind::TableExecute,
             Self::MergeTable(_) => ConnectorReadRelationKind::MergeTable,
         }
     }
@@ -145,8 +175,14 @@ impl IcebergRuntimeRelation {
             Self::TableFunction(handle) => handle.schema_table_name(),
             Self::ChangeWindow(handle) => handle.schema_table_name(),
             Self::SystemTable(handle) => handle.schema_table_name(),
-            Self::TableExecute(handle) => handle.schema_table_name(),
             Self::MergeTable(handle) => handle.schema_table_name(),
+        }
+    }
+
+    pub(crate) fn read_projection(&self, layout: IcebergReadLayout) -> IcebergReadProjection {
+        match self {
+            Self::Table(table) => IcebergReadProjection::for_table(table, layout),
+            _ => IcebergReadProjection::Sql(layout),
         }
     }
 }
@@ -158,7 +194,6 @@ pub enum IcebergReadSplit {
     ChangeWindow(IcebergChangeSplit),
     SystemManifest(SystemManifestSplit),
     SystemRelation(SystemRelationSplit),
-    RewritePositionDeleteFiles(IcebergRewritePositionDeleteFilesSplit),
 }
 
 /// The backend-only half of Iceberg's read type family.
@@ -228,7 +263,6 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::ChangeWindow(split) => split.is_remotely_accessible(),
             Self::SystemManifest(split) => split.is_remotely_accessible(),
             Self::SystemRelation(split) => split.is_remotely_accessible(),
-            Self::RewritePositionDeleteFiles(split) => split.is_remotely_accessible(),
         }
     }
 
@@ -239,7 +273,6 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::ChangeWindow(split) => split.addresses(),
             Self::SystemManifest(split) => split.addresses(),
             Self::SystemRelation(split) => split.addresses(),
-            Self::RewritePositionDeleteFiles(split) => split.addresses(),
         }
     }
 
@@ -250,7 +283,6 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::ChangeWindow(split) => split.affinity_key(),
             Self::SystemManifest(split) => split.affinity_key(),
             Self::SystemRelation(split) => split.affinity_key(),
-            Self::RewritePositionDeleteFiles(split) => split.affinity_key(),
         }
     }
 
@@ -261,7 +293,6 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::ChangeWindow(split) => split.split_weight(),
             Self::SystemManifest(split) => split.split_weight(),
             Self::SystemRelation(split) => split.split_weight(),
-            Self::RewritePositionDeleteFiles(split) => split.split_weight(),
         }
     }
 
@@ -272,7 +303,6 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::ChangeWindow(split) => split.retained_size_in_bytes(),
             Self::SystemManifest(split) => split.retained_size_in_bytes(),
             Self::SystemRelation(split) => split.retained_size_in_bytes(),
-            Self::RewritePositionDeleteFiles(split) => split.retained_size_in_bytes(),
         }
     }
 }

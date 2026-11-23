@@ -32,7 +32,7 @@ CREATE CATALOG ice_ivm_a11_drop_add_${uuid0} USING iceberg WITH ("iceberg.catalo
 CREATE SCHEMA ice_ivm_a11_drop_add_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_a11_drop_add_${uuid0}.ns_${uuid0}.base_${uuid0} (
   id INT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_a11_drop_add_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES

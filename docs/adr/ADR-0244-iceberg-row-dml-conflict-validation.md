@@ -5,6 +5,10 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0251
+    scope: "Rule 7's ownership of the public commit failure message for ordinary Iceberg row-level writes"
+    link: "ADR-0251-iceberg-maintenance-commits-by-operation.md"
 partially-supersedes:
   - id: ADR-0171
     scope: "RefUnchanged and the conservative conflict-domain policy for ordinary Iceberg DELETE, UPDATE, and MERGE"
@@ -33,7 +37,8 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/dependency/row_delta.rs (RowDeltaWindowCheck)"
   - "novarocks/connector/iceberg/src/commit/write_stack/control/publication/materialized.rs (MaterializedDeleteStep)"
   - "novarocks/connector/iceberg/src/commit/attempt.rs (commit loop)"
-  - "novarocks/trino-adapter/src/error_mapping.rs (public commit error projection)"
+  - "novarocks/connector/iceberg/src/catalog_control/maintenance_error.rs (project_maintenance_commit_failure)"
+  - "novarocks/trino-adapter/src/error_mapping.rs (commit_failure_code)"
 ---
 
 ## 问题

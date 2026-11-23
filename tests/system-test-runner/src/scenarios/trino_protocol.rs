@@ -947,16 +947,22 @@ fn refusals(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     let error = failed_query(
         actor,
         "SELECT CAST(1 AS LARGEINT) AS wide_value",
-        (13, "NOT_SUPPORTED", "USER_ERROR"),
+        (58, "TYPE_MISMATCH", "USER_ERROR"),
     )?;
     ensure!(
         error["error"]["message"]
             .as_str()
             .context("missing refusal message")?
-            .contains("wide_value"),
-        "unsupported type error omitted actual column name"
+            .contains("Unknown type: largeint"),
+        "retired type error omitted the original type name"
     );
-    context.action("verified Host/user HTTP refusals, unsupported feature errors and named LARGEINT type rejection");
+    ensure!(
+        error["error"]["errorLocation"]["lineNumber"] == 1
+            && error["error"]["errorLocation"]["columnNumber"] == 18,
+        "retired type error omitted the original declaration location"
+    );
+    context.action("verified Host/user HTTP refusals, unsupported feature errors and the LARGEINT type declaration diagnostic");
+
     temporal_result_capabilities(actor)?;
     context.action("verified independently negotiated temporal metadata, signed interval keys, and terminal legacy MAP collision refusal");
     Ok(())

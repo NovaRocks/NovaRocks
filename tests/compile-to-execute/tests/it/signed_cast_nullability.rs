@@ -44,7 +44,8 @@ use novarocks_sql_testkit::sql_source_with_declared_fields;
 use novarocks_test_compile_to_execute::compiler_results::{compile_options, validate_package};
 use novarocks_test_compile_to_execute::programs::frozen_reads_with_explicit_source_shape;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType, PureCompileControl,
+    CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType, OperatorFunction,
+    PureCompileControl, TrinoCastMode,
 };
 use prost::Message;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -127,7 +128,7 @@ fn check_array_source(
     expected_values: &[Option<i32>],
 ) {
     {
-        let sql = format!("SELECT [10,20][{index_expression}] AS picked FROM t");
+        let sql = format!("SELECT TRY(ARRAY[10,20][{index_expression}]) AS picked FROM t");
         let source = sql_source_with_declared_fields(&sql, std::slice::from_ref(&field));
         let declaration = source
             .checked_original_result_declaration_observed(&Control)
@@ -151,15 +152,14 @@ fn check_array_source(
                 let ExprKind::FunctionCall { function, args } = &expression.kind else {
                     continue;
                 };
-                if function.function_id.as_str() != "builtin.scalar/__array_element_at/v1" {
+                if function.function_id.as_str()
+                    != OperatorFunction::ArraySubscript.function_id_text()
+                {
                     continue;
                 }
                 let index = unit.definition(args[1]).unwrap();
-                let expected = FunctionValueType::new(
-                    DataType::Int32,
-                    expected_index_source.nullable()
-                        || expected_index_source.data_type() == &DataType::Int64,
-                );
+                let expected =
+                    FunctionValueType::new(DataType::Int64, expected_index_source.nullable());
                 assert_eq!(index.ty, expected);
                 assert_eq!(
                     function.argument_types[1],
@@ -170,13 +170,20 @@ fn check_array_source(
                     panic!("real index source");
                 };
                 assert_eq!(value_type, &expected);
-                if expected_index_source.data_type() == &DataType::Int32 {
+                if expected_index_source.data_type() == &DataType::Int64 {
                     assert_eq!(index.ty, expected_index_source);
+                    assert!(!matches!(&index.kind, ExprKind::Cast { .. }));
                 } else {
-                    let ExprKind::Cast { expr, target, .. } = &index.kind else {
-                        panic!("implicit signed index cast");
+                    let ExprKind::Cast {
+                        expr,
+                        target,
+                        cast_mode,
+                    } = &index.kind
+                    else {
+                        panic!("implicit widening of the original subscript index");
                     };
-                    assert_eq!(target, &DataType::Int32);
+                    assert_eq!(target, &DataType::Int64);
+                    assert_eq!(*cast_mode, TrinoCastMode::Implicit);
                     assert_eq!(unit.definition(*expr).unwrap().ty, expected_index_source);
                 }
                 indexes += 1;
@@ -324,7 +331,7 @@ fn check_array_source(
 }
 
 #[test]
-fn actual_primitive_if_index_retains_exact_type_and_overflow_is_successful_null() {
+fn actual_primitive_if_index_retains_exact_type_and_try_recovers_a_bad_subscript() {
     let input: ArrayRef = Arc::new(Int32Array::from(vec![99, 1, 2, 3, 99]));
     for (expression, index_type, expected) in [
         (

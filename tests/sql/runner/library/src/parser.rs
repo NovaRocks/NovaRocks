@@ -308,13 +308,16 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
             PublicationCatalogFault::BeforeRequirementCheckHoldForConcurrentShell
         }
         "after-commit-before-response" => PublicationCatalogFault::AfterCommitBeforeResponse,
+        "after-commit-before-response-hide-table-load" => {
+            PublicationCatalogFault::AfterCommitBeforeResponseHideTableLoad
+        }
         "after-commit-hold-for-frontend-kill" => {
             PublicationCatalogFault::AfterCommitHoldForFrontendKill
         }
         "incomplete-discovery" => PublicationCatalogFault::IncompleteDiscovery,
         "corrupt-package" => PublicationCatalogFault::CorruptPackage,
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-forbidden, before-dispatch-hold-for-concurrent-shell, before-requirement-check-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-forbidden, before-dispatch-hold-for-concurrent-shell, before-requirement-check-hold-for-concurrent-shell, after-commit-before-response, after-commit-before-response-hide-table-load, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
         ),
     };
     let compatible = matches!(
@@ -329,6 +332,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
             PublicationCatalogAction::TableCommit,
             PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell
                 | PublicationCatalogFault::BeforeRequirementCheckHoldForConcurrentShell
+                | PublicationCatalogFault::AfterCommitBeforeResponseHideTableLoad
         ) | (
             PublicationCatalogAction::NamespaceList,
             PublicationCatalogFault::IncompleteDiscovery

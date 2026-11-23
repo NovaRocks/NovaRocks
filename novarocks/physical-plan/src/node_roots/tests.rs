@@ -127,6 +127,7 @@ fn function(kind: FunctionKind) -> BoundFunction {
 }
 fn aggregate() -> AggregateCall {
     AggregateCall {
+        filter_root: None,
         id: AggregateCallId::new(0),
         binding: AggregateBinding {
             state_interpretation: None,
@@ -267,11 +268,13 @@ fn ordinary_hash_join_keys_keep_each_side_and_residual_truth_scope() {
                         left: r(9),
                         right: r(3),
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     },
                     JoinKey {
                         left: r(2),
                         right: r(8),
                         null_safe: true,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     },
                 ]),
                 residual: Some(r(5)),
@@ -310,11 +313,13 @@ fn naa_value_keys_scope_keys_and_eligibility_keep_separate_order_and_value_deman
                     left: r(9),
                     right: r(2),
                     null_safe: false,
+                    match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                 }]),
                 scope_keys: Box::new([JoinKey {
                     left: r(7),
                     right: r(3),
                     null_safe: true,
+                    match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                 }]),
                 eligibility: Some(r(5)),
             },

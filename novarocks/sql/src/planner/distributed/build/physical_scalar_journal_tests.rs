@@ -211,7 +211,7 @@ fn scalar_journal_keeps_original_none_for_cast_and_nested_physical_constants() {
     for argument in [
         TypedExpr {
             kind: TypedKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(text("MiXeD")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -284,7 +284,7 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
     };
     let owner = authored(TypedExpr {
         kind: TypedKind::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(input),
             target: DataType::LargeUtf8,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

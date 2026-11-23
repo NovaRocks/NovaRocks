@@ -21,8 +21,9 @@
 use arrow_array::{types::*, *};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ExpressionEffectContext,
-    FunctionValueType, PureCompileControl, ValueLogicalType, arrow_data_types_exact_observed,
+    CharacterKind, CompileCheckpoints, CompileControlError, CompilePhase, ExpressionEffectContext,
+    FunctionValueType, PureCompileControl, ValueKind, ValueLogicalType,
+    arrow_data_types_exact_observed,
 };
 use std::{cmp::Ordering, error::Error, fmt};
 
@@ -99,6 +100,7 @@ impl From<novarocks_type_contract::ValueTypeError> for ComparisonPrepareError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedComparisonRecipe {
     operator: ComparisonOperator,
+    ieee_float_equality: bool,
     left: FunctionValueType,
     right: FunctionValueType,
     leaf: FlatLeaf,
@@ -141,6 +143,7 @@ enum FlatLeaf {
     IntervalDayTime,
     IntervalMonthDayNano,
     Utf8,
+    Char,
     LargeUtf8,
     Binary,
     LargeBinary,
@@ -226,8 +229,17 @@ impl PreparedComparisonRecipe {
             if temporal != right.value_type().temporal() {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
+            let character = char_declaration(left);
+            if character != char_declaration(right) {
+                return Err(ComparisonPrepareError::TypeMismatch);
+            }
             let leaf = if let Some(declaration) = temporal {
                 FlatLeaf::Temporal(declaration)
+            } else if character.is_some() {
+                if left.data_type() != &DataType::Utf8 {
+                    return Err(ComparisonPrepareError::Unsupported);
+                }
+                FlatLeaf::Char
             } else if left.logical_type() == ValueLogicalType::LargeInt {
                 FlatLeaf::LargeInt
             } else {
@@ -245,6 +257,7 @@ impl PreparedComparisonRecipe {
             work.flush()?;
             let prepared = Self {
                 operator,
+                ieee_float_equality: false,
                 left: left.clone(),
                 right: right.clone(),
                 leaf,
@@ -262,6 +275,21 @@ impl PreparedComparisonRecipe {
         work.finish()?;
         result
     }
+    pub fn try_new_ieee_float_equality(
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ComparisonPrepareError> {
+        let mut recipe = Self::try_new(ComparisonOperator::Eq, left, right, control)?;
+        if left.logical_type() != ValueLogicalType::Physical
+            || !matches!(recipe.leaf, FlatLeaf::Float32 | FlatLeaf::Float64)
+        {
+            return Err(ComparisonPrepareError::Unsupported);
+        }
+        recipe.ieee_float_equality = true;
+        Ok(recipe)
+    }
+
     pub fn operator(&self) -> ComparisonOperator {
         self.operator
     }
@@ -345,7 +373,14 @@ impl PreparedComparisonRecipe {
                     Ok(None)
                 } else {
                     let bytes: fn(&$ty, usize) -> &[u8] = $bytes;
-                    compare_bytes(self.operator, bytes(left, l), bytes(right, r), work).map(Some)
+                    compare_bytes(
+                        self.operator,
+                        bytes(left, l),
+                        bytes(right, r),
+                        self.leaf == FlatLeaf::Char,
+                        work,
+                    )
+                    .map(Some)
                 }
             }};
         }
@@ -388,6 +423,12 @@ impl PreparedComparisonRecipe {
             FlatLeaf::UInt32 => p!(UInt32Type),
             FlatLeaf::UInt64 => p!(UInt64Type),
             FlatLeaf::Float16 => p!(Float16Type),
+            FlatLeaf::Float32 if self.ieee_float_equality => {
+                ieee_float_eq::<Float32Type>(left, l, right, r, work)
+            }
+            FlatLeaf::Float64 if self.ieee_float_equality => {
+                ieee_float_eq::<Float64Type>(left, l, right, r, work)
+            }
             FlatLeaf::Float32 => p!(Float32Type),
             FlatLeaf::Float64 => p!(Float64Type),
             FlatLeaf::Decimal32 => p!(Decimal32Type),
@@ -411,7 +452,7 @@ impl PreparedComparisonRecipe {
             FlatLeaf::IntervalYearMonth => p!(IntervalYearMonthType),
             FlatLeaf::IntervalDayTime => p!(IntervalDayTimeType),
             FlatLeaf::IntervalMonthDayNano => p!(IntervalMonthDayNanoType),
-            FlatLeaf::Utf8 => b!(StringArray, |a, i| a.value(i).as_bytes()),
+            FlatLeaf::Utf8 | FlatLeaf::Char => b!(StringArray, |a, i| a.value(i).as_bytes()),
             FlatLeaf::LargeUtf8 => b!(LargeStringArray, |a, i| a.value(i).as_bytes()),
             FlatLeaf::Binary => b!(BinaryArray, |a, i| a.value(i)),
             FlatLeaf::LargeBinary => b!(LargeBinaryArray, |a, i| a.value(i)),
@@ -462,17 +503,49 @@ fn primitive<T: ArrowPrimitiveType>(
     work.step()?;
     Ok(Some(equal))
 }
+pub(crate) fn ieee_float_comparison<T: PartialOrd>(
+    operator: ComparisonOperator,
+    left: T,
+    right: T,
+) -> bool {
+    left.partial_cmp(&right)
+        .map_or(operator == ComparisonOperator::Ne, |ordering| {
+            operator.apply(ordering)
+        })
+}
+
+fn ieee_float_eq<T: ArrowPrimitiveType>(
+    left: &dyn Array,
+    l: usize,
+    right: &dyn Array,
+    r: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<bool>, KernelFailure>
+where
+    T::Native: PartialOrd,
+{
+    let left = cast::<PrimitiveArray<T>>(left)?;
+    let right = cast::<PrimitiveArray<T>>(right)?;
+    if left.is_null(l) || right.is_null(r) {
+        return Ok(None);
+    }
+    let matches = ieee_float_comparison(ComparisonOperator::Eq, left.value(l), right.value(r));
+    work.step()?;
+    Ok(Some(matches))
+}
+
 fn equal_bytes(
     left: &[u8],
     right: &[u8],
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
-    compare_bytes(ComparisonOperator::Eq, left, right, work)
+    compare_bytes(ComparisonOperator::Eq, left, right, false, work)
 }
 fn compare_bytes(
     operator: ComparisonOperator,
     left: &[u8],
     right: &[u8],
+    pad_char: bool,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
     if !operator.is_ordering() && left.len() != right.len() {
@@ -486,10 +559,37 @@ fn compare_bytes(
             return Ok(operator.apply(ordering));
         }
     }
-    let ordering = left.len().cmp(&right.len());
+    let length_order = left.len().cmp(&right.len());
+    if pad_char && length_order != Ordering::Equal {
+        let (shorter, longer) = if length_order == Ordering::Less {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        for &byte in &longer[shorter.len()..] {
+            let ordering = b' '.cmp(&byte);
+            work.step()?;
+            if ordering != Ordering::Equal {
+                return Ok(operator.apply(if length_order == Ordering::Less {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }));
+            }
+        }
+        return Ok(operator.apply(Ordering::Equal));
+    }
     work.step()?;
-    Ok(operator.apply(ordering))
+    Ok(operator.apply(length_order))
 }
+
+fn char_declaration(ty: &FunctionValueType) -> Option<novarocks_type_contract::CharacterType> {
+    match ty.value_type().kind() {
+        ValueKind::BoundedCharacter(ty) if ty.kind() == CharacterKind::Char => Some(*ty),
+        _ => None,
+    }
+}
+
 fn flat_type_matches(
     expected: &DataType,
     actual: &DataType,

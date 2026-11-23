@@ -26,10 +26,10 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    v1 int(11) ,
-    v2 int(11) ,
-    v3 int(11) NOT NULL,
-    v4 int(11)
+    v1 INTEGER ,
+    v2 INTEGER ,
+    v3 INTEGER NOT NULL,
+    v4 INTEGER
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t1 VALUES
 ROW(1, 1, 1, NULL), ROW(1, 1, 2, NULL), ROW(1, NULL, 3, NULL), ROW(1, NULL, 4, NULL),
@@ -176,8 +176,8 @@ SELECT v3, AVG(v3) OVER(ORDER BY v3 ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS
 -- query 32
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (
-    v1 int(11) ,
-    v2 STRING
+    v1 INTEGER ,
+    v2 VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t2 VALUES
 ROW(1, '1'), ROW(2, NULL), ROW(3, '2'), ROW(4, '2'), ROW(5, '2'),

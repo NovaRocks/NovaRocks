@@ -17,27 +17,30 @@
 
 // Design: ADR-0244 (docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{ConnectorError, ConnectorMutationFailure};
 
-use super::history::{HistoryGap, HistoryWindow, history_window};
+use super::history::{HistoryGap, history_window};
+use super::window::{
+    WindowFiles, WindowTrace, data_candidate, delete_candidate, delete_sequence,
+    equality_can_match, has_owner, position_target, snapshot_ids,
+};
 use super::{ValidationInputs, Verdict};
 use crate::commit::conflict::{
     CandidateFile, MayMatch, RowDeltaValidationFacts, validation_conflict,
 };
-use crate::commit::manifest_sources::SnapshotSources;
-use crate::commit::model::{ArtifactWriter, Dependency, EntryIdentity, IsolationLevel};
-use crate::delete_semantics::{POSITION_FILE_PATH_FIELD_ID, TypedPartition};
+use crate::commit::model::{ArtifactWriter, CommitOperation, EntryIdentity, IsolationLevel};
+#[cfg(test)]
+use crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID;
+use crate::delete_semantics::TypedPartition;
 use crate::iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus, Operation,
-    PrimitiveLiteral, StructType, TableMetadata,
+    DataContentType, DataFileFormat, ManifestContentType, ManifestStatus, Operation, StructType,
+    TableMetadata,
 };
 use crate::iceberg::{Error, ErrorKind, Result};
-use crate::manifest::binding::BoundEntry;
 use crate::read_snapshot::historical_mutation_partition_types;
 
 const DELETED_DATA_OPERATIONS: &[Operation] =
@@ -62,10 +65,6 @@ pub(crate) struct RowDeltaWindowCheck {
 }
 
 impl RowDeltaWindowCheck {
-    pub(crate) const fn isolation(&self) -> IsolationLevel {
-        self.isolation
-    }
-
     // The write operation installs this dependency when it freezes its row-delta intent.
     pub(crate) fn new(
         isolation: IsolationLevel,
@@ -109,48 +108,7 @@ impl PartialEq for RowDeltaWindowCheck {
 
 impl Eq for RowDeltaWindowCheck {}
 
-struct WindowTrace {
-    attempt: crate::commit::model::AttemptToken,
-    stage: Option<usize>,
-    start: Option<i64>,
-    parent: Option<i64>,
-    isolation: IsolationLevel,
-    window_len: Option<usize>,
-    checks: Vec<&'static str>,
-    failed_check: Option<&'static str>,
-    object: Option<String>,
-    complete: bool,
-}
-
-impl WindowTrace {
-    fn reject(&mut self, check: &'static str, object: Option<&str>) {
-        self.failed_check = Some(check);
-        self.object = object.map(ToOwned::to_owned);
-        self.complete = true;
-    }
-}
-
-impl Drop for WindowTrace {
-    fn drop(&mut self) {
-        tracing::debug!(
-            operation = ?self.attempt.operation(),
-            attempt = self.attempt.ordinal(),
-            stage = ?self.stage,
-            source_snapshot = ?self.start,
-            parent_snapshot = ?self.parent,
-            isolation = ?self.isolation,
-            window_len = ?self.window_len,
-            checks = ?self.checks,
-            failed_check = self.failed_check,
-            object = self.object.as_deref(),
-            complete = self.complete,
-            "Iceberg row-delta window validation",
-        );
-    }
-}
-
 pub(super) async fn validate_row_delta(
-    dependency: &Dependency,
     check: &RowDeltaWindowCheck,
     inputs: &ValidationInputs<'_>,
     start: Option<i64>,
@@ -159,26 +117,24 @@ pub(super) async fn validate_row_delta(
 ) -> Result<Verdict> {
     io.check_active()?;
     let metadata = inputs.metadata;
-    let mut trace = WindowTrace {
-        attempt: io.attempt_token(),
-        stage: inputs.stage,
+    let mut trace = WindowTrace::new(
+        CommitOperation::Write,
+        Some(check.isolation),
+        inputs,
         start,
-        parent: inputs.parent,
-        isolation: check.isolation,
-        window_len: None,
-        checks: vec!["ancestor", "history"],
-        failed_check: None,
-        object: None,
-        complete: false,
-    };
+        io,
+        vec!["ancestor", "history"],
+    );
     let window = match history_window(metadata, start, inputs.parent) {
         Ok(window) => window,
         Err(reason) => {
             trace.reject("history", None);
-            return Ok(Verdict::Unprovable {
-                dependency: dependency.clone(),
-                reason,
-            });
+            return Ok(Verdict::ValidationConflict(history_conflict(
+                &reason,
+                metadata,
+                start,
+                inputs.parent,
+            )));
         }
     };
     trace.window_len = Some(window.snapshots().len());
@@ -344,33 +300,6 @@ pub(super) async fn validate_row_delta(
     Ok(Verdict::Holds)
 }
 
-fn snapshot_ids(window: &HistoryWindow, operations: &[Operation]) -> BTreeSet<i64> {
-    window
-        .filtered(operations)
-        .map(|snapshot| snapshot.snapshot_id())
-        .collect()
-}
-
-fn has_owner(entry: &BoundEntry<'_>, owners: &BTreeSet<i64>) -> bool {
-    entry
-        .sequences
-        .snapshot_id
-        .is_some_and(|id| owners.contains(&id))
-}
-
-fn delete_sequence(entry: &BoundEntry<'_>) -> Result<i64> {
-    entry
-        .sequences
-        .data_sequence
-        .filter(|sequence| *sequence >= 0)
-        .ok_or_else(|| {
-            invalid(format!(
-                "Delete file {} has no resolved data sequence",
-                entry.raw.data_file().file_path()
-            ))
-        })
-}
-
 fn may_match(check: &RowDeltaWindowCheck, file: &CandidateFile<'_>) -> Result<bool> {
     check
         .scope
@@ -379,104 +308,6 @@ fn may_match(check: &RowDeltaWindowCheck, file: &CandidateFile<'_>) -> Result<bo
             Error::new(ErrorKind::Unexpected, error.message()).with_source(error)
         })
 }
-
-fn data_candidate<'a>(
-    metadata: &'a TableMetadata,
-    entry: &BoundEntry<'a>,
-) -> Result<CandidateFile<'a>> {
-    let file = entry.raw.data_file();
-    if file.content_type() != DataContentType::Data {
-        return Err(invalid("A data manifest contains a delete entry"));
-    }
-    Ok(CandidateFile {
-        metadata,
-        spec_id: entry.source.descriptor.partition_spec_id,
-        file,
-    })
-}
-
-fn delete_candidate<'a>(
-    metadata: &'a TableMetadata,
-    entry: &BoundEntry<'a>,
-) -> Result<CandidateFile<'a>> {
-    let file = entry.raw.data_file();
-    if !matches!(
-        file.content_type(),
-        DataContentType::EqualityDeletes | DataContentType::PositionDeletes
-    ) {
-        return Err(invalid("A delete manifest contains a data entry"));
-    }
-    Ok(CandidateFile {
-        metadata,
-        spec_id: entry.source.descriptor.partition_spec_id,
-        file,
-    })
-}
-
-struct WindowFiles<'a> {
-    metadata: &'a TableMetadata,
-    io: &'a dyn ArtifactWriter,
-    window: &'a HistoryWindow,
-}
-
-impl WindowFiles<'_> {
-    async fn find(
-        &self,
-        operations: &[Operation],
-        content: ManifestContentType,
-        must_have_additions: bool,
-        mut find: impl FnMut(&BoundEntry<'_>) -> Result<Option<String>>,
-    ) -> Result<Option<String>> {
-        for snapshot in self.window.filtered(operations) {
-            let sources = SnapshotSources::load(self.metadata, snapshot, self.io.file_io(), || {
-                self.io.check_active()
-            })
-            .await?;
-            let result = sources
-                .fold(
-                    self.io.file_io(),
-                    || self.io.check_active(),
-                    |descriptor| {
-                        descriptor.content == content
-                            && descriptor.added_snapshot_id == snapshot.snapshot_id()
-                            && (!must_have_additions || descriptor.has_added_files())
-                    },
-                    |entry| match find(&entry)? {
-                        Some(detail) => {
-                            Err(Error::new(ErrorKind::Unexpected, "Row-delta entry matched")
-                                .with_source(MatchedEntry(detail)))
-                        }
-                        None => Ok(()),
-                    },
-                )
-                .await;
-            if let Err(error) = result {
-                use std::error::Error as _;
-                if let Some(matched) = error
-                    .source()
-                    .and_then(|cause| cause.downcast_ref::<MatchedEntry>())
-                {
-                    return Ok(Some(matched.0.clone()));
-                }
-                return Err(error);
-            }
-        }
-        Ok(None)
-    }
-}
-
-// SnapshotSources::fold stops at the first match without reading another
-// manifest. Original reader, predicate and control errors travel unchanged.
-#[derive(Debug)]
-struct MatchedEntry(String);
-
-impl fmt::Display for MatchedEntry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for MatchedEntry {}
 
 fn conflict(message: String) -> Result<Verdict> {
     Ok(Verdict::ValidationConflict(validation_conflict(message)))
@@ -606,90 +437,6 @@ fn replaced_data_file(
         }
     }
     Ok(None)
-}
-
-fn position_target(file: &DataFile) -> Result<Option<Cow<'_, str>>> {
-    if file.content_type() == DataContentType::EqualityDeletes {
-        return Ok(None);
-    }
-    if let Some(path) = file.referenced_data_file() {
-        return Ok(Some(Cow::Owned(path)));
-    }
-    if file.file_format() == DataFileFormat::Puffin {
-        return Err(invalid(
-            "Concurrent deletion vector is missing its referenced data file",
-        ));
-    }
-    let lower = file.lower_bounds().get(&POSITION_FILE_PATH_FIELD_ID);
-    let upper = file.upper_bounds().get(&POSITION_FILE_PATH_FIELD_ID);
-    match (
-        lower.map(|bound| bound.literal()),
-        upper.map(|bound| bound.literal()),
-    ) {
-        (Some(PrimitiveLiteral::String(lower)), Some(PrimitiveLiteral::String(upper)))
-            if lower == upper =>
-        {
-            Ok(Some(Cow::Borrowed(lower.as_str())))
-        }
-        _ => Ok(None),
-    }
-}
-
-// The delete index checks equality field ranges after partition and sequence.
-fn equality_can_match(delete: &DataFile, data: &DataFile, metadata: &TableMetadata) -> bool {
-    let Some(ids) = delete.equality_ids() else {
-        return true;
-    };
-    ids.iter().all(|id| {
-        let field = metadata.current_schema().field_by_id(*id).or_else(|| {
-            // A delete can still carry metrics for a field that was dropped.
-            metadata
-                .schemas_iter()
-                .filter_map(|schema| Some((schema.schema_id(), schema.field_by_id(*id)?)))
-                .max_by_key(|(schema_id, _)| *schema_id)
-                .map(|(_, field)| field)
-        });
-        let Some(field) = field else {
-            return true;
-        };
-        if !field.field_type.is_primitive() {
-            return true;
-        }
-        let data_nulls = data.null_value_counts().get(id).copied();
-        let delete_nulls = delete.null_value_counts().get(id).copied();
-        let data_values = data.value_counts().get(id).copied();
-        let delete_values = delete.value_counts().get(id).copied();
-
-        if !field.required {
-            // Two nullable files might have a matching null, even when their
-            // ordinary values' bounds are disjoint.
-            if data_nulls != Some(0) && delete_nulls != Some(0) {
-                return true;
-            }
-            if (data_nulls.is_some() && data_nulls == data_values && delete_nulls == Some(0))
-                || (delete_nulls.is_some()
-                    && delete_nulls == delete_values
-                    && data_nulls == Some(0))
-            {
-                return false;
-            }
-        }
-        let (Some(data_lower), Some(data_upper), Some(delete_lower), Some(delete_upper)) = (
-            data.lower_bounds().get(id),
-            data.upper_bounds().get(id),
-            delete.lower_bounds().get(id),
-            delete.upper_bounds().get(id),
-        ) else {
-            return true;
-        };
-        !matches!(
-            data_lower.partial_cmp(delete_upper),
-            Some(std::cmp::Ordering::Greater)
-        ) && !matches!(
-            delete_lower.partial_cmp(data_upper),
-            Some(std::cmp::Ordering::Greater)
-        )
-    })
 }
 
 fn invalid(message: impl Into<String>) -> Error {

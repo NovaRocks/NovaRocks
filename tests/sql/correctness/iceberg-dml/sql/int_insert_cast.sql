@@ -38,3 +38,57 @@ INSERT INTO ${case_db}.t_int_insert_regression VALUES ROW(3, 3);
 SELECT id, v
 FROM ${case_db}.t_int_insert_regression
 ORDER BY id;
+
+-- query 8
+CREATE TABLE ${case_db}.t_bigint_source_cast (v BIGINT);
+
+-- query 9
+INSERT INTO ${case_db}.t_bigint_source_cast
+VALUES (BIGINT '9007199254740993'), (DOUBLE '1.0');
+
+-- query 10
+INSERT INTO ${case_db}.t_bigint_source_cast
+SELECT BIGINT '9007199254740995' UNION ALL SELECT DOUBLE '2.0';
+
+-- query 11
+SELECT v FROM ${case_db}.t_bigint_source_cast ORDER BY v;
+
+-- query 12
+SELECT count(*) AS snapshots FROM ${case_db}."t_bigint_source_cast$snapshots";
+
+-- query 13
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+INSERT INTO ${case_db}.t_bigint_source_cast VALUES ('12');
+
+-- query 14
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+INSERT INTO ${case_db}.t_bigint_source_cast VALUES (DECIMAL '9223372036854775808');
+
+-- query 15
+SELECT v FROM ${case_db}.t_bigint_source_cast ORDER BY v;
+
+-- query 16
+SELECT count(*) AS snapshots FROM ${case_db}."t_bigint_source_cast$snapshots";
+
+-- query 17
+CREATE TABLE ${case_db}.t_nullable_source_cast (id INTEGER, v BIGINT, items ARRAY(VARBINARY));
+
+-- query 18
+INSERT INTO ${case_db}.t_nullable_source_cast (id, v)
+VALUES (1, BIGINT '9007199254740993'), (2, DOUBLE '1.0'), (3, NULL);
+
+-- query 19
+INSERT INTO ${case_db}.t_nullable_source_cast (id, items)
+SELECT 4, s.x FROM (SELECT ARRAY[] AS x) AS s;
+
+-- query 20
+INSERT INTO ${case_db}.t_nullable_source_cast (id, items)
+SELECT 5, CASE WHEN TRUE THEN ARRAY[] ELSE NULL END;
+
+-- query 21
+INSERT INTO ${case_db}.t_nullable_source_cast (id, items)
+SELECT 6, CASE WHEN FALSE THEN ARRAY[] ELSE NULL END;
+
+-- query 22
+SELECT id, v, items
+FROM ${case_db}.t_nullable_source_cast ORDER BY id;

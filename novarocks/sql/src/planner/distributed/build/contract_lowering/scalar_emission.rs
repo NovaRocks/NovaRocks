@@ -480,7 +480,7 @@ impl ScalarEmission<'_, '_> {
             ExprKind::Cast {
                 expr,
                 decimal_overflow_policy,
-                array_failure_mode,
+                cast_mode,
                 ..
             } => {
                 return self.lower_expression_as(
@@ -488,7 +488,7 @@ impl ScalarEmission<'_, '_> {
                     visible,
                     &ty,
                     *decimal_overflow_policy,
-                    *array_failure_mode,
+                    *cast_mode,
                 );
             }
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
@@ -560,6 +560,7 @@ impl ScalarEmission<'_, '_> {
                 negated: *negated,
             },
             ExprKind::Case {
+                ieee_float_equality,
                 operand,
                 when_then,
                 else_expr,
@@ -612,6 +613,7 @@ impl ScalarEmission<'_, '_> {
                     .map(|item| lower_branch(self, item))
                     .transpose()?;
                 ContractExprKind::Case {
+                    ieee_float_equality: *ieee_float_equality,
                     operand,
                     when_then: branches.into_boxed_slice(),
                     else_expr,
@@ -1263,9 +1265,9 @@ impl ScalarEmission<'_, '_> {
         visible: &BTreeMap<ColumnId, ValueId>,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        if array_failure_mode.is_none()
+        if cast_mode.is_none()
             && let Some(source) = self.null_constant_type(expression)?
             && source != *target
         {
@@ -1287,9 +1289,9 @@ impl ScalarEmission<'_, '_> {
             target = target
                 .with_nullable(true)
                 .expect("validated root NULL contract");
-            self.convert_expression_to(lowered, &target, policy, array_failure_mode)
+            self.convert_expression_to(lowered, &target, policy, cast_mode)
         } else {
-            self.convert_expression_to(lowered, target, policy, array_failure_mode)
+            self.convert_expression_to(lowered, target, policy, cast_mode)
         }
     }
 
@@ -1305,10 +1307,9 @@ impl ScalarEmission<'_, '_> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        let result =
-            self.convert_expression_to_inner(expression, target, policy, array_failure_mode);
+        let result = self.convert_expression_to_inner(expression, target, policy, cast_mode);
         if matches!(&result, Err(ContractLoweringError::Control(_))) {
             return result;
         }
@@ -1321,7 +1322,7 @@ impl ScalarEmission<'_, '_> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     ) -> Result<ExprId, ContractLoweringError> {
         let site = self.storage.source_site();
         let source = self.expression_value_type(expression)?;
@@ -1330,7 +1331,7 @@ impl ScalarEmission<'_, '_> {
             &source,
             target,
             policy,
-            array_failure_mode,
+            cast_mode,
             self.control,
         )
         .map_err(|error| match error {
@@ -1439,15 +1440,12 @@ impl ScalarEmission<'_, '_> {
         let Some(carrier) = carrier else {
             return Ok(expression);
         };
-        let allow_throw_exception = self.root_allow_throw_reference();
         self.add_scoped_expression(
             carrier.target().clone(),
             ContractExprKind::Cast {
-                array_failure_mode: carrier.array_failure_mode(),
-                allow_throw_exception,
+                cast_mode: carrier.cast_mode(),
                 expr: expression,
                 target: carrier.target().data_type().clone(),
-                decimal_overflow_policy: carrier.decimal_overflow_policy(),
             },
         )
     }

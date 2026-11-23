@@ -22,7 +22,9 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
 };
 
-use crate::iceberg::spec::{FormatVersion, ManifestFile, ManifestStatus, TableMetadata};
+use crate::iceberg::spec::{
+    FormatVersion, ManifestContentType, ManifestFile, ManifestStatus, TableMetadata,
+};
 use crate::iceberg::{Error, ErrorKind, Result};
 use crate::manifest::binding::BoundEntry;
 use crate::manifest::source::{BindingOrigin, ManifestSource};
@@ -61,6 +63,10 @@ impl<'a> MergeCandidate<'a> {
             descriptor,
             committed: None,
         }
+    }
+
+    pub(super) fn into_descriptor(self) -> ManifestFile {
+        self.descriptor
     }
 
     fn source(&self, snapshot_id: i64) -> ManifestSource<'_> {
@@ -166,6 +172,10 @@ async fn merge_bin(
         .registered_manifest_paths(snapshot_id)?
         .map(RegisteredMergeBacking::new);
     let mut entries = Vec::new();
+    let track_row_ids =
+        metadata.format_version() == FormatVersion::V3 && content == ManifestContentType::Data;
+    let mut first_row_id: Option<i64> = None;
+    let mut needs_row_ids = false;
     for candidate in bin {
         artifacts.check_active()?;
         let source = candidate.source(snapshot_id);
@@ -211,6 +221,13 @@ async fn merge_bin(
                 backing.retain_clone(&bound)?;
             }
             if let Some(entry) = merged_entry(bound, raw.metadata().format_version, snapshot_id)? {
+                if track_row_ids && bound.raw.is_alive() {
+                    if let Some(id) = bound.first_row_id {
+                        first_row_id = Some(first_row_id.map_or(id, |first| first.min(id)));
+                    } else {
+                        needs_row_ids = true;
+                    }
+                }
                 entries.push(SourcedManifestEntry {
                     source: encoding_source.clone(),
                     entry,
@@ -218,7 +235,12 @@ async fn merge_bin(
             }
         }
     }
-    write_sourced_manifest(
+    let first_row_id = first_row_id
+        .filter(|_| !needs_row_ids)
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| invalid("Negative first row ID in merged manifest"))?;
+    let mut merged = write_sourced_manifest(
         artifacts,
         metadata,
         snapshot_id,
@@ -227,7 +249,13 @@ async fn merge_bin(
         entries,
         &replaces,
     )
-    .await
+    .await?;
+    // The manifest list allocates an ID range only when this descriptor has
+    // no first row ID. A merge of assigned files must keep that assignment.
+    if first_row_id.is_some() {
+        merged.first_row_id = first_row_id;
+    }
+    Ok(merged)
 }
 
 /// Keep the original statement's payments through the actual encoded write.

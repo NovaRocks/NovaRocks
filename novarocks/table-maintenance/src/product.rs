@@ -39,16 +39,7 @@ use crate::{
 /// this value is the product's execution decision after lowering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RewriteIntent {
-    Optimize {
-        file_size_threshold_bytes: u64,
-    },
-    DataFiles {
-        rewrite_all: bool,
-    },
-    PositionDeletes {
-        rewrite_all: bool,
-        min_input_files: Option<u32>,
-    },
+    Optimize { file_size_threshold_bytes: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,21 +205,6 @@ pub trait TableMaintenanceEffectPort: Sync {
     /// Plans one automatic distributed rewrite with the caller-frozen identity.
     /// Any failure after possible provider dispatch needs its true terminal
     /// classification, including `CommitUnknown` when commitment is uncertain.
-    fn begin_rewrite_with_id<'a>(
-        &'a self,
-        _target: &'a MaintenanceTarget,
-        _intent: RewriteIntent,
-        _effect_id: MaintenanceEffectId,
-    ) -> crate::product::MaintenanceFuture<
-        'a,
-        Result<Box<dyn DistributedRewriteSession + 'a>, TerminalError>,
-    > {
-        Box::pin(async move {
-            Err(TerminalError::pre_dispatch_failed(
-                "automatic maintenance rewrite effect identity is unsupported",
-            ))
-        })
-    }
     fn execute_cleanup<'a>(
         &'a self,
         _target: &'a MaintenanceTarget,
@@ -276,32 +252,6 @@ impl TableMaintenanceProduct {
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, TerminalError> {
         match request {
-            MaintenanceActionRequest::RewriteDataFiles { target, .. } => {
-                let _permit = self
-                    .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
-                    .map_err(|error| error.to_string())?;
-                self.execute_rewrite_terminal(
-                    effects,
-                    &target,
-                    RewriteIntent::DataFiles { rewrite_all: true },
-                )
-                .await
-            }
-            MaintenanceActionRequest::RewritePositionDeleteFiles {
-                target,
-                options,
-                where_clause,
-            } => {
-                let _permit = self
-                    .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
-                    .map_err(|error| error.to_string())?;
-                self.execute_rewrite_terminal(
-                    effects,
-                    &target,
-                    rewrite_position_delete_intent(&options, where_clause.as_deref())?,
-                )
-                .await
-            }
             MaintenanceActionRequest::RemoveOrphanFiles {
                 target,
                 older_than_ms,
@@ -326,31 +276,6 @@ impl TableMaintenanceProduct {
         effect_id: MaintenanceEffectId,
     ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         match request {
-            MaintenanceActionRequest::RewriteDataFiles { target, .. } => {
-                let _permit = self
-                    .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
-                    .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
-                let intent = RewriteIntent::DataFiles { rewrite_all: true };
-                let session = effects
-                    .begin_rewrite_with_id(&target, intent.clone(), effect_id)
-                    .await?;
-                Self::run_rewrite_session_terminal(session, intent).await
-            }
-            MaintenanceActionRequest::RewritePositionDeleteFiles {
-                target,
-                options,
-                where_clause,
-            } => {
-                let intent = rewrite_position_delete_intent(&options, where_clause.as_deref())
-                    .map_err(TerminalError::pre_dispatch_failed)?;
-                let _permit = self
-                    .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
-                    .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
-                let session = effects
-                    .begin_rewrite_with_id(&target, intent.clone(), effect_id)
-                    .await?;
-                Self::run_rewrite_session_terminal(session, intent).await
-            }
             MaintenanceActionRequest::RemoveOrphanFiles { .. } => Err(
                 TerminalError::pre_dispatch_failed("automatic orphan cleanup is unsupported"),
             ),
@@ -371,17 +296,16 @@ impl TableMaintenanceProduct {
         intent: RewriteIntent,
     ) -> Result<MaintenanceActionOutcome, TerminalError> {
         let session = effects
-            .begin_rewrite(target, intent.clone())
+            .begin_rewrite(target, intent)
             .await
             .map_err(TerminalError::failed)?;
-        Self::run_rewrite_session_terminal(session, intent)
+        Self::run_rewrite_session_terminal(session)
             .await
             .map(AutomaticMaintenanceOutcome::into_action_outcome)
     }
 
     async fn run_rewrite_session_terminal(
         mut session: Box<dyn DistributedRewriteSession + '_>,
-        intent: RewriteIntent,
     ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         let plan = session.plan_facts();
         if plan.noop {
@@ -393,7 +317,7 @@ impl TableMaintenanceProduct {
                 output_rows: Some(0),
                 ..RewriteReceiptFacts::default()
             };
-            return rewrite_outcome(intent, Some(receipt), plan)
+            return rewrite_outcome(receipt, plan)
                 .map(AutomaticMaintenanceOutcome::NoOpWithoutCommit)
                 .map_err(TerminalError::pre_dispatch_failed);
         }
@@ -424,11 +348,10 @@ impl TableMaintenanceProduct {
                 effect,
                 finalization_failed: None,
             } => rewrite_outcome(
-                intent,
-                Some(session.finalize_committed().await.map_err(|e| {
+                session.finalize_committed().await.map_err(|e| {
                     e.into_terminal(TerminalError::known_committed_finalization_failed)
                         .with_effect(effect)
-                })?),
+                })?,
                 plan,
             )
             .map(|outcome| match effect {
@@ -542,105 +465,41 @@ async fn abort_rewrite_known_uncommitted(
 }
 
 fn rewrite_outcome(
-    intent: RewriteIntent,
-    receipt: Option<RewriteReceiptFacts>,
+    receipt: RewriteReceiptFacts,
     plan: RewritePlanFacts,
 ) -> Result<MaintenanceActionOutcome, String> {
-    let receipt = receipt.unwrap_or_default();
-    match intent {
-        RewriteIntent::DataFiles { .. } | RewriteIntent::Optimize { .. } => {
-            Ok(MaintenanceActionOutcome::RewriteDataFiles {
-                target_snapshot_id: receipt.target_snapshot_id,
-                rewritten_data_files_count: i32::try_from(receipt.input_data_files)
-                    .map_err(|_| "distributed rewrite input data file count exceeds i32")?,
-                added_data_files_count: receipt
-                    .output_data_files
-                    .map(|count| {
-                        i32::try_from(count).map_err(|_| {
-                            "distributed rewrite output data file count exceeds i32".to_string()
-                        })
-                    })
-                    .transpose()?,
-                added_delete_files_count: receipt
-                    .output_delete_files
-                    .map(|count| {
-                        i32::try_from(count).map_err(|_| {
-                            "distributed rewrite output delete file count exceeds i32".to_string()
-                        })
-                    })
-                    .transpose()?,
-                rewritten_bytes_count: i64::try_from(plan.input_bytes)
-                    .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
-                failed_data_files_count: 0,
-                removed_delete_files_count: i32::try_from(receipt.input_delete_files)
-                    .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
-                output_record_count: receipt
-                    .output_rows
-                    .map(|count| {
-                        i64::try_from(count).map_err(|_| {
-                            "distributed rewrite output row count exceeds i64".to_string()
-                        })
-                    })
-                    .transpose()?,
+    Ok(MaintenanceActionOutcome::RewriteDataFiles {
+        target_snapshot_id: receipt.target_snapshot_id,
+        rewritten_data_files_count: i32::try_from(receipt.input_data_files)
+            .map_err(|_| "distributed rewrite input data file count exceeds i32")?,
+        added_data_files_count: receipt
+            .output_data_files
+            .map(|count| {
+                i32::try_from(count).map_err(|_| {
+                    "distributed rewrite output data file count exceeds i32".to_string()
+                })
             })
-        }
-        RewriteIntent::PositionDeletes { .. } => {
-            Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
-                rewritten_delete_files_count: i32::try_from(receipt.input_delete_files)
-                    .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
-                added_delete_files_count: receipt
-                    .output_delete_files
-                    .map(|count| {
-                        i32::try_from(count).map_err(|_| {
-                            "distributed rewrite output delete file count exceeds i32".to_string()
-                        })
-                    })
-                    .transpose()?,
-                rewritten_bytes_count: i64::try_from(plan.input_bytes)
-                    .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
-                added_bytes_count: 0,
+            .transpose()?,
+        added_delete_files_count: receipt
+            .output_delete_files
+            .map(|count| {
+                i32::try_from(count).map_err(|_| {
+                    "distributed rewrite output delete file count exceeds i32".to_string()
+                })
             })
-        }
-    }
-}
-
-pub fn rewrite_position_delete_intent(
-    options: &std::collections::BTreeMap<String, String>,
-    where_clause: Option<&str>,
-) -> Result<RewriteIntent, String> {
-    if where_clause.is_some() {
-        return Err(
-            "rewrite_position_delete_files where is not supported in NovaRocks yet".to_string(),
-        );
-    }
-    let mut rewrite_all = false;
-    let mut min_input_files = None;
-    for (key, value) in options {
-        match key.as_str() {
-            "rewrite-all" if value.eq_ignore_ascii_case("true") => rewrite_all = true,
-            "rewrite-all" => {
-                return Err(
-                    "rewrite_position_delete_files option `rewrite-all` must be `true`".to_string(),
-                );
-            }
-            "min-input-files" => {
-                min_input_files = Some(value.parse::<u32>().map_err(|_| {
-                    "rewrite_position_delete_files option `min-input-files` must be a positive integer".to_string()
-                })?);
-                if min_input_files == Some(0) {
-                    return Err("rewrite_position_delete_files option `min-input-files` must be a positive integer".to_string());
-                }
-            }
-            other => {
-                return Err(format!(
-                    "unsupported rewrite_position_delete_files option `{other}`"
-                ));
-            }
-        }
-    }
-    Ok(RewriteIntent::PositionDeletes {
-        rewrite_all,
-        min_input_files,
+            .transpose()?,
+        rewritten_bytes_count: i64::try_from(plan.input_bytes)
+            .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
+        failed_data_files_count: 0,
+        removed_delete_files_count: i32::try_from(receipt.input_delete_files)
+            .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
+        output_record_count: receipt
+            .output_rows
+            .map(|count| {
+                i64::try_from(count)
+                    .map_err(|_| "distributed rewrite output row count exceeds i64".to_string())
+            })
+            .transpose()?,
     })
 }
 
@@ -651,11 +510,9 @@ trait ActionTarget {
 impl ActionTarget for MaintenanceActionRequest {
     fn target(&self) -> &MaintenanceTarget {
         match self {
-            Self::RewriteDataFiles { target, .. }
-            | Self::RewriteManifests { target, .. }
+            Self::RewriteManifests { target, .. }
             | Self::ExpireSnapshots { target, .. }
-            | Self::RemoveOrphanFiles { target, .. }
-            | Self::RewritePositionDeleteFiles { target, .. } => target,
+            | Self::RemoveOrphanFiles { target, .. } => target,
         }
     }
 }
@@ -760,9 +617,6 @@ mod tests {
     struct AutomaticPort {
         seen: Mutex<Vec<MaintenanceEffectId>>,
         metadata: Result<AutomaticMaintenanceOutcome, TerminalError>,
-        commit: Result<RewriteCommit, RewriteFailure>,
-        finalization: Result<RewriteReceiptFacts, RewriteFailure>,
-        noop: bool,
     }
 
     impl AutomaticPort {
@@ -775,12 +629,6 @@ mod tests {
                         added_manifests_count: 1,
                     },
                 )),
-                commit: Ok(RewriteCommit::KnownCommitted {
-                    effect: novarocks_coordination_contract::ExecutionEffect::External,
-                    finalization_failed: None,
-                }),
-                finalization: Ok(RewriteReceiptFacts::default()),
-                noop: false,
             }
         }
 
@@ -880,40 +728,6 @@ mod tests {
                 async move { unreachable!("automatic action must not use the user rewrite port") },
             )
         }
-
-        fn begin_rewrite_with_id<'a>(
-            &'a self,
-            _target: &'a MaintenanceTarget,
-            _intent: RewriteIntent,
-            effect_id: MaintenanceEffectId,
-        ) -> crate::product::MaintenanceFuture<
-            'a,
-            Result<Box<dyn DistributedRewriteSession + 'a>, TerminalError>,
-        > {
-            Box::pin(async move {
-                self.seen
-                    .lock()
-                    .expect("test recorder is not poisoned")
-                    .push(effect_id);
-                Ok(Box::new(AutomaticSession {
-                    commit: self.commit.clone(),
-                    finalization: self.finalization.clone(),
-                    noop: self.noop,
-                })
-                    as Box<dyn DistributedRewriteSession + 'a>)
-            })
-        }
-    }
-
-    fn automatic_rewrite_request() -> MaintenanceActionRequest {
-        MaintenanceActionRequest::RewriteDataFiles {
-            target: target(),
-            base_snapshot_id: 1,
-            job_id: None,
-            options: Default::default(),
-            branch: None,
-            where_clause: None,
-        }
     }
 
     #[tokio::test]
@@ -949,75 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_rewrite_passes_exact_id_and_preserves_commit_terminals() {
-        let product = TableMaintenanceProduct::default();
-        let id = MaintenanceEffectId::from_bytes([9; 16]);
-        let port = AutomaticPort::new();
-        assert!(matches!(
-            product
-                .execute_automatic_action(&port, automatic_rewrite_request(), id)
-                .await
-                .expect("rewrite committed"),
-            AutomaticMaintenanceOutcome::KnownCommitted(
-                MaintenanceActionOutcome::RewriteDataFiles { .. }
-            )
-        ));
-        assert_eq!(port.seen(), vec![id]);
-
-        let cases = [
-            (
-                Ok(RewriteCommit::KnownUncommitted {
-                    failure: "conflict".into(),
-                }),
-                MaintenanceJobState::KnownUncommitted,
-            ),
-            (
-                Ok(RewriteCommit::CommitUnknown {
-                    failure: "receipt lost".into(),
-                }),
-                MaintenanceJobState::CommitUnknown,
-            ),
-            (
-                Err("opaque dispatch failure".into()),
-                MaintenanceJobState::CommitUnknown,
-            ),
-            (
-                Ok(RewriteCommit::KnownCommitted {
-                    effect: novarocks_coordination_contract::ExecutionEffect::External,
-                    finalization_failed: Some("finalize failed".into()),
-                }),
-                MaintenanceJobState::KnownCommittedFinalizationFailed,
-            ),
-        ];
-        for (commit, state) in cases {
-            let port = AutomaticPort {
-                commit,
-                ..AutomaticPort::new()
-            };
-            let error = product
-                .execute_automatic_action(&port, automatic_rewrite_request(), id)
-                .await
-                .expect_err("non-success terminal");
-            assert_eq!(error.state, state);
-            assert_eq!(port.seen(), vec![id]);
-        }
-
-        let port = AutomaticPort {
-            finalization: Err("projection unavailable".into()),
-            ..AutomaticPort::new()
-        };
-        let error = product
-            .execute_automatic_action(&port, automatic_rewrite_request(), id)
-            .await
-            .expect_err("committed finalization failed");
-        assert_eq!(
-            error.state,
-            MaintenanceJobState::KnownCommittedFinalizationFailed
-        );
-    }
-
-    #[tokio::test]
-    async fn automatic_expire_and_position_delete_rewrite_each_pass_their_frozen_id() {
+    async fn automatic_expiration_passes_its_frozen_id() {
         let product = TableMaintenanceProduct::default();
         let expire_id = MaintenanceEffectId::from_bytes([12; 16]);
         let expire = AutomaticPort {
@@ -1051,60 +797,16 @@ mod tests {
             )
         ));
         assert_eq!(expire.seen(), vec![expire_id]);
-
-        let delete_id = MaintenanceEffectId::from_bytes([13; 16]);
-        let rewrite = AutomaticPort::new();
-        assert!(matches!(
-            product
-                .execute_automatic_action(
-                    &rewrite,
-                    MaintenanceActionRequest::RewritePositionDeleteFiles {
-                        target: target(),
-                        options: Default::default(),
-                        where_clause: None,
-                    },
-                    delete_id,
-                )
-                .await
-                .expect("position delete rewrite committed"),
-            AutomaticMaintenanceOutcome::KnownCommitted(
-                MaintenanceActionOutcome::RewritePositionDeleteFiles { .. }
-            )
-        ));
-        assert_eq!(rewrite.seen(), vec![delete_id]);
     }
 
     #[tokio::test]
-    async fn automatic_rewrite_without_id_capability_fails_before_dispatch() {
-        let product = TableMaintenanceProduct::default();
-        let error = product
-            .execute_automatic_action(
-                &FixedRewritePort {
-                    commit: RewriteCommit::KnownCommitted {
-                        effect: novarocks_coordination_contract::ExecutionEffect::External,
-                        finalization_failed: None,
-                    },
-                },
-                automatic_rewrite_request(),
-                MaintenanceEffectId::from_bytes([11; 16]),
-            )
-            .await
-            .expect_err("unsupported id capability must fail closed");
-        assert_eq!(error.state, MaintenanceJobState::PreDispatchFailed);
-        assert!(error.message.contains("effect identity is unsupported"));
-    }
-
-    #[tokio::test]
-    async fn automatic_rewrite_noop_does_not_report_a_committed_effect() {
-        let product = TableMaintenanceProduct::default();
-        let id = MaintenanceEffectId::from_bytes([14; 16]);
-        let port = AutomaticPort {
-            noop: true,
+    async fn optimize_noop_reports_known_zero_without_a_commit() {
+        let session = Box::new(AutomaticSession {
             commit: Err("no-op must not dispatch a commit".into()),
-            ..AutomaticPort::new()
-        };
-        let outcome = product
-            .execute_automatic_action(&port, automatic_rewrite_request(), id)
+            finalization: Err("no-op must not finalize a commit".into()),
+            noop: true,
+        });
+        let outcome = TableMaintenanceProduct::run_rewrite_session_terminal(session)
             .await
             .expect("no-op is a successful terminal without a commit");
         let AutomaticMaintenanceOutcome::NoOpWithoutCommit(
@@ -1116,54 +818,22 @@ mod tests {
             },
         ) = outcome
         else {
-            panic!("expected an effect-free data rewrite");
+            panic!("expected an effect-free optimize");
         };
         assert_eq!(added_data_files_count, Some(0));
         assert_eq!(added_delete_files_count, Some(0));
         assert_eq!(output_record_count, Some(0));
-        assert_eq!(port.seen(), vec![id]);
-    }
-
-    #[tokio::test]
-    async fn position_delete_noop_reports_known_zero_without_a_commit() {
-        let session = Box::new(AutomaticSession {
-            commit: Err("no-op must not dispatch a commit".into()),
-            finalization: Err("no-op must not finalize a commit".into()),
-            noop: true,
-        });
-        let outcome = TableMaintenanceProduct::run_rewrite_session_terminal(
-            session,
-            RewriteIntent::PositionDeletes {
-                rewrite_all: false,
-                min_input_files: None,
-            },
-        )
-        .await
-        .expect("no-op is a successful terminal without a commit");
-        let AutomaticMaintenanceOutcome::NoOpWithoutCommit(
-            MaintenanceActionOutcome::RewritePositionDeleteFiles {
-                rewritten_delete_files_count,
-                added_delete_files_count,
-                ..
-            },
-        ) = outcome
-        else {
-            panic!("expected an effect-free position-delete rewrite");
-        };
-        assert_eq!(rewritten_delete_files_count, 0);
-        assert_eq!(added_delete_files_count, Some(0));
     }
 
     #[tokio::test]
     async fn rewrite_unknown_output_is_not_converted_to_zero() {
         let outcome = rewrite_outcome(
-            RewriteIntent::DataFiles { rewrite_all: true },
-            Some(RewriteReceiptFacts {
+            RewriteReceiptFacts {
                 output_data_files: None,
                 output_delete_files: Some(0),
                 output_rows: None,
                 ..RewriteReceiptFacts::default()
-            }),
+            },
             RewritePlanFacts {
                 noop: false,
                 cohort_count: 1,
@@ -1186,13 +856,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn position_delete_options_reject_zero_minimum() {
-        let mut options = std::collections::BTreeMap::new();
-        options.insert("min-input-files".to_string(), "0".to_string());
-        assert!(rewrite_position_delete_intent(&options, None).is_err());
-    }
-
-    #[tokio::test]
     async fn rewrite_commit_unknown_is_a_product_terminal_not_a_retry() {
         let product = TableMaintenanceProduct::default();
         let error = product
@@ -1203,7 +866,9 @@ mod tests {
                     },
                 },
                 &target(),
-                RewriteIntent::DataFiles { rewrite_all: true },
+                RewriteIntent::Optimize {
+                    file_size_threshold_bytes: 1,
+                },
             )
             .await
             .expect_err("unknown commit cannot be reported as success");
@@ -1223,7 +888,9 @@ mod tests {
                     },
                 },
                 &target(),
-                RewriteIntent::DataFiles { rewrite_all: true },
+                RewriteIntent::Optimize {
+                    file_size_threshold_bytes: 1,
+                },
             )
             .await
             .expect_err("known committed finalization failure is not plain failure");
@@ -1303,12 +970,10 @@ mod tests {
                     abort_fails,
                     calls: calls.clone(),
                 };
-                let failure = TableMaintenanceProduct::run_rewrite_session_terminal(
-                    Box::new(session),
-                    RewriteIntent::DataFiles { rewrite_all: true },
-                )
-                .await
-                .unwrap_err();
+                let failure =
+                    TableMaintenanceProduct::run_rewrite_session_terminal(Box::new(session))
+                        .await
+                        .unwrap_err();
                 assert_eq!(failure.compile_control, Some(control.clone()));
                 assert_eq!(
                     failure.state,
@@ -1340,12 +1005,9 @@ mod tests {
                 abort_fails,
                 calls: calls.clone(),
             };
-            let failure = TableMaintenanceProduct::run_rewrite_session_terminal(
-                Box::new(session),
-                RewriteIntent::DataFiles { rewrite_all: true },
-            )
-            .await
-            .unwrap_err();
+            let failure = TableMaintenanceProduct::run_rewrite_session_terminal(Box::new(session))
+                .await
+                .unwrap_err();
             assert_eq!(failure.execution_failure, Some(input.clone()));
             assert_eq!(
                 failure.state,
@@ -1581,7 +1243,9 @@ mod tests {
                 .execute_rewrite_terminal(
                     &port,
                     &target(),
-                    RewriteIntent::DataFiles { rewrite_all: true },
+                    RewriteIntent::Optimize {
+                        file_size_threshold_bytes: 1,
+                    },
                 )
                 .await;
             assert_eq!(
@@ -1803,10 +1467,9 @@ mod async_metadata_tests {
     async fn late_actual_effect_keeps_original_task_cause_and_distinguishes_noop() {
         use novarocks_coordination_contract::ExecutionEffect;
         for effect in [ExecutionEffect::External, ExecutionEffect::None] {
-            let error = TableMaintenanceProduct::run_rewrite_session_terminal(
-                Box::new(LateEffectSession { effect }),
-                RewriteIntent::DataFiles { rewrite_all: true },
-            )
+            let error = TableMaintenanceProduct::run_rewrite_session_terminal(Box::new(
+                LateEffectSession { effect },
+            ))
             .await
             .unwrap_err();
             assert_eq!(error.state, MaintenanceJobState::Failed);

@@ -989,34 +989,7 @@ fn prepare_core<'loan, 'source, 'control>(
                     return Err(shape("expression function differs from original signature"));
                 }
             }
-            if let ExprKind::Cast {
-                expr,
-                target,
-                array_failure_mode,
-                ..
-            } = &node.kind
-            {
-                if let Some(mode) = array_failure_mode {
-                    admission.charge(&mut facts, 1, work)?;
-                    work.flush()?;
-                    let source = unit.and_then(|unit| unit.definition(*expr));
-                    work.flush()?;
-                    work.step()?;
-                    let source =
-                        source.ok_or_else(|| shape("explicit array CAST source is unknown"))?;
-                    preflight_types(&source.ty, &node.ty, &mut facts, &mut admission, work)?;
-                    if !novarocks_type_contract::array_cast_mode_types_valid_observed(
-                        &source.ty,
-                        &node.ty,
-                        *mode,
-                        || work.step().map_err(Error::from),
-                    )? {
-                        return Err(shape(
-                            "explicit array CAST mode differs from its source and result declarations",
-                        ));
-                    }
-                    work.step()?;
-                }
+            if let ExprKind::Cast { target, .. } = &node.kind {
                 // Reuse the same left topology's already measured full bound.
                 // A raw target has no independent nullable/logical root flags.
                 admission.charge(&mut facts, verified.work_upper_bound(), work)?;
@@ -1257,6 +1230,7 @@ fn count_kind(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             refs = numeric_add(
                 numeric_add(

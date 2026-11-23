@@ -15,38 +15,47 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Migrated from dev/test/sql/test_cast/T/test_cast_string_to_int
--- Test Objective:
--- 1. Validate that CAST('+' or '-' as integer types) returns NULL.
--- 2. Covers tinyint, smallint, int, bigint, largeint.
--- 3. These strings cannot be parsed as integers and must return NULL, not an error.
+-- A standalone sign is invalid for every standard signed integer width.
 
 -- query 1
-select cast('-' as tinyint);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('-' AS tinyint);
 
 -- query 2
-select cast('-' as smallint);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('-' AS smallint);
 
 -- query 3
-select cast('-' as int);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('-' AS int);
 
 -- query 4
-select cast('-' as bigint);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('-' AS bigint);
 
 -- query 5
-select CAST(cast('-' as largeint) AS VARCHAR) AS "CAST('-' AS LARGEINT)";
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST('-' AS largeint);
 
 -- query 6
-select cast('+' as tinyint);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('+' AS tinyint);
 
 -- query 7
-select cast('+' as smallint);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('+' AS smallint);
 
 -- query 8
-select cast('+' as int);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('+' AS int);
 
 -- query 9
-select cast('+' as bigint);
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT CAST('+' AS bigint);
 
 -- query 10
-select CAST(cast('+' as largeint) AS VARCHAR) AS "CAST('+' AS LARGEINT)";
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST('+' AS largeint);
+
+-- query 11
+SELECT TRY_CAST('-' AS TINYINT), TRY_CAST('-' AS SMALLINT), TRY_CAST('-' AS INTEGER), TRY_CAST('-' AS BIGINT), TRY_CAST('+' AS TINYINT), TRY_CAST('+' AS SMALLINT), TRY_CAST('+' AS INTEGER), TRY_CAST('+' AS BIGINT);

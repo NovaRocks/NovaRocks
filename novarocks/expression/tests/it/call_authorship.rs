@@ -564,157 +564,92 @@ fn call_author_preserves_first_control_and_actual_wide_edge_order() {
 #[test]
 fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals() {
     use arrow::{
-        array::{ListBuilder, StringBuilder, TimestampMicrosecondArray, TimestampSecondArray},
-        datatypes::{Field, TimeUnit},
+        array::{Int64Array, ListBuilder, StringBuilder},
+        datatypes::Field,
     };
     use novarocks_expression::{CallAuthorError, CapabilityRefusal};
     use novarocks_functions::CastPrepareError;
-    use novarocks_type_contract::{
-        ArrayCastFailureMode, ExpressionEffects, SemanticParameterId, SemanticParameterKey,
-        SemanticParameterRef, SemanticParameterValue,
-    };
+    use novarocks_type_contract::{ExpressionEffects, TrinoCastMode};
     use std::sync::Arc;
 
-    let allow = SemanticParameterRef {
-        id: SemanticParameterId::new(71),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
-    let parameters = SemanticParameters::try_new([(
-        allow.id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
     let mut fixture = AuthorFixture::new();
-    let seconds = fixture.constant(
-        Arc::new(TimestampSecondArray::from(vec![i64::MAX])),
-        FunctionValueType::new(DataType::Timestamp(TimeUnit::Second, None), false),
+    let integer = fixture.constant(
+        Arc::new(Int64Array::from(vec![i64::MAX])),
+        FunctionValueType::new(DataType::Int64, false),
     );
-    let micros = fixture.constant(
-        Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX])),
-        FunctionValueType::new(DataType::Timestamp(TimeUnit::Microsecond, None), false),
-    );
-    for (expr, target, nullable) in [
-        (
-            seconds,
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
-        ),
-        (
-            micros,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-    ] {
-        let cast = fixture.add(
-            FunctionValueType::new(target.clone(), nullable),
-            ExprKind::Cast {
-                expr,
-                target,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: allow,
-                array_failure_mode: None,
-            },
-        );
-        fixture.root(cast, EvaluationDemand::Value);
-    }
     let mut strings = ListBuilder::new(StringBuilder::new());
     strings.values().append_value("invalid integer");
     strings.append(true);
-    let input = fixture.constant(
+    let array = fixture.constant(
         Arc::new(strings.finish()),
         FunctionValueType::new(
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
     );
-    let target = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-    for mode in [
-        ArrayCastFailureMode::ReportError,
-        ArrayCastFailureMode::OutputNull,
+    let list_of_int = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+
+    for (expr, target, nullable, mode) in [
+        (integer, DataType::Float64, false, TrinoCastMode::Implicit),
+        (integer, DataType::Int8, false, TrinoCastMode::Explicit),
+        (integer, DataType::Int8, true, TrinoCastMode::Try),
+        (array, list_of_int.clone(), false, TrinoCastMode::Explicit),
+        (array, list_of_int, true, TrinoCastMode::Try),
     ] {
         let cast = fixture.add(
-            FunctionValueType::new(target.clone(), true),
+            FunctionValueType::new(target.clone(), nullable),
             ExprKind::Cast {
-                expr: input,
-                target: target.clone(),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: allow,
-                array_failure_mode: Some(mode),
+                expr,
+                target,
+                cast_mode: mode,
             },
         );
         fixture.root(cast, EvaluationDemand::Value);
     }
     let sealed = fixture.seal();
+    let parameters = SemanticParameters::default();
     let authored = fixture
         .author(&sealed, &parameters, &HarnessControl)
         .unwrap();
     assert!(authored.claims.is_empty());
     let contexts = sealed.control_flow().uses();
-    let root = sealed.root_use_ids()[0];
-    let summary = authored.summaries[&root]
-        .for_use(contexts[&root].context)
-        .unwrap();
-    assert_eq!(summary, ExpressionEffects::PURE_VALUE);
-    let root = sealed.root_use_ids()[1];
-    let summary = authored.summaries[&root]
-        .for_use(contexts[&root].context)
-        .unwrap();
-    assert!(summary.may_raise_row_error);
-    for (root, may_raise_row_error) in sealed.root_use_ids()[2..].iter().zip([true, false]) {
+    for (root, may_raise_row_error) in sealed
+        .root_use_ids()
+        .iter()
+        .zip([false, true, false, true, false])
+    {
         let summary = authored.summaries[root]
             .for_use(contexts[root].context)
             .unwrap();
         assert_eq!(summary.may_raise_row_error, may_raise_row_error);
-    }
-
-    for invalid in [
-        SemanticParameters::default(),
-        SemanticParameters::try_new([(
-            allow.id,
-            SemanticParameterValue::TimeZone(
-                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
-            ),
-        )])
-        .unwrap(),
-    ] {
-        let Err(error @ CallAuthorError::Capability(CapabilityRefusal::Effects(_))) =
-            fixture.author(&sealed, &invalid, &HarnessControl)
-        else {
-            panic!("missing or foreign semantic parameter must fail through the effects author");
-        };
-        assert!(
-            error
-                .to_string()
-                .starts_with("package call effects: Parameter(")
-        );
+        if !may_raise_row_error {
+            assert_eq!(summary, ExpressionEffects::PURE_VALUE);
+        }
     }
 
     let mut fixture = AuthorFixture::new();
     let input = fixture.constant(
-        Arc::new(TimestampSecondArray::from(vec![i64::MAX])),
-        FunctionValueType::new(DataType::Timestamp(TimeUnit::Second, None), false),
+        Arc::new(Int64Array::from(vec![i64::MAX])),
+        FunctionValueType::new(DataType::Int64, false),
     );
-    let target = DataType::Timestamp(TimeUnit::Microsecond, None);
     let cast = fixture.add(
-        FunctionValueType::new(target.clone(), false),
+        FunctionValueType::new(DataType::Int8, false),
         ExprKind::Cast {
             expr: input,
-            target,
-            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            allow_throw_exception: allow,
-            array_failure_mode: None,
+            target: DataType::Int8,
+            cast_mode: TrinoCastMode::Try,
         },
     );
     fixture.root(cast, EvaluationDemand::Value);
     let sealed = fixture.seal();
-    let Err(CallAuthorError::Capability(CapabilityRefusal::Primitive { source, cast: None })) =
+    let Err(CallAuthorError::Capability(CapabilityRefusal::Primitive { source, .. })) =
         fixture.author(&sealed, &parameters, &HarnessControl)
     else {
-        panic!("nonnullable overflowing carrier must fail through the cast owner");
+        panic!("TRY_CAST requires a nullable narrow integer result");
     };
     assert_eq!(
         source.downcast_ref::<CastPrepareError>(),
-        Some(&CastPrepareError::TypeMismatch),
+        Some(&CastPrepareError::TypeMismatch)
     );
 }
 
@@ -812,6 +747,7 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     let case = fixture.add(
         ty.clone(),
         ExprKind::Case {
+            ieee_float_equality: false,
             operand: None,
             when_then: Box::from([(condition, then_value)]),
             else_expr: Some(else_value),

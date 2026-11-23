@@ -32,7 +32,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::iceberg::io::FileIO;
-use crate::iceberg::spec::TableMetadata;
+use crate::iceberg::spec::{StatisticsFile, TableMetadata};
 use crate::stats_loader::StatsLoader;
 
 /// How far back the walk looks before giving up.
@@ -125,6 +125,24 @@ pub(crate) fn resolve_ancestor_ndv_from_metadata(
     resolved
 }
 
+/// Find the nearest complete registered statistics file on one snapshot walk.
+pub(crate) fn first_registered_statistics<E>(
+    metadata: &TableMetadata,
+    mut cursor: Option<i64>,
+    mut active: impl FnMut() -> Result<(), E>,
+) -> Result<Option<&StatisticsFile>, E> {
+    while let Some(snapshot_id) = cursor {
+        active()?;
+        if let Some(statistics) = metadata.statistics_for_snapshot(snapshot_id) {
+            return Ok(Some(statistics));
+        }
+        cursor = metadata
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+    Ok(None)
+}
+
 /// SHOW STATS follows Trino's first-statistics-file rule, independently of
 /// the optimizer's per-column and bounded ancestry policy above. Registered
 /// metadata is sufficient; this never opens a Puffin object.
@@ -134,51 +152,44 @@ pub(crate) fn resolve_summary_ndv_from_metadata(
     field_ids: &BTreeSet<i32>,
     mut active: impl FnMut() -> Result<(), novarocks_spi::connector::ConnectorError>,
 ) -> Result<HashMap<i32, u64>, novarocks_spi::connector::ConnectorError> {
-    let mut cursor = Some(current_snapshot_id);
-    while let Some(snapshot_id) = cursor {
+    let Some(statistics) =
+        first_registered_statistics(metadata, Some(current_snapshot_id), &mut active)?
+    else {
+        return Ok(HashMap::new());
+    };
+    let mut resolved = HashMap::new();
+    let mut seen = BTreeSet::new();
+    for blob in &statistics.blob_metadata {
         active()?;
-        if let Some(statistics) = metadata.statistics_for_snapshot(snapshot_id) {
-            let mut resolved = HashMap::new();
-            let mut seen = BTreeSet::new();
-            for blob in &statistics.blob_metadata {
-                active()?;
-                if blob.r#type != crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1 {
-                    continue;
-                }
-                let [field_id] = blob.fields.as_slice() else {
-                    continue;
-                };
-                if !field_ids.contains(field_id) {
-                    continue;
-                }
-                let Some(rendered) = blob.properties.get(crate::stats_loader::NDV_PROPERTY) else {
-                    continue;
-                };
-                if !seen.insert(*field_id) {
-                    return Err(novarocks_spi::connector::ConnectorError::new(
-                        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
-                        format!(
-                            "statistics metadata contains duplicate Theta blobs for field {field_id}"
-                        ),
-                    ));
-                }
-                resolved.insert(
-                    *field_id,
-                    crate::stats_loader::parse_ndv_property(rendered).map_err(|error| {
-                        novarocks_spi::connector::ConnectorError::new(
-                            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
-                            error,
-                        )
-                    })?,
-                );
-            }
-            return Ok(resolved);
+        if blob.r#type != crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1 {
+            continue;
         }
-        cursor = metadata
-            .snapshot_by_id(snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id());
+        let [field_id] = blob.fields.as_slice() else {
+            continue;
+        };
+        if !field_ids.contains(field_id) {
+            continue;
+        }
+        let Some(rendered) = blob.properties.get(crate::stats_loader::NDV_PROPERTY) else {
+            continue;
+        };
+        if !seen.insert(*field_id) {
+            return Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                format!("statistics metadata contains duplicate Theta blobs for field {field_id}"),
+            ));
+        }
+        resolved.insert(
+            *field_id,
+            crate::stats_loader::parse_ndv_property(rendered).map_err(|error| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                    error,
+                )
+            })?,
+        );
     }
-    Ok(HashMap::new())
+    Ok(resolved)
 }
 
 #[cfg(test)]

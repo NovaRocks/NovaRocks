@@ -34,7 +34,7 @@ CREATE TABLE ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_left_${uuid0} (
 CREATE TABLE ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_right_${uuid0} (
   dim_id BIGINT NOT NULL,
   rid BIGINT,
-  label STRING
+  label VARCHAR
 ) WITH (format_version = 3);
 USE ice_ivm_join_mult_${uuid0}.ns_${uuid0};
 

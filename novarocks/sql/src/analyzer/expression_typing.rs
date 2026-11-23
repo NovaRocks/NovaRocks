@@ -230,6 +230,29 @@ impl AnalyzerContext<'_> {
         })
     }
 
+    pub(super) fn coerce_simple_case_float_operand(
+        &self,
+        value: TypedExpr,
+        target: &FunctionValueType,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        self.with_typing(span, |context, work| {
+            let mut children = typed_children(context, std::slice::from_ref(&value), false, work)?;
+            let child = children.pop().expect("one simple CASE operand");
+            let target = target.with_nullable(value.value_type.nullable())?;
+            let conversion = typing::operator_decimal_float(context, &child, &target, work)?;
+            let mut args = apply_conversions(
+                context,
+                vec![value],
+                vec![conversion],
+                self.sql_semantics.statement_time(),
+                self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
+                work,
+            )?;
+            Ok(args.pop().expect("one converted simple CASE operand"))
+        })
+    }
+
     fn with_typing<T>(
         &self,
         span: Span,
@@ -358,6 +381,40 @@ pub(super) fn authored_temporal_cast(
     )
 }
 
+#[cfg(test)]
+pub(super) fn type_value_node_with_catalog(
+    catalog: &dyn SqlFunctionCatalog,
+    shape: NodeShape<'_>,
+    args: Vec<TypedExpr>,
+    decimal_overflow_policy: DecimalOverflowPolicy,
+    constant_policy: ConstantPolicy,
+    control: &dyn PureCompileControl,
+    span: Span,
+) -> Result<(FunctionValueType, Vec<TypedExpr>), AnalyzeError> {
+    with_typing(
+        catalog,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+        span,
+        |context, work| {
+            let check_branch_constants = matches!(shape, NodeShape::SearchedCase { .. });
+            let children = typed_children(context, &args, check_branch_constants, work)?;
+            let NodeTyping::Value {
+                result,
+                conversions,
+            } = typing::type_node(context, shape, &children, work)?
+            else {
+                return Err(TypingError::InvalidShape("expected a typed value node"));
+            };
+            Ok((
+                result,
+                apply_conversions(context, args, conversions, None, false, work)?,
+            ))
+        },
+    )
+}
+
 pub(super) fn type_scalar_call_with_catalog(
     catalog: &dyn SqlFunctionCatalog,
     shape: NodeShape<'_>,
@@ -439,6 +496,10 @@ fn scalar_selection_error(
                 error,
                 FunctionBindingError::UnavailableImplementation(_)
                     | FunctionBindingError::VariantTargetType(_)
+                    | FunctionBindingError::UnknownFunction
+                    | FunctionBindingError::HiddenFunction
+                    | FunctionBindingError::NoMatchingOverload
+                    | FunctionBindingError::AmbiguousOverload
             ) =>
         {
             let arg_types: Vec<_> = args.iter().map(|arg| arg.value_type.data_type()).collect();
@@ -477,6 +538,9 @@ pub(super) fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeErr
         TypingError::InvalidLiteral(message) => AnalyzeError::invalid_literal(message, span),
         TypingError::Unsupported(message) => AnalyzeError::unsupported_expression(message, span),
         TypingError::Control(error) => AnalyzeError::control(error),
+        TypingError::Binding(error @ FunctionBindingError::AmbiguousOverload) => {
+            AnalyzeError::ambiguous_function_call(error, span)
+        }
         TypingError::Binding(error) => AnalyzeError::function_binding(error).at_type_mismatch(span),
         TypingError::Constant(error) => {
             AnalyzeError::function_binding(error.into()).at_type_mismatch(span)
@@ -572,12 +636,23 @@ fn apply_conversions(
                     conversion.binding.selected.overload.as_str(),
                 );
                 enforce_mv_time_independence(forbid_time_dependencies, dependencies)?;
-                let binding = SqlFunctionBinding::new_with_conversion_constraint(
-                    conversion.binding,
-                    context.decimal_overflow_policy,
-                    conversion.expected_result,
-                    conversion.target,
-                ).with_statement_time(statement_time, dependencies)?;
+                let binding = match conversion.origin {
+                    typing::ValueConversionOrigin::ValueDomain => {
+                        SqlFunctionBinding::new_with_conversion_constraint(
+                            conversion.binding,
+                            context.decimal_overflow_policy,
+                            conversion.expected_result,
+                            conversion.target,
+                        )
+                    }
+                    typing::ValueConversionOrigin::OperatorDecimalFloat => {
+                        SqlFunctionBinding::new_with_operator_decimal_float_constraint(
+                            conversion.binding,
+                            context.decimal_overflow_policy,
+                            conversion.expected_result,
+                        )
+                    }
+                }.with_statement_time(statement_time, dependencies)?;
                 let expression = TypedExpr {
                     kind: ExprKind::FunctionCall {
                         name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.into(),
@@ -611,7 +686,7 @@ fn cast_expression(source: TypedExpr, conversion: CarrierConversion) -> TypedExp
             expr: ast::AstBox::new(source),
             target: conversion.target.data_type().clone(),
             decimal_overflow_policy: conversion.decimal_overflow_policy,
-            array_failure_mode: None,
+            cast_mode: conversion.mode,
         },
         value_type: conversion.target,
     }

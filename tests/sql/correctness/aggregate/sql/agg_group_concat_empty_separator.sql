@@ -27,7 +27,7 @@
 CREATE TABLE ${case_db}.t_agg_group_concat_empty_separator (
     g INT,
     ord INT,
-    s STRING
+    s VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_empty_separator VALUES

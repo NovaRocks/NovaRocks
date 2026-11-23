@@ -445,7 +445,7 @@ fn gc_disabled_real_lease_refuses_before_dispatch_and_preserves_shared_source_ro
                 removed: Vec::new(),
             },
             dependencies: vec![Dependency::NoRead],
-            isolation: IsolationLevel::Serializable,
+            protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),
             token: operation.token(),

@@ -84,13 +84,13 @@ CREATE TABLE ${case_db}.t3 (
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.test_all_type (
   "t1a" varchar(20) ,
-  "t1b" smallint(6) ,
-  "t1c" int(11) ,
-  "t1d" bigint(20) ,
-  "t1e" float ,
+  "t1b" SMALLINT ,
+  "t1c" INTEGER ,
+  "t1d" BIGINT ,
+  "t1e" REAL ,
   "t1f" double ,
-  "t1g" bigint(20) ,
-  "id_datetime" datetime ,
+  "t1g" BIGINT ,
+  "id_datetime" TIMESTAMP(6) ,
   "id_date" date ,
   "id_decimal" decimal(10,2)
 ) WITH (format_version = 3);
@@ -99,13 +99,13 @@ CREATE TABLE ${case_db}.test_all_type (
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.test_all_type_not_null (
   "t1a" varchar(20) NOT NULL,
-  "t1b" smallint(6) NOT NULL,
-  "t1c" int(11) NOT NULL,
-  "t1d" bigint(20) NOT NULL,
-  "t1e" float NOT NULL,
+  "t1b" SMALLINT NOT NULL,
+  "t1c" INTEGER NOT NULL,
+  "t1d" BIGINT NOT NULL,
+  "t1e" REAL NOT NULL,
   "t1f" double NOT NULL,
-  "t1g" bigint(20) NOT NULL,
-  "id_datetime" datetime NOT NULL,
+  "t1g" BIGINT NOT NULL,
+  "id_datetime" TIMESTAMP(6) NOT NULL,
   "id_date" date NOT NULL,
   "id_decimal" decimal(10,2) NOT NULL
 ) WITH (format_version = 3);

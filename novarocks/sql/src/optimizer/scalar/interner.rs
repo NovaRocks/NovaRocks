@@ -277,6 +277,8 @@ fn node_fields<'a>(
             f.id(*body)?;
         }
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
@@ -284,6 +286,11 @@ fn node_fields<'a>(
             resolved,
         } => {
             f.number(7)?;
+            f.boolean(occurrence.is_some())?;
+            if let Some(occurrence) = occurrence {
+                f.number(occurrence.identity() as u128)?;
+            }
+            f.optional_id(*filter)?;
             f.text(name)?;
             f.ids(args)?;
             f.boolean(*distinct)?;
@@ -291,16 +298,18 @@ fn node_fields<'a>(
             f.binding(resolved)?;
         }
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => {
             f.number(8)?;
-            f.number(match array_failure_mode {
+            f.number(match cast_mode {
                 None => 0,
-                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError) => 1,
-                Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull) => 2,
+                Some(novarocks_type_contract::TrinoCastMode::Explicit) => 1,
+                Some(novarocks_type_contract::TrinoCastMode::Try) => 2,
+                Some(novarocks_type_contract::TrinoCastMode::Implicit) => 3,
+                Some(novarocks_type_contract::TrinoCastMode::StoreAssignment) => 4,
             })?;
             f.id(*child)?;
             f.push(Token::Type(target))?;
@@ -344,11 +353,13 @@ fn node_fields<'a>(
             f.boolean(*negated)?;
         }
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => {
             f.number(13)?;
+            f.boolean(*ieee_float_equality)?;
             f.optional_id(*operand)?;
             f.number(when_then.len() as u128)?;
             for (when, then) in when_then {

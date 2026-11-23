@@ -70,7 +70,7 @@ fn effects(scope: v2::proof_scope::Kind) -> v2::CallEffects {
 }
 
 #[test]
-fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
+fn all_five_parameter_variants_preserve_raw_values_and_oneof_presence() {
     use v2::semantic_parameter::Value;
     let values = [
         Value::StatementStartUtc(
@@ -81,7 +81,6 @@ fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
         ),
         Value::TimeZone("+08:00".into()),
         Value::AllowThrowException(false),
-        Value::DecimalOverflowToDouble(true),
         Value::GroupConcatLegacy(false),
         Value::GroupConcatMaxLen(i64::MAX),
     ];
@@ -90,7 +89,7 @@ fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
             .into_iter()
             .enumerate()
             .map(|(ordinal, value)| v2::SemanticParameter {
-                id: if ordinal == 5 {
+                id: if ordinal == 4 {
                     u32::MAX
                 } else {
                     ordinal as u32
@@ -111,7 +110,7 @@ fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
             .unwrap()
             .fields()
             .count(),
-        6
+        5
     );
     for entry in &parameters.entries {
         let absent = v2::SemanticParameter {
@@ -763,7 +762,7 @@ fn call_policy_presence_preserves_absent_unspecified_and_unknown_for_typed_decod
 }
 
 #[test]
-fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_values() {
+fn calls_and_binary_share_one_semantic_policy_with_unchanged_numeric_wire_values() {
     let pool = pool();
     for (message, tag, presence) in [
         ("novarocks.physical_semantics_v2.FrozenCall", 4, true),
@@ -773,7 +772,6 @@ fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_v
             true,
         ),
         ("novarocks.physical_package_v2.BinaryExpression", 4, false),
-        ("novarocks.physical_package_v2.CastExpression", 3, false),
     ] {
         let descriptor = pool.get_message_by_name(message).unwrap();
         let field = descriptor
@@ -798,11 +796,7 @@ fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_v
             &[0x20, value][..],
         )
         .unwrap();
-        let cast =
-            novarocks_proto_models::physical_package_v2::CastExpression::decode(&[0x18, value][..])
-                .unwrap();
         assert_eq!(binary.decimal_overflow_policy, i32::from(value));
-        assert_eq!(cast.decimal_overflow_policy, i32::from(value));
     }
 }
 

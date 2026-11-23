@@ -54,17 +54,7 @@ pub(super) fn prepare_repeat_input(
         return Ok(grouping_key_aliases);
     }
 
-    let mut project_items = Vec::new();
-    let mut seen_refs = std::collections::HashSet::new();
-    for gb_expr in &select.group_by {
-        collect_repeat_input_refs(gb_expr, &mut project_items, &mut seen_refs);
-    }
-    for item in &select.projection {
-        collect_repeat_input_refs(&item.expr, &mut project_items, &mut seen_refs);
-    }
-    if let Some(having) = &select.having {
-        collect_repeat_input_refs(having, &mut project_items, &mut seen_refs);
-    }
+    let mut project_items = pass_through_input(current)?;
 
     // Materialize each rollup key expression under its alias and prepare
     // a substitution map. The rule used to only materialize ColumnRef
@@ -325,48 +315,98 @@ fn authored_group_column_matches(
     })
 }
 
-fn collect_repeat_input_refs(
-    expr: &TypedExpr,
-    out: &mut Vec<ProjectItem>,
-    seen: &mut std::collections::HashSet<(Option<String>, String)>,
-) {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            qualifier,
-            column,
-            column_id,
-            ..
-        } => {
-            if qualifier.is_none() && column.starts_with("__grouping_") {
-                return;
-            }
-            let key = (qualifier.clone(), column.to_lowercase());
-            if seen.insert(key) {
-                out.push(ProjectItem {
-                    expr: expr.clone(),
-                    output_name: column.clone(),
-                    output_column_id: *column_id,
-                });
-            }
+fn pass_through_input(current: &LogicalPlanNode) -> Result<Vec<ProjectItem>, SqlCompileError> {
+    let mut seen = std::collections::HashSet::new();
+    Ok(super::output::plan_output_columns(current)?
+        .into_iter()
+        .filter(|column| seen.insert(column.column_id))
+        .map(|column| ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: column.column_id,
+                    qualifier: None,
+                    column: column.name.clone(),
+                },
+                value_type: column.value_type,
+            },
+            output_name: column.name,
+            output_column_id: column.column_id,
+        })
+        .collect())
+}
+
+// Design: ADR-0253 (docs/adr/ADR-0253-aggregate-filters-select-original-rows-per-call.md)
+/// Each update has its own row-domain values. Repeat may duplicate these
+/// outputs, while the binding continues to refer to the original channels.
+pub(super) fn project_aggregate_inputs(
+    current: LogicalPlanNode,
+    calls: &mut [AggregateCall],
+    repeat: Option<&PlanRepeatNode>,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlanNode, SqlCompileError> {
+    let mut inputs = Vec::new();
+    for (index, call) in calls.iter_mut().enumerate() {
+        if repeat.is_none() && call.source.filter().is_none() {
+            continue;
         }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for arg in args {
-                collect_repeat_input_refs(arg, out, seen);
-            }
-            for sort_item in order_by {
-                collect_repeat_input_refs(&sort_item.expr, out, seen);
-            }
-        }
-        _ => {
-            // Unlike output substitution, input collection deliberately enters
-            // aggregate argument and aggregate-local ordering domains above.
-            // All scalar and window children share the complete traversal.
-            let _ = rewrite_expr_children(expr, |child| {
-                collect_repeat_input_refs(child, out, seen);
-                child.clone()
+        let mut project = |expr: &TypedExpr, channel: &str, ordinal: usize| {
+            let name = format!("__aggregate_{index}_{channel}_{ordinal}");
+            let id = factory.create(None, name.clone(), expr.value_type.clone());
+            inputs.push(ProjectItem {
+                expr: expr.clone(),
+                output_name: name,
+                output_column_id: id,
             });
-        }
+            id
+        };
+        let requires_projection = |expr: &TypedExpr| {
+            let Some(repeat) = repeat else { return false };
+            if matches!(
+                expr.kind,
+                ExprKind::ColumnRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_)
+            ) {
+                return false;
+            }
+            // GROUPING results are authored by Repeat itself. Existing value
+            // and ORDER BY consumers of those outputs use the expanded domain.
+            !any_expression(expr, &|child| {
+                matches!(child.kind, ExprKind::ColumnRef { column_id, .. }
+                    if repeat.grouping_fn_ids.iter().any(|(_, output)| *output == column_id))
+            })
+        };
+        let arguments = call
+            .source
+            .arguments()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, expr)| requires_projection(expr).then(|| project(expr, "arg", ordinal)))
+            .collect();
+        let order_by = call
+            .source
+            .order_by()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, item)| {
+                requires_projection(&item.expr).then(|| project(&item.expr, "order", ordinal))
+            })
+            .collect();
+        let filter = call.source.filter().map(|expr| project(expr, "filter", 0));
+        call.source
+            .set_projected_inputs(arguments, order_by, filter);
     }
+    if inputs.is_empty() {
+        return Ok(current);
+    }
+    let mut items = pass_through_input(&current)?;
+    items.extend(inputs);
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Project(PlanProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![current],
+        None,
+    ))
 }
 
 type AggregateProjectionSplit = (
@@ -772,18 +812,13 @@ pub(super) fn rewrite_agg_calls_to_refs(
     agg_calls: &[AggregateCall],
     control: &dyn PureCompileControl,
 ) -> Result<TypedExpr, SqlCompileError> {
-    if let ExprKind::AggregateCall {
-        name,
-        args,
-        distinct,
-        order_by,
-        resolved,
-    } = &expr.kind
-    {
+    if let ExprKind::AggregateCall { occurrence, .. } = &expr.kind {
+        let can_share = crate::analysis::expr_identity::expression_can_share_evaluation(expr);
         for call in agg_calls {
-            if aggregate_call_matches(call, name, args, *distinct, order_by, resolved, control)? {
-                let display =
-                    agg_call_display_name_from_parts(name, args, *distinct, order_by, control)?;
+            if call.source.contains_occurrence(occurrence)
+                || (can_share && aggregate_call_matches(call, expr, control)?)
+            {
+                let display = typed_expr_display_name(expr, control)?;
                 return Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: call.output_column_id,
@@ -841,6 +876,79 @@ pub(super) fn rewrite_expr_children(
     }
 }
 
+pub(super) fn contains_aggregate(expr: &TypedExpr) -> bool {
+    any_expression(expr, &|candidate| {
+        matches!(candidate.kind, ExprKind::AggregateCall { .. })
+    })
+}
+
+#[recursive::recursive]
+fn any_expression(expr: &TypedExpr, matches_expr: &dyn Fn(&TypedExpr) -> bool) -> bool {
+    if matches_expr(expr) {
+        return true;
+    }
+    let contains = |child: &TypedExpr| any_expression(child, matches_expr);
+    match &expr.kind {
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => args
+            .iter()
+            .chain(order_by.iter().map(|item| &item.expr))
+            .chain(filter.as_deref())
+            .any(contains),
+        ExprKind::BinaryOp { left, right, .. } => contains(left) || contains(right),
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::LambdaFunction { body: expr, .. }
+        | ExprKind::Lambda { body: expr, .. } => contains(expr),
+        ExprKind::FunctionCall { args, .. } => args.iter().any(contains),
+        ExprKind::InList { expr, list, .. } => contains(expr) || list.iter().any(contains),
+        ExprKind::Between {
+            expr, low, high, ..
+        } => contains(expr) || contains(low) || contains(high),
+        ExprKind::Like { expr, pattern, .. } => contains(expr) || contains(pattern),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(contains)
+                || when_then
+                    .iter()
+                    .any(|(when, then)| contains(when) || contains(then))
+                || else_expr.as_deref().is_some_and(contains)
+        }
+        ExprKind::WindowCall {
+            args,
+            function_order_by,
+            partition_by,
+            order_by,
+            ..
+        } => args
+            .iter()
+            .chain(partition_by)
+            .chain(
+                function_order_by
+                    .iter()
+                    .chain(order_by)
+                    .map(|key| &key.expr),
+            )
+            .any(contains),
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
+        | ExprKind::SubqueryPlaceholder { .. } => false,
+    }
+}
+
 fn rewrite_expr_children_with<E>(
     expr: &TypedExpr,
     mut rewrite_child: impl FnMut(&TypedExpr) -> Result<TypedExpr, E>,
@@ -883,12 +991,12 @@ fn rewrite_expr_children_with<E>(
             body: novarocks_parser::ast::AstBox::new(rewrite_child(body)?),
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
         } => ExprKind::Cast {
-            array_failure_mode: *array_failure_mode,
+            cast_mode: *cast_mode,
             expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,
@@ -934,10 +1042,12 @@ fn rewrite_expr_children_with<E>(
             negated: *negated,
         },
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ExprKind::Case {
+            ieee_float_equality: *ieee_float_equality,
             operand: operand
                 .as_ref()
                 .map(|operand| rewrite_child(operand).map(novarocks_parser::ast::AstBox::new))
@@ -1034,20 +1144,33 @@ fn rewrite_expr_children_with<E>(
 
 fn aggregate_call_matches(
     call: &AggregateCall,
-    name: &str,
-    args: &[TypedExpr],
-    distinct: bool,
-    order_by: &[SortItem],
-    resolved: &crate::binding::SqlFunctionBinding,
+    expression: &TypedExpr,
     control: &dyn PureCompileControl,
 ) -> Result<bool, SqlCompileError> {
+    let ExprKind::AggregateCall {
+        name,
+        args,
+        distinct,
+        order_by,
+        filter,
+        resolved,
+        ..
+    } = &expression.kind
+    else {
+        return Ok(false);
+    };
     if call.source.binding() != resolved
-        || call.name != name
-        || call.distinct != distinct
+        || &call.name != name
+        || call.distinct != *distinct
         || call.source.arguments().len() != args.len()
         || call.source.order_by().len() != order_by.len()
     {
         return Ok(false);
+    }
+    match (call.source.filter(), filter.as_deref()) {
+        (None, None) => {}
+        (Some(left), Some(right)) if typed_expr_semantically_eq(left, right, control)? => {}
+        _ => return Ok(false),
     }
     for (left, right) in call.source.arguments().iter().zip(args) {
         if !typed_expr_semantically_eq(left, right, control)? {
@@ -1081,6 +1204,8 @@ pub(super) fn collect_aggregates(
             distinct,
             order_by,
             resolved,
+            occurrence,
+            filter,
         } => {
             // The bound callable owns the complete result, including children.
             // Never mint a same-value symbol from a substituted declaration.
@@ -1097,33 +1222,31 @@ pub(super) fn collect_aggregates(
                     "aggregate occurrence differs from its complete declared type".into(),
                 ));
             }
-            // Avoid duplicates — compare full aggregate semantics, including
-            // ORDER BY metadata for ordered aggregates like
-            // `array_agg(distinct x order by y desc)`.
-            let mut already = false;
-            for call in out.iter() {
-                if aggregate_call_matches(call, name, args, *distinct, order_by, resolved, control)?
+            let can_share = crate::analysis::expr_identity::expression_can_share_evaluation(expr);
+            for call in out.iter_mut() {
+                if call.source.contains_occurrence(occurrence)
+                    || (can_share && aggregate_call_matches(call, expr, control)?)
                 {
-                    already = true;
-                    break;
+                    call.source.record_occurrence(occurrence);
+                    return Ok(());
                 }
             }
-            if !already {
-                let display =
-                    agg_call_display_name_from_parts(name, args, *distinct, order_by, control)?;
-                let output_column_id = factory.create(None, display, expr.value_type.clone());
-                out.push(AggregateCall {
-                    name: name.clone(),
-                    distinct: *distinct,
-                    result_type: expr.value_type.clone(),
-                    output_column_id,
-                    source: crate::binding::AggregateArgumentSource::logical_update(
-                        args.clone().into_inner(),
-                        order_by.clone().into_inner(),
-                        resolved.clone(),
-                    ),
-                });
-            }
+            let display = typed_expr_display_name(expr, control)?;
+            let output_column_id = factory.create(None, display, expr.value_type.clone());
+            let mut source = crate::binding::AggregateArgumentSource::logical_update(
+                args.clone().into_inner(),
+                order_by.clone().into_inner(),
+                resolved.clone(),
+            );
+            source.record_occurrence(occurrence);
+            source.set_filter(filter.as_deref());
+            out.push(AggregateCall {
+                name: name.clone(),
+                distinct: *distinct,
+                result_type: expr.value_type.clone(),
+                output_column_id,
+                source,
+            });
         }
         ExprKind::BinaryOp { left, right, .. } => {
             collect_aggregates(left, out, factory, control)?;
@@ -1141,6 +1264,7 @@ pub(super) fn collect_aggregates(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_aggregates(op, out, factory, control)?;
@@ -1286,6 +1410,7 @@ fn collect_non_agg_column_refs_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_non_agg_column_refs_inner(op, group_by, out, inside_agg, control)?;
@@ -1329,6 +1454,8 @@ mod call_policy_tests {
         let result_type = crate::functions::aggregate_result_type(&selected).clone();
         let expression = |policy| TypedExpr {
             kind: ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "sum".into(),
                 args: (args.clone()).into(),
                 distinct: false,
@@ -1425,6 +1552,8 @@ mod call_policy_tests {
         );
         let aggregate = |argument| TypedExpr {
             kind: ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "sum".into(),
                 args: (vec![argument]).into(),
                 distinct: false,
@@ -1464,6 +1593,8 @@ mod call_policy_tests {
         let expression = TypedExpr {
             value_type: crate::functions::aggregate_result_type(&selected).clone(),
             kind: ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: name.into(),
                 args: (vec![argument]).into(),
                 distinct: false,
@@ -1910,6 +2041,8 @@ mod call_policy_tests {
             let expression = TypedExpr {
                 value_type: crate::functions::aggregate_result_type(&selected).clone(),
                 kind: ExprKind::AggregateCall {
+                    occurrence: crate::analysis::AggregateOccurrence::new(),
+                    filter: None,
                     name: "sum".into(),
                     args: (vec![argument]).into(),
                     distinct: false,

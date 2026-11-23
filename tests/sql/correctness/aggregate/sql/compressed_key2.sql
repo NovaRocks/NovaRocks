@@ -27,22 +27,22 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t3 (
-    c_2_0 LARGEINT NOT NULL,
-    c_2_1 LARGEINT NOT NULL,
-    c_2_2 LARGEINT NOT NULL,
-    c_2_3 LARGEINT NOT NULL,
-    c_2_4 LARGEINT NOT NULL,
-    c_2_5 LARGEINT NOT NULL,
-    c_2_6 LARGEINT NOT NULL,
-    c_2_7 LARGEINT NOT NULL,
-    c_2_8 LARGEINT NOT NULL,
-    c_2_9 LARGEINT NOT NULL,
-    c_2_10 LARGEINT NOT NULL,
-    c_2_11 LARGEINT NOT NULL,
-    c_2_12 LARGEINT NOT NULL,
-    c_2_13 LARGEINT NOT NULL,
-    c_2_14 LARGEINT NOT NULL,
-    c_2_15 LARGEINT NOT NULL
+    c_2_0 DECIMAL(38, 0) NOT NULL,
+    c_2_1 DECIMAL(38, 0) NOT NULL,
+    c_2_2 DECIMAL(38, 0) NOT NULL,
+    c_2_3 DECIMAL(38, 0) NOT NULL,
+    c_2_4 DECIMAL(38, 0) NOT NULL,
+    c_2_5 DECIMAL(38, 0) NOT NULL,
+    c_2_6 DECIMAL(38, 0) NOT NULL,
+    c_2_7 DECIMAL(38, 0) NOT NULL,
+    c_2_8 DECIMAL(38, 0) NOT NULL,
+    c_2_9 DECIMAL(38, 0) NOT NULL,
+    c_2_10 DECIMAL(38, 0) NOT NULL,
+    c_2_11 DECIMAL(38, 0) NOT NULL,
+    c_2_12 DECIMAL(38, 0) NOT NULL,
+    c_2_13 DECIMAL(38, 0) NOT NULL,
+    c_2_14 DECIMAL(38, 0) NOT NULL,
+    c_2_15 DECIMAL(38, 0) NOT NULL
 ) WITH (format_version = 3);
 
 -- query 3
@@ -88,7 +88,7 @@ ORDER BY trc2_output.c_2_0, trc2_output.c_2_1, trc2_output.c_2_2, trc2_output.c_
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t4 (
-    c_2_0 LARGEINT NOT NULL
+    c_2_0 DECIMAL(38, 0) NOT NULL
 ) WITH (format_version = 3);
 
 -- query 8

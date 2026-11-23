@@ -56,6 +56,7 @@ pub enum ArgumentControl {
     TypeOnly,
     If,
     Coalesce,
+    Try,
     /// The exact installed owner demands original emitted source occurrences.
     TemporalSource(crate::TemporalSourceKind),
     SimpleCase,
@@ -86,6 +87,7 @@ impl ArgumentControl {
             | (Self::NoArguments, ControlShape::NoArguments)
             | (Self::If, ControlShape::If)
             | (Self::Coalesce, ControlShape::Coalesce)
+            | (Self::Try, ControlShape::Try)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
             | (Self::SearchedCase, ControlShape::Case { simple: false, .. }) => true,
             (
@@ -205,6 +207,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::TypeOnly
                         | ArgumentControl::If
                         | ArgumentControl::Coalesce
+                        | ArgumentControl::Try
                         | ArgumentControl::TemporalSource(_)
                         | ArgumentControl::SimpleCase
                         | ArgumentControl::SearchedCase
@@ -234,6 +237,7 @@ impl FunctionEffectDeclaration {
             self.argument_control,
             ArgumentControl::If
                 | ArgumentControl::Coalesce
+                | ArgumentControl::Try
                 | ArgumentControl::TemporalSource(_)
                 | ArgumentControl::SimpleCase
                 | ArgumentControl::SearchedCase
@@ -254,7 +258,6 @@ impl FunctionEffectDeclaration {
         let mut statement_start_utc = false;
         let mut time_zone = false;
         let mut allow_throw_exception = false;
-        let mut decimal_overflow_to_double = false;
         let mut group_concat_legacy = false;
         let mut group_concat_max_len = false;
         for key in &self.environment_dependencies {
@@ -262,7 +265,6 @@ impl FunctionEffectDeclaration {
                 SemanticParameterKey::StatementStartUtc => &mut statement_start_utc,
                 SemanticParameterKey::TimeZone => &mut time_zone,
                 SemanticParameterKey::AllowThrowException => &mut allow_throw_exception,
-                SemanticParameterKey::DecimalOverflowToDouble => &mut decimal_overflow_to_double,
                 SemanticParameterKey::GroupConcatLegacy => &mut group_concat_legacy,
                 SemanticParameterKey::GroupConcatMaxLen => &mut group_concat_max_len,
             };
@@ -589,6 +591,7 @@ mod tests {
             ArgumentControl::TypeOnly,
             ArgumentControl::If,
             ArgumentControl::Coalesce,
+            ArgumentControl::Try,
             ArgumentControl::SimpleCase,
             ArgumentControl::SearchedCase,
             ArgumentControl::HigherOrder {
@@ -608,6 +611,7 @@ mod tests {
             ControlShape::TypeOnly,
             ControlShape::If,
             ControlShape::Coalesce,
+            ControlShape::Try,
             ControlShape::Case {
                 simple: true,
                 arms: 1,

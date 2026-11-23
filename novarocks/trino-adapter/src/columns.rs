@@ -17,8 +17,8 @@
 
 //! Trino column metadata projected only from the frozen client render contract.
 use novarocks_result_contract::{
-    ClientPresentationFamily, ClientRenderSchema, NativeRenderType, RenderIntervalField,
-    RenderTemporalType, RenderTimeUnit, TrinoJsonFacts,
+    CharacterKind, ClientPresentationFamily, ClientRenderSchema, NativeRenderType,
+    RenderIntervalField, RenderTemporalType, RenderTimeUnit, TrinoJsonFacts,
 };
 use serde::Serialize;
 use std::fmt::{self, Write};
@@ -236,7 +236,7 @@ fn precision(unit: RenderTimeUnit) -> u64 {
 enum ScalarName {
     Plain(&'static str),
     Decimal(u8, i8),
-    Temporal {
+    Parameterized {
         keyword: &'static str,
         precision: u64,
         suffix: &'static str,
@@ -299,6 +299,23 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
             arguments: [2_147_483_647, 0, 0, 0],
             argument_count: 1,
         }),
+        N::BoundedCharacter(character) => {
+            let name = match character.kind() {
+                CharacterKind::Char => "char",
+                CharacterKind::Varchar => "varchar",
+            };
+            let length = u64::from(character.length());
+            TypeInfo::Scalar(ScalarInfo {
+                raw_type: name,
+                name: ScalarName::Parameterized {
+                    keyword: name,
+                    precision: length,
+                    suffix: "",
+                },
+                arguments: [length, 0, 0, 0],
+                argument_count: 1,
+            })
+        }
         N::Binary => plain("varbinary"),
         N::Date => plain("date"),
         N::Time { unit } | N::Timestamp { unit, .. } => {
@@ -314,7 +331,7 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
                 let precision = precision(*unit);
                 TypeInfo::Scalar(ScalarInfo {
                     raw_type,
-                    name: ScalarName::Temporal {
+                    name: ScalarName::Parameterized {
                         keyword,
                         precision,
                         suffix,
@@ -395,7 +412,7 @@ fn temporal_type_info(ty: RenderTemporalType, facts: TrinoJsonFacts) -> ScalarIn
     ScalarInfo {
         raw_type,
         name: if facts.parametric_datetime {
-            ScalarName::Temporal {
+            ScalarName::Parameterized {
                 keyword,
                 precision: u64::from(precision),
                 suffix,
@@ -569,7 +586,7 @@ fn write_type_name(
         TypeInfo::Scalar(info) => match info.name {
             ScalarName::Plain(name) => out.write_str(name),
             ScalarName::Decimal(precision, scale) => write!(out, "decimal({precision}, {scale})"),
-            ScalarName::Temporal {
+            ScalarName::Parameterized {
                 keyword,
                 precision,
                 suffix,

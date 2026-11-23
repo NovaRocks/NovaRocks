@@ -28,7 +28,7 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_null_order_limit_offset;
 CREATE TABLE ${case_db}.t_topn_null_order_limit_offset (
   id INT,
   k INT,
-  s STRING
+  s VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_topn_null_order_limit_offset VALUES
   ROW(1, NULL, 'a'),

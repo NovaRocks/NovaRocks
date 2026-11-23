@@ -4,3 +4,39 @@ id	v
 1	1
 2	2
 3	3
+
+-- query 11
+-- types	bigint
+v
+1
+2
+9007199254740992
+9007199254740996
+
+-- query 12
+-- types	bigint
+snapshots
+2
+
+-- query 15
+-- types	bigint
+v
+1
+2
+9007199254740992
+9007199254740996
+
+-- query 16
+-- types	bigint
+snapshots
+2
+
+-- query 22
+-- types	integer	bigint	array(varbinary)
+id	v	items
+1	9007199254740992	NULL
+2	1	NULL
+3	NULL	NULL
+4	NULL	[]
+5	NULL	[]
+6	NULL	NULL

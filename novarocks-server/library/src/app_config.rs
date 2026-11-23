@@ -1103,8 +1103,6 @@ pub struct StandaloneServerConfig {
     pub iceberg_maintenance_max_concurrent: usize,
     #[serde(default = "default_standalone_iceberg_maintenance_compaction_min_data_files")]
     pub iceberg_maintenance_compaction_min_data_files: u64,
-    #[serde(default = "default_standalone_iceberg_maintenance_dv_min_delete_files")]
-    pub iceberg_maintenance_dv_min_delete_files: u64,
     #[serde(default = "default_standalone_iceberg_maintenance_action_cooldown_ms")]
     pub iceberg_maintenance_action_cooldown_ms: i64,
     #[serde(default = "default_standalone_iceberg_maintenance_max_consecutive_failures")]
@@ -1170,10 +1168,6 @@ fn default_standalone_iceberg_maintenance_compaction_min_data_files() -> u64 {
     100
 }
 
-fn default_standalone_iceberg_maintenance_dv_min_delete_files() -> u64 {
-    10
-}
-
 fn default_standalone_iceberg_maintenance_action_cooldown_ms() -> i64 {
     3_600_000
 }
@@ -1218,8 +1212,6 @@ impl Default for StandaloneServerConfig {
                 default_standalone_iceberg_maintenance_max_concurrent(),
             iceberg_maintenance_compaction_min_data_files:
                 default_standalone_iceberg_maintenance_compaction_min_data_files(),
-            iceberg_maintenance_dv_min_delete_files:
-                default_standalone_iceberg_maintenance_dv_min_delete_files(),
             iceberg_maintenance_action_cooldown_ms:
                 default_standalone_iceberg_maintenance_action_cooldown_ms(),
             iceberg_maintenance_max_consecutive_failures:
@@ -4489,7 +4481,6 @@ grpc_port = 19080
                 iceberg_maintenance_tick_interval_ms: 600_000,
                 iceberg_maintenance_max_concurrent: 1,
                 iceberg_maintenance_compaction_min_data_files: 100,
-                iceberg_maintenance_dv_min_delete_files: 10,
                 iceberg_maintenance_action_cooldown_ms: 3_600_000,
                 iceberg_maintenance_max_consecutive_failures: 4,
             })
@@ -4530,7 +4521,6 @@ grpc_port = 19080
         assert_eq!(cfg.iceberg_maintenance_tick_interval_ms, 600_000);
         assert_eq!(cfg.iceberg_maintenance_max_concurrent, 1);
         assert_eq!(cfg.iceberg_maintenance_compaction_min_data_files, 100);
-        assert_eq!(cfg.iceberg_maintenance_dv_min_delete_files, 10);
         assert_eq!(cfg.iceberg_maintenance_action_cooldown_ms, 3_600_000);
         assert_eq!(cfg.iceberg_maintenance_max_consecutive_failures, 4);
         assert_eq!(cfg.mv_refresh_max_touched_groups, 100_000);

@@ -216,6 +216,7 @@ impl FunctionSemantics {
         let argument_evaluation = match effects.argument_control {
             ArgumentControl::If
             | ArgumentControl::Coalesce
+            | ArgumentControl::Try
             | ArgumentControl::SimpleCase
             | ArgumentControl::SearchedCase => FunctionArgumentEvaluation::ShortCircuit,
             ArgumentControl::Eager
@@ -545,6 +546,7 @@ enum BindingResolverOwnerKind {
         Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
     ),
     BorrowedTemporalContext(Arc<crate::builtin::temporal_context::TemporalContextResolver>),
+    BorrowedBinaryOperator(Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>),
     ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
     Original(Arc<dyn FunctionBindingResolver>),
 }
@@ -586,6 +588,11 @@ impl FunctionBindingResolverOwner {
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedTemporalContext(owner))
     }
+    pub(crate) fn borrowed_binary_operator(
+        owner: Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedBinaryOperator(owner))
+    }
     pub(crate) fn parametric_aggregate(owner: Arc<ParametricAggregateBindingResolver>) -> Self {
         Self(BindingResolverOwnerKind::ParametricAggregate(owner))
     }
@@ -623,6 +630,9 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::ParametricAggregate(owner) => owner
                         .validate_selected_with_creator_in(selected, request, creation, control),
                     BindingResolverOwnerKind::Original(_) => {
@@ -641,6 +651,7 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Original(owner) => owner.as_ref(),
         }

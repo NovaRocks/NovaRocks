@@ -39,16 +39,17 @@ pub(super) fn current_constraint(
             }
             Ok(None)
         }
-        SqlResultConstraintOrigin::ArrayCommonCoercion => {
+        SqlResultConstraintOrigin::ArrayCommonCoercion
+        | SqlResultConstraintOrigin::OperatorDecimalFloatCoercion => {
             let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
             else {
                 return Err(invalid(
-                    "ARRAY common constraint lacks its original value source",
+                    "direct conversion constraint lacks its original value source",
                 ));
             };
             let target = binding
                 .result_constraint()
-                .ok_or_else(|| invalid("ARRAY common constraint lost its authored target"))?;
+                .ok_or_else(|| invalid("direct conversion constraint lost its authored target"))?;
             work.flush()?;
             let target = target
                 .with_nullable(target.nullable() || value_type.nullable())
@@ -152,31 +153,26 @@ impl ScalarEmission<'_, '_> {
         }
         let revised = match &old.kind {
             ContractExprKind::Cast {
-                array_failure_mode,
-                expr,
-                target,
-                allow_throw_exception,
-                decimal_overflow_policy,
+                cast_mode, expr, ..
             } => {
-                // The same statement owner authored this occurrence's reference.
-                // Read its frozen boolean, never an ambient setting or default.
-                if *allow_throw_exception != self.root_allow_throw_reference() {
-                    return Err(invalid(
-                        "cast seed differs from its statement semantic source",
-                    ));
-                }
                 let input = &self.nullability_definition(*expr)?.ty;
-                let conversion_can_produce_null = match array_failure_mode {
-                    Some(mode) => {
-                        *mode == novarocks_type_contract::ArrayCastFailureMode::OutputNull
-                    }
-                    None => novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                        input.data_type(),
-                        target,
-                        *decimal_overflow_policy,
-                        self.root_allow_throw_exception,
-                    ),
-                };
+                let conversion_can_produce_null =
+                    novarocks_functions::PreparedCastRecipe::trino_result_nullable(
+                        input,
+                        &old.ty,
+                        *cast_mode,
+                        self.control,
+                    )
+                    .map_err(|error| match error.control_error() {
+                        Some(cause) => ContractLoweringError::Control(cause),
+                        None => ContractLoweringError::InvalidFunctionBinding {
+                            detail: format!(
+                                "{cast_mode:?} CAST from {:?} to {:?} while rebinding {id:?}: {error}",
+                                input.value_type().kind(),
+                                old.ty.value_type().kind(),
+                            ),
+                        },
+                    })?;
                 old.ty
                     .clone()
                     .with_nullable(

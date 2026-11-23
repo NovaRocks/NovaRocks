@@ -136,6 +136,16 @@ try {
   require(VariantFixture.load().schema().asStruct()==sourceSchema.asStruct(),"Spark changed the Binary source declaration")
   val invalid=session.sql("SELECT st IS NOT NULL,st.f IS NULL FROM ice_rest.${case_db}.spark_fixed_source_${uuid0} WHERE id=1").head()
   require(invalid.getBoolean(0) && invalid.getBoolean(1),"Nested-requiredness source must have an active parent and a NULL child")
+  VariantFixture.initialize(session,"${case_db}","spark_retired_largeint_${uuid0}")
+  val retiredSchema=new Schema(
+    Types.NestedField.required(1,"id",Types.IntegerType.get()),
+    Types.NestedField.optional(2,"raw",Types.FixedType.ofLength(16)))
+  val nominal="""{"version":1,"fields":[{"id":2,"domain":"largeint"}]}"""
+  val retiredTable=VariantFixture.create(retiredSchema,properties=Map("novarocks.nominal-types.v1"->nominal))
+  VariantFixture.write(retiredTable,Seq(Seq[Any](Int.box(1),fixedBytes("00112233445566778899AABBCCDDEEFF"))))
+  val retired=VariantFixture.load()
+  require(retired.schema().findField("raw").fieldId()==2 && retired.properties().get("novarocks.nominal-types.v1")==nominal,
+    "Legacy nominal field lost its declared field identity")
   println("FIXED_WIDTH_CREATED_OK")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA
@@ -473,7 +483,21 @@ SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ORDER BY id;
 
 -- query 18
+SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_retired_largeint_${uuid0};
+
+-- query 19
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.analyze.unsupported_expression] Field raw (ID 2) uses retired SQL type LARGEINT
+SELECT count(raw) FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_retired_largeint_${uuid0};
+
+-- query 20
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.analyze.unsupported_expression] Field raw (ID 2) uses retired SQL type LARGEINT
+SELECT count(raw) FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_retired_largeint_${uuid0} WHERE FALSE;
+
+-- query 21
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ;
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_source_${uuid0} ;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_retired_largeint_${uuid0};

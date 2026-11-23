@@ -28,6 +28,7 @@ pub enum MetadataRegistryLabel {
     Accounts,
     Owners,
     Events,
+    FundingRecords,
 }
 impl fmt::Display for MetadataRegistryLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

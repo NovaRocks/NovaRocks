@@ -32,11 +32,13 @@ use novarocks_type_contract::{
 };
 
 mod conversion;
+pub mod declaration;
 mod literal;
 mod route;
 #[doc(hidden)]
 pub mod syntax_constant;
 mod temporal;
+pub use conversion::operator_decimal_float;
 pub use literal::{LiteralEmission, LiteralSyntax, TypedLiteral, supports_typed_string};
 pub use route::{ScalarTypingRoute, scalar_typing_route};
 pub use syntax_constant::{LiteralValue, admit_syntax_constant};
@@ -44,6 +46,38 @@ pub use temporal::{
     TemporalSyntax, at_zone_syntax, bind_temporal_syntax, clock_syntax, declared_temporal_type,
     qualified_datetime_difference, select_temporal_cast, temporal_function_value_type,
 };
+
+/// Project numeric and comparison syntax into the installed operator vocabulary.
+pub fn syntax_arithmetic(operator: novarocks_parser::ast::BinaryOperator) -> OperatorFunction {
+    use novarocks_parser::ast::BinaryOperator::*;
+    match operator {
+        Add => OperatorFunction::Add,
+        Subtract => OperatorFunction::Subtract,
+        Multiply => OperatorFunction::Multiply,
+        Divide => OperatorFunction::Divide,
+        Modulo => OperatorFunction::Modulo,
+    }
+}
+
+pub fn syntax_comparison(operator: novarocks_parser::ast::ComparisonOperator) -> OperatorFunction {
+    use novarocks_parser::ast::ComparisonOperator::*;
+    match operator {
+        Equal => OperatorFunction::Equal,
+        NotEqual => OperatorFunction::NotEqual,
+        LessThan => OperatorFunction::LessThan,
+        LessThanOrEqual => OperatorFunction::LessThanOrEqual,
+        GreaterThan => OperatorFunction::GreaterThan,
+        GreaterThanOrEqual => OperatorFunction::GreaterThanOrEqual,
+    }
+}
+
+pub fn syntax_distinct_from(negated: bool) -> OperatorFunction {
+    if negated {
+        OperatorFunction::Identical
+    } else {
+        OperatorFunction::Distinct
+    }
+}
 
 /// The caller's original statement binding authority. Implementations retain
 /// their declaration and installed implementation admission at both steps.
@@ -146,6 +180,8 @@ pub enum NodeShape<'a> {
         expected_result: Option<&'a FunctionValueType>,
     },
     Operator(OperatorFunction),
+    Coalesce,
+    UnaryPlus,
     And,
     Or,
     IsNull,
@@ -184,6 +220,7 @@ impl ChildTyping {
 #[derive(Debug)]
 pub struct CarrierConversion {
     pub target: FunctionValueType,
+    pub mode: Option<novarocks_type_contract::TrinoCastMode>,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
 }
 
@@ -193,6 +230,13 @@ pub struct ValueDomainConversion {
     pub expected_result: FunctionValueType,
     pub target: FunctionValueType,
     pub tail: Option<CarrierConversion>,
+    pub origin: ValueConversionOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueConversionOrigin {
+    ValueDomain,
+    OperatorDecimalFloat,
 }
 
 #[derive(Debug)]
@@ -230,6 +274,7 @@ pub enum TypingError {
     InvalidShape(&'static str),
     Binding(FunctionBindingError),
     Constant(ConstantError),
+    JsonLiteralValidation(novarocks_functions::KernelFailure),
     ValueType(ValueTypeError),
     CommonType(AssignmentCommonTypeError),
     Control(CompileControlError),
@@ -284,6 +329,7 @@ impl fmt::Display for TypingError {
             Self::InvalidShape(message) => f.write_str(message),
             Self::Binding(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
+            Self::JsonLiteralValidation(error) => error.fmt(f),
             Self::ValueType(error) => error.fmt(f),
             Self::CommonType(error) => error.fmt(f),
             Self::Control(error) => error.fmt(f),
@@ -296,6 +342,7 @@ impl std::error::Error for TypingError {
         match self {
             Self::Binding(error) => Some(error),
             Self::Constant(error) => Some(error),
+            Self::JsonLiteralValidation(error) => Some(error),
             Self::ValueType(error) => Some(error),
             Self::CommonType(error) => Some(error),
             Self::Control(error) => Some(error),
@@ -365,42 +412,36 @@ pub fn type_node(
         NodeShape::CatalogCall {
             name,
             expected_result,
-        } => {
-            let arguments = arguments(children, work)?;
-            work.flush()?;
-            let binding = context.catalog.select_scalar(
-                name,
-                request(&arguments, expected_result),
-                work.control(),
-            )?;
-            type_selected_call(context, binding, expected_result, children, work)?
-        }
-        NodeShape::Operator(operator) if operator != OperatorFunction::Negation => {
-            let arguments = arguments(children, work)?;
-            work.flush()?;
-            let binding = match context.catalog.select_operator(
-                operator,
-                request(&arguments, None),
-                work.control(),
-            ) {
-                Err(FunctionBindingError::NoMatchingOverload) => {
-                    return Err(TypingError::TypeMismatch(format!(
-                        "No matching temporal arithmetic overload for {:?}",
-                        operator
-                    )));
-                }
-                result => result?,
+        } => type_catalog_call(context, name, expected_result, children, work)?,
+        NodeShape::Coalesce => {
+            let Some((first, remaining)) = children.split_first() else {
+                return Err(TypingError::InvalidShape("COALESCE requires operands"));
             };
-            type_selected_call(context, binding, None, children, work)?
+            remaining
+                .iter()
+                .try_fold(first.value_type.clone(), |common, child| {
+                    novarocks_type_contract::assignment_common_value_type(
+                        &common,
+                        &child.value_type,
+                        work,
+                    )
+                })?;
+            type_catalog_call(context, "coalesce", None, children, work)?
         }
         NodeShape::Operator(operator) => {
-            let [child] = children else {
-                return Err(TypingError::InvalidShape("negation requires one operand"));
-            };
-            if child.value_type.data_type() == &DataType::Null {
-                return Err(TypingError::TypeMismatch(
-                    "unary minus requires an operand with a specified numeric type".into(),
+            let unary = matches!(
+                operator,
+                OperatorFunction::Negation | OperatorFunction::TemporalNegation
+            );
+            if children.len() != if unary { 1 } else { 2 } {
+                return Err(TypingError::InvalidShape(
+                    "operator has the wrong number of operands",
                 ));
+            }
+            if operator == OperatorFunction::Negation
+                && children[0].value_type.data_type() == &DataType::Null
+            {
+                return Err(FunctionBindingError::AmbiguousOverload.into());
             }
             let arguments = arguments(children, work)?;
             work.flush()?;
@@ -410,14 +451,69 @@ pub fn type_node(
                 work.control(),
             ) {
                 Err(FunctionBindingError::NoMatchingOverload) => {
+                    if matches!(
+                        operator,
+                        OperatorFunction::TemporalAdd
+                            | OperatorFunction::TemporalSubtract
+                            | OperatorFunction::TemporalMultiply
+                            | OperatorFunction::TemporalDivide
+                            | OperatorFunction::TemporalNegation
+                    ) {
+                        return Err(TypingError::TypeMismatch(format!(
+                            "No matching temporal arithmetic overload for {:?}",
+                            operator
+                        )));
+                    }
+                    if operator == OperatorFunction::ArraySubscript {
+                        return Err(TypingError::TypeMismatch(format!(
+                            "cannot subscript {:?} with {:?}",
+                            children[0].value_type.data_type(),
+                            children[1].value_type.data_type(),
+                        )));
+                    }
+                    if unary {
+                        return Err(TypingError::TypeMismatch(format!(
+                            "unary minus requires a supported numeric operand, got {:?}",
+                            children[0].value_type.data_type()
+                        )));
+                    }
                     return Err(TypingError::TypeMismatch(format!(
-                        "unary minus requires a supported numeric operand, got {:?}",
-                        child.value_type.data_type()
+                        "operator {} does not accept {:?} and {:?}",
+                        operator.sql(),
+                        children[0].value_type.data_type(),
+                        children[1].value_type.data_type()
                     )));
                 }
                 result => result?,
             };
             type_selected_call(context, binding, None, children, work)?
+        }
+        NodeShape::UnaryPlus => {
+            let [child] = children else {
+                return Err(TypingError::InvalidShape("unary plus requires one operand"));
+            };
+            validate_temporal_unary_plus(&child.value_type)?;
+            if child.value_type.logical_type()
+                != novarocks_type_contract::ValueLogicalType::Physical
+                || !matches!(
+                    child.value_type.data_type(),
+                    DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                )
+            {
+                return Err(TypingError::TypeMismatch(format!(
+                    "unary plus requires a signed integer, real, or double operand, got {:?}",
+                    child.value_type.data_type(),
+                )));
+            }
+            NodeTyping::Value {
+                result: child.value_type.clone(),
+                conversions: vec![Conversion::Keep],
+            }
         }
         NodeShape::IsNull => {
             if children.len() != 1 {
@@ -490,6 +586,23 @@ fn request<'a>(
     }
 }
 
+fn type_catalog_call(
+    context: &TypingContext<'_>,
+    name: &str,
+    expected_result: Option<&FunctionValueType>,
+    children: &[ChildTyping],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<NodeTyping, TypingError> {
+    let arguments = arguments(children, work)?;
+    work.flush()?;
+    let binding = context.catalog.select_scalar(
+        name,
+        request(&arguments, expected_result),
+        work.control(),
+    )?;
+    type_selected_call(context, binding, expected_result, children, work)
+}
+
 fn type_selected_call(
     context: &TypingContext<'_>,
     binding: ResolvedFunctionBinding,
@@ -498,6 +611,8 @@ fn type_selected_call(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeTyping, TypingError> {
     check_shape(&binding, children.len())?;
+    let arithmetic = OperatorFunction::from_function_id(&binding.function_id)
+        .is_some_and(|operator| operator.arithmetic().is_some());
     let conversions = binding
         .selected
         .argument_types
@@ -509,6 +624,12 @@ fn type_selected_call(
                     "selected scalar expects a lambda argument",
                 ));
             };
+            if arithmetic
+                && matches!(child.value_type.data_type(), DataType::Decimal128(..))
+                && matches!(target.data_type(), DataType::Float32 | DataType::Float64)
+            {
+                return conversion::operator_decimal_float(context, child, target, work);
+            }
             conversion::coerce_argument(context, child, target, work)
         })
         .collect::<Result<_, _>>()?;
@@ -518,6 +639,40 @@ fn type_selected_call(
             expected_result: expected_result.cloned(),
         },
         conversions,
+    })
+}
+
+/// Ask the selected value author for legality and possible successful SQL NULL.
+pub fn type_cast(
+    context: &TypingContext<'_>,
+    source: &FunctionValueType,
+    target: FunctionValueType,
+    mode: novarocks_type_contract::TrinoCastMode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CarrierConversion, TypingError> {
+    use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
+
+    work.flush()?;
+    let nullable = PreparedCastRecipe::trino_result_nullable(source, &target, mode, work.control())
+        .map_err(|error| {
+            if let Some(cause) = error.control_error() {
+                return TypingError::Control(cause);
+            }
+            let message = format!(
+                "Cannot cast {:?} to {:?}: {error}",
+                source.value_type().kind(),
+                target.value_type().kind(),
+            );
+            match error {
+                CastPrepareError::Illegal => TypingError::TypeMismatch(message),
+                CastPrepareError::Unsupported => TypingError::Unsupported(message),
+                _ => TypingError::Binding(FunctionBindingError::InvalidBinding(message.into())),
+            }
+        })?;
+    Ok(CarrierConversion {
+        target: target.with_nullable(nullable)?,
+        mode: Some(mode),
+        decimal_overflow_policy: context.decimal_overflow_policy,
     })
 }
 
@@ -610,8 +765,7 @@ fn type_searched_case(
     {
         return Err(TypingError::InvalidShape("invalid searched CASE operands"));
     }
-    let (cases, otherwise) = children.split_at(2 * when_count);
-    let (cases, _) = cases.as_chunks::<2>();
+    let (cases, otherwise) = children.as_chunks::<2>();
     let mut result = FunctionValueType::new(DataType::Null, true);
     for branch in cases.iter().map(|[_, branch]| branch).chain(otherwise) {
         work.step()?;
@@ -621,10 +775,6 @@ fn type_searched_case(
             work,
         )?;
     }
-    if result.data_type() == &DataType::Null {
-        result = FunctionValueType::new(DataType::Utf8, true);
-    }
-
     let mut conversions = Vec::with_capacity(children.len());
     for [condition, branch] in cases {
         conversions.push(boolean_operand(context, condition, "CASE WHEN", work)?);

@@ -985,6 +985,16 @@ pub(crate) fn validate_node_semantics(
                     "hash join must have at least one key",
                 ));
             }
+            if condition.is_null_aware()
+                && keys.iter().any(|key| {
+                    key.match_relation != novarocks_type_contract::JoinKeyMatch::Grouping
+                })
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "NULL-aware membership value keys require grouping equality",
+                ));
+            }
             for key in keys
                 .iter()
                 .chain(condition.scope_keys().into_iter().flatten())
@@ -992,12 +1002,23 @@ pub(crate) fn validate_node_semantics(
                 if let (Some(left), Some(right)) = (
                     fragment.root_expression(node.id, key.left),
                     fragment.root_expression(node.id, key.right),
-                ) && !super::value_bindings_match_ignoring_root_nullability(&left.ty, &right.ty)
-                {
-                    errors.push(ValidationError::new(
-                        path,
-                        "hash join key pair does not have one exact execution data type",
-                    ));
+                ) {
+                    if !super::value_bindings_match_ignoring_root_nullability(&left.ty, &right.ty) {
+                        errors.push(ValidationError::new(
+                            path,
+                            "hash join key pair does not have one exact execution data type",
+                        ));
+                    }
+                    if !key.match_relation.supports(
+                        left.ty.data_type(),
+                        left.ty.logical_type(),
+                        key.null_safe,
+                    ) {
+                        errors.push(ValidationError::new(
+                            path,
+                            "hash join key match relation does not admit its frozen type or NULL mode",
+                        ));
+                    }
                 }
             }
             if let Some(residual) = residual {
@@ -3545,6 +3566,26 @@ fn validate_aggregate_contract(
             path,
             errors,
         );
+        if let Some(root) = call.filter_root {
+            if !call.binding.phase.consumes_logical_arguments() {
+                errors.push(ValidationError::new(
+                    path,
+                    "state-consuming aggregate phase cannot apply FILTER",
+                ));
+            }
+            if !fragment
+                .root_expression(node.id, root)
+                .is_some_and(|expression| {
+                    matches!(expression.kind, ExprKind::Value(_))
+                        && expression.ty.data_type() == &arrow_schema::DataType::Boolean
+                })
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "aggregate FILTER must directly reference a BOOLEAN input value",
+                ));
+            }
+        }
         if !call.binding.phase.consumes_logical_arguments() && call.distinct {
             errors.push(ValidationError::new(
                 path,
@@ -3636,6 +3677,7 @@ fn validate_grouped_topn(
     for call in calls {
         if !matches!(call.binding.phase, AggregatePhase::Intermediate { .. })
             || call.distinct
+            || call.filter_root.is_some()
             || !call.order_by.is_empty()
             || call.arguments.len() != 1
         {

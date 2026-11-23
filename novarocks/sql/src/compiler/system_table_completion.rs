@@ -18,24 +18,39 @@
 //! Collect and install metadata snapshots on their original optimized leaves.
 use super::SqlCompileError;
 use super::completion::{CompileNeedId, SystemTableSnapshotFact, SystemTableSnapshotNeed};
-use super::completion_predicate::{ProviderPredicateColumn, lower_atom_with_column};
+use super::completion_predicate::{
+    ProviderPredicateColumn, lower_atom_with_literal, lower_literal,
+};
 use crate::analysis::{BinOp, ExprKind, TypedExpr};
 use crate::column_id::ColumnId;
+use crate::common::binary_operator::typed_comparison;
 use crate::planner::physical::{PhysicalPlanKind, PhysicalPlanNode};
 use crate::planner::system_relation::PhysicalSystemTableState;
 use crate::system_table::{
     SystemTableKeyConstraint, SystemTableKeyValues, SystemTableOccurrenceId,
 };
 use novarocks_spi::connector::read_stack::{ConnectorValue, ConnectorValueType};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
+};
 use std::collections::BTreeMap;
 
 #[derive(Clone)]
 struct Predicate {
     expression: TypedExpr,
     // Original predicate IDs -> IDs exposed by the current child.
-    mapping: Option<BTreeMap<ColumnId, ColumnId>>,
+    mapping: Option<BTreeMap<ColumnId, ProjectInput>>,
 }
+
+#[derive(Clone)]
+enum ProjectInput {
+    Column(ColumnId),
+    Varchar {
+        value: ConnectorValue,
+        value_type: FunctionValueType,
+    },
+}
+
 fn unnest(mut expression: &TypedExpr) -> &TypedExpr {
     while let ExprKind::Nested(inner) = &expression.kind {
         expression = inner;
@@ -84,10 +99,17 @@ pub(super) fn collect(
                     .items
                     .iter()
                     .map(|item| {
-                        let ExprKind::ColumnRef { column_id, .. } = &unnest(&item.expr).kind else {
-                            return None;
+                        let expression = unnest(&item.expr);
+                        let input = match &expression.kind {
+                            ExprKind::ColumnRef { column_id, .. } => {
+                                ProjectInput::Column(*column_id)
+                            }
+                            _ => ProjectInput::Varchar {
+                                value: lower_literal(expression, ConnectorValueType::Varchar)?,
+                                value_type: expression.value_type.clone(),
+                            },
                         };
-                        Some((item.output_column_id, *column_id))
+                        Some((item.output_column_id, input))
                     })
                     .collect::<Option<BTreeMap<_, _>>>();
                 if let Some(mapping) = mapping {
@@ -97,7 +119,11 @@ pub(super) fn collect(
                             Some(previous) => previous
                                 .iter()
                                 .filter_map(|(original, current)| {
-                                    mapping.get(current).map(|next| (*original, *next))
+                                    let next = match current {
+                                        ProjectInput::Column(column) => mapping.get(column)?,
+                                        ProjectInput::Varchar { .. } => current,
+                                    };
+                                    Some((*original, next.clone()))
                                 })
                                 .collect(),
                         });
@@ -115,20 +141,22 @@ pub(super) fn collect(
                 let mut constraint = SystemTableKeyConstraint::default();
                 for predicate in predicates {
                     work.step()?;
-                    if !matches!(
-                        &unnest(&predicate.expression).kind,
-                        ExprKind::BinaryOp { op: BinOp::Eq, .. }
-                            | ExprKind::InList { negated: false, .. }
-                    ) {
+                    let expression = unnest(&predicate.expression);
+                    if !matches!(typed_comparison(expression), Some((BinOp::Eq, _)))
+                        && !matches!(&expression.kind, ExprKind::InList { negated: false, .. })
+                    {
                         continue;
                     }
-                    let atom = lower_atom_with_column(&predicate.expression, |expression| {
+                    let resolve_column = |expression: &TypedExpr| {
                         let ExprKind::ColumnRef { column_id, .. } = &unnest(expression).kind else {
                             return None;
                         };
                         let id = match &predicate.mapping {
                             None => *column_id,
-                            Some(mapping) => *mapping.get(column_id)?,
+                            Some(mapping) => match mapping.get(column_id)? {
+                                ProjectInput::Column(id) => *id,
+                                ProjectInput::Varchar { .. } => return None,
+                            },
                         };
                         let (column, ordinal) = table
                             .relation
@@ -146,8 +174,23 @@ pub(super) fn collect(
                             ordinal: u32::try_from(*ordinal).ok()?,
                             value_type: ConnectorValueType::Varchar,
                         })
-                    });
-                    let Some((ordinal, domain)) = atom else {
+                    };
+                    let resolve_literal = |expression: &TypedExpr, expected| {
+                        if let ExprKind::ColumnRef { column_id, .. } = &unnest(expression).kind
+                            && let Some(ProjectInput::Varchar { value, value_type }) =
+                                predicate.mapping.as_ref()?.get(column_id)
+                            && expected == ConnectorValueType::Varchar
+                            && value_type == &expression.value_type
+                        {
+                            return Some(value.clone());
+                        }
+                        lower_literal(expression, expected)
+                    };
+                    let Some((ordinal, domain)) = lower_atom_with_literal(
+                        &predicate.expression,
+                        resolve_column,
+                        resolve_literal,
+                    ) else {
                         continue;
                     };
                     if domain.null_allowed() {

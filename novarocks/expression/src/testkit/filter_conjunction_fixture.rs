@@ -25,7 +25,7 @@ use crate::{
     CompiledExprSet, CompiledFilterConjunctionInstance, EvaluationEnvironment, ScopeLayouts,
 };
 use arrow::{
-    array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array},
+    array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -41,7 +41,7 @@ use novarocks_functions::{
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
     FunctionValueType, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    SemanticParameterValue, SemanticParameters,
+    SemanticParameterValue, SemanticParameters, TrinoCastMode,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -117,17 +117,20 @@ fn integer_literal(
     constant(draft, pools, &value, ty)
 }
 
-fn cast(draft: &mut BoundExprSetBuilder, expr: ExprId, ty: FunctionValueType) -> ExprId {
+fn cast(
+    draft: &mut BoundExprSetBuilder,
+    expr: ExprId,
+    ty: FunctionValueType,
+    cast_mode: TrinoCastMode,
+) -> ExprId {
     draft
         .add(
             None,
             ty.clone(),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode,
                 expr,
                 target: ty.data_type().clone(),
-                decimal_overflow_policy: OUTPUT_NULL,
-                allow_throw_exception: ALLOW_THROW,
             },
         )
         .unwrap()
@@ -165,7 +168,12 @@ fn count_eq_zero(
         .add(None, count.1.clone(), ExprKind::Value(count.0))
         .unwrap();
     let zero = integer_literal(draft, pools, 0);
-    let right = cast(draft, zero, FunctionValueType::new(DataType::Int64, false));
+    let right = cast(
+        draft,
+        zero,
+        FunctionValueType::new(DataType::Int64, false),
+        TrinoCastMode::Implicit,
+    );
     comparison(draft, left, BinaryOperator::Eq, right)
 }
 
@@ -173,7 +181,12 @@ fn present_date(draft: &mut BoundExprSetBuilder, max: &(ValueId, FunctionValueTy
     let max = draft
         .add(None, max.1.clone(), ExprKind::Value(max.0))
         .unwrap();
-    let date = cast(draft, max, FunctionValueType::new(DataType::Date32, true));
+    let date = cast(
+        draft,
+        max,
+        FunctionValueType::new(DataType::Date32, true),
+        TrinoCastMode::Explicit,
+    );
     draft
         .add(
             None,
@@ -234,6 +247,7 @@ fn rand_lt_half(
         draft,
         half,
         FunctionValueType::new(DataType::Float64, false),
+        TrinoCastMode::Implicit,
     );
     comparison(draft, random, BinaryOperator::Lt, half)
 }
@@ -257,7 +271,7 @@ pub fn fixture(shape: FilterShape) -> Fixture {
         FilterShape::CountAndRandom => vec![(ValueId::new(2), count)],
         FilterShape::DateAndRandom => vec![(
             ValueId::new(2),
-            FunctionValueType::new(DataType::Float64, true),
+            FunctionValueType::new(DataType::Utf8, true),
         )],
     };
     let first = match shape {
@@ -342,7 +356,7 @@ pub fn fixture(shape: FilterShape) -> Fixture {
     Fixture { unit, roots, shape }
 }
 
-pub fn batch(f: &Fixture, counts: &[i64], doubles: &[Option<f64>]) -> RecordBatch {
+pub fn batch(f: &Fixture, counts: &[i64], dates: &[Option<&str>]) -> RecordBatch {
     let keys = Arc::new(Int32Array::from_iter_values(
         (0..counts.len()).map(|n| i32::try_from(n + 1).unwrap()),
     ));
@@ -352,8 +366,8 @@ pub fn batch(f: &Fixture, counts: &[i64], doubles: &[Option<f64>]) -> RecordBatc
         FilterShape::TwoCounts => arrays.extend([counts_array() as ArrayRef, counts_array()]),
         FilterShape::CountAndRandom => arrays.push(counts_array()),
         FilterShape::DateAndRandom => {
-            assert_eq!(counts.len(), doubles.len());
-            arrays.push(Arc::new(Float64Array::from(doubles.to_vec())));
+            assert_eq!(counts.len(), dates.len());
+            arrays.push(Arc::new(StringArray::from(dates.to_vec())));
         }
     }
     RecordBatch::try_new(f.unit.scopes()[0].schema().clone(), arrays).unwrap()

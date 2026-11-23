@@ -341,6 +341,7 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
         "try_temporal",
         "try_temporal_clock",
         "try_temporal_zone",
+        "operator_decimal_float_coercion",
     ] {
         manifest.push(InstalledPureKernel {
             function: FunctionId::try_new("builtin.scalar/value_domain_conversion/v1").unwrap(),

@@ -392,3 +392,27 @@ fn explicit_maintenance_refusals_keep_the_original_property_and_where_details() 
         "WHERE not supported for procedure OPTIMIZE_MANIFESTS"
     );
 }
+
+#[test]
+fn optimize_preparation_passes_the_bound_threshold_without_replacing_zero() {
+    // The private projection must keep the admitted byte count for RewriteIntent.
+    for (source, expected) in [
+        ("ALTER TABLE lake.ns.t EXECUTE optimize", 104_857_600),
+        (
+            "ALTER TABLE lake.ns.t EXECUTE optimize(file_size_threshold => '1.5MB')",
+            1_572_864,
+        ),
+        (
+            "ALTER TABLE lake.ns.t EXECUTE optimize(file_size_threshold => '0B')",
+            0,
+        ),
+    ] {
+        assert_eq!(
+            project(source).unwrap(),
+            Procedure::Optimize {
+                file_size_threshold_bytes: expected
+            },
+            "{source}",
+        );
+    }
+}

@@ -142,6 +142,7 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
             TEMPORAL_WRITE_ASSIGNMENT,
             NULL_LIFT,
             OPAQUE_BINARY,
+            OPERATOR_DECIMAL_FLOAT_COERCION,
             SIGNED_LARGEINT,
             TEMPORAL,
             TEMPORAL_CLOCK,

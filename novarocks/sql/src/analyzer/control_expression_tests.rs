@@ -113,6 +113,7 @@ fn case_clauses_keep_original_order_bindings_and_full_branch_declarations() {
             operand,
             when_then,
             else_expr,
+            ..
         } = &actual.kind
         else {
             panic!("original CASE IR")
@@ -139,7 +140,7 @@ fn case_clauses_keep_original_order_bindings_and_full_branch_declarations() {
                 expr,
                 target,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                array_failure_mode: None,
+                cast_mode: None,
             } = &actual.kind
             else {
                 panic!("searched CASE must explicitly convert to the nullable result type");
@@ -169,8 +170,8 @@ fn case_clauses_keep_original_order_bindings_and_full_branch_declarations() {
         let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
         assert_eq!(
             actual.value_type,
-            FunctionValueType::new(DataType::Utf8, true),
-            "the original all-NULL CASE rule"
+            FunctionValueType::new(DataType::Null, true),
+            "an all-NULL CASE has an unknown result type"
         );
     }
 }
@@ -244,11 +245,17 @@ fn partial_case_unique_and_invalid_exists_fail_before_inputs_and_table_lookup() 
 }
 
 #[test]
-fn cast_safe_syntax_retains_the_existing_conversion_policy_and_display_contract() {
+fn cast_safe_syntax_distinguishes_conversion_modes_and_preserves_display_contract() {
+    use novarocks_type_contract::TrinoCastMode;
+
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let scope = ctx.new_scope();
-    for operand in ["1", "'invalid'", "NULL"] {
+    for (operand, strict_nullable, try_nullable) in [
+        ("1", false, false),
+        ("'invalid'", false, true),
+        ("NULL", true, true),
+    ] {
         let ordinary = query(&format!("SELECT CAST({operand} AS INT)"));
         let safe = query(&format!("SELECT TRY_CAST({operand} AS INT)"));
         let ast::Expr::Cast(ordinary_node) = projection(&ordinary) else {
@@ -259,15 +266,30 @@ fn cast_safe_syntax_retains_the_existing_conversion_policy_and_display_contract(
         };
         assert!(!ordinary_node.safe);
         assert!(safe_node.safe);
-        let actual = ctx.analyze_expr(projection(&safe), &scope);
-        let expected = ctx.analyze_expr(projection(&ordinary), &scope);
-        match (actual, expected) {
-            (Ok(actual), Ok(expected)) => same_typed(&actual, &expected, &control),
-            (Err(actual), Err(expected)) => {
-                assert_eq!(actual.kind(), expected.kind());
-                assert_eq!(actual.message(), expected.message());
-            }
-            _ => panic!("safe syntax retains the current shared conversion owner"),
+        let source = ctx.analyze_expr(&ordinary_node.expression, &scope).unwrap();
+        for (query, mode, nullable) in [
+            (&ordinary, TrinoCastMode::Explicit, strict_nullable),
+            (&safe, TrinoCastMode::Try, try_nullable),
+        ] {
+            let actual = ctx.analyze_expr(projection(query), &scope).unwrap();
+            assert_eq!(actual.value_type.data_type(), &DataType::Int32);
+            assert_eq!(
+                actual.value_type.nullable(),
+                nullable,
+                "{operand}: {mode:?}"
+            );
+            let ExprKind::Cast {
+                expr,
+                target,
+                cast_mode,
+                ..
+            } = &actual.kind
+            else {
+                panic!("conversion retains its original operand: {operand}");
+            };
+            same_typed(expr, &source, &control);
+            assert_eq!(target, &DataType::Int32);
+            assert_eq!(*cast_mode, Some(mode));
         }
         assert_eq!(
             super::display_expr_for_test(projection(&safe)),
@@ -293,192 +315,6 @@ fn cast_safe_syntax_retains_the_existing_conversion_policy_and_display_contract(
             "{sql}"
         );
     }
-}
-
-#[test]
-fn lambda_body_borrow_retains_original_constant_ordinal_and_write_conversion() {
-    use crate::compiler::SqlWriteAssignmentSite;
-    use crate::compiler::materialized_values::MaterializedSourceBorrow;
-    use arrow::array::{Array, Int32Array};
-    use novarocks_functions::ConstantPool;
-    use novarocks_type_contract::CompilePhase;
-    use std::{borrow::Cow, sync::Arc};
-    let control = SqlCompileControl::unbounded();
-    let field = Arc::new(arrow::datatypes::Field::new(
-        "original_lambda_body",
-        DataType::Int32,
-        false,
-    ));
-    let pool = ConstantPool::try_new(
-        field.clone(),
-        FunctionValueType::new(DataType::Int32, false),
-        Int32Array::from(vec![99, 5]).to_data(),
-        crate::constant::test_constant_policy(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let value = pool.value(1).unwrap();
-    let query = query("SELECT array_map(x -> only_original_body, [1,2])");
-    let ast::Expr::FunctionCall(call) = projection(&query) else {
-        panic!("array_map")
-    };
-    let ast::Expr::Lambda(lambda) = &call.arguments[0].value else {
-        panic!("lambda")
-    };
-    assert_eq!(lambda.arguments[0].name.value, "x");
-    let mut source = MaterializedSourceBorrow::empty(&query);
-    source
-        .insert_context_constant(&lambda.body, value.clone(), &control)
-        .unwrap();
-    source
-        .insert_write_assignment(
-            &lambda.body,
-            Cow::Owned(
-                SqlWriteAssignmentSite::try_new(
-                    0,
-                    FunctionValueType::new(DataType::Int64, false),
-                    None,
-                    &control,
-                )
-                .unwrap()
-                .with_source_span(lambda.body.span()),
-            ),
-            &control,
-        )
-        .unwrap();
-    assert!(source.view().constant_at(&lambda.body.clone()).is_none());
-    let mut ctx = context(&control);
-    ctx.materialized_values = Some(source.view());
-    let scope = ctx.new_scope();
-    let expected = ctx.analyze_expr(&lambda.body, &scope).unwrap();
-    let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
-    let ExprKind::FunctionCall { args, .. } = &actual.kind else {
-        panic!("original array function binding")
-    };
-    let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
-        panic!("original lambda binder")
-    };
-    assert_eq!(params.len(), 1);
-    assert_eq!(params[0].name, "x");
-    same_typed(body, &expected, &control);
-    assert_eq!(
-        body.value_type,
-        FunctionValueType::new(DataType::Int64, true)
-    );
-    let ExprKind::Cast { expr, target, .. } = &body.kind else {
-        panic!("original write conversion")
-    };
-    assert_eq!(target, &DataType::Int64);
-    let ExprKind::Constant(retained) = &expr.kind else {
-        panic!("original lambda body source")
-    };
-    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
-    assert_eq!(retained.ordinal(), 1);
-    assert_eq!(retained.field(), field.as_ref());
-    assert_eq!(retained.value_type(), value.value_type());
-}
-
-#[test]
-fn case_result_cast_path_preserves_original_constant_and_write_conversion() {
-    use crate::compiler::SqlWriteAssignmentSite;
-    use crate::compiler::materialized_values::{
-        MaterializedValues, SqlConstantExpressionSite, SqlConstantExpressionStep,
-        SqlExpressionConstant,
-    };
-    use arrow::array::{Array, Int32Array};
-    use novarocks_functions::ConstantPool;
-    use novarocks_type_contract::CompilePhase;
-    use std::{borrow::Cow, sync::Arc};
-    let control = SqlCompileControl::unbounded();
-    let field = Arc::new(arrow::datatypes::Field::new(
-        "original_case_source",
-        DataType::Int32,
-        false,
-    ));
-    let pool = ConstantPool::try_new(
-        field.clone(),
-        FunctionValueType::new(DataType::Int32, false),
-        Int32Array::from(vec![99, 5]).to_data(),
-        crate::constant::test_constant_policy(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let value = pool.value(1).unwrap();
-    let query = query("SELECT CASE WHEN TRUE THEN CAST(only_original_result AS BIGINT) ELSE 2 END");
-    let ast::Expr::SearchedCase(case) = projection(&query) else {
-        panic!("searched CASE")
-    };
-    let ast::Expr::Cast(cast) = &case.when_clauses[0].result else {
-        panic!("original CAST")
-    };
-    let source = MaterializedValues::try_new_expressions(
-        &query,
-        vec![
-            SqlExpressionConstant::new(
-                vec![],
-                SqlConstantExpressionSite::SelectProjection { column: 0 },
-                value.clone(),
-            )
-            .with_expression_path(vec![
-                SqlConstantExpressionStep::CaseResult(0),
-                SqlConstantExpressionStep::CastExpression,
-            ]),
-        ]
-        .into(),
-        &control,
-    )
-    .unwrap();
-    let mut original = source.loan(&query, &control).unwrap();
-    original
-        .insert_write_assignment(
-            &cast.expression,
-            Cow::Owned(
-                SqlWriteAssignmentSite::try_new(
-                    0,
-                    FunctionValueType::new(DataType::Int64, false),
-                    None,
-                    &control,
-                )
-                .unwrap()
-                .with_source_span(cast.expression.span()),
-            ),
-            &control,
-        )
-        .unwrap();
-    let mut ctx = context(&control);
-    ctx.materialized_values = Some(original.view());
-    let scope = ctx.new_scope();
-    let expected = ctx
-        .analyze_expr(&case.when_clauses[0].result, &scope)
-        .unwrap();
-    let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
-    let ExprKind::Case { when_then, .. } = &actual.kind else {
-        panic!("original CASE IR")
-    };
-    same_typed(&when_then[0].1, &expected, &control);
-    assert_eq!(
-        when_then[0].1.value_type,
-        FunctionValueType::new(DataType::Int64, true)
-    );
-    let ExprKind::Cast { expr, target, .. } = &when_then[0].1.kind else {
-        panic!("original source conversion")
-    };
-    assert_eq!(target, &DataType::Int64);
-    let ExprKind::Constant(retained) = &expr.kind else {
-        panic!("original CASE result source")
-    };
-    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
-    assert_eq!(retained.ordinal(), 1);
-    assert_eq!(retained.field(), field.as_ref());
-    assert_eq!(retained.value_type(), value.value_type());
-    assert!(
-        original
-            .view()
-            .constant_at(&cast.expression.clone())
-            .is_none()
-    );
 }
 
 #[test]
@@ -554,18 +390,20 @@ fn dedicated_controls_keep_original_bindings_display_and_direct_refusals() {
             super::helpers::expr_display_name(&ordinary)
         );
     }
-    for sql in [
-        "SELECT if(TRUE, missing_value)",
-        "SELECT try(missing_value)",
-        "SELECT format(missing_format, missing_value)",
+    for (sql, kind) in [
+        (
+            "SELECT if(TRUE, missing_value)",
+            AnalyzeErrorKind::UnsupportedExpression,
+        ),
+        ("SELECT try(missing_value)", AnalyzeErrorKind::UnknownColumn),
+        (
+            "SELECT format(missing_format, missing_value)",
+            AnalyzeErrorKind::UnsupportedExpression,
+        ),
     ] {
         let parsed = query(sql);
         let error = ctx.analyze_expr(projection(&parsed), &scope).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            AnalyzeErrorKind::UnsupportedExpression,
-            "{sql}: {error}"
-        );
+        assert_eq!(error.kind(), kind, "{sql}: {error}");
     }
     for sql in [
         "SELECT typeof(CAST(if(TRUE, missing_value) AS INT))",

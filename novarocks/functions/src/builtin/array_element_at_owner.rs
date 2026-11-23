@@ -22,7 +22,7 @@ use std::sync::Arc;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompilePhase,
     FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
-    PureCompileControl,
+    OperatorFunction, PureCompileControl,
 };
 
 use super::catalogue::BuiltinScalarResolver;
@@ -37,8 +37,10 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-pub(super) fn operation(name: &str) -> bool {
-    name == "__array_element_at"
+pub(super) const SUBSCRIPT_NAME: &str = OperatorFunction::ArraySubscript.catalog_name();
+
+fn operation(name: &str) -> bool {
+    matches!(name, "__array_element_at" | SUBSCRIPT_NAME)
 }
 
 /// The exact two-argument profiles normalize indices with the original safe Arrow cast.
@@ -56,22 +58,36 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
+pub(super) fn subscript_effects() -> FunctionEffectDeclaration {
+    FunctionEffectDeclaration {
+        own_row_error: FunctionIntrinsicRowError::MayRaise,
+        null_behavior: FunctionNullBehavior::Strict,
+        ..effects()
+    }
+}
+
 pub(super) fn definition(
     name: &str,
     declaration: FunctionBindingDeclaration,
     resolver: BuiltinScalarResolver,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(ArrayElementAtOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    let visibility = if owner.strict {
+        FunctionVisibility::Hidden
+    } else {
+        FunctionVisibility::Public
+    };
+    FunctionDefinition::try_new_pure_scalar(name, visibility, owner).map_err(|error| {
+        FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin __array_element_at pure owner",
             value: error.to_string().into(),
-        },
-    )
+        }
+    })
 }
 
 struct ArrayElementAtOwner {
     resolver: Arc<BuiltinScalarResolver>,
+    strict: bool,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -88,10 +104,15 @@ impl ArrayElementAtOwner {
             });
         }
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let strict = name == SUBSCRIPT_NAME;
+        let (expected, arity) = if strict {
+            (subscript_effects(), 1)
+        } else {
+            (effects(), 2)
+        };
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 2
+            || declaration.overloads().len() != arity
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -114,13 +135,18 @@ impl ArrayElementAtOwner {
             .collect();
         Ok(Self {
             resolver: Arc::new(resolver),
+            strict,
             declaration,
             implementations,
         })
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = if self.strict {
+            subscript_effects()
+        } else {
+            effects()
+        };
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -243,6 +269,7 @@ impl PureScalarImplementation for ArrayElementAtOwner {
 #[derive(Debug)]
 struct PreparedArrayElementAt {
     contract: Arc<ScalarCallContract>,
+    strict: bool,
 }
 impl PreparedScalarKernel for PreparedArrayElementAt {
     fn contract(&self) -> &Arc<ScalarCallContract> {
@@ -254,18 +281,22 @@ impl PreparedScalarKernel for PreparedArrayElementAt {
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(ArrayElementAtInstance))
+        Ok(Box::new(ArrayElementAtInstance {
+            strict: self.strict,
+        }))
     }
 }
 
-struct ArrayElementAtInstance;
+struct ArrayElementAtInstance {
+    strict: bool,
+}
 impl ScalarKernelInstance for ArrayElementAtInstance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::array_access_selected::evaluate(input, control)
+        super::array_access_selected::evaluate(input, self.strict, control)
     }
 
     fn retained_bytes(&self) -> usize {
@@ -347,13 +378,16 @@ impl ArrayElementAtOwner {
                 FunctionBindingError::Control(error) => compile_failure(error),
                 _ => invalid("__array_element_at preparation has a stale selected binding"),
             })?;
-            super::array_access_selected::validate_profile(&contract, || {
+            super::array_access_selected::validate_profile(&contract, self.strict, || {
                 work.step().map_err(compile_failure)
             })?;
             work.step().map_err(compile_failure)?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
-            Ok(Arc::new(PreparedArrayElementAt { contract }) as Arc<dyn PreparedScalarKernel>)
+            Ok(Arc::new(PreparedArrayElementAt {
+                contract,
+                strict: self.strict,
+            }) as Arc<dyn PreparedScalarKernel>)
         })();
         if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;

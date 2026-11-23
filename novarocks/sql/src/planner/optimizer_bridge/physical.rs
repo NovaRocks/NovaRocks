@@ -187,7 +187,7 @@ impl BridgeCtx<'_> {
                     expr: if is_action {
                         TypedExpr {
                             kind: ExprKind::Cast {
-                                array_failure_mode: None,
+                                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
                                 expr: novarocks_parser::ast::AstBox::new(source),
                                 target: DataType::Int8,
                                 decimal_overflow_policy:
@@ -335,6 +335,7 @@ impl BridgeCtx<'_> {
                                         left: materialize(self.scalars, cond.left),
                                         right: materialize(self.scalars, cond.right),
                                         null_safe: cond.null_safe,
+                                        match_relation: cond.match_relation,
                                     })
                                     .collect(),
                             )
@@ -1432,7 +1433,7 @@ mod tests {
             ColumnId::new_for_test(11)
         );
         assert!(matches!(&project.items[1].expr.kind,
-            ExprKind::Cast { target: DataType::Int8, expr, .. }
+            ExprKind::Cast { cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit), target: DataType::Int8, expr, .. }
             if expr.value_type.data_type() == &DataType::Int32
             && matches!(expr.kind, ExprKind::ColumnRef { column_id: ColumnId(12), .. })));
     }

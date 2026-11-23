@@ -29,6 +29,7 @@ use novarocks_parser::{Span, ast::TrinoTableExecute};
 use novarocks_query_application::{
     admitted_query_context::QueryExecutionContext,
     api::CommandErrorKind,
+    protocol_delivery::QuerySessionOutput as StatementResult,
     session_control::GovernedStatementAction,
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::{
@@ -216,7 +217,9 @@ impl MaintenanceCommandExecutor {
             table: target.table,
         };
         match procedure {
-            Procedure::Optimize => super::super::rewrite_job::direct::prepare_resolved_optimize(
+            Procedure::Optimize {
+                file_size_threshold_bytes,
+            } => super::super::rewrite_job::direct::prepare_resolved_optimize(
                 &self.kernel,
                 RequestScopedMaintenanceEngine::new(
                     self.kernel.clone(),
@@ -224,7 +227,8 @@ impl MaintenanceCommandExecutor {
                     connector.clone(),
                 ),
                 target,
-                Some(&planning),
+                file_size_threshold_bytes,
+                &planning,
                 execution,
                 family,
                 #[cfg(novarocks_dev_controls)]
@@ -247,7 +251,7 @@ impl MaintenanceCommandExecutor {
                     &self.kernel,
                     target,
                     older_than_ms,
-                    super::super::cleanup_action::CleanupEntry::TableExecute(retention),
+                    retention,
                     planning,
                     execution,
                     connector,
@@ -332,16 +336,15 @@ impl MaintenanceCommandExecutor {
         ];
         self.prepare_metadata_source(
             ParsedMaintenanceStatement { name_parts, action },
-            false,
             context,
             execution,
             connector,
             lease,
-            Some(MetadataPreparation {
+            MetadataPreparation {
                 target,
                 planning,
                 intent,
-            }),
+            },
         )
         .map(PreparedTableExecute::Metadata)
     }
@@ -349,7 +352,9 @@ impl MaintenanceCommandExecutor {
 
 #[derive(Debug, PartialEq)]
 enum Procedure {
-    Optimize,
+    Optimize {
+        file_size_threshold_bytes: u64,
+    },
     RewriteManifests,
     ExpireSnapshots {
         older_than_ms: i64,
@@ -515,7 +520,25 @@ fn project_bound(
 ) -> Result<Procedure, QueryServiceError> {
     let kind = bound.declaration().kind();
     match kind {
-        TableProcedureKind::Optimize => return Ok(Procedure::Optimize),
+        TableProcedureKind::Optimize => {
+            let (slot, argument) = bound.into_arguments().next().ok_or_else(invariant)?;
+            let file_size_threshold_bytes = match argument {
+                BoundProcedureArgument::Present {
+                    value: BoundProcedureValue::FileSizeThreshold(size),
+                    ..
+                } => size.bytes(),
+                BoundProcedureArgument::Omitted | BoundProcedureArgument::ExplicitDefault(_) => {
+                    let Some(ProcedureArgumentDefault::DataSizeBytes(bytes)) = slot.default else {
+                        return Err(invariant());
+                    };
+                    bytes
+                }
+                _ => return Err(invariant()),
+            };
+            return Ok(Procedure::Optimize {
+                file_size_threshold_bytes,
+            });
+        }
         TableProcedureKind::OptimizeManifests => return Ok(Procedure::RewriteManifests),
         TableProcedureKind::AddFiles => {
             use crate::query_execution::dml::add_files::AddFilesArguments;

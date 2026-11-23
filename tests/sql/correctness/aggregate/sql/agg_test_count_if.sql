@@ -29,7 +29,7 @@ USE ${case_db};
 CREATE TABLE "test_count_if" (
   "v1" varchar(65533),
   "v2" varchar(65533),
-  "v3" datetime,
+  "v3" TIMESTAMP(6),
   "v4" int
 ) WITH (format_version = 3);
 

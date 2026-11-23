@@ -187,11 +187,9 @@ fn values_program_with_sources(
                             None,
                             ty,
                             ExprKind::Cast {
-                                array_failure_mode: None,
+                                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                                 expr: constant,
                                 target: types[column].data_type().clone(),
-                                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                                allow_throw_exception: ALLOW,
                             },
                         )
                         .unwrap()
@@ -298,22 +296,17 @@ fn values_program_with_sources(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    compile(package(fragment, constants), 1)
-}
-
-fn package(
-    fragment: crate::exec::operators::family_fixture::constant_sources::Fragment,
-    constants: ConstantPools,
-) -> Arc<FragmentPackage> {
-    package_with_parameters(
-        fragment,
-        constants,
-        SemanticParameters::try_new([(
-            ALLOW.id,
-            SemanticParameterValue::AllowThrowException(true),
-        )])
-        .unwrap(),
-    )
+    let parameters = if rows
+        .iter()
+        .flatten()
+        .any(|cell| matches!(cell, Cell::Overflow))
+    {
+        SemanticParameters::try_new([(ALLOW.id, SemanticParameterValue::AllowThrowException(true))])
+            .unwrap()
+    } else {
+        SemanticParameters::default()
+    };
+    compile(package_with_parameters(fragment, constants, parameters), 1)
 }
 
 fn package_with_parameters(

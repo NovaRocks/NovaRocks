@@ -28,7 +28,7 @@ CREATE CATALOG ice_ivm_xjoin_${uuid0} USING iceberg WITH ("iceberg.catalog.type"
 CREATE SCHEMA ice_ivm_xjoin_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions (
   id BIGINT NOT NULL,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts (
   id BIGINT NOT NULL,

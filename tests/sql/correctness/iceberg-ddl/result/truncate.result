@@ -71,3 +71,33 @@ id	v
 -- types	bigint
 n
 0
+
+-- query 39
+-- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+table_case	total_records	total_files_size	total_data_files	total_delete_files	total_position_deletes	total_equality_deletes
+v2	0	0	0	0	0	0
+
+-- query 40
+-- types	boolean	boolean	boolean	boolean
+no_deleted_files	no_deleted_rows	no_removed_bytes	no_removed_deletes
+true	true	true	true
+
+-- query 41
+-- types	boolean
+removed_dvs
+true
+
+-- query 42
+-- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+table_case	total_records	total_files_size	total_data_files	total_delete_files	total_position_deletes	total_equality_deletes
+v3	0	0	0	0	0	0
+
+-- query 43
+-- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+table_case	total_records	total_files_size	total_data_files	total_delete_files	total_position_deletes	total_equality_deletes
+empty_v3	0	0	0	0	0	0
+
+-- query 44
+-- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar
+table_case	total_records	total_files_size	total_data_files	total_delete_files	total_position_deletes	total_equality_deletes
+after_dv	0	0	0	0	0	0

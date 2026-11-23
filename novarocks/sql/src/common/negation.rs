@@ -74,18 +74,19 @@ pub(crate) fn is_negation(function: &novarocks_type_contract::FunctionId) -> boo
 pub(crate) fn typed_operand_has_lower_precedence(operand: &crate::analysis::TypedExpr) -> bool {
     use crate::analysis::ExprKind;
 
-    matches!(
-        operand.kind,
-        ExprKind::BinaryOp { .. }
-            | ExprKind::UnaryOp { .. }
-            | ExprKind::IsNull { .. }
-            | ExprKind::IsTruthValue { .. }
-            | ExprKind::InList { .. }
-            | ExprKind::Between { .. }
-            | ExprKind::Like { .. }
-            | ExprKind::LambdaFunction { .. }
-            | ExprKind::Lambda { .. }
-    )
+    crate::common::binary_operator::typed_operands(operand).is_some()
+        || matches!(
+            operand.kind,
+            ExprKind::BinaryOp { .. }
+                | ExprKind::UnaryOp { .. }
+                | ExprKind::IsNull { .. }
+                | ExprKind::IsTruthValue { .. }
+                | ExprKind::InList { .. }
+                | ExprKind::Between { .. }
+                | ExprKind::Like { .. }
+                | ExprKind::LambdaFunction { .. }
+                | ExprKind::Lambda { .. }
+        )
 }
 
 pub(crate) fn negation_delimiters(

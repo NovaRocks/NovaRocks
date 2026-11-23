@@ -22,14 +22,14 @@
 CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     g INT,
     id INT,
-    name STRING,
+    name VARCHAR,
     score INT,
     score_items ARRAY<INT>,
-    tags ARRAY<STRING>,
-    city STRING,
-    city_null STRING,
-    city_array ARRAY<STRING>,
-    city_array_null ARRAY<STRING>
+    tags ARRAY<VARCHAR>,
+    city VARCHAR,
+    city_null VARCHAR,
+    city_array ARRAY<VARCHAR>,
+    city_array_null ARRAY<VARCHAR>
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_collection_string_dict VALUES
@@ -53,7 +53,7 @@ ORDER BY g;
 SELECT
     g,
     STRING_AGG(name, '|' ORDER BY id) AS names_concat,
-    STRING_AGG(DISTINCT CAST(score AS STRING), ',' ORDER BY 1) AS distinct_scores
+    STRING_AGG(DISTINCT CAST(score AS VARCHAR), ',' ORDER BY 1) AS distinct_scores
 FROM ${case_db}.t_agg_collection_string_dict
 WHERE name IS NOT NULL
 GROUP BY g

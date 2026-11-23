@@ -257,6 +257,10 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_implementation_re
             value_conversion::TEMPORAL_WRITE_ASSIGNMENT,
             "builtin.scalar/value_domain_conversion/nested_temporal_write_assignment/selected-v1",
         ),
+        (
+            value_conversion::OPERATOR_DECIMAL_FLOAT_COERCION,
+            "builtin.scalar/value_domain_conversion/operator_decimal_float_coercion/selected-v1",
+        ),
     ];
     assert_eq!(owner.implementations.len(), expected.len());
     for record in &owner.implementations {

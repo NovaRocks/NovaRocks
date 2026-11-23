@@ -476,6 +476,9 @@ pub enum FunctionResolutionError {
         candidates: usize,
         binding_enforced: bool,
     },
+    AmbiguousSignature {
+        candidates: usize,
+    },
     BadSignature(String),
 }
 
@@ -488,6 +491,10 @@ impl fmt::Display for FunctionResolutionError {
             Self::NoMatchingSignature { candidates, .. } => write!(
                 formatter,
                 "no matching signature among {candidates} registered candidates"
+            ),
+            Self::AmbiguousSignature { candidates } => write!(
+                formatter,
+                "could not choose among {candidates} applicable overloads"
             ),
             Self::BadSignature(message) => write!(formatter, "bad signature: {message}"),
         }

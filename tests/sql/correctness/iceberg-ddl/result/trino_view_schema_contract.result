@@ -63,3 +63,13 @@ x
 -- types	integer
 v
 11
+
+-- query 78
+-- types	varchar	array(varchar)
+s	items
+aaa	["one"]
+
+-- query 82
+-- types	varchar	array(varchar)
+s	items
+aaa	["one"]

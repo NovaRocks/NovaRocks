@@ -70,6 +70,11 @@ pub fn temporal_write_assignment_matches(
     })
 }
 
+/// The numeric operator binder selects this family only for its original
+/// DECIMAL argument and explicit REAL or DOUBLE target.
+pub const OPERATOR_DECIMAL_FLOAT_COERCION: &str =
+    "builtin.scalar/value_domain_conversion/operator_decimal_float_coercion/v1";
+
 pub(super) const JSON_TEXT: &str =
     "builtin.scalar/value_domain_conversion/json_text_same_structure/v1";
 pub(super) const OPAQUE_BINARY: &str =
@@ -266,6 +271,7 @@ pub(super) fn definition_parts()
         (TRY_TEMPORAL_CLOCK, "exact temporal source and nullable target; own row capture with effective zone and start", "capture only own temporal row Data with captured start and zone"),
         (ARRAY_COMMON_COERCION, "original complete source->independently inferred ARRAY common element target; exact selection only", "strict Trino common coercion; preserve source NULL/domain/layout obligations; conversion Data propagates; never an automatic domain candidate"),
         (TEMPORAL_WRITE_ASSIGNMENT, "exact same-shape Iceberg Array/Map/Row with temporal precision changes; exact selection only", "round reachable temporal leaves once; retain target geometry; conversion Data propagates"),
+        (OPERATOR_DECIMAL_FLOAT_COERCION, "Physical Decimal128(1<=p<=38,0<=s<=p)->Physical(Float32|Float64); exact selection only", "explicit operand target; round directly to its IEEE width; preserve NULL"),
     ]
     .into_iter()
     .map(|(id, argument_pattern, result_pattern)| {
@@ -644,6 +650,7 @@ fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType
                 && target.data_type() == &DataType::FixedSizeBinary(16)
                 && target.nullable()
         }
+        OPERATOR_DECIMAL_FLOAT_COERCION => operator_decimal_float_types(source, target).is_some(),
         NULL_LIFT => {
             source.logical_type() == ValueLogicalType::Physical
                 && source.data_type() == &DataType::Null
@@ -652,6 +659,30 @@ fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType
         }
         _ => false,
     }
+}
+
+pub(super) fn operator_decimal_float_types(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+) -> Option<(u8, u8, crate::cast::TrinoFloatWidth)> {
+    if source.logical_type() != ValueLogicalType::Physical
+        || target.logical_type() != ValueLogicalType::Physical
+        || (source.nullable() && !target.nullable())
+    {
+        return None;
+    }
+    let DataType::Decimal128(precision, scale) = *source.data_type() else {
+        return None;
+    };
+    if !(1..=38).contains(&precision) || !(0..=precision as i8).contains(&scale) {
+        return None;
+    }
+    let width = match target.data_type() {
+        DataType::Float32 => crate::cast::TrinoFloatWidth::F32,
+        DataType::Float64 => crate::cast::TrinoFloatWidth::F64,
+        _ => return None,
+    };
+    Some((precision, scale as u8, width))
 }
 
 fn json_domain_pair(source: ValueLogicalType, target: ValueLogicalType) -> Option<bool> {

@@ -5489,10 +5489,14 @@ mod tests {
         // CTAS carries the selected SQL output domain into target admission.
         use crate::compiler::*;
         use novarocks_physical_plan::ResultValueDomain as Domain;
-        for (sql, expected) in [
-            ("select parse_json('{}') as v", Domain::Json),
-            ("select cast(NULL AS VARIANT) as v", Domain::Variant),
-            ("select X'AB' as v", Domain::Plain),
+        for (sql, expected, width) in [
+            ("select parse_json('{}') as v", Domain::Json, None),
+            (
+                "select cast('x' AS VARCHAR(8)) as v",
+                Domain::Plain,
+                Some(8),
+            ),
+            ("select X'AB' as v", Domain::Plain, None),
         ] {
             let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
             let snapshot = SqlPlannerTableSnapshot::new(&catalog);
@@ -5528,6 +5532,16 @@ mod tests {
             let columns = source.output_columns();
             assert_eq!(columns.len(), 1, "{sql}");
             assert_eq!(columns[0].domain, expected, "{sql}");
+            if let Some(width) = width {
+                use novarocks_type_contract::{CharacterKind, CharacterType, ValueKind};
+                assert_eq!(
+                    columns[0].value_type.value_type().kind(),
+                    &ValueKind::BoundedCharacter(
+                        CharacterType::new(CharacterKind::Varchar, width).unwrap()
+                    ),
+                    "{sql}"
+                );
+            }
             assert_eq!(
                 columns[0].value_type, source.optimized.output_columns[0].value_type,
                 "the application projection must retain the actual complete SQL author: {sql}"

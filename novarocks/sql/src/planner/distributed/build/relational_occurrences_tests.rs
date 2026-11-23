@@ -241,6 +241,7 @@ fn aggregate(
             .unwrap();
         output.push(value);
         calls.push(AggregateCall {
+            filter_root: None,
             id,
             binding,
             arguments,

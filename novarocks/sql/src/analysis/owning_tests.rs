@@ -100,7 +100,7 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
         4 => ExprKind::Cast {
             expr: boxed(child),
             target: DataType::Int64,
-            array_failure_mode: None,
+            cast_mode: None,
             decimal_overflow_policy: policy,
         },
         5 => ExprKind::IsNull {
@@ -141,11 +141,13 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             negated: true,
         },
         12 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(child)),
             when_then: vec![(marker(), marker())].into(),
             else_expr: Some(boxed(marker())),
         },
         13 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(marker())),
             when_then: vec![(marker(), marker())].into(),
             else_expr: Some(boxed(child)),
@@ -168,6 +170,8 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             volatility: crate::functions::FunctionVolatility::Immutable,
         },
         18 => ExprKind::AggregateCall {
+            occurrence: crate::analysis::AggregateOccurrence::new(),
+            filter: None,
             name: "owning".into(),
             args: vec![marker(), child].into(),
             distinct: true,
@@ -175,6 +179,8 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             resolved: binding(),
         },
         19 => ExprKind::AggregateCall {
+            occurrence: crate::analysis::AggregateOccurrence::new(),
+            filter: None,
             name: "owning".into(),
             args: vec![marker()].into(),
             distinct: true,
@@ -187,11 +193,13 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             negated: true,
         },
         21 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(marker())),
             when_then: vec![(marker(), marker()), (child, marker())].into(),
             else_expr: Some(boxed(marker())),
         },
         22 => ExprKind::Case {
+            ieee_float_equality: false,
             operand: Some(boxed(marker())),
             when_then: vec![(marker(), marker()), (marker(), child)].into(),
             else_expr: Some(boxed(marker())),
@@ -290,7 +298,7 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
             ExprKind::Cast {
                 expr,
                 target: DataType::Int64,
-                array_failure_mode: None,
+                cast_mode: None,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             },
             4,
@@ -366,6 +374,7 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
                 operand: Some(operand),
                 when_then,
                 else_expr: Some(else_expr),
+                ..
             },
             12 | 13 | 21 | 22,
         ) => {

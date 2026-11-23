@@ -34,17 +34,17 @@ CREATE CATALOG ice_ivm_union_reject_${uuid0} USING iceberg WITH ("iceberg.catalo
 CREATE SCHEMA ice_ivm_union_reject_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 -- Give every source a real v3 snapshot before testing unrelated UNION shape admission.

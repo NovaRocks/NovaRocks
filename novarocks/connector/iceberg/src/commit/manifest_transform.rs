@@ -138,6 +138,46 @@ async fn ordinary_manifests_core(
             .await?
         }
     };
+    count_manifests(snapshot_id, manifests, eligible_previous)
+}
+
+/// Filtered deletes retain every untouched live source by reference.
+pub(super) async fn filtered_manifests(
+    view: &super::staging::StagedView<'_>,
+    snapshot_id: i64,
+    sources: Option<&SnapshotSources<'_>>,
+    removed: &[&LocatedEntry],
+    scope: Option<&ManifestReadScope>,
+) -> Result<OrdinaryManifests> {
+    let Some(sources) = sources else {
+        return count_manifests(snapshot_id, Vec::new(), 0);
+    };
+    let (filtered, eligible_previous) = apply_removals(
+        view.metadata(),
+        view.artifacts(),
+        view.preparation().io_window_width,
+        view.stage_key(),
+        snapshot_id,
+        sources,
+        removed.iter().copied(),
+        scope.map(|scope| (scope, false)),
+    )
+    .await?;
+    count_manifests(
+        snapshot_id,
+        filtered
+            .into_iter()
+            .map(MergeCandidate::into_descriptor)
+            .collect(),
+        eligible_previous,
+    )
+}
+
+fn count_manifests(
+    snapshot_id: i64,
+    manifests: Vec<ManifestFile>,
+    eligible_previous: usize,
+) -> Result<OrdinaryManifests> {
     let created = manifests
         .iter()
         .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
@@ -371,7 +411,7 @@ fn changed_entry(
     message: &'static str,
 ) -> Error {
     if observation.is_some_and(|(_, later_snapshot)| later_snapshot) {
-        return super::new_manifests::row_delta_validation_error(format!(
+        return super::new_manifests::commit_validation_error(format!(
             "Missing required files to delete: {}",
             expected.frozen.identity().path(),
         ));

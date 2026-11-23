@@ -218,6 +218,7 @@ pub(crate) fn hash_batch(
             )?;
         } else {
             match prepared.spec.equalities()[column] {
+                KeyEquality::IeeeFloat => return Err(invariant(ValueViolation::Carrier)),
                 KeyEquality::SqlGrouping(_) => complex_hashes::<false>(
                     prepared,
                     column,
@@ -358,7 +359,10 @@ fn fixed_hashes(
         return Ok(());
     }
     macro_rules! primitive {
-        ($ty:ty, $canonical:expr) => {{
+        ($ty:ty, $canonical:expr) => {
+            primitive!($ty, $canonical, |_| true)
+        };
+        ($ty:ty, $canonical:expr, $eligible:expr) => {{
             let values = array
                 .as_any()
                 .downcast_ref::<$ty>()
@@ -372,7 +376,11 @@ fn fixed_hashes(
                         valid[ordinal] = 0;
                     }
                 } else {
-                    let bytes = ($canonical)(values.value(row)).to_le_bytes();
+                    let value = values.value(row);
+                    if !($eligible)(value) {
+                        valid[ordinal] = 0;
+                    }
+                    let bytes = ($canonical)(value).to_le_bytes();
                     let mut state = Xxh3::with_seed(seed);
                     state.update(&[1]);
                     state.update(&bytes);
@@ -404,10 +412,18 @@ fn fixed_hashes(
         DataType::UInt64 => primitive!(UInt64Array, |v: u64| v),
         DataType::Float32 => match prepared.spec.equalities()[column] {
             KeyEquality::SqlGrouping(_) => primitive!(Float32Array, canonical_f32_bits),
+            KeyEquality::IeeeFloat => {
+                primitive!(Float32Array, canonical_f32_bits, |value: f32| !value
+                    .is_nan())
+            }
             KeyEquality::ResultContent => primitive!(Float32Array, content_f32_bits),
         },
         DataType::Float64 => match prepared.spec.equalities()[column] {
             KeyEquality::SqlGrouping(_) => primitive!(Float64Array, canonical_f64_bits),
+            KeyEquality::IeeeFloat => {
+                primitive!(Float64Array, canonical_f64_bits, |value: f64| !value
+                    .is_nan())
+            }
             KeyEquality::ResultContent => primitive!(Float64Array, content_f64_bits),
         },
         DataType::Decimal128(..) => primitive!(Decimal128Array, |v: i128| v),

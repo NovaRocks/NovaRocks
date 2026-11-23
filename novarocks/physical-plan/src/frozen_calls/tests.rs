@@ -517,6 +517,7 @@ fn case_fixture(constants: &mut crate::tests::constant_fixture::ConstantFixture)
             lambda_scope: None,
             ty: boolean(),
             kind: ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(definition, definition)]),
                 else_expr: Some(otherwise),
@@ -657,6 +658,7 @@ fn special_fixture_with_rows(
             .unwrap();
         outputs.push(output);
         aggregate_calls.push(AggregateCall {
+            filter_root: None,
             id,
             binding: AggregateBinding {
                 state_interpretation: None,
@@ -847,6 +849,7 @@ fn wide_relation_fixture(count: usize) -> Fixture {
             .unwrap();
         outputs.push(output);
         specifications.push(AggregateCall {
+            filter_root: None,
             id: call,
             binding: AggregateBinding {
                 state_interpretation: None,

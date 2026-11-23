@@ -176,7 +176,8 @@ impl SpjgDescriptor {
 
         let aggregate = match &node.op {
             Operator::LogicalAggregate(a) => {
-                if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
+                if a.stage != AggStage::Single || a.is_split || has_unhandled_aggregate_channels(a)
+                {
                     return Err("unsupported aggregate shape for MV rewrite"
                         .to_string()
                         .into());
@@ -339,7 +340,8 @@ impl SpjgDescriptor {
         let (aggregate, mut node) = match &expr.op {
             Operator::LogicalAggregate(a) => {
                 // Only the original, unsplit Single aggregate is accepted.
-                if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
+                if a.stage != AggStage::Single || a.is_split || has_unhandled_aggregate_channels(a)
+                {
                     return Ok(None);
                 }
                 let child = miss!(first_logical_expr(memo, *miss!(expr.children.first())));
@@ -565,10 +567,10 @@ fn references_any(arena: &ScalarArena, expr: ScalarId, ids: &[ColumnId]) -> bool
     }
 }
 
-fn aggregate_has_order_by(agg: &LogicalAggregateOp) -> bool {
+fn has_unhandled_aggregate_channels(agg: &LogicalAggregateOp) -> bool {
     agg.aggregates
         .iter()
-        .any(|call| !call.source.order_by().is_empty())
+        .any(|call| !call.source.order_by().is_empty() || call.source.has_projected_inputs())
 }
 
 fn substitute_aggregate(
@@ -790,18 +792,21 @@ fn split_join_condition(
     let mut edges = Vec::new();
     let mut residuals = Vec::new();
     for c in conjuncts {
-        let edge = match arena.node(c) {
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left,
-                right,
-                ..
-            } => match (arena.node(*left), arena.node(*right)) {
-                (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => {
-                    normalize_equi_edge(*l, *r, left_columns, right_columns)
+        let edge = match crate::common::binary_operator::scalar_comparison(arena, c) {
+            Some((BinOp::Eq, [left, right]))
+                if [left, right].into_iter().all(|operand| {
+                    crate::common::binary_operator::permits_equality_substitution(
+                        arena.data_type(operand),
+                    )
+                }) =>
+            {
+                match (arena.node(left), arena.node(right)) {
+                    (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => {
+                        normalize_equi_edge(*l, *r, left_columns, right_columns)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
             _ => None,
         };
         match edge {
@@ -928,12 +933,18 @@ pub(crate) fn substitute_scalar(
             volatility,
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ScalarNode::AggregateCall {
+            occurrence,
+            filter: filter
+                .map(|id| substitute_scalar(arena, id, defs, control))
+                .transpose()?,
             name,
             args: args
                 .into_iter()
@@ -947,12 +958,12 @@ pub(crate) fn substitute_scalar(
             resolved,
         },
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child: substitute_scalar(arena, child, defs, control)?,
             target,
             decimal_overflow_policy,
@@ -994,10 +1005,12 @@ pub(crate) fn substitute_scalar(
             negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ScalarNode::Case {
+            ieee_float_equality,
             operand: operand
                 .map(|item| substitute_scalar(arena, item, defs, control))
                 .transpose()?,
@@ -1105,6 +1118,7 @@ fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             let mut out = Vec::with_capacity(operand.iter().count() + when_then.len() * 2 + 1);
             out.extend(operand.iter().copied());

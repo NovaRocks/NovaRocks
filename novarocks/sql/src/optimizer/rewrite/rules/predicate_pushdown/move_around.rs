@@ -486,6 +486,66 @@ mod tests {
     }
 
     #[test]
+    fn signed_bound_equality_is_not_rederived_from_its_opposite_side() {
+        use novarocks_functions::{FunctionArgument, FunctionBindingRequest, FunctionKind};
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, OperatorFunction};
+
+        let mut arena = ScalarArena::new();
+        let column = col_expr("l", "a", 1);
+        let mut literal = int_lit(10);
+        literal.value_type = FunctionValueType::new(DataType::Int32, false);
+        let arguments = [&column, &literal].map(|expr| FunctionArgument::Value {
+            value_type: expr.value_type.clone(),
+            constant: None,
+        });
+        let request = FunctionBindingRequest {
+            expected_result_type: None,
+            arguments: &arguments,
+            logical_argument_count: arguments.len(),
+        };
+        let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
+        let operator = OperatorFunction::Equal;
+        let catalog = crate::functions::builtin_engine_function_catalog();
+        let bound = catalog
+            .resolve_bound_trusted_by_id(
+                &operator.function_id(),
+                FunctionKind::Scalar,
+                request,
+                control,
+            )
+            .unwrap();
+        catalog.validate_bound(&bound, request, control).unwrap();
+        let binding =
+            crate::binding::SqlFunctionBinding::new(bound, DecimalOverflowPolicy::OutputNull);
+        let predicate =
+            crate::common::binary_operator::typed_call(operator, binding, vec![column, literal]);
+        let left = make_filter(&mut arena, predicate, make_scan("l", &[("a", 1)]));
+        let join = make_inner_join(
+            &mut arena,
+            eq(col_expr("l", "a", 1), col_expr("r", "b", 2)),
+            left,
+            make_scan("r", &[("b", 2)]),
+        );
+
+        let mut ctx = make_ctx(arena);
+        let result = JoinPredicateMoveAround.apply(join, &mut ctx).unwrap();
+        let RewriteResult::Changed(propagated) = result else {
+            panic!("the signed equality must reach the right child");
+        };
+        let Operator::LogicalFilter(derived) = &propagated.right().op else {
+            panic!("the right child must have the propagated filter");
+        };
+        assert!(matches!(
+            ctx.scalar_arena().borrow().node(derived.predicate),
+            crate::optimizer::scalar::ScalarNode::BinaryOp { op: BinOp::Eq, .. }
+        ));
+        assert!(matches!(
+            JoinPredicateMoveAround.apply(propagated, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
+    }
+
+    #[test]
     fn skips_left_outer_nullable_side_derivation() {
         let mut arena = ScalarArena::new();
         let left_scan = make_scan("l", &[("a", 1)]);

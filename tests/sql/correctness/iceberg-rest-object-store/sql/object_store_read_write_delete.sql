@@ -23,7 +23,7 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.object_store_rows (
     id INT,
-    "value" STRING
+    "value" VARCHAR
 ) WITH (format_version = 2);
 
 -- query 2

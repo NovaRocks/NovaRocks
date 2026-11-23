@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.merge_duplicates_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
+CREATE TABLE ${case_db}.merge_duplicates_${uuid0} (id BIGINT, v VARCHAR) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.merge_duplicates_${uuid0} VALUES ROW(1,'a');
 
 -- query 2

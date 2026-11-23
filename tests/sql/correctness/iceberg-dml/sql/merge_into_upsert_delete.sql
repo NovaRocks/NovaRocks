@@ -28,12 +28,12 @@ DROP TABLE IF EXISTS ${case_db}.t_merge_source;
 CREATE TABLE ${case_db}.t_merge_target (
   city_id INT,
   population INT,
-  city STRING
+  city VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_merge_source (
   city_id INT,
   population INT,
-  city STRING
+  city VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_merge_target VALUES
   ROW(1, 100, 'Beijing'),

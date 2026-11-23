@@ -44,7 +44,7 @@ select typeof(cast(1 as decimal(19, 2)));
 select typeof(cast(1 as double));
 
 -- query 8
-select typeof(cast(1 as float));
+select typeof(cast(1 as REAL));
 
 -- query 9
 select typeof(cast(1 as boolean));
@@ -53,19 +53,19 @@ select typeof(cast(1 as boolean));
 select typeof(cast(1 as char));
 
 -- query 11
-select typeof(cast(1 as string));
+select typeof(cast(1 as VARCHAR));
 
 -- query 12
 select typeof(cast(1 as varchar));
 
 -- query 13
-select typeof(cast('s' as BINARY));
+select typeof(cast('s' as VARBINARY));
 
 -- query 14
 select typeof(cast('2023-03-07' as date));
 
 -- query 15
-SELECT typeof(CAST('2023-03-07 11:22:33' AS timestamp(6)));
+SELECT typeof(CAST('2023-03-07 11:22:33' AS TIMESTAMP(6)));
 
 -- query 16
 select typeof([1, 2, 3]);
@@ -99,13 +99,13 @@ create table t1 (
   c8 decimal(38, 9),
   c9 boolean,
   c10 varchar,
-  c11 string,
+  c11 VARCHAR,
   c12 varchar,
-  c13 binary,
+  c13 VARBINARY,
   c14 date,
-  c15 timestamp(6),
+  c15 TIMESTAMP(6),
   c16 array<tinyint>,
-  c17 string,
+  c17 VARCHAR,
   c18 map<tinyint, varchar>,
   c19 ROW(col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint),
   c20 json

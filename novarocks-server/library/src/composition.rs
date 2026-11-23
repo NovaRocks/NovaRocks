@@ -696,10 +696,6 @@ pub fn compose_frontend_role_config(
                 .iceberg_maintenance_compaction_min_data_files
                 .try_into()
                 .unwrap_or(i64::MAX),
-            standalone
-                .iceberg_maintenance_dv_min_delete_files
-                .try_into()
-                .unwrap_or(i64::MAX),
             standalone.iceberg_maintenance_action_cooldown_ms,
             standalone.iceberg_maintenance_max_consecutive_failures,
         ));

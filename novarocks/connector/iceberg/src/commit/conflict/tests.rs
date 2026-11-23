@@ -16,15 +16,23 @@
 // under the License.
 
 use super::*;
+use novarocks_failure_contract::{
+    FailureClass, FailureFact, FailureProjection,
+    connector_reason::{
+        COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_STATE_UNKNOWN,
+        ICEBERG_COMMIT_VALIDATION_CONFLICT,
+    },
+};
 
 #[test]
 fn commit_failure_projects_the_original_typed_category_and_message() {
-    use ConnectorMutationFailureKind::{Conflict, Unavailable};
+    use novarocks_spi::connector::ConnectorMutationFailureKind::{Conflict, Unavailable};
 
     let validation = validation_conflict("Cannot commit, missing data files: path");
-    let rejected = transaction_conflict(
+    let rejected = original_commit_failure(
+        CommitOperation::Write,
+        CommitFailureKind::Contention { attempts: 3 },
         ConnectorMutationFailure::new(Conflict, "Catalog returned HTTP 409"),
-        3,
     );
     let unknown = commit_state_unknown(ConnectorMutationFailure::new(
         Unavailable,
@@ -57,9 +65,14 @@ fn commit_failure_projects_the_original_typed_category_and_message() {
             failure.failure_fact(),
             FailureFact::new(FailureClass::Dependency, reason)
         );
-        assert_eq!(
-            failure.connector_source().unwrap().failure_fact().reason(),
-            reason
-        );
+        let source = failure.connector_source().unwrap();
+        assert_eq!(source.failure_fact().reason(), reason);
+        let marker = if reason == ICEBERG_COMMIT_STATE_UNKNOWN {
+            "[CommitUnknown] "
+        } else {
+            ""
+        };
+        let expected = format!("Failed to commit the transaction during write: {marker}{message}");
+        assert_eq!(source.public_failure_detail(), Some(expected.as_str()));
     }
 }

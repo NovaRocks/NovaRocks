@@ -35,7 +35,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::query_execution::cohort_read::{QueryPinnedFileSetRead, QueryRewriteGroupRead};
+use crate::query_execution::cohort_read::QueryPinnedFileSetRead;
 use crate::query_execution::write_session::ConnectorWriteSession;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
@@ -70,34 +70,6 @@ pub(crate) fn pinned_rewrite_scan_physical_plan(
     )
 }
 
-/// Admit the synthetic source used by one procedure cohort's group read.
-pub(crate) fn admit_rewrite_group_scan_binding(
-    bindings: &QueryTableBindingStore,
-    input_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
-    read: QueryRewriteGroupRead,
-) -> Result<SqlTableBindingId, String> {
-    crate::query_execution::rewrite_group_read::admit_table_execute_scan_binding(
-        bindings,
-        &frozen_rewrite_identity(),
-        input_schema,
-        read,
-    )
-}
-
-/// Build the minimal physical source for one procedure cohort's group read.
-/// Preparation freezes the relation the group names; no normal table lookup
-/// may run.
-pub(crate) fn rewrite_group_scan_physical_plan(
-    input_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
-    binding: SqlTableBindingId,
-) -> Result<FrozenConnectorScanPlan, String> {
-    crate::query_execution::rewrite_group_read::table_execute_scan_physical_plan(
-        &frozen_rewrite_identity(),
-        input_schema,
-        binding,
-    )
-}
-
 /// State what one rewrite cohort's scan needs from the provider it reads.
 ///
 /// The relation is the query-local synthetic name the cohort is planned
@@ -119,9 +91,6 @@ pub(crate) fn rewrite_cohort_provider_read_need(
     let relation = match cohort {
         QueryFrozenCohortRead::PinnedFileSet(_) => {
             novarocks_sql::compiler::ProviderReadRelationNeed::PinnedFileSet { relation }
-        }
-        QueryFrozenCohortRead::TableExecute(_) => {
-            novarocks_sql::compiler::ProviderReadRelationNeed::TableExecute { relation }
         }
     };
     novarocks_sql::compiler::ProviderReadNeed::for_program(
@@ -744,9 +713,9 @@ mod tests {
         let request = ConnectorDistributedRewritePlanningRequest::try_new(
             operation_id,
             key.clone(),
-            novarocks_spi::connector::ConnectorDistributedRewriteOperation::RewriteDataFiles {
+            novarocks_spi::connector::ConnectorDistributedRewriteOperation::OptimizeDataFiles {
                 table: table.clone(),
-                rewrite_all: true,
+                file_size_threshold_bytes: 1024,
             },
             context(),
         )
@@ -787,16 +756,12 @@ mod tests {
                 crate::connector::schema_creation::with_schema_creation(&context(), |creation| {
                     ConnectorDistributedRewriteCohortPlan::try_new_typed(
                         ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
-                        novarocks_spi::connector::ConnectorRewriteCohortRead::DeleteArtifactGroup(
-                            novarocks_spi::connector::ConnectorFrozenRewriteGroup::try_new(
+                        novarocks_spi::connector::ConnectorRewriteCohortRead::PinnedFileSet(
+                            novarocks_spi::connector::ConnectorPinnedFileSet::try_new(
                                 "db",
                                 "orders",
-                                operation_id,
-                                digest,
-                                novarocks_spi::connector::ConnectorProcessLocalPayload::new(
-                                    key.clone(),
-                                    Arc::new(()),
-                                ),
+                                1,
+                                [format!("s3://warehouse/orders/group-{index}.parquet").as_str()],
                             )
                             .unwrap(),
                         ),

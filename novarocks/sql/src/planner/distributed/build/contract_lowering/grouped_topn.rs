@@ -305,6 +305,7 @@ impl ContractLoweringVisitor<'_> {
             }
             output.push(value);
             calls.push(ContractAggregateCall {
+                filter_root: None,
                 id,
                 binding,
                 arguments: Box::from([argument_root]),

@@ -57,7 +57,7 @@ use crate::commit::write_stack::domain::{
     IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
 };
 use crate::commit::write_stack::flavor::{
-    IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, plan_distributed_rewrite_branches,
+    IcebergSessionFlavorPlan, plan_distributed_rewrite_branches,
     plan_document_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
 };
 use crate::commit::write_stack::planning::{
@@ -70,8 +70,7 @@ use crate::commit::write_stack::test_support::{
     binding, data_branch_plan, data_input_shape, delete_branch_plan, delete_input_shape,
     document_publication_facts, document_publication_facts_with_shape, dv_artifact,
     equality_delete_input_shape, equality_delete_recipe, lineage_only_input_shape,
-    merge_on_read_input_shape, position_rewrite_target, sample_metrics, sample_partition,
-    session_material, table_facts,
+    merge_on_read_input_shape, sample_metrics, sample_partition, session_material, table_facts,
 };
 use crate::commit::write_stack::test_support::{receive_write_query, write_query_identity};
 use crate::delete_file::IcebergFileFormat;
@@ -215,7 +214,7 @@ pub(in crate::commit) fn dv_session() -> (IcebergWriteCommitSession, IcebergWrit
             base_version_digest: None,
             staged_metadata: None,
             data: data_branch_plan(),
-            deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector, None)],
+            deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector)],
         },
     )
     .expect("session");
@@ -250,21 +249,6 @@ fn received(
     received.arrive(query, &mut fragments).expect("arrive");
     received.confirm(query).expect("confirm");
     received
-}
-
-fn dv_fragment(path: &str, referenced: &str, merged: Vec<EntryIdentity>) -> IcebergCommitFragment {
-    IcebergCommitFragment::deletion_vector(
-        crate::commit::write_stack::domain::IcebergDeletionVectorArtifact::try_new(
-            path.to_string(),
-            sample_partition(),
-            sample_metrics(3, 1024),
-            referenced.to_string(),
-            crate::commit::write_stack::domain::IcebergContentRange::try_new(4, 64).expect("range"),
-            3,
-            merged,
-        )
-        .expect("deletion vector artifact"),
-    )
 }
 
 pub(super) fn final_vector(
@@ -411,36 +395,6 @@ fn two_delete_artifacts_for_one_data_file_are_rejected() {
         error.message().contains("more than one delete artifact"),
         "{}",
         error.message()
-    );
-}
-
-#[test]
-fn a_position_rewrite_artifact_for_an_unselected_data_file_is_rejected() {
-    let plan = plan_distributed_rewrite_branches(
-        &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
-        POSITION_DELETE_REWRITE,
-        &position_delete_rewrite_groups(&["a"]),
-    )
-    .unwrap();
-    let (handle, _) = flavor_session(plan);
-    let adapter = adapter("unit", 1);
-    let set = received(
-        &handle,
-        &adapter,
-        vec![(
-            ordinal(0),
-            dv_fragment(
-                "s3://b/wh/db/t/data/v.puffin",
-                "s3://b/wh/db/t/data/never-selected.parquet",
-                Vec::new(),
-            ),
-        )],
-    );
-    let error = validate_received_set(&handle, &adapter, &set).expect_err("unselected data file");
-    assert!(
-        error
-            .message()
-            .contains("differs from its selected data file")
     );
 }
 
@@ -681,7 +635,7 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
                 base_version_digest: None,
                 staged_metadata: None,
                 data: data_branch_plan(),
-                deletes: vec![delete_branch_plan(branch, None)],
+                deletes: vec![delete_branch_plan(branch)],
             },
         )
         .unwrap_or_else(|error| panic!("{} must plan: {error:?}", flavor.as_str()));
@@ -970,7 +924,7 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
                     route: Some(data_route),
                 },
                 IcebergWriteBranchPlan::Delete {
-                    plan: delete_branch_plan(IcebergWriteBranch::DeletionVector, None),
+                    plan: delete_branch_plan(IcebergWriteBranch::DeletionVector),
                     route: Some(delete_route),
                 },
             ],
@@ -986,18 +940,8 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
     );
 }
 
-/// The frozen data-file rewrite shape, whose selection the provider re-cuts
-/// from the target alone.
 const DATA_FILE_REWRITE: ConnectorDistributedRewriteShape =
-    ConnectorDistributedRewriteShape::DataFiles { rewrite_all: true };
-
-/// The frozen position-delete rewrite shape. Its selection facts travel with
-/// it because the group set depends on them.
-const POSITION_DELETE_REWRITE: ConnectorDistributedRewriteShape =
-    ConnectorDistributedRewriteShape::PositionDeletes {
-        rewrite_all: true,
-        min_input_files: None,
-    };
+    ConnectorDistributedRewriteShape::DataFiles;
 
 /// One live data file, with whatever delete artifacts are attached to it.
 fn rewrite_data_file(
@@ -1020,94 +964,15 @@ fn rewrite_data_file(
     }
 }
 
-/// One live Puffin deletion vector attached to `data_file`.
-fn rewrite_deletion_vector(
-    path: &str,
-    data_file: &str,
-) -> crate::scan_model::IcebergDeleteFileInfo {
-    crate::scan_model::IcebergDeleteFileInfo {
-        record_count: Some(1),
-        partition_data_json: Some(r#"{"version":1,"values":[]}"#.to_string()),
-        path: path.to_string(),
-        file_format: crate::scan_model::IcebergDeleteFileFormat::Puffin,
-        file_content: crate::scan_model::IcebergDeleteFileContent::Position,
-        length: Some(1024),
-        content_offset: Some(4),
-        content_size_in_bytes: Some(32),
-        sequence_number: Some(7),
-        partition_spec_id: Some(0),
-        partition_key: None,
-        referenced_data_file: Some(data_file.to_string()),
-        equality_column_names: Vec::new(),
-        equality_field_ids: Vec::new(),
-    }
-}
-
-/// Attach the frozen branch facts a data rewrite carries: none, because a data
-/// branch owns no delete artifact.
-fn data_rewrite_branches(
-    groups: Vec<crate::distributed_rewrite::IcebergFrozenRewriteGroupV1>,
-) -> Vec<IcebergFrozenRewriteBranch> {
-    groups
-        .into_iter()
-        .map(|group| IcebergFrozenRewriteBranch {
-            group,
-            position_rewrite: None,
-        })
-        .collect()
-}
-
-/// Cut real rewrite groups, one per partition key, through the rewrite
-/// planner the rewrite path already uses.
-fn rewrite_groups(partitions: &[&str]) -> Vec<IcebergFrozenRewriteBranch> {
+fn rewrite_groups(
+    partitions: &[&str],
+) -> Vec<crate::distributed_rewrite::IcebergFrozenRewriteGroupV1> {
     let files = partitions
         .iter()
         .map(|partition| rewrite_data_file(partition, Vec::new()))
-        .collect::<Vec<_>>();
-    data_rewrite_branches(
-        crate::distributed_rewrite::plan_data_file_groups(
-            files,
-            &std::collections::BTreeSet::new(),
-        )
-        .expect("plan rewrite groups"),
-    )
-}
-
-/// Cut real position-delete rewrite groups, one per data file that carries
-/// deletion vectors, and freeze each branch's own merge target the way
-/// `begin_write` does: owning its group's data file with no old reference to
-/// merge.
-fn position_delete_rewrite_groups(partitions: &[&str]) -> Vec<IcebergFrozenRewriteBranch> {
-    let files = partitions
-        .iter()
-        .map(|partition| {
-            let path = format!("s3://b/wh/db/t/data/{partition}/f.parquet");
-            rewrite_data_file(
-                partition,
-                vec![
-                    rewrite_deletion_vector(
-                        &format!("s3://b/wh/db/t/data/{partition}/d0.puffin"),
-                        &path,
-                    ),
-                    rewrite_deletion_vector(
-                        &format!("s3://b/wh/db/t/data/{partition}/d1.puffin"),
-                        &path,
-                    ),
-                ],
-            )
-        })
-        .collect::<Vec<_>>();
-    crate::distributed_rewrite::plan_position_delete_groups(files, true, None)
-        .expect("plan position-delete rewrite groups")
-        .into_iter()
-        .map(|group| {
-            let position_rewrite = Some(position_rewrite_target(&group.data_files[0].path, 1));
-            IcebergFrozenRewriteBranch {
-                group,
-                position_rewrite,
-            }
-        })
-        .collect()
+        .map(crate::manifest::data_file_with_stats_to_iceberg_data_file_info)
+        .collect();
+    crate::distributed_rewrite::group_data_files(files).expect("plan rewrite groups")
 }
 
 #[test]
@@ -1115,12 +980,8 @@ fn a_distributed_rewrite_yields_one_target_per_rewrite_group() {
     let adapter = adapter("rewrite", 6);
     let groups = rewrite_groups(&["a", "b", "c"]);
     assert_eq!(groups.len(), 3);
-    let plan = plan_distributed_rewrite_branches(
-        &session_material(data_input_shape()),
-        DATA_FILE_REWRITE,
-        &groups,
-    )
-    .expect("plan a distributed rewrite");
+    let plan = plan_distributed_rewrite_branches(&session_material(data_input_shape()), &groups)
+        .expect("plan a distributed rewrite");
     assert_eq!(plan.flavor, IcebergWriteFlavor::DistributedRewrite);
     let (handle, targets) = flavor_session(plan);
     assert_eq!(
@@ -1155,30 +1016,39 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     // when its frozen file set is absent, so before the session carried its
     // frozen groups every rewrite commit failed with "requires its frozen file
     // set". This asserts the session now supplies exactly the union it froze.
-    let live_deletes = std::collections::BTreeSet::from([
-        EntryIdentity::DeleteFile {
-            path: "s3://b/wh/db/t/data/d0.parquet".to_string(),
-        },
-        EntryIdentity::DeleteFile {
-            path: "s3://b/wh/db/t/data/d1.parquet".to_string(),
-        },
-    ]);
-    let groups = data_rewrite_branches(
-        crate::distributed_rewrite::plan_data_file_groups(
-            ["a", "b"]
-                .iter()
-                .map(|partition| rewrite_data_file(partition, Vec::new()))
-                .collect(),
-            &live_deletes,
-        )
-        .expect("plan rewrite groups"),
-    );
-    let plan = plan_distributed_rewrite_branches(
-        &session_material(data_input_shape()),
-        DATA_FILE_REWRITE,
-        &groups,
-    )
-    .expect("plan a distributed rewrite");
+    let files = ["a", "b"]
+        .into_iter()
+        .map(|partition| {
+            let mut file = rewrite_data_file(partition, Vec::new());
+            let delete = crate::scan_model::IcebergDeleteFileInfo {
+                path: format!("s3://b/wh/db/t/data/{partition}/delete.parquet"),
+                file_format: crate::scan_model::IcebergDeleteFileFormat::Parquet,
+                file_content: crate::scan_model::IcebergDeleteFileContent::Position,
+                record_count: Some(1),
+                partition_data_json: None,
+                length: Some(1024),
+                content_offset: None,
+                content_size_in_bytes: None,
+                sequence_number: Some(4),
+                partition_spec_id: Some(0),
+                partition_key: Some(partition.to_string()),
+                referenced_data_file: None,
+                equality_column_names: Vec::new(),
+                equality_field_ids: Vec::new(),
+            };
+            file.delete_files.push(delete);
+            crate::manifest::data_file_with_stats_to_iceberg_data_file_info(file)
+        })
+        .collect();
+    let groups = crate::distributed_rewrite::group_data_files(files).unwrap();
+    let live_deletes = ["a", "b"]
+        .into_iter()
+        .map(|partition| EntryIdentity::DeleteFile {
+            path: format!("s3://b/wh/db/t/data/{partition}/delete.parquet"),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let plan = plan_distributed_rewrite_branches(&session_material(data_input_shape()), &groups)
+        .expect("plan a distributed rewrite");
     let (handle, _) = flavor_session(plan);
 
     let files = crate::commit::write_stack::control::selected_rewrite_files(&handle)
@@ -1186,10 +1056,6 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     files
         .validate()
         .expect("the frozen file set satisfies the rewrite action");
-    assert_eq!(
-        files.kind,
-        crate::commit::selected_rewrite::SelectedRewriteKind::Data
-    );
     assert_eq!(
         files.data_paths,
         std::collections::BTreeSet::from([
@@ -1206,134 +1072,10 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     assert_eq!(files.delete_paths, live_deletes);
 }
 
-/// A position-delete rewrite repacks delete artifacts, so it seals a deletion
-/// vector branch per frozen group -- never the data branch a data rewrite
-/// seals. Sealing a data branch here would give SQL somewhere to send table
-/// rows the operation never reads, and its commit would then republish data
-/// files nothing rewrote.
-#[test]
-fn a_position_delete_rewrite_seals_one_delete_branch_per_frozen_group() {
-    let adapter = adapter("rewrite-position-deletes", 6);
-    let original = position_delete_rewrite_groups(&["a", "b"]);
-    let mut groups = original.clone();
-    let operation = (1u8..=255)
-        .map(|n| novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([n; 16]))
-        .find(|id| {
-            let cohort = |g: &IcebergFrozenRewriteBranch| {
-                novarocks_spi::connector::ConnectorWriteCohortId::derive(
-                    *id,
-                    b"iceberg-distributed-rewrite-group",
-                    crate::distributed_rewrite::decode_digest(&g.group.group_digest_hex).unwrap(),
-                )
-                .unwrap()
-            };
-            cohort(&original[0]) > cohort(&original[1])
-        })
-        .expect("cohort order must differ from group-digest order for this fixture");
-    groups.sort_by_key(|g| {
-        novarocks_spi::connector::ConnectorWriteCohortId::derive(
-            operation,
-            b"iceberg-distributed-rewrite-group",
-            crate::distributed_rewrite::decode_digest(&g.group.group_digest_hex).unwrap(),
-        )
-        .unwrap()
-    });
-    assert_ne!(
-        groups[0].group.group_digest_hex,
-        original[0].group.group_digest_hex
-    );
-    assert_eq!(groups.len(), 2);
-    let plan = plan_distributed_rewrite_branches(
-        &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
-        POSITION_DELETE_REWRITE,
-        &groups,
-    )
-    .expect("plan a position-delete rewrite");
-    assert_eq!(
-        plan.flavor,
-        IcebergWriteFlavor::DistributedRewritePositionDeletes
-    );
-    let (handle, targets) = flavor_session(plan);
-    assert_eq!(handle.expected_targets(), vec![ordinal(0), ordinal(1)]);
-    assert!(
-        handle
-            .targets()
-            .iter()
-            .all(|target| target.branch() == IcebergWriteBranch::DeletionVector)
-    );
-    for (index, branch) in groups.iter().enumerate() {
-        let expected = branch.position_rewrite.as_ref().unwrap();
-        assert_eq!(handle.targets()[index].position_rewrite(), Some(expected));
-        assert_eq!(targets[index].handle().position_rewrite(), Some(expected));
-        assert_eq!(expected.path(), branch.group.data_files[0].path);
-    }
-    let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
-    assert_eq!(sealed.targets().len(), 2);
-    assert!(
-        sealed
-            .targets()
-            .iter()
-            .all(|target| target.route().is_none())
-    );
-}
-
-/// The commit replaces the half of the frozen set its operation names. A data
-/// rewrite retires the group's data files plus the deletes they owned; a
-/// position-delete rewrite retires only the vectors its groups selected, and
-/// names their data files so the replacements can be proven to cover them.
-#[test]
-fn a_position_delete_rewrite_commits_the_delete_artifacts_it_froze() {
-    let plan = plan_distributed_rewrite_branches(
-        &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
-        POSITION_DELETE_REWRITE,
-        &position_delete_rewrite_groups(&["a"]),
-    )
-    .expect("plan a position-delete rewrite");
-    let (handle, _) = flavor_session(plan);
-    assert_eq!(handle.commit_op_kind(), CommitOpKind::SelectedRewrite);
-
-    let files = crate::commit::write_stack::control::selected_rewrite_files(&handle)
-        .expect("a rewrite session commits the file set it froze");
-    files
-        .validate()
-        .expect("the frozen file set satisfies the rewrite action");
-    assert_eq!(
-        files.kind,
-        crate::commit::selected_rewrite::SelectedRewriteKind::PositionDeletes
-    );
-    assert_eq!(
-        files.delete_paths,
-        std::collections::BTreeSet::from([
-            crate::distributed_rewrite::delete_entry_identity(&rewrite_deletion_vector(
-                "s3://b/wh/db/t/data/a/d0.puffin",
-                "s3://b/wh/db/t/data/a/f.parquet"
-            ))
-            .unwrap(),
-            crate::distributed_rewrite::delete_entry_identity(&rewrite_deletion_vector(
-                "s3://b/wh/db/t/data/a/d1.puffin",
-                "s3://b/wh/db/t/data/a/f.parquet"
-            ))
-            .unwrap(),
-        ])
-    );
-    assert_eq!(
-        files.data_paths,
-        std::collections::BTreeSet::from([EntryIdentity::DataFile {
-            path: "s3://b/wh/db/t/data/a/f.parquet".to_string()
-        }])
-    );
-}
-
-/// Which branch a rewrite seals follows the frozen operation, not the writer
-/// input. Reading it off the input would let a caller signing a delete shape
-/// turn a data rewrite into a delete rewrite -- and its commit would then
-/// retire the wrong half of the frozen set -- so each shape refuses the
-/// other's input outright.
 #[test]
 fn a_rewrite_refuses_the_input_its_frozen_operation_does_not_write() {
     let delete_input_to_data_rewrite = plan_distributed_rewrite_branches(
         &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
-        DATA_FILE_REWRITE,
         &rewrite_groups(&["a"]),
     )
     .expect_err("a data rewrite writes data files");
@@ -1347,24 +1089,6 @@ fn a_rewrite_refuses_the_input_its_frozen_operation_does_not_write() {
             .contains("not a row-level delete input"),
         "unexpected message: {}",
         delete_input_to_data_rewrite.message()
-    );
-
-    let data_input_to_delete_rewrite = plan_distributed_rewrite_branches(
-        &session_material(data_input_shape()),
-        POSITION_DELETE_REWRITE,
-        &position_delete_rewrite_groups(&["a"]),
-    )
-    .expect_err("a position-delete rewrite writes deletion vectors");
-    assert_eq!(
-        data_input_to_delete_rewrite.kind(),
-        ConnectorErrorKind::Unsupported
-    );
-    assert!(
-        data_input_to_delete_rewrite
-            .message()
-            .contains("not a data input"),
-        "unexpected message: {}",
-        data_input_to_delete_rewrite.message()
     );
 }
 
@@ -1407,7 +1131,6 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
             crate::commit::write_stack::domain::IcebergSealedWriteTarget::new(
                 ordinal(0),
                 IcebergWriteBranch::Data,
-                None,
             ),
         ],
     )
@@ -1423,10 +1146,9 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
 
 #[test]
 fn a_rewrite_is_not_gated_by_the_external_write_fence() {
-    // The rewrite is arbitrated by the ordinary Iceberg base-state compare and
-    // swap the frozen publication runner already performs against the frozen snapshot, so
-    // it must not also take the distributed external write fence. Every other
-    // flavor keeps it.
+    // Each publication attempt validates its current Iceberg base. The
+    // rewrite keeps its original planning snapshot without an external
+    // write fence. Every other flavor below keeps the fence.
     for flavor in [
         IcebergWriteFlavor::Append,
         IcebergWriteFlavor::Overwrite,
@@ -1444,18 +1166,15 @@ fn a_rewrite_is_not_gated_by_the_external_write_fence() {
         );
     }
     assert!(!IcebergWriteFlavor::DistributedRewrite.requires_external_write_fence());
-    assert!(!IcebergWriteFlavor::DistributedRewritePositionDeletes.requires_external_write_fence());
 
     let plan = plan_distributed_rewrite_branches(
         &session_material(data_input_shape()),
-        DATA_FILE_REWRITE,
         &rewrite_groups(&["a"]),
     )
     .expect("plan a distributed rewrite");
     let (handle, _) = flavor_session(plan);
     assert!(!handle.requires_external_write_fence());
-    // The compare-and-swap input the commit dispatch checks the loaded table
-    // against, and the rewrite commit action it dispatches.
+    // Preserve the planning snapshot and the actual rewrite operation.
     assert_eq!(handle.table().base_snapshot_id(), Some(77));
     assert_eq!(handle.commit_op_kind(), CommitOpKind::SelectedRewrite);
 }
@@ -2108,12 +1827,8 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
     }
 
     // Empty plans terminate in FE without opening a write session.
-    let error = plan_distributed_rewrite_branches(
-        &session_material(data_input_shape()),
-        DATA_FILE_REWRITE,
-        &[],
-    )
-    .unwrap_err();
+    let error =
+        plan_distributed_rewrite_branches(&session_material(data_input_shape()), &[]).unwrap_err();
     assert_eq!(error.kind(), ConnectorErrorKind::Internal);
 }
 
@@ -2599,7 +2314,6 @@ fn an_equality_delete_session_seals_one_equality_branch_and_no_data_branch() {
     // It appends delete files rather than superseding a data file's deletes, so
     // it commits as an ordinary row delta.
     assert_eq!(handle.commit_op_kind(), CommitOpKind::RowDelta);
-    assert!(handle.targets()[0].position_rewrite().is_none());
 
     let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
     assert_eq!(sealed.expected_targets(), vec![ordinal(0)]);
@@ -3014,13 +2728,6 @@ fn all_write_admission_requests(
                 frozen: test_rewrite_payload(),
             },
         ),
-        (
-            "position delete rewrite",
-            ConnectorWriteSessionFlavor::DistributedRewrite {
-                shape: POSITION_DELETE_REWRITE,
-                frozen: test_rewrite_payload(),
-            },
-        ),
     ] {
         let mut request = ordinary(ConnectorWriteIntent::Append);
         request.flavor = flavor;
@@ -3090,9 +2797,23 @@ fn assert_write_admission_refused_without_io(
     );
     let requests = all_write_admission_requests(&runtime, incarnation, catalog_handle);
     assert_eq!(
-        requests.len(),
-        11,
-        "all flavors, intents and equality delete"
+        requests
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "append",
+            "overwrite",
+            "partition overwrite",
+            "row delta",
+            "equality delete",
+            "staged create",
+            "row mutation",
+            "data rewrite",
+            "full document publication",
+            "incremental document publication",
+        ],
+        "all surviving flavors and intents, including equality delete"
     );
     for (name, mut request) in requests {
         request.context = request.context.with_initiation(initiation);
@@ -3260,7 +2981,7 @@ impl FrozenRewriteLake {
             ),
         )
     }
-    fn plan(&self, position: bool) -> novarocks_spi::connector::ConnectorDistributedRewritePlan {
+    fn plan(&self) -> novarocks_spi::connector::ConnectorDistributedRewritePlan {
         use novarocks_spi::connector::{
             ConnectorDistributedRewrite, ConnectorDistributedRewriteOperation,
             ConnectorDistributedRewritePlanningRequest, ConnectorTableHandle,
@@ -3279,17 +3000,9 @@ impl FrozenRewriteLake {
                 ConnectorDistributedRewritePlanningRequest::try_new(
                     ConnectorWriteOperationId::new(),
                     self.control.binding_key().clone(),
-                    if position {
-                        ConnectorDistributedRewriteOperation::RewritePositionDeletes {
-                            table,
-                            rewrite_all: true,
-                            min_input_files: None,
-                        }
-                    } else {
-                        ConnectorDistributedRewriteOperation::RewriteDataFiles {
-                            table,
-                            rewrite_all: true,
-                        }
+                    ConnectorDistributedRewriteOperation::OptimizeDataFiles {
+                        table,
+                        file_size_threshold_bytes: i64::MAX as u64,
                     },
                     request_context(),
                 )
@@ -3736,17 +3449,16 @@ impl FrozenRewriteLake {
 }
 
 mod baseline_contract_tests;
+mod rewrite_begin;
 mod row_mutation_begin;
 
 #[test]
 fn distributed_rewrite_inputs_are_attempt_owned_and_never_written() {
     let lake = FrozenRewriteLake::new();
-    for position in [false, true] {
-        let before = lake.inventory();
-        let plan = lake.plan(position);
-        assert!(plan.cohorts().is_empty());
-        assert_eq!(lake.inventory(), before);
-    }
+    let before = lake.inventory();
+    let empty = lake.plan();
+    assert!(empty.cohorts().is_empty());
+    assert_eq!(lake.inventory(), before);
     lake.write_rows(
         novarocks_spi::connector::ConnectorWriteIntent::Append,
         &[1],
@@ -3758,7 +3470,7 @@ fn distributed_rewrite_inputs_are_attempt_owned_and_never_written() {
         "b",
     );
     let before = lake.inventory();
-    let plan = lake.plan(false);
+    let plan = lake.plan();
     assert_eq!(lake.inventory(), before);
     let content = plan
         .frozen()
@@ -3802,139 +3514,25 @@ fn distributed_rewrite_inputs_are_attempt_owned_and_never_written() {
 }
 
 #[test]
-fn distributed_rewrite_refuses_a_head_that_moved_before_begin_without_writing() {
-    use novarocks_spi::connector::write_stack::ConnectorWriteControl;
-    let lake = FrozenRewriteLake::new();
-    lake.write_rows(
-        novarocks_spi::connector::ConnectorWriteIntent::Append,
-        &[1],
-        "old",
-    );
-    let shared_context = request_context();
-    // Production FE clones this exact context across metadata, planning and begin.
-    let observed = lake
-        .runtime
-        .load_table_for_request("db", "t", &shared_context)
-        .unwrap();
-    let plan = lake.plan(false);
-    assert_eq!(
-        observed.table.metadata().current_snapshot_id(),
-        plan.frozen()
-            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
-            .unwrap()
-            .base_snapshot_id
-    );
-    lake.write_rows(
-        novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
-        &[99],
-        "concurrent",
-    );
-    let before = lake.inventory();
-    let mut request = lake.request(&plan);
-    request.context = shared_context.clone();
-    assert_eq!(
-        lake.runtime
-            .load_table_for_request("db", "t", &shared_context)
-            .unwrap()
-            .table
-            .metadata()
-            .current_snapshot_id(),
-        observed.table.metadata().current_snapshot_id(),
-        "the cached planning observation intentionally remains S0"
-    );
-    let error = lake.control.begin_write(request).unwrap_err();
-    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    assert!(error.message().contains("moved after planning"));
-    assert_eq!(lake.inventory(), before);
-    assert_eq!(lake.rows(), vec![99]);
-}
-
-#[test]
-fn distributed_rewrite_replaces_only_frozen_inputs_and_rejects_concurrent_commit() {
-    use novarocks_spi::connector::write_stack::{
-        ConnectorWriteControl, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
-    };
-    for concurrent in [false, true] {
-        let lake = FrozenRewriteLake::new();
-        lake.write_rows(
-            novarocks_spi::connector::ConnectorWriteIntent::Append,
-            &[1, 2],
-            "old",
-        );
-        let plan = lake.plan(false);
-        let session = lake.control.begin_write(lake.request(&plan)).unwrap();
-        for (target, cohort) in session.targets().iter().zip(plan.cohorts()) {
-            assert_eq!(target.rewrite_group_digest(), Some(cohort.group_digest()));
-        }
-        let handle = lake
-            .adapter
-            .commit_session(session.commit_session())
-            .unwrap();
-        let selected = crate::commit::write_stack::control::selected_rewrite_files(handle).unwrap();
-        let content = plan
-            .frozen()
-            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
-            .unwrap();
-        assert_eq!(
-            selected.data_paths,
-            content
-                .groups
-                .iter()
-                .flat_map(|g| g.data_files.iter().map(|f| EntryIdentity::DataFile {
-                    path: f.path.clone()
-                }))
-                .collect()
-        );
-        let row_count = lake.output(&session, &[1, 2], "rewritten");
-        if concurrent {
-            lake.write_rows(
-                novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
-                &[99],
-                "concurrent",
-            );
-        }
-        let result = lake
-            .control
-            .finish_write(ConnectorWriteFinishRequest {
-                commit: session.commit_session(),
-                row_count,
-                statistics: Vec::new(),
-                publication: ConnectorWriteFinishPublication::None,
-                context: request_context(),
-            })
-            .unwrap();
-        if concurrent {
-            assert!(
-                matches!(result, ExternalMutationOutcome::KnownUncommitted { .. }),
-                "{result:?}"
-            );
-            assert_eq!(lake.rows(), vec![99]);
-        } else {
-            assert!(
-                matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
-                "{result:?}"
-            );
-            assert_eq!(lake.rows(), vec![1, 2]);
-        }
-        lake.inventory();
-    }
-}
-
-#[test]
 fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
     let lake = FrozenRewriteLake::new();
     lake.write_rows(
         novarocks_spi::connector::ConnectorWriteIntent::Append,
         &[1],
-        "old",
+        "a",
     );
-    let plan = lake.plan(false);
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[2],
+        "b",
+    );
+    let plan = lake.plan();
     let before = lake.inventory();
     let original = plan
         .frozen()
         .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
         .unwrap();
-    for case in 0..8 {
+    for case in 0..12 {
         let mut content = original.as_ref().clone();
         let mut owner = lake.control.binding_key().clone();
         match case {
@@ -3946,6 +3544,10 @@ fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
             5 => content.artifact.groups.clear(),
             6 => content.artifact.table_uuid = "other".to_string(),
             7 => content.artifact.base_snapshot_id = None,
+            8 => content.artifact.base_sequence_number += 1,
+            9 => content.artifact.schema_id += 1,
+            10 => content.artifact.default_spec_id += 1,
+            11 => content.artifact.version -= 1,
             _ => unreachable!(),
         }
         let frozen = if case == 1 {
@@ -3970,311 +3572,36 @@ fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
         );
         assert_eq!(lake.inventory(), before);
     }
-    assert_eq!(lake.rows(), vec![1]);
+    assert_eq!(lake.rows(), vec![1, 2]);
 }
 
 #[test]
-fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_artifacts() {
-    use novarocks_spi::connector::read_stack::{
-        ConnectorReadConstraint, ConnectorReadDynamicFilterSnapshot,
-        ConnectorReadFrozenRewriteGroup, ConnectorReadRequestControlFactory,
-        ConnectorReadTableExecuteProcedure, ConnectorSession, SchemaTableName,
-    };
-    use novarocks_spi::connector::{
-        ConnectorFrozenRewriteGroup, ConnectorPlanningContext, ConnectorProcessLocalPayload,
-        ConnectorRewriteCohortRead,
-    };
+fn optimize_pins_the_data_file_with_a_materialized_deletion_vector() {
     let lake = FrozenRewriteLake::new_version(crate::iceberg::spec::FormatVersion::V3);
     lake.write_rows(
         novarocks_spi::connector::ConnectorWriteIntent::Append,
         &[1, 2],
-        "first",
+        "source",
     );
-    lake.write_rows(
-        novarocks_spi::connector::ConnectorWriteIntent::Append,
-        &[3, 4],
-        "second",
-    );
-    let table = lake.table();
     let files = lake
         .executor
-        .block_on(crate::manifest::extract_data_files_with_stats(&table))
+        .block_on(crate::manifest::extract_data_files_with_stats(
+            &lake.table(),
+        ))
         .unwrap();
-    for file in &files {
-        lake.seed_position_vector(file);
-    }
-    let before = lake.inventory();
-    let plan = lake.plan(true);
-    assert_eq!(plan.cohorts().len(), 2);
-    assert_eq!(lake.inventory(), before);
-    // The real planner freezes file_path/pos artifact identities. Enter C1
-    // using that exact preparation, rather than testing only its read splits.
-    // These requests must never gain ordinary scan-metadata alias authority.
-    let source_snapshot = lake.table().metadata().current_snapshot_id();
-    for case in 0..11 {
-        let mut request = lake.request(&plan);
-        let novarocks_spi::connector::ConnectorWriteInputRequest::DeletionVector {
-            identity_fields,
-            ..
-        } = &mut request.input
-        else {
-            panic!("frozen position-delete preparation")
-        };
-        match case {
-            0 => {
-                identity_fields.pop();
-            }
-            1 => {
-                identity_fields[0] =
-                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
-                        Field::new("_file", DataType::Utf8, false),
-                        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-                    )
-                    .unwrap();
-            }
-            2 => identity_fields.swap(0, 1),
-            3 | 4 => {
-                let data_type = if case == 3 {
-                    DataType::Int32
-                } else {
-                    DataType::Int64
-                };
-                let nullable = case == 4;
-                identity_fields[1] =
-                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
-                        Field::new("pos", data_type.clone(), nullable),
-                        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-                    )
-                    .unwrap();
-            }
-            5 => request.flavor = ConnectorWriteSessionFlavor::Ordinary,
-            6 => {
-                request.input = novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                    fields: Vec::new(),
-                }
-            }
-            7..=10 => {
-                let content = plan
-                    .frozen()
-                    .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
-                    .unwrap();
-                let mut content = content.as_ref().clone();
-                let mut owner = lake.control.binding_key().clone();
-                match case {
-                    7 => content.artifact.table_uuid = "replaced".into(),
-                    8 => content.artifact.target_ref = "another".into(),
-                    9 => content.artifact.base_snapshot_id = None,
-                    10 => owner.instance_id = ConnectorInstanceId::parse("foreign").unwrap(),
-                    _ => unreachable!(),
-                }
-                request.flavor = ConnectorWriteSessionFlavor::DistributedRewrite {
-                    shape: plan.shape(),
-                    frozen: ConnectorProcessLocalPayload::new(owner, Arc::new(content)),
-                };
-            }
-            _ => unreachable!(),
-        }
-        let error = lake.control.begin_write(request).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            if case == 8 {
-                ConnectorErrorKind::Internal
-            } else {
-                ConnectorErrorKind::InvalidRequest
-            },
-            "case {case}: {error}"
-        );
-        assert_eq!(
-            lake.inventory(),
-            before,
-            "rejected begin {case} wrote an artifact"
-        );
-        assert_eq!(
-            lake.table().metadata().current_snapshot_id(),
-            source_snapshot
-        );
-    }
-    let writer = lake.control.begin_write(lake.request(&plan)).unwrap();
-    assert_eq!(writer.targets().len(), plan.cohorts().len());
-    for target in writer.targets() {
-        assert_eq!(
-            lake.adapter
-                .writer_handle(target.handle())
-                .unwrap()
-                .branch(),
-            IcebergWriteBranch::DeletionVector
-        );
-        let ConnectorWriteInputShape::DeletionVector {
-            identity_fields,
-            partition_source_fields,
-        } = target.input()
-        else {
-            panic!("position-delete writer lost its artifact input")
-        };
-        assert!(partition_source_fields.is_empty());
-        assert_eq!(identity_fields.len(), 2);
-        for (binding, (name, data_type)) in identity_fields
-            .iter()
-            .zip([("file_path", DataType::Utf8), ("pos", DataType::Int64)])
-        {
-            assert_eq!(binding.field(), &Field::new(name, data_type.clone(), false));
-            assert_eq!(
-                binding.execution_type().unwrap(),
-                &novarocks_type_contract::FunctionValueType::new(data_type, false)
-            );
-        }
-    }
-    assert_eq!(
-        lake.inventory(),
-        before,
-        "C1 begin must not write artifacts"
-    );
-    let aborted = lake
-        .control
-        .abort_write(
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest {
-                commit: writer.commit_session(),
-                production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
-                context: request_context(),
-            },
-        )
-        .unwrap();
-    assert!(matches!(
-        aborted,
-        ConnectorWriteAbortOutcome::KnownUncommitted { .. }
-    ));
-    drop(writer);
-    assert_eq!(lake.inventory(), before);
-    assert_eq!(
-        lake.table().metadata().current_snapshot_id(),
-        source_snapshot
-    );
-    let descriptor = descriptor("rewrite-local");
-    let catalog = CatalogHandle::new(
-        descriptor.instance_id.clone(),
-        CatalogVersion::from_bytes([6; 32]),
-    );
-    let boundary = Arc::new(crate::typed_boundary::IcebergTypedBoundary::new(
-        descriptor,
-        lake.control.binding_key().incarnation,
-        catalog,
-        crate::typed_read::HiveTransactionHandle::new(true, [1; 16]),
-        lake.runtime.clone(),
-    ));
-    let factory = crate::typed_boundary::IcebergTypedRequestControlFactory::new(boundary);
-    let control = factory
-        .for_planning(&ConnectorPlanningContext::try_from_request(request_context()).unwrap())
-        .unwrap();
-    let metadata = control.metadata();
-    let split_manager = control.splits();
-    let session = ConnectorSession::try_new(
-        "rewrite-test",
-        "user",
-        "UTC",
-        "en_US",
-        std::time::SystemTime::now(),
-    )
-    .unwrap();
-    let name = SchemaTableName::try_new("db", "t").unwrap();
-    let content = plan
-        .frozen()
-        .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
-        .unwrap();
-    let weak = Arc::downgrade(content);
-    for cohort in plan.cohorts() {
-        let ConnectorRewriteCohortRead::DeleteArtifactGroup(group) = cohort.read() else {
-            panic!("position rewrite")
-        };
-        let procedure = ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
-            ConnectorReadFrozenRewriteGroup::from_cohort(group, cohort.group_digest()),
-        );
-        let opened = metadata
-            .get_table_execute_plan(&session, &name, procedure)
-            .unwrap()
-            .unwrap();
-        let mut original_split_owner = None;
-        let mut source = lake
-            .executor
-            .block_on(split_manager.get_splits(
-                novarocks_spi::connector::read_stack::ConnectorReadSplitOpenRequest::new(
-                    session.clone(),
-                    opened,
-                    Vec::new(),
-                    std::collections::BTreeSet::new(),
-                    ConnectorReadConstraint::of_summary(
-                        novarocks_spi::connector::read_stack::TupleDomain::all(),
-                    ),
-                ),
-                &mut original_split_owner,
-            ))
-            .unwrap();
-        let batch = source
-            .next_batch(1, &ConnectorReadDynamicFilterSnapshot::all_complete())
-            .unwrap();
-        assert_eq!(batch.splits().len(), 1);
-        assert!(source.is_finished());
-        source.close().unwrap();
-        assert_eq!(lake.inventory(), before);
-    }
-    let group = match plan.cohorts()[0].read() {
-        ConnectorRewriteCohortRead::DeleteArtifactGroup(g) => g,
-        _ => unreachable!(),
+    let [file] = files.as_slice() else {
+        panic!("expected one source data file");
     };
-    for case in 0..9 {
-        let mut owner = lake.control.binding_key().clone();
-        let mut private = content.as_ref().clone();
-        let mut op = group.operation_id();
-        let mut digest = group.artifact_digest();
-        let mut group_digest = plan.cohorts()[0].group_digest();
-        match case {
-            0 => owner.instance_id = ConnectorInstanceId::parse("foreign").unwrap(),
-            1 => {}
-            2 => op = novarocks_spi::connector::ConnectorWriteOperationId::new(),
-            3 => digest = [255; 32],
-            4 => group_digest = [255; 32],
-            5 => private.artifact.table_uuid = "different".to_string(),
-            6 => private.artifact.schema_id += 1,
-            7 => private.artifact.base_snapshot_id = None,
-            8 => owner.incarnation = ProviderBindingEpoch::new(),
-            _ => unreachable!(),
-        }
-        let payload = if case == 1 {
-            ConnectorProcessLocalPayload::new(owner, Arc::new(()))
-        } else {
-            ConnectorProcessLocalPayload::new(owner, Arc::new(private))
-        };
-        let wrong = ConnectorFrozenRewriteGroup::try_new("db", "t", op, digest, payload).unwrap();
-        let error = metadata
-            .get_table_execute_plan(
-                &session,
-                &name,
-                ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
-                    ConnectorReadFrozenRewriteGroup::from_cohort(&wrong, group_digest),
-                ),
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.kind(),
-            if (1..5).contains(&case) {
-                ConnectorErrorKind::Internal
-            } else {
-                ConnectorErrorKind::InvalidRequest
-            },
-            "case {case}: {error}"
-        );
-        if case == 8 {
-            assert_eq!(
-                error.message(),
-                "process-local payload belongs to another connector generation"
-            );
-        }
-        assert_eq!(lake.inventory(), before);
-    }
-    drop(plan);
-    assert!(
-        weak.upgrade().is_none(),
-        "read and split scopes must release content after their actual exit"
-    );
+    lake.seed_position_vector(file);
+    let before = lake.inventory();
+    let plan = lake.plan();
+    let [cohort] = plan.cohorts() else {
+        panic!("expected a cohort for the delete-bearing file");
+    };
+    let novarocks_spi::connector::ConnectorRewriteCohortRead::PinnedFileSet(pinned) = cohort.read();
+    assert_eq!(pinned.files(), &[Arc::<str>::from(file.path.as_str())]);
+    assert_eq!(plan.summary().input_delete_files, 1);
+    assert_eq!(lake.inventory(), before);
 }
 
 fn project_prepared_managed_rows(
@@ -5470,7 +4797,7 @@ fn an_empty_finish_cannot_replace_an_original_terminal_or_inflight_fact() {
                 0 => dv_session().0,
                 1 => flavor_session(plan_distributed_rewrite_branches(
                     &session_material(data_input_shape()),
-                    DATA_FILE_REWRITE,
+
                     &rewrite_groups(&["a"]),
                 ).unwrap()).0,
                 _ => flavor_session(plan_document_publication_branches(
@@ -5481,30 +4808,54 @@ fn an_empty_finish_cannot_replace_an_original_terminal_or_inflight_fact() {
                     ),
                 ).unwrap()).0,
             };
-            assert_eq!(
-                handle.empty_write_decision(),
+            let rewrite = handle.flavor() == IcebergWriteFlavor::DistributedRewrite;
+            let empty = if rewrite {
+                let query = write_query_identity();
+                handle
+                    .with_active_receiving(|receiving| {
+                        receiving.begin_query(
+                            query,
+                            &handle.expected_targets(),
+                            &mut None,
+                            handle.targets(),
+                            None,
+                        )?;
+                        receiving.confirm(query)
+                    })
+                    .unwrap();
+                IcebergEmptyWriteDecision::Commit
+            } else {
                 IcebergEmptyWriteDecision::SkipExternalCommit
-            );
-            // Exercise the same no-op author directly for each flavor.
+            };
+            assert_eq!(handle.empty_write_decision(), empty);
             // The managed fixture does not construct a publication packet.
-            let finish = || -> Result<_, ConnectorError> {
-                match handle.claim_finish(|| empty_write_needed(&handle).map(Some))? {
-                    super::domain::ClaimedWriteFinish::EmptyNoOp(completion) => Ok(completion),
-                    _ => panic!("an empty NoOp must never enter publication"),
-                }
+            let finish = || {
+                handle.claim_finish(|| match empty {
+                    IcebergEmptyWriteDecision::SkipExternalCommit => {
+                        empty_write_needed(&handle).map(Some)
+                    }
+                    IcebergEmptyWriteDecision::Commit => Ok(None),
+                })
             };
             let mut original_needed = None;
             let mut original_evidence = None;
             match previous {
-                0 => {
-                    let ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } =
-                        finish().expect("original Active session may settle its NoOp")
-                    else {
-                        panic!("empty Active finish lost its NoOp")
-                    };
-                    assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
-                    original_needed = Some(needed);
-                }
+                0 => match finish().expect("the original Active session owns finish") {
+                    super::domain::ClaimedWriteFinish::Publish {
+                        received,
+                        empty_preflight_error,
+                    } if rewrite => {
+                        assert!(received.is_empty());
+                        assert!(empty_preflight_error.is_none());
+                    }
+                    super::domain::ClaimedWriteFinish::EmptyNoOp(
+                        ConnectorWritePublicationCompletion::KnownCommitted { needed, .. },
+                    ) if !rewrite => {
+                        assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
+                        original_needed = Some(needed);
+                    }
+                    _ => panic!("the active empty write lost its flavor's publication decision"),
+                },
                 1 => {
                     assert!(matches!(
                         release_session_state(
@@ -5570,7 +4921,9 @@ fn an_empty_finish_cannot_replace_an_original_terminal_or_inflight_fact() {
             let state_before = format!("{:?}", handle.state().unwrap());
             let cleanup_before = handle.terminal_cleanup();
             let responsibility_before = handle.cleanup_responsibility();
-            let rejected = finish().expect_err("empty finish cannot replace an earlier fact");
+            let Err(rejected) = finish() else {
+                panic!("empty finish cannot replace an earlier fact");
+            };
             assert_eq!(rejected.kind(), ConnectorErrorKind::InvalidRequest);
             assert_eq!(format!("{:?}", handle.state().unwrap()), state_before);
             assert_eq!(handle.terminal_cleanup(), cleanup_before);

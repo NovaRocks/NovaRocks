@@ -454,6 +454,7 @@ pub enum ValueKind {
     /// A non-container Arrow scalar, with all value parameters preserved.
     Scalar(DataType),
     String,
+    BoundedCharacter(crate::CharacterType),
     Binary,
     Nominal(ValueLogicalType),
     Temporal(crate::TemporalType),

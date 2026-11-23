@@ -353,14 +353,16 @@ fn native_lake_and_mv_cases_use_the_owned_namespace() {
             assert!(!rewritten.contains(&format!("schema_name = '{old}'")));
         } else {
             assert!(rewritten.contains(&format!(".{expected}.optimize_rows EXECUTE optimize")));
-            let mut prepared = bound.steps.iter().filter(|step| {
-                step.meta.expect_error.as_deref() == Some("dependency: RefUnchanged")
-            });
-            let optimize = prepared
-                .next()
-                .expect("OPTIMIZE retains its fixed dependency");
-            assert!(optimize.sql.contains("EXECUTE optimize"));
-            assert!(prepared.next().is_none());
+            let optimize = bound
+                .steps
+                .iter()
+                .find(|step| {
+                    step.sql
+                        .contains(&format!(".{expected}.optimize_rows EXECUTE optimize"))
+                })
+                .expect("OPTIMIZE is prepared against the same owned namespace");
+            assert!(optimize.meta.expect_error.is_none());
+            assert!(optimize.meta.publication_catalog_fault.is_some());
             let delete = bound
                 .steps
                 .iter()

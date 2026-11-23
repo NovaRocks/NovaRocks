@@ -122,66 +122,68 @@ pub(super) fn finalize_snapshot_summary(
     truncate_full_table: bool,
 ) -> HashMap<String, String> {
     if truncate_full_table {
-        for key in [
-            TOTAL_DATA_FILES,
-            TOTAL_DELETE_FILES,
-            TOTAL_RECORDS,
-            TOTAL_FILE_SIZE,
-            TOTAL_POSITION_DELETES,
-            TOTAL_EQUALITY_DELETES,
-        ] {
-            props.insert(key.to_string(), "0".to_string());
+        for (total, _, _) in SNAPSHOT_TOTALS {
+            props.insert(total.to_owned(), "0".to_owned());
         }
     } else {
-        carry_total(
-            &mut props,
-            previous,
-            TOTAL_DATA_FILES,
-            ADDED_DATA_FILES,
-            DELETED_DATA_FILES,
-        );
-        carry_total(
-            &mut props,
-            previous,
-            TOTAL_DELETE_FILES,
-            ADDED_DELETE_FILES,
-            REMOVED_DELETE_FILES,
-        );
-        carry_total(
-            &mut props,
-            previous,
-            TOTAL_RECORDS,
-            ADDED_RECORDS,
-            DELETED_RECORDS,
-        );
-        carry_total(
-            &mut props,
-            previous,
-            TOTAL_FILE_SIZE,
-            ADDED_FILE_SIZE,
-            REMOVED_FILE_SIZE,
-        );
-        carry_total(
-            &mut props,
-            previous,
-            TOTAL_POSITION_DELETES,
-            ADDED_POSITION_DELETES,
-            REMOVED_POSITION_DELETES,
-        );
-        carry_total(
-            &mut props,
-            previous,
-            TOTAL_EQUALITY_DELETES,
-            ADDED_EQUALITY_DELETES,
-            REMOVED_EQUALITY_DELETES,
-        );
+        for (total, added, removed) in SNAPSHOT_TOTALS {
+            carry_total(&mut props, previous, total, added, removed);
+        }
     }
+    stamp_engine(&mut props);
+    props
+}
+
+const SNAPSHOT_TOTALS: [(&str, &str, &str); 6] = [
+    (TOTAL_DATA_FILES, ADDED_DATA_FILES, DELETED_DATA_FILES),
+    (TOTAL_DELETE_FILES, ADDED_DELETE_FILES, REMOVED_DELETE_FILES),
+    (TOTAL_RECORDS, ADDED_RECORDS, DELETED_RECORDS),
+    (TOTAL_FILE_SIZE, ADDED_FILE_SIZE, REMOVED_FILE_SIZE),
+    (
+        TOTAL_POSITION_DELETES,
+        ADDED_POSITION_DELETES,
+        REMOVED_POSITION_DELETES,
+    ),
+    (
+        TOTAL_EQUALITY_DELETES,
+        ADDED_EQUALITY_DELETES,
+        REMOVED_EQUALITY_DELETES,
+    ),
+];
+
+/// Iceberg filter deletes carry known totals from the current branch head.
+pub(super) fn finalize_filtered_delete_summary(
+    mut props: HashMap<String, String>,
+    previous: Option<&Summary>,
+) -> HashMap<String, String> {
+    for (total, _, removed) in SNAPSHOT_TOTALS {
+        let base = match previous {
+            None => Some(0),
+            Some(previous) => previous
+                .additional_properties
+                .get(total)
+                .and_then(|value| value.parse::<i64>().ok()),
+        };
+        let Ok(removed) = i64::try_from(parse_u64_prop(&props, removed)) else {
+            continue;
+        };
+        if let Some(next) = base
+            .and_then(|base| base.checked_sub(removed))
+            .filter(|next| *next >= 0)
+        {
+            props.insert(total.to_owned(), next.to_string());
+        }
+    }
+    stamp_engine(&mut props);
+    props
+}
+
+fn stamp_engine(props: &mut HashMap<String, String>) {
     props.insert(ENGINE_NAME_KEY.to_string(), ENGINE_NAME_VALUE.to_string());
     props.insert(
         ENGINE_VERSION_KEY.to_string(),
         env!("CARGO_PKG_VERSION").to_string(),
     );
-    props
 }
 
 fn parse_u64_prop(props: &HashMap<String, String>, key: &str) -> u64 {

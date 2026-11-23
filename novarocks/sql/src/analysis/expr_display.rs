@@ -135,6 +135,13 @@ fn expression(
     out: &mut DisplayOutput<'_, '_>,
 ) -> Result<(), SqlCompileError> {
     out.work.step()?;
+    if let Some((operator, [left, right])) = crate::common::binary_operator::typed_operands(expr) {
+        with_parens(left, out)?;
+        out.append(" ")?;
+        out.append(operator.sql())?;
+        out.append(" ")?;
+        return with_parens(right, out);
+    }
     if let Some(operand) = typed_operand(expr) {
         if let ExprKind::Constant(value) = &operand.kind {
             out.work.step()?;
@@ -271,12 +278,21 @@ fn expression(
             args,
             distinct,
             order_by,
+            filter,
             ..
-        } => aggregate(name, args, *distinct, order_by, out),
+        } => {
+            aggregate(name, args, *distinct, order_by, out)?;
+            if let Some(predicate) = filter {
+                out.append(" FILTER (WHERE ")?;
+                expression(predicate, false, out)?;
+                out.append(")")?;
+            }
+            Ok(())
+        }
         ExprKind::Cast {
             expr: inner,
             target,
-            array_failure_mode: None,
+            cast_mode: None,
             ..
         } if matches!(target, arrow::datatypes::DataType::List(_))
             && matches!(&inner.kind, ExprKind::FunctionCall { name, .. } if name == "__array_literal") =>
@@ -286,13 +302,11 @@ fn expression(
         ExprKind::Cast {
             expr: inner,
             target,
-            array_failure_mode,
+            cast_mode,
             ..
         } => {
             out.append(
-                if *array_failure_mode
-                    == Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull)
-                {
+                if *cast_mode == Some(novarocks_type_contract::TrinoCastMode::Try) {
                     "try_cast("
                 } else {
                     "cast("
@@ -369,6 +383,7 @@ fn expression(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             out.append("CASE")?;
             if let Some(value) = operand {
@@ -471,15 +486,16 @@ fn expressions(
     Ok(())
 }
 fn with_parens(expr: &TypedExpr, out: &mut DisplayOutput<'_, '_>) -> Result<(), SqlCompileError> {
-    let parens = !matches!(
-        expr.kind,
-        ExprKind::ColumnRef { .. }
-            | ExprKind::LambdaParamRef { .. }
-            | ExprKind::Literal(_)
-            | ExprKind::Constant(_)
-            | ExprKind::FunctionCall { .. }
-            | ExprKind::AggregateCall { .. }
-    );
+    let parens = crate::common::binary_operator::typed_operands(expr).is_some()
+        || !matches!(
+            expr.kind,
+            ExprKind::ColumnRef { .. }
+                | ExprKind::LambdaParamRef { .. }
+                | ExprKind::Literal(_)
+                | ExprKind::Constant(_)
+                | ExprKind::FunctionCall { .. }
+                | ExprKind::AggregateCall { .. }
+        );
     if parens {
         out.append("(")?;
     }

@@ -1,0 +1,30 @@
+-- query 3
+-- types	varchar	bigint
+customer	amount
+A	10
+A	20
+B	30
+
+-- query 4
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 6
+-- types	varchar	bigint
+customer	amount
+A	10
+A	20
+B	30
+
+-- query 9
+-- types	bigint
+live_rows
+0
+
+-- query 10
+-- types	bigint
+live_rows
+0

@@ -344,6 +344,7 @@ fn compile_core<H>(
                     work.step()?;
                 }
                 StaticExprKind::Case {
+                    ieee_float_equality,
                     has_case_expr: true,
                     has_else_expr,
                     children,
@@ -384,12 +385,15 @@ fn compile_core<H>(
                     }
                     for arm in 0..arms {
                         work.flush()?;
-                        let recipe = prepare_comparison_node(
-                            ComparisonOperator::Eq,
-                            value(children[0])?,
-                            value(children[1 + arm as usize * 2])?,
-                            control,
-                        )?;
+                        let left = value(children[0])?;
+                        let right = value(children[1 + arm as usize * 2])?;
+                        let recipe = if *ieee_float_equality {
+                            PreparedComparisonRecipe::try_new_ieee_float_equality(
+                                left, right, control,
+                            )?
+                        } else {
+                            prepare_comparison_node(ComparisonOperator::Eq, left, right, control)?
+                        };
                         before_recipe_insert(&recipes, retained, work)?;
                         recipes.insert(ComparisonSite::CaseWhen { occurrence, arm }, recipe);
                         work.step()?;
@@ -578,9 +582,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                 let StaticExprKind::PreparedCast {
                     operation,
                     child,
-                    decimal_overflow_policy,
-                    allow_throw_exception,
-                    array_failure_mode,
+                    cast_mode,
                 } = kind
                 else {
                     continue;
@@ -599,9 +601,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                     *operation,
                     value(*child)?,
                     value(invocation.definition)?,
-                    *decimal_overflow_policy,
-                    *allow_throw_exception,
-                    *array_failure_mode,
+                    *cast_mode,
                     control,
                 )?;
                 before_recipe_insert(&recipes, &mut retained, &mut work)?;
@@ -949,22 +949,14 @@ pub fn prepare_null_safe_comparison_node(
     Ok(novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(left, right, control)?)
 }
 pub fn prepare_cast_node(
-    operation: novarocks_functions::CastOperation,
+    _operation: novarocks_functions::CastOperation,
     source: &FunctionValueType,
     result: &FunctionValueType,
-    policy: novarocks_type_contract::DecimalOverflowPolicy,
-    allow_throw_exception: bool,
-    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+    cast_mode: novarocks_type_contract::TrinoCastMode,
     control: &dyn PureCompileControl,
 ) -> Result<novarocks_functions::PreparedCastRecipe, ProgramPrimitiveError> {
-    Ok(novarocks_functions::PreparedCastRecipe::try_new(
-        operation,
-        source,
-        result,
-        policy,
-        allow_throw_exception,
-        array_failure_mode,
-        control,
+    Ok(novarocks_functions::PreparedCastRecipe::try_new_trino(
+        source, result, cast_mode, control,
     )?)
 }
 pub fn prepare_arithmetic_node(

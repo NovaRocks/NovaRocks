@@ -26,7 +26,7 @@
 -- 3. Group and assert ordered group_concat outputs.
 CREATE TABLE ${case_db}.t_agg_group_concat_distinct_all_null_group (
     g INT,
-    s STRING
+    s VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_distinct_all_null_group VALUES

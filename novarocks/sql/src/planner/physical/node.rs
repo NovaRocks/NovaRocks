@@ -85,6 +85,7 @@ pub(crate) struct PhysicalHashJoinEqCondition {
     pub left: TypedExpr,
     pub right: TypedExpr,
     pub null_safe: bool,
+    pub match_relation: novarocks_type_contract::JoinKeyMatch,
 }
 
 #[allow(dead_code)]

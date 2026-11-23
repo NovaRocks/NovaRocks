@@ -81,6 +81,7 @@ pub(crate) fn compatible_write_projection<E>(
             crate::schema::arrow_validated_data_types_exact_observed(a, b, observe)?
         }
         (ValueKind::String, ValueKind::String) | (ValueKind::Binary, ValueKind::Binary) => true,
+        (ValueKind::BoundedCharacter(a), ValueKind::BoundedCharacter(b)) => a == b,
         (ValueKind::Nominal(a), ValueKind::Nominal(b)) => {
             observe()?;
             a == b

@@ -53,28 +53,29 @@ pub use read::{
     decode_expression_definitions, decode_expression_definitions_in,
 };
 
-fn encode_array_cast_failure_mode(
-    mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
-) -> Option<i32> {
-    use novarocks_proto_models::physical_package_v2::ArrayCastFailureMode as Wire;
-    use novarocks_type_contract::ArrayCastFailureMode as Mode;
-    mode.map(|mode| match mode {
-        Mode::ReportError => Wire::ReportError as i32,
-        Mode::OutputNull => Wire::OutputNull as i32,
-    })
+fn encode_trino_cast_mode(mode: novarocks_type_contract::TrinoCastMode) -> Option<i32> {
+    use novarocks_proto_models::physical_package_v2::TrinoCastMode as Wire;
+    use novarocks_type_contract::TrinoCastMode as Mode;
+    Some(match mode {
+        Mode::Explicit => Wire::Explicit,
+        Mode::Try => Wire::Try,
+        Mode::Implicit => Wire::Implicit,
+        Mode::StoreAssignment => Wire::StoreAssignment,
+    } as i32)
 }
 
-fn decode_array_cast_failure_mode(
+fn decode_trino_cast_mode(
     mode: Option<i32>,
-) -> Result<Option<novarocks_type_contract::ArrayCastFailureMode>, ExpressionCodecError> {
-    use novarocks_proto_models::physical_package_v2::ArrayCastFailureMode as Wire;
-    use novarocks_type_contract::ArrayCastFailureMode as Mode;
-    match mode {
-        None => Ok(None),
-        Some(value) if value == Wire::ReportError as i32 => Ok(Some(Mode::ReportError)),
-        Some(value) if value == Wire::OutputNull as i32 => Ok(Some(Mode::OutputNull)),
-        Some(_) => Err(ExpressionCodecError::InvalidShape(
-            "explicit array CAST failure mode is unspecified or unknown",
+) -> Result<novarocks_type_contract::TrinoCastMode, ExpressionCodecError> {
+    use novarocks_proto_models::physical_package_v2::TrinoCastMode as Wire;
+    use novarocks_type_contract::TrinoCastMode as Mode;
+    match mode.and_then(|value| Wire::try_from(value).ok()) {
+        Some(Wire::Explicit) => Ok(Mode::Explicit),
+        Some(Wire::Try) => Ok(Mode::Try),
+        Some(Wire::Implicit) => Ok(Mode::Implicit),
+        Some(Wire::StoreAssignment) => Ok(Mode::StoreAssignment),
+        _ => Err(ExpressionCodecError::InvalidShape(
+            "CAST mode is absent or invalid",
         )),
     }
 }

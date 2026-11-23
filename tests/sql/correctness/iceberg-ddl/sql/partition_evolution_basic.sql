@@ -23,7 +23,7 @@ USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 DROP TABLE IF EXISTS test_users_bucketed;
 CREATE TABLE test_users_bucketed (
   user_id BIGINT,
-  country STRING,
+  country VARCHAR,
   score DOUBLE
 ) WITH (partitioning = ARRAY['bucket(user_id, 16)']);
 INSERT INTO test_users_bucketed VALUES

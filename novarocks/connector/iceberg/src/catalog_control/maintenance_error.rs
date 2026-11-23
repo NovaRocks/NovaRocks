@@ -19,6 +19,9 @@
 
 use std::{error::Error, fmt};
 
+use crate::commit::commit_failure::{CommitFailureKind, commit_failure};
+use crate::commit::model::CommitOperation;
+
 use novarocks_failure_contract::{
     FailureClass, FailureFact, FailureProjection,
     connector_reason::{ICEBERG_COMMIT_ERROR, ICEBERG_FILESYSTEM_ERROR, ICEBERG_INVALID_METADATA},
@@ -79,69 +82,17 @@ pub(crate) fn filesystem_failure(message: impl Into<String>) -> ConnectorError {
     .with_public_failure_detail()
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum MaintenanceCommitProcedure {
-    OptimizeManifests,
-    ExpireSnapshots,
-}
-
-impl MaintenanceCommitProcedure {
-    fn name(self) -> &'static str {
-        match self {
-            Self::OptimizeManifests => "optimize_manifests",
-            Self::ExpireSnapshots => "expire_snapshots",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitFailureDisposition {
     KnownUncommitted,
     Unknown,
 }
 
-#[derive(Debug)]
-struct MaintenanceCommitFailure {
-    procedure: MaintenanceCommitProcedure,
-    disposition: CommitFailureDisposition,
-    original: ConnectorMutationFailure,
-}
-
-impl fmt::Display for MaintenanceCommitFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Failed to commit during {}: ", self.procedure.name())?;
-        if self.disposition == CommitFailureDisposition::Unknown {
-            f.write_str("[CommitUnknown] ")?;
-        }
-        let detail = self
-            .original
-            .connector_source()
-            .and_then(ConnectorError::public_failure_detail)
-            .unwrap_or(match (self.disposition, self.original.kind()) {
-                (CommitFailureDisposition::Unknown, _) => "the catalog did not confirm the commit",
-                (_, ConnectorMutationFailureKind::Conflict) => "catalog commit conflict",
-                _ => "the catalog rejected the commit",
-            });
-        f.write_str(detail)
-    }
-}
-
-impl Error for MaintenanceCommitFailure {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.original)
-    }
-}
-
-impl FailureProjection for MaintenanceCommitFailure {
-    fn failure_fact(&self) -> FailureFact {
-        FailureFact::new(FailureClass::Dependency, ICEBERG_COMMIT_ERROR)
-    }
-}
-
+// Design: ADR-0251 (docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)
 /// Project an original commit failure after the owner has finished retry and
 /// selected the terminal. The owner keeps the terminal, evidence and cleanup.
-pub(crate) fn commit_failure(
-    procedure: MaintenanceCommitProcedure,
+pub(crate) fn project_maintenance_commit_failure(
+    operation: CommitOperation,
     disposition: CommitFailureDisposition,
     original: ConnectorMutationFailure,
 ) -> ConnectorMutationFailure {
@@ -172,17 +123,20 @@ pub(crate) fn commit_failure(
         return original;
     }
 
-    ConnectorMutationFailure::from_connector(
-        ConnectorError::from_domain(
-            ConnectorErrorKind::Unavailable,
-            MaintenanceCommitFailure {
-                procedure,
-                disposition,
-                original,
-            },
-        )
-        .with_public_failure_detail(),
-    )
+    let detail = original
+        .connector_source()
+        .and_then(ConnectorError::public_failure_detail)
+        .unwrap_or(match (disposition, original.kind()) {
+            (CommitFailureDisposition::Unknown, _) => "the catalog did not confirm the commit",
+            (_, ConnectorMutationFailureKind::Conflict) => "catalog commit conflict",
+            _ => "the catalog rejected the commit",
+        })
+        .to_owned();
+    let kind = match disposition {
+        CommitFailureDisposition::KnownUncommitted => CommitFailureKind::Rejected,
+        CommitFailureDisposition::Unknown => CommitFailureKind::Unknown,
+    };
+    commit_failure(operation, kind, original, &detail)
 }
 
 #[cfg(test)]

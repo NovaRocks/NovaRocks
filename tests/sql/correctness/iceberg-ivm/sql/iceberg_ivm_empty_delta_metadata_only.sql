@@ -36,7 +36,7 @@ CREATE SCHEMA ice_ivm_empty_delta_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
   amount BIGINT,
-  name STRING
+  name VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders VALUES
   ROW(200, 200, 'keep'),

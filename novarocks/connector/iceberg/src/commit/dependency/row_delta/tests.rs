@@ -23,6 +23,8 @@ use novarocks_failure_contract::connector_reason::ICEBERG_COMMIT_VALIDATION_CONF
 use novarocks_spi::connector::{ConnectorMutationFailureKind, ConnectorWriteOperationId};
 use tempfile::TempDir;
 
+use iceberg::spec::DataFile;
+
 use super::*;
 use crate::commit::dependency::validate_with_removed_data;
 use crate::commit::model::{
@@ -314,8 +316,14 @@ impl Fixture {
                     .map_or(0, |snapshot| snapshot.sequence_number()),
             }),
             changes: Default::default(),
-            isolation: check.isolation,
-            dependencies: vec![Dependency::RowDeltaWindow(check)],
+            protocol: crate::commit::model::CommitProtocol::RowDelta {
+                window: check,
+                writer: crate::commit::model::WriterSchemaSpec {
+                    schema_id: self.metadata.current_schema_id(),
+                    default_spec_id: self.metadata.default_partition_spec_id(),
+                },
+            },
+            dependencies: Vec::new(),
             shape: RequestShape::SnapshotProducing,
             summary: Default::default(),
             token: self.attempt_token().operation(),
@@ -326,10 +334,10 @@ impl Fixture {
             .unwrap()
     }
 
-    fn message(&self, result: Verdict, start: Option<i64>, parent: Option<i64>) -> String {
-        let error = result
-            .row_delta_conflict(&self.metadata, start, parent)
-            .unwrap_or_else(|| panic!("Expected conflict, found {result:?}"));
+    fn message(&self, result: Verdict, _start: Option<i64>, _parent: Option<i64>) -> String {
+        let Verdict::ValidationConflict(error) = result else {
+            panic!("Expected conflict, found {result:?}");
+        };
         assert_eq!(error.kind(), ConnectorMutationFailureKind::Conflict);
         assert_eq!(
             error.failure_fact().reason(),

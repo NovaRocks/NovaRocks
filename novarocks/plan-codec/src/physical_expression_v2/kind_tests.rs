@@ -143,6 +143,7 @@ fn ordered_ids_case_and_lambda_vocabulary_are_not_canonicalized() {
         })
     );
     let Kind::CaseExpression(case) = encoded(ExprKind::Case {
+        ieee_float_equality: false,
         operand: Some(ExprId::new(0)),
         when_then: Box::from([
             (ExprId::new(9), ExprId::new(8)),

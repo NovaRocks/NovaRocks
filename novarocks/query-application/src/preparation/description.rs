@@ -593,12 +593,9 @@ mod tests {
         use novarocks_type_contract::ValueLogicalType as T;
         for (sql, domain) in [
             ("select json_object('k': 1) as value", T::Json),
-            ("select cast(null as bitmap) as value", T::Bitmap),
-            ("select cast(null as hll) as value", T::Hll),
-            (
-                "select cast(json_object('k': 1) as varchar) as value",
-                T::Physical,
-            ),
+            ("select cast(null as uuid) as value", T::Uuid),
+            ("select cast(null as varbinary) as value", T::Physical),
+            ("select cast(JSON '7' as varchar(8)) as value", T::Physical),
         ] {
             let completed =
                 crate::completed_plan_fixture::completed_literal_query([41; 16], sql).await;
@@ -617,6 +614,7 @@ mod tests {
             assert_eq!(output.fields().len(), 1, "{sql}");
             assert_eq!(output.fields()[0].name(), "value", "{sql}");
             assert_eq!(output.fields()[0].logical_type(), domain, "{sql}");
+            assert_eq!(output.fields()[0].value_type(), &port.fields[0].ty, "{sql}");
         }
     }
 
@@ -728,7 +726,7 @@ mod tests {
 
     fn intrinsic_description(values: &[bool], nonconsumers: usize) -> FrozenExecutionDescription {
         use arrow::datatypes::DataType;
-        use novarocks_expression_contract::{ExprKind, RootScope};
+        use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
         use novarocks_physical_plan::{
             FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
             PlanVersionId, ValueOrigin, ValueType,
@@ -793,15 +791,15 @@ mod tests {
                 .add(
                     None,
                     ty.clone(),
-                    ExprKind::Cast {
-                        array_failure_mode: None,
-                        expr: literal,
-                        target: DataType::Int64,
-                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception: SemanticParameterRef {
+                    ExprKind::Binary {
+                        op: BinaryOperator::Add,
+                        left: literal,
+                        right: literal,
+                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                        allow_throw_exception: Some(SemanticParameterRef {
                             id: SemanticParameterId::new(ids[ordinal]),
                             expected_key: SemanticParameterKey::AllowThrowException,
-                        },
+                        }),
                     },
                 )
                 .unwrap();

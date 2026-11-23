@@ -28,7 +28,7 @@ DROP TABLE IF EXISTS ${case_db}.t_project_case_coalesce;
 CREATE TABLE ${case_db}.t_project_case_coalesce (
   id INT,
   score INT,
-  note STRING
+  note VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_project_case_coalesce VALUES
   ROW(1, 95, 'top'),

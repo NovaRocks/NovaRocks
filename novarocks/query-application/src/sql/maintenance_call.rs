@@ -21,16 +21,11 @@ use novarocks_parser::{
     Span,
     ast::{Expr, FunctionCall, Ident, Literal, LiteralKind, ObjectName, TrinoCall},
 };
-use novarocks_sql::semantic::{
-    MaintenanceSqlCommand,
-    command::{
-        CommandLiteral, MaintenanceValueSql, ProcedureArgumentModeSql, ProcedureArgumentSql,
-    },
-};
+use novarocks_sql::semantic::command::ProcedureArgumentModeSql;
 
 use crate::api::{CommandError, CommandErrorKind};
 
-/// The procedure input consumed by both specialized and ordinary CALL routes.
+/// Arguments retained for registered management and development CALL routes.
 /// Literal spelling remains available to domain checks that require it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedMaintenanceCall {
@@ -59,35 +54,6 @@ impl PreparedMaintenanceValue {
         match self {
             Self::Literal(value) => Some(value),
             Self::Timestamp(_) | Self::Map(_) => None,
-        }
-    }
-
-    fn maintenance_value(&self) -> Result<MaintenanceValueSql, String> {
-        match self {
-            Self::Literal(value) => {
-                super::lower_command_literal(value).map(MaintenanceValueSql::Literal)
-            }
-            Self::Timestamp(value) => {
-                let literal = match &value.kind {
-                    LiteralKind::Generic(generic)
-                        if generic.type_name.eq_ignore_ascii_case("TIMESTAMP") =>
-                    {
-                        CommandLiteral::String(generic.value.clone())
-                    }
-                    _ => super::lower_command_literal(value)?,
-                };
-                Ok(MaintenanceValueSql::Timestamp(literal))
-            }
-            Self::Map(entries) => entries
-                .iter()
-                .map(|(key, value)| {
-                    Ok((
-                        super::lower_command_literal(key)?,
-                        super::lower_command_literal(value)?,
-                    ))
-                })
-                .collect::<Result<_, String>>()
-                .map(MaintenanceValueSql::Map),
         }
     }
 }
@@ -147,24 +113,6 @@ impl PreparedMaintenanceCall {
             arguments,
             argument_mode,
             span: statement.span,
-        })
-    }
-
-    pub fn maintenance_command(&self) -> Result<MaintenanceSqlCommand, String> {
-        let arguments = self
-            .arguments
-            .iter()
-            .map(|argument| {
-                Ok(ProcedureArgumentSql {
-                    name: argument.name.as_ref().map(|name| name.value.clone()),
-                    value: argument.value.maintenance_value()?,
-                })
-            })
-            .collect::<Result<_, String>>()?;
-        Ok(MaintenanceSqlCommand::Call {
-            procedure: super::lower_object_name(&self.procedure),
-            arguments,
-            argument_mode: self.argument_mode,
         })
     }
 }
@@ -232,52 +180,49 @@ fn is_procedure_map(call: &FunctionCall) -> bool {
 mod tests {
     use super::*;
     use novarocks_parser::{ast::TrinoStatement, parser};
-    use novarocks_sql::semantic::ObjectName;
 
-    fn prepare(sql: &str) -> Result<MaintenanceSqlCommand, CommandError> {
+    fn prepare(sql: &str) -> Result<PreparedMaintenanceCall, CommandError> {
         let TrinoStatement::Call(call) = parser::parse_statement(sql).unwrap() else {
             panic!("expected CALL");
         };
-        PreparedMaintenanceCall::from_trino(&call)?
-            .maintenance_command()
-            .map_err(|message| CommandError::new(CommandErrorKind::Unsupported, message))
+        PreparedMaintenanceCall::from_trino(&call)
     }
 
     #[test]
     fn typed_call_moves_to_the_original_maintenance_value_shapes() {
         let sql = r#"CALL lake.system.proc("table" => 's.t', before => TIMESTAMP '2020-01-01 00:00:00', options => map('keep', 'true', 'drop', 'false'))"#;
-        let expected = MaintenanceSqlCommand::Call {
-            procedure: ObjectName {
-                parts: vec!["lake".into(), "system".into(), "proc".into()],
-            },
-            argument_mode: ProcedureArgumentModeSql::Named,
-            arguments: vec![
-                ProcedureArgumentSql {
-                    name: Some("table".into()),
-                    value: MaintenanceValueSql::Literal(CommandLiteral::String("s.t".into())),
-                },
-                ProcedureArgumentSql {
-                    name: Some("before".into()),
-                    value: MaintenanceValueSql::Timestamp(CommandLiteral::String(
-                        "2020-01-01 00:00:00".into(),
-                    )),
-                },
-                ProcedureArgumentSql {
-                    name: Some("options".into()),
-                    value: MaintenanceValueSql::Map(vec![
-                        (
-                            CommandLiteral::String("keep".into()),
-                            CommandLiteral::String("true".into()),
-                        ),
-                        (
-                            CommandLiteral::String("drop".into()),
-                            CommandLiteral::String("false".into()),
-                        ),
-                    ]),
-                },
-            ],
+        let call = prepare(sql).unwrap();
+        assert_eq!(
+            call.procedure
+                .parts
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<Vec<_>>(),
+            ["lake", "system", "proc"]
+        );
+        assert_eq!(call.argument_mode, ProcedureArgumentModeSql::Named);
+        let [table, before, options] = call.arguments.as_slice() else {
+            panic!("expected three named arguments");
         };
-        assert_eq!(prepare(sql).unwrap(), expected);
+        assert_eq!(table.name.as_ref().unwrap().value, "table");
+        assert_eq!(before.name.as_ref().unwrap().value, "before");
+        assert_eq!(options.name.as_ref().unwrap().value, "options");
+        assert!(matches!(&table.value,
+            PreparedMaintenanceValue::Literal(Literal{kind: LiteralKind::String(value),..})
+                if value == "s.t"));
+        assert!(matches!(&before.value,
+            PreparedMaintenanceValue::Timestamp(Literal{kind: LiteralKind::Generic(value),..})
+                if value.value == "2020-01-01 00:00:00"));
+        let PreparedMaintenanceValue::Map(entries) = &options.value else {
+            panic!("expected ordered literal pairs");
+        };
+        assert_eq!(entries.len(), 2);
+        for ((key, value), (expected_key, expected_value)) in
+            entries.iter().zip([("keep", "true"), ("drop", "false")])
+        {
+            assert!(matches!(&key.kind, LiteralKind::String(k) if k == expected_key));
+            assert!(matches!(&value.kind, LiteralKind::String(v) if v == expected_value));
+        }
     }
 
     #[test]

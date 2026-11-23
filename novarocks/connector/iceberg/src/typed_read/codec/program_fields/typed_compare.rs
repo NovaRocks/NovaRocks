@@ -28,7 +28,7 @@ pub(super) fn value(
     nominal: Option<ValueLogicalType>,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
     nominals: &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
-    read_layout: crate::typed_read::runtime::IcebergReadLayout,
+    projection: crate::typed_read::runtime::IcebergReadProjection,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
     work.step()?;
@@ -46,7 +46,7 @@ pub(super) fn value(
             }
         }
         Type::Primitive(_) | Type::Variant(_) => {
-            let (expected, domain) = match source {
+            let (source_layout, domain) = match source {
                 Type::Primitive(primitive) => (
                     crate::schema_mapping::typed_value::primitive_layout(primitive, integer)
                         .map_err(|cause| match cause {
@@ -71,6 +71,19 @@ pub(super) fn value(
                 }
                 _ => unreachable!("scalar source arm"),
             };
+            let raw_fixed = match source {
+                Type::Primitive(primitive) => {
+                    crate::schema_mapping::typed_value::plain_fixed_width(primitive, domain)
+                        .is_some()
+                }
+                _ => false,
+            };
+            let projected_fixed = raw_fixed && projection.projects_fixed_as_binary();
+            let expected = if projected_fixed {
+                DataType::Binary
+            } else {
+                source_layout
+            };
             let same_kind = match (domain, actual.kind()) {
                 (ValueLogicalType::Physical, ValueKind::String) => expected == DataType::Utf8,
                 (ValueLogicalType::Physical, ValueKind::Binary) => expected == DataType::Binary,
@@ -79,7 +92,12 @@ pub(super) fn value(
                 _ => false,
             };
             work.step()?;
-            if !same_kind || layout != &read_layout.byte_carrier(&expected, domain) {
+            let expected_layout = if raw_fixed {
+                expected
+            } else {
+                projection.byte_carrier(&expected, domain)
+            };
+            if !same_kind || layout != &expected_layout {
                 return Err(invalid(
                     "public execution value differs from its explicit Iceberg source domain/layout",
                 ));
@@ -118,7 +136,7 @@ pub(super) fn value(
                     nominals.get(&source.id).map(|domain| domain.logical_type()),
                     None,
                     nominals,
-                    read_layout,
+                    projection,
                     work,
                 )?;
             }
@@ -148,7 +166,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
-                read_layout,
+                projection,
                 work,
             )?;
         }
@@ -188,7 +206,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
-                read_layout,
+                projection,
                 work,
             )?;
             self::value(
@@ -200,7 +218,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
-                read_layout,
+                projection,
                 work,
             )?;
         }
@@ -214,12 +232,6 @@ pub(super) fn nominal_declarations(
     match relation {
         IcebergRuntimeRelation::Table(table) => Some(table.nominal_declarations()),
         IcebergRuntimeRelation::ChangeWindow(window) => Some(window.nominal_declarations()),
-        IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
-            Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
-                Some(optimize.table_handle().nominal_declarations())
-            }
-            _ => None,
-        },
         _ => None,
     }
 }

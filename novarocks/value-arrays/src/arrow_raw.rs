@@ -22,8 +22,8 @@ use allocator_api2::{
     vec::Vec as AllocVec,
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
-    StringViewArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray,
+    LargeStringArray, StringArray, StringViewArray,
 };
 use arrow_buffer::{ArrowNativeType, Buffer, NullBuffer, ScalarBuffer};
 use arrow_data::ByteView;
@@ -125,6 +125,32 @@ pub(crate) fn byte_span(array: &dyn Array, row: usize) -> Result<Option<ByteSpan
         arrow_schema::DataType::Utf8View => views!(StringViewArray),
         arrow_schema::DataType::BinaryView => views!(BinaryViewArray),
         _ => return Err(ValueError::Invariant(ValueViolation::Carrier)),
+    }))
+}
+
+pub(crate) fn fixed_binary_span(
+    array: &dyn Array,
+    row: usize,
+) -> Result<Option<ByteSpan<'_>>, ValueError> {
+    let array = concrete::<FixedSizeBinaryArray>(array)?;
+    if row >= array.len() {
+        return Err(ValueError::Invariant(ValueViolation::Bounds));
+    }
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let len = array.value_size();
+    let offset = row
+        .checked_mul(len)
+        .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+    let buffer = array.values();
+    if offset.checked_add(len).is_none_or(|end| end > buffer.len()) {
+        return Err(ValueError::Invariant(ValueViolation::Bounds));
+    }
+    Ok(Some(ByteSpan::Region {
+        buffer,
+        offset,
+        len,
     }))
 }
 

@@ -496,6 +496,8 @@ pub enum PublicationCatalogFault {
     /// actor then advances the table before the original request is released.
     BeforeRequirementCheckHoldForConcurrentShell,
     AfterCommitBeforeResponse,
+    /// Lose the successful response and withhold exact readback until release.
+    AfterCommitBeforeResponseHideTableLoad,
     /// Hold the downstream-successful response until the runner has killed
     /// the frontend while the issuing statement is still in flight.
     AfterCommitHoldForFrontendKill,
@@ -517,6 +519,9 @@ impl PublicationCatalogFault {
                 "before-requirement-check-hold-for-concurrent-shell"
             }
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
+            Self::AfterCommitBeforeResponseHideTableLoad => {
+                "after-commit-before-response-hide-table-load"
+            }
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
             Self::IncompleteDiscovery => "incomplete-discovery",
             Self::CorruptPackage => "corrupt-package",

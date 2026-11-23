@@ -121,7 +121,6 @@ pub const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: i32 = 5;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SqlSemanticSettings {
     sql_mode: SqlMode,
-    decimal_overflow_to_double: bool,
     /// Raw value projected from the actual admitted SessionExecutionSettings.
     group_concat_max_len: Option<i64>,
     recursive_cte_max_depth: Option<i32>,
@@ -155,10 +154,6 @@ impl SqlSemanticSettings {
         &self.sql_mode
     }
 
-    pub const fn decimal_overflow_to_double(&self) -> bool {
-        self.decimal_overflow_to_double
-    }
-
     pub const fn group_concat_max_len(&self) -> Option<i64> {
         self.group_concat_max_len
     }
@@ -167,40 +162,9 @@ impl SqlSemanticSettings {
         self
     }
 
-    pub fn with_decimal_overflow_to_double(mut self, value: bool) -> Self {
-        self.decimal_overflow_to_double = value;
-        self
-    }
-
     pub fn with_sql_mode(mut self, value: SqlMode) -> Self {
         self.sql_mode = value;
         self
-    }
-}
-
-fn decimal_flag(value: &ast::Expr) -> Result<bool, crate::analyze_error::AnalyzeError> {
-    let text = match value {
-        ast::Expr::Literal(literal) => match &literal.kind {
-            ast::LiteralKind::Boolean(value) => return Ok(*value),
-            ast::LiteralKind::String(value) => value.as_str(),
-            ast::LiteralKind::Long {
-                parsed_value: 1, ..
-            } => "1",
-            ast::LiteralKind::Long {
-                parsed_value: 0, ..
-            } => "0",
-            _ => "",
-        },
-        ast::Expr::Identifier(name) => name.value.as_str(),
-        _ => "",
-    };
-    match text.trim().to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" => Ok(true),
-        "0" | "off" | "false" => Ok(false),
-        _ => Err(crate::analyze_error::AnalyzeError::invalid_argument(
-            "invalid decimal_overflow_to_double value; expected 1, ON, TRUE, 0, OFF, or FALSE",
-            value.span(),
-        )),
     }
 }
 
@@ -217,11 +181,6 @@ pub fn query_sql_semantics(
         };
         if name.value.eq_ignore_ascii_case("sql_mode") {
             settings = settings.with_sql_mode(SqlMode::from_expression(&property.value)?);
-        } else if name
-            .value
-            .eq_ignore_ascii_case("decimal_overflow_to_double")
-        {
-            settings = settings.with_decimal_overflow_to_double(decimal_flag(&property.value)?);
         }
     }
     Ok(settings)
@@ -340,19 +299,8 @@ pub(crate) fn query_requires_semantic_snapshot(
     settings: &SqlSemanticSettings,
     query: &ast::Query,
 ) -> bool {
-    (settings.sql_mode().group_concat_legacy()
-        || settings.decimal_overflow_to_double()
-        || settings.sql_mode().error_if_overflow())
+    (settings.sql_mode().group_concat_legacy() || settings.sql_mode().error_if_overflow())
         && query_has_select(query)
-}
-
-/// Detect a numeric policy used by this query's SELECTs under one setting.
-pub fn query_uses_decimal_overflow_to_double(
-    session: &SqlSemanticSettings,
-    query: &ast::Query,
-) -> Result<bool, crate::analyze_error::AnalyzeError> {
-    let settings = query_sql_semantics(session, query)?;
-    Ok(settings.decimal_overflow_to_double() && query_has_select(query))
 }
 
 /// Detect uncaptured legacy mode under the root query setting.
@@ -412,14 +360,6 @@ fn check_persisted_query_semantics(
     {
         return Err(PersistedSemanticsError::Uncaptured(
             "GROUP_CONCAT_LEGACY is not captured for persisted VIEW or MATERIALIZED VIEW definition replay",
-        ));
-    }
-    if caller.decimal_overflow_to_double()
-        || query_uses_decimal_overflow_to_double(caller, query)
-            .map_err(PersistedSemanticsError::Analyze)?
-    {
-        return Err(PersistedSemanticsError::Uncaptured(
-            "decimal_overflow_to_double=true is not captured for persisted VIEW or MATERIALIZED VIEW definition replay",
         ));
     }
     if caller.sql_mode().error_if_overflow()
@@ -766,99 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_query_assignments_preserve_mode_and_validate_at_the_root() {
-        let session = semantics("GROUP_CONCAT_LEGACY").with_decimal_overflow_to_double(true);
-        let original_session = session.clone();
-        for value in ["0", "OFF", "false", "'false'"] {
-            let resolved = query_sql_semantics(
-                &session,
-                &query_with_assignments("SELECT 1", &format!("decimal_overflow_to_double={value}")),
-            )
-            .unwrap();
-            assert!(!resolved.decimal_overflow_to_double());
-            assert!(resolved.sql_mode().group_concat_legacy());
-        }
-        let value = query_sql_semantics(&session, &query(
-            "WITH SESSION sql_mode = 32, decimal_overflow_to_double = 0, decimal_overflow_to_double = 1 SELECT 1"
-        )).unwrap();
-        assert!(value.decimal_overflow_to_double());
-        assert!(!value.sql_mode().group_concat_legacy());
-        for (sql, value) in [
-            ("SELECT 1", "2"),
-            ("SELECT 1 FROM (SELECT 1) t", "'bad'"),
-            ("WITH t AS (SELECT 1) SELECT 1 FROM t", "1+1"),
-            ("SELECT 1 UNION ALL SELECT 1", "NULL"),
-        ] {
-            let query = query_with_assignments(sql, &format!("decimal_overflow_to_double={value}"));
-            let error = normalize_concat_query(query.clone(), &session).unwrap_err();
-            assert_eq!(error.code().as_str(), "sql.analyze.invalid_argument");
-            assert!(error.span().is_some());
-            let error =
-                statement_sql_semantics(&session, &ast::TrinoStatement::Query(query)).unwrap_err();
-            assert_eq!(error.code().as_str(), "sql.analyze.invalid_argument");
-            assert!(error.span().is_some());
-        }
-        assert_eq!(session, original_session);
-    }
-
-    #[test]
-    fn decimal_replay_rejects_uncaptured_caller_or_query_policy() {
-        let ordinary = SqlSemanticSettings::default();
-        let promoted = ordinary.clone().with_decimal_overflow_to_double(true);
-        let original_ordinary = ordinary.clone();
-        let original_promoted = promoted.clone();
-        for sql in [
-            "SELECT 1",
-            "SELECT 1 FROM (SELECT 1) t",
-            "WITH t AS (SELECT 1) SELECT 1 FROM t",
-            "SELECT 1 UNION ALL SELECT 1",
-        ] {
-            assert!(validate_persisted_query_semantics(&query(sql), &ordinary).is_ok());
-            assert!(
-                validate_persisted_query_semantics(&query(sql), &promoted)
-                    .unwrap_err()
-                    .contains("decimal_overflow_to_double=true is not captured")
-            );
-            let enabled = query_with_assignments(sql, "decimal_overflow_to_double=true");
-            assert!(
-                validate_persisted_query_semantics(&enabled, &ordinary)
-                    .unwrap_err()
-                    .contains("decimal_overflow_to_double=true is not captured")
-            );
-            let disabled = query_with_assignments(sql, "decimal_overflow_to_double=false");
-            assert!(validate_persisted_query_semantics(&disabled, &ordinary).is_ok());
-            // A query override cannot make an uncaptured caller a replay context.
-            assert!(validate_persisted_query_semantics(&disabled, &promoted).is_err());
-        }
-        assert_eq!(ordinary, original_ordinary);
-        assert_eq!(promoted, original_promoted);
-    }
-
-    #[test]
-    fn decimal_usage_observes_one_effective_query_setting() {
-        let on = SqlSemanticSettings::default().with_decimal_overflow_to_double(true);
-        let off = SqlSemanticSettings::default();
-        let original_on = on.clone();
-        let original_off = off.clone();
-        for sql in [
-            "SELECT 1",
-            "SELECT 1 UNION ALL SELECT 2",
-            "WITH c AS (SELECT 1) SELECT * FROM c",
-            "SELECT (SELECT 1)",
-        ] {
-            assert!(query_uses_decimal_overflow_to_double(&on, &query(sql)).unwrap());
-            assert!(!query_uses_decimal_overflow_to_double(&off, &query(sql)).unwrap());
-            let disabled = query_with_assignments(sql, "decimal_overflow_to_double=false");
-            assert!(!query_uses_decimal_overflow_to_double(&on, &disabled).unwrap());
-            let enabled = query_with_assignments(sql, "decimal_overflow_to_double=true");
-            assert!(query_uses_decimal_overflow_to_double(&off, &enabled).unwrap());
-        }
-        assert_eq!(on, original_on);
-        assert_eq!(off, original_off);
-    }
-
-    #[test]
-    fn overflow_error_policy_is_independent_from_allow_throw_and_promotion() {
+    fn overflow_error_policy_is_independent_from_allow_throw() {
         use novarocks_type_contract::DecimalOverflowPolicy;
         let report = SqlMode::from_assignment("ERROR_IF_OVERFLOW");
         assert!(report.error_if_overflow());
@@ -881,15 +729,6 @@ mod tests {
         ] {
             assert!(SqlMode::from_assignment(mode).error_if_overflow());
         }
-        let both = SqlSemanticSettings::default()
-            .with_decimal_overflow_to_double(true)
-            .with_sql_mode(report);
-        assert!(both.decimal_overflow_to_double());
-        assert!(both.sql_mode().error_if_overflow());
-        let reassigned = both.clone().with_sql_mode(allow);
-        assert!(reassigned.decimal_overflow_to_double());
-        assert!(!reassigned.sql_mode().error_if_overflow());
-        assert!(both.sql_mode().error_if_overflow());
     }
 
     #[test]

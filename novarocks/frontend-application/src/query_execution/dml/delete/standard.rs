@@ -717,6 +717,18 @@ fn validate_literal_for_column(
         LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
         LiteralKind::Double(value) => format!("{:?}", value.get()),
         LiteralKind::Boolean(b) => b.to_string(),
+        LiteralKind::Generic(literal)
+            if !negate
+                && literal.type_name.eq_ignore_ascii_case("TIMESTAMP")
+                && matches!(
+                    column_type,
+                    DataType::Timestamp(TimeUnit::Microsecond, None)
+                ) =>
+        {
+            // SQL planning evaluates the original TIMESTAMP literal and owns
+            // its type, precision and conversion failures.
+            return Ok(());
+        }
         LiteralKind::Null => {
             return Err(format!(
                 "phase 1 DELETE WHERE does not support NULL literals; use IS NULL/IS NOT NULL instead \
@@ -1231,14 +1243,11 @@ mod tests {
     // --------------- Timestamp predicate tests ---------------
 
     #[test]
-    fn delete_validate_accepts_datetime_literals_with_and_without_subseconds() {
+    fn delete_accepts_typed_timestamp_predicates_for_sql_planning() {
         for literal in ["2020-01-01 00:00:00", "2020-01-01 00:00:00.5"] {
-            let expr = Expr::Literal(Literal {
-                kind: LiteralKind::String(literal.to_string()),
-                span: Span::new(0, literal.len()),
-            });
-            super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
-                .unwrap_or_else(|error| panic!("`{literal}` must be accepted: {error}"));
+            let filter = where_expr(&format!("ts = TIMESTAMP '{literal}'"));
+            super::validate_where(&filter, &columns_with_timestamp())
+                .unwrap_or_else(|error| panic!("`{literal}` must reach SQL planning: {error}"));
         }
     }
 

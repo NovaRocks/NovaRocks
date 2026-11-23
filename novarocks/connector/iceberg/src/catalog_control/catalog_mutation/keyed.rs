@@ -24,8 +24,8 @@ use crate::commit::attempt::prepared::{
 };
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    BaseIdentity, Dependency, FileChanges, FrozenRequest, IsolationLevel, OperationIntent,
-    OperationIntentParts, OperationToken, RequestShape, StartSnapshot, TableTarget,
+    BaseIdentity, Dependency, FileChanges, FrozenRequest, OperationIntent, OperationIntentParts,
+    OperationToken, RequestShape, StartSnapshot, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::slot_change::{
@@ -264,7 +264,7 @@ pub(super) fn execute(
         } else {
             Dependency::NoRead
         }],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape,
         summary,
         token: operation.token(),
@@ -642,7 +642,7 @@ pub(super) async fn execute_async(
         } else {
             Dependency::NoRead
         }],
-        isolation: IsolationLevel::Snapshot,
+        protocol: crate::commit::model::CommitProtocol::Legacy,
         shape,
         summary,
         token: operation.token(),

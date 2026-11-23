@@ -148,10 +148,17 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
         | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => vec![*child],
         ScalarNode::FunctionCall { args, .. } => args.clone(),
-        ScalarNode::AggregateCall { args, order_by, .. } => {
-            let mut children = Vec::with_capacity(args.len() + order_by.len());
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            let mut children =
+                Vec::with_capacity(args.len() + order_by.len() + usize::from(filter.is_some()));
             children.extend(args.iter().copied());
             children.extend(order_by.iter().map(|key| key.expr));
+            children.extend(*filter);
             children
         }
         ScalarNode::InList { child, list, .. } => {
@@ -168,6 +175,7 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             let mut children = Vec::with_capacity(operand.iter().count() + when_then.len() * 2 + 1);
             children.extend(operand.iter().copied());
@@ -369,7 +377,15 @@ fn collect_column_refs_inner(
                 collect_column_refs_inner(scalars, arg, seen, refs);
             }
         }
-        ScalarNode::AggregateCall { args, order_by, .. } => {
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                collect_column_refs_inner(scalars, *predicate, seen, refs);
+            }
             for &arg in args {
                 collect_column_refs_inner(scalars, arg, seen, refs);
             }
@@ -398,6 +414,7 @@ fn collect_column_refs_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_column_refs_inner(scalars, *operand, seen, refs);
@@ -479,12 +496,18 @@ fn substitute(
             volatility,
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ScalarNode::AggregateCall {
+            occurrence,
+            filter: filter
+                .map(|id| substitute(scalars, id, subst, control))
+                .transpose()?,
             name,
             args: args
                 .into_iter()
@@ -501,12 +524,12 @@ fn substitute(
             resolved,
         },
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child: substitute(scalars, child, subst, control)?,
             target,
             decimal_overflow_policy,
@@ -548,10 +571,12 @@ fn substitute(
             negated,
         },
         ScalarNode::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => ScalarNode::Case {
+            ieee_float_equality,
             operand: operand
                 .map(|operand| substitute(scalars, operand, subst, control))
                 .transpose()?,
@@ -1184,7 +1209,9 @@ fn rewrite_aggregate(
     };
     let mut roots = aggregate.group_by.clone();
     for (index, spec) in aggregate.aggregates.iter().enumerate() {
-        if aggregate.is_merge.get(index).copied().unwrap_or(false) {
+        if aggregate.is_merge.get(index).copied().unwrap_or(false)
+            || spec.source.has_projected_inputs()
+        {
             continue;
         }
         roots.extend(spec.source.arguments().iter().copied());
@@ -1204,7 +1231,7 @@ fn rewrite_aggregate(
     }
     let is_merge = aggregate.is_merge.clone();
     for (index, spec) in aggregate.aggregates.iter_mut().enumerate() {
-        if is_merge.get(index).copied().unwrap_or(false) {
+        if is_merge.get(index).copied().unwrap_or(false) || spec.source.has_projected_inputs() {
             continue;
         }
         spec.source.rewrite_channels(|arguments, order_by| {
@@ -1611,7 +1638,7 @@ mod tests {
     fn cast(arena: &mut ScalarArena, child: ScalarId) -> ScalarId {
         arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1776,7 +1803,7 @@ mod tests {
         let array_map_type = DataType::List(Arc::new(Field::new("item", map_type, true)));
         let cast_null_array = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: null_array,
                 target: array_map_type.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -3628,6 +3655,7 @@ mod tests {
                         left: left_a,
                         right: right_key,
                         null_safe: false,
+                        match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
                     }],
                     residual: Some(condition),
                 },
@@ -4027,6 +4055,7 @@ mod intrinsic_eligibility_tests {
                 );
                 let branch = arena.intern(
                     ScalarNode::Case {
+                        ieee_float_equality: false,
                         operand: None,
                         when_then: vec![(condition, call)],
                         else_expr: Some(child),

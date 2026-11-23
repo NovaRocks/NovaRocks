@@ -314,6 +314,24 @@ impl MvCommandExecutor {
         )
     }
 
+    pub(crate) fn owns_typed_call(name: &novarocks_parser::ast::ObjectName) -> bool {
+        if crate::mv::domain::management_call::owned_procedure(name).is_some() {
+            return true;
+        }
+        #[cfg(novarocks_dev_controls)]
+        {
+            name.parts.last().is_some_and(|part| {
+                part.value
+                    .eq_ignore_ascii_case(crate::mv::domain::document_expiry::PROCEDURE)
+                    || part
+                        .value
+                        .eq_ignore_ascii_case(crate::mv::domain::stateless_rebuild::PROCEDURE_NAME)
+            })
+        }
+        #[cfg(not(novarocks_dev_controls))]
+        false
+    }
+
     /// Executes the MV management procedures and the test-only stateless
     /// rebuild from prepared procedure arguments. Other procedures remain a
     /// route miss.

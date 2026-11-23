@@ -33,16 +33,6 @@ json_values
 string_values
 ["100.0","1.0E2",null,"a\n中",null]
 
--- query 10
--- types	array(varchar)
-whole_array
-NULL
-
--- query 12
--- types	array(varchar)
-whole_array
-NULL
-
 -- query 14
 -- types	array(varchar)
 whole_array

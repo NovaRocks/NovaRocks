@@ -20,12 +20,13 @@
 //! No runtime reference calculator or old evaluator supplies expected values.
 use super::*;
 use arrow::array::Decimal128Array;
-use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::testkit::{PassThroughCallHost, numeric_fixtures::compiled_cast};
 use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
-use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
+use novarocks_failure_contract::kernel_reason::NUMERIC_OUT_OF_RANGE;
+use novarocks_functions::{DataFailureReason, ScalarInvocationActivation, ScalarInvocationScope};
+use novarocks_type_contract::TrinoCastMode;
 
-const OVERFLOW: &str =
-    "Expr evaluate meet error: The numeric type cast involving decimal overflows";
+const OVERFLOW: DataFailureReason = DataFailureReason::Domain(NUMERIC_OUT_OF_RANGE);
 
 // Pure data constructors and inspectors are local to this retained test. They
 // do not invoke a CAST or calculate a decimal result.
@@ -42,34 +43,19 @@ fn values(array: &ArrayRef) -> Vec<Option<i128>> {
         .map(|r| (!array.is_null(r)).then(|| array.value(r)))
         .collect()
 }
-fn modes() -> [(DecimalOverflowPolicy, bool); 4] {
-    [
-        (DecimalOverflowPolicy::OutputNull, false),
-        (DecimalOverflowPolicy::OutputNull, true),
-        (DecimalOverflowPolicy::ReportError, false),
-        (DecimalOverflowPolicy::ReportError, true),
-    ]
-}
-
 #[derive(Clone, Copy, Debug)]
 enum Expected {
     Value(i128),
     SourceNull,
-    // Finite conversion overflow: NULL only in OutputNull/allow=false.
+    // An admitted value overflows the target precision.
     Overflow,
 }
 impl Expected {
-    // Materialize only the frozen policy response to a handwritten flag.
-    // This function contains no precision, rounding or scale calculation.
-    fn outcome(
-        self,
-        policy: DecimalOverflowPolicy,
-        allow: bool,
-    ) -> (Option<i128>, Option<&'static str>) {
+    fn outcome(self, mode: TrinoCastMode) -> (Option<i128>, Option<DataFailureReason>) {
         match self {
             Self::Value(value) => (Some(value), None),
             Self::SourceNull => (None, None),
-            Self::Overflow if policy == DecimalOverflowPolicy::OutputNull && !allow => (None, None),
+            Self::Overflow if mode == TrinoCastMode::Try => (None, None),
             Self::Overflow => (None, Some(OVERFLOW)),
         }
     }
@@ -97,15 +83,15 @@ fn compare(
     expected_constant: Expected,
 ) {
     assert_eq!(raw.len(), expected_full.len());
-    for (policy, allow) in modes() {
+    for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
         let full = input(p, s, raw.clone());
-        let program = compiled(
+        let program = compiled_cast(
             FunctionValueType::new(full.data_type().clone(), true),
             FunctionValueType::new(target.clone(), true),
             Source::Column,
             Wrap::Bare,
-            policy,
-            allow,
+            mode,
+            false,
         );
         // Each variant carries the corresponding part of the same handwritten
         // result table, so row addresses and compact ordinals remain distinct.
@@ -138,34 +124,34 @@ fn compare(
                 let mut expected = Vec::new();
                 let mut errors = Vec::new();
                 for (ordinal, row) in rows.iter().copied().enumerate() {
-                    let (value, error) = expected_source[row].outcome(policy, allow);
+                    let (value, error) = expected_source[row].outcome(mode);
                     expected.push(value);
-                    if let Some(message) = error {
-                        errors.push((ordinal, message.to_owned()));
+                    if let Some(reason) = error {
+                        errors.push((ordinal, reason));
                     }
                 }
                 assert_eq!(
                     values(out.values()),
                     expected,
-                    "source Decimal128({p}, {s}), target {target:?}, policy {policy:?}, allow {allow}, rows {rows:?}"
+                    "source Decimal128({p}, {s}), target {target:?}, mode {mode:?}, rows {rows:?}"
                 );
                 assert_eq!(
                     out.errors()
                         .iter()
-                        .map(|e| (e.selected_ordinal(), e.message().to_owned()))
+                        .map(|e| (e.selected_ordinal(), e.reason()))
                         .collect::<Vec<_>>(),
                     errors,
-                    "source Decimal128({p}, {s}), target {target:?}, policy {policy:?}, allow {allow}, rows {rows:?}",
+                    "source Decimal128({p}, {s}), target {target:?}, mode {mode:?}, rows {rows:?}",
                 );
             }
         }
-        let constant = compiled(
+        let constant = compiled_cast(
             FunctionValueType::new(full.data_type().clone(), false),
             FunctionValueType::new(target.clone(), true),
             Source::Constant,
             Wrap::Bare,
-            policy,
-            allow,
+            mode,
+            false,
         );
         let cb = batch(&constant, input(p, s, vec![Some(0); 5]));
         let selected = Selection::try_sparse(5, &[1, 4]).unwrap();
@@ -185,23 +171,23 @@ fn compare(
         assert_eq!(out.values().data_type(), &target);
         // The shared compiled fixture's Source::Constant authors raw Decimal128
         // integer 1. Its profile-specific result is explicitly listed below.
-        let (expected, error) = expected_constant.outcome(policy, allow);
+        let (expected, error) = expected_constant.outcome(mode);
         assert_eq!(values(out.values()), vec![expected, expected]);
         let errors = match error {
-            Some(message) => vec![(0, message.to_owned()), (1, message.to_owned())],
+            Some(reason) => vec![(0, reason), (1, reason)],
             None => vec![],
         };
         assert_eq!(
             out.errors()
                 .iter()
-                .map(|e| (e.selected_ordinal(), e.message().to_owned()))
+                .map(|e| (e.selected_ordinal(), e.reason()))
                 .collect::<Vec<_>>(),
             errors
         );
     }
 }
 #[test]
-fn decimal128_rescale_actual_compiler_observed_7_2_to_9_3_full_policy_and_selection() {
+fn decimal128_rescale_actual_compiler_observed_7_2_to_9_3_both_modes_and_selection() {
     // A stored integer r at scale s means r * 10^-s. Raising scale
     // from 2 to 3 multiplies r by 10; all four outputs fit precision 9.
     compare(
@@ -214,7 +200,7 @@ fn decimal128_rescale_actual_compiler_observed_7_2_to_9_3_full_policy_and_select
     );
 }
 #[test]
-fn decimal128_rescale_actual_compiler_observed_14_13_to_38_13_full_policy_and_selection() {
+fn decimal128_rescale_actual_compiler_observed_14_13_to_38_13_both_modes_and_selection() {
     // Equal scales preserve raw integers; each fits the wider precision.
     compare(
         14,
@@ -226,110 +212,142 @@ fn decimal128_rescale_actual_compiler_observed_14_13_to_38_13_full_policy_and_se
     );
 }
 #[test]
-fn decimal128_rescale_actual_compiler_identical_metadata_full_carrier_precision_is_not_identity() {
-    // Precision 1 admits only -9..=9 even when the source metadata matches.
-    // The full physical carrier values remain data; a precision claim cannot
-    // hide MIN/MAX or +/-10 from target precision enforcement.
+fn decimal128_rescale_actual_compiler_identity_preserves_valid_boundary_coefficients() {
     compare(
         1,
         0,
         DataType::Decimal128(1, 0),
-        vec![
-            Some(i128::MIN),
-            Some(i128::MAX),
-            None,
-            Some(9),
-            Some(10),
-            Some(-10),
-        ],
-        &[O, O, N, V(9), O, O],
+        vec![Some(-9), Some(9), None, Some(0), Some(-1)],
+        &[V(-9), V(9), N, V(0), V(-1)],
         V(1),
     );
 }
 
-fn full_carrier_corpus() -> Vec<Option<i128>> {
-    vec![
-        Some(i128::MIN),
-        Some(i128::MAX),
-        None,
-        Some(3185),
-        Some(-3185),
-        Some(1),
-    ]
+#[test]
+fn decimal128_rescale_actual_compiler_rejects_malformed_source_in_both_modes() {
+    let source = input(
+        1,
+        0,
+        vec![Some(i128::MIN), Some(i128::MAX), Some(-10), Some(10)],
+    );
+    for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
+        let program = compiled_cast(
+            FunctionValueType::new(source.data_type().clone(), true),
+            FunctionValueType::new(DataType::Decimal128(2, 1), true),
+            Source::Column,
+            Wrap::Bare,
+            mode,
+            false,
+        );
+        let data = batch(&program, source.clone());
+        assert!(matches!(
+            instance(&program).evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            ),
+            Err(ExprEvaluationFailure::Kernel(
+                KernelFailure::InvalidProgram(_)
+            ))
+        ));
+    }
 }
+
 #[test]
 fn decimal128_rescale_actual_compiler_full_rescale_rounding_overflow_scale_and_null_profiles() {
-    // These are fixed tables, not a second converter. Precision p accepts
-    // absolute raw magnitude < 10^p; downscale uses nearest with half ties
-    // away from zero. All large-carrier outcomes are justified per row below.
-    // A scale difference does not require materializing a power of ten.
-    // Every i128 magnitude is below 10^39 / 2, so division by 10^76
-    // rounds to zero. Multiplication by 10^76 overflows for any nonzero
-    // i128; zero remains exactly zero. These are mathematical value proofs.
-    for (p, s, tp, ts, expected, constant) in [
-        // x10: MIN/MAX cannot fit the output carrier/precision. The three
-        // small raw values become 31850, -31850 and 10.
-        (38, 0, 38, 1, [O, O, N, V(31850), V(-31850), V(10)], V(10)),
-        // /100: rounded MIN/MAX still have 37 digits, exceeding precision10.
-        // 31.85 -> 32; -31.85 -> -32; 0.01 -> 0.
-        (10, 4, 10, 2, [O, O, N, V(32), V(-32), V(0)], V(0)),
-        // x100: MIN/MAX exceed precision20; 3185 -> 318500.
-        (
-            18,
-            -2,
-            20,
-            0,
-            [O, O, N, V(318500), V(-318500), V(100)],
-            V(100),
-        ),
-        // /10000: rounded MIN/MAX still have 35 digits, exceeding precision20.
-        // Each small corpus magnitude is below one half, hence rounds to 0.
-        (18, 2, 20, -2, [O, O, N, V(0), V(0), V(0)], V(0)),
-        // /10^38: MIN/MAX have magnitude 1.7014118346..., hence -2/+2.
-        // All three small values round to 0 and fit precision38.
-        (38, 0, 38, -38, [V(-2), V(2), N, V(0), V(0), V(0)], V(0)),
-        // /10^76 rounds every physical carrier value to zero.
-        (38, 38, 38, -38, [V(0), V(0), N, V(0), V(0), V(0)], V(0)),
-        // x10^76 overflows for every nonzero corpus value, with the
-        // original numeric-overflow policy rather than a factor error.
-        (1, -38, 38, 38, [O, O, N, O, O, O], O),
-    ] {
-        compare(
-            p,
-            s,
-            DataType::Decimal128(tp, ts),
-            full_carrier_corpus(),
-            &expected,
-            constant,
-        );
-    }
-    // Zero is not an overflow when scaling up; source NULL stays separate.
-    // Keep this boundary alongside the nonzero full-carrier table above.
+    const MAX: i128 = 10_i128.pow(38) - 1;
+    // Scaling to one decimal place overflows on the two largest declared
+    // integers. The remaining signed coefficients scale exactly.
     compare(
-        1,
-        -38,
+        38,
+        0,
+        DataType::Decimal128(38, 1),
+        vec![
+            Some(-MAX),
+            Some(MAX),
+            None,
+            Some(3185),
+            Some(-3185),
+            Some(1),
+        ],
+        &[O, O, N, V(31850), V(-31850), V(10)],
+        V(10),
+    );
+    // Half ties are away from zero. Larger valid source values already exceed
+    // the target integer width before rounding.
+    compare(
+        10,
+        4,
+        DataType::Decimal128(6, 2),
+        vec![
+            Some(-9999999999),
+            Some(9999999999),
+            None,
+            Some(3150),
+            Some(-3150),
+            Some(1),
+        ],
+        &[O, O, N, V(32), V(-32), V(0)],
+        V(0),
+    );
+    // 99.995 is within the target integer width before rounding but carries
+    // into the next digit. Its neighbor still fits.
+    compare(
+        9,
+        3,
+        DataType::Decimal128(4, 2),
+        vec![
+            Some(-99995),
+            Some(99995),
+            None,
+            Some(99994),
+            Some(-99994),
+            Some(1),
+        ],
+        &[O, O, N, V(9999), V(-9999), V(0)],
+        V(0),
+    );
+    compare(
+        38,
+        38,
+        DataType::Decimal128(38, 0),
+        vec![Some(-MAX), Some(MAX), None, Some(3185), Some(-1)],
+        &[V(-1), V(1), N, V(0), V(0)],
+        V(0),
+    );
+    // The scale-38 target has no integer digits. Zero fits and the original
+    // SQL NULL remains distinct from an error or a TRY_CAST-created NULL.
+    compare(
+        38,
+        0,
         DataType::Decimal128(38, 38),
-        vec![Some(0), None, Some(1)],
-        &[V(0), N, O],
+        vec![Some(0), None, Some(1), Some(-1)],
+        &[V(0), N, O, O],
         O,
     );
 }
 
 #[test]
 fn decimal128_rescale_actual_compiler_every_seven_callback_causes_stop_and_latch_without_replay() {
-    for (p, s, tp, ts, policy, allow) in [
-        (7, 2, 9, 3, DecimalOverflowPolicy::OutputNull, false),
-        (1, 0, 1, 0, DecimalOverflowPolicy::ReportError, true),
-        (38, 38, 38, -38, DecimalOverflowPolicy::OutputNull, false),
+    for (p, s, tp, ts, mode) in [
+        (7, 2, 9, 3, TrinoCastMode::Explicit),
+        (2, 0, 1, 0, TrinoCastMode::Explicit),
+        (2, 0, 1, 0, TrinoCastMode::Try),
+        (38, 0, 38, 38, TrinoCastMode::Try),
     ] {
-        let source = input(p, s, vec![Some(1), Some(i128::MAX), None, Some(-1)]);
-        let program = compiled(
+        let source = input(p, s, vec![Some(1), Some(99), None, Some(-1)]);
+        let program = compiled_cast(
             FunctionValueType::new(source.data_type().clone(), true),
             FunctionValueType::new(DataType::Decimal128(tp, ts), true),
             Source::Column,
             Wrap::Bare,
-            policy,
-            allow,
+            mode,
+            false,
         );
         let data = batch(&program, source);
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);

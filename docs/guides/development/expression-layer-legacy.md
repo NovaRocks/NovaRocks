@@ -4,15 +4,19 @@
 
 ## 构造、转换与关系调用
 
+TRC-6a 的标准算术和比较经共享定型选择隐藏重载，EXPLAIN 按身份渲染原运算符。标准一元正号保持已定型的有符号整数、REAL 或 DOUBLE 实参。常量折叠和执行共用已选调用，实际数据错误沿原需用位置报告。 [ADR-0250](../../adr/ADR-0250-standard-numeric-operator-semantics.md)
+
 | 遗留面 | 当前入口与实际计算 | 迁移方 |
 | --- | --- | --- |
-| 二元算术 | SQL `analyzer/resolve_expr.rs::analyze_binary_op`，`type-contract/src/arithmetic.rs` 推导，`functions/src/arithmetic/` 的已选 recipe 计算 | TRC-6a |
-| 比较与 IS [NOT] DISTINCT FROM | SQL `analyze_binary_op`、`analyze_predicated`，类型契约的 `comparison_coercion.rs`，Functions 的 `comparison/` | TRC-6a。保留比较原方向与用户呈现 |
-| 一元正号 | SQL `signed_unary_plus_identity` 只接纳有符号物理整数，已接纳时直接保留原表达式。Trino 484 的数值正号范围更广 | TRC-6a |
+| 宽数二元算术 | `resolve_expr.rs::analyze_binary_op` 根据原完整声明把 LARGEINT 和已准入宽数送入遗留分支。LARGEINT 与 DECIMAL 加减可能保留 Decimal256 结果。走 `ExprKind::Binary`、wire 字段 9 和原宽数 recipe。混合 DECIMAL 沿原 `DecimalOverflowPolicy`，LARGEINT 沿原签名。由 `decimal_largeint_add_sub` 和对应 Rust/Codec 用例保护 | TRC-6b 收回宽数准入并核对转换和其他消费者后清理 |
+| MV 内部撤回计数 | `planner/imv_rewrite/aggregate_rewrite.rs` 的 `RetractionCount` 对已有状态加本批增量。CASE 先处理旧行缺席，已有状态走原 Binary 加法、`AllowThrowException` 参数和原算术 recipe | MV 状态合并定型迁移时核对存量状态和溢出契约 |
+| 宽数及集合比较 | `resolve_expr.rs::analyze_comparison_predicate` 按原递归类型选择路径。保留的宽数即使收敛成 DOUBLE，仍沿原 Binary 比较。集合继续消费原内部能力及准确拒绝。JOIN USING 的已准入宽数跟随原比较 | TRC-6b 核对宽数退出。集合能力沿原作者演进 |
+| 字符串或布尔与数值的显式比较 | `resolve_expr.rs::analyze_comparison_predicate` 识别原混合输入，用 `comparison_common_value_type` 冻结原数值转换及 Binary 比较。比如 `VARCHAR '10' > 5` 保留原数值结果。JOIN USING 和简单 CASE 仍使用各自的原公共类型作者 | TRC-6b 收敛混合域准入和比较转换 |
+| 子查询成员比较 | `subquery_rewrite.rs` 保管原 `IN`、`NOT IN` 的值相等、相关资格和虑及 NULL 的角色。保留的 Binary 与冻结键消费原成员关系。由 `join_non_finite_float_key_null_semantics`、`join_null_aware_anti` 和关联回归保护 | 后续成员语义裁决及其独立验收 |
 | NOT、LIKE、IN、BETWEEN | SQL `analyze_expr_impl` 与 `analyze_predicated`，表达式层的 `evaluator/guarded.rs`、`evaluator/utf8_inlist.rs` 与既有 Functions recipe | 相应语义改动迁入。BETWEEN 的迁移引入单次求值绑定 |
-| IS [NOT] TRUE/FALSE | SQL `analyze_predicated` 仍产出 `IsTruthValue`，契约、编解码和求值都保管该构造 | UEA-5E B8c 退役原产出后清理 |
-| CAST 和 TRY_CAST | SQL `analyze_expr_impl`、`analyzer/value_conversion.rs`、表达式 cast 节点与 `functions/src/cast.rs`。标量 TRY_CAST 的 `safe` 仍用遗留规则 | TRC-6b |
-| 简单 CASE | SQL `analyze_case` 的比较公共类型，`contract_lowering/scalar_emission.rs` 的旧分支转换，表达式层 CASE 控制域 | 随比较迁移 |
+| IS [NOT] TRUE/FALSE | SQL `analyze_predicated` 以已绑定 Identical 及原 NOT 表达 TRUE/FALSE 测试，UNKNOWN 走原 IsNull。契约、编解码和求值仍保留 `IsTruthValue` 的存量入口 | UEA-5E B8c 退役原产出后清理 |
+| 内部值转换 | SQL `analyzer/value_conversion.rs` 和 Functions 的存量值域转换仍有内部调用。公开 CAST、TRY_CAST 和 TRY 的语境及错误合同见 [ADR-0252](../../adr/ADR-0252-trino-casts-and-row-error-scopes.md) | 按原消费者收口 |
+| 简单 CASE | SQL `analyze_case` 保留当前共同类型。在宽数转换前选择匹配方式，表达式单元冻结该选择。CASE 仍只求值一次主表达式并按剩余行求值标签。宽数保留原比较 | TRC-6b 涉及宽数准入时复验 |
 | 时间值、精度与运算 | SQL `resolve_expr.rs` 中的`date_trunc` 与间隔专用定型，Functions 对应时间/日期 owner | TRC-6c 先统一时间类型与运算，按名特设随函数迁移 |
 | 聚合、窗口与 MV 状态 | SQL `analyzer/functions.rs` 与 `resolve_expr.rs` 的特设参数、类型和校验，`planning/mv.rs` 另有窗口判断名单。关系调用沿原函数 owner 的 ABI | TRC-6d 收敛重复定型和窗口名单，保留独立关系调用生命周期 |
 
@@ -23,7 +27,7 @@
 [共享迁移判定](../../../novarocks/expression/src/typing/route.rs) 列出具名函数和可达别名。迁移整个函数时同步 SQL 与文本入口的归属。
 
 - **结构与语法特设，由 TRC-6d 迁移。** `resolve_expr.rs` 保有 `strpos`、`normalize`、`element_at` 及其数组和 MAP 内部名称、`typeof`、`array_length`、`cardinality`、`array_sortby`、`concat`、`array_generate`、`array_flatten`、`if`、`variant_get` 及别名、`named_struct`、`array_concat`，以及 FIELD 的参数规范化和公开名称 `negative` 的原拒绝。
-- **字符串预转换，由 TRC-6d 迁移。** SQL 的 `apply_implicit_string_function_casts` 保有拼接、TRIM、长度与大小写、正则、替换、拆分、子串等具名规则，实际实现由 Functions 对应 owner 执行。
+- **字符串函数签名，由 TRC-6d 迁移。** Functions 保管原有具名签名和实现，包含长度、大小写、正则、替换、拆分和子串的结果声明。
 - **按名校验，由 TRC-6d 迁移。** `analyzer/functions.rs::validate_scalar_function_call_impl` 保有 MAP 键、数组约束、固定参数个数及 MV 状态辅助函数规则。
 - **高阶函数与 lambda。** `resolve_expr.rs` 的按名改写、SQL lambda scope、Functions 的动态重载与现有 ABI 共同承接数组及 MAP 的高阶调用。UEA-5E B7 或 TRC-6d 的首个新增高阶能力 PR 冻结两段式 lambda 接口。
 - **ROW 安装缺口。** Parser 映射 `ROW`，元数据声明 `builtin.scalar/row/dynamic-v1`。原生封存仍缺准确实现，UEA-5E B7 承接。
@@ -34,11 +38,9 @@
 | --- | --- |
 | 规划与改写决定 | `optimizer/scalar/` 的重新绑定、`analyzer/subquery_rewrite.rs`、`analyzer/resolve_from.rs` 的 USING、IMV 改写与谓词下推重建 CAST。相应改动迁移本构造，并保留实际列与关系语义 |
 | 降级重算 | `contract_lowering/scalar_nullability.rs`、`compiler/selected_scalar_call.rs` 的转换选择和 `canonical_null_target` 承接旧构造。各构造迁移后移除其语义重算，真实物理 NULL 传播继续由原单元事务维护 |
-| 共享旧结构 | Functions recipe、契约中的旧运算符枚举以及 `DecimalOverflowToDouble` 和 `AllowThrowException`。最后一个构造的迁移负责前两项，语义开关由 TRC 收敛 |
+| 共享旧结构 | Binary、IN、BETWEEN 和各自的原 Functions recipe 仍有生产消费者。CAST 及需此设置的存量算术继续签发 `AllowThrowException`，混合宽数和 CAST 保留原 `DecimalOverflowPolicy`。 `decimal_overflow_to_double` 随 TRC-6a 退役 |
 
 ## 已知差异与缺陷
 
-- 二元运算在用户可见 EXPLAIN 的通用表现可能丢失括号。相应构造迁移时收敛，取负的专用渲染已接入按身份的路径。
-- LARGEINT 减法的回绕位于 `functions/src/arithmetic/largeint.rs`，由 TRC-6a 承接。
+- LARGEINT 减法沿 `functions/src/arithmetic/largeint.rs` 保留现有行为，随 TRC-6b 的准入和遗留覆盖审查。
 - SQL 的 `analyzer/helpers.rs` 与 `analyzer/resolve_from.rs` 仍有直接从 AST 常量取负的路径，最小 i64 的受检语义需由原消费方修复。
-- NovaRocks 在分析期对裸 `-NULL` 返回 `TYPE_MISMATCH`。Trino 484 返回 `AMBIGUOUS_FUNCTION_CALL`，两侧都要求给出明确的数值类型。错误映射差异由 TRC 核对。

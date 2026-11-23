@@ -1579,6 +1579,26 @@ pub(crate) fn build_table_metadata(
         &metadata.uuid().to_string(),
         projected_snapshot,
     )?;
+    let read_projection = if payload.metadata_table_type.is_none()
+        && crate::schema_mapping::typed_value::contains_plain_fixed(
+            definition_schema.as_struct().fields(),
+            &nominal_document.nominals,
+            creation,
+        )? {
+        Some(crate::schema_mapping::catalog_value::table_read_projection(
+            &nominal_document,
+            &definition_schema,
+            &payload.metadata_columns,
+            mutation_metadata.as_ref(),
+            creation,
+        )?)
+    } else {
+        None
+    };
+    let (execution_schema, original_schema) = match read_projection {
+        Some(read) => (read, Some(execution_schema)),
+        None => (execution_schema, None),
+    };
     let observed_source = creation.arc(
         crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts {
             access: Arc::new(crate::loaded_table::IcebergAttemptTableAccess::freeze(loaded.clone())),
@@ -1595,7 +1615,7 @@ pub(crate) fn build_table_metadata(
             observed_source,
             creation,
         )?;
-    ConnectorTableMetadata::try_new_typed_with_format_projection(
+    ConnectorTableMetadata::try_new_with_read_projection(
         novarocks_spi::connector::ConnectorTableMetadataHeader {
             identity: ConnectorTableIdentity {
                 instance_id: descriptor.instance_id.clone(),
@@ -1619,6 +1639,7 @@ pub(crate) fn build_table_metadata(
         },
         schema,
         execution_schema,
+        original_schema.as_ref(),
         creation,
         |ordinal, source, binding, creation| {
             let declaration = if let Some(columns) = &metadata_columns {
@@ -3125,6 +3146,105 @@ mod plan_splits_pruning_tests {
         fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
             None
         }
+    }
+
+    #[test]
+    fn catalog_metadata_composes_fixed_and_temporal_projections_in_one_row() {
+        use crate::iceberg::spec::StructType;
+        use arrow::datatypes::DataType;
+        use novarocks_type_contract::{TemporalPrecision, TemporalType, ValueKind};
+
+        let (_executor, _warehouse, provider) = provider();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "payload",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::required(
+                        2,
+                        "raw",
+                        Type::Primitive(PrimitiveType::Fixed(4)),
+                    )),
+                    Arc::new(NestedField::optional(
+                        3,
+                        "instant",
+                        Type::Primitive(PrimitiveType::Timestamptz),
+                    )),
+                ])),
+            ))])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///catalog-projection".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let resources = provider.runtime.resources();
+        let io = crate::fs_io::build_file_io_for_location(
+            metadata.location(),
+            resources.planning_binding().clone(),
+        );
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .metadata(Arc::new(metadata))
+            .file_io(io)
+            .runtime(resources.catalog_runtime().iceberg_runtime().clone())
+            .build()
+            .unwrap();
+        let context = context();
+        let published = with_pure_schema_creation(&context, |creation| {
+            build_table_metadata(
+                TableMetadataBuildInput {
+                    descriptor: &provider.descriptor,
+                    incarnation: provider.incarnation,
+                    request: ConnectorTableRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: provider.descriptor.instance_id.clone(),
+                            namespace: Arc::from("db"),
+                            table: Arc::from("t"),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: context.clone(),
+                    },
+                    loaded: crate::loaded_table::IcebergPhysicalTable::new(table),
+                    table_name: "t".to_string(),
+                    metadata_table_type: None,
+                    snapshots: crate::catalog::SnapshotLoading::All,
+                    projection: TableMetadataProjection::Current,
+                },
+                creation,
+            )
+            .map_err(metadata_creation_error)
+        })
+        .unwrap();
+
+        let input = published.planning_facts.column_facts()[0]
+            .write_input()
+            .unwrap();
+        let DataType::Struct(storage) = input.storage_type().unwrap().data_type() else {
+            panic!("expected complete writer storage row");
+        };
+        assert_eq!(storage[0].data_type(), &DataType::FixedSizeBinary(4));
+
+        let binding = published.execution_schema().binding(0).unwrap();
+        let ValueKind::Struct(fields) = binding.value_type().kind() else {
+            panic!("expected projected read row");
+        };
+        assert_eq!(fields[0].value_type().kind(), &ValueKind::Binary);
+        assert!(!fields[0].value_type().nullable());
+        assert_eq!(
+            fields[1].value_type().temporal(),
+            Some(TemporalType::TimestampWithTimeZone(
+                TemporalPrecision::MICROSECONDS,
+            ))
+        );
     }
 
     #[test]

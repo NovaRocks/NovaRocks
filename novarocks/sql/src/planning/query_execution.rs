@@ -208,23 +208,6 @@ pub fn pinned_file_set_resolved_analyzer_table(
     )
 }
 
-/// Build the query-local analyzer table for one distributed
-/// `ALTER TABLE ... EXECUTE` procedure read.  SQL receives the same token,
-/// static identity, and Arrow schema as any synthetic source; the frozen group
-/// itself never enters SQL.
-pub fn table_execute_resolved_analyzer_table(
-    identity: &FrozenConnectorScanIdentity,
-    columns: Vec<novarocks_types::schema::ColumnDef>,
-    binding: SqlTableBindingId,
-) -> ResolvedAnalyzerTable {
-    synthetic_resolved_analyzer_table_from_columns(
-        identity,
-        columns,
-        binding,
-        crate::planner::table::SqlScanKind::TableExecute,
-    )
-}
-
 fn synthetic_resolved_analyzer_table(
     identity: &FrozenConnectorScanIdentity,
     input_schema: SchemaRef,
@@ -315,22 +298,6 @@ pub fn build_pinned_file_set_scan_plan(
         input_columns,
         binding,
         crate::planner::table::SqlScanKind::PinnedFileSet,
-    )
-}
-
-/// Construct the synthetic scan carrier for one distributed
-/// `ALTER TABLE ... EXECUTE` procedure read.  The physical tree stays opaque
-/// outside SQL.
-pub fn build_table_execute_scan_plan(
-    identity: &FrozenConnectorScanIdentity,
-    input_columns: &[novarocks_types::schema::ColumnDef],
-    binding: SqlTableBindingId,
-) -> Result<FrozenConnectorScanPlan, String> {
-    build_synthetic_scan_plan_from_columns(
-        identity,
-        input_columns,
-        binding,
-        crate::planner::table::SqlScanKind::TableExecute,
     )
 }
 
@@ -465,21 +432,6 @@ pub fn matches_pinned_file_set_scan(
         binding,
         identity,
         &crate::planner::table::SqlScanKind::PinnedFileSet,
-    )
-}
-
-/// Compare a sealed/read-only scan projection with the exact application
-/// binding that admitted a table-execute procedure read.
-pub fn matches_table_execute_scan(
-    scan: &PlanScanNode,
-    binding: SqlTableBindingId,
-    identity: &FrozenConnectorScanIdentity,
-) -> bool {
-    matches_synthetic_scan(
-        scan,
-        binding,
-        identity,
-        &crate::planner::table::SqlScanKind::TableExecute,
     )
 }
 

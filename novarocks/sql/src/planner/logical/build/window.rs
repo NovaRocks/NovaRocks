@@ -223,6 +223,7 @@ fn has_window_call(expr: &TypedExpr) -> bool {
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             operand.as_deref().is_some_and(has_window_call)
                 || when_then
@@ -450,8 +451,12 @@ fn rewrite_window_calls(
             distinct,
             order_by,
             resolved,
+            occurrence,
+            filter,
         } => TypedExpr {
             kind: ExprKind::AggregateCall {
+                occurrence: occurrence.clone(),
+                filter: filter.clone(),
                 name: name.clone(),
                 args: args
                     .iter()
@@ -479,13 +484,13 @@ fn rewrite_window_calls(
             value_type: expr.value_type.clone(),
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
         } => TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: *array_failure_mode,
+                cast_mode: *cast_mode,
                 expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
@@ -594,11 +599,13 @@ fn rewrite_window_calls(
             value_type: expr.value_type.clone(),
         },
         ExprKind::Case {
+            ieee_float_equality,
             operand,
             when_then,
             else_expr,
         } => TypedExpr {
             kind: ExprKind::Case {
+                ieee_float_equality: *ieee_float_equality,
                 operand: operand.as_ref().map(|inner| {
                     novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                         inner,

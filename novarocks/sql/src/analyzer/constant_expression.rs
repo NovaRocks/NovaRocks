@@ -27,7 +27,9 @@ use arrow::datatypes::DataType;
 use novarocks_functions::FunctionVolatility;
 use novarocks_parser::ast::Visit;
 use novarocks_parser::{Span, ast};
-use novarocks_type_contract::{CompilePhase, FunctionValueType, PureCompileControl, ValueKind};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, ValueKind,
+};
 
 use crate::compiler::{
     PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
@@ -183,10 +185,10 @@ pub(crate) fn prepare(
         }
     };
     validate_scalar(&expression, span, control)?;
-    validate_implicit_target(&expression.value_type, target, span)?;
     // The target admits NULL until the application checks the actual result.
     // This does not erase a possible NULL produced by an ordinary CAST.
     let result_type = required_target_value_type(&expression.value_type, target, control)?;
+    validate_implicit_target(&expression.value_type, &result_type, target, span, control)?;
     let expression = super::value_conversion::cast_to_value_type(
         expression,
         result_type,
@@ -335,14 +337,17 @@ fn reject_subqueries(
 
 fn validate_implicit_target(
     source: &FunctionValueType,
+    result: &FunctionValueType,
     target: RequiredConstantTarget,
     span: Span,
+    control: &dyn PureCompileControl,
 ) -> Result<(), AnalyzeError> {
-    use DataType::*;
     if target == RequiredConstantTarget::TimeZone {
         let ty = source.value_type();
-        if matches!(ty.kind(), ValueKind::String)
-            || matches!(ty.temporal(), Some(novarocks_type_contract::TemporalType::Interval(qualifier)) if !qualifier.is_year_month())
+        if matches!(
+            ty.kind(),
+            ValueKind::String | ValueKind::BoundedCharacter(_)
+        ) || matches!(ty.temporal(), Some(novarocks_type_contract::TemporalType::Interval(qualifier)) if !qualifier.is_year_month())
         {
             return Ok(());
         }
@@ -356,42 +361,23 @@ fn validate_implicit_target(
     let allowed = if target == RequiredConstantTarget::Timestamp {
         source.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
             && match source.value_type().kind() {
-                ValueKind::Scalar(ty @ Timestamp(..)) => source.data_type() == ty,
-                ValueKind::Scalar(Null) => source.nullable() && source.data_type() == &Null,
+                ValueKind::Scalar(ty @ DataType::Timestamp(..)) => source.data_type() == ty,
+                ValueKind::Scalar(DataType::Null) => {
+                    source.nullable() && source.data_type() == &DataType::Null
+                }
                 _ => false,
             }
-    } else if target == RequiredConstantTarget::ArrayVarchar {
-        match source.value_type().kind() {
-            ValueKind::Scalar(Null) => source.nullable(),
-            ValueKind::List(child) => match child.kind() {
-                ValueKind::String => true,
-                ValueKind::Scalar(Null) => child.nullable(),
-                _ => false,
-            },
-            _ => false,
-        }
     } else {
-        match source.value_type().kind() {
-            ValueKind::String => target == RequiredConstantTarget::Varchar,
-            ValueKind::Scalar(data_type) => match data_type {
-                Null => true,
-                Boolean => target == RequiredConstantTarget::Boolean,
-                Int8 | Int16 | Int32 => matches!(
-                    target,
-                    RequiredConstantTarget::Integer
-                        | RequiredConstantTarget::Bigint
-                        | RequiredConstantTarget::Double
-                ),
-                Int64 => matches!(
-                    target,
-                    RequiredConstantTarget::Bigint | RequiredConstantTarget::Double
-                ),
-                Float32 | Float64 | Decimal32(..) | Decimal64(..) | Decimal128(..)
-                | Decimal256(..) => target == RequiredConstantTarget::Double,
-                _ => false,
-            },
-            _ => false,
-        }
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+            .map_err(AnalyzeError::control)?;
+        let allowed = novarocks_type_contract::trino_can_coerce(
+            source.value_type(),
+            result.value_type(),
+            &mut work,
+        )
+        .map_err(AnalyzeError::control)?;
+        work.finish().map_err(AnalyzeError::control)?;
+        allowed
     };
     if allowed {
         Ok(())
@@ -444,25 +430,10 @@ fn required_target_value_type(
                     .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
                     .map_err(AnalyzeError::control);
             }
-            let unknown = matches!(source.value_type().kind(), ValueKind::Scalar(DataType::Null) if source.nullable())
-                || matches!(source.value_type().kind(), ValueKind::List(child) if child.nullable() && matches!(child.kind(), ValueKind::Scalar(DataType::Null)));
-            if !unknown {
-                return Err(AnalyzeError::internal(
-                    "required ArrayVarchar declaration received an unadmitted source",
-                ));
-            }
-            let unknown_source = match source.value_type().kind() {
-                ValueKind::Scalar(DataType::Null) => source.nullable(),
-                ValueKind::List(child) => {
-                    child.nullable() && matches!(child.kind(), ValueKind::Scalar(DataType::Null))
-                }
-                _ => false,
+            let child_nullable = match source.value_type().kind() {
+                ValueKind::List(child) => child.nullable(),
+                _ => true,
             };
-            if !unknown_source {
-                return Err(AnalyzeError::internal(
-                    "required ArrayVarchar declaration lacks its validated UNKNOWN source",
-                ));
-            }
             // These are pure declaration-construction observations, not a
             // runtime storage grant. Exact/opaque events still check control.
             let mut observe = |request| {
@@ -480,7 +451,7 @@ fn required_target_value_type(
             let storage = ValueTypeStorageLifetime::pure();
             let child = FunctionValueType::try_with_logical_type_with_construction(
                 DataType::Utf8,
-                true,
+                child_nullable,
                 ValueLogicalType::Physical,
                 storage.clone(),
                 Some(&mut observe),
@@ -602,6 +573,7 @@ fn validate_scalar(
                 operand,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(expr) = else_expr {
                     pending.push(expr);

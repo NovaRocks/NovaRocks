@@ -117,7 +117,10 @@ impl CollectionProjection<'_> {
         let expression_lookup = e.lookup_work_upper_bound()?;
         let mut nested_exprs = 0;
         for call in calls {
-            let nested = add(call.arguments.len(), call.order_by.len())?;
+            let nested = add(
+                add(call.arguments.len(), call.order_by.len())?,
+                usize::from(call.filter_root.is_some()),
+            )?;
             model.items = add(model.items, nested)?;
             known = add(
                 known,
@@ -171,7 +174,10 @@ impl CollectionProjection<'_> {
         let expression_lookup = e.lookup_work_upper_bound()?;
         let mut nested_exprs = 0;
         for call in calls {
-            let nested = add(call.argument_roots.len(), call.order_by.len())?;
+            let nested = add(
+                add(call.argument_roots.len(), call.order_by.len())?,
+                usize::from(call.filter_root.is_some()),
+            )?;
             model.items = add(model.items, nested)?;
             known = add(
                 known,
@@ -321,6 +327,10 @@ pub(crate) fn encode_collection_references(
             encoded_expr(sort.expr.get(), e, w)?;
             w.step()?;
         }
+        if let Some(filter) = call.filter_root {
+            encoded_expr(filter.get(), e, w)?;
+            w.step()?;
+        }
         reference(call.output.get(), values, w)?;
         w.step()?;
     }
@@ -352,6 +362,10 @@ pub(crate) fn decode_collection_references(
                 properties::decode_nulls(sort.null_ordering).map_err(Error::from),
                 w,
             )?;
+            w.step()?;
+        }
+        if let Some(filter) = call.filter_root {
+            decoded_expr(filter, e, w)?;
             w.step()?;
         }
         reference(required(call.output_value_id, w)?, e.values(), w)?;
@@ -387,6 +401,7 @@ pub(crate) fn encode_collections(
             id: call.id.get(),
             aggregate_binding_id: Some(id),
             argument_roots: args,
+            filter_root: call.filter_root.map(|root| root.get()),
             distinct: call.distinct,
             order_by: encode_sorts(&call.order_by, w)?,
             output_value_id: Some(call.output.get()),
@@ -431,6 +446,9 @@ pub(crate) fn decode_collections(
             id: p::AggregateCallId::new(call.id),
             binding,
             arguments: boxed(args, w)?,
+            filter_root: call
+                .filter_root
+                .map(novarocks_expression_contract::RootOrdinal::new),
             distinct: call.distinct,
             order_by: decode_sorts(&call.order_by, w)?,
             output: p::ValueId::new(required(call.output_value_id, w)?),

@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0251
+    scope: "RefUnchanged for OPTIMIZE and main-branch TRUNCATE, and the retired distributed DV rewrite commit path"
+    link: "ADR-0251-iceberg-maintenance-commits-by-operation.md"
   - id: ADR-0246
     scope: "Section 1 ADD FILES dependency on the exact main reference"
     link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"

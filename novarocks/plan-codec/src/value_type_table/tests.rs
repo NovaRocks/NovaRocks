@@ -188,6 +188,38 @@ fn scalar(kind: wire::ScalarKind) -> Kind {
 }
 
 #[test]
+fn bounded_character_logical_types_keep_width_under_recursive_declarations() {
+    use novarocks_type_contract::{CharacterKind, CharacterType};
+
+    for (kind, length) in [(CharacterKind::Char, 0), (CharacterKind::Varchar, 65_537)] {
+        let item = value(
+            ValueKind::BoundedCharacter(CharacterType::new(kind, length).unwrap()),
+            true,
+        );
+        let root = value(ValueKind::List(item), false);
+        let definitions = encode(
+            &[LogicalTypeRoot {
+                id: 0,
+                value: &root,
+            }],
+            &Control::good(),
+            &mut allow,
+        )
+        .unwrap();
+        let decoded = decode(
+            &definitions,
+            ValueTypeStorageLifetime::pure(),
+            &Control::good(),
+            &mut allow,
+        )
+        .unwrap();
+        let control = Control::good();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        assert_eq!(decoded.get_observed(0, &mut work).unwrap(), Some(&root));
+    }
+}
+
+#[test]
 fn recursive_domains_named_order_and_sparse_zero_root_ids_round_trip() {
     let root = fixture();
     let other = value(ValueKind::String, false);
@@ -374,6 +406,20 @@ fn every_definition_is_checked_even_when_it_has_no_referenced_root() {
         ],
     ];
     for malformed in [
+        wire::ScalarValue {
+            kind: wire::ScalarKind::Char as i32,
+            ..Default::default()
+        },
+        wire::ScalarValue {
+            kind: wire::ScalarKind::Char as i32,
+            character_length: Some(65_537),
+            ..Default::default()
+        },
+        wire::ScalarValue {
+            kind: wire::ScalarKind::String as i32,
+            character_length: Some(0),
+            ..Default::default()
+        },
         wire::ScalarValue {
             kind: wire::ScalarKind::String as i32,
             precision: Some(1),

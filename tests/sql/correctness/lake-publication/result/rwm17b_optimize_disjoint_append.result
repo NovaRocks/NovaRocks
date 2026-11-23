@@ -1,0 +1,14 @@
+-- query 3
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 4
+-- types	bigint	bigint	varchar
+id	value	p
+1	10	seed
+2	20	seed
+3	30	seed
+4	40	outside

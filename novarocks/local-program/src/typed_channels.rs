@@ -561,6 +561,26 @@ impl ChannelValidation<'_> {
                             }
                         };
                         let contract = self.aggregate(site)?;
+                        if let Some(reference) = source.filter_root {
+                            use novarocks_expression_contract::RootScope;
+                            use novarocks_type_contract::EvaluationDemand;
+                            let Some(unit) = self.units.get(reference.unit.index()) else {
+                                return Err(ProgramChannelTypeError::WrongShape);
+                            };
+                            let Some(root) = unit.root(reference.root) else {
+                                return Err(ProgramChannelTypeError::WrongShape);
+                            };
+                            if grouped
+                                || !contract.phase().consumes_logical_arguments()
+                                || root.scope != RootScope::Port(0)
+                                || root.demand != EvaluationDemand::TruthOnly
+                                || unit.input(root.use_id).is_none()
+                                || self.definition(reference)?.data_type()
+                                    != &arrow_schema::DataType::Boolean
+                            {
+                                return Err(ProgramChannelTypeError::WrongShape);
+                            }
+                        }
                         if contract.phase().consumes_logical_arguments() {
                             let expected = contract
                                 .logical_argument_types()

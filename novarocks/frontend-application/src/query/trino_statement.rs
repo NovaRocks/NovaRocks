@@ -3,7 +3,7 @@
 //! Temporary typed statement entrance for Trino compatibility tests.
 
 use super::*;
-use crate::query_execution::dml::truncate::TruncateCommand;
+use crate::query_execution::dml::truncate::{TruncateCommand, TruncateTarget};
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
     session::{QuerySessionStatement, StatementAdmission, StatementOutputShape},
@@ -388,18 +388,7 @@ fn preparation_plan(
         }
         Prep::Update(_) => CommandPlan::write(Update, true),
         Prep::Merge(_) => CommandPlan::write(Merge, true),
-        Prep::Call(node) => {
-            let mut plan = CommandPlan::management(Call, UndeterminedCall, true);
-            if matches!(node.name.parts.as_slice(), [_, namespace, procedure]
-                if namespace.value.eq_ignore_ascii_case("system")
-                    && (procedure.value.eq_ignore_ascii_case("rewrite_data_files")
-                        || procedure.value.eq_ignore_ascii_case("rewrite_position_delete_files")))
-            {
-                plan.work_class = WorkClass::Query;
-                plan.window_class = ResultWindowClass::Internal;
-            }
-            plan
-        }
+        Prep::Call(_) => CommandPlan::management(Call, UndeterminedCall, true),
         Prep::CreateView(_) => management(CreateView),
         Prep::DropView(_) => management(DropView),
         Prep::ShowCreateView(_) => CommandPlan::management(ShowCreateView, ResultSet, false),
@@ -495,12 +484,15 @@ impl FrontendQuerySession {
                         .map_err(product_command_service_error);
                     return self.run_trino_action(statement, action).await;
                 }
-                CatalogSqlCommand::TruncateTable { table, target_ref } => {
+                CatalogSqlCommand::TruncateTable {
+                    table,
+                    target_ref: _,
+                } => {
                     return self
                         .execute_trino_truncate(
                             TruncateCommand {
                                 target_parts: table.parts,
-                                target_ref,
+                                target: TruncateTarget::Main,
                             },
                             None,
                             CommandEntry { statement, input },
@@ -515,20 +507,6 @@ impl FrontendQuerySession {
                     .map_err(product_command_service_error);
                 return self.run_trino_action(statement, action).await;
             }
-            ProductSqlCommand::Maintenance(command)
-                if crate::query_execution::maintenance::command::is_async_metadata_command(
-                    &command,
-                    input.request.session().current_catalog(),
-                    input.request.session().current_database(),
-                )
-                .unwrap_or(false) =>
-            {
-                let action = router
-                    .prepare_maintenance_statement_action(command, input.request, input.command)
-                    .map_err(product_command_service_error);
-                return self.run_trino_action(statement, action).await;
-            }
-            command => command,
         };
         let execution_owner = statement
             .take_execution_owner()
@@ -578,6 +556,7 @@ impl FrontendQuerySession {
         let execution_owner = statement
             .take_execution_owner()
             .expect("SQL command has one execution owner");
+        let main_truncate = matches!(&command.target, TruncateTarget::Main);
         let dml = Arc::clone(&self.service.dml);
         let engine = Arc::clone(&self.service.truncate_engine);
         let prepare_dml = Arc::clone(&dml);
@@ -598,9 +577,13 @@ impl FrontendQuerySession {
                     .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
             },
             move |prepared| {
-                dml.execute_prepared_truncate(engine.as_ref(), prepared)
-                    .map(|()| StatementResult::Ok)
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                let result = dml.execute_prepared_truncate(engine.as_ref(), prepared);
+                if main_truncate {
+                    dml_result(result)
+                } else {
+                    result.map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                }
+                .map(|()| StatementResult::Ok)
             },
         )) as TypedCommandWorker;
         self.finish_command_worker_with_unknown_count(
@@ -729,14 +712,32 @@ impl FrontendQuerySession {
                 return self.run_trino_action(statement, action).await;
             }
             Prep::RenameTable(node) => table::lower_trino_rename_table(&source, &node).map(catalog),
-            Prep::AddColumn(node) => table::lower_trino_add_column(&source, &node).map(catalog),
+            Prep::AddColumn(node) => table::lower_trino_add_column(
+                &source,
+                &node,
+                &novarocks_sql::compiler::SqlCompileControl::new(
+                    input.deadline,
+                    crate::query_execution::planning::sql_cancellation_observation(
+                        input.cancellation.clone(),
+                    ),
+                ),
+            )
+            .map(catalog),
             Prep::RenameColumn(node) => {
                 table::lower_trino_rename_column(&source, &node).map(catalog)
             }
             Prep::DropColumn(node) => table::lower_trino_drop_column(&source, &node).map(catalog),
-            Prep::SetColumnType(node) => {
-                table::lower_trino_set_column_type(&source, &node).map(catalog)
-            }
+            Prep::SetColumnType(node) => table::lower_trino_set_column_type(
+                &source,
+                &node,
+                &novarocks_sql::compiler::SqlCompileControl::new(
+                    input.deadline,
+                    crate::query_execution::planning::sql_cancellation_observation(
+                        input.cancellation.clone(),
+                    ),
+                ),
+            )
+            .map(catalog),
             Prep::DropNotNullConstraint(node) => {
                 table::lower_trino_drop_not_null(&source, &node).map(catalog)
             }
@@ -811,7 +812,7 @@ impl FrontendQuerySession {
                     .execute_trino_truncate(
                         TruncateCommand {
                             target_parts: table.parts,
-                            target_ref: branch,
+                            target: TruncateTarget::WholeBranch(branch),
                         },
                         Some(projection),
                         CommandEntry { statement, input },
@@ -1145,6 +1146,12 @@ impl FrontendQuerySession {
             mut statement,
             input,
         } = entry;
+        if !crate::mv::command::MvCommandExecutor::owns_typed_call(&syntax.name) {
+            let error = novarocks_query_application::sql::trino_admission::procedure_not_registered(
+                &syntax.name,
+            );
+            return Ok(self.governed_typed_error(error, statement));
+        }
         let command = match PreparedMaintenanceCall::from_trino(&syntax) {
             Ok(call) => Arc::new(call),
             Err(error) => {
@@ -1153,49 +1160,23 @@ impl FrontendQuerySession {
                 );
             }
         };
-        if let Ok(candidate) = command.maintenance_command()
-            && crate::query_execution::maintenance::command::is_async_metadata_command(
-                &candidate,
-                input.request.session().current_catalog(),
-                input.request.session().current_database(),
-            )
-            .unwrap_or(false)
-        {
-            return self
-                .execute_trino_product(
-                    ProductSqlCommand::Maintenance(candidate),
-                    CommandEntry { statement, input },
-                )
-                .await;
-        }
-
         let execution_owner = statement
             .take_execution_owner()
             .expect("one original CALL owner");
         let specialized = self.service.command_executor.clone();
-        let router = self.service.product_command_router.clone();
         let mut worker = Box::pin(async move {
             let result = specialized
-                .execute_maintenance_call(command.clone(), &input.request, &input.command)
+                .execute_maintenance_call(command, &input.request, &input.command)
                 .await
-                .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
-            match result {
-                Ok(Some(output)) => Ok((Ok(output), execution_owner)),
-                Err(error) => Ok((Err(error), execution_owner)),
-                Ok(None) => match command.maintenance_command() {
-                    Ok(command) => {
-                        execute_product_statement(
-                            router,
-                            ProductSqlCommand::Maintenance(command),
-                            input.request,
-                            input.command,
-                            execution_owner,
+                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                .and_then(|output| {
+                    output.ok_or_else(|| {
+                        RoutedExecutionError::Engine(
+                            "Registered CALL procedure did not produce a result".to_string(),
                         )
-                        .await
-                    }
-                    Err(error) => Ok((Err(RoutedExecutionError::Engine(error)), execution_owner)),
-                },
-            }
+                    })
+                });
+            Ok((result, execution_owner))
         }) as TypedCommandWorker;
         self.finish_command_worker(
             statement,
@@ -1562,5 +1543,71 @@ mod branch_delete_tests {
         };
         assert_eq!(table.parts, ["lake", "db", "t"]);
         assert_eq!(branch, "dev");
+    }
+}
+
+#[cfg(test)]
+mod call_routing_tests {
+    use super::*;
+    use crate::mv::command::MvCommandExecutor;
+    use novarocks_query_application::sql::trino_admission::procedure_not_registered;
+
+    fn name(sql: &str) -> ast::ObjectName {
+        let ast::TrinoStatement::Call(call) =
+            novarocks_parser::parser::parse_statement(sql).unwrap()
+        else {
+            panic!("expected CALL");
+        };
+        call.name
+    }
+
+    #[test]
+    fn registered_management_and_development_calls_keep_their_owner() {
+        for procedure in [
+            "novarocks_mv_management_status",
+            "novarocks_mv_resume_management",
+            "novarocks_mv_set_owner",
+        ] {
+            assert!(MvCommandExecutor::owns_typed_call(&name(&format!(
+                "CALL {procedure}()"
+            ))));
+        }
+        for procedure in [
+            "novarocks_mv_document_expiry",
+            "novarocks_imv_stateless_rebuild",
+        ] {
+            assert_eq!(
+                MvCommandExecutor::owns_typed_call(&name(&format!(
+                    "CALL ice.system.{procedure}()"
+                ))),
+                cfg!(novarocks_dev_controls)
+            );
+        }
+    }
+
+    #[test]
+    fn retired_and_unregistered_calls_have_the_same_typed_error() {
+        for procedure in [
+            "rewrite_data_files",
+            "rewrite_position_delete_files",
+            "rewrite_manifests",
+            "expire_snapshots",
+            "remove_orphan_files",
+            "rollback_to_snapshot",
+            "arbitrary_unknown_procedure",
+        ] {
+            let name = name(&format!(
+                "CALL ice.system.{}()",
+                procedure.to_ascii_uppercase()
+            ));
+            assert!(!MvCommandExecutor::owns_typed_call(&name));
+            let error = procedure_not_registered(&name);
+            let user_error = error.user_error().expect("typed user error");
+            assert_eq!(user_error.code().as_str(), "sql.admit.procedure_not_found");
+            assert_eq!(
+                user_error.message(),
+                format!("Procedure not registered: system.{procedure}")
+            );
+        }
     }
 }

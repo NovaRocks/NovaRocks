@@ -17,16 +17,21 @@
 
 -- @order_sensitive=true
 -- @tags=filter,comparison,child_type
--- Test Objective:
--- 1. Validate BINARY_PRED child type coercion from FE plan metadata.
--- 2. Prevent regressions where mixed numeric/bool operands fail without explicit casts.
--- Test Flow:
--- 1. Build scalar predicates with mixed operand types.
--- 2. Rely on FE-inferred comparison child type for coercion.
--- 3. Assert deterministic boolean outputs.
-SELECT
-  abs(1 - 2) = 0 AS abs_eq_zero,
-  true = 1 AS bool_eq_one,
-  false < 1 AS bool_lt_one,
-  cast(1.25 as double) > 1 AS dbl_gt_int,
-  cast(1 as decimal(10,2)) = 1 AS dec_eq_int;
+-- Numeric comparisons use their common Trino input type.
+
+-- query 1
+SELECT abs(1 - 2) = 0 AS abs_eq_zero,
+       CAST(1.25 AS DOUBLE) > 1 AS dbl_gt_int,
+       CAST(1 AS DECIMAL(10,2)) = 1 AS dec_eq_int;
+
+-- query 2
+SELECT CAST(TRUE AS INTEGER) = 1 AS bool_eq_one,
+       CAST(FALSE AS INTEGER) < 1 AS bool_lt_one;
+
+-- query 3
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT TRUE = 1;
+
+-- query 4
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT FALSE < 1;

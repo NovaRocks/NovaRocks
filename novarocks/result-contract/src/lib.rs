@@ -50,6 +50,9 @@ pub use scalar_visit::{BorrowedScalarRecord, ScalarRecordEvent, ScalarVisitError
 mod scalar_record;
 pub use scalar_record::{SCALAR_RECORD_MAX_BYTES, ScalarRecord, ScalarRecordWriter, ScalarValue};
 
+mod character_type;
+pub use character_type::{CharacterKind, CharacterType};
+
 mod render_schema;
 pub use render_schema::{
     ClientPresentationFamily, ClientRenderSchema, NamedRenderField, NativeRenderType,

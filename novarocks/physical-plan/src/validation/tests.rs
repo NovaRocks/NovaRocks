@@ -406,6 +406,7 @@ mod validation_error_tests {
         };
         let mut calls = (1..=4096)
             .map(|id| crate::AggregateCall {
+                filter_root: None,
                 id: crate::AggregateCallId::new(id),
                 binding: binding(crate::AggregateSequenceId::new(id)),
                 arguments: Box::default(),
@@ -415,6 +416,7 @@ mod validation_error_tests {
             })
             .collect::<Vec<_>>();
         calls.push(crate::AggregateCall {
+            filter_root: None,
             id: crate::AggregateCallId::new(4097),
             binding: binding(crate::AggregateSequenceId::new(4096)),
             arguments: Box::default(),

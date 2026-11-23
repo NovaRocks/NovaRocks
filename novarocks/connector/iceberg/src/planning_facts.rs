@@ -23,8 +23,9 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorColumnDefault, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableColumnPlanningFact,
-    ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+    ConnectorInstanceId, ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorRetiredReadField, ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
+    ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
     ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTablePlanningFacts,
     ConnectorTableUniqueConstraint,
 };
@@ -194,6 +195,7 @@ fn table_planning_columns<'a>(
     authority: PlanningAuthority,
     write_inputs: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
 ) -> Result<TablePlanningColumns<'a>, ConnectorError> {
+    let control = input.context.original_operation_control();
     let column_facts = input
         .schema
         .fields()
@@ -213,10 +215,28 @@ fn table_planning_columns<'a>(
             } else {
                 ConnectorTableColumnVisibility::Sql
             };
-            let domain = input
+            let source = input
                 .iceberg_schema
-                .and_then(|schema| schema.as_struct().fields().get(ordinal))
-                .and_then(|source| input.nominal_declarations.get(&source.id));
+                .and_then(|schema| schema.as_struct().fields().get(ordinal));
+            let domain = source.and_then(|source| input.nominal_declarations.get(&source.id));
+            let mut retired_read_fields = Vec::new();
+            if let Some(source) = source
+                && !input.nominal_declarations.is_empty()
+            {
+                crate::schema_mapping::nominal_declaration::visit_retired_read_fields(
+                    source,
+                    input.nominal_declarations,
+                    &mut Vec::new(),
+                    &mut |path, field| {
+                        retired_read_fields.push(ConnectorRetiredReadField {
+                            field_path: path.iter().map(|name| (*name).to_owned()).collect(),
+                            field_id: field.id,
+                            sql_type: "LARGEINT",
+                        });
+                    },
+                    &mut || control.check_active(),
+                )?;
+            }
             let semantic_kind = match domain {
                 Some(crate::schema_mapping::nominal_declaration::NominalSourceDomain::Bitmap) => {
                     ConnectorTableColumnSemanticKind::Bitmap
@@ -274,7 +294,8 @@ fn table_planning_columns<'a>(
                 role,
             )
             .with_write_default(write_default)
-            .with_write_input(write_input))
+            .with_write_input(write_input)
+            .with_retired_read_fields(retired_read_fields))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     let metadata = input.table_metadata;

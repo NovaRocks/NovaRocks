@@ -619,6 +619,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     operand,
                     when_then,
                     else_expr,
+                    ..
                 } => case_child(*operand, when_then, *else_expr, next),
                 _ => return Err(ExprCompileError::UnsupportedExpression(id).into()),
             };
@@ -705,24 +706,11 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                 ExprKind::Cast {
                     expr,
                     target,
-                    decimal_overflow_policy,
-                    allow_throw_exception,
-                    array_failure_mode,
+                    cast_mode,
                 } => {
                     let child = *ids
                         .get(expr)
                         .ok_or(ExprCompileError::Invalid("cast operand was not lowered"))?;
-                    let authored_allow = environment
-                        .parameters
-                        .require(*allow_throw_exception)
-                        .map_err(|_| ExprCompileError::Invalid("missing cast parameter source"))?;
-                    let novarocks_type_contract::SemanticParameterValue::AllowThrowException(allow) =
-                        authored_allow
-                    else {
-                        return Err(
-                            ExprCompileError::Invalid("cast parameter has a foreign key").into(),
-                        );
-                    };
                     if !novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
                         ExprCompileError,
                     >(
@@ -736,24 +724,19 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         );
                     }
                     work.flush()?;
-                    novarocks_functions::PreparedCastRecipe::try_new(
-                        novarocks_functions::CastOperation::Carrier,
+                    novarocks_functions::PreparedCastRecipe::try_new_trino(
                         &source
                             .definition(*expr)
                             .ok_or(ExprCompileError::Invalid("missing cast source"))?
                             .ty,
                         &node.ty,
-                        *decimal_overflow_policy,
-                        *allow,
-                        *array_failure_mode,
+                        *cast_mode,
                         control,
                     )?;
                     StaticExprKind::PreparedCast {
                         operation: novarocks_functions::CastOperation::Carrier,
                         child,
-                        decimal_overflow_policy: *decimal_overflow_policy,
-                        allow_throw_exception: *allow,
-                        array_failure_mode: *array_failure_mode,
+                        cast_mode: *cast_mode,
                     }
                 }
                 ExprKind::Binary {
@@ -984,6 +967,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     }
                 }
                 ExprKind::Case {
+                    ieee_float_equality,
                     operand,
                     when_then,
                     else_expr,
@@ -1000,6 +984,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         work.step()?;
                     }
                     StaticExprKind::Case {
+                        ieee_float_equality: *ieee_float_equality,
                         has_case_expr: operand.is_some(),
                         has_else_expr: else_expr.is_some(),
                         children,
@@ -1569,29 +1554,16 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     ExprKind::Cast {
                         expr,
                         target,
-                        decimal_overflow_policy,
-                        allow_throw_exception,
-                        array_failure_mode,
+                        cast_mode,
                     },
                     StaticExprKind::PreparedCast {
                         operation,
                         child,
-                        decimal_overflow_policy: local_policy,
-                        allow_throw_exception: local_allow,
-                        array_failure_mode: local_array_mode,
+                        cast_mode: local_cast_mode,
                     },
                 ) => {
-                    let source_allow = environment
-                        .parameters
-                        .require(*allow_throw_exception)
-                        .map_err(|_| ExprCompileError::Invalid("cast parameter source differs"))?;
                     if *operation != novarocks_functions::CastOperation::Carrier
-                        || decimal_overflow_policy != local_policy
-                        || array_failure_mode != local_array_mode
-                        || source_allow
-                            != &novarocks_type_contract::SemanticParameterValue::AllowThrowException(
-                                *local_allow,
-                            )
+                        || cast_mode != local_cast_mode
                         || invocation.control != ControlShape::Eager
                         || invocation.arguments.len() != 1
                         || lowered.ids.get(expr) != Some(child)
@@ -1616,16 +1588,13 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         .into());
                     }
                     work.flush()?;
-                    let recipe = novarocks_functions::PreparedCastRecipe::try_new(
-                        *operation,
+                    let recipe = novarocks_functions::PreparedCastRecipe::try_new_trino(
                         &unit
                             .definition(*expr)
                             .ok_or(ExprCompileError::Invalid("missing cast operand source"))?
                             .ty,
                         &source.ty,
-                        *local_policy,
-                        *local_allow,
-                        *local_array_mode,
+                        *local_cast_mode,
                         control,
                     )?;
                     recipe
@@ -1809,11 +1778,13 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                 }
                 (
                     ExprKind::Case {
+                        ieee_float_equality,
                         operand,
                         when_then,
                         else_expr,
                     },
                     StaticExprKind::Case {
+                        ieee_float_equality: compiled_ieee_equality,
                         has_case_expr,
                         has_else_expr,
                         children,
@@ -1829,6 +1800,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     };
                     if invocation.control != expected
                         || *has_case_expr != operand.is_some()
+                        || ieee_float_equality != compiled_ieee_equality
                         || *has_else_expr != else_expr.is_some()
                         || children.len() != count
                         || invocation.arguments.len() != count
@@ -1924,7 +1896,8 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                                 (true, false)
                             }
                             (ControlShape::If, ArgumentControl::If)
-                            | (ControlShape::Coalesce, ArgumentControl::Coalesce) => (false, true),
+                            | (ControlShape::Coalesce, ArgumentControl::Coalesce)
+                            | (ControlShape::Try, ArgumentControl::Try) => (false, true),
                             (
                                 ControlShape::TemporalSource(shape),
                                 ArgumentControl::TemporalSource(kind),

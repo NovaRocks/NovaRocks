@@ -271,8 +271,31 @@ SELECT * FROM default_catalog.default.trc_local_exists_${uuid0};
 USE views_${uuid0};
 
 -- query 77
+CREATE VIEW trc_views_${uuid0}.views_${uuid0}.bounded_characters AS
+SELECT CAST('aaa' AS VARCHAR(6)) AS s, ARRAY[CAST('one' AS VARCHAR(6))] AS items;
+
+-- query 78
+SELECT * FROM trc_views_${uuid0}.views_${uuid0}.bounded_characters;
+
+-- query 79
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+CREATE VIEW trc_views_${uuid0}.views_${uuid0}.rejected_character AS SELECT CAST('aaa' AS CHAR(3)) AS s;
+
+-- query 80
+-- @expect_trino_error=TABLE_NOT_FOUND,USER_ERROR
+SELECT * FROM trc_views_${uuid0}.views_${uuid0}.rejected_character;
+
+-- query 81
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+CREATE OR REPLACE VIEW trc_views_${uuid0}.views_${uuid0}.bounded_characters AS SELECT CAST('aaa' AS CHAR(3)) AS s;
+
+-- query 82
+SELECT * FROM trc_views_${uuid0}.views_${uuid0}.bounded_characters;
+
+-- query 83
 -- @cleanup=true
 -- @skip_result_check=true
+DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.bounded_characters;
 DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.header_view;
 DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.type_bigint;
 DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.type_integer;
@@ -302,7 +325,7 @@ DROP TABLE IF EXISTS trc_views_${uuid0}.caller_${uuid0}.context_source;
 DROP SCHEMA IF EXISTS trc_views_${uuid0}.saved_${uuid0};
 DROP SCHEMA IF EXISTS trc_views_${uuid0}.caller_${uuid0};
 
--- query 78
+-- query 84
 -- @cleanup=true
 -- @skip_result_check=true
 

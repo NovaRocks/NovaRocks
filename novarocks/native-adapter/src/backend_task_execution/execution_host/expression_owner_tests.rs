@@ -496,7 +496,7 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     let events = trace.events.lock().unwrap().clone();
     // One unit scope owns the final Arc, six scopes own the ordered recipe
     // maps, and one independent scope owns the actual IN parameters.
-    let expected_scopes = 1 + 6 + 1;
+    let expected_scopes = 8;
     assert_eq!(trace.scopes.load(Ordering::SeqCst), expected_scopes);
     assert_eq!(
         events.iter().filter(|event| event.kind == "scope").count(),
@@ -541,7 +541,7 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     drop(actual);
     assert!(
         tracker.current() > recipe_charge,
-        "the recipe-family and final Arc owners remain with the late entity"
+        "the recipe map and final Arc owners remain with the late entity"
     );
     drop(late_unit);
     assert_eq!(

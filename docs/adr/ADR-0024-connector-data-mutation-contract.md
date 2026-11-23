@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0251
+    scope: "Fixed-base planning and the no-rebase retry rule for main-branch TRUNCATE"
+    link: "ADR-0251-iceberg-maintenance-commits-by-operation.md"
   - id: ADR-0246
     scope: "ADD FILES source manifest, field identity, fixed limits and re-planning per attempt"
     link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"

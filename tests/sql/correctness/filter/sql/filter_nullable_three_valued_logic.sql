@@ -29,7 +29,7 @@ CREATE TABLE ${case_db}.t_filter_nullable_three_valued_logic (
   id INT,
   a INT,
   b INT,
-  tag STRING
+  tag VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_nullable_three_valued_logic VALUES
   ROW(1, 3, 1, 'n'),

@@ -26,7 +26,7 @@ use novarocks_types::schema::SqlType;
 
 pub mod command;
 
-pub use command::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
+pub use command::{CatalogSqlCommand, StatisticsSqlCommand};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectName {

@@ -27,12 +27,12 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t0" (
-  "v1" int(11),
-  "v2" int(11),
-  "v3" bigint(20),
+  "v1" INTEGER,
+  "v2" INTEGER,
+  "v3" BIGINT,
   "v4" varchar(50),
   "v5" decimal(10,2),
-  "v6" float
+  "v6" REAL
 ) WITH (format_version = 3);
 
 -- query 3
@@ -619,12 +619,12 @@ CROSS JOIN UNNEST(concat(
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t1" (
-  "v1" int(11),
-  "v2" int(11),
-  "v3" bigint(20),
+  "v1" INTEGER,
+  "v2" INTEGER,
+  "v3" BIGINT,
   "v4" varchar(50),
   "v5" decimal(10,2),
-  "v6" float
+  "v6" REAL
 ) WITH (format_version = 3);
 
 -- query 48

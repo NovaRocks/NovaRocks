@@ -148,6 +148,12 @@ struct RegistrationPlanPayload {
     recursive_directory: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TruncateMode {
+    Main,
+    WholeBranch,
+}
+
 #[derive(Clone)]
 enum PlannedIcebergMutation {
     RegisterExistingFiles {
@@ -156,6 +162,7 @@ enum PlannedIcebergMutation {
         recursion: ConnectorAddFilesRecursion,
     },
     Truncate {
+        mode: TruncateMode,
         payload: IcebergDataMutationPlanPayloadV2,
         source_metadata: Arc<TableMetadata>,
     },
@@ -171,11 +178,22 @@ impl PlannedIcebergMutation {
         }
     }
 
+    fn is_main_truncate(&self) -> bool {
+        matches!(
+            self,
+            Self::Truncate {
+                mode: TruncateMode::Main,
+                ..
+            }
+        )
+    }
+
     fn truncate_parts(&self) -> Option<(&IcebergDataMutationPlanPayloadV2, &TableMetadata)> {
         match self {
             Self::Truncate {
                 payload,
                 source_metadata,
+                ..
             } => Some((payload, source_metadata)),
             Self::RegisterExistingFiles { .. } => None,
         }
@@ -547,7 +565,8 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             ));
         }
         let operation = match request.operation() {
-            ConnectorDataMutationOperation::Truncate { .. } => CatalogOperation::Truncate,
+            ConnectorDataMutationOperation::TruncateMain { .. }
+            | ConnectorDataMutationOperation::Truncate { .. } => CatalogOperation::Truncate,
             ConnectorDataMutationOperation::RegisterExistingFiles { .. } => {
                 CatalogOperation::RegisterFiles
             }
@@ -655,8 +674,20 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     ConnectorDataMutationPlanSummary::default(),
                 ))
             }
-            ConnectorDataMutationOperation::Truncate { target_ref, .. } => {
-                if target_ref.as_ref() != "main"
+            mutation => {
+                let (mode, target_ref) = match mutation {
+                    ConnectorDataMutationOperation::TruncateMain { .. } => {
+                        (TruncateMode::Main, "main")
+                    }
+                    ConnectorDataMutationOperation::Truncate { target_ref, .. } => {
+                        (TruncateMode::WholeBranch, target_ref.as_ref())
+                    }
+                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => unreachable!(),
+                };
+                if mode == TruncateMode::Main {
+                    crate::commit::model::validate_target_branch(metadata, target_ref)
+                        .map_err(invalid)?;
+                } else if target_ref != "main"
                     && metadata.format_version() != crate::iceberg::spec::FormatVersion::V3
                 {
                     return Err(invalid(
@@ -680,6 +711,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 let state_digest = truncate_state_digest(&payload);
                 Ok((
                     PlannedIcebergMutation::Truncate {
+                        mode,
                         payload,
                         source_metadata: table.metadata_ref(),
                     },
@@ -950,9 +982,10 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                     && let Some((journal, entry)) =
                         crate::commit::attempt::observation::PublicationJournal::<DataPublication>::from_evidence(evidence)?
                     {
-                        return Ok(publication::project_for_operation(
+                        let recovered = publication::project_for_operation(
                             journal.catalog_entry_outcome(entry), request.plan.operation_kind(),
-                        ));
+                        );
+                        return Ok(project_truncate_unknown(&cached.private, recovered));
                     }
                 return Ok(record.outcome);
             }
@@ -994,12 +1027,24 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                     self.backend
                         .execute(&cached.private, &marker, &template, &request.context)?
                 }
-                Err(error) => ExternalMutationOutcome::KnownUncommitted {
-                    failure: crate::commit::attempt::before_dispatch_failure(
-                        &publication::format_error(error),
-                    ),
-                    cleanup: ExternalMutationFinalization::Complete,
-                },
+                Err(error) => {
+                    let failure = if cached.private.is_main_truncate()
+                        && error.kind() == ConnectorErrorKind::NotFound
+                    {
+                        crate::commit::commit_failure::validation_failure(
+                            crate::commit::model::CommitOperation::Truncate,
+                            "Iceberg commit target table does not exist",
+                        )
+                    } else {
+                        crate::commit::attempt::before_dispatch_failure(&publication::format_error(
+                            error,
+                        ))
+                    };
+                    ExternalMutationOutcome::KnownUncommitted {
+                        failure,
+                        cleanup: ExternalMutationFinalization::Complete,
+                    }
+                }
             }
         } else {
             self.backend.execute_registration(
@@ -1009,6 +1054,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 &self.key,
             )?
         };
+        let outcome = project_truncate_unknown(&cached.private, outcome);
         self.terminal
             .lock()
             .map_err(|error| internal(format!("Iceberg data mutation terminal lock: {error}")))?
@@ -1142,6 +1188,31 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 evidence: request.evidence,
             }),
         }
+    }
+}
+
+fn project_truncate_unknown(
+    planned: &PlannedIcebergMutation,
+    outcome: ExternalMutationOutcome<ConnectorDataMutationReceipt>,
+) -> ExternalMutationOutcome<ConnectorDataMutationReceipt> {
+    if !planned.is_main_truncate() {
+        return outcome;
+    }
+    match outcome {
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+            use crate::commit::commit_failure::{CommitFailureKind, original_commit_failure};
+            use crate::commit::model::CommitOperation;
+
+            ExternalMutationOutcome::CommitUnknown {
+                failure: original_commit_failure(
+                    CommitOperation::Truncate,
+                    CommitFailureKind::Unknown,
+                    failure,
+                ),
+                evidence,
+            }
+        }
+        other => other,
     }
 }
 

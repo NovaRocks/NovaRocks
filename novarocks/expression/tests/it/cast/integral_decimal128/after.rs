@@ -24,15 +24,15 @@ use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 fn compare_profile(dtype: DataType, p: u8, s: i8, expected_full: [Expected; 5]) {
     let (min, max) = bound(&dtype);
     let target = DataType::Decimal128(p, s);
-    for (policy, allow) in modes() {
+    for mode in MODES {
         let full = integral_input(&dtype, vec![Some(min), None, Some(max), Some(1), Some(-1)]);
-        let program = compiled(
+        let program = compiled_cast(
             FunctionValueType::new(dtype.clone(), true),
             FunctionValueType::new(target.clone(), true),
             Source::Column,
             Wrap::Bare,
-            policy,
-            allow,
+            mode,
+            false,
         );
         for (source, fixed) in [
             (full.clone(), expected_full.as_slice()),
@@ -74,22 +74,22 @@ fn compare_profile(dtype: DataType, p: u8, s: i8, expected_full: [Expected; 5]) 
                 let mut expected = Vec::new();
                 let mut errors = Vec::new();
                 for (ordinal, row) in rows.iter().copied().enumerate() {
-                    let (value, error) = fixed[row].result(policy);
+                    let (value, error) = fixed[row].outcome(mode);
                     expected.push(value);
-                    if let Some(message) = error {
-                        errors.push((ordinal, message.to_owned()));
+                    if let Some(reason) = error {
+                        errors.push((ordinal, reason));
                     }
                 }
                 assert_eq!(
                     values(output.values()),
                     expected,
-                    "{dtype:?} -> Decimal128({p}, {s}), rows {rows:?}, {policy:?}, allow {allow}"
+                    "{dtype:?} -> Decimal128({p}, {s}), rows {rows:?}, {mode:?}"
                 );
                 assert_eq!(
                     output
                         .errors()
                         .iter()
-                        .map(|e| (e.selected_ordinal(), e.message().to_owned()))
+                        .map(|e| (e.selected_ordinal(), e.reason()))
                         .collect::<Vec<_>>(),
                     errors
                 );
@@ -98,12 +98,10 @@ fn compare_profile(dtype: DataType, p: u8, s: i8, expected_full: [Expected; 5]) 
     }
 }
 #[test]
-fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and_empty() {
+fn signed_to_decimal_cast_preserves_extrema_and_selected_overflow() {
     // Fixed raw-output tables for [source MIN, source NULL, source MAX, +1,-1].
-    // Decimal coefficient = integer*10^scale; negative scales truncate toward
-    // zero. Precision p requires coefficient magnitude < 10^p. O denotes a
-    // finite overflow, independently of source NULL, and is never computed by
-    // a reference converter. These tables include full physical source extrema.
+    // The coefficient is integer * 10^scale. Precision p requires magnitude
+    // less than 10^p. Each overflowing extrema or scaled value is marked O.
     for (dtype, p, s, expected) in [
         (DataType::Int8, 3, 0, [V(-128), N, V(127), V(1), V(-1)]),
         (DataType::Int8, 4, 0, [V(-128), N, V(127), V(1), V(-1)]),
@@ -113,12 +111,10 @@ fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and
             2,
             [V(-12800), N, V(12700), V(100), V(-100)],
         ),
-        (DataType::Int8, 7, -2, [V(-1), N, V(1), V(0), V(0)]),
         (DataType::Int8, 18, 1, [V(-1280), N, V(1270), V(10), V(-10)]),
         (DataType::Int8, 19, 1, [V(-1280), N, V(1270), V(10), V(-10)]),
         (DataType::Int8, 38, 1, [V(-1280), N, V(1270), V(10), V(-10)]),
         (DataType::Int8, 38, 38, [O, N, O, O, O]),
-        (DataType::Int8, 38, -38, [V(0), N, V(0), V(0), V(0)]),
         (DataType::Int16, 3, 0, [O, N, O, V(1), V(-1)]),
         (DataType::Int16, 4, 0, [O, N, O, V(1), V(-1)]),
         (
@@ -127,7 +123,6 @@ fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and
             2,
             [V(-3276800), N, V(3276700), V(100), V(-100)],
         ),
-        (DataType::Int16, 7, -2, [V(-327), N, V(327), V(0), V(0)]),
         (
             DataType::Int16,
             18,
@@ -147,11 +142,9 @@ fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and
             [V(-327680), N, V(327670), V(10), V(-10)],
         ),
         (DataType::Int16, 38, 38, [O, N, O, O, O]),
-        (DataType::Int16, 38, -38, [V(0), N, V(0), V(0), V(0)]),
         (DataType::Int32, 3, 0, [O, N, O, V(1), V(-1)]),
         (DataType::Int32, 4, 0, [O, N, O, V(1), V(-1)]),
         (DataType::Int32, 7, 2, [O, N, O, V(100), V(-100)]),
-        (DataType::Int32, 7, -2, [O, N, O, V(0), V(0)]),
         (
             DataType::Int32,
             18,
@@ -171,12 +164,22 @@ fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and
             [V(-21474836480), N, V(21474836470), V(10), V(-10)],
         ),
         (DataType::Int32, 38, 38, [O, N, O, O, O]),
-        (DataType::Int32, 38, -38, [V(0), N, V(0), V(0), V(0)]),
         (DataType::Int64, 3, 0, [O, N, O, V(1), V(-1)]),
         (DataType::Int64, 4, 0, [O, N, O, V(1), V(-1)]),
         (DataType::Int64, 7, 2, [O, N, O, V(100), V(-100)]),
-        (DataType::Int64, 7, -2, [O, N, O, V(0), V(0)]),
         (DataType::Int64, 18, 1, [O, N, O, V(10), V(-10)]),
+        (
+            DataType::Int64,
+            19,
+            0,
+            [
+                V(-9223372036854775808),
+                N,
+                V(9223372036854775807),
+                V(1),
+                V(-1),
+            ],
+        ),
         (DataType::Int64, 19, 1, [O, N, O, V(10), V(-10)]),
         (
             DataType::Int64,
@@ -191,7 +194,6 @@ fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and
             ],
         ),
         (DataType::Int64, 38, 38, [O, N, O, O, O]),
-        (DataType::Int64, 38, -38, [V(0), N, V(0), V(0), V(0)]),
     ] {
         compare_profile(dtype, p, s, expected);
     }
@@ -199,15 +201,15 @@ fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and
 
 #[test]
 fn integral_decimal128_actual_after_original_i64_constant_broadcast_exact_source() {
-    for (policy, allow) in modes() {
+    for mode in MODES {
         let target = DataType::Decimal128(4, 0);
-        let program = compiled(
+        let program = compiled_cast(
             FunctionValueType::new(DataType::Int64, false),
             FunctionValueType::new(target.clone(), true),
             Source::Constant,
             Wrap::Bare,
-            policy,
-            allow,
+            mode,
+            false,
         );
         let b = RecordBatch::try_new(
             program.input_schema().clone(),
@@ -280,13 +282,13 @@ fn causes() -> [KernelFailure; 7] {
 }
 #[test]
 fn integral_decimal128_actual_after_every_frame_callback_keeps_seven_causes_and_no_replay() {
-    let program = compiled(
+    let program = compiled_cast(
         FunctionValueType::new(DataType::Int64, true),
         FunctionValueType::new(DataType::Decimal128(3, 0), true),
         Source::Column,
         Wrap::Bare,
-        DecimalOverflowPolicy::ReportError,
-        true,
+        TrinoCastMode::Explicit,
+        false,
     );
     let b = RecordBatch::try_new(
         program.input_schema().clone(),

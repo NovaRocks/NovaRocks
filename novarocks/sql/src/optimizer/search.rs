@@ -791,6 +791,7 @@ mod tests {
             )
             .unwrap(),
             null_safe: false,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         }
     }
 
@@ -1923,6 +1924,7 @@ mod cascaded_derivation_tests {
             )
             .unwrap(),
             null_safe: false,
+            match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         }
     }
 

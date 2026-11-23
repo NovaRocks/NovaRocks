@@ -38,7 +38,7 @@ use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     ExpressionEffectContext, ExpressionEffects, FunctionValueType, PureCompileControl,
-    ValueLogicalType,
+    TrinoCastMode, ValueLogicalType,
 };
 use std::{error::Error, fmt};
 
@@ -51,11 +51,18 @@ pub(crate) use f3_scalar::{decimal_integral_coefficient, decimal_overflow_error}
 mod f3_array;
 
 mod array_json;
+pub use array_json::validate_trino_json_literal;
 mod array_mode;
 mod array_text;
 #[path = "cast/selected.rs"]
 mod selected;
+mod trino;
 mod trino_array_leaf;
+mod trino_float_text;
+mod trino_temporal;
+pub(crate) use trino_array_leaf::{
+    FloatWidth as TrinoFloatWidth, decimal_to_float_bits as trino_decimal_to_float_bits,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CastOperation {
@@ -69,6 +76,7 @@ pub enum CastPrepareError {
     Control(CompileControlError),
     Kernel(KernelFailure),
     Unsupported,
+    Illegal,
     TypeMismatch,
 }
 impl CastPrepareError {
@@ -101,6 +109,7 @@ impl fmt::Display for CastPrepareError {
             Self::Unsupported => {
                 f.write_str("cast requires an implemented exact Physical scalar domain")
             }
+            Self::Illegal => f.write_str("source and target have no legal Trino conversion"),
             Self::TypeMismatch => {
                 f.write_str("cast result violates its frozen successful-NULL contract")
             }
@@ -404,6 +413,7 @@ enum CastBody {
     ArrayText,
     ArrayDateText,
     ArrayJson(array_json::Operation),
+    Trino(trino::Scalar),
     ExtendedScalar(f3_scalar::Body),
     SelectedArray(f3_array::Body),
     /// Original List retag/null-child computation on an exact selected domain.
@@ -470,6 +480,7 @@ pub struct PreparedCastRecipe {
     result: FunctionValueType,
     body: CastBody,
     array_child: Option<Box<PreparedCastRecipe>>,
+    trino_mode: Option<TrinoCastMode>,
     decimal_overflow_policy: DecimalOverflowPolicy,
     allow_throw_exception: bool,
 }
@@ -532,6 +543,42 @@ impl PreparedCastRecipe {
         Ok(bytes)
     }
 
+    /// Prepare the authored SQL conversion against complete source and result
+    /// declarations. The original CAST entry is reserved for legacy callers
+    /// during contract migration.
+    pub fn try_new_trino(
+        source: &FunctionValueType,
+        result: &FunctionValueType,
+        mode: TrinoCastMode,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, CastPrepareError> {
+        trino::prepare(source, result, mode, control, true)
+    }
+
+    pub fn cast_mode(&self) -> Option<TrinoCastMode> {
+        self.trino_mode
+    }
+
+    /// Determine successful SQL NULL from the actual admitted value recipe.
+    /// A caller may use the unadjusted target declaration to query this fact.
+    pub fn trino_result_nullable(
+        source: &FunctionValueType,
+        result: &FunctionValueType,
+        mode: TrinoCastMode,
+        control: &dyn PureCompileControl,
+    ) -> Result<bool, CastPrepareError> {
+        Ok(trino::prepare(source, result, mode, control, false)?.trino_can_return_null())
+    }
+
+    fn trino_can_return_null(&self) -> bool {
+        self.source.nullable()
+            || matches!(
+                self.body,
+                CastBody::ArrayJson(array_json::Operation::JsonToVarchar)
+            )
+            || (self.trino_mode == Some(TrinoCastMode::Try) && self.conversion_may_raise())
+    }
+
     pub fn try_new(
         operation: CastOperation,
         source: &FunctionValueType,
@@ -587,6 +634,7 @@ impl PreparedCastRecipe {
                         result: result.clone(),
                         body: CastBody::ExtendedScalar(body),
                         array_child: None,
+                        trino_mode: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
                     });
@@ -614,6 +662,7 @@ impl PreparedCastRecipe {
                         scale: *scale,
                     },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -654,6 +703,7 @@ impl PreparedCastRecipe {
                         scale: *scale,
                     },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -683,6 +733,7 @@ impl PreparedCastRecipe {
                         scale: *scale,
                     },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -718,6 +769,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::Identity,
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -738,6 +790,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::Collection,
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -762,6 +815,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::TimeCalendar,
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -791,6 +845,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::TimeText { mode },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -810,6 +865,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::BinaryText,
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -840,6 +896,7 @@ impl PreparedCastRecipe {
                             scale: *scale,
                         },
                         array_child: None,
+                        trino_mode: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
                     });
@@ -883,6 +940,7 @@ impl PreparedCastRecipe {
                             },
                         },
                         array_child: None,
+                        trino_mode: None,
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
                     });
@@ -902,6 +960,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::LargeIntText,
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -914,6 +973,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::SelectedArray(body),
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -938,6 +998,7 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::DateFloat { target },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -955,6 +1016,7 @@ impl PreparedCastRecipe {
                         source: source_kind,
                     },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -972,6 +1034,7 @@ impl PreparedCastRecipe {
                         source: source_kind,
                     },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -989,6 +1052,7 @@ impl PreparedCastRecipe {
                         source: source_kind,
                     },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -1016,6 +1080,7 @@ impl PreparedCastRecipe {
                         unit: unit.copied(),
                     },
                     array_child: None,
+                    trino_mode: None,
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -1053,6 +1118,7 @@ impl PreparedCastRecipe {
                     target,
                 },
                 array_child: None,
+                trino_mode: None,
                 decimal_overflow_policy: policy,
                 allow_throw_exception,
             };
@@ -1171,25 +1237,49 @@ impl PreparedCastRecipe {
         }
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        let may_raise_row_error = match self.body {
+        if self.trino_mode == Some(TrinoCastMode::Try) {
+            return ScopedExpressionEffects::primitive(context, ExpressionEffects::PURE_VALUE);
+        }
+        ScopedExpressionEffects::primitive(
+            context,
+            ExpressionEffects {
+                may_raise_row_error: self.conversion_may_raise(),
+                ..ExpressionEffects::PURE_VALUE
+            },
+        )
+    }
+
+    fn conversion_may_raise(&self) -> bool {
+        match self.body {
             CastBody::ExplicitArray => {
-                self.array_failure_mode
-                    == Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
-                    && self.array_child.as_ref().is_some_and(|child| {
-                        child
-                            .own_effects(context)
-                            .for_use(context)
-                            .expect("same effect context")
-                            .may_raise_row_error
-                    })
+                (self.trino_mode.is_some()
+                    || self.array_failure_mode
+                        == Some(novarocks_type_contract::ArrayCastFailureMode::ReportError))
+                    && self
+                        .array_child
+                        .as_ref()
+                        .is_some_and(|child| child.conversion_may_raise())
             }
             CastBody::ArrayNull => false,
             CastBody::ArrayLeaf(leaf) => leaf.may_fail(),
+            CastBody::ArrayJson(array_json::Operation::VarcharToJson)
+                if self.trino_mode.is_some() =>
+            {
+                false
+            }
             CastBody::ArrayText | CastBody::ArrayDateText | CastBody::ArrayJson(_) => true,
-            CastBody::SelectedArray(f3_array::Body::ArrowScalar) => true,
+            CastBody::SelectedArray(f3_array::Body::ArrowScalar) => self.trino_mode.is_none(),
             CastBody::SelectedArray(
-                f3_array::Body::Structure | f3_array::Body::ByteViewProjection,
+                f3_array::Body::Structure
+                | f3_array::Body::ByteViewProjection
+                | f3_array::Body::TrinoCharBinary(_),
             ) => false,
+            CastBody::Trino(trino::Scalar::Render { .. })
+                if self.source.data_type() == &DataType::Date32 =>
+            {
+                true
+            }
+            CastBody::Trino(body) => body.may_raise(),
             CastBody::ExtendedScalar(body) => body.may_raise(
                 self.source.data_type(),
                 self.decimal_overflow_policy,
@@ -1259,14 +1349,7 @@ impl PreparedCastRecipe {
                         )
                     )
             }
-        };
-        ScopedExpressionEffects::primitive(
-            context,
-            ExpressionEffects {
-                may_raise_row_error,
-                ..ExpressionEffects::PURE_VALUE
-            },
-        )
+        }
     }
     /// The host excludes inherited errors before this selected-row operation.
     /// Both the actual address and concrete scalar carrier are checked before NULL.
@@ -1302,6 +1385,16 @@ impl PreparedCastRecipe {
                 return array_mode::evaluate_leaf(
                     self,
                     leaf,
+                    argument,
+                    ordinal,
+                    logical_row,
+                    &mut work,
+                );
+            }
+            if let CastBody::Trino(body) = self.body {
+                return trino::evaluate_scalar(
+                    self,
+                    body,
                     argument,
                     ordinal,
                     logical_row,
@@ -2300,6 +2393,11 @@ impl PreparedCastRecipe {
         })();
         // The same work latch returns any original callback cause without replay.
         work.finish()?;
+        if self.trino_mode == Some(TrinoCastMode::Try)
+            && matches!(&outcome, Ok(CastRowResult::RowError(_)))
+        {
+            return Ok(CastRowResult::Null);
+        }
         outcome
     }
     fn checked_row(

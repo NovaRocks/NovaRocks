@@ -788,6 +788,67 @@ fn runtime_original_seven_causes_keep_success_null_and_ordinary_error_tails_with
     assert_eq!(control.trace.lock().unwrap().len(), 640);
 }
 
+#[test]
+fn decimal_widening_effect_matches_checked_trino_rows() {
+    let source = |precision, scale, values| {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        ) as ArrayRef
+    };
+    let cases = [
+        (
+            source(7, 2, vec![9_999_999, -9_999_999]),
+            DataType::Decimal128(12, 4),
+            Some(source(12, 4, vec![999_999_900, -999_999_900])),
+        ),
+        (
+            source(38, 0, vec![0, 1]),
+            DataType::Decimal128(38, 38),
+            None,
+        ),
+    ];
+    for (input, target, expected) in cases {
+        let recipe = PreparedCastRecipe::try_new_trino(
+            &ty(input.data_type().clone(), false),
+            &ty(target, false),
+            TrinoCastMode::Implicit,
+            &CompileControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            recipe
+                .own_effects(context())
+                .for_use(context())
+                .unwrap()
+                .may_raise_row_error,
+            expected.is_none()
+        );
+        let selected = recipe
+            .evaluate_selected(
+                EvaluatedArgument::Column(&input),
+                Selection::all(input.len()),
+                &[],
+                &Control::default(),
+            )
+            .unwrap();
+        if let Some(expected) = expected {
+            assert!(selected.errors().is_empty());
+            assert_eq!(selected.values().to_data(), expected.to_data());
+        } else {
+            assert_eq!(selected.errors().len(), 1);
+            assert_eq!(selected.errors()[0].selected_ordinal(), 1);
+            assert_eq!(
+                selected.errors()[0].reason(),
+                crate::DataFailureReason::Domain(
+                    novarocks_failure_contract::kernel_reason::NUMERIC_OUT_OF_RANGE
+                ),
+            );
+        }
+    }
+}
+
 // A carrier with no primitive conversion kernel casts exactly to itself:
 // the value passes unchanged, only nullability may widen, and no row can
 // fail. Kernel-backed carriers keep their own row operation.

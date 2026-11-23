@@ -167,6 +167,7 @@ fn fixed_binary_case_unit() -> (Arc<CompiledExprSet>, [RootOrdinal; 2]) {
                 None,
                 result_ty,
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then: Box::from([(condition, input)]),
                     else_expr: Some(null),

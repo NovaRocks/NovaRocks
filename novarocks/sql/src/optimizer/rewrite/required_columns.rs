@@ -222,7 +222,15 @@ fn collect_scalar_column_id_refs_inner(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             collect_scalar_column_id_refs_inner(arena, *body, out);
         }
-        ScalarNode::AggregateCall { args, order_by, .. } => {
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                collect_scalar_column_id_refs_inner(arena, *predicate, out);
+            }
             for arg in args {
                 collect_scalar_column_id_refs_inner(arena, *arg, out);
             }
@@ -251,6 +259,7 @@ fn collect_scalar_column_id_refs_inner(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 collect_scalar_column_id_refs_inner(arena, *operand, out);
@@ -428,11 +437,20 @@ fn tag_aggregate(
         }
         for agg in &node.aggregates {
             if needed.contains(&agg.output_column_id) {
-                for &arg in agg.source.arguments() {
-                    required_inputs.extend(collect_scalar_column_id_refs(arena, arg));
+                required_inputs.extend(agg.source.filter_input());
+                for (ordinal, &arg) in agg.source.arguments().iter().enumerate() {
+                    if let Some(column) = agg.source.projected_argument(ordinal) {
+                        required_inputs.insert(column);
+                    } else {
+                        required_inputs.extend(collect_scalar_column_id_refs(arena, arg));
+                    }
                 }
-                for item in agg.source.order_by() {
-                    required_inputs.extend(collect_scalar_column_id_refs(arena, item.expr));
+                for (ordinal, item) in agg.source.order_by().iter().enumerate() {
+                    if let Some(column) = agg.source.projected_order_key(ordinal) {
+                        required_inputs.insert(column);
+                    } else {
+                        required_inputs.extend(collect_scalar_column_id_refs(arena, item.expr));
+                    }
                 }
             }
         }
@@ -640,7 +658,7 @@ fn tag_union(
 
     // Resolve which positions in the output schema are needed.
     let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
-    let needed_positions: Vec<usize> = match &parent_needed {
+    let mut needed_positions: Vec<usize> = match &parent_needed {
         None => (0..outputs.len()).collect(),
         Some(n) => outputs
             .iter()
@@ -648,6 +666,11 @@ fn tag_union(
             .filter_map(|(i, id)| n.contains(id).then_some(i))
             .collect(),
     };
+    // UNION ALL pruning retains its first output when the parent only needs
+    // row counts. Keep that position's original value in each branch as well.
+    if needed_positions.is_empty() && !outputs.is_empty() {
+        needed_positions.push(0);
+    }
 
     expr.required_output_columns = parent_needed.clone();
     let children = expr.children;
@@ -2857,7 +2880,7 @@ mod tests {
         );
         let order = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: key,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,

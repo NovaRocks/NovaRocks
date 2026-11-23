@@ -33,7 +33,7 @@ CREATE TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.fact (
 ) WITH (format_version = 3);
 CREATE TABLE ice_ivm_join_agg_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 USE ice_ivm_join_agg_${uuid0}.ns_${uuid0};

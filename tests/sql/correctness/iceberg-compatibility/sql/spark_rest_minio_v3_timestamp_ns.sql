@@ -118,8 +118,8 @@ printf 'CATALOG_OK schema=timestamp_ns records=%s\n' "$rec_count"
 
 -- query 5
 -- NovaRocks reads the table back and asserts 9-digit nanosecond precision.
--- CAST(ts AS STRING) renders all nine fractional digits from the declaration.
-SELECT id, CAST(ts AS STRING) AS s
+-- CAST(ts AS VARCHAR) renders all nine fractional digits from the declaration.
+SELECT id, CAST(ts AS VARCHAR) AS s
   FROM iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
   ORDER BY id;
 

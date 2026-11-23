@@ -18,7 +18,9 @@
 //! Root purpose projection. Unknown kinds and profiles have no fallback.
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::result as wire;
-use novarocks_result_contract::{InternalResultDomain, RootOutputKind, RootProfileId};
+use novarocks_result_contract::{
+    CharacterKind, CharacterType, InternalResultDomain, RootOutputKind, RootProfileId,
+};
 fn invalid(path: FieldPath, message: &str) -> ProtocolError {
     ProtocolError::new(path, ProtocolErrorKind::InvalidValue, message)
 }
@@ -192,6 +194,13 @@ fn encode_type(
             K::Decimal
         }
         NativeRenderType::String => K::String,
+        NativeRenderType::BoundedCharacter(character) => {
+            out.character_length = Some(character.length());
+            match character.kind() {
+                CharacterKind::Char => K::Char,
+                CharacterKind::Varchar => K::Varchar,
+            }
+        }
         NativeRenderType::Binary => K::Binary,
         NativeRenderType::Date => K::Date,
         NativeRenderType::Temporal(temporal) => {
@@ -496,6 +505,7 @@ fn decode_type(
         || (kind != K::Timestamp && src.time_zone.is_some())
         || (kind != K::Opaque && src.opaque_kind != 0)
         || ((kind == K::Temporal) != src.temporal_type.is_some())
+        || (matches!(kind, K::Char | K::Varchar) != src.character_length.is_some())
         || (!matches!(kind, K::List | K::Map | K::Struct) && !src.children.is_empty())
         || (kind == K::List && (src.children.len() != 1 || src.children[0].name != "item"))
         || (kind == K::Map
@@ -524,6 +534,18 @@ fn decode_type(
                 .map_err(|_| invalid(path.clone(), "render scale overflow"))?,
         },
         K::String => NativeRenderType::String,
+        K::Char | K::Varchar => {
+            let character_kind = if kind == K::Char {
+                CharacterKind::Char
+            } else {
+                CharacterKind::Varchar
+            };
+            let character = src
+                .character_length
+                .and_then(|length| CharacterType::new(character_kind, length))
+                .ok_or_else(|| invalid(path.clone(), "invalid render character length"))?;
+            NativeRenderType::BoundedCharacter(character)
+        }
         K::Binary => NativeRenderType::Binary,
         K::Date => NativeRenderType::Date,
         K::Temporal => NativeRenderType::Temporal(
@@ -587,6 +609,28 @@ mod schema_tests {
                 native_type,
                 presentation,
             },
+        }
+    }
+
+    #[test]
+    fn bounded_character_render_length_has_explicit_wire_presence() {
+        for kind in [CharacterKind::Char, CharacterKind::Varchar] {
+            let ty = NativeRenderType::BoundedCharacter(CharacterType::new(kind, 0).unwrap());
+            let schema = ClientRenderSchema::try_new(
+                ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
+                vec![col(0, ty, RenderPresentation::TrinoValue)],
+                1,
+            )
+            .unwrap();
+            let mut encoded = encode_client_schema(&schema);
+            let path = || FieldPath::root("schema");
+            assert_eq!(decode_client_schema(&encoded, 1, path()).unwrap(), schema);
+            encoded.field_nodes[0]
+                .native_type
+                .as_mut()
+                .unwrap()
+                .character_length = None;
+            assert!(decode_client_schema(&encoded, 1, path()).is_err());
         }
     }
     #[test]
@@ -749,27 +793,36 @@ mod schema_tests {
         };
         let schema = ClientRenderSchema::try_new(
             ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
-            vec![col(
-                0,
-                NativeRenderType::Map {
-                    key: Box::new(leaf(T::TimestampWithTimeZone(12))),
-                    value: Box::new(leaf(T::Interval {
-                        start: F::Hour,
-                        end: F::Second,
-                        leading_precision: 3,
-                        fractional_precision: 9,
-                    })),
-                },
-                RenderPresentation::TrinoValue,
-            )],
-            1,
+            vec![
+                col(
+                    0,
+                    NativeRenderType::Map {
+                        key: Box::new(leaf(T::TimestampWithTimeZone(12))),
+                        value: Box::new(leaf(T::Interval {
+                            start: F::Hour,
+                            end: F::Second,
+                            leading_precision: 3,
+                            fractional_precision: 9,
+                        })),
+                    },
+                    RenderPresentation::TrinoValue,
+                ),
+                col(
+                    1,
+                    NativeRenderType::BoundedCharacter(
+                        CharacterType::new(CharacterKind::Char, 4).unwrap(),
+                    ),
+                    RenderPresentation::TrinoValue,
+                ),
+            ],
+            2,
         )
         .unwrap();
         let encoded = encode_client_schema(&schema);
         let bytes = encoded.encode_to_vec();
         let parsed = wire::ClientRenderSchema::decode(bytes.as_slice()).unwrap();
         assert_eq!(
-            decode_client_schema(&parsed, 1, FieldPath::root("schema")).unwrap(),
+            decode_client_schema(&parsed, 2, FieldPath::root("schema")).unwrap(),
             schema
         );
 
@@ -781,7 +834,7 @@ mod schema_tests {
             .find(|ty| ty.temporal_type.is_some())
             .unwrap();
         leaf.temporal_type = None;
-        assert!(decode_client_schema(&missing, 1, FieldPath::root("schema")).is_err());
+        assert!(decode_client_schema(&missing, 2, FieldPath::root("schema")).is_err());
 
         let mut foreign = parsed;
         let leaf = foreign
@@ -790,8 +843,8 @@ mod schema_tests {
             .filter_map(|field| field.native_type.as_mut())
             .find(|ty| ty.temporal_type.is_some())
             .unwrap();
-        leaf.bits = 64;
-        assert!(decode_client_schema(&foreign, 1, FieldPath::root("schema")).is_err());
+        leaf.character_length = Some(4);
+        assert!(decode_client_schema(&foreign, 2, FieldPath::root("schema")).is_err());
     }
 
     #[test]

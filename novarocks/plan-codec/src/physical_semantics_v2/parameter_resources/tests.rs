@@ -89,7 +89,6 @@ fn source() -> wire::SemanticParameters {
             ),
             entry(0, TimeZone("Asia/Shanghai".into())),
             entry(2, AllowThrowException(true)),
-            entry(3, DecimalOverflowToDouble(false)),
             entry(4, GroupConcatLegacy(true)),
             entry(5, GroupConcatMaxLen(i64::MIN)),
             entry(6, AllowThrowException(false)),
@@ -101,7 +100,7 @@ fn bounded_parameters_keep_all_raw_variants_scoped_keys_and_sparse_ids() {
     let input = source();
     let (table, facts) =
         decode_semantic_parameters(&input, SOURCE, limits(), &Control::default()).unwrap();
-    assert_eq!(table.entries().len(), 7);
+    assert_eq!(table.entries().len(), 6);
     assert_eq!(
         table.get(SemanticParameterId::new(u32::MAX)),
         Some(&SemanticParameterValue::StatementStartUtc(
@@ -117,10 +116,6 @@ fn bounded_parameters_keep_all_raw_variants_scoped_keys_and_sparse_ids() {
     assert_eq!(
         table.get(SemanticParameterId::new(2)),
         Some(&SemanticParameterValue::AllowThrowException(true))
-    );
-    assert_eq!(
-        table.get(SemanticParameterId::new(3)),
-        Some(&SemanticParameterValue::DecimalOverflowToDouble(false))
     );
     assert_eq!(
         table.get(SemanticParameterId::new(4)),
@@ -139,9 +134,9 @@ fn bounded_parameters_keep_all_raw_variants_scoped_keys_and_sparse_ids() {
         SemanticParameterKey::AllowThrowException
     );
     // This is a cumulative node-request bound, not n actual allocated nodes.
-    assert_eq!(facts.parameter_count, 7);
+    assert_eq!(facts.parameter_count, 6);
     assert_eq!(facts.timezone_request_bytes_upper_bound, 0);
-    assert_eq!(facts.allocation_requests_upper_bound, 7);
+    assert_eq!(facts.allocation_requests_upper_bound, 6);
     let control = Control::default();
     let prepared = prepare_semantic_parameters_decode(&input, SOURCE, limits(), &control).unwrap();
     assert_eq!(*prepared.facts(), facts);
@@ -405,7 +400,7 @@ fn bounded_parameter_sending_matches_independent_canonical_wire_and_prepared_loa
     } else {
         panic!("expected original timezone spelling");
     }
-    assert_eq!(facts.parameter_count, 7);
+    assert_eq!(facts.parameter_count, 6);
     assert_eq!(
         facts.timezone_request_bytes_upper_bound,
         "Asia/Shanghai".len()
@@ -413,7 +408,7 @@ fn bounded_parameter_sending_matches_independent_canonical_wire_and_prepared_loa
     assert_eq!(facts.allocation_requests_upper_bound, 2);
     assert_eq!(
         facts.allocation_request_bytes_upper_bound,
-        std::alloc::Layout::array::<wire::SemanticParameter>(7)
+        std::alloc::Layout::array::<wire::SemanticParameter>(6)
             .unwrap()
             .size()
             + "Asia/Shanghai".len()
@@ -460,7 +455,7 @@ fn bounded_parameter_sending_six_exact_caps_empty_and_occupied_source_floors() {
         ));
     }
     let known = size_of::<SemanticParameters>()
-        + 7 * (size_of::<SemanticParameterId>() + size_of::<SemanticParameterValue>());
+        + 6 * (size_of::<SemanticParameterId>() + size_of::<SemanticParameterValue>());
     assert!(matches!(
         prepare_semantic_parameters_encode(&table, known - 1, limits(), &EncodeControl::default()),
         Err(Error::InvalidShape(_))
@@ -617,9 +612,9 @@ fn observed_parameters_preserve_original_facts_sparse_ids_layout_and_caller_phas
     let (table, facts) = observed_decode(&input, &control, &mut admit).unwrap();
     assert_eq!(table, original);
     assert_eq!(facts, receiving);
-    assert_eq!(facts.parameter_count, 7);
+    assert_eq!(facts.parameter_count, 6);
     assert_eq!(facts.timezone_request_bytes_upper_bound, 0);
-    assert_eq!(facts.allocation_requests_upper_bound, 7);
+    assert_eq!(facts.allocation_requests_upper_bound, 6);
     assert_eq!(contributions.last(), Some(&facts));
     assert!(contributions.windows(2).all(|pair| {
         pair[0].allocation_request_bytes_upper_bound <= pair[1].allocation_request_bytes_upper_bound
@@ -642,7 +637,7 @@ fn observed_parameters_preserve_original_facts_sparse_ids_layout_and_caller_phas
     assert_eq!(facts.allocation_requests_upper_bound, 2);
     assert_eq!(
         facts.allocation_request_bytes_upper_bound,
-        Layout::array::<wire::SemanticParameter>(7).unwrap().size() + "Asia/Shanghai".len()
+        Layout::array::<wire::SemanticParameter>(6).unwrap().size() + "Asia/Shanghai".len()
     );
     assert!(
         control

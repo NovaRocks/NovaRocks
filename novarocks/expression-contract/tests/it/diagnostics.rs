@@ -21,10 +21,7 @@
 use super::support::*;
 use arrow_schema::DataType;
 use novarocks_expression_contract::*;
-use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, FunctionArgumentType, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef,
-};
+use novarocks_type_contract::{EvaluationDemand, FunctionArgumentType};
 
 fn message(builder: BoundExprSetBuilder, ports: Vec<ExprPort>) -> String {
     match no_calls(builder, ports, &Control::good()).unwrap_err() {
@@ -68,14 +65,9 @@ fn lazy_type_issues_keep_cast_connective_case_and_arity_details() {
             None,
             integer(false),
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                 expr: source,
                 target: DataType::Int32,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: SemanticParameterRef {
-                    id: SemanticParameterId::new(0),
-                    expected_key: SemanticParameterKey::AllowThrowException,
-                },
             },
         )
         .unwrap();
@@ -112,6 +104,7 @@ fn lazy_type_issues_keep_cast_connective_case_and_arity_details() {
                 None,
                 integer(true),
                 ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: simple.then_some(a),
                     when_then: Box::new([(if simple { b } else { a }, a)]),
                     else_expr: None,

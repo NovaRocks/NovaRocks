@@ -775,17 +775,32 @@ fn expression_facts(
             (SqlMvPersistenceExpressionKind::Literal, None)
         }
         ExprKind::Cast { .. } => (SqlMvPersistenceExpressionKind::Cast, None),
-        ExprKind::FunctionCall { binding, .. }
-            if crate::common::negation::is_negation(&binding.function_id) =>
-        {
-            (
-                SqlMvPersistenceExpressionKind::Function,
-                Some(binding.function_id.as_str().to_owned()),
-            )
+        ExprKind::FunctionCall { name, binding, .. } => {
+            use novarocks_type_contract::{ArithmeticOperator, OperatorFunction};
+
+            let operator = OperatorFunction::from_function_id(&binding.function_id);
+            if let Some(arithmetic) = operator.and_then(OperatorFunction::arithmetic) {
+                let op = match arithmetic {
+                    ArithmeticOperator::Add => BinOp::Add,
+                    ArithmeticOperator::Subtract => BinOp::Sub,
+                    ArithmeticOperator::Multiply => BinOp::Mul,
+                    ArithmeticOperator::Divide => BinOp::Div,
+                    ArithmeticOperator::Modulo => BinOp::Mod,
+                };
+                (
+                    SqlMvPersistenceExpressionKind::Mixed,
+                    Some(binary_operator_identity(op).to_owned()),
+                )
+            } else {
+                let identity = if operator.is_some() {
+                    binding.function_id.as_str().to_owned()
+                } else {
+                    name.to_ascii_lowercase()
+                };
+                (SqlMvPersistenceExpressionKind::Function, Some(identity))
+            }
         }
-        ExprKind::FunctionCall { name, .. }
-        | ExprKind::AggregateCall { name, .. }
-        | ExprKind::WindowCall { name, .. } => (
+        ExprKind::AggregateCall { name, .. } | ExprKind::WindowCall { name, .. } => (
             SqlMvPersistenceExpressionKind::Function,
             Some(name.to_ascii_lowercase()),
         ),
@@ -989,6 +1004,7 @@ fn walk_expression<'a>(
             operand,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(operand) = operand {
                 walk_expression(operand, visitor)?;

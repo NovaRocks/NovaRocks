@@ -103,7 +103,18 @@ fn negation_requires_an_exact_numeric_operand_and_keeps_the_original_overload() 
     let context = context(catalogue.metadata());
     let operator = NodeShape::Operator(OperatorFunction::Negation);
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    for ty in [DataType::Null, DataType::Utf8, DataType::UInt32] {
+    assert!(matches!(
+        type_node(
+            &context,
+            operator,
+            &[input(DataType::Null, true)],
+            &mut work
+        ),
+        Err(TypingError::Binding(
+            FunctionBindingError::AmbiguousOverload
+        ))
+    ));
+    for ty in [DataType::Utf8, DataType::UInt32] {
         assert!(matches!(
             type_node(&context, operator, &[input(ty, true)], &mut work),
             Err(TypingError::TypeMismatch(_))

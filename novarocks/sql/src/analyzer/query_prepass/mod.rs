@@ -69,14 +69,17 @@ pub(crate) fn preanalyze_with_semantics(
 /// Inline definitions cannot be ignored and rebound as unrelated global calls.
 fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> {
     #[derive(Default)]
-    struct UnsupportedSyntax(Option<(&'static str, Span)>);
+    struct UnsupportedSyntax(Option<AnalyzeError>);
     impl Visit for UnsupportedSyntax {
         fn visit_query(&mut self, query: &Query) {
             if self.0.is_some() {
                 return;
             }
             if let Some(function) = query.functions.first() {
-                self.0 = Some(("Inline functions are not supported", function.span));
+                self.0 = Some(AnalyzeError::unsupported_expression(
+                    "Inline functions are not supported",
+                    function.span,
+                ));
             } else {
                 novarocks_parser::ast::walk_query(self, query);
             }
@@ -86,7 +89,7 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 return;
             }
             if let Some(reason) = super::resolve_expr::unsupported_window_frame_reason(frame) {
-                self.0 = Some((reason, frame.span));
+                self.0 = Some(AnalyzeError::unsupported_expression(reason, frame.span));
                 return;
             }
             novarocks_parser::ast::walk_window_frame(self, frame);
@@ -96,13 +99,16 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 return;
             }
             if let Some(reason) = super::unsupported_control_expression_reason(expression) {
-                self.0 = Some((reason, expression.span()));
+                self.0 = Some(AnalyzeError::unsupported_expression(
+                    reason,
+                    expression.span(),
+                ));
                 return;
             }
             match expression {
                 Expr::Predicated(node) => {
                     if let Some(reason) = super::unsupported_predicate_reason(node) {
-                        self.0 = Some((reason, node.span));
+                        self.0 = Some(AnalyzeError::unsupported_expression(reason, node.span));
                         return;
                     }
                     self.visit_expr(&node.value);
@@ -117,37 +123,49 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                     }
                 }
                 Expr::InList(list) => {
-                    self.0 = Some((
+                    self.0 = Some(AnalyzeError::unsupported_expression(
                         "IN lists are only supported as an IN predicate value list",
                         list.span,
                     ));
                 }
                 Expr::JsonConstructor(_) => {
-                    self.0 = Some(("SQL/JSON constructor is not supported", expression.span()));
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "SQL/JSON constructor is not supported",
+                        expression.span(),
+                    ));
                 }
                 Expr::JsonExists(_) => {
-                    self.0 = Some(("JSON_EXISTS is not supported", expression.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "JSON_EXISTS is not supported",
+                        expression.span(),
+                    ))
                 }
                 Expr::JsonValue(_) => {
-                    self.0 = Some(("JSON_VALUE is not supported", expression.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "JSON_VALUE is not supported",
+                        expression.span(),
+                    ))
                 }
                 Expr::JsonSerialize(_) => {
-                    self.0 = Some(("JSON_SERIALIZE is not supported", expression.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "JSON_SERIALIZE is not supported",
+                        expression.span(),
+                    ))
                 }
                 Expr::JsonObject(node) if !super::is_supported_json_object_profile(node) => {
-                    self.0 = Some((
+                    self.0 = Some(AnalyzeError::unsupported_expression(
                         "JSON_OBJECT clauses are not supported by the existing function",
                         node.span,
                     ));
                 }
                 Expr::JsonArray(node) if !super::is_supported_json_array_profile(node) => {
-                    self.0 = Some((
+                    self.0 = Some(AnalyzeError::unsupported_expression(
                         "JSON_ARRAY clauses are not supported by the existing function",
                         node.span,
                     ));
                 }
                 Expr::JsonQuery(node) if !super::is_plain_json_query(node) => {
-                    self.0 = Some((
+                    self.0 = Some(AnalyzeError::unsupported_expression(
                         "JSON_QUERY only supports its plain two-argument profile",
                         node.span,
                     ));
@@ -159,13 +177,14 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
             if self.0.is_some() {
                 return;
             }
-            if matches!(
-                data_type.kind,
-                novarocks_parser::ast::TypeKind::ExplicitArray(_)
-            ) {
-                self.0 = Some(("explicit ARRAY lengths are not supported", data_type.span));
-            } else {
-                novarocks_parser::ast::walk_type_name(self, data_type);
+            match &data_type.kind {
+                ast::TypeKind::ExplicitArray(_) => {
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "explicit ARRAY lengths are not supported",
+                        data_type.span,
+                    ));
+                }
+                _ => novarocks_parser::ast::walk_type_name(self, data_type),
             }
         }
         fn visit_literal(&mut self, literal: &novarocks_parser::ast::Literal) {
@@ -173,10 +192,15 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 return;
             }
             match &literal.kind {
-                LiteralKind::Generic(value)
-                    if !crate::literal::is_supported_generic_literal(value) =>
-                {
-                    self.0 = Some(("generic literal type is not supported", literal.span))
+                LiteralKind::Generic(value) => {
+                    let rejected =
+                        novarocks_expression::typing::declaration::validate_typed_string_type_name(
+                            &value.type_name,
+                            literal.span,
+                        );
+                    if let Err(error) = rejected {
+                        self.0 = Some(super::helpers::type_declaration_error(error));
+                    }
                 }
                 _ => novarocks_parser::ast::walk_literal(self, literal),
             }
@@ -186,7 +210,10 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 return;
             }
             if period.start.is_some() || period.end.is_none() {
-                self.0 = Some(("query period requires only an end expression", period.span));
+                self.0 = Some(AnalyzeError::unsupported_expression(
+                    "query period requires only an end expression",
+                    period.span,
+                ));
             } else {
                 ast::walk_query_period(self, period);
             }
@@ -199,25 +226,46 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                 ast::Relation::Aliased(node)
                     if node.column_names.as_ref().is_some_and(Vec::is_empty) =>
                 {
-                    self.0 = Some(("empty relation column aliases are not supported", node.span))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "empty relation column aliases are not supported",
+                        node.span,
+                    ))
                 }
                 ast::Relation::Table(node) if node.branch.is_some() => {
-                    self.0 = Some(("table branches in FROM are not supported", node.span))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "table branches in FROM are not supported",
+                        node.span,
+                    ))
                 }
                 ast::Relation::JsonTable(_) => {
-                    self.0 = Some(("JSON_TABLE is not supported", relation.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "JSON_TABLE is not supported",
+                        relation.span(),
+                    ))
                 }
                 ast::Relation::Sampled(_) => {
-                    self.0 = Some(("TABLESAMPLE is not supported", relation.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "TABLESAMPLE is not supported",
+                        relation.span(),
+                    ))
                 }
                 ast::Relation::Pivot(_) => {
-                    self.0 = Some(("PIVOT is not supported", relation.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "PIVOT is not supported",
+                        relation.span(),
+                    ))
                 }
                 ast::Relation::Nearest(_) => {
-                    self.0 = Some(("NEAREST is not supported", relation.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "NEAREST is not supported",
+                        relation.span(),
+                    ))
                 }
                 ast::Relation::PatternRecognition(_) => {
-                    self.0 = Some(("MATCH_RECOGNIZE is not supported", relation.span()))
+                    self.0 = Some(AnalyzeError::unsupported_expression(
+                        "MATCH_RECOGNIZE is not supported",
+                        relation.span(),
+                    ))
                 }
                 ast::Relation::TableFunction(node)
                     if !node.copartitioning.is_empty()
@@ -228,7 +276,7 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
                             )
                         }) =>
                 {
-                    self.0 = Some((
+                    self.0 = Some(AnalyzeError::unsupported_expression(
                         "table function argument profile is not supported",
                         node.span,
                     ))
@@ -240,7 +288,7 @@ fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> 
     let mut visitor = UnsupportedSyntax::default();
     visitor.visit_query(query);
     match visitor.0 {
-        Some((message, span)) => Err(AnalyzeError::unsupported_expression(message, span)),
+        Some(error) => Err(error),
         None => Ok(()),
     }
 }

@@ -20,6 +20,7 @@
 //! The request's function catalog owns conversion selection. This module does
 //! not infer identity from carriers or install execution implementations.
 
+use arrow::datatypes::DataType;
 use novarocks_parser::Span;
 use novarocks_type_contract::{
     FunctionValueType, PureCompileControl, preserves_value_domains_observed,
@@ -29,46 +30,44 @@ use crate::analysis::{ExprKind, LiteralValue, TypedExpr, function_argument};
 use crate::analyze_error::AnalyzeError;
 
 impl super::AnalyzerContext<'_> {
-    /// An explicit array conversion retains the independently analyzed source and
-    /// complete declared target, even for identity and NULL inputs. Preparation
-    /// remains the capability author; this validates only the boundary facts.
-    pub(super) fn cast_explicit_array_to_value_type(
+    pub(super) fn require_boolean_predicate(
+        &self,
+        source: TypedExpr,
+        clause: &str,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        match source.value_type.data_type() {
+            DataType::Boolean => Ok(source),
+            DataType::Null => self.coerce_common_value(
+                source,
+                &FunctionValueType::new(DataType::Boolean, true),
+                span,
+            ),
+            actual => Err(AnalyzeError::type_mismatch(
+                format!("{clause} requires a boolean expression, got {actual:?}"),
+                span,
+            )),
+        }
+    }
+
+    pub(super) fn cast_with_trino_mode(
         &self,
         source: TypedExpr,
         target: FunctionValueType,
-        mode: novarocks_type_contract::ArrayCastFailureMode,
+        mode: novarocks_type_contract::TrinoCastMode,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
-        super::helpers::validate_value_type(&source.value_type, self.control)?;
-        super::helpers::validate_value_type(&target, self.control)?;
-        self.control
-            .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
-            .map_err(AnalyzeError::control)?;
-        if !novarocks_type_contract::array_cast_mode_types_valid_observed(
-            &source.value_type,
-            &target,
+        cast_with_trino_mode(
+            source,
+            target,
             mode,
-            || {
-                self.control
-                    .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
-            },
+            span,
+            self.function_catalog,
+            &self.sql_semantics,
+            self.constant_policy,
+            self.control,
+            self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
         )
-        .map_err(AnalyzeError::control)?
-        {
-            return Err(AnalyzeError::unsupported_expression(
-                "invalid explicit array CAST boundary",
-                span,
-            ));
-        }
-        Ok(TypedExpr {
-            kind: ExprKind::Cast {
-                expr: novarocks_parser::ast::AstBox::new(source),
-                target: target.data_type().clone(),
-                decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                array_failure_mode: Some(mode),
-            },
-            value_type: target,
-        })
     }
 
     /// Preserve ordinary carrier CASTs, but select the exact conversion owner
@@ -90,6 +89,69 @@ impl super::AnalyzerContext<'_> {
             self.control,
         )
     }
+}
+
+pub(super) fn cast_with_trino_mode(
+    source: TypedExpr,
+    target: FunctionValueType,
+    mode: novarocks_type_contract::TrinoCastMode,
+    span: Span,
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    settings: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn PureCompileControl,
+    forbid_time_dependencies: bool,
+) -> Result<TypedExpr, AnalyzeError> {
+    use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
+
+    super::helpers::validate_value_type(&source.value_type, control)?;
+    super::helpers::validate_value_type(&target, control)?;
+    if source.value_type.value_type().temporal().is_some()
+        || target.value_type().temporal().is_some()
+    {
+        return super::expression_typing::authored_temporal_cast(
+            catalog,
+            settings,
+            constant_policy,
+            control,
+            source,
+            target,
+            mode == novarocks_type_contract::TrinoCastMode::Try,
+            span,
+            forbid_time_dependencies,
+        );
+    }
+    let nullable =
+        PreparedCastRecipe::trino_result_nullable(&source.value_type, &target, mode, control)
+            .map_err(|error| {
+                if let Some(cause) = error.control_error() {
+                    return AnalyzeError::control(cause);
+                }
+                let message = format!(
+                    "Cannot cast {:?} to {:?}: {error}",
+                    source.value_type.value_type().kind(),
+                    target.value_type().kind(),
+                );
+                match error {
+                    CastPrepareError::Illegal => AnalyzeError::type_mismatch(message, span),
+                    CastPrepareError::Unsupported => {
+                        AnalyzeError::unsupported_expression(message, span)
+                    }
+                    _ => AnalyzeError::internal(message),
+                }
+            })?;
+    let target = target
+        .with_nullable(nullable)
+        .map_err(|error| AnalyzeError::internal(error.to_string()))?;
+    Ok(TypedExpr {
+        kind: ExprKind::Cast {
+            expr: novarocks_parser::ast::AstBox::new(source),
+            target: target.data_type().clone(),
+            decimal_overflow_policy: settings.sql_mode().decimal_overflow_policy(),
+            cast_mode: Some(mode),
+        },
+        value_type: target,
+    })
 }
 
 /// The sole assignment/CAST conversion author, also consumed by exact internal
@@ -154,7 +216,7 @@ pub(super) fn cast_to_value_type(
         // including JSON children; it is not a same-shape domain bridge.
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 target: target.data_type().clone(),
                 expr: novarocks_parser::ast::AstBox::new(source),
                 decimal_overflow_policy: sql_semantics.sql_mode().decimal_overflow_policy(),
@@ -303,7 +365,7 @@ pub(super) fn convert_value_domain_with_catalog(
     } else {
         Ok(TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(converted),
                 target: target.data_type().clone(),
                 decimal_overflow_policy,

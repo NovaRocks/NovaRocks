@@ -403,6 +403,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
                     constants.boolean(true, &ty(DataType::Boolean, false));
                 parts.definitions[root.get() as usize].ty = ty(DataType::Int64, true);
                 parts.definitions[root.get() as usize].kind = ExprKind::Case {
+                    ieee_float_equality: false,
                     operand: None,
                     when_then: Box::from([(left, right)]),
                     else_expr: None,
@@ -617,6 +618,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
             node,
             ty(DataType::Int64, true),
             ExprKind::Case {
+                ieee_float_equality: false,
                 operand: None,
                 when_then: Box::from([(condition, value)]),
                 else_expr: None,
@@ -2425,6 +2427,20 @@ fn intrinsic_package_fixture(
             },
         )
         .unwrap();
+    let arithmetic = builder
+        .define(
+            node,
+            ty(DataType::Int64, false),
+            ExprKind::Binary {
+                left: arithmetic,
+                op: BinaryOperator::Add,
+                right,
+                decimal_overflow_policy:
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                allow_throw_exception: Some(intrinsic_reference(u32::MAX)),
+            },
+        )
+        .unwrap();
     let cast = builder
         .define(
             node,
@@ -2432,10 +2448,7 @@ fn intrinsic_package_fixture(
             ExprKind::Cast {
                 expr: arithmetic,
                 target: DataType::Int64,
-                decimal_overflow_policy:
-                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: intrinsic_reference(u32::MAX),
-                array_failure_mode: None,
+                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
             },
         )
         .unwrap();
@@ -2601,18 +2614,12 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
 fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
     let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
     let input = intrinsic_package_fixture(&mut constants);
-    for mutation in 0..3 {
+    for mutation in 0..2 {
         let error = candidate_fixture_unit(&input.fragment, input.fragment.root(), |parts| {
             let expression = parts
                 .definitions
                 .iter_mut()
-                .find(|expression| {
-                    if mutation == 2 {
-                        matches!(expression.kind, ExprKind::Cast { .. })
-                    } else {
-                        matches!(expression.kind, ExprKind::Binary { .. })
-                    }
-                })
+                .find(|expression| matches!(expression.kind, ExprKind::Binary { .. }))
                 .unwrap();
             match &mut expression.kind {
                 ExprKind::Binary {
@@ -2627,10 +2634,6 @@ fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
                         })
                     }
                 },
-                ExprKind::Cast {
-                    allow_throw_exception,
-                    ..
-                } => allow_throw_exception.expected_key = SemanticParameterKey::TimeZone,
                 _ => unreachable!(),
             }
         })

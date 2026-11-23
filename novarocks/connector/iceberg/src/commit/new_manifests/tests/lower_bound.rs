@@ -167,6 +167,11 @@ async fn compact_bound_is_below_physical_avro_for_supported_contents_and_widths(
                         let file = written_file_with_historical_partition(&value, &metadata, None)
                             .unwrap();
                         let file = crate::commit::data_file::into_written_file(file).unwrap();
+                        if content == ManifestContentType::Data {
+                            let backing = rewrite_file_backing(&value, &metadata).unwrap();
+                            assert_eq!(backing.partition, 0);
+                            assert_eq!(backing.file, decoded_file_clone_bytes(&file).unwrap());
+                        }
                         files.push(ManifestEntryWrite::Added(
                             AddedContent::new_logical_data(file, 0).unwrap(),
                         ));

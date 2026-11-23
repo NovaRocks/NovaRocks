@@ -24,7 +24,7 @@
 DROP TABLE IF EXISTS ${case_db}.sqlx2_delete_unsupported_predicate ;
 CREATE TABLE ${case_db}.sqlx2_delete_unsupported_predicate (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.sqlx2_delete_unsupported_predicate VALUES ROW(1, 'alpha');
 
