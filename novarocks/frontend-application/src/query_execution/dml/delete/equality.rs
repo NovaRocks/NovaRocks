@@ -1360,6 +1360,9 @@ pub(in crate::query_execution) mod tests {
 
     #[test]
     fn build_equality_delete_sink_query_projects_typed_values() {
+        use novarocks_parser::ast::{SelectItem, SetExpr, SyntaxEq};
+        use novarocks_parser::parser::parse_expression;
+
         let table = plain_table();
         let columns = vec!["id".to_string(), "category".to_string()];
         let rows = vec![
@@ -1382,29 +1385,26 @@ pub(in crate::query_execution) mod tests {
         let raw_rows = parsed_rows("VALUES (2, 'B'), (4, NULL)");
         let query = super::build_equality_delete_sink_query(&fields, &raw_rows).expect("query");
         assert_sink_rows(&query, &raw_rows);
-        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        for (item, name, ty) in select
-            .projection
-            .iter()
-            .zip(["id", "category"])
-            .zip(["INT", "STRING"])
-            .map(|((item, name), ty)| (item, name, ty))
-        {
-            let novarocks_parser::ast::SelectItem::SingleColumn(single_column) = item else {
+        let expected = [
+            ("id", r#"CAST("__nr_eqdel"."id" AS INT)"#),
+            ("category", r#"CAST("__nr_eqdel"."category" AS VARCHAR)"#),
+        ];
+        assert_eq!(select.projection.len(), expected.len());
+        for (item, (name, cast_sql)) in select.projection.iter().zip(expected) {
+            let SelectItem::SingleColumn(single_column) = item else {
                 panic!("typed equality-key projection");
             };
-            let Some(alias) = &single_column.alias else {
-                panic!("typed equality-key projection");
-            };
-            let novarocks_parser::ast::Expr::Cast(cast) = &single_column.expression else {
-                panic!("typed equality-key projection");
-            };
-
+            let alias = single_column.alias.as_ref().expect("equality key alias");
+            assert!(alias.quoted);
             assert_eq!(alias.value, name);
+            let expected_cast = parse_expression(cast_sql).expect("equality key cast");
             assert!(
-                matches!(&cast.data_type.kind, novarocks_parser::ast::TypeKind::Generic(generic) if generic.name.value == ty)
+                single_column.expression.syntax_eq(&expected_cast),
+                "unexpected projection for {name}: {:?}",
+                single_column.expression
             );
         }
     }
