@@ -36,10 +36,10 @@ use crate::{
     FunctionBindingResolverOwner, FunctionBindingSelection, FunctionCatalogError,
     FunctionDefinition, FunctionEffectOwner, FunctionEffectOwnerError, FunctionFailureBehavior,
     FunctionId, FunctionIntrinsicRowError, FunctionKind, FunctionOverloadDeclaration,
-    FunctionOverloadId, FunctionResultType, FunctionValueType, FunctionVisibility,
-    FunctionVolatility, KernelFailure, PreparedScalarKernel, PureFunctionMetadataOwner,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PureScalarImplementation,
-    ScalarCallContract,
+    FunctionOverloadId, FunctionPublicSignature, FunctionResultType, FunctionValueType,
+    FunctionVisibility, FunctionVolatility, KernelFailure, PreparedScalarKernel,
+    PureFunctionMetadataOwner, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    PureScalarImplementation, ScalarCallContract,
 };
 
 pub(super) fn definition(
@@ -104,6 +104,32 @@ fn operator_definition(
     };
     let declaration = FunctionBindingDeclaration::try_new(id, FunctionKind::Scalar, overloads)
         .map_err(declaration_error)?;
+    let declaration = if visibility == FunctionVisibility::Public {
+        let forms = declaration
+            .overloads()
+            .iter()
+            .map(|overload| {
+                let arguments = overload
+                    .argument_pattern
+                    .strip_prefix('(')
+                    .and_then(|value| value.strip_suffix(')'))
+                    .expect("the remainder author declares parenthesized arguments");
+                (
+                    overload.identity.clone(),
+                    vec![FunctionPublicSignature::new(
+                        arguments,
+                        overload.result_pattern.as_ref(),
+                        "",
+                    )],
+                )
+            })
+            .collect::<Vec<_>>();
+        declaration
+            .with_public_signatures(forms)
+            .map_err(declaration_error)?
+    } else {
+        declaration
+    };
     let implementation =
         PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
     let implementations = declaration
