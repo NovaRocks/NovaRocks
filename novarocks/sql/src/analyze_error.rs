@@ -75,6 +75,11 @@ const INVALID_LITERAL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const NUMERIC_OUT_OF_RANGE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.numeric_out_of_range"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INVALID_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.invalid_argument"),
     phase: ErrorPhase::Analyze,
@@ -179,6 +184,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     FUNCTION_NOT_AGGREGATE,
     EXPRESSION_NOT_SCALAR,
     INVALID_LITERAL,
+    NUMERIC_OUT_OF_RANGE,
     INVALID_ARGUMENT,
     MISSING_ARGUMENT,
     INVALID_FUNCTION_ARGUMENT,
@@ -212,6 +218,7 @@ pub enum AnalyzeErrorKind {
     FunctionNotAggregate,
     ExpressionNotScalar,
     InvalidLiteral,
+    NumericOutOfRange,
     InvalidArgument,
     MissingArgument,
     InvalidFunctionArgument,
@@ -247,6 +254,7 @@ impl AnalyzeErrorKind {
             Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
             Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
             Self::InvalidLiteral => INVALID_LITERAL,
+            Self::NumericOutOfRange => NUMERIC_OUT_OF_RANGE,
             Self::InvalidArgument => INVALID_ARGUMENT,
             Self::MissingArgument => MISSING_ARGUMENT,
             Self::InvalidFunctionArgument => INVALID_FUNCTION_ARGUMENT,

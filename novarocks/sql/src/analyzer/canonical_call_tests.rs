@@ -18,11 +18,11 @@
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{ConstantPolicy, FunctionArgumentType, FunctionResultType};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
-    PureCompileControl, ValueLogicalType,
+    PureCompileControl, TemporalPrecision, TemporalType, ValueLogicalType,
 };
 use novarocks_types::schema::{ColumnDef, SqlType};
 
@@ -148,108 +148,66 @@ fn assert_bound(
 }
 
 #[test]
-fn canonical_named_day_calls_keep_four_units_zones_and_source_fvt() {
-    let mut carriers = vec![DataType::Date32];
-    for unit in [
-        TimeUnit::Second,
-        TimeUnit::Millisecond,
-        TimeUnit::Microsecond,
-        TimeUnit::Nanosecond,
-    ] {
-        for zone in [None, Some("UTC".into())] {
-            carriers.push(DataType::Timestamp(unit, zone));
+fn canonical_date_add_retains_the_precise_source_type() {
+    let mut sources = vec![(DataType::Date32, None)];
+    for precision in [0, 3, 6, 9, 12] {
+        let precision = TemporalPrecision::new(precision).unwrap();
+        for temporal in [
+            TemporalType::Time(precision),
+            TemporalType::TimeWithTimeZone(precision),
+            TemporalType::Timestamp(precision),
+            TemporalType::TimestampWithTimeZone(precision),
+        ] {
+            sources.push((temporal.carrier(), Some(SqlType::Temporal(temporal))));
         }
     }
-    for carrier in carriers {
+    for (carrier, logical) in sources {
         for nullable in [false, true] {
             let source = SourceCatalog {
                 carrier: carrier.clone(),
-                logical: None,
+                logical: logical.clone(),
                 nullable,
             };
-            let target = if carrier == DataType::Date32 {
-                DataType::Date32
-            } else {
-                DataType::Timestamp(TimeUnit::Microsecond, None)
-            };
-            let args = [
-                FunctionValueType::new(
-                    target.clone(),
-                    nullable
-                        || matches!(
-                            carrier,
-                            DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, _)
-                        ),
-                ),
-                // Explicit SQL CAST authors nullable=true before this helper.
-                FunctionValueType::new(DataType::Int64, true),
-            ];
-            let result = FunctionValueType::new(target.clone(), true);
-            let sql = "SELECT days_add(x,CAST(5 AS INT)), days_sub(x,CAST(5 AS INT)) FROM temporal_source";
-            let query = analyze(sql, &source, crate::constant::test_constant_policy()).unwrap();
-            for (ordinal, name) in [(0, "days_add"), (1, "days_sub")] {
-                let expression = project(&query, ordinal);
-                assert_bound(expression, name, &args, &result);
-                let date = &call(expression).2[0];
-                if carrier != target {
-                    let ExprKind::Cast {
-                        cast_mode: None,
-                        expr,
-                        target: cast_target,
-                        decimal_overflow_policy,
-                    } = &date.kind
-                    else {
-                        panic!("canonical temporal cast");
-                    };
-                    assert_eq!(
-                        expr.value_type,
-                        FunctionValueType::new(carrier.clone(), nullable)
-                    );
-                    assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
-                    assert_eq!(cast_target, &target);
-                    assert_eq!(
-                        *decimal_overflow_policy,
-                        call(expression).1.decimal_overflow_policy()
-                    );
-                } else {
-                    assert!(matches!(date.kind, ExprKind::ColumnRef { .. }));
-                }
-            }
+            let query = analyze(
+                "SELECT x, date_add('day', CAST(5 AS INTEGER), x) FROM temporal_source",
+                &source,
+                crate::constant::test_constant_policy(),
+            )
+            .unwrap();
+            let input = &project(&query, 0).value_type;
+            let shifted = project(&query, 1);
+            let (_, _, args) = call(shifted);
+            assert_eq!(input.data_type(), &carrier);
+            assert_eq!(input.nullable(), nullable);
+            assert!(matches!(args[2].kind, ExprKind::ColumnRef { .. }));
+            assert_bound(
+                shifted,
+                "date_add",
+                &[
+                    args[0].value_type.clone(),
+                    FunctionValueType::new(DataType::Int64, false),
+                    input.clone(),
+                ],
+                input,
+            );
         }
     }
 }
 
 #[test]
-fn canonical_named_day_calls_inherit_root_policy_and_preserve_nullable_sources() {
+fn canonical_date_add_inherits_root_policy_and_preserves_nullable_sources() {
     use DecimalOverflowPolicy::{OutputNull, ReportError};
+    let temporal = TemporalType::TimestampWithTimeZone(TemporalPrecision::new(9).unwrap());
     let source = SourceCatalog {
-        carrier: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-        logical: None,
+        carrier: temporal.carrier(),
+        logical: Some(SqlType::Temporal(temporal)),
         nullable: true,
     };
     for (outer, outer_policy) in [("ERROR_IF_OVERFLOW", ReportError), ("32", OutputNull)] {
         let sql = format!(
-            "WITH SESSION sql_mode = '{outer}' SELECT days_add(q.x,CAST(1 AS INT)), days_sub(q.x,CAST(1 AS INT)) FROM (SELECT x,days_sub(x,CAST(1 AS INT)) AS shifted FROM temporal_source) q"
+            "WITH SESSION sql_mode = '{outer}' SELECT date_add('day', CAST(1 AS BIGINT), q.x) FROM (SELECT x,date_add('day', CAST(-1 AS BIGINT), x) AS shifted FROM temporal_source) q"
         );
-        // The admitted root policy also governs expressions in the derived query.
         let query = analyze(&sql, &source, crate::constant::test_constant_policy()).unwrap();
-        for ordinal in [0, 1] {
-            let (_, binding, args) = call(project(&query, ordinal));
-            assert_eq!(binding.decimal_overflow_policy(), outer_policy);
-            let ExprKind::Cast {
-                expr,
-                decimal_overflow_policy,
-                ..
-            } = &args[0].kind
-            else {
-                panic!("source cast");
-            };
-            assert_eq!(*decimal_overflow_policy, outer_policy);
-            assert_eq!(
-                expr.value_type,
-                FunctionValueType::new(source.carrier.clone(), true)
-            );
-        }
         let QueryBody::Select(select) = &query.body else {
             panic!("select");
         };
@@ -259,35 +217,34 @@ fn canonical_named_day_calls_inherit_root_policy_and_preserve_nullable_sources()
         else {
             panic!("subquery");
         };
-        let (_, binding, args) = call(project(inner_query, 1));
-        assert_eq!(binding.decimal_overflow_policy(), outer_policy);
-        let ExprKind::Cast {
-            decimal_overflow_policy,
-            ..
-        } = &args[0].kind
-        else {
-            panic!("source cast");
-        };
-        assert_eq!(*decimal_overflow_policy, outer_policy);
+        for expression in [project(&query, 0), project(inner_query, 1)] {
+            let (_, binding, args) = call(expression);
+            assert_eq!(binding.decimal_overflow_policy(), outer_policy);
+            let ExprKind::Cast {
+                decimal_overflow_policy,
+                ..
+            } = &args[1].kind
+            else {
+                panic!("original explicit offset cast");
+            };
+            assert_eq!(*decimal_overflow_policy, outer_policy);
+            assert_eq!(args[2].value_type.data_type(), &source.carrier);
+            assert!(args[2].value_type.nullable());
+            assert_eq!(expression.value_type, args[2].value_type);
+        }
     }
-    // An explicitly typed NULL retains the named function's argument contract.
+
     let query = analyze(
-        "SELECT days_add(CAST(NULL AS DATETIME),1), days_sub(CAST(NULL AS DATETIME),1)",
+        "SELECT CAST(NULL AS TIMESTAMP(6)), date_add('day', 1, CAST(NULL AS TIMESTAMP(6)))",
         &source,
         crate::constant::test_constant_policy(),
     )
     .unwrap();
-    for (ordinal, name) in [(0, "days_add"), (1, "days_sub")] {
-        assert_bound(
-            project(&query, ordinal),
-            name,
-            &[
-                FunctionValueType::new(DataType::Timestamp(TimeUnit::Microsecond, None), true),
-                FunctionValueType::new(DataType::Int64, false),
-            ],
-            &FunctionValueType::new(DataType::Timestamp(TimeUnit::Microsecond, None), true),
-        );
-    }
+    let null = &project(&query, 0).value_type;
+    let shifted = project(&query, 1);
+    assert!(null.nullable());
+    assert_eq!(&call(shifted).2[2].value_type, null);
+    assert_eq!(&shifted.value_type, null);
 }
 
 #[test]
@@ -516,7 +473,7 @@ fn canonical_resolved_helper_materializes_text_and_preserves_success_error_contr
             assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::ReportError);
         } else {
             let error = result.unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
             assert_eq!(error.span(), Some(span));
         }
         let trace = good.callbacks.lock().unwrap().clone();

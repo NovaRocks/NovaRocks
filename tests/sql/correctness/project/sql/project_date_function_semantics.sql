@@ -17,13 +17,7 @@
 
 -- @order_sensitive=true
 -- @tags=project,date
--- Test Objective:
--- 1. Validate date/time scalar semantics for coercion, boundary handling, and null propagation.
--- 2. Guard regressions for hour_from_unixtime, makedate, microseconds_add/sub, time_format, and years_diff.
--- Test Flow:
--- 1. Execute one deterministic projection over constant literals.
--- 2. Assert exact scalar outputs and nullability.
+-- Complete years across a leap-day boundary, in both directions.
 SELECT
-
-  YEARS_DIFF('2026-02-28', '2024-02-29') AS years_diff_v,
-  YEARS_DIFF('2024-02-29', '2026-02-28') AS years_diff_neg_v;
+  date_diff('year', DATE '2024-02-29', DATE '2026-02-28') AS years_diff_v,
+  date_diff('year', DATE '2026-02-28', DATE '2024-02-29') AS years_diff_neg_v;

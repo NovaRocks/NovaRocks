@@ -95,36 +95,7 @@ pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, Unsuppor
             };
             (name, vec![&node.trim_source])
         }
-        Expr::Extract(node) => {
-            let name = match node.field {
-                ExtractField::Year => "year",
-                ExtractField::Month => "month",
-                ExtractField::Day => "day",
-                ExtractField::Hour => "hour",
-                ExtractField::Minute => "minute",
-                ExtractField::Second => "second",
-                field @ (ExtractField::Quarter
-                | ExtractField::Week
-                | ExtractField::DayOfMonth
-                | ExtractField::DayOfWeek
-                | ExtractField::Dow
-                | ExtractField::DayOfYear
-                | ExtractField::Doy
-                | ExtractField::YearOfWeek
-                | ExtractField::Yow
-                | ExtractField::TimezoneMinute
-                | ExtractField::TimezoneHour) => {
-                    return Err(UnsupportedCallSyntax::new(
-                        format!(
-                            "unsupported EXTRACT field: {}",
-                            field.as_str().to_ascii_lowercase()
-                        ),
-                        span,
-                    ));
-                }
-            };
-            (name, vec![&node.expression])
-        }
+        Expr::Extract(node) => (extract_call_name(node.field), vec![&node.expression]),
         _ => return Ok(None),
     };
     Ok(Some(CanonicalCall {
@@ -132,4 +103,24 @@ pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, Unsuppor
         arguments,
         span,
     }))
+}
+
+/// The scalar identity associated with the parsed EXTRACT field.
+pub fn extract_call_name(field: ExtractField) -> &'static str {
+    match field {
+        ExtractField::Year => "year",
+        ExtractField::Quarter => "quarter",
+        ExtractField::Month => "month",
+        ExtractField::Day => "day",
+        ExtractField::DayOfMonth => "day_of_month",
+        ExtractField::DayOfWeek | ExtractField::Dow => "day_of_week",
+        ExtractField::DayOfYear | ExtractField::Doy => "day_of_year",
+        ExtractField::Week => "week",
+        ExtractField::YearOfWeek | ExtractField::Yow => "__extract_year_of_week",
+        ExtractField::Hour => "hour",
+        ExtractField::Minute => "minute",
+        ExtractField::Second => "second",
+        ExtractField::TimezoneHour => "__extract_timezone_hour",
+        ExtractField::TimezoneMinute => "__extract_timezone_minute",
+    }
 }

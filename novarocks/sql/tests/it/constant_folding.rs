@@ -17,7 +17,9 @@
 
 //! Optional folding through ordinary SQL completion.
 
-use crate::fixtures::{compile_table_free, expression_sources, session, text};
+use crate::fixtures::{
+    compile_table_free, expression_sources, session, table_free_request_with_constant_policy, text,
+};
 use crate::fold_observation::FoldProbe;
 use arrow::array::Decimal128Array;
 use arrow::datatypes::DataType;
@@ -105,6 +107,55 @@ fn folds_date_format_and_utf8_to_date32_through_real_kernels() {
         })
         .unwrap();
     assert_eq!(text(formatted.result.as_ref().unwrap()), "2020-01-01");
+}
+
+#[test]
+fn date_format_keeps_a_successful_output_that_exceeds_the_optional_fold_limit() {
+    const FORMAT: &str = "builtin.scalar/date_format/v1";
+    let sql = format!(
+        "SELECT date_format(TIMESTAMP '2024-09-01 12:00:00.000', '{}')",
+        "%M".repeat(96)
+    );
+    let expected = "September".repeat(96);
+    let small_policy = novarocks_functions::ConstantPolicy {
+        max_retained_buffer_bytes: 512,
+        ..sql_fixture_constant_policy()
+    };
+
+    let fold = Arc::new(FoldProbe::default());
+    let control = fold.control();
+    let owner = table_free_request_with_constant_policy(
+        &sql,
+        session(Default::default(), true),
+        &control,
+        small_policy,
+    )
+    .try_into_completion()
+    .unwrap();
+    let owner = novarocks_sql::compiler::SqlCompiler::start(owner, &control)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .into_plan();
+    let receipts = fold.receipts.lock().unwrap();
+    let attempted = receipts
+        .iter()
+        .find(|receipt| receipt.is_call(FORMAT))
+        .unwrap();
+    assert!(attempted.result.is_none());
+    assert!(expression_sources(&owner).any(|(_, _, node)| {
+        matches!(&node.kind, ExprKind::FunctionCall { function, .. }
+            if function.function_id.as_str() == FORMAT)
+    }));
+
+    let normal = Arc::new(FoldProbe::default());
+    compile(&sql, &normal);
+    let receipts = normal.receipts.lock().unwrap();
+    let fully_folded = receipts
+        .iter()
+        .find(|receipt| receipt.is_call(FORMAT))
+        .unwrap();
+    assert_eq!(text(fully_folded.result.as_ref().unwrap()), expected);
 }
 
 fn decimal_coefficient(value: &ConstantValue) -> i128 {

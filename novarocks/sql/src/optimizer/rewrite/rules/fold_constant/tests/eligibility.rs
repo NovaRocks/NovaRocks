@@ -134,7 +134,7 @@ fn does_not_fold_distinct_function_call() {
 
 #[test]
 fn does_not_fold_denylisted_function_even_when_marked_immutable() {
-    for name in ["from_unixtime", "FROM_UNIXTIME", "now"] {
+    for name in ["get_variant_date", "GET_VARIANT_DATE", "get_variant_time"] {
         let mut fixture = Fixture::new();
         let one = fixture.int_literal(1);
         let call = fixture.function_call(

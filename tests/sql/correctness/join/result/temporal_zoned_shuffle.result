@@ -1,5 +1,5 @@
--- query 12
--- types	integer	integer	varchar	varchar
-probe_id	build_id	probe_zone	build_zone
-1	101	1970-01-01 07:59:59.999999999 Asia/Shanghai	1969-12-31 23:59:59.999999999 UTC
-2	102	2024-01-01 08:00:00.000000001 Asia/Shanghai	2024-01-01 00:00:00.000000001 UTC
+-- query 13
+-- types	integer	integer	varchar	varchar	double	boolean
+probe_id	build_id	probe_zone	build_zone	probe_epoch	same_statement_clock
+1	101	1970-01-01 07:59:59.999999999 Asia/Shanghai	1969-12-31 23:59:59.999999999 UTC	1.0	true
+2	102	2024-01-01 08:00:00.000000001 Asia/Shanghai	2024-01-01 00:00:00.000000001 UTC	2.0	true
