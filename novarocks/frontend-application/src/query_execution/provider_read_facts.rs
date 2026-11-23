@@ -644,6 +644,9 @@ struct ReadOpening {
     // Keep the original admitted materialization/generation through the
     // request control and Provider facts' actual destruction.
     admitted: AdmittedRead,
+    original_reference: Option<String>,
+    original_table:
+        Option<novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation>,
     name: String,
 }
 
@@ -660,6 +663,8 @@ fn prepare_read_opening(
     // admitted as a materialization; a cohort a provider froze for this
     // request is admitted as its own carrier, because the cohort is the read
     // and nothing could resolve it from a name and a version.
+    let mut original_table = None;
+    let mut original_reference = None;
     let admitted = if let ProviderReadRelationNeed::MvTarget {
         target_table_uuid,
         target_snapshot_id,
@@ -694,6 +699,36 @@ fn prepare_read_opening(
         let binding = bindings.binding(need.binding())?;
         use crate::catalog_application::query_bindings::QueryTableBindingAdmission;
         match &binding.admission {
+            QueryTableBindingAdmission::OriginalTableObservation(_, reference) => {
+                if !matches!(relation, ProviderReadRelationNeed::Data { .. })
+                    || input != QueryFrozenReadInput::Current
+                {
+                    return Err(
+                        "ordinary scan differs from its original Current observation"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                let original = binding.source_metadata.as_ref().ok_or_else(|| {
+                    "ordinary scan lost its original table observation".to_string()
+                })?;
+                let materialization = bindings.frozen_read_input(need.binding(), input)?;
+                if materialization.table != original.table {
+                    return Err("ordinary scan names another original table"
+                        .to_string()
+                        .into());
+                }
+                original_table = Some(
+                    novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation {
+                        table: original.table.clone(),
+                        source: original.source_read_facts().cloned().ok_or_else(|| {
+                            "ordinary scan has no original provider source provenance".to_string()
+                        })?,
+                    },
+                );
+                original_reference = reference.clone();
+                AdmittedRead::Relation(materialization)
+            }
             QueryTableBindingAdmission::RowMutationCurrent(_, source) => {
                 if !matches!(
                     relation,
@@ -794,6 +829,8 @@ fn prepare_read_opening(
     Ok(ReadOpening {
         name,
         admitted,
+        original_table,
+        original_reference,
         planning_pin,
         read,
         request_control,
@@ -850,7 +887,12 @@ async fn prepare_observation(
         *observation = Some(ReadObservation::OriginalPreparedSource);
         return Ok(());
     }
-    let kind = if let AdmittedRead::RowMutationCurrent { source, .. } = &opening.admitted {
+    let kind = if let Some(reference) = &opening.original_reference {
+        K::Table {
+            version: ConnectorReadRelationVersion::Reference,
+            reference: Some(reference.clone()),
+        }
+    } else if let AdmittedRead::RowMutationCurrent { source, .. } = &opening.admitted {
         K::RowMutationCurrent(source.clone())
     } else if let AdmittedRead::RowMutationMatch {
         materialization,
@@ -954,8 +996,11 @@ async fn prepare_observation(
             relation => return Err(unsupported_family(relation).into()),
         }
     };
-    let request =
+    let mut request =
         Request::new(opening.table.clone(), kind).with_filter_offer(!need.predicates().is_empty());
+    if let Some(original) = &opening.original_table {
+        request = request.with_original_table(original.clone());
+    }
     let metadata = opening.request_control.metadata();
     let prepared = metadata
         .prepare_relation(session, &request)
@@ -1050,6 +1095,18 @@ pub(crate) fn observe_delete_target(
     Option<novarocks_spi::connector::read_stack::ConnectorDeleteTargetFacts>,
     ProviderReadError,
 > {
+    observe_delete_target_on_ref(control, original, context, None)
+}
+
+pub(crate) fn observe_delete_target_on_ref(
+    control: &ConnectorControlHost,
+    original: &crate::connector::write_target::ConnectorWriteTargetBinding,
+    context: &ConnectorRequestContext,
+    reference: Option<&str>,
+) -> Result<
+    Option<novarocks_spi::connector::read_stack::ConnectorDeleteTargetFacts>,
+    ProviderReadError,
+> {
     use novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation;
     let Some(source) = original.metadata().source_read_facts() else {
         return Ok(None);
@@ -1057,10 +1114,13 @@ pub(crate) fn observe_delete_target(
     let read = control.typed_read_for_planning_pin(original.planning_pin())?;
     let request = request_control_for(&read, context)?;
     request
-        .observe_delete_target(&ConnectorReadOriginalTableObservation {
-            table: original.handle().clone(),
-            source: source.clone(),
-        })
+        .observe_delete_target_on_ref(
+            &ConnectorReadOriginalTableObservation {
+                table: original.handle().clone(),
+                source: source.clone(),
+            },
+            reference,
+        )
         .map_err(ProviderReadError::from)
 }
 

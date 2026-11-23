@@ -310,6 +310,20 @@ pub struct PreparedDeleteDescription {
     pub(crate) overlay: crate::catalog_application::query_materializer::QueryLocalTableOverlay,
 }
 
+/// Original Root and matching-read inputs for a read-only DELETE explanation.
+pub struct DeleteExplainStatementInput {
+    pub(crate) statement: OwnedDeleteStatement,
+    pub(crate) sql: Arc<str>,
+    pub(crate) context: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) command: novarocks_query_application::api::CommandContext,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) detail: novarocks_query_application::sql::session::ExplainDetail,
+    pub(crate) environment: crate::query::QueryActionEnvironment,
+    pub(crate) family: novarocks_result_contract::ClientPresentationFamily,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+}
+
 /// One-to-one core capability used only by the frontend DML application owner.
 // Design: ADR-0020 (docs/adr/ADR-0020-frontend-delete-application-owner.md)
 #[async_trait::async_trait]
@@ -325,6 +339,13 @@ pub trait DeleteEngine: Send + Sync {
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         crate::catalog_application::resolver::TargetResolutionError,
+    >;
+    fn prepare_explain_action(
+        &self,
+        input: DeleteExplainStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::session_error::QueryServiceError,
     >;
 }
 
@@ -400,5 +421,14 @@ impl DeleteEngine for DmlExecutionKernel {
         crate::catalog_application::resolver::TargetResolutionError,
     > {
         crate::query::delete_action::prepare(self.clone(), input)
+    }
+    fn prepare_explain_action(
+        &self,
+        input: DeleteExplainStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
+        crate::query::prepare_delete_explain(self.clone(), input)
     }
 }

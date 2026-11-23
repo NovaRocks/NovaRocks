@@ -33,7 +33,9 @@ use novarocks_spi::connector::read_stack::{
     Constraint, ConstraintApplicationResult, Domain, LimitApplicationResult, OrderedAssignments,
     ProjectionApplicationResult, SchemaTableName, TupleDomain,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
+};
 
 use crate::iceberg::spec::{PartitionSpec, Schema, Transform, Type};
 use crate::read_snapshot::PreparedReadManifestList;
@@ -207,10 +209,32 @@ pub struct IcebergTableHandleParams {
     pub pinned_data_files: Option<IcebergPinnedDataFileSet>,
 }
 
-/// The original request scope mints this marker for its E read. It has no
-/// storage authority and is absent from every encoded worker handle.
+/// One original unqualified DELETE read. Its immutable list may be consumed
+/// by both the probe and the later matching read under the same request.
 #[derive(Debug, Default)]
-pub(crate) struct OriginalDeleteFilter;
+pub(crate) struct OriginalDeleteFilter {
+    manifest_list: tokio::sync::OnceCell<Arc<PreparedReadManifestList>>,
+}
+
+impl OriginalDeleteFilter {
+    pub(crate) async fn prepare_manifest_list(
+        &self,
+        table: &crate::iceberg::table::Table,
+        snapshot_id: i64,
+        context: &ConnectorRequestContext,
+    ) -> Result<Arc<PreparedReadManifestList>, ConnectorError> {
+        context.check_active()?;
+        let prepared = self
+            .manifest_list
+            .get_or_try_init(|| {
+                PreparedReadManifestList::prepare(table, snapshot_id, Some(context))
+            })
+            .await?;
+        context.check_active()?;
+        prepared.validate_observation(table.metadata(), snapshot_id)?;
+        Ok(Arc::clone(prepared))
+    }
+}
 
 impl PartialEq for OriginalDeleteFilter {
     fn eq(&self, other: &Self) -> bool {

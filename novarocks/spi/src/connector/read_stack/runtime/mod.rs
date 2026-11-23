@@ -942,9 +942,18 @@ impl ConnectorReadRequestControl {
         &self,
         original: &ConnectorReadOriginalTableObservation,
     ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
+        self.observe_delete_target_on_ref(original, None)
+    }
+
+    /// Select a DELETE branch from the same original table observation.
+    pub fn observe_delete_target_on_ref(
+        &self,
+        original: &ConnectorReadOriginalTableObservation,
+        reference: Option<&str>,
+    ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
         match &self.attempt_access {
             ConnectorReadAttemptAccessMode::Provider(sealer) => {
-                sealer.observe_delete_target(original)
+                sealer.observe_delete_target(original, reference)
             }
             _ => Ok(None),
         }
@@ -1059,6 +1068,7 @@ pub trait ConnectorReadAttemptAccessSealer: Send + Sync {
     fn observe_delete_target(
         &self,
         _original: &ConnectorReadOriginalTableObservation,
+        _reference: Option<&str>,
     ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
         Ok(None)
     }

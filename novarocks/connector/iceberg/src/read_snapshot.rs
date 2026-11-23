@@ -347,9 +347,31 @@ impl PreparedReadManifestList {
 
     pub(crate) fn validate(&self, domain: &ReadDomain) -> Result<(), ConnectorError> {
         let endpoint = domain.endpoint();
-        if self.table_uuid != endpoint.table_uuid()
-            || self.metadata_identity != endpoint.metadata_identity()
-            || self.snapshot_id != endpoint.snapshot_id()
+        self.validate_identity(
+            endpoint.table_uuid(),
+            endpoint.metadata_identity(),
+            endpoint.snapshot_id(),
+        )
+    }
+
+    pub(crate) fn validate_observation(
+        &self,
+        metadata: &TableMetadata,
+        snapshot_id: i64,
+    ) -> Result<(), ConnectorError> {
+        let identity = metadata_identity(metadata).map_err(read_snapshot_error)?;
+        self.validate_identity(metadata.uuid(), &identity, snapshot_id)
+    }
+
+    fn validate_identity(
+        &self,
+        table_uuid: uuid::Uuid,
+        metadata_identity: &str,
+        snapshot_id: i64,
+    ) -> Result<(), ConnectorError> {
+        if self.table_uuid != table_uuid
+            || self.metadata_identity != metadata_identity
+            || self.snapshot_id != snapshot_id
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1704,6 +1726,53 @@ mod tests {
                 .err()
                 .unwrap();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn original_delete_probe_and_matching_read_share_one_manifest_list() {
+        use crate::typed_read::table_handle::OriginalDeleteFilter;
+        use novarocks_spi::connector::{
+            ConnectorStopOwner, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        };
+
+        let (table, _) = descriptor_context_table().await;
+        let stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            stop.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let probe = context.request_scope_extension_or_insert_with(OriginalDeleteFilter::default);
+        let first = probe
+            .prepare_manifest_list(&table, 77, &context)
+            .await
+            .unwrap();
+        let manifest_list = table.metadata().snapshot_by_id(77).unwrap().manifest_list();
+        table.file_io().delete(manifest_list).await.unwrap();
+        drop(probe);
+
+        let matching = context.clone();
+        let observation =
+            matching.request_scope_extension_or_insert_with(OriginalDeleteFilter::default);
+        let reused = observation
+            .prepare_manifest_list(&table, 77, &matching)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        let error = observation
+            .prepare_manifest_list(&table, 78, &matching)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            OriginalDeleteFilter::default()
+                .prepare_manifest_list(&table, 77, &context)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

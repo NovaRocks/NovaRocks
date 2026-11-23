@@ -157,7 +157,7 @@ alternative	statement	55	setRole	0	SET ROLE ALL IN cat	parsed-not-supported	acce
 optional	statement	56		1	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	56	showGrants	0	SHOW GRANTS ON BRANCH dev IN TABLE cat.sch.t	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	statement	57		1	EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
-optional	statement	57		2	EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
+optional	statement	57		2	EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) DELETE FROM lake.db.t WHERE part = 1	supported	accept	reviewed-grammar-path	none
 alternative	statement	57	explain	0	EXPLAIN SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
 optional	statement	58		1	EXPLAIN ANALYZE VERBOSE SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none
 alternative	statement	58	explainAnalyze	0	EXPLAIN ANALYZE SELECT 1 AS answer	supported	accept	reviewed-grammar-path	none

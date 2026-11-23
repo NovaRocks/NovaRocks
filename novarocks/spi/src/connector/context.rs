@@ -492,6 +492,7 @@ pub struct ConnectorRequestContext {
     metadata_cpu: Option<Arc<dyn super::ProviderMetadataCpuPort>>,
     io_phase: Option<super::ConnectorIoPermit>,
     io_weak_phase: Option<super::ConnectorIoWeakPhase>,
+    reuse_original_table_preparation: bool,
     fresh_catalog_observation_required: bool,
     initiation: ConnectorRequestInitiation,
 }
@@ -590,9 +591,22 @@ impl ConnectorRequestContext {
             metadata_cpu: None,
             io_phase: None,
             io_weak_phase: None,
+            reuse_original_table_preparation: false,
             fresh_catalog_observation_required: false,
             initiation: ConnectorRequestInitiation::Statement,
         })
+    }
+
+    /// The statement will consume the same observed table in two serial read
+    /// preparations. A provider may keep completed immutable preparation in
+    /// the original request scope under its existing payload receipt.
+    pub fn with_original_table_preparation_reuse(mut self) -> Self {
+        self.reuse_original_table_preparation = true;
+        self
+    }
+
+    pub const fn reuses_original_table_preparation(&self) -> bool {
+        self.reuse_original_table_preparation
     }
 
     /// Explicit same-action capability; never inferred from request extensions.

@@ -31,7 +31,9 @@ use novarocks_sql::compiler::{
     SqlSessionContext,
 };
 
-use crate::catalog_application::query_bindings::{QueryTableBindingKey, QueryTableBindingStore};
+use crate::catalog_application::query_bindings::{
+    QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
+};
 use crate::catalog_application::query_catalog::connector_table_materialization_from_metadata;
 use crate::catalog_application::query_materializer::{
     QueryLocalTableOverlay, connector_query_binding_from_materialization,
@@ -235,9 +237,26 @@ pub(crate) fn original_target_overlay(
     target: &TargetBackend,
     original: &ConnectorWriteTargetBinding,
 ) -> Result<QueryLocalTableOverlay, String> {
+    original_target_overlay_with_read(target, original, None)
+}
+
+pub(crate) fn original_target_explain_overlay(
+    target: &TargetBackend,
+    original: &ConnectorWriteTargetBinding,
+    reference: Option<String>,
+) -> Result<QueryLocalTableOverlay, String> {
+    original_target_overlay_with_read(target, original, Some(reference))
+}
+
+fn original_target_overlay_with_read(
+    target: &TargetBackend,
+    original: &ConnectorWriteTargetBinding,
+    explain_reference: Option<Option<String>>,
+) -> Result<QueryLocalTableOverlay, String> {
+    let planning = original.planning_pin().clone();
     let materialization = connector_table_materialization_from_metadata(
         original.metadata().clone(),
-        original.planning_pin().clone(),
+        planning.clone(),
     )?;
     let identity = target.clone();
     Ok(QueryLocalTableOverlay::for_catalog(
@@ -246,13 +265,22 @@ pub(crate) fn original_target_overlay(
         &target.table,
         QueryTableBindingKey::strict_base(&target.catalog, &target.namespace, &target.table),
         move |id| {
-            connector_query_binding_from_materialization(
+            let mut binding = connector_query_binding_from_materialization(
                 materialization.clone(),
                 &identity.catalog,
                 &identity.namespace,
                 &identity.table,
                 id,
-            )
+            )?;
+            if let Some(reference) = &explain_reference {
+                binding.admission = QueryTableBindingAdmission::OriginalTableObservation(
+                    planning.clone(),
+                    reference.clone(),
+                );
+                // The original Current pin cannot describe the named-branch read.
+                binding.statistics_pin = None;
+            }
+            Ok(binding)
         },
     ))
 }
