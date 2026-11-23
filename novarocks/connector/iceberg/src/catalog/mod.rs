@@ -64,6 +64,7 @@ pub(crate) mod factory;
 pub(crate) mod hadoop;
 pub(crate) mod hive;
 
+mod create_location;
 pub(crate) mod listing_admission;
 pub(crate) mod metadata_read;
 #[cfg(test)]
@@ -194,15 +195,6 @@ pub(crate) enum CatalogCreateIntent {
     /// admission and publication, so the catalog must prove the whole path
     /// before the first side effect.
     CreateTableAsSelect,
-}
-
-impl CatalogCreateIntent {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::EmptyTable => "empty-table",
-            Self::CreateTableAsSelect => "ctas",
-        }
-    }
 }
 
 /// A drop that committed, with the exact identity captured before the drop.
@@ -358,6 +350,42 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         generation: novarocks_spi::connector::ProviderBindingEpoch,
         preparation: novarocks_spi::connector::ConnectorRequestContext,
     ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication>;
+
+    async fn resolve_create_table_location(
+        &self,
+        _table: &CatalogTableName,
+        explicit: Option<String>,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Option<String>, ConnectorError> {
+        Ok(explicit)
+    }
+
+    async fn check_create_table_location(
+        &self,
+        _location: &str,
+        _binding: &crate::access_binding::IcebergReadBinding,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    async fn ordinary_create_table_location(
+        &self,
+        table: &CatalogTableName,
+        explicit: Option<String>,
+        binding: &crate::access_binding::IcebergReadBinding,
+    ) -> Result<Option<String>, ConnectorError> {
+        let namespace = CatalogNamespaceName::new(Arc::clone(&table.namespace));
+        if !self
+            .namespace_exists_for_read(namespace, binding.clone())
+            .await?
+        {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                "Iceberg table namespace does not exist",
+            ));
+        }
+        Ok(explicit)
+    }
 
     /// Freeze one ordinary create using the admitted owner's exact mechanism.
     /// This synchronous boundary builds immutable facts only.

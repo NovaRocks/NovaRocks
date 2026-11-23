@@ -61,7 +61,6 @@ use novarocks_query_application::protocol_delivery::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
     GovernedImmediateStatementResult, QuerySessionOutput as StatementResult,
 };
-use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::serving_admission::{
     FrontendAdmissionError, FrontendServingAdmission,
 };
@@ -928,7 +927,6 @@ pub struct FrontendQueryService {
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
     statement_clock: crate::application::StatementClock,
-    lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     serving_admission: FrontendServingAdmission,
 }
 
@@ -992,7 +990,6 @@ impl FrontendQueryService {
         query_blocking_executor: QueryBlockingExecutor,
         optimizer_query_mem_limit_bytes: u64,
         statement_clock: crate::application::StatementClock,
-        lake_publication_runtime_policy: LakePublicationRuntimePolicy,
         serving_admission: FrontendServingAdmission,
     ) -> Self {
         Self {
@@ -1030,7 +1027,6 @@ impl FrontendQueryService {
             query_blocking_executor,
             optimizer_query_mem_limit_bytes,
             statement_clock,
-            lake_publication_runtime_policy,
             serving_admission,
         }
     }

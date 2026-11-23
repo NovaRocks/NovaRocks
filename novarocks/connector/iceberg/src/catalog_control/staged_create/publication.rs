@@ -698,6 +698,7 @@ mod tests {
                         updates: provenance,
                     }],
                     final_table_location: None,
+                    location_refusal: None,
                     final_metadata_path: None,
                 },
                 policy: CreatePolicy::FailIfExists,

@@ -45,11 +45,6 @@ impl NovaRocksCatalogFactory {
     ) -> Result<Arc<dyn NovaRocksCatalog>, String> {
         let evidence_policy =
             super::publication::CatalogEvidencePolicy::from_properties(&configuration.properties)?;
-        let warehouse: Option<Arc<str>> = if configuration.warehouse_uri.is_empty() {
-            None
-        } else {
-            Some(Arc::from(configuration.warehouse_uri.as_str()))
-        };
         match configuration.kind {
             IcebergCatalogKind::Hadoop => {
                 let hadoop = client.hadoop().cloned().ok_or_else(|| {
@@ -67,7 +62,6 @@ impl NovaRocksCatalogFactory {
                 Ok(Arc::new(
                     super::rest::NovaRocksRestCatalog::new(
                         endpoints,
-                        warehouse,
                         client.rest_access_delegation(),
                     )
                     .with_evidence_policy(evidence_policy),
@@ -100,11 +94,10 @@ impl NovaRocksCatalogFactory {
     #[cfg(test)]
     pub(crate) fn adopt_vended_rest_for_test(
         endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
-        warehouse: &str,
+        _warehouse: &str,
     ) -> Arc<dyn NovaRocksCatalog> {
         Arc::new(super::rest::NovaRocksRestCatalog::new(
             endpoints,
-            Some(Arc::from(warehouse)),
             crate::catalog_runtime::RestAccessDelegationMode::Vended,
         ))
     }

@@ -42,14 +42,11 @@ pub(crate) mod maintenance_error;
 pub(crate) mod metadata_maintenance;
 
 mod orphan_files;
-#[path = "catalog_control/staged_create.rs"]
 pub mod staged_create;
 #[path = "catalog_control/statistics.rs"]
 pub mod statistics;
 #[path = "catalog_control/type_mapping.rs"]
 pub(crate) mod type_mapping;
-#[path = "catalog_control/unanchored_ctas_cleanup.rs"]
-pub(crate) mod unanchored_ctas_cleanup;
 #[path = "catalog_control/views.rs"]
 pub(crate) mod views;
 

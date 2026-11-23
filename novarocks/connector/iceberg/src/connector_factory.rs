@@ -29,7 +29,6 @@ use crate::catalog_control::cleanup_maintenance::IcebergCleanupMaintenanceAdapte
 use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
 use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
-use crate::catalog_control::unanchored_ctas_cleanup::IcebergUnanchoredCtasCleanupAdapter;
 use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::commit::IcebergWriteControl;
 use crate::distributed_rewrite::IcebergDistributedRewriteControl;
@@ -287,20 +286,6 @@ impl IcebergConnectorFactory {
         let staged_create = Some(Arc::new(IcebergStagedCreateAdapter::try_new(Arc::clone(
             &provider,
         ))?));
-        let unanchored_ctas_cleanup = match IcebergUnanchoredCtasCleanupAdapter::try_new(
-            descriptor.clone(),
-            incarnation,
-            Arc::clone(&unpublished.runtime),
-        ) {
-            Ok(capability) => Some(Arc::new(capability)),
-            // Sweeping the unanchored namespace needs a warehouse this
-            // generation can enumerate and delete under. A catalog without one
-            // still attaches for reads and ordinary table operations; CTAS is
-            // what cannot run, and it is refused at admission rather than by a
-            // missing slot here.
-            Err(error) if error.kind() == ConnectorErrorKind::Unsupported => None,
-            Err(error) => return Err(error),
-        };
         let mut binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
                 descriptor.clone(),
                 incarnation,
@@ -316,9 +301,6 @@ impl IcebergConnectorFactory {
                 Some(write_control),
                 Some(provider.clone()),
             )?
-            .try_with_unanchored_ctas_cleanup(unanchored_ctas_cleanup.map(|capability| {
-                capability as Arc<dyn novarocks_spi::connector::ConnectorUnanchoredCtasCleanup>
-            }))?
             .try_with_view_metadata(Some(provider.clone()))?;
         // Desired state, not this FE-local control generation, owns the
         // immutable catalog version. Defer typed-read registration until that
@@ -863,15 +845,6 @@ mod tests {
             creation.binding().staged_create().is_some(),
             "every Iceberg generation installs the staged-create adapter"
         );
-        // The sweeper attaches too, and deliberately does not ask whether this
-        // catalog can CTAS. One that cannot has never staged anything
-        // unanchored, so the sweep finds nothing; gating it here would replace
-        // the catalog's own explanation of why CTAS is impossible with a
-        // generic "no cleanup capability" from the lease derivation.
-        assert!(
-            creation.binding().unanchored_ctas_cleanup().is_some(),
-            "the sweeper attaches wherever its warehouse is usable"
-        );
         let views = creation.binding().view_metadata().expect("view metadata");
         assert_eq!(views.descriptor(), creation.binding().descriptor());
         assert_eq!(views.incarnation(), creation.binding().incarnation());
@@ -1189,12 +1162,8 @@ mod tests {
 
         let creation = factory
             .create_control(request)
-            .expect("REST control without a GC-capable warehouse");
+            .expect("REST control without an explicit warehouse");
         assert!(creation.binding().staged_create().is_some());
-        assert!(
-            creation.binding().unanchored_ctas_cleanup().is_none(),
-            "missing cleanup capability belongs to CTAS preflight, not catalog attachment"
-        );
     }
 
     #[test]

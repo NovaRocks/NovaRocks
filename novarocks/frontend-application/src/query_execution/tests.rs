@@ -16,7 +16,6 @@
 // under the License.
 
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationSource};
-use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 
 #[test]
 fn cancellation_view_observes_injected_flag() {
@@ -26,30 +25,6 @@ fn cancellation_view_observes_injected_flag() {
     assert!(!view.is_cancelled());
     let _ = cancelled.request(QueryCancellationReason::ClientDisconnected);
     assert!(view.is_cancelled());
-}
-
-#[test]
-fn statistics_attempt_timeout_must_be_positive() {
-    let policy_for = |attempt_timeout| {
-        LakePublicationRuntimePolicy::try_new(
-            attempt_timeout,
-            std::time::Duration::from_secs(45 * 60),
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(5 * 60),
-            std::time::Duration::from_secs(60),
-        )
-    };
-    let policy =
-        policy_for(std::time::Duration::from_secs(30 * 60)).expect("positive attempt timeout");
-    assert_eq!(
-        policy.max_attempt_duration(),
-        std::time::Duration::from_secs(30 * 60)
-    );
-    assert!(
-        policy_for(std::time::Duration::from_secs(30 * 60 + 1)).is_ok(),
-        "the shared policy accepts longer attempts when its strict GC relationship is satisfied"
-    );
-    assert!(policy_for(std::time::Duration::ZERO).is_err());
 }
 
 #[test]

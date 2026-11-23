@@ -54,7 +54,6 @@ pub(super) struct OriginalWorkerDependencies {
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     statement_clock: crate::application::StatementClock,
-    attempt_timeout: Duration,
     runtime: tokio::runtime::Handle,
 }
 impl From<&RefreshWorkerDependencies> for OriginalWorkerDependencies {
@@ -70,7 +69,6 @@ impl From<&RefreshWorkerDependencies> for OriginalWorkerDependencies {
             root_admission: original.root_admission.clone(),
             optimizer_query_mem_limit_bytes: original.optimizer_query_mem_limit_bytes,
             statement_clock: original.statement_clock.clone(),
-            attempt_timeout: original.attempt_timeout,
             runtime: original.runtime.clone(),
         }
     }
@@ -158,11 +156,6 @@ impl BackgroundManagementPass {
             let scope = owner.scope();
             let cancel =
                 QueryCancellationView::governed(scope.cancellation().map_err(work_error)?, None);
-            let deadline = Instant::now()
-                .checked_add(dependencies.attempt_timeout)
-                .ok_or_else(|| {
-                    work_error(novarocks_workload_control::WorkError::ArithmeticOverflow)
-                })?;
             let topology = dependencies.topology.snapshot().map_err(|e| {
                 QueryServiceError::new(QueryServiceErrorKind::Unavailable, e.to_string())
             })?;
@@ -171,7 +164,7 @@ impl BackgroundManagementPass {
                 String::new(),
                 dependencies.role,
                 topology,
-                Some(deadline),
+                None,
                 cancel.clone(),
                 SessionOptimizerSettings {
                     optimizer_query_mem_limit_bytes: Some(
@@ -202,7 +195,7 @@ impl BackgroundManagementPass {
                 self.store
                     .as_ref()
                     .unwrap()
-                    .execution_requests(binding.transaction_deadline, Some(deadline))
+                    .execution_requests(binding.transaction_deadline, None)
                     .map_err(QueryServiceError::from_failure_cause)?,
             ));
             self.context = Some(
@@ -513,11 +506,6 @@ impl ScheduledCall {
                     "scheduler refresh is waiting for a non-empty admitted backend topology",
                 )));
             }
-            let deadline = Instant::now()
-                .checked_add(dependencies.attempt_timeout)
-                .ok_or_else(|| {
-                    work_error(novarocks_workload_control::WorkError::ArithmeticOverflow)
-                })?;
             let capacity =
                 QueryResultCapacityBinding::from_root_owner(self.owner.as_ref().unwrap())
                     .map_err(work_error)?;
@@ -530,7 +518,7 @@ impl ScheduledCall {
                 self.request.target.database.clone(),
                 dependencies.role,
                 topology,
-                Some(deadline),
+                None,
                 cancel,
                 SessionOptimizerSettings {
                     optimizer_query_mem_limit_bytes: Some(

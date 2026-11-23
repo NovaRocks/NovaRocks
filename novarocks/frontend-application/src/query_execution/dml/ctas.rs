@@ -25,7 +25,6 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorControlPlanningPin, ConnectorMutationFailure,
@@ -34,10 +33,9 @@ use novarocks_spi::connector::{
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateSession,
     ConnectorStagedCtasProperties, ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest,
-    ConnectorStagedWriteProof, ConnectorTableIdentity, ConnectorUnanchoredCtasCleanupSession,
-    ConnectorWrite, ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization,
-    LakePublicationId,
+    ConnectorStagedWriteProof, ConnectorTableIdentity, ConnectorWrite,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest, ConnectorWriteIntent, CreatePolicy,
+    ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -508,8 +506,6 @@ struct CoreStandardCtasTargetPreflight {
     /// that staged the target. Re-acquiring the current one at write time could
     /// hand the session a runtime that never saw the staged create.
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
-    unanchored_ctas_cleanup_session:
-        novarocks_spi::connector::ConnectorUnanchoredCtasCleanupSession,
     write: ConnectorWrite,
     target_catalog_properties: novarocks_spi::connector::CatalogProperties,
 }
@@ -1276,58 +1272,6 @@ async fn prepare_planned_ctas_connector_write_async(
     )
 }
 
-async fn sweep_unanchored_ctas_roots_async(
-    kernel: &DmlExecutionKernel,
-    cleanup_session: &ConnectorUnanchoredCtasCleanupSession,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    receiving: &GovernedCtasControlReceiving,
-) -> Result<(), CtasFailure> {
-    let policy = kernel.lake_publication_runtime_policy().ok_or_else(|| CtasFailure {
-        kind: CtasFailureKind::Unsupported,
-        message: "standard CTAS is unsupported until the shared lake publication GC policy is installed"
-            .to_string(),
-        user_error: None,
-    })?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| internal_failure("system clock is before Unix epoch"))?;
-    let now_ms = i64::try_from(now.as_millis())
-        .map_err(|_| internal_failure("system clock exceeds i64 milliseconds"))?;
-    let safe_age_ms = i64::try_from(policy.safe_gc_age().as_millis())
-        .map_err(|_| internal_failure("lake publication safe GC age exceeds i64 milliseconds"))?;
-    let cutoff_ms = now_ms
-        .checked_sub(safe_age_ms)
-        .ok_or_else(|| internal_failure("lake publication safe GC cutoff underflows"))?;
-    let warehouse_root = cleanup_session
-        .warehouse_root()
-        .map_err(connector_failure)?;
-    let candidates = cleanup_session
-        .discover_unanchored_ctas_async(
-            warehouse_root.clone(),
-            cutoff_ms,
-            context.clone(),
-            &receiving.discovery,
-        )
-        .await
-        .map_err(connector_failure)?;
-    for provenance in candidates {
-        // An exact delete whose acknowledgement is uncertain stays an aged
-        // residue for a later GC pass. It never grants this new CTAS attempt
-        // authority to reconcile, retry, or infer the old publication.
-        let _ = cleanup_session
-            .inspect_then_delete_unanchored_ctas_async(
-                warehouse_root.clone(),
-                cutoff_ms,
-                provenance,
-                context.clone(),
-                &receiving.cleanup,
-            )
-            .await
-            .map_err(connector_failure)?;
-    }
-    Ok(())
-}
-
 impl CoreStandardCtasTargetSession {
     async fn begin_write_session_async(
         &self,
@@ -1439,16 +1383,10 @@ impl DmlExecutionKernel {
         let staged_session = planning
             .derive_staged_create_lease()
             .map_err(connector_failure)?;
-        let unanchored_ctas_cleanup_session = planning
-            .derive_unanchored_ctas_cleanup_lease()
-            .map_err(connector_failure)?;
         let write = planning.derive_write_lease().map_err(connector_failure)?;
-        if !staged_session.matches_write_lease(&write)
-            || staged_session.control_runtime_id()
-                != unanchored_ctas_cleanup_session.control_runtime_id()
-        {
+        if !staged_session.matches_write_lease(&write) {
             return Err(internal_failure(
-                "standard CTAS staged-create, cleanup, and writer leases do not share one exact generation",
+                "standard CTAS staged-create and writer leases do not share one exact generation",
             ));
         }
         // The typed entry can finish an initial IF NOT EXISTS probe early.
@@ -1474,7 +1412,6 @@ impl DmlExecutionKernel {
                     target,
                     staged_session,
                     planning_pin: planning.clone(),
-                    unanchored_ctas_cleanup_session,
                     write,
                     target_catalog_properties,
                 }),
@@ -1651,30 +1588,6 @@ impl DmlExecutionKernel {
                     write_unknown_latched: AtomicBool::new(false),
                     publish_started: AtomicBool::new(false),
                 });
-                // A vended catalog cannot clean its warehouse before staged
-                // creation: the staged response is the first place it can
-                // disclose this request's storage authority. Run the same
-                // maintenance step only after that response has populated the
-                // request-local lease collector. This ordering is universal,
-                // so static and vended catalogs retain one CTAS lifecycle.
-                if let Err(failure) = sweep_unanchored_ctas_roots_async(
-                    self,
-                    &preflight.unanchored_ctas_cleanup_session,
-                    request.context.clone(),
-                    receiving,
-                )
-                .await
-                {
-                    return Ok(StandardCtasStageOutcome::AppliedButUnusable {
-                        receipt,
-                        finalization: ExternalMutationFinalization::Failed(
-                            novarocks_spi::connector::ConnectorMutationFailure::new(
-                                novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
-                                failure.message,
-                            ),
-                        ),
-                    });
-                }
                 *target_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&target));
@@ -2307,22 +2220,6 @@ pub(crate) struct GovernedCtasControlReceiving {
             >,
         >,
     >,
-    pub(crate) discovery: Mutex<
-        Option<
-            Result<
-                Vec<novarocks_spi::connector::ConnectorCtasUnanchoredProvenance>,
-                novarocks_spi::connector::ConnectorError,
-            >,
-        >,
-    >,
-    pub(crate) cleanup: Mutex<
-        Option<
-            Result<
-                novarocks_spi::connector::ConnectorCtasUnanchoredCleanupOutcome,
-                novarocks_spi::connector::ConnectorError,
-            >,
-        >,
-    >,
 }
 // The caller Source owns this facade at all times; no F becomes its sole
 // owner and no Provider poll/Drop runs while the receiving mutex is held.
@@ -2466,8 +2363,6 @@ impl GovernedCtasControlReceiving {
             adjudication: Mutex::new(None),
             target_abort: Mutex::new(None),
             target_cleanup: Mutex::new(None),
-            discovery: Mutex::new(None),
-            cleanup: Mutex::new(None),
         });
         drop(
             source
@@ -2484,18 +2379,6 @@ impl GovernedCtasControlReceiving {
         drop(
             source
                 .adjudication
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        drop(
-            source
-                .discovery
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        drop(
-            source
-                .cleanup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );

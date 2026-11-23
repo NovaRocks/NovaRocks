@@ -29,8 +29,8 @@ use super::{
     ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateSession,
     ConnectorStatistics, ConnectorStatisticsResolver, ConnectorStatisticsSession,
-    ConnectorTableHandle, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupSession,
-    ConnectorViewMetadata, ConnectorWrite, ConnectorWriteControl, ProviderBindingEpoch,
+    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWrite, ConnectorWriteControl,
+    ProviderBindingEpoch,
 };
 
 type CatalogHandleInstaller = dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync;
@@ -270,7 +270,6 @@ pub struct ConnectorControlBinding {
     distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
     cleanup_maintenance: Option<Arc<dyn ConnectorCleanupMaintenance>>,
     staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
-    unanchored_ctas_cleanup: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
@@ -454,7 +453,6 @@ impl ConnectorControlBinding {
             distributed_rewrite: None,
             cleanup_maintenance: None,
             staged_create: None,
-            unanchored_ctas_cleanup: None,
             write,
             statistics,
             view_metadata: None,
@@ -769,10 +767,6 @@ impl ConnectorControlBinding {
         self.staged_create.as_ref()
     }
 
-    pub fn unanchored_ctas_cleanup(&self) -> Option<&Arc<dyn ConnectorUnanchoredCtasCleanup>> {
-        self.unanchored_ctas_cleanup.as_ref()
-    }
-
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
         self.write.as_ref()
     }
@@ -827,27 +821,6 @@ impl ConnectorControlBinding {
             )?;
         }
         self.view_metadata = view_metadata;
-        Ok(self)
-    }
-
-    /// Attaches the catalog-wide CTAS staging-root collector to this exact
-    /// generation. The capability is independent from table-owned cleanup:
-    /// before a CREATE publishes its target, no table location can anchor the
-    /// staged root.
-    pub fn try_with_unanchored_ctas_cleanup(
-        mut self,
-        capability: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(capability) = &capability
-            && (capability.descriptor() != &self.descriptor
-                || capability.incarnation() != self.incarnation)
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "unanchored CTAS cleanup capability owner does not match its control binding generation",
-            ));
-        }
-        self.unanchored_ctas_cleanup = capability;
         Ok(self)
     }
 
@@ -1071,35 +1044,6 @@ impl ConnectorControlPlanningPin {
         let provider_incarnation = self.binding.incarnation();
         let retained_planning_pin = self.clone();
         ConnectorStagedCreateSession::new_with_control_runtime(
-            descriptor,
-            control_runtime_id,
-            provider_incarnation,
-            capability,
-            move || drop(retained_planning_pin),
-        )
-    }
-
-    /// Derive the catalog-wide unanchored CTAS cleanup capability from this
-    /// planning generation. It is retained alongside staged-create so a
-    /// retired connector generation cannot use a newer catalog's warehouse.
-    pub fn derive_unanchored_ctas_cleanup_lease(
-        &self,
-    ) -> Result<ConnectorUnanchoredCtasCleanupSession, ConnectorError> {
-        let capability = self
-            .binding
-            .unanchored_ctas_cleanup()
-            .cloned()
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    "connector control generation has no unanchored CTAS cleanup capability",
-                )
-            })?;
-        let descriptor = self.binding.descriptor().clone();
-        let control_runtime_id = self.binding.control_runtime_id();
-        let provider_incarnation = self.binding.incarnation();
-        let retained_planning_pin = self.clone();
-        ConnectorUnanchoredCtasCleanupSession::new_with_control_runtime(
             descriptor,
             control_runtime_id,
             provider_incarnation,

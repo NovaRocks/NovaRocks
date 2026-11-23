@@ -1269,49 +1269,6 @@ pub fn build_file_io_for_location(location: &str, binding: IcebergReadBinding) -
     FileIOBuilder::new(Arc::new(IcebergFileSystemFactory::new(binding))).build()
 }
 
-/// Write one small finalization document under the caller's admitted scope.
-/// Each new storage operation checks the same grant; an issued PUT is retained
-/// until its actual exit even if that grant expires while it is in flight.
-pub(crate) async fn write_finalization_document(
-    location: &str,
-    binding: IcebergReadBinding,
-    context: &novarocks_spi::connector::ConnectorRequestContext,
-    bytes: Bytes,
-) -> Result<()> {
-    finalization_active(context)?;
-    let storage = IcebergFsStorage::new(binding);
-    let _phase = storage.non_http_phase(location).await?;
-    let (access, relative) = storage
-        .resolve_path("write finalization document", location)
-        .await?;
-    write_finalization_document_to_operator(access.operator(), &relative, context, bytes).await
-}
-
-fn finalization_active(context: &novarocks_spi::connector::ConnectorRequestContext) -> Result<()> {
-    context.check_active().map_err(|error| {
-        Error::new(
-            ErrorKind::Unexpected,
-            "Finalization storage request stopped",
-        )
-        .with_source(error)
-    })
-}
-
-async fn write_finalization_document_to_operator(
-    operator: Operator,
-    relative: &str,
-    context: &novarocks_spi::connector::ConnectorRequestContext,
-    bytes: Bytes,
-) -> Result<()> {
-    finalization_active(context)?;
-    IcebergFsStorage::ensure_parent_dir(&operator, relative).await?;
-    finalization_active(context)?;
-    operator.write(relative, bytes).await.map_err(|error| {
-        Error::new(ErrorKind::Unexpected, "Finalization document PUT failed").with_source(error)
-    })?;
-    finalization_active(context)
-}
-
 /// Enumerate child directories directly through the provider-owned capability.
 pub(crate) async fn list_directories(
     location: &str,
@@ -1795,81 +1752,6 @@ mod tests {
             admission,
             events,
         )
-    }
-
-    #[tokio::test]
-    async fn finalization_document_waits_for_actual_put_exit_and_never_extends_the_grant() {
-        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
-        let original = ConnectorRequestContext::try_new(
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-            ConnectorStopOwner::new().view(),
-            64,
-            128,
-        )
-        .unwrap();
-        let grant = crate::catalog::publication::CatalogEvidencePolicy {
-            finalization: std::time::Duration::from_millis(20),
-            ..Default::default()
-        }
-        .begin_finalization()
-        .unwrap();
-        let context = grant.for_io(&original).unwrap();
-        let events = Arc::new(WriterEvents::default());
-        let service: crate::opendal::raw::Servicer = Arc::new(ControlledWriterService {
-            events: events.clone(),
-            delay_close: true,
-            fail_write: false,
-        });
-        let operator = crate::opendal::Operator::from_parts(
-            crate::opendal::OperationContext::default(),
-            service,
-        )
-        .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
-        let used_operator = operator.clone();
-        let used_context = context.clone();
-        let task = tokio::spawn(async move {
-            super::write_finalization_document_to_operator(
-                used_operator,
-                "provenance.json",
-                &used_context,
-                Bytes::from_static(b"owned provenance"),
-            )
-            .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), events.started.notified())
-            .await
-            .expect("issued PUT must enter its controlled close before the readiness bound");
-        tokio::time::sleep_until((grant.deadline() + std::time::Duration::from_millis(5)).into())
-            .await;
-        assert!(
-            !task.is_finished(),
-            "issued PUT/close still owns its actual work after deadline"
-        );
-        assert_eq!(
-            *events.log.lock().unwrap(),
-            ["write-start", "write-exit", "close-start"]
-        );
-        events.resume.notify_one();
-        assert!(task.await.unwrap().is_err());
-        assert_eq!(
-            *events.log.lock().unwrap(),
-            ["write-start", "write-exit", "close-start", "close-exit"]
-        );
-        assert!(
-            super::write_finalization_document_to_operator(
-                operator,
-                "again.json",
-                &context,
-                Bytes::new()
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(
-            events.log.lock().unwrap().len(),
-            4,
-            "expired grant starts no second PUT"
-        );
     }
 
     #[tokio::test]
