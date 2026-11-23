@@ -7478,7 +7478,7 @@ mod tests {
 
     #[test]
     fn comparison_null_targets_keep_largeint_identity_and_original_nullability() {
-        use novarocks_type_contract::{TrinoCastMode, ValueLogicalType};
+        use novarocks_type_contract::{FunctionValueType, TrinoCastMode, ValueLogicalType};
 
         let catalog = UnaryInputCatalog {
             key_type: DataType::FixedSizeBinary(16),
@@ -9743,7 +9743,7 @@ mod tests {
         let expected_largeint =
             FunctionValueType::try_with_logical_type(largeint, false, ValueLogicalType::LargeInt)
                 .unwrap();
-        let analyze = |sql| {
+        let analyze = |sql: &str| {
             analyze_projection_expr_with_catalog(
                 sql,
                 &catalog,

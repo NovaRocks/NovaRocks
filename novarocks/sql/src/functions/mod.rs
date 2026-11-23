@@ -1114,12 +1114,12 @@ mod tests {
             assert_eq!(
                 effects.value_stability,
                 FunctionVolatility::Immutable,
-                "{overload}"
+                "{overload:?}"
             );
             assert_eq!(
                 effects.environment_dependencies.as_ref(),
                 &[Key::StatementStartUtc, Key::TimeZone],
-                "{overload}"
+                "{overload:?}"
             );
         }
         for retired in ["curdate", "curtime"] {
