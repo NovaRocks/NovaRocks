@@ -91,3 +91,14 @@ fn rewrite_files_uses_its_own_window_and_transaction_style() {
     assert_eq!(protocol.operation().style(), CommitStyle::Transaction);
     assert_eq!(protocol.writer_schema_spec(), None);
 }
+
+#[test]
+fn delete_uses_the_main_update_protocol_without_a_history_window() {
+    let protocol = CommitProtocol::Delete;
+    assert_eq!(protocol.operation(), CommitOperation::Delete);
+    assert_eq!(protocol.operation().style(), CommitStyle::Update);
+    assert!(protocol.requires_target_branch());
+    assert!(matches!(protocol.window(), WindowValidation::None));
+    assert!(protocol.writer_schema_spec().is_none());
+    assert!(protocol.rewrite_output_requirement().is_none());
+}

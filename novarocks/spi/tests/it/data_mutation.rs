@@ -498,3 +498,88 @@ fn data_mutation_receipt_wire_rejects_trailing_data() {
         ConnectorErrorKind::CorruptData
     );
 }
+
+#[test]
+fn delete_request_binds_the_original_predicate_digest_and_generation() {
+    use novarocks_spi::connector::{ConnectorDeleteCondition, ConnectorProcessLocalPayload};
+    let instance_id = ConnectorInstanceId::parse("analytics").unwrap();
+    let owner = ConnectorProviderBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ProviderBindingEpoch::from_bytes([4; 16]),
+    };
+    let table = ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table")).unwrap();
+    let request = |condition, payload| {
+        ConnectorDataMutationPlanningRequest::try_new_with_process_local(
+            ConnectorMutationOperationId::from_bytes([3; 16]),
+            owner.clone(),
+            ConnectorDataMutationOperation::DeleteByCondition {
+                table: table.clone(),
+                condition,
+            },
+            payload,
+            context(),
+        )
+    };
+    let sealed = |tag| ConnectorDeleteCondition::SealedPredicate { digest: [tag; 32] };
+    let payload = ConnectorProcessLocalPayload::new(owner.clone(), Arc::new("proof"));
+    let all = request(ConnectorDeleteCondition::AllRows, None).unwrap();
+    let filtered = request(sealed(1), Some(payload.clone())).unwrap();
+    let changed = request(sealed(2), Some(payload.clone())).unwrap();
+    assert_ne!(all.request_digest(), filtered.request_digest());
+    assert_ne!(filtered.request_digest(), changed.request_digest());
+
+    assert!(request(sealed(1), None).is_err());
+    assert!(request(ConnectorDeleteCondition::AllRows, Some(payload)).is_err());
+    let wrong = ConnectorProcessLocalPayload::new(
+        ConnectorProviderBindingKey {
+            instance_id: owner.instance_id.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([5; 16]),
+        },
+        Arc::new("proof"),
+    );
+    assert!(request(sealed(1), Some(wrong)).is_err());
+}
+
+#[test]
+fn delete_receipt_preserves_an_optional_bigint_count() {
+    use novarocks_spi::connector::DELETE_KIND;
+    let plan = plan(
+        ConnectorAddFilesFormat::Parquet,
+        ConnectorAddFilesRecursion::Fail,
+    );
+    let receipt = |kind| {
+        ConnectorDataMutationReceipt::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: plan.owner().instance_id.clone(),
+            },
+            plan.owner().incarnation,
+            plan.operation_id(),
+            kind,
+            plan.request_digest(),
+            plan.plan_digest(),
+            plan.state_digest(),
+            plan.summary(),
+            Bytes::from_static(b"opaque-receipt"),
+        )
+        .unwrap()
+    };
+    for count in [None, Some(0), Some(i64::MAX as u64)] {
+        let original = receipt(DELETE_KIND).try_with_deleted_rows(count).unwrap();
+        let decoded =
+            ConnectorDataMutationReceipt::try_from_wire_v1(&original.try_to_wire_v1().unwrap())
+                .unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.deleted_rows(), count);
+    }
+    assert!(
+        receipt(DELETE_KIND)
+            .try_with_deleted_rows(Some(i64::MAX as u64 + 1))
+            .is_err()
+    );
+    assert!(
+        receipt(plan.operation_kind())
+            .try_with_deleted_rows(Some(0))
+            .is_err()
+    );
+}

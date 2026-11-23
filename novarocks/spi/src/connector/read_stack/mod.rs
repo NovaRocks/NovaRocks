@@ -82,15 +82,16 @@ pub use projection::{
 };
 pub use public_schema::{ConnectorReadPublicSchema, ConnectorReadSchemaCreation};
 pub use runtime::{
-    ConnectorAdmittedReadProviderFactory, ConnectorPreparedSourceRead,
-    ConnectorPreparedSourceReadFuture, ConnectorReadAttemptAccessMint,
+    ConnectorAdmittedReadProviderFactory, ConnectorDeleteConditionOutcome,
+    ConnectorPreparedSourceRead, ConnectorPreparedSourceReadFuture, ConnectorReadAttemptAccessMint,
     ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
     ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadBinding,
     ConnectorReadChangeWindow, ConnectorReadColumnBinding, ConnectorReadColumnHandle,
     ConnectorReadConstraint, ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot,
     ConnectorReadFilterApplication, ConnectorReadLimitApplication, ConnectorReadMetadata,
-    ConnectorReadOpenedRelation, ConnectorReadPageSourceProvider, ConnectorReadRegistrationPin,
-    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationPreparation,
+    ConnectorReadOpenedRelation, ConnectorReadOriginalTableObservation,
+    ConnectorReadPageSourceProvider, ConnectorReadRegistrationPin, ConnectorReadRelation,
+    ConnectorReadRelationKind, ConnectorReadRelationPreparation,
     ConnectorReadRelationPreparationFuture, ConnectorReadRelationPreparationKind,
     ConnectorReadRelationPreparationRequest, ConnectorReadRelationVersion,
     ConnectorReadRequestControl, ConnectorReadRequestControlFactory,

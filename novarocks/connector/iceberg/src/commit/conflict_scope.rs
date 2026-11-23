@@ -561,8 +561,11 @@ fn field_nullable(schema: &SchemaRef, id: i32) -> Option<bool> {
     }))
 }
 
-fn connector_datum(value: &ConnectorValue, primitive: &PrimitiveType) -> Option<Datum> {
-    let original = match value {
+pub(super) fn connector_native_datum(
+    value: &ConnectorValue,
+    primitive: &PrimitiveType,
+) -> Option<Datum> {
+    Some(match value {
         ConnectorValue::Boolean(v) => Datum::bool(*v),
         ConnectorValue::TinyInt(v) => Datum::int(*v),
         ConnectorValue::SmallInt(v) => Datum::int(*v),
@@ -593,7 +596,11 @@ fn connector_datum(value: &ConnectorValue, primitive: &PrimitiveType) -> Option<
         ConnectorValue::Varbinary(v) => Datum::binary(v.iter().copied()),
         ConnectorValue::Uuid(v) => Datum::uuid(Uuid::from_bytes(*v)),
         ConnectorValue::Fixed(v) => Datum::fixed(v.iter().copied()),
-    };
+    })
+}
+
+fn connector_datum(value: &ConnectorValue, primitive: &PrimitiveType) -> Option<Datum> {
+    let original = connector_native_datum(value, primitive)?;
     if original.data_type() == primitive {
         Some(original)
     } else {

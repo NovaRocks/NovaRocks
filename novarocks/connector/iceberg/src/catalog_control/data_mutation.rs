@@ -565,6 +565,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             ));
         }
         let operation = match request.operation() {
+            ConnectorDataMutationOperation::DeleteByCondition { .. } => CatalogOperation::Delete,
             ConnectorDataMutationOperation::TruncateMain { .. }
             | ConnectorDataMutationOperation::Truncate { .. } => CatalogOperation::Truncate,
             ConnectorDataMutationOperation::RegisterExistingFiles { .. } => {
@@ -633,6 +634,10 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         let metadata_version_digest = metadata_version_digest(table.metadata_location());
 
         match request.operation() {
+            ConnectorDataMutationOperation::DeleteByCondition { .. } => Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg metadata delete preparation is unavailable",
+            )),
             ConnectorDataMutationOperation::RegisterExistingFiles {
                 location,
                 format,
@@ -682,7 +687,8 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     ConnectorDataMutationOperation::Truncate { target_ref, .. } => {
                         (TruncateMode::WholeBranch, target_ref.as_ref())
                     }
-                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => unreachable!(),
+                    ConnectorDataMutationOperation::RegisterExistingFiles { .. }
+                    | ConnectorDataMutationOperation::DeleteByCondition { .. } => unreachable!(),
                 };
                 if mode == TruncateMode::Main {
                     crate::commit::model::validate_target_branch(metadata, target_ref)

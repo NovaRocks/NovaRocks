@@ -25,12 +25,12 @@ use novarocks_spi::connector::{
     ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorDataMutationExecuteRequest,
     ConnectorDataMutationOperation, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
-    ConnectorDataMutationSession, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorPayloadRetentionGuard, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableRequest, ConnectorTableResolution, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    REGISTER_EXISTING_FILES_KIND,
+    ConnectorDataMutationSession, ConnectorDeleteCondition, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorPayloadRetentionGuard, ConnectorProcessLocalPayload,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, REGISTER_EXISTING_FILES_KIND,
 };
 
 #[cfg(test)]
@@ -38,12 +38,21 @@ use novarocks_query_application::engine_error::EngineError;
 
 /// The statement-level operation before its provider-owned table handle is
 /// loaded through the exact-generation metadata capability.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum DataMutationIntent {
     RegisterExistingFiles {
         location: Option<Arc<str>>,
         format: Option<ConnectorAddFilesFormat>,
         recursion: ConnectorAddFilesRecursion,
+    },
+    #[expect(
+        dead_code,
+        reason = "The DELETE path provides the original target observation"
+    )]
+    DeleteByCondition {
+        original_table: ConnectorTableHandle,
+        condition: ConnectorDeleteCondition,
+        process_local: Option<ConnectorProcessLocalPayload>,
     },
     TruncateMain,
     Truncate {
@@ -82,6 +91,9 @@ impl DataMutationIntent {
             } => Ok(ConnectorDataMutationOperation::register_existing_files(
                 table, location, format, recursion,
             )),
+            Self::DeleteByCondition { condition, .. } => {
+                Ok(ConnectorDataMutationOperation::DeleteByCondition { table, condition })
+            }
             Self::TruncateMain => Ok(ConnectorDataMutationOperation::truncate_main(table)),
             Self::Truncate { target_ref } => {
                 ConnectorDataMutationOperation::truncate(table, target_ref)
@@ -245,6 +257,7 @@ pub struct DataMutationSession {
     plan: novarocks_spi::connector::ConnectorDataMutationPlan,
     context: ConnectorRequestContext,
     main_truncate: bool,
+    delete_condition: Option<ConnectorProcessLocalPayload>,
     phase: DataMutationSessionPhase,
 }
 
@@ -300,19 +313,37 @@ impl DataMutationSession {
                 DataMutationDispatchState::ConfirmedNotDispatched,
             ));
         }
-        let metadata = session
-            .metadata()
-            .load_frontend_table(ConnectorTableRequest {
-                table: table.clone(),
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: context.clone(),
-            })
-            .map_err(|error| ResolvedDataMutation::KnownUncommitted {
-                failure: KnownUncommittedDataMutation::Planning(error),
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            })?;
-        if metadata.identity != table || metadata.table.owner() != &session.descriptor().instance_id
-        {
+        let (target, process_local) = match &intent {
+            DataMutationIntent::DeleteByCondition {
+                original_table,
+                process_local,
+                ..
+            } => (original_table.clone(), process_local.clone()),
+            _ => {
+                let metadata = session
+                    .metadata()
+                    .load_frontend_table(ConnectorTableRequest {
+                        table: table.clone(),
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: context.clone(),
+                    })
+                    .map_err(|error| ResolvedDataMutation::KnownUncommitted {
+                        failure: KnownUncommittedDataMutation::Planning(error),
+                        cleanup: ExternalMutationFinalization::Complete,
+                    })?;
+                if metadata.identity != table {
+                    return Err(contract_failure(
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "connector metadata returned a different data mutation table identity",
+                        ),
+                        DataMutationDispatchState::ConfirmedNotDispatched,
+                    ));
+                }
+                (metadata.table, None)
+            }
+        };
+        if target.owner() != &session.descriptor().instance_id {
             return Err(contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -322,14 +353,19 @@ impl DataMutationSession {
             ));
         }
         let main_truncate = matches!(&intent, DataMutationIntent::TruncateMain);
-        let operation = intent.into_operation(metadata.table).map_err(|error| {
+        let operation = intent.into_operation(target).map_err(|error| {
             ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             }
         })?;
         let plan = session
-            .plan_operation(operation_id, operation, context.clone())
+            .plan_operation_with_process_local(
+                operation_id,
+                operation,
+                process_local.clone(),
+                context.clone(),
+            )
             .map_err(|error| ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
@@ -340,6 +376,7 @@ impl DataMutationSession {
             plan,
             context,
             main_truncate,
+            delete_condition: process_local,
             phase: DataMutationSessionPhase::Planned,
         })
     }
@@ -399,6 +436,10 @@ impl DataMutationSession {
                     }
                     None => Ok(request),
                 });
+        let request = request.and_then(|request| match self.delete_condition.take() {
+            Some(payload) => request.with_delete_condition(payload),
+            None => Ok(request),
+        });
         let request = match request {
             Ok(request) => request,
             Err(error) => {

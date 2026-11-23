@@ -143,8 +143,8 @@ pub use data_mutation::{
     ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
     ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
-    ConnectorDataMutationResolver, ConnectorDataMutationSession,
-    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    ConnectorDataMutationResolver, ConnectorDataMutationSession, ConnectorDeleteCondition,
+    DELETE_KIND, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, REGISTER_EXISTING_FILES_KIND, TRUNCATE_KIND,
 };
 pub use distributed_rewrite::{

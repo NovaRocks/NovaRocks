@@ -85,15 +85,20 @@ impl OperationIntent {
         if parts.start.is_some_and(|start| start.sequence_number < 0) {
             return Err(invalid("Start snapshot sequence must be nonnegative"));
         }
-        if matches!(&parts.protocol, CommitProtocol::Truncate)
-            && (parts.shape != RequestShape::SnapshotProducing
-                || parts.target_ref != "main"
-                || parts.start.is_some()
-                || !parts.dependencies.is_empty())
+        if matches!(
+            &parts.protocol,
+            CommitProtocol::Truncate | CommitProtocol::Delete
+        ) && (parts.shape != RequestShape::SnapshotProducing
+            || parts.target_ref != "main"
+            || parts.start.is_some()
+            || !parts.dependencies.is_empty())
         {
-            return Err(invalid(
-                "TRUNCATE requires the main branch and no frozen ref dependency",
-            ));
+            return Err(invalid(match &parts.protocol {
+                CommitProtocol::Delete => {
+                    "DELETE requires the main branch and no frozen ref dependency"
+                }
+                _ => "TRUNCATE requires the main branch and no frozen ref dependency",
+            }));
         }
         if matches!(&parts.protocol, CommitProtocol::RowDelta { .. })
             && (parts.shape != RequestShape::SnapshotProducing || !parts.dependencies.is_empty())
