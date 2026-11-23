@@ -6558,103 +6558,26 @@ mod tests {
     }
 
     #[test]
-    fn test_percentile_approx_with_array_literal_returns_array_type() {
-        let resolved = parse_raw_and_analyze(
-            "SELECT percentile_approx(o_totalprice, CAST([0.25, 0.5] AS ARRAY<double>)) FROM orders",
-        )
-        .expect("analysis should succeed");
-        assert_eq!(resolved.output_columns.len(), 1);
-        assert!(matches!(
-            resolved.output_columns[0].value_type.data_type(),
-            arrow::datatypes::DataType::List(_)
-        ));
-    }
-
-    #[test]
-    fn test_percentile_approx_weighted_rejects_null_weight_in_analyzer() {
-        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, NULL, 0.9)")
-            .expect_err("analysis should reject NULL weight");
-        assert!(err.contains(
-            "percentile_approx_weighted requires the second parameter (weight) to be numeric type, but got: NULL_TYPE."
-        ));
-    }
-
-    #[test]
-    fn test_percentile_approx_weighted_rejects_negative_scalar_percentile_in_analyzer() {
-        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, 1, -0.1)")
-            .expect_err("analysis should reject negative percentile");
-        assert!(err.contains(
-            "Type check failed. percentile parameter must be between 0 and 1 in percentile_approx_weighted, but got: -0.1"
-        ));
-    }
-
-    #[test]
-    fn test_percentile_approx_weighted_rejects_negative_array_percentile_in_analyzer() {
-        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, 1, [-0.1, 0.5])")
-            .expect_err("analysis should reject negative percentile array item");
-        assert!(err.contains(
-            "Type check failed. percentile array element[0] must be between 0 and 1 in percentile_approx_weighted, but got: -0.1"
-        ));
-    }
-
-    #[test]
-    fn test_group_concat_rejects_negative_order_by_position() {
-        let err = parse_raw_and_analyze(
-            "SELECT group_concat(distinct 3.1323, o_orderstatus order by 1, 2, -20) FROM orders GROUP BY o_orderkey",
-        )
-        .expect_err("negative group_concat ORDER BY position should be rejected");
-        assert!(
-            err.contains("ORDER BY position -20 is not in group_concat output list."),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_empty_input() {
-        let err = parse_raw_and_analyze("SELECT group_concat()")
-            .expect_err("group_concat without input should be rejected");
-        assert!(
-            err.contains("group_concat should have at least one input."),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_non_string_separator() {
-        let err = parse_raw_and_analyze(
-            "SELECT string_agg('中国' \n,\n 1\nORDER BY '第一' \n) FROM orders",
-        )
-        .expect_err("group_concat should reject non-string separator");
-        assert!(
-            err.contains(
-                "group_concat requires separator to be of getType() STRING: group_concat('中国', 1)."
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_array_input() {
-        let err = parse_raw_and_analyze("SELECT group_concat([1,2]) FROM orders")
-            .expect_err("group_concat should reject array input");
-        assert!(
-            err.contains(
-                "No matching function with signature: group_concat(array<int(11)>, varchar)."
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_map_input() {
-        let err = parse_raw_and_analyze("SELECT group_concat(map(ARRAY[2],ARRAY[3])) FROM orders")
-            .expect_err("group_concat should reject map input");
-        assert!(
-            err.contains(
-                "No matching function with signature: group_concat(map<int(11),int(11)>, varchar)."
-            ),
-            "unexpected error: {err}"
-        );
+    fn retired_aggregate_names_do_not_bind_in_user_sql() {
+        for call in [
+            "group_concat('a')",
+            "string_agg('a', ',')",
+            "percentile_approx(1, 0.5)",
+            "percentile_approx_weighted(1, 1, -0.1)",
+            "approx_top_k(1, 1)",
+            "array_agg_distinct(1)",
+            "max_n(1, 1)",
+            "ndv(1)",
+            "std(1)",
+        ] {
+            let query = parse_native_query(&format!("SELECT {call}")).unwrap();
+            let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownFunction,
+                "{call}: {error}",
+            );
+        }
     }
 
     #[test]

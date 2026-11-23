@@ -375,6 +375,41 @@ fn filtered_distinct_and_its_sibling_update_after_a_single_gather() {
 }
 
 #[test]
+fn single_only_aggregate_keeps_original_update_channels_with_a_mergeable_peer() {
+    use novarocks_local_program::{ProgramCallSite, ProgramStateTemplate};
+
+    let source = sql_source(
+        "SELECT approx_distinct(k), listagg(CAST(k AS VARCHAR)) WITHIN GROUP (ORDER BY k), \
+         approx_percentile(k, DOUBLE '0.5'), max(k, BIGINT '2') FROM fixture.source",
+        DataType::Int64,
+    );
+    let programs = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
+    let nodes = aggregates(source.plan()).collect::<Vec<_>>();
+    let [(fragment, node, calls)] = nodes.as_slice() else {
+        panic!("expected one Single aggregate");
+    };
+    let program = &programs[&fragment.id()];
+    let local = local_aggregate(program, node);
+    assert_eq!(calls.len(), 4);
+    for (call, physical) in calls.iter().enumerate() {
+        assert_eq!(physical.binding.phase, AggregatePhase::Single);
+        let site = ProgramCallSite::Aggregate {
+            node: local.local_id().unwrap(),
+            call: u32::try_from(call).unwrap(),
+        };
+        let Some(ProgramStateTemplate::Aggregate { kernel, .. }) = program.state_template(site)
+        else {
+            panic!("missing prepared aggregate");
+        };
+        assert_eq!(
+            kernel.local_stages().is_some(),
+            physical.binding.function.function_id.as_str()
+                == "builtin.aggregate/approx_distinct/v1",
+        );
+    }
+}
+
+#[test]
 fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
     use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
     use novarocks_functions::{

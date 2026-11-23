@@ -28,7 +28,7 @@ use novarocks_type_contract::{
 use super::catalogue::BuiltinScalarResolver;
 use super::window_default::DefaultValueRecipe;
 use super::window_offset::{OffsetOperation, PreparedOffset};
-use crate::kernel_control::{compile_failure, invalid, invalid_function_argument};
+use crate::kernel_control::{compile_failure, invalid};
 use crate::{
     CallEffectInput, FunctionArgument, FunctionArgumentType, FunctionBindingDeclaration,
     FunctionBindingError, FunctionBindingRequest, FunctionBindingResolver,
@@ -388,16 +388,11 @@ fn canonical_call(
     let offset = value
         .int64_observed(CompilePhase::FunctionSpecialization, work.control())
         .map_err(FunctionBindingError::from)
-        .map_err(binding_failure)?
-        .ok_or_else(|| invalid_function_argument("LEAD/LAG offset must not be NULL"))?;
-    let nonnegative = offset >= 0;
+        .map_err(binding_failure)?;
     work.step().map_err(compile_failure)?;
-    if !nonnegative {
-        return Err(invalid_function_argument(
-            "LEAD/LAG offset must be non-negative",
-        ));
-    }
-    Ok(Some(offset))
+    // Invalid offsets are row-data errors. The partition kernel must observe
+    // the original channel before reporting one, including for a constant.
+    Ok(offset.filter(|offset| *offset >= 0))
 }
 
 impl WindowOffsetOwner {

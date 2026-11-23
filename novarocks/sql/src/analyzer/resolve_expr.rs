@@ -2200,8 +2200,7 @@ impl<'a> super::AnalyzerContext<'a> {
         };
         let mut name = name;
 
-        // Preserve the original zero-input ORDER BY refusal before aggregate
-        // ordering validation. Legacy SEPARATOR is normalized by its parser owner.
+        // Reject a function-local ordering with no arguments.
         if original_arguments.is_empty() && func.order_by.is_some() {
             return Err(AnalyzeError::invalid_query_shape(
                 if func.distinct {
@@ -2696,7 +2695,6 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         let mut bound_scalar = None;
-        self.validate_percentile_arguments(&name, &args_typed, func.span)?;
         let mut bound_aggregate = None;
         if is_aggregate_function(self.function_catalog, &name) {
             bound_aggregate = Some(resolve_aggregate_function_call_with_order(
@@ -2954,114 +2952,6 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
-    fn validate_percentile_arguments(
-        &self,
-        name: &str,
-        args: &[TypedExpr],
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        match name {
-            "percentile_approx" => {
-                if let Some(expr) = args.first() {
-                    validate_percentile_numeric_arg(name, 0, "value", expr)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-            }
-            "percentile_approx_weighted" => {
-                if let Some(expr) = args.first() {
-                    validate_percentile_numeric_arg(name, 0, "value", expr)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-                if let Some(expr) = args.get(1) {
-                    validate_percentile_numeric_arg(name, 1, "weight", expr)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-            }
-            _ => {}
-        }
-
-        let (quantile_idx, compression_idx) = match name {
-            "percentile_approx" => (1usize, 2usize),
-            "percentile_approx_weighted" => (2usize, 3usize),
-            _ => return Ok(()),
-        };
-        if let Some(expr) = args.get(quantile_idx) {
-            self.validate_percentile_quantile_arg(name, quantile_idx, expr, span)?;
-        }
-        if let Some(expr) = args.get(compression_idx) {
-            self.validate_percentile_compression_arg(name, expr, span)?;
-        }
-        Ok(())
-    }
-
-    fn validate_percentile_quantile_arg(
-        &self,
-        name: &str,
-        quantile_idx: usize,
-        expr: &TypedExpr,
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        match &expr.value_type.data_type() {
-            DataType::List(item) => {
-                if matches!(item.data_type(), DataType::Null) {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<NULL_TYPE>.",
-                            ordinal_name(quantile_idx)
-                        ),
-                        span,
-                    ));
-                }
-                if !is_numeric_type(item.data_type()) {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<{:?}>.",
-                            ordinal_name(quantile_idx),
-                            item.data_type()
-                        ),
-                        span,
-                    ));
-                }
-                if let Some(items) = array_literal_items(expr) {
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(value) = const_numeric_value(item) {
-                            validate_percentile_value(name, value, Some(idx))
-                                .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                        }
-                    }
-                }
-            }
-            data_type if is_numeric_type(data_type) => {
-                if let Some(value) = const_numeric_value(expr) {
-                    validate_percentile_value(name, value, None)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn validate_percentile_compression_arg(
-        &self,
-        name: &str,
-        expr: &TypedExpr,
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        if let Some(value) = const_numeric_value(expr)
-            && value <= 0.0
-        {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "Type check failed. compression parameter must be positive in {name}, but got: {}",
-                    format_percentile_error_value(value)
-                ),
-                span,
-            ));
-        }
-        Ok(())
-    }
-
     /// Extract ORDER BY clauses from within function arguments (e.g. array_agg(x ORDER BY y)).
     fn extract_function_order_by(
         &self,
@@ -3080,12 +2970,6 @@ impl<'a> super::AnalyzerContext<'a> {
         } else {
             Vec::new()
         };
-        let visible_args =
-            if matches!(func_name.as_str(), "group_concat" | "string_agg") && !args.is_empty() {
-                &args[..args.len() - 1]
-            } else {
-                args
-            };
         if let Some(order_by) = &func.order_by {
             if order_by.items.is_empty() {
                 return Err(AnalyzeError::invalid_argument(
@@ -3095,31 +2979,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             let mut items = Vec::with_capacity(order_by.items.len());
             for ob in &order_by.items {
-                let typed =
-                    if !trino_order && let Some(pos) = function_order_by_position(&ob.sort_key) {
-                        let pos_index = usize::try_from(pos).ok();
-                        if let Some(pos_index) = pos_index
-                            && (1..=visible_args.len()).contains(&pos_index)
-                        {
-                            visible_args[pos_index - 1].clone()
-                        } else if matches!(func_name.as_str(), "array_agg" | "array_agg_distinct") {
-                            let display_name = if func_name == "string_agg" {
-                                "group_concat"
-                            } else {
-                                func_name.as_str()
-                            };
-                            return Err(AnalyzeError::invalid_argument(
-                                format!(
-                                    "ORDER BY position {pos} is not in {display_name} output list."
-                                ),
-                                ob.span,
-                            ));
-                        } else {
-                            self.analyze_expr(&ob.sort_key, scope)?
-                        }
-                    } else {
-                        self.analyze_expr(&ob.sort_key, scope)?
-                    };
+                let typed = self.analyze_expr(&ob.sort_key, scope)?;
                 if distinct_order
                     && !matches!(&typed.kind, ExprKind::ColumnRef { column_id, .. }
                         if args.iter().any(|arg| matches!(&arg.kind,
@@ -3405,19 +3265,6 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             _ => false,
         }
-    }
-}
-
-fn function_order_by_position(expr: &ast::Expr) -> Option<i64> {
-    match expr {
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Long { parsed_value, .. },
-            ..
-        }) => Some(*parsed_value),
-        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
-            function_order_by_position(&unary.expression)?.checked_neg()
-        }
-        _ => None,
     }
 }
 
@@ -4465,111 +4312,6 @@ fn resolve_aggregate_function_call_with_order(
 
 fn is_analyzer_aggregate_syntax(name: &str) -> bool {
     name == "every"
-}
-
-fn ordinal_name(index: usize) -> &'static str {
-    match index {
-        0 => "first",
-        1 => "second",
-        2 => "third",
-        3 => "fourth",
-        _ => "unknown",
-    }
-}
-
-fn is_numeric_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
-}
-
-fn validate_percentile_numeric_arg(
-    name: &str,
-    index: usize,
-    role: &str,
-    expr: &TypedExpr,
-) -> Result<(), String> {
-    if is_numeric_type(expr.value_type.data_type()) {
-        return Ok(());
-    }
-    Err(format!(
-        "{name} requires the {} parameter ({role}) to be numeric type, but got: {}.",
-        ordinal_name(index),
-        percentile_argument_type_name(expr.value_type.data_type())
-    ))
-}
-
-fn percentile_argument_type_name(data_type: &DataType) -> String {
-    match data_type {
-        DataType::Null => "NULL_TYPE".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => "varchar(65533)".to_string(),
-        DataType::Date32 => "date".to_string(),
-        DataType::Timestamp(_, _) => "datetime".to_string(),
-        dt if novarocks_types::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
-        other => format!("{other:?}").to_lowercase(),
-    }
-}
-
-fn strip_casts(expr: &TypedExpr) -> &TypedExpr {
-    match &expr.kind {
-        ExprKind::Cast { expr, .. } => strip_casts(expr),
-        ExprKind::Nested(inner) => strip_casts(inner),
-        _ => expr,
-    }
-}
-
-fn array_literal_items(expr: &TypedExpr) -> Option<&[TypedExpr]> {
-    match &strip_casts(expr).kind {
-        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => Some(args),
-        _ => None,
-    }
-}
-
-fn const_numeric_value(expr: &TypedExpr) -> Option<f64> {
-    match &strip_casts(expr).kind {
-        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
-        ExprKind::Literal(LiteralValue::Decimal(v)) => v.parse::<f64>().ok(),
-        _ => crate::common::negation::typed_operand(strip_casts(expr))
-            .and_then(const_numeric_value)
-            .map(|value| -value),
-    }
-}
-
-fn validate_percentile_value(
-    name: &str,
-    value: f64,
-    array_index: Option<usize>,
-) -> Result<(), String> {
-    if (0.0..=1.0).contains(&value) {
-        return Ok(());
-    }
-    match array_index {
-        Some(idx) => Err(format!(
-            "Type check failed. percentile array element[{idx}] must be between 0 and 1 in {name}, but got: {}",
-            format_percentile_error_value(value)
-        )),
-        None => Err(format!(
-            "Type check failed. percentile parameter must be between 0 and 1 in {name}, but got: {}",
-            format_percentile_error_value(value)
-        )),
-    }
-}
-
-fn format_percentile_error_value(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.1}")
-    } else {
-        value.to_string()
-    }
 }
 
 fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
@@ -8307,9 +8049,9 @@ mod tests {
     #[test]
     fn ordered_aggregate_binding_freezes_every_update_channel() {
         let expr = analyze_projection_expr(
-            "select string_agg('v' \n,\n '|'\norder by 1, cast(7 as bigint) \n)",
+            "SELECT LISTAGG('v', '|') WITHIN GROUP (ORDER BY 1, BIGINT '7')",
         )
-        .expect("ordered group_concat should analyze");
+        .expect("ordered LISTAGG should analyze");
         let crate::analysis::ExprKind::AggregateCall {
             args,
             order_by,
@@ -8319,58 +8061,40 @@ mod tests {
         else {
             panic!("expected AggregateCall, got {:?}", expr.kind);
         };
-        assert_eq!(args.len(), 2, "value and separator remain logical args");
+        assert_eq!(args.len(), 5);
         assert_eq!(order_by.len(), 2);
-        let argument_types = resolved
-            .selected
-            .argument_types
-            .iter()
-            .map(|argument| match argument {
-                novarocks_functions::FunctionArgumentType::Value(value) => {
-                    value.data_type().clone()
-                }
-                novarocks_functions::FunctionArgumentType::Lambda { .. } => {
-                    panic!("aggregate update arguments cannot be lambdas")
-                }
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            argument_types,
-            [
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Int64,
-            ]
+            resolved.selected.overload.as_str(),
+            "builtin.aggregate/listagg/derived-v1"
         );
-        let DataType::Struct(fields) = &crate::functions::aggregate_selection(&resolved)
-            .intermediate_type
-            .data_type()
-        else {
-            panic!("expected Struct intermediate for ordered group_concat");
-        };
-        assert_eq!(fields.len(), 4);
-        for (field, input_type) in fields.iter().zip(argument_types.iter()) {
-            let DataType::List(item) = field.data_type() else {
-                panic!("expected List field in group_concat intermediate");
-            };
-            assert_eq!(item.data_type(), input_type);
-        }
+        let update_types: Vec<_> = args
+            .iter()
+            .chain(order_by.iter().map(|key| &key.expr))
+            .map(|expr| novarocks_functions::FunctionArgumentType::Value(expr.value_type.clone()))
+            .collect();
+        assert_eq!(resolved.selected.argument_types.as_ref(), update_types);
     }
 
     #[test]
-    fn generic_fixed_offset_binding_uses_the_original_checked_literal_normalization() {
-        let expression = analyze_projection_expr("SELECT lead('a', 1, 'b') OVER ()").unwrap();
+    fn generic_fixed_offset_binding_preserves_the_literal_and_its_widening() {
+        let expression =
+            analyze_projection_expr("SELECT lead('a', 1, 'b') OVER (ORDER BY 1)").unwrap();
         let ExprKind::WindowCall { args, binding, .. } = expression.kind else {
             panic!("window");
         };
         assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
         assert!(!args[1].value_type.nullable());
-        // The existing syntax-literal author normalizes a checked value before
-        // its first canonical CV admission; already-admitted ConstantValue and
-        // nonliteral inputs never enter signed_int_literal_value.
+        let ExprKind::Cast {
+            expr: original,
+            target: DataType::Int64,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            ..
+        } = &args[1].kind
+        else {
+            panic!("expected implicit BIGINT widening: {:?}", args[1].kind);
+        };
         assert!(matches!(
-            args[1].kind,
+            original.kind,
             ExprKind::Literal(LiteralValue::Int(1))
         ));
         assert_eq!(
@@ -8428,18 +8152,19 @@ mod tests {
 
     #[test]
     fn fixed_wide_parameters_do_not_erase_original_unary_integer_overflow() {
-        let safe = analyze_projection_expr("SELECT lead('a', - -1, 'b') OVER ()").unwrap();
+        let safe =
+            analyze_projection_expr("SELECT lead('a', - -1, 'b') OVER (ORDER BY 1)").unwrap();
         let ExprKind::WindowCall { args, .. } = safe.kind else {
             panic!("window");
         };
-        assert!(
-            matches!(args[1].kind, ExprKind::Literal(LiteralValue::Int(1))),
-            "existing safe normalization remains"
-        );
+        let ExprKind::Cast { expr: original, .. } = &args[1].kind else {
+            panic!("expected implicit BIGINT widening: {:?}", args[1].kind);
+        };
+        assert_eq!(super::signed_int_literal_value(original), Some(1));
         assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
         for sql in [
-            "SELECT lead('a', - -2147483648, 'b') OVER ()",
-            "SELECT lead('a', -(-2147483648), 'b') OVER ()",
+            "SELECT lead('a', - -2147483648, 'b') OVER (ORDER BY 1)",
+            "SELECT lead('a', -(-2147483648), 'b') OVER (ORDER BY 1)",
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
             let ExprKind::WindowCall { args, .. } = expression.kind else {

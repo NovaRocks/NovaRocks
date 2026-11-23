@@ -437,6 +437,9 @@ impl PreparedAggregateKernel for TopKKernel {
     fn requires_empty_update_preparation(&self) -> bool {
         true
     }
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

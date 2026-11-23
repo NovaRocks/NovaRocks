@@ -115,8 +115,14 @@ mod tests {
     }
 
     fn call(name: &str, distinct: bool, ordered: bool) -> AggregateCall {
-        let args = if matches!(name, "group_concat" | "string_agg") {
-            vec![arg(DataType::Int64), arg(DataType::Utf8)]
+        let args = if name == "listagg" {
+            vec![
+                arg(DataType::Utf8),
+                arg(DataType::Utf8),
+                arg(DataType::Boolean),
+                arg(DataType::Utf8),
+                arg(DataType::Boolean),
+            ]
         } else {
             vec![arg(DataType::Int64)]
         };
@@ -207,7 +213,7 @@ mod tests {
             AggMergeability::SinglePhaseOnly
         );
         assert_eq!(
-            aggregate_mergeability(&call("group_concat", false, false)),
+            aggregate_mergeability(&call("listagg", false, false)),
             AggMergeability::SinglePhaseOnly
         );
     }

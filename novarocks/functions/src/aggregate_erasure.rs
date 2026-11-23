@@ -56,6 +56,7 @@ impl PreparedAggregateHandle {
             contract: kernel.contract().clone(),
             layout: Layout::new::<K::State>(),
             policy: kernel.memory_policy(),
+            local_stages_supported: kernel.supports_local_stages(),
             invocation_data: kernel.has_invocation_data(),
             emission_context: kernel.requires_emission_context(),
             helper_memory: kernel.requires_helper_memory(),
@@ -76,6 +77,9 @@ impl PreparedAggregateHandle {
     ) -> Result<(), KernelFailure> {
         if self.local_stages.is_some() {
             return Err(invalid("local aggregate stages were already prepared"));
+        }
+        if !self.inner.supports_local_stages() {
+            return Ok(());
         }
         let source = Arc::clone(self.contract());
         let (partial_contract, final_contract) =
@@ -432,6 +436,7 @@ impl PreparedAggregateLocalStages {
     }
 }
 pub(crate) trait ErasedAggregateOps: Send + Sync + fmt::Debug {
+    fn supports_local_stages(&self) -> bool;
     fn clone_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,
@@ -484,6 +489,7 @@ struct TypedOps<K: PreparedAggregateKernel> {
     contract: Arc<AggregateCallContract>,
     layout: Layout,
     policy: AggregateStateMemoryPolicy,
+    local_stages_supported: bool,
     invocation_data: bool,
     emission_context: bool,
     helper_memory: bool,
@@ -493,6 +499,7 @@ impl<K: PreparedAggregateKernel> TypedOps<K> {
         if self.kernel.has_invocation_data() != self.invocation_data
             || self.kernel.requires_emission_context() != self.emission_context
             || self.kernel.requires_helper_memory() != self.helper_memory
+            || self.kernel.supports_local_stages() != self.local_stages_supported
             || self.kernel.memory_policy() != self.policy
             || !Arc::ptr_eq(self.kernel.contract(), &self.contract)
         {
@@ -528,6 +535,9 @@ impl<K: PreparedAggregateKernel> TypedOps<K> {
     }
 }
 impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
+    fn supports_local_stages(&self) -> bool {
+        self.local_stages_supported
+    }
     fn clone_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

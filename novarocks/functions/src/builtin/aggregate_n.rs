@@ -53,6 +53,9 @@ impl NKernel {
     }
 }
 impl PreparedAggregateKernel for NKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

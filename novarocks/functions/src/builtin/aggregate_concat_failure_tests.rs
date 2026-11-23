@@ -17,16 +17,8 @@
 
 use super::*;
 use arrow_array::StringArray;
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
 
-struct Compile;
-impl PureCompileControl for Compile {
-    fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-        assert!(units <= 256);
-        Ok(())
-    }
-}
 #[derive(Default)]
 struct Control {
     trace: Mutex<Vec<u32>>,
@@ -47,7 +39,7 @@ impl KernelEvaluationControl for Control {
         }
     }
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        panic!("GROUP_CONCAT never waits")
+        panic!("LISTAGG never waits")
     }
 }
 #[derive(Default)]
@@ -108,17 +100,6 @@ fn assert_metadata_only(host: &Host) {
         .expect("successful constructor allocated metadata");
     assert_eq!(ledger.live.as_slice(), &[metadata]);
     assert_eq!(ledger.bytes, metadata.1.size());
-}
-fn causes() -> [KernelFailure; 7] {
-    [
-        KernelFailure::Cancelled,
-        KernelFailure::DeadlineExceeded,
-        KernelFailure::ResourceExhausted,
-        invalid("host original"),
-        internal("host original"),
-        KernelFailure::Operational(KernelDiagnostic::new("host original")),
-        KernelFailure::InstanceFailed,
-    ]
 }
 fn listagg_contributors(
     values: &[Option<&str>],
@@ -270,4 +251,62 @@ fn listagg_reports_its_own_data_failures_and_returns_null_for_empty() {
             .value(0),
         "a"
     );
+}
+
+#[test]
+fn listagg_releases_emission_scratch_on_allocator_refusal() {
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut state = ListaggState::new(allocator);
+    let columns: [ArrayRef; 6] = [
+        Arc::new(StringArray::from(vec!["first", "second"])),
+        Arc::new(StringArray::from(vec!["|"; 2])),
+        Arc::new(arrow_array::BooleanArray::from(vec![true; 2])),
+        Arc::new(StringArray::from(vec!["..."; 2])),
+        Arc::new(arrow_array::BooleanArray::from(vec![false; 2])),
+        Arc::new(arrow_array::Int64Array::from(vec![2, 1])),
+    ];
+    let mut work = ScalarWork::new(None);
+    for row in 0..2 {
+        state
+            .update_row(&columns.each_ref().map(|array| (array, row)), &mut work)
+            .unwrap();
+    }
+
+    let retained = host.ledger.lock().unwrap().bytes;
+    arm_refusal(&host, 1, KernelFailure::ResourceExhausted);
+    let result =
+        core::build_listagg_array(std::iter::once(&state), true, &[true], &[false], &mut work);
+    assert!(matches!(result, Err(KernelFailure::ResourceExhausted)));
+    assert_eq!(host.ledger.lock().unwrap().bytes, retained);
+    state.latch_failure();
+    assert_metadata_only(&host);
+    drop(state);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}
+
+#[test]
+fn listagg_wide_value_copy_observes_cancellation_and_releases_scratch() {
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut state = ListaggState::new(allocator);
+    let columns: [ArrayRef; 5] = [
+        Arc::new(StringArray::from(vec!["a".repeat(1_048_576)])),
+        Arc::new(StringArray::from(vec!["|"])),
+        Arc::new(arrow_array::BooleanArray::from(vec![true])),
+        Arc::new(StringArray::from(vec!["..."])),
+        Arc::new(arrow_array::BooleanArray::from(vec![false])),
+    ];
+    let control = Control {
+        refusal: Some((8, KernelFailure::Cancelled)),
+        ..Control::default()
+    };
+    let mut checkpoints = EvaluationCheckpoints::new(&control);
+    let mut work = ScalarWork::new(Some(&mut checkpoints));
+    let outcome = state.update_row(&columns.each_ref().map(|array| (array, 0)), &mut work);
+    assert!(matches!(outcome, Err(KernelFailure::Cancelled)));
+    assert!(control.trace.lock().unwrap().contains(&256));
+    assert_metadata_only(&host);
+    drop(state);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }

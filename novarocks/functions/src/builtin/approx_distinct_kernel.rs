@@ -98,6 +98,9 @@ impl PreparedAggregateKernel for ApproxDistinctKernel {
         &self.contract
     }
 
+    fn supports_local_stages(&self) -> bool {
+        !self.contract.distinct() && self.contract.order_keys().is_empty()
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

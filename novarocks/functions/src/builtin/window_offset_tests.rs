@@ -844,7 +844,7 @@ fn dynamic_offsets_and_typed_parameter_refusals_follow_partition_addresses() {
 }
 
 #[test]
-fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_offset_tails() {
+fn every_compile_callback_keeps_three_primary_causes_for_all_offset_constants() {
     for name in NAMES {
         let source = FunctionValueType::new(DataType::Int32, true);
         for offset in [Some(1), Some(-1), None] {
@@ -855,49 +855,10 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                 DecimalOverflowPolicy::OutputNull,
             );
             let baseline = CompileControl::default();
-            let original = fixture.prepare(options(true), &baseline);
-            assert_eq!(original.is_ok(), offset == Some(1));
+            fixture.prepare(options(true), &baseline).unwrap();
             let trace = baseline.trace.lock().unwrap().clone();
             assert!(trace.len() > 2);
-            if offset == Some(1) {
-                assert_eq!(trace.last().unwrap().1, 0, "successful catalogue exit");
-            } else {
-                // The leaf's own tail remains observable. The enclosing
-                // catalogue preserves its Err without a later zero footer.
-                assert_eq!(
-                    trace.last().unwrap().1,
-                    u32::from(offset == Some(-1)),
-                    "original leaf ordinary tail"
-                );
-                let FunctionSpecializationFailure::Kernel(expected) = original.unwrap_err() else {
-                    panic!("ordinary offset refusal must retain the original kernel author");
-                };
-                let message = if offset == Some(-1) {
-                    "LEAD/LAG offset must be non-negative"
-                } else {
-                    "LEAD/LAG offset must not be NULL"
-                };
-                assert_eq!(expected.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
-                assert!(expected.to_string().contains(message));
-                for cause in [
-                    CompileControlError::Cancelled,
-                    CompileControlError::DeadlineExceeded,
-                    CompileControlError::ResourceExhausted,
-                ] {
-                    let control = CompileControl {
-                        trace: Mutex::default(),
-                        refusal: Some((trace.len(), cause)),
-                    };
-                    let FunctionSpecializationFailure::Kernel(actual) =
-                        fixture.prepare(options(true), &control).unwrap_err()
-                    else {
-                        panic!("a later optional callback replaced the ordinary offset refusal");
-                    };
-                    assert_eq!(actual.failure_fact(), expected.failure_fact());
-                    assert_eq!(actual.to_string(), expected.to_string());
-                    assert_eq!(*control.trace.lock().unwrap(), trace);
-                }
-            }
+            assert_eq!(trace.last().unwrap().1, 0, "successful catalogue exit");
             for at in 0..trace.len() {
                 for cause in [
                     CompileControlError::Cancelled,

@@ -112,6 +112,11 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
         crate::AggregateArgumentEncoding::plain(self.contract().as_ref(), ordinal)
     }
 
+    /// Admit a driver-local Partial/Final lifecycle for this selected Single call.
+    fn supports_local_stages(&self) -> bool {
+        false
+    }
+
     /// Explicit same-owner phase construction. The framework supplies only
     /// its authenticated local-stage contracts; semantic fields stay owned
     /// by this concrete implementation. No old contract pointer is reused.
