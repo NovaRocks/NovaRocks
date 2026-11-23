@@ -61,7 +61,7 @@ fn incremental_compact_rows_match_the_original_materialized_projection() {
 }
 
 #[test]
-fn metadata_only_selects_compact_and_full_refresh_selects_whole_receiving() {
+fn metadata_only_and_full_refresh_use_compact_receiving() {
     let shape = ConnectorManagedPublicationShape::Data;
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
     let (compact, rows) = project_managed_rows_fixture(
@@ -86,6 +86,6 @@ fn metadata_only_selects_compact_and_full_refresh_selects_whole_receiving() {
         false,
     )
     .unwrap();
-    assert!(!compact);
+    assert!(compact);
     assert_eq!(rows, Some(ConnectorWriteRowChange::Replace(5)));
 }

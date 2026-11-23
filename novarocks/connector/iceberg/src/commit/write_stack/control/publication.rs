@@ -702,7 +702,10 @@ impl crate::commit::dependency::RemovedDataFiles for materialized::MaterializedD
     }
 }
 
-struct KeyedPublicationPreparer(novarocks_spi::connector::KeyedPublication);
+struct KeyedPublicationPreparer {
+    documents: novarocks_spi::connector::KeyedPublication,
+    full_refresh: bool,
+}
 #[async_trait]
 impl Preparer for KeyedPublicationPreparer {
     async fn prepare(
@@ -713,9 +716,30 @@ impl Preparer for KeyedPublicationPreparer {
         // Recompute closure on this attempt's actual refs base.
         // A concurrent metadata-only marker write may increase its byte size
         // without advancing main; the admitted source is not that base.
-        let prepared =
-            crate::document_storage::keyed::write::publication_updates(view.metadata(), &self.0)
-                .map_err(format_error)?;
+        use crate::document_storage::keyed::write::{
+            publication_updates, publication_updates_from_snapshot,
+        };
+        let metadata = view.metadata();
+        let prepared = if self.full_refresh {
+            // The staged append already names the new records. Validate the
+            // actual attempt's preceding publication before adding their closure.
+            let predecessor = intent
+                .start()
+                .map(|base| {
+                    metadata.snapshot_by_id(base.snapshot_id).ok_or_else(|| {
+                        format_error(corrupt("Full refresh lost its original document snapshot"))
+                    })
+                })
+                .transpose()?;
+            publication_updates_from_snapshot(
+                metadata,
+                predecessor.map(AsRef::as_ref),
+                &self.documents,
+            )
+        } else {
+            publication_updates(metadata, &self.documents)
+        }
+        .map_err(format_error)?;
         for (key, value) in &prepared.summary {
             if intent.summary().get(key) != Some(value) {
                 return Err(format_error(invalid(
@@ -1090,7 +1114,12 @@ impl IcebergWriteSessionControl {
                 }
             };
             let leading = recipe.leading_stage();
-            let keyed = recipe.keyed_documents.map(KeyedPublicationPreparer);
+            let keyed = recipe
+                .keyed_documents
+                .map(|documents| KeyedPublicationPreparer {
+                    documents,
+                    full_refresh,
+                });
             let delete;
             let mut preparers: Vec<&dyn Preparer> = Vec::new();
             match leading {
@@ -2156,7 +2185,10 @@ mod keyed_preparation_tests {
         )
         .unwrap();
         engine
-            .stage(&KeyedPublicationPreparer(documents))
+            .stage(&KeyedPublicationPreparer {
+                documents,
+                full_refresh: false,
+            })
             .await
             .expect("large existing private properties do not prevent keyed preparation");
         for (key, value) in properties {
@@ -2191,7 +2223,10 @@ mod keyed_preparation_tests {
         )
         .unwrap();
         engine
-            .stage(&KeyedPublicationPreparer(documents.clone()))
+            .stage(&KeyedPublicationPreparer {
+                documents: documents.clone(),
+                full_refresh: false,
+            })
             .await
             .unwrap();
         engine

@@ -3889,9 +3889,8 @@ fn managed_logical_rows_refuse_insertion_count_overflow() {
     )
     .unwrap_err();
     assert!(
-        error
-            .message()
-            .contains("logical insertion count overflowed")
+        error.message().contains("compact entry counter overflow"),
+        "{error}"
     );
 }
 
