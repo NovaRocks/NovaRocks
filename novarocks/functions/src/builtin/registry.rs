@@ -1252,10 +1252,8 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // -> Utf8 (no args / Utf8 args)
-    for name in ["version", "database", "current_user", "user", "uuid"] {
-        add(m, name, Signature::new(vec![], TypeSpec::Utf8));
-    }
+    add(m, "version", Signature::new(vec![], TypeSpec::Utf8));
+    add(m, "uuid", Signature::new(vec![], TypeSpec::Uuid));
     add(
         m,
         "typeof",

@@ -31,3 +31,32 @@ pub fn format_uuid(bytes: [u8; 16]) -> [u8; 36] {
     }
     text
 }
+
+/// Decode the canonical 36-byte UUID form, accepting ASCII hex in either case.
+pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let text: &[u8; 36] = text.as_bytes().try_into().ok()?;
+    let mut bytes = [0; 16];
+    let mut cursor = 0;
+    for byte in &mut bytes {
+        if matches!(cursor, 8 | 13 | 18 | 23) {
+            if text[cursor] != b'-' {
+                return None;
+            }
+            cursor += 1;
+        }
+        let high = hex_nibble(text[cursor])?;
+        let low = hex_nibble(text[cursor + 1])?;
+        *byte = (high << 4) | low;
+        cursor += 2;
+    }
+    Some(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}

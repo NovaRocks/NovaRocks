@@ -103,6 +103,7 @@ impl<'a> ScalarTypeRecipe<'a> {
                     TypeSpec::LargeInt => ValueLogicalType::LargeInt,
                     TypeSpec::Bitmap => ValueLogicalType::Bitmap,
                     TypeSpec::Json => ValueLogicalType::Json,
+                    TypeSpec::Uuid => ValueLogicalType::Uuid,
                     _ => ValueLogicalType::Physical,
                 },
             ),

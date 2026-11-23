@@ -288,8 +288,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "current_date",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("current_user", BuiltinDisposition::Unavailable),
-    ("database", BuiltinDisposition::Unavailable),
     (
         "date",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -851,7 +849,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "url_extract_query",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("user", BuiltinDisposition::Unavailable),
     (
         "uuid",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),

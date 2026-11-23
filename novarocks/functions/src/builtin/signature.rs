@@ -74,6 +74,7 @@ pub enum TypeSpec {
     Character(CharacterKind, CharacterWidth),
     /// Explicit JSON semantics; Utf8 is its canonical storage, not its identity.
     Json,
+    Uuid,
     Binary,
     /// Explicit bitmap bytes; the Binary carrier does not authorize this domain.
     Bitmap,
@@ -278,6 +279,7 @@ impl TypeSpec {
             Self::Utf8 => output.push_str("varchar"),
             Self::Character(_, _) => self.write_canonical(output),
             Self::Json => output.push_str("json"),
+            Self::Uuid => output.push_str("uuid"),
             Self::Binary => output.push_str("varbinary"),
             Self::Bitmap => output.push_str("bitmap"),
             Self::Date => output.push_str("date"),
@@ -350,6 +352,7 @@ impl TypeSpec {
                 .expect("writing to a String cannot fail");
             }
             Self::Json => output.push_str("json"),
+            Self::Uuid => output.push_str("uuid"),
             Self::Binary => output.push_str("binary"),
             Self::Bitmap => output.push_str("bitmap"),
             Self::Date => output.push_str("date"),
@@ -425,6 +428,7 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         (TypeSpec::Utf8, DataType::Utf8) => true,
         (TypeSpec::Utf8, DataType::LargeUtf8) => true,
         (TypeSpec::Json, DataType::Utf8) => true,
+        (TypeSpec::Uuid, DataType::FixedSizeBinary(16)) => true,
         (TypeSpec::Bitmap, DataType::Binary) => true,
         (TypeSpec::Binary, DataType::Binary) => true,
         (TypeSpec::Binary, DataType::LargeBinary) => true,
@@ -525,6 +529,7 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Float32 => DataType::Float32,
         TypeSpec::Float64 => DataType::Float64,
         TypeSpec::Utf8 | TypeSpec::Json => DataType::Utf8,
+        TypeSpec::Uuid => DataType::FixedSizeBinary(16),
         TypeSpec::Character(..) => {
             return Err("character declarations require complete SQL value types".into());
         }
@@ -1442,6 +1447,11 @@ pub(super) fn unify_value_with_construction<E>(
             ty.data_type() == &DataType::Null
                 || (ty.logical_type() == ValueLogicalType::Json
                     && ty.data_type() == &DataType::Utf8)
+        }
+        TypeSpec::Uuid => {
+            ty.data_type() == &DataType::Null
+                || (ty.logical_type() == ValueLogicalType::Uuid
+                    && ty.data_type() == &DataType::FixedSizeBinary(16))
         }
         TypeSpec::Utf8 if ty.logical_type() == ValueLogicalType::Json => {
             let target =

@@ -386,6 +386,7 @@ pub enum CastRowResult {
     Decimal128(i128),
     Timestamp(i64),
     Text(String),
+    UuidBytes([u8; 16]),
     RowError(RowDataError),
 }
 

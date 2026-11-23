@@ -2893,3 +2893,4 @@ mod f3_recipe_independent_tests;
 pub mod testkit;
 
 pub use builtin::nullif::PreparedNullIf;
+pub use novarocks_value_arrays::uuid::parse_uuid;

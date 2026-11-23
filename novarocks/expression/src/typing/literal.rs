@@ -160,6 +160,24 @@ pub(super) fn type_literal(
                         error.control.expect("original type declaration control"),
                     ),
                 })?;
+            if target.logical_type() == ValueLogicalType::Uuid {
+                let bytes = novarocks_functions::parse_uuid(value)
+                    .ok_or_else(|| TypingError::InvalidLiteral("Invalid UUID literal".into()))?;
+                let field = Arc::new(Field::new("literal", DataType::FixedSizeBinary(16), false));
+                work.flush()?;
+                let value = ConstantValue::from_uuid(
+                    field,
+                    target.clone(),
+                    bytes,
+                    context.constant_policy,
+                    CompilePhase::FunctionSpecialization,
+                    work.control(),
+                )?;
+                return Ok(LiteralEmission::Constant {
+                    value_type: target,
+                    value,
+                });
+            }
             if target.logical_type() == ValueLogicalType::Json {
                 work.flush()?;
                 let valid = validate_trino_json_literal(value, work.control()).map_err(

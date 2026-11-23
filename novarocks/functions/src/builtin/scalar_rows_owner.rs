@@ -144,8 +144,10 @@ impl ScalarRowsOwner {
                 value: declaration.function_id().as_str().into(),
             });
         }
-        let implementation =
-            PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
+        let implementation_version = if operation == Operation::Uuid { 2 } else { 1 };
+        let implementation = PureImplementationId::try_new(format!(
+            "builtin.scalar/{name}/selected-v{implementation_version}"
+        ))?;
         let implementations = declaration
             .overloads()
             .iter()
@@ -407,12 +409,17 @@ impl ScalarRowsOwner {
             })?;
             let result_type = match self.operation {
                 Operation::AssertTrue => DataType::Boolean,
-                Operation::TypeOf | Operation::Uuid | Operation::Bar => DataType::Utf8,
+                Operation::TypeOf | Operation::Bar => DataType::Utf8,
+                Operation::Uuid => DataType::FixedSizeBinary(16),
                 Operation::Bucket => DataType::Int64,
                 Operation::Vector(_) => DataType::Float64,
             };
-            if contract.result_type().logical_type()
-                != novarocks_type_contract::ValueLogicalType::Physical
+            let result_domain = if self.operation == Operation::Uuid {
+                novarocks_type_contract::ValueLogicalType::Uuid
+            } else {
+                novarocks_type_contract::ValueLogicalType::Physical
+            };
+            if contract.result_type().logical_type() != result_domain
                 || contract.result_type().data_type() != &result_type
             {
                 return Err(invalid(

@@ -195,12 +195,7 @@ struct FunctionMetadata<'a> {
 fn unsupported_remaining_root(expr: &ast::Expr) -> bool {
     matches!(
         expr,
-        ast::Expr::MethodCall(_)
-            | ast::Expr::StaticMethodCall(_)
-            | ast::Expr::CurrentCatalog(_)
-            | ast::Expr::CurrentPath(_)
-            | ast::Expr::CurrentSchema(_)
-            | ast::Expr::CurrentUser(_)
+        ast::Expr::MethodCall(_) | ast::Expr::StaticMethodCall(_) | ast::Expr::CurrentPath(_)
     )
 }
 
@@ -215,6 +210,12 @@ impl<'a> super::AnalyzerContext<'a> {
         self.check_control()?;
         if let ast::Expr::Parameter(parameter) = expr {
             return self.analyze_prepared_parameter(parameter);
+        }
+        if matches!(
+            expr,
+            ast::Expr::CurrentCatalog(_) | ast::Expr::CurrentSchema(_) | ast::Expr::CurrentUser(_)
+        ) {
+            return self.type_session_expression(expr);
         }
         // Direct expression admission precedes its own CV lookup. This is not
         // a whole-tree prepass over opaque declaration shortcuts.
@@ -393,12 +394,12 @@ impl<'a> super::AnalyzerContext<'a> {
             | ast::Expr::CurrentTimestamp(_)
             | ast::Expr::LocalTime(_)
             | ast::Expr::LocalTimestamp(_) => self.type_clock(expr),
+            ast::Expr::CurrentCatalog(_)
+            | ast::Expr::CurrentSchema(_)
+            | ast::Expr::CurrentUser(_) => self.type_session_expression(expr),
             ast::Expr::MethodCall(_)
             | ast::Expr::StaticMethodCall(_)
-            | ast::Expr::CurrentCatalog(_)
-            | ast::Expr::CurrentPath(_)
-            | ast::Expr::CurrentSchema(_)
-            | ast::Expr::CurrentUser(_) => Err(AnalyzeError::unsupported_expression(
+            | ast::Expr::CurrentPath(_) => Err(AnalyzeError::unsupported_expression(
                 "expression profile is not supported",
                 expr.span(),
             )),

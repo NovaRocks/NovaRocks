@@ -83,6 +83,8 @@ impl AnalyzerContext<'_> {
             catalog: &catalog,
             current_database: &view.default_database,
             function_catalog: self.function_catalog,
+            // Saved namespace controls lookups. The original admitted session
+            // remains authoritative for expressions in the stored body.
             sql_semantics: self.sql_semantics.clone(),
             factory: self.factory.clone(),
             view_stack: self.view_stack.clone(),
@@ -628,6 +630,85 @@ mod tests {
     fn analyze(sql: &str, catalog: &Catalog) -> Result<ResolvedQuery, AnalyzeError> {
         let query = novarocks_parser::parser::parse_query(sql).unwrap();
         analyze_and_plan(&query, catalog)
+    }
+
+    #[test]
+    fn stored_view_uses_caller_session_with_its_saved_name_lookup() {
+        use crate::sql_mode::{SqlSemanticSettings, StatementSessionEnvironment};
+        for (expression, caller_schema, expected, nullable) in [
+            ("CURRENT_USER", Some("calling"), Some("reader"), false),
+            ("CURRENT_CATALOG", Some("calling"), Some("lookup"), true),
+            ("CURRENT_SCHEMA", Some("calling"), Some("calling"), true),
+            ("CURRENT_SCHEMA", None, None, true),
+        ] {
+            let sql = format!(r#"SELECT {expression} AS x FROM "t$files""#);
+            let mut view = declaration(&sql, "x", FunctionValueType::new(D::Utf8, nullable));
+            view.default_catalog = "ice".into();
+            view.default_database = "saved".into();
+            let catalog = catalog(view);
+            let query = novarocks_parser::parser::parse_query("SELECT x FROM v").unwrap();
+            let settings = SqlSemanticSettings::default().with_statement_session(Some(
+                StatementSessionEnvironment::new(
+                    "reader".into(),
+                    Some("lookup".into()),
+                    caller_schema.map(str::to_owned),
+                ),
+            ));
+            let (resolved, _, _) =
+                crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
+                    &query,
+                    &catalog,
+                    "db",
+                    crate::functions::builtin_sql_function_catalog(),
+                    &settings,
+                    crate::constant::test_constant_policy(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+            let QueryBody::Select(outer) = resolved.body else {
+                panic!("outer SELECT");
+            };
+            let Some(Relation::Subquery { query, .. }) = outer.from else {
+                panic!("expanded stored view");
+            };
+            let QueryBody::Select(inner) = &query.body else {
+                panic!("stored SELECT");
+            };
+            let value = &inner.projection[0].expr;
+            assert_eq!(value.value_type, FunctionValueType::new(D::Utf8, nullable));
+            let ExprKind::Constant(constant) = &value.kind else {
+                panic!("frozen session expression");
+            };
+            assert_eq!(constant.try_utf8().unwrap(), expected);
+            assert_eq!(
+                catalog.quoted_metadata_lookups.borrow().as_slice(),
+                &[("ice".into(), "saved".into(), "t$files".into())],
+            );
+        }
+    }
+
+    #[test]
+    fn mv_definition_rejects_session_dependency_before_projection() {
+        let view_sql = "SELECT CURRENT_SCHEMA AS x";
+        let catalog = catalog(declaration(
+            view_sql,
+            "x",
+            FunctionValueType::new(D::Utf8, true),
+        ));
+        for sql in [view_sql, "SELECT x FROM v"] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let error = crate::analyzer::analyze_mv_definition(
+                &query,
+                &catalog,
+                "db",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+            assert!(error.message().contains("depend on the caller's session"));
+        }
     }
 
     #[test]

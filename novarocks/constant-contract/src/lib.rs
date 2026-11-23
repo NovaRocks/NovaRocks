@@ -3434,6 +3434,27 @@ impl ConstantValue {
         };
         Self::from_scalar_array(field, ty, array, policy, phase, control)
     }
+    pub fn from_uuid(
+        field: Arc<Field>,
+        ty: FunctionValueType,
+        bytes: [u8; 16],
+        policy: ConstantPolicy,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ConstantError> {
+        factory_preflight(&field, &ty, 16, false, policy, phase, control)?;
+        if ty.logical_type() != ValueLogicalType::Uuid
+            || *ty.data_type() != DataType::FixedSizeBinary(16)
+        {
+            return Err(ConstantError::Invalid(
+                "UUID factory requires exact logical UUID type",
+            ));
+        }
+        let array = arrow_array::FixedSizeBinaryArray::try_from_iter([bytes].into_iter())
+            .map_err(ConstantError::arrow_validation)?;
+        Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
+    }
+
     pub fn from_binary(
         field: Arc<Field>,
         ty: FunctionValueType,

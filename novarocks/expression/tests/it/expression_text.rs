@@ -502,6 +502,57 @@ fn two_argument_if_preserves_the_selected_type_and_null_branch() {
 }
 
 #[test]
+fn uuid_literals_and_explicit_casts_keep_the_exact_nominal_bytes() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let literal = "UUID 'F24F9B64-81FA-49D1-B74E-8C09A6E31C56'";
+    let uuid = constant(literal, &context);
+    assert!(uuid.batch.errors.is_empty());
+    assert_eq!(
+        uuid.batch.result_type.logical_type(),
+        ValueLogicalType::Uuid
+    );
+    assert_eq!(
+        uuid.batch.result_type.data_type(),
+        &DataType::FixedSizeBinary(16)
+    );
+    let text = constant(&format!("CAST({literal} AS VARCHAR)"), &context);
+    assert_eq!(
+        text.batch.values.to_data(),
+        StringArray::from(vec!["f24f9b64-81fa-49d1-b74e-8c09a6e31c56"]).to_data()
+    );
+    for sql in [
+        format!("CAST(CAST({literal} AS VARBINARY) AS UUID)"),
+        format!("CAST(CAST({literal} AS VARCHAR) AS UUID)"),
+    ] {
+        let roundtrip = constant(&sql, &context);
+        assert!(roundtrip.batch.errors.is_empty(), "{sql}");
+        assert_eq!(roundtrip.batch.result_type, uuid.batch.result_type);
+        assert_eq!(
+            roundtrip.batch.values.to_data(),
+            uuid.batch.values.to_data()
+        );
+    }
+    for invalid in [
+        format!("CAST({literal} AS VARCHAR(35))"),
+        "CAST(X'0001' AS UUID)".into(),
+        "CAST('f24f9b6481fa49d1b74e8c09a6e31c56' AS UUID)".into(),
+    ] {
+        let result = evaluate(&compile(&invalid, &[], &context), &batch(&[], vec![]));
+        let [error] = result.batch.errors.as_ref() else {
+            panic!("expected one row error from {invalid}");
+        };
+        assert_eq!(
+            error.reason(),
+            DataFailureReason::Domain(
+                novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT
+            )
+        );
+    }
+}
+
+#[test]
 fn nullif_preserves_left_type_and_demands_only_present_rows() {
     let functions = fixture();
     let parameters = parameters();

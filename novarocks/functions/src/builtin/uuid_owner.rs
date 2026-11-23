@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::StringBuilder;
+use arrow_array::builder::FixedSizeBinaryBuilder;
 use arrow_schema::DataType;
 use rand::{
     RngCore, SeedableRng,
@@ -26,29 +26,12 @@ use rand::{
 
 use crate::{
     KernelEvaluationControl, KernelFailure, ScalarCallInput, ScalarKernelInstance, SelectedValues,
-    aggregate_scalar::checked_utf8_output_offset,
     kernel_control::{KernelDiagnostic, internal},
     kernel_input::EvaluationCheckpoints,
 };
 
 #[derive(Default)]
 pub(super) struct Instance(Option<StdRng>);
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
-fn format_uuid(bytes: [u8; 16]) -> [u8; 36] {
-    let mut text = [b'-'; 36];
-    let mut cursor = 0;
-    for byte in bytes {
-        if matches!(cursor, 8 | 13 | 18 | 23) {
-            cursor += 1;
-        }
-        text[cursor] = HEX[usize::from(byte >> 4)];
-        text[cursor + 1] = HEX[usize::from(byte & 0x0f)];
-        cursor += 2;
-    }
-    text
-}
 
 impl ScalarKernelInstance for Instance {
     fn retained_bytes(&self) -> usize {
@@ -63,12 +46,12 @@ impl ScalarKernelInstance for Instance {
         let selection = input.selection();
         let mut work = EvaluationCheckpoints::new(control);
         work.flush()?;
-        let payload = selection
+        selection
             .len()
-            .checked_mul(36)
+            .checked_mul(16)
+            .filter(|bytes| *bytes <= i32::MAX as usize)
             .ok_or(KernelFailure::ResourceExhausted)?;
-        checked_utf8_output_offset(0, payload)?;
-        let mut values = StringBuilder::with_capacity(selection.len(), payload);
+        let mut values = FixedSizeBinaryBuilder::with_capacity(selection.len(), 16);
         if !selection.is_empty() {
             if self.0.is_none() {
                 self.0 = Some(StdRng::from_rng(OsRng).map_err(|_| {
@@ -88,16 +71,15 @@ impl ScalarKernelInstance for Instance {
                 rng.fill_bytes(&mut bytes);
                 bytes[6] = (bytes[6] & 0x0f) | 0x40;
                 bytes[8] = (bytes[8] & 0x3f) | 0x80;
-                let text = format_uuid(bytes);
-                values.append_value(
-                    std::str::from_utf8(&text).map_err(|_| internal("UUID is not ASCII"))?,
-                );
+                values
+                    .append_value(bytes)
+                    .map_err(|_| internal("Generated UUID lost its exact byte width"))?;
             }
         }
         work.flush()?;
         let output = SelectedValues::try_new_observed(
             selection,
-            &DataType::Utf8,
+            &DataType::FixedSizeBinary(16),
             Arc::new(values.finish()),
             Box::new([]),
             || work.step(),
