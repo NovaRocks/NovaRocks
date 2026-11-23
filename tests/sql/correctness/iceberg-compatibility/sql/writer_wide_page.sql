@@ -20,51 +20,45 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
-  (id BIGINT, payload VARCHAR);
--- Each pad fits its 1 MiB limit. CONCAT produces one payload of
--- 17 * 1048576 - (1 + ... + 17) bytes for the single input row.
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
-SELECT BIGINT '1',
-       concat(
-           rpad('', 1048576 - n, 'x'),
-           rpad('', 1048575 - n, 'x'),
-           rpad('', 1048574 - n, 'x'),
-           rpad('', 1048573 - n, 'x'),
-           rpad('', 1048572 - n, 'x'),
-           rpad('', 1048571 - n, 'x'),
-           rpad('', 1048570 - n, 'x'),
-           rpad('', 1048569 - n, 'x'),
-           rpad('', 1048568 - n, 'x'),
-           rpad('', 1048567 - n, 'x'),
-           rpad('', 1048566 - n, 'x'),
-           rpad('', 1048565 - n, 'x'),
-           rpad('', 1048564 - n, 'x'),
-           rpad('', 1048563 - n, 'x'),
-           rpad('', 1048562 - n, 'x'),
-           rpad('', 1048561 - n, 'x'),
-           rpad('', 1048560 - n, 'x')
-       )
-FROM TABLE(sequence(1, 1)) AS offsets(n);
+shell: set -eu
+tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-wide-source-XXXXXX.sql")"
+trap 'rm -f "$tmp_sql"' EXIT
+cat > "$tmp_sql" <<'SPARK_SQL'
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
+CREATE TABLE ice_rest.${case_db}.rwm13_wide_source_${uuid0}
+USING iceberg TBLPROPERTIES ('format-version' = '3') AS
+SELECT CAST(1 AS BIGINT) AS id, repeat('x', 17825639) AS payload;
+SPARK_SQL
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 
 -- query 2
+-- @skip_result_check=true
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
+    (id BIGINT, payload VARCHAR);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
+SELECT id, payload FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_source_${uuid0};
+
+-- query 3
 -- Spark reads the stored value independently of NovaRocks' scan batch budget.
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-wide-write-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
 SELECT concat('RWM13_WIDE=', CAST(count(*) AS STRING), ':',
-             CAST(max(id) AS STRING), ':', CAST(max(length(payload)) AS STRING))
+             COALESCE(CAST(max(id) AS STRING), 'NULL'), ':', COALESCE(CAST(max(length(payload)) AS STRING), 'NULL'))
 FROM ice_rest.${case_db}.rwm13_wide_${uuid0};
 SPARK_SQL
 if ! spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" 2>&1)"; then
   printf '%s\n' "$spark_out"
   exit 1
 fi
-printf '%s\n' "$spark_out" | grep '^RWM13_WIDE='
+if ! printf '%s\n' "$spark_out" | grep '^RWM13_WIDE='; then
+  printf '%s\n' "$spark_out" >&2
+  exit 1
+fi
 
--- query 3
+-- query 4
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0} ;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_source_${uuid0};
