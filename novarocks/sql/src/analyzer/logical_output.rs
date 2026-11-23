@@ -1426,7 +1426,11 @@ mod scalar_domain_tests {
                 sql_semantics: Default::default(),
                 current_catalog: Some("iceberg".to_owned()),
                 current_database: "db".to_owned(),
-                optimizer_settings: SessionOptimizerSettings::default(),
+                optimizer_settings: SessionOptimizerSettings {
+                    // This fixture supplies the original catalog, statistics and provider facts.
+                    enable_materialized_view_rewrite: Some(false),
+                    ..Default::default()
+                },
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
