@@ -232,8 +232,12 @@ fn received(
     adapter: &IcebergWriteAdapter,
     entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
 ) -> Result<IcebergReceiving, ConnectorError> {
+    use super::domain::{IcebergCreationReceipt, IcebergCreationScope};
+    use novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext;
+
     let mut received = IcebergReceiving::new(None);
-    let query = write_query_identity();
+    let query_id = [1; 16];
+    let query = ConnectorWriteQueryIdentity::try_new(query_id, 1, [2; 16])?;
     received.begin_query(
         query,
         &handle.expected_targets(),
@@ -241,10 +245,32 @@ fn received(
         handle.targets(),
         None,
     )?;
-    let (targets, fragments): (Vec<_>, Vec<_>) = entries
-        .into_iter()
-        .map(|(target, fragment)| (target, adapter.wrap_commit_fragment(fragment)))
-        .unzip();
+    let scope = IcebergCreationScope::try_new(handle.session_id(), [3; 16], [4; 32])?;
+    let physical = ConnectorWriterPhysicalContext::new(query_id, 1, [5; 16], 0, 1);
+    let mut targets = Vec::with_capacity(entries.len());
+    let mut fragments = Vec::with_capacity(entries.len());
+    for (target, fragment) in entries {
+        let fragment = if fragment.branch() == IcebergWriteBranch::DeletionVector {
+            let path = fragment.new_object_path().expect("fixture Puffin object");
+            let identity = scope.identity(physical, path, IcebergFileFormat::Puffin)?;
+            let size = fragment
+                .metrics()
+                .expect("fixture Puffin metrics")
+                .file_size_in_bytes();
+            // Two logical ranges in the same Puffin describe one creation.
+            fragment.try_with_creation(IcebergCreationReceipt::try_new(
+                physical,
+                identity[..16].try_into().expect("creation ID width"),
+                identity,
+                size,
+                [6; 32],
+            )?)?
+        } else {
+            fragment
+        };
+        targets.push(target);
+        fragments.push(adapter.wrap_commit_fragment(fragment));
+    }
     let (paid, author) = paid_fragments(adapter, fragments);
     received.arrive_original(
         handle,

@@ -27,17 +27,22 @@ use crate::commit::row_delta::RowDeltaPreparer;
 use crate::commit::staging::{StagingBase, StagingEngine};
 use crate::commit::write_stack::codec::CompactFragmentCodec;
 use crate::commit::write_stack::domain::{
-    IcebergCommitFragment, IcebergContentRange, IcebergDataFileArtifact,
-    IcebergDeletionVectorArtifact, IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
+    IcebergCommitFragment, IcebergContentRange, IcebergCreationReceipt, IcebergCreationScope,
+    IcebergDataFileArtifact, IcebergDeletionVectorArtifact, IcebergFinalDeleteEffect,
+    IcebergFinalDeleteKind,
 };
 use crate::commit::write_stack::receiving::IcebergReceiving;
-use crate::commit::write_stack::test_support::{
-    paid_fragments, sample_metrics, sample_partition, write_query_identity,
-};
+use crate::commit::write_stack::test_support::{paid_fragments, sample_metrics, sample_partition};
 use crate::commit::write_stack::tests::dv_session;
 use crate::delete_file::IcebergFileFormat;
 use crate::iceberg::spec::{DataFileBuilder, DataFileFormat, FormatVersion, Struct};
-use novarocks_spi::connector::ConnectorMutationFailure;
+
+use novarocks_spi::connector::write_stack::{
+    ConnectorWriteProductionProof, ConnectorWriteQueryIdentity, ConnectorWriterPhysicalContext,
+    WriteTargetOrdinal,
+};
+use novarocks_spi::connector::{ConnectorError, ConnectorMutationFailure};
+use sha2::{Digest, Sha256};
 
 const TARGET: &str = "s3://b/data.parquet";
 const CONCURRENT_DV: &str = "s3://b/concurrent-delete.puffin";
@@ -130,6 +135,38 @@ pub(crate) async fn observed_materialized_staging_fixture(
     observed_compact_step(metadata, operation, io, fragments).await
 }
 
+struct FixtureWriterCohort(BTreeMap<WriteTargetOrdinal, ConnectorWriterPhysicalContext>);
+
+impl ConnectorWriteProductionProof for FixtureWriterCohort {
+    fn admits(
+        &self,
+        target: WriteTargetOrdinal,
+        physical: &ConnectorWriterPhysicalContext,
+    ) -> std::result::Result<bool, ConnectorError> {
+        Ok(self.0.get(&target) == Some(physical))
+    }
+}
+
+async fn fixture_content_digest(
+    io: &dyn ArtifactWriter,
+    path: &str,
+    size: u64,
+) -> Result<[u8; 32]> {
+    if path.starts_with("file://") {
+        let file = io.file_io().new_input(path)?;
+        if file.exists().await? {
+            let bytes = file.read().await?;
+            assert_eq!(bytes.len() as u64, size, "{path}");
+            return Ok(Sha256::digest(bytes.as_ref()).into());
+        }
+    }
+    // Some staging tests address manifest-only files without a storage body.
+    let mut digest = Sha256::new();
+    digest.update(path);
+    digest.update(size.to_be_bytes());
+    Ok(digest.finalize().into())
+}
+
 async fn observed_compact_step(
     metadata: Arc<TableMetadata>,
     operation: &IcebergCommitOperation,
@@ -138,26 +175,65 @@ async fn observed_compact_step(
 ) -> Result<Arc<MaterializedDeleteStep>> {
     let id = metadata.current_snapshot_id().unwrap();
     let (handle, adapter) = dv_session();
-    let query = write_query_identity();
-    let (targets, fragments): (Vec<_>, Vec<_>) = fragments
-        .into_iter()
-        .map(|fragment| {
-            let target = handle
-                .targets()
-                .iter()
-                .find(|target| target.branch() == fragment.branch())
-                .unwrap()
-                .ordinal();
-            (target, adapter.wrap_commit_fragment(fragment))
-        })
-        .unzip();
-    let (fragments, author) = paid_fragments(&adapter, fragments);
+    let scope = IcebergCreationScope::try_new(
+        handle.session_id(),
+        *uuid::Uuid::now_v7().as_bytes(),
+        crate::read_snapshot::metadata_identity_digest(&metadata).map_err(invalid)?,
+    )
+    .unwrap();
+    let handle = handle.try_with_creation_scope(scope).unwrap();
+    let execution = *uuid::Uuid::now_v7().as_bytes();
+    let query = ConnectorWriteQueryIdentity::try_new(execution, 1, [2; 16]).unwrap();
+    let writers = FixtureWriterCohort(
+        handle
+            .expected_targets()
+            .into_iter()
+            .map(|ordinal| {
+                let physical =
+                    ConnectorWriterPhysicalContext::new(execution, 1, [4; 16], 0, ordinal.get());
+                (ordinal, physical)
+            })
+            .collect(),
+    );
+    let mut targets = Vec::with_capacity(fragments.len());
+    let mut witnessed = Vec::with_capacity(fragments.len());
+    for mut fragment in fragments {
+        let target = handle
+            .targets()
+            .iter()
+            .find(|target| target.branch() == fragment.branch())
+            .unwrap()
+            .ordinal();
+        if let Some(path) = fragment.new_object_path() {
+            let physical = writers.0[&target];
+            let format = if fragment.referenced_data_file().is_some() {
+                IcebergFileFormat::Puffin
+            } else {
+                IcebergFileFormat::Parquet
+            };
+            let identity = scope.identity(physical, path, format).unwrap();
+            let size = fragment.metrics().unwrap().file_size_in_bytes();
+            let digest = fixture_content_digest(io, path, size).await?;
+            let receipt = IcebergCreationReceipt::try_new(
+                physical,
+                *uuid::Uuid::now_v7().as_bytes(),
+                identity,
+                size,
+                digest,
+            )
+            .unwrap();
+            fragment = fragment.try_with_creation(receipt).unwrap();
+        }
+        targets.push(target);
+        witnessed.push(adapter.wrap_commit_fragment(fragment));
+    }
+    let (fragments, author) = paid_fragments(&adapter, witnessed);
     let mut receiving = IcebergReceiving::default();
     receiving
         .begin_query(
             query,
             &handle.expected_targets(),
-            &mut None,
+            &mut Some(Arc::new(writers)),
             handle.targets(),
             None,
         )
