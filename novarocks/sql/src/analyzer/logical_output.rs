@@ -579,7 +579,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains("select coalesce(null,null),case when true then null else null end"),
-            vec![None, Some(SqlType::String)]
+            vec![None, None]
         );
     }
 

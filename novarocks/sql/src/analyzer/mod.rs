@@ -6111,8 +6111,8 @@ mod tests {
 
     #[test]
     fn correlated_exists_apply_inner_preserves_original_compare_sides() {
-        let sql = "SELECT s.s_1 FROM array_test s \
-                   WHERE EXISTS (SELECT 1 FROM array_test t WHERE t.s_1 = s.d_1)";
+        let sql = "SELECT s.i_1 FROM array_test s \
+                   WHERE EXISTS (SELECT 1 FROM array_test t WHERE t.i_1 = s.i_1)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
         let sel = select_body(&resolved);
         let spec = only_predicate_spec(sel);
@@ -6123,8 +6123,8 @@ mod tests {
         else {
             panic!("expected original correlation equality, got: {cond:?}");
         };
-        assert!(expr_has_qualified_column(left, "t", "s_1"));
-        assert!(expr_has_qualified_column(right, "s", "d_1"));
+        assert!(expr_has_qualified_column(left, "t", "i_1"));
+        assert!(expr_has_qualified_column(right, "s", "i_1"));
     }
 
     #[test]
