@@ -707,17 +707,14 @@ pub fn tuple_value(expressions: Vec<Expr>) -> Result<Expr, BuildError> {
     }))
 }
 
-/// Builds the ordinary variadic map call, retaining key/value order and nodes.
-pub fn map(entries: Vec<(Expr, Expr)>) -> Expr {
+/// Build the ordinary two-array map call while preserving both argument trees.
+pub fn map(keys: Expr, values: Expr) -> Expr {
     function(
         ObjectName {
             parts: vec![ident("map", false)],
             span: SYNTHETIC,
         },
-        entries
-            .into_iter()
-            .flat_map(|(key, value)| [key, value])
-            .collect(),
+        vec![keys, values],
     )
 }
 

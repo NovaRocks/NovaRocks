@@ -234,7 +234,39 @@ fn left_mark_rejects_noncanonical_hash_condition_and_placement() {
     }
 }
 #[test]
-fn left_mark_rejects_wrong_origin_type_outputs_and_nested_loop_algorithm() {
+fn nested_loop_left_mark_requires_complete_predicate_and_singleton_inputs() {
+    let fragment = mark_fragment(
+        ValueType::new(DataType::Boolean, true),
+        NodeId::new(3),
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    validate_fragment(&fragment, &FragmentCuts::default()).unwrap();
+
+    for change_predicate in [true, false] {
+        let mut parts = fragment.clone().into_parts();
+        let node = parts.nodes.get_mut(&NodeId::new(3)).unwrap();
+        let NodeKind::NestLoopJoin {
+            predicate,
+            distribution,
+            ..
+        } = &mut node.kind
+        else {
+            unreachable!()
+        };
+        if change_predicate {
+            *predicate = None;
+        } else {
+            *distribution = NestLoopJoinDistribution::BroadcastRight;
+        }
+        assert!(validate_fragment(&Fragment::from(parts), &FragmentCuts::default()).is_err());
+    }
+}
+
+#[test]
+fn left_mark_rejects_wrong_origin_type_and_outputs() {
     for (ty, owner, probe, build, hash) in [
         (
             ValueType::new(DataType::Boolean, false),
@@ -274,7 +306,7 @@ fn left_mark_rejects_wrong_origin_type_outputs_and_nested_loop_algorithm() {
         (
             ValueType::new(DataType::Boolean, true),
             NodeId::new(3),
-            true,
+            false,
             false,
             false,
         ),

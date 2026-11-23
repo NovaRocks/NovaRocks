@@ -35,14 +35,17 @@ pub use crate::functions::{
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
 mod required_constant;
+pub(crate) mod table_sequence;
 pub use required_constant::{
-    PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
-    RequiredConstantTarget, SqlAuthoredScalarUnit, prepare_required_constant,
+    PreparedRequiredConstant, RequiredConstantEligibility, RequiredConstantInput,
+    RequiredConstantRequest, RequiredConstantTarget, SqlAuthoredScalarUnit,
+    prepare_required_constant,
 };
 #[cfg(novarocks_dev_controls)]
 pub use required_constant::{
     SqlStandaloneScalarColumn, SqlStandaloneScalarRequest, author_standalone_scalar_for_test,
 };
+pub use table_sequence::{TableSequenceArgumentFact, TableSequenceArgumentNeed};
 
 mod captured_catalog;
 mod dml_catalog;
@@ -62,7 +65,9 @@ pub use crate::planner::distributed::build::{
 pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
-pub use dml_catalog::SqlDmlCatalogPreparation;
+pub use dml_catalog::{
+    SqlDmlAnalysisProgress, SqlDmlCatalogPreparation, SqlDmlTableSequenceAnalysis,
+};
 pub use logical_explain::SqlLogicalExplainCatalog;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
@@ -1004,6 +1009,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
+    pub(crate) table_sequence: Option<&'a table_sequence::TableSequencePass>,
     pub(crate) control: SqlCompileControl,
 }
 
@@ -1056,6 +1062,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             constant_policy,
             mv_rewrite,
             imv_rewrite: None,
+            table_sequence: None,
             control,
         }
     }
@@ -1093,6 +1100,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             constant_policy,
             mv_rewrite: None,
             imv_rewrite: None,
+            table_sequence: None,
             control,
         }
     }
@@ -1692,9 +1700,17 @@ use completion_driver::{
 pub(crate) use system_table_completion::install as install_system_table_snapshots;
 
 impl SqlCompiler {
-    pub fn analyze(
+    pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
+        Self::analyze_with_table_sequence(request)?.ok_or_else(|| {
+            SqlCompileError::InvalidRequest(
+                "Original table arguments are required before analysis can publish a plan".into(),
+            )
+        })
+    }
+
+    fn analyze_with_table_sequence(
         mut request: SqlAnalyzeRequest<'_>,
-    ) -> Result<SqlAnalyzeOutput, SqlCompileError> {
+    ) -> Result<Option<SqlAnalyzeOutput>, SqlCompileError> {
         request.check_control()?;
         request.freeze_scalar_presence_scope();
         let (
@@ -1764,10 +1780,17 @@ impl SqlCompiler {
                         },
                         request.write_assignments.as_deref(),
                         request.statement.root_session_admitted(),
+                        request.table_sequence,
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
 
+                if request
+                    .table_sequence
+                    .is_some_and(table_sequence::TableSequencePass::has_requests)
+                {
+                    return Ok(None);
+                }
                 let analyzed_fields = resolved.output_columns.clone();
                 let logical_plan =
                     crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;
@@ -1804,23 +1827,23 @@ impl SqlCompiler {
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
-            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::analysis(
-                SqlAnalysisOutput {
+            return Ok(Some(SqlAnalyzeOutput::Complete(
+                SqlCompileOutput::analysis(SqlAnalysisOutput {
                     logical_plan,
                     factory,
                     root_semantics,
-                },
+                }),
             )));
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) && request.imv_rewrite.is_none()
         {
-            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
+            return Ok(Some(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
                 SqlAnalysisOutput {
                     logical_plan,
                     factory,
                     root_semantics,
                 },
-            )));
+            ))));
         }
         let settings = request.session.optimizer_settings.clone();
         if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
@@ -1894,13 +1917,13 @@ impl SqlCompiler {
             request.check_control()?;
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) {
-            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
+            return Ok(Some(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
                 SqlAnalysisOutput {
                     logical_plan,
                     factory,
                     root_semantics,
                 },
-            )));
+            ))));
         }
 
         let mv_rewrite = if let Some(definitions) = request.mv_rewrite {
@@ -1942,7 +1965,7 @@ impl SqlCompiler {
             })?
             .snapshot();
 
-        Ok(SqlAnalyzeOutput::Pending(SqlAnalyzedQuery {
+        Ok(Some(SqlAnalyzeOutput::Pending(SqlAnalyzedQuery {
             root_semantics,
             logical_plan,
             factory,
@@ -1956,7 +1979,7 @@ impl SqlCompiler {
             function_catalog,
             constant_policy: request.constant_policy,
             sealed_functions: request.sealed_functions,
-        }))
+        })))
     }
 
     pub fn optimize(request: SqlOptimizeRequest<'_>) -> Result<SqlCompileOutput, SqlCompileError> {
@@ -3009,8 +3032,8 @@ mod tests {
         for sql in [
             "select array_agg(JSON_OBJECT('2': 3)) as j, array_agg(cast(JSON_OBJECT('2': 3) as varchar)) as s",
             "with q as (select cast(json_object('k':1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
-            "select array_sortby([json_object('k':1), json_object('k':2)],[2,1]) as j, array_sortby(cast([json_object('k':1), json_object('k':2)] as array<varchar>),[2,1]) as s",
-            "with q as (select [json_object('k':1),json_object('k':2)] as j) select array_sortby(j,[2,1]) as j, array_sortby(cast(j as array<varchar>),[2,1]) as s from q",
+            "select concat(ARRAY[json_object('k':1)], ARRAY[json_object('k':2)]) as j, concat(cast(ARRAY[json_object('k':1), json_object('k':2)] as ARRAY(VARCHAR)), ARRAY['plain']) as s",
+            "with q as (select [json_object('k':1),json_object('k':2)] as j) select concat(j, ARRAY[json_object('k':3)]) as j, concat(cast(j as ARRAY(VARCHAR)), ARRAY['plain']) as s from q",
         ] {
             let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
             let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);

@@ -26,7 +26,7 @@ CREATE TABLE ${case_db}.rf_x_build (k INT, v INT);
 INSERT INTO ${case_db}.ra VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
 INSERT INTO ${case_db}.customer_demographics VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
 INSERT INTO ${case_db}.rf_x_probe
-    SELECT generate_series, generate_series FROM TABLE(generate_series(1, 100000));
+    SELECT generate_series, generate_series FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.rf_x_build VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
 ANALYZE ${case_db}.ra;
 ANALYZE ${case_db}.customer_demographics;

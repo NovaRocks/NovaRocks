@@ -42,19 +42,19 @@ INSERT INTO tc VALUES ROW(4, null, null, null, null);
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entry from ms (kept the non-null 1:null entry)
 USE ${case_db};
-INSERT INTO tc VALUES ROW(3, null, ['a','b'], null, map(1,null));
+INSERT INTO tc VALUES ROW(3, null, ['a','b'], null, MAP(ARRAY[1], ARRAY[null]));
 
 -- query 4
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entry from mi (kept the non-null 1:1 entry)
 USE ${case_db};
-INSERT INTO tc VALUES ROW(1, [1,2], null, map(1,1), null);
+INSERT INTO tc VALUES ROW(1, [1,2], null, MAP(ARRAY[1], ARRAY[1]), null);
 
 -- query 5
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the null-key entries from mi and ms (kept the non-null entries)
 USE ${case_db};
-INSERT INTO tc VALUES ROW(2, [1,2], ['a','b'], map(1,1), map(1,'b'));
+INSERT INTO tc VALUES ROW(2, [1,2], ['a','b'], MAP(ARRAY[1], ARRAY[1]), MAP(ARRAY[1], ARRAY['b']));
 
 -- query 6
 -- CASE WHEN with array columns (with else)
@@ -139,7 +139,7 @@ SELECT if(i>2, ass, ai) FROM tc ORDER BY i;
 -- query 22
 -- IF with map_from_arrays and NULL
 USE ${case_db};
-SELECT if(ai is not null, map_from_arrays(['a', 'b'], [1, 2]), null) FROM tc ORDER BY i;
+SELECT if(ai is not null, map(['a', 'b'], [1, 2]), null) FROM tc ORDER BY i;
 
 -- query 23
 -- NULLIF on array columns

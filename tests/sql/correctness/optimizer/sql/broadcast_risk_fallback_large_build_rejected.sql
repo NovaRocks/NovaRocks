@@ -27,11 +27,11 @@ SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH probe_1m AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 1000000))
+    FROM TABLE(sequence(1, 1000000)) AS generate_series(generate_series)
 ),
 build_fallback_risky AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 100000000))
+    FROM TABLE(sequence(1, 100000000)) AS generate_series(generate_series)
 )
 SELECT COUNT() AS cnt
 FROM probe_1m p JOIN build_fallback_risky b ON p.k = b.k;

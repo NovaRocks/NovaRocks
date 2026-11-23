@@ -40,6 +40,9 @@ use super::completion::{
 use super::completion_catalog::CatalogCompletionState;
 use super::completion_predicate::{ProviderPredicateColumn, lower_provider_predicates};
 use super::mv_rewrite::{MvRewriteDefinitionIndex, SqlMvRewriteDefinitionFacts};
+use super::table_sequence::{
+    TableSequenceArgumentFact, TableSequenceOccurrence, TableSequencePass,
+};
 use super::{
     SqlAnalyzeOutput, SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCompileControl, SqlCompileError,
     SqlCompileIntent, SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot,
@@ -324,6 +327,12 @@ impl SqlCatalogCompletionState {
     }
 }
 
+pub(crate) struct SqlTableSequenceCompletionState {
+    catalog: SqlCatalogCompletionState,
+    occurrences: Vec<TableSequenceOccurrence>,
+    next_need_ordinal: u32,
+}
+
 pub(crate) struct SqlStatisticsCompletionState {
     common: FinalPlanCommon,
     analyzed: SqlAnalyzedQuery,
@@ -504,20 +513,7 @@ pub(super) fn resume_catalog(
             CompilerContinuation::catalog(state),
         ));
     }
-    let fact_catalog = state.catalog.completed_catalog()?;
-    let analyzed = analyze_with_catalog(
-        &state.common,
-        state.catalog.query().clone(),
-        &fact_catalog,
-        state.mv_definitions.as_ref(),
-        control,
-    )?;
-    statistics_or_optimize_step(
-        state.common,
-        analyzed,
-        state.catalog.next_need_ordinal(),
-        control,
-    )
+    analyze_completed_catalog(state, control)
 }
 
 fn catalog_or_analyze_step(
@@ -539,15 +535,76 @@ fn catalog_or_analyze_step(
         ));
     }
 
-    let fact_catalog = catalog.completed_catalog()?;
-    let analyzed = analyze_with_catalog(
-        &common,
-        catalog.query().clone(),
-        &fact_catalog,
-        mv_definitions.as_ref(),
+    analyze_completed_catalog(
+        SqlCatalogCompletionState {
+            common,
+            catalog,
+            mv_definitions,
+        },
         control,
-    )?;
-    statistics_or_optimize_step(common, analyzed, catalog.next_need_ordinal(), control)
+    )
+}
+
+fn analyze_completed_catalog(
+    state: SqlCatalogCompletionState,
+    control: &SqlCompileControl,
+) -> Result<CompilerStep, SqlCompileError> {
+    let pass = TableSequencePass::request(
+        Arc::clone(&state.common.sealed_functions),
+        state.catalog.next_need_ordinal(),
+    );
+    let analyzed = analyze_with_completed_catalog(&state, &pass, control)?;
+    let (occurrences, next_need_ordinal) = pass.into_requests();
+    if occurrences.is_empty() {
+        let analyzed = analyzed.ok_or_else(|| {
+            SqlCompileError::InvalidRequest("Catalog analysis did not publish a plan".into())
+        })?;
+        return statistics_or_optimize_step(state.common, analyzed, next_need_ordinal, control);
+    }
+    let needs = TableSequencePass::needs(&occurrences);
+    Ok(CompilerStep::need(
+        SqlNeedBatch::TableSequenceArguments(needs),
+        CompilerContinuation::TableSequence(Box::new(SqlTableSequenceCompletionState {
+            catalog: state,
+            occurrences,
+            next_need_ordinal,
+        })),
+    ))
+}
+
+pub(super) fn resume_table_sequence(
+    state: SqlTableSequenceCompletionState,
+    facts: Box<[TableSequenceArgumentFact]>,
+    control: &SqlCompileControl,
+) -> Result<CompilerStep, SqlCompileError> {
+    let pass = TableSequencePass::resume(state.occurrences, facts, control)?;
+    let analyzed =
+        analyze_with_completed_catalog(&state.catalog, &pass, control)?.ok_or_else(|| {
+            SqlCompileError::InvalidRequest("Table sequence analysis still needs arguments".into())
+        })?;
+    pass.check_consumed()?;
+    statistics_or_optimize_step(
+        state.catalog.common,
+        analyzed,
+        state.next_need_ordinal,
+        control,
+    )
+}
+
+fn analyze_with_completed_catalog(
+    state: &SqlCatalogCompletionState,
+    pass: &TableSequencePass,
+    control: &SqlCompileControl,
+) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
+    let fact_catalog = state.catalog.completed_catalog()?;
+    analyze_with_catalog(
+        &state.common,
+        state.catalog.query().clone(),
+        &fact_catalog,
+        state.mv_definitions.as_ref(),
+        Some(pass),
+        control,
+    )
 }
 
 fn analyze_with_catalog(
@@ -555,8 +612,9 @@ fn analyze_with_catalog(
     query: novarocks_parser::ast::Query,
     catalog: &dyn crate::catalog::PlannerTableProvider,
     mv_definitions: Option<&MvRewriteDefinitionIndex>,
+    table_sequence: Option<&TableSequencePass>,
     control: &SqlCompileControl,
-) -> Result<SqlAnalyzedQuery, SqlCompileError> {
+) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
     let catalog = SqlPlannerTableSnapshot::new(catalog);
     let query = Box::new(query);
     let statement = match &common.materialized_source {
@@ -577,7 +635,7 @@ fn analyze_with_catalog(
         }
         None => SqlStatementInput::parsed_query(query),
     };
-    let request = SqlAnalyzeRequest::new(
+    let mut request = SqlAnalyzeRequest::new(
         statement,
         common.intent.clone(),
         common.session.clone(),
@@ -589,9 +647,11 @@ fn analyze_with_catalog(
         common.constant_policy,
         control.clone(),
     );
-    match SqlCompiler::analyze(request)? {
-        SqlAnalyzeOutput::Pending(analyzed) => Ok(analyzed),
-        SqlAnalyzeOutput::Complete(_) => Err(SqlCompileError::InvalidRequest(
+    request.table_sequence = table_sequence;
+    match SqlCompiler::analyze_with_table_sequence(request)? {
+        None => Ok(None),
+        Some(SqlAnalyzeOutput::Pending(analyzed)) => Ok(Some(analyzed)),
+        Some(SqlAnalyzeOutput::Complete(_)) => Err(SqlCompileError::InvalidRequest(
             "final physical-plan analysis terminated before optimization".to_string(),
         )),
     }
@@ -2281,6 +2341,9 @@ mod tests {
                         SqlNeedBatch::ProviderInputs { .. } => {
                             panic!("root intrinsic fixture has no system tables")
                         }
+                        SqlNeedBatch::TableSequenceArguments(_) => {
+                            panic!("root intrinsic fixture has no table arguments")
+                        }
                     };
                 }
             }
@@ -2566,6 +2629,9 @@ mod tests {
                 SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
                 SqlNeedBatch::ProviderInputs { .. } => {
                     panic!("base query fixture has no system tables")
+                }
+                SqlNeedBatch::TableSequenceArguments(_) => {
+                    panic!("base query fixture has no table arguments")
                 }
             };
         }
@@ -4030,11 +4096,11 @@ mod tests {
     fn source_free_ctes_do_not_fabricate_base_statistics_or_known_zero_rows() {
         let scenarios = [
             (
-                "WITH big_probe AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 1000000))), no_stats AS (SELECT k FROM (SELECT generate_series + 0 AS k FROM TABLE(generate_series(1, 100000000))) projected WHERE k > 0) SELECT COUNT(*) AS cnt FROM big_probe p JOIN no_stats b ON p.k = b.k",
+                "WITH big_probe AS (SELECT sequential_number AS k FROM TABLE(sequence(1, 1000000))), no_stats AS (SELECT k FROM (SELECT sequential_number + 0 AS k FROM TABLE(sequence(1, 100000000))) projected WHERE k > 0) SELECT COUNT(*) AS cnt FROM big_probe p JOIN no_stats b ON p.k = b.k",
                 false,
             ),
             (
-                "WITH p AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 1000))), b AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 10))) SELECT COUNT(*) AS cnt FROM p JOIN b ON p.k = b.k",
+                "WITH p AS (SELECT sequential_number AS k FROM TABLE(sequence(1, 1000))), b AS (SELECT sequential_number AS k FROM TABLE(sequence(1, 10))) SELECT COUNT(*) AS cnt FROM p JOIN b ON p.k = b.k",
                 true,
             ),
         ];

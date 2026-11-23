@@ -142,6 +142,7 @@ impl SqlCapturedCatalogPreparation {
     pub fn analyze_view_definition(
         self,
         functions: &dyn super::SqlFunctionCatalog,
+        sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
         policy: super::ConstantPolicy,
     ) -> Result<Box<[crate::catalog::SqlViewColumn]>, SqlCompileError> {
         let database = self.catalog.definition_database()?;
@@ -154,15 +155,22 @@ impl SqlCapturedCatalogPreparation {
             crate::sql_mode::normalize_concat_query(self.catalog.query().clone(), &semantics)
                 .map_err(SqlCompileError::from)?;
         let functions = functions.snapshot_for_scalar_presence();
-        let (resolved, _, factory) = crate::analyzer::analyze_with_function_catalog(
-            &query,
-            &catalog,
-            database,
-            functions.as_ref(),
-            policy,
-            &self.control,
-        )
-        .map_err(SqlCompileError::from)?;
+        let table_sequence = super::table_sequence::TableSequencePass::SchemaOnly(sealed_functions);
+        let (resolved, _, factory) =
+            crate::analyzer::analyze_with_write_assignments_and_sql_semantics(
+                &query,
+                &catalog,
+                database,
+                functions.as_ref(),
+                &semantics,
+                policy,
+                &self.control,
+                None,
+                None,
+                false,
+                Some(&table_sequence),
+            )
+            .map_err(SqlCompileError::from)?;
         let names = crate::analysis::schema::validate_definition_column_names(
             &resolved.output_columns,
             query.span,
@@ -325,6 +333,7 @@ mod view_definition_tests {
         assert!(source.needs().is_empty());
         source.analyze_view_definition(
             crate::functions::builtin_sql_function_catalog(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
         )
     }
@@ -339,6 +348,24 @@ mod view_definition_tests {
             &arrow::datatypes::DataType::Int16
         );
         assert!(columns[1].value_type.nullable());
+    }
+
+    #[test]
+    fn table_sequence_view_declares_columns_without_sampling_the_saved_argument() {
+        let columns = definition(
+            "CREATE VIEW v AS SELECT sequential_number AS n FROM TABLE(sequence(stop => 3 + CAST(floor(random()) AS BIGINT)))",
+        )
+        .unwrap();
+        assert_eq!(columns[0].name.as_ref(), "n");
+        assert_eq!(
+            columns[0].value_type.data_type(),
+            &arrow::datatypes::DataType::Int64
+        );
+        let rejected = definition(
+            "CREATE VIEW v AS SELECT sequential_number AS n FROM TABLE(sequence(stop => (SELECT 3)))",
+        );
+        assert!(matches!(rejected, Err(SqlCompileError::Analyze(error))
+            if error.kind() == AnalyzeErrorKind::ExpressionNotConstant));
     }
 
     #[test]
@@ -430,6 +457,7 @@ mod view_definition_tests {
         assert!(matches!(
             source.analyze_view_definition(
                 crate::functions::builtin_sql_function_catalog(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::constant::test_constant_policy()
             ),
             Err(SqlCompileError::InvalidRequest(_))

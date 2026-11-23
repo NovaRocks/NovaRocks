@@ -39,7 +39,7 @@ fn offset_core_same_original_child_agnostic_null_and_slice_body() {
     .unwrap();
     assert_eq!(
         o.as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<arrow_array::Int64Array>()
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
@@ -55,7 +55,7 @@ fn offset_core_same_original_child_agnostic_null_and_slice_body() {
     .unwrap();
     assert_eq!(
         o.as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<arrow_array::Int64Array>()
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),

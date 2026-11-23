@@ -16,18 +16,33 @@
 -- under the License.
 
 -- query 1
-SELECT concat('a', CAST('[]' AS ARRAY<VARCHAR>)) AS empty_tail;
+SELECT concat('a', CAST(ARRAY[] AS ARRAY(VARCHAR))) AS empty_tail;
 -- query 2
-SELECT concat('a', ['b'], 'c') AS mixed;
+SELECT concat(ARRAY['a'], ARRAY['b'], ARRAY['c']) AS mixed;
 -- query 3
-SELECT concat(CAST(NULL AS VARCHAR), ['b']) AS null_element;
+SELECT concat(ARRAY[CAST(NULL AS VARCHAR)], ARRAY['b']) AS null_element;
 -- query 4
-SELECT concat('a', CAST(NULL AS ARRAY<VARCHAR>)) AS null_array;
+SELECT concat('a', CAST(NULL AS ARRAY(VARCHAR))) AS null_array;
 -- query 5
-SELECT array_map(x -> concat(x, []), ['a','b']) AS nested;
+SELECT ARRAY[
+    concat('a', CAST(ARRAY[] AS ARRAY(VARCHAR))),
+    concat('b', CAST(ARRAY[] AS ARRAY(VARCHAR)))
+] AS nested;
 -- query 6
 SELECT concat('a','b') AS string_value;
 -- query 7
-SELECT CAST('[]' AS ARRAY<VARCHAR>) AS l, array_map(x -> concat(x,l), ['a','b']) AS nested;
+WITH q(l) AS (VALUES CAST(ARRAY[] AS ARRAY(VARCHAR)))
+SELECT l, ARRAY[concat('a',l), concat('b',l)] AS nested FROM q;
 -- query 8
-SELECT concat(CAST(9223372036854775807 AS BIGINT), CAST([1] AS ARRAY<BIGINT>)) AS exact_integer;
+SELECT concat(CAST(9223372036854775807 AS BIGINT), CAST(ARRAY[1] AS ARRAY(BIGINT))) AS exact_integer;
+
+-- query 9
+SELECT concat(ARRAY[CAST(1 AS INTEGER)], ARRAY[CAST(2147483648 AS BIGINT)]) AS combined,
+       concat(CAST(1 AS INTEGER), ARRAY[CAST(2147483648 AS BIGINT)]) AS prepended,
+       concat(ARRAY[CAST(1 AS INTEGER)], CAST(2147483648 AS BIGINT)) AS appended;
+-- query 10
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT concat(ARRAY['a'], ARRAY[1]);
+-- query 11
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT concat(ARRAY['a'], MAP(ARRAY[1], ARRAY[2]));

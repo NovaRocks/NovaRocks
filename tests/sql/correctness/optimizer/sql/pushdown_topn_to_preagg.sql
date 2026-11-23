@@ -25,7 +25,7 @@ DROP TABLE IF EXISTS ${case_db}.t_pushdown_topn_preagg;
 CREATE TABLE ${case_db}.t_pushdown_topn_preagg (city INT, sales INT);
 INSERT INTO ${case_db}.t_pushdown_topn_preagg
     SELECT generate_series % 1000, generate_series
-    FROM TABLE(generate_series(1, 100000));
+    FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.t_pushdown_topn_preagg;
 
 SET SESSION disable_optimizer_rules = '';

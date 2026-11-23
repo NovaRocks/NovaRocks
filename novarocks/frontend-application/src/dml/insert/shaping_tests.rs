@@ -240,7 +240,7 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         column("s", structure),
     ];
     let source = parse_query(
-        "VALUES ROW(ARRAY[123456789.123456789, 1.25e2, NULL], map(123456789.123456789, ARRAY[123456789.123456789, NULL]), ROW(123456789.123456789, ARRAY[123456789.123456789]))",
+        "VALUES ROW(ARRAY[123456789.123456789, 1.25e2, NULL], map(ARRAY[123456789.123456789], ARRAY[ARRAY[123456789.123456789, NULL]]), ROW(123456789.123456789, ARRAY[123456789.123456789]))",
     );
     let query = shape_insert_source(&source, &[], &columns, &columns)
         .expect("literal source should shape")
@@ -280,19 +280,26 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
     else {
         panic!("expected MAP constructor");
     };
+    let ast::Expr::Array(keys) = cast_input(&map.arguments[0].value, "ARRAY(DECIMAL(18, 9))")
+    else {
+        panic!("expected MAP key array");
+    };
     assert_eq!(
-        number_text(cast_input(&map.arguments[0].value, "DECIMAL(18, 9)")),
+        number_text(cast_input(&keys.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    let ast::Expr::Array(map_array) = cast_input(&map.arguments[1].value, "ARRAY(DECIMAL(18, 9))")
+    let ast::Expr::Array(values) =
+        cast_input(&map.arguments[1].value, "ARRAY(ARRAY(DECIMAL(18, 9)))")
     else {
-        panic!("expected MAP array value");
+        panic!("expected MAP value array");
+    };
+    let ast::Expr::Array(map_array) = cast_input(&values.values[0], "ARRAY(DECIMAL(18, 9))") else {
+        panic!("expected MAP's first array value");
     };
     assert_eq!(
         number_text(cast_input(&map_array.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-
     let ast::Expr::Row(structure) = cast_input(
         row[2],
         r#"ROW("d" DECIMAL(18, 9), "a" ARRAY(DECIMAL(18, 9)))"#,
@@ -670,8 +677,18 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
     let ast::Expr::FunctionCall(map) = &structure.fields[1].expression else {
         panic!("expected nonempty ordinary MAP default");
     };
-    assert_eq!(number_text(&map.arguments[0].value), "7");
-    assert_eq!(number_text(&map.arguments[1].value), "-123456789.123456789");
+    let ast::Expr::Array(keys) = cast_input(&map.arguments[0].value, "ARRAY(INT)") else {
+        panic!("expected typed MAP keys");
+    };
+    let ast::Expr::Array(values) = cast_input(&map.arguments[1].value, "ARRAY(DECIMAL(18, 9))")
+    else {
+        panic!("expected typed MAP values");
+    };
+    assert_eq!(number_text(cast_input(&keys.values[0], "INT")), "7");
+    assert_eq!(
+        number_text(cast_input(&values.values[0], "DECIMAL(18, 9)")),
+        "-123456789.123456789"
+    );
 
     let columns = [column("id", DataType::Int32), nested];
     let shaped = shape_insert_source(
@@ -697,6 +714,24 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
         number_text(cast_input(&array.values[0], "DECIMAL(18, 9)")),
         "-123456789.123456789"
     );
+}
+
+#[test]
+fn empty_map_default_carries_two_declared_array_types() {
+    let mut empty = column("m", map_type(DataType::Int32, decimal_type()));
+    empty.write_default = Some(ColumnDefault::Map(Vec::new()));
+    let ast::Expr::FunctionCall(map) = omitted_insert_expr(&empty).unwrap() else {
+        panic!("expected MAP constructor");
+    };
+    for (argument, target) in map
+        .arguments
+        .iter()
+        .zip(["ARRAY(INT)", "ARRAY(DECIMAL(18, 9))"])
+    {
+        assert!(
+            matches!(cast_input(&argument.value, target), ast::Expr::Array(array) if array.values.is_empty())
+        );
+    }
 }
 
 #[test]

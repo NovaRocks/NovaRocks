@@ -420,33 +420,50 @@ fn dynamic_named_arguments() -> [FunctionArgument; 2] {
         },
     ]
 }
+fn trusted_named_binding(
+    catalog: &crate::EngineFunctionCatalog,
+    args: &[FunctionArgument],
+) -> crate::ResolvedFunctionBinding {
+    let function = crate::FunctionId::try_new("builtin.scalar/named_struct/v1").unwrap();
+    let overload =
+        crate::FunctionOverloadId::try_new("builtin.scalar/named_struct/dynamic-v1").unwrap();
+    catalog
+        .resolve_bound_trusted_at_overload(
+            &function,
+            FunctionKind::Scalar,
+            &overload,
+            request(args),
+            &Control,
+        )
+        .unwrap()
+}
+
 #[test]
-fn dynamic_created_validation_retains_original_named_and_lambda_value_domains() {
+fn dynamic_created_validation_retains_original_named_and_map_value_domains() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let named = dynamic_named_arguments();
+    let key = FunctionValueType::new(DataType::Utf8, false);
     let json =
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
-    let list = declared_list(&json, false).unwrap();
-    let lambda = [
-        FunctionArgument::Lambda {
-            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                vec![json.with_nullable(true).unwrap()].into_boxed_slice(),
-            ),
-            result_type: json.clone(),
+    let map = [
+        FunctionArgument::Value {
+            value_type: declared_list(&key, false).unwrap(),
+            constant: None,
         },
         FunctionArgument::Value {
-            value_type: list,
+            value_type: declared_list(&json, false).unwrap(),
             constant: None,
         },
     ];
-    for (name, args) in [
-        ("named_struct", named.as_slice()),
-        ("array_map", lambda.as_slice()),
+    let named_binding = trusted_named_binding(&catalog, &named);
+    let map_binding = catalog
+        .resolve_bound_user("map", FunctionKind::Scalar, request(&map), &Control)
+        .unwrap();
+    for (bound, args, child_index) in [
+        (named_binding, named.as_slice(), 0),
+        (map_binding, map.as_slice(), 1),
     ] {
-        let bound = catalog
-            .resolve_bound_user(name, FunctionKind::Scalar, request(args), &Control)
-            .unwrap();
         let before = bound.selected.clone();
         let (facts, mut scope) = RequestScope::new(None);
         created_map_validation(&catalog, &bound, args, &mut scope, &Control).unwrap();
@@ -455,7 +472,11 @@ fn dynamic_created_validation_retains_original_named_and_lambda_value_domains() 
         let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
             panic!("scalar result")
         };
-        let child = result.typed_binding().borrowed().child_at(0).unwrap();
+        let child = result
+            .typed_binding()
+            .borrowed()
+            .child_at(child_index)
+            .unwrap();
         assert_eq!(
             child.value_type().kind(),
             &ValueKind::Nominal(ValueLogicalType::Json)
@@ -544,14 +565,7 @@ impl novarocks_type_contract::ValueSchemaCreationScope<CreatedRefusal> for Refus
 fn dynamic_created_validation_first_refusal_and_control_have_no_tail() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let args = dynamic_named_arguments();
-    let bound = catalog
-        .resolve_bound_user(
-            "named_struct",
-            FunctionKind::Scalar,
-            request(&args),
-            &Control,
-        )
-        .unwrap();
+    let bound = trusted_named_binding(&catalog, &args);
     let (facts, mut scope) = RequestScope::new(None);
     let control = Trace::default();
     created_map_validation(&catalog, &bound, &args, &mut scope, &control).unwrap();

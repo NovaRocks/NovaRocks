@@ -645,6 +645,13 @@ fn apply_conversions(
                             conversion.target,
                         )
                     }
+                    typing::ValueConversionOrigin::ArrayCommonCoercion => {
+                        SqlFunctionBinding::new_with_array_common_constraint(
+                            conversion.binding,
+                            context.decimal_overflow_policy,
+                            conversion.expected_result,
+                        )
+                    }
                     typing::ValueConversionOrigin::OperatorDecimalFloat => {
                         SqlFunctionBinding::new_with_operator_decimal_float_constraint(
                             conversion.binding,

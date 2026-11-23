@@ -125,10 +125,10 @@
       "unit": "sql-case:complex-type/array_generate_temporal_domain",
       "failure": {
         "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_generate/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "Statement 2 reaches the explicit Trino timestamp sequence inputs and refuses the INTERVAL DAY literal before scalar binding. The prior array_generate/dynamic-v1 failure is retained in baseline evidence. TRC-6c owns interval representation and B7b owns scalar sequence installation. Verify the complete date and timestamp case and native cleanup before removal.",
+      "owner": "TRC-6c, UEA-5E B7b",
       "expires": "2026-12-15"
     },
     {
@@ -137,8 +137,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_contains/(list<any<T>>,any<T>)->bool;widen;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "Statement 1 selects builtin.scalar/contains/(list<any<T>>,any<T>)->bool;widen;legacy, which has no installed pure implementation. The former array_contains raw failure is preserved in the base evidence. Restore this exact selected domain and verify the complete original NULL-element oracles and native cleanup before removal.",
+      "owner": "UEA-5E B7b",
       "expires": "2026-12-15"
     },
     {
@@ -148,16 +148,6 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "Missing installed pure implementation for builtin.scalar/array_sort/(list<any<T>>)->list<any<T>>;strict;legacy; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/array_sortby_null_order_controls",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_generate/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
@@ -277,22 +267,12 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "Statement 1 selects builtin.scalar/transform_keys/lambda-v1 with the public argument order, and the overload has no installed pure implementation. The prior missing MAP constructor and wrong argument order failures remain in the native evidence. Verify the original higher-order value oracles and native cleanup after installing the exact overloads.",
+      "owner": "UEA-5E B7c",
       "expires": "2026-12-15"
     },
     {
       "unit": "sql-case:complex-type/complex_map_keys_values_unnest",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_map_subscript_access",
       "failure": {
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
@@ -402,16 +382,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_array_sortby",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 10 and the frozen selected overload builtin.scalar/array_generate/dynamic-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_test_arrays_zip",
       "failure": {
         "class": "error_code",
@@ -428,16 +398,6 @@
         "code": "query.execution.unsupported"
       },
       "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 4; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/map_null_values_lookup",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
@@ -529,16 +489,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/get_json_object/(any,utf8)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
       "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/map_aggregate_input_schema",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -1087,8 +1037,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_repeat/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "The first five ARRAY cases pass with the original value oracles converted to typed snapshots. Statement 6 selects builtin.scalar/row/dynamic-v1, which has no installed pure implementation. Earlier array_repeat failure and later unexecuted oracles remain recorded. Restore the ROW capability and verify the complete native case and cleanup before removal.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -1097,8 +1047,8 @@
         "class": "error_code",
         "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
+      "reason": "Statement 3 reaches the public ROW value used by the MAP seed and selects builtin.scalar/row/dynamic-v1, which has no installed pure implementation. The original missing MAP constructor refusal remains in baseline evidence. Restore the exact ROW capability and verify the complete native case and cleanup before removal.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -1576,10 +1526,10 @@
       "unit": "sql-case:join/join_array_not_in_element_null",
       "failure": {
         "class": "error_code",
-        "code": "query.execution.unsupported"
+        "code": "sql.analyze.type_mismatch"
       },
-      "reason": "The unchanged case first refuses at statement 5: its ARRAY comparison is retained as the original nested-loop predicate and the exact prepared comparison recipe supports flat leaves, not List carriers. Frozen optimizer/lowering and typed source projection identify the B7 nested comparison capability before runtime. No other failed oracle or cleanup violation accompanies it. Restore this capability and pass the entire unchanged native case and all original positive/negative oracles before removal. Actual source 70fce8ee795bf4af335afa2d131e1f378289177d. Native b722 and TST-G9b1 c30 both refuse unchanged step 5; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "UEA-5E B7",
+      "reason": "The same statement 5 refuses ordinary equality between ARRAY(DECIMAL(26,2)) and ARRAY(INTEGER), which is outside the installed integral ARRAY comparison and widening domain. The original query.execution.unsupported result remains in baseline evidence. Restore this comparison and verify every original oracle and actual 1FE+3BE cleanup before removal.",
+      "owner": "UEA-5E B7e",
       "expires": "2026-12-15"
     },
     {
@@ -1721,13 +1671,6 @@
       "owner": "UEA-5E B7",
       "exit_condition": "UEA-5E B7 restores builtin.scalar/row/dynamic-v1; rerun this original complete native1FE+3BE case with all original result, expected-error, fault, lifecycle and cleanup assertions passing, then remove this quarantine.",
       "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:execution-failure/representation-recovery-policy",
-      "owner": "B7",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(a) proposal only: the unchanged real native 1FE+3BE scenario fails before execution with sql.analyze.unavailable_implementation for the already registered exact builtin.scalar/array_repeat/dynamic-v1 gap. Clean 1f15 original invocation exits 1 with stable declared inputs and producer cleanup ok. Its expected Execution Representation ERR/fact and subsequent recovery checks remain unchanged and unreached. This is not a known-failure disposition or a passing Representation test.",
-      "exit_condition": "B7 delivers the actual selected pure array_repeat/dynamic-v1 carrier, effects and required array scalar closure. On one clean candidate and canonical artifacts, run this complete unchanged native 1FE+3BE scenario: original 1105/HY000 ERR; originating Representation KERNEL:320, MinimumUnit layout KERNEL:63, required=2147483648, extent_limit=2147483647, no resource/row/prefix inventions; original attempt 1 and no replacement; actual Worker convergence; exact rows on the original socket and an independent connection; unchanged deadline, exact process identity and cleanup. Reassess each newly exposed first failure separately; admission alone or replacing the expected error with the early refusal is insufficient. Remove this exact quarantine only after the full original scenario passes."
     },
     {
       "unit": "sql-case:complex-type/schema_free_exchange_depth64_struct",

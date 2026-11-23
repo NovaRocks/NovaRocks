@@ -158,30 +158,6 @@ fn validate_scalar_function_call_impl(
     arg_types: &[DataType],
     typed_args: Option<&[TypedExpr]>,
 ) -> Result<(), String> {
-    if name == "map" && !arg_types.len().is_multiple_of(2) {
-        return Err(no_matching_signature(name, arg_types));
-    }
-    // MAP keys must be a comparable scalar type — Iceberg / Trino / StarRocks
-    // all reject ARRAY, MAP, and STRUCT as map keys because they have no
-    // canonical bytewise identity. Catch the construction site (`map(k, v)`)
-    // so the user sees a clear "Map key don't supported type: …" error
-    // instead of an opaque runtime CAST failure further downstream.
-    if name == "map" {
-        for (idx, ty) in arg_types.iter().enumerate() {
-            if !idx.is_multiple_of(2) {
-                continue;
-            }
-            let kind = match ty {
-                DataType::List(_) | DataType::LargeList(_) => Some("ARRAY"),
-                DataType::Map(_, _) => Some("MAP"),
-                DataType::Struct(_) => Some("struct"),
-                _ => None,
-            };
-            if let Some(k) = kind {
-                return Err(format!("Map key don't supported type: {k}"));
-            }
-        }
-    }
     if name == "arrays_overlap" {
         if let Some(args) = typed_args {
             validate_arrays_overlap_typed_arguments(args)?;
@@ -189,15 +165,14 @@ fn validate_scalar_function_call_impl(
             validate_arrays_overlap_arguments(arg_types)?;
         }
     }
-    if matches!(name, "array_contains_seq") {
+    if matches!(name, "contains_sequence") {
         validate_array_pair_arguments(name, arg_types)?;
     }
     if is_mv_state_scalar_function(name) {
         validate_mv_state_scalar_function(name, arg_types)?;
     }
     let expected_arity = match name {
-        "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
-        | "array_max" => Some(1usize),
+        "cardinality" | "map_keys" | "map_values" | "array_min" | "array_max" => Some(1usize),
         "__array_struct_subfield" => Some(2usize),
         "translate" => Some(3usize),
         _ => None,
@@ -658,7 +633,7 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         | "url_encode" | "url_decode" | "translate" | "initcap" | "regexp_extract"
         | "regexp_extract_all" | "regexp_replace" | "bar" | "char" | "format" | "strleft"
         | "strright" | "group_concat" | "string_agg" | "parse_url" => DataType::Utf8,
-        "str_to_map" => DataType::Map(
+        "split_to_map" => DataType::Map(
             Arc::new(arrow::datatypes::Field::new(
                 "entries",
                 DataType::Struct(
@@ -801,7 +776,7 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
         "mv_group_row_id" => DataType::Utf8,
         "state_all_zero" => DataType::Boolean,
-        "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
+        "array_position" | "cardinality" => DataType::Int64,
         "grouping" => DataType::Int64,
         "split" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
@@ -809,21 +784,14 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
             true,
         ))),
         "array_min" | "array_max" => array_item_type(arg_types.first()).unwrap_or(DataType::Null),
-        "all_match" | "any_match" | "array_contains" | "array_contains_seq" | "arrays_overlap" => {
+        "all_match" | "any_match" | "contains" | "contains_sequence" | "arrays_overlap" => {
             DataType::Boolean
         }
-        "array_sort" | "array_sort_lambda" | "array_sortby" | "array_reverse" | "array_slice"
-        | "array_remove" | "array_filter" | "array_map" | "array_distinct" => {
+        "array_sort" | "slice" | "array_remove" | "array_distinct" => {
             arg_types.first().cloned().unwrap_or(DataType::Null)
         }
-        "array_append" => infer_array_append_return_type(arg_types),
-        "array_concat" => infer_array_concat_return_type(arg_types),
-        "array_flatten" => infer_array_flatten_return_type(arg_types),
+        "flatten" => infer_array_flatten_return_type(arg_types),
         "array_intersect" => infer_array_intersect_return_type(arg_types),
-        "array_repeat" => infer_array_repeat_return_type(arg_types),
-        "array_generate" => {
-            crate::functions::dynamic_scalar_data_type("array_generate", arg_types)?
-        }
         "map_keys" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
                 DataType::Struct(fields) if fields.len() == 2 => DataType::List(Arc::new(
@@ -843,39 +811,14 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
             _ => DataType::Null,
         },
         "map_entries" => infer_map_entries_return_type(arg_types),
-        "arrays_zip" => infer_arrays_zip_return_type(arg_types),
+        "zip" => infer_arrays_zip_return_type(arg_types),
         "map_concat" => infer_map_concat_return_type(arg_types),
         "map_filter" | "transform_keys" | "transform_values" => {
             arg_types.first().cloned().unwrap_or(DataType::Null)
         }
         "map" => infer_map_constructor_return_type(arg_types),
-        "row" | "struct" => infer_struct_constructor_return_type(arg_types),
+        "row" => infer_struct_constructor_return_type(arg_types),
         "named_struct" => infer_named_struct_return_type(arg_types),
-        "map_from_arrays" => match (arg_types.first(), arg_types.get(1)) {
-            (Some(DataType::List(keys)), Some(DataType::List(values))) => DataType::Map(
-                Arc::new(arrow::datatypes::Field::new(
-                    "entries",
-                    DataType::Struct(
-                        vec![
-                            Arc::new(arrow::datatypes::Field::new(
-                                "key",
-                                keys.data_type().clone(),
-                                true,
-                            )),
-                            Arc::new(arrow::datatypes::Field::new(
-                                "value",
-                                values.data_type().clone(),
-                                true,
-                            )),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            ),
-            _ => DataType::Null,
-        },
         "get_json_bool" | "get_variant_bool" | "json_exists" => DataType::Boolean,
         "get_json_int" | "get_variant_int" => DataType::Int64,
         "get_json_double" | "get_variant_double" => DataType::Float64,
@@ -912,25 +855,6 @@ fn array_item_type(data_type: Option<&DataType>) -> Option<DataType> {
     }
 }
 
-fn infer_array_append_return_type(arg_types: &[DataType]) -> DataType {
-    let Some(DataType::List(item)) = arg_types.first() else {
-        return DataType::Null;
-    };
-    let item_type = arg_types
-        .get(1)
-        .map(|target| wider_type(item.data_type(), target))
-        .unwrap_or_else(|| item.data_type().clone());
-    list_type(item_type)
-}
-
-fn infer_array_concat_return_type(arg_types: &[DataType]) -> DataType {
-    let item_type = arg_types
-        .iter()
-        .filter_map(|ty| array_item_type(Some(ty)))
-        .reduce(|acc, ty| wider_type(&acc, &ty));
-    item_type.map(list_type).unwrap_or(DataType::Null)
-}
-
 fn infer_array_flatten_return_type(arg_types: &[DataType]) -> DataType {
     match arg_types.first() {
         Some(DataType::List(outer)) => match outer.data_type() {
@@ -947,10 +871,6 @@ fn infer_array_intersect_return_type(arg_types: &[DataType]) -> DataType {
         .filter_map(|ty| array_item_type(Some(ty)))
         .reduce(|acc, ty| wider_type(&acc, &ty));
     item_type.map(list_type).unwrap_or(DataType::Null)
-}
-
-fn infer_array_repeat_return_type(arg_types: &[DataType]) -> DataType {
-    list_type(arg_types.first().cloned().unwrap_or(DataType::Null))
 }
 
 fn map_key_value_types(data_type: &DataType) -> Option<(DataType, DataType)> {
@@ -1183,20 +1103,16 @@ mod tests {
     }
 
     #[test]
-    fn infer_scalar_return_type_for_collection_length_functions() {
+    fn infer_scalar_return_type_for_collection_count_functions() {
         let int_array = array_type(DataType::Int32);
 
         assert_eq!(
-            infer_scalar_return_type("array_length", std::slice::from_ref(&int_array)),
-            DataType::Int32
-        );
-        assert_eq!(
             infer_scalar_return_type("cardinality", std::slice::from_ref(&int_array)),
-            DataType::Int32
+            DataType::Int64
         );
         assert_eq!(
             infer_scalar_return_type("array_position", &[int_array, DataType::Int32]),
-            DataType::Int32
+            DataType::Int64
         );
     }
 
@@ -1535,28 +1451,28 @@ mod tests {
     }
 
     #[test]
-    fn array_contains_seq_rejects_non_array_second_argument_with_starrocks_error() {
+    fn contains_sequence_rejects_non_array_second_argument_with_starrocks_error() {
         let err = validate_scalar_function_call(
-            "array_contains_seq",
+            "contains_sequence",
             &[array_type(DataType::Utf8), DataType::Utf8],
         )
-        .expect_err("array_contains_seq should reject scalar second argument");
+        .expect_err("contains_sequence should reject scalar second argument");
         assert_eq!(
             err,
-            "2-th input of array_contains_seq should be an array, rather than varchar"
+            "2-th input of contains_sequence should be an array, rather than varchar"
         );
     }
 
     #[test]
-    fn array_contains_seq_rejects_non_array_first_argument_with_starrocks_error() {
+    fn contains_sequence_rejects_non_array_first_argument_with_starrocks_error() {
         let err = validate_scalar_function_call(
-            "array_contains_seq",
+            "contains_sequence",
             &[DataType::Utf8, array_type(DataType::Utf8)],
         )
-        .expect_err("array_contains_seq should reject scalar first argument");
+        .expect_err("contains_sequence should reject scalar first argument");
         assert_eq!(
             err,
-            "1-th input of array_contains_seq should be an array, rather than varchar"
+            "1-th input of contains_sequence should be an array, rather than varchar"
         );
     }
 

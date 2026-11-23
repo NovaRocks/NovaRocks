@@ -53,6 +53,7 @@ pub(super) fn analyze_local_definition(
     preparation
         .analyze_view_definition(
             novarocks_sql::compiler::builtin_sql_function_catalog(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::completed_plan_fixture::test_constant_policy(),
         )
         .map(|columns| columns.into_vec())

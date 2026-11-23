@@ -53,7 +53,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0}.t_card_${
 -- Populate 1000 rows with k1 = v = 1..1000.
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0}.t_card_${uuid0}
 SELECT CAST(generate_series AS INT) AS k1, CAST(generate_series AS INT) AS v
-  FROM TABLE(generate_series(1, 1000));
+  FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 
 -- query 4
 -- Sanity: the table holds exactly 1000 rows spanning [1, 1000].

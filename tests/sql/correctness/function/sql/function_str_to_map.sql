@@ -17,7 +17,7 @@
 
 -- Migrated from dev/test/sql/test_function/T/test_str_to_map
 -- Test Objective:
--- 1. Validate str_to_map() correctly parses string values into maps.
+-- 1. Validate split_to_map() correctly parses string values into maps.
 -- 2. Validate cardinality of resulting maps over a large dataset (10000 rows).
 -- 3. Ensure sum of cardinalities matches expected total.
 
@@ -28,8 +28,10 @@ CREATE TABLE ${case_db}.t1(c1 INT, c2 VARCHAR) WITH (format_version = 3);
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 SELECT generate_series, CAST(generate_series AS VARCHAR) FROM TABLE(generate_series(1, 10000));
+INSERT INTO t1
+SELECT i, concat(CAST(i AS VARCHAR), ':value')
+FROM TABLE(sequence(1, 10000)) AS source(i);
 
 -- query 3
 USE ${case_db};
-select sum(cardinality(str_to_map(c2, ',', ':'))) from t1;
+select sum(cardinality(split_to_map(c2, ',', ':'))) from t1;

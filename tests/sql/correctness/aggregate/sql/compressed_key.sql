@@ -58,7 +58,7 @@ create table all_t0 (
 -- @skip_result_check=true
 USE ${case_db};
 -- The compact calendar inputs in this range have midnight time parts.
-insert into all_t0 SELECT x%200, x%200, x%200, x%200, x%200, x, CAST(CAST(x AS DATE) AS TIMESTAMP(6)), x%200, x, x, x, x, x % 8, x % 8, x % 16, x %200, x%200, '2020-02-02', '2020-02-02', x%200, x, x, x, x FROM TABLE(generate_series(1,  30000)) as g(x);
+insert into all_t0 SELECT x%200, x%200, x%200, x%200, x%200, x, CAST(CAST(x AS DATE) AS TIMESTAMP(6)), x%200, x, x, x, x, x % 8, x % 8, x % 16, x %200, x%200, '2020-02-02', '2020-02-02', x%200, x, x, x, x FROM TABLE(sequence(1,  30000)) as g(x);
 
 -- query 4
 -- @skip_result_check=true
@@ -393,7 +393,7 @@ create table all_decimal (
 -- query 50
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_decimal SELECT x%100, x%200, x%200, x%200 FROM TABLE(generate_series(1,  30000)) as g(x);
+insert into all_decimal SELECT x%100, x%200, x%200, x%200 FROM TABLE(sequence(1,  30000)) as g(x);
 
 -- query 51
 USE ${case_db};
@@ -490,7 +490,7 @@ insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values 
 -- query 70
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_numbers_t0 SELECT x%128, x%200, x%200, x%200, x%200, x%128, x%200, x%200, x%200, x%200 FROM TABLE(generate_series(1,  30000)) as g(x);
+insert into all_numbers_t0 SELECT x%128, x%200, x%200, x%200, x%200, x%128, x%200, x%200, x%200, x%200 FROM TABLE(sequence(1,  30000)) as g(x);
 
 -- query 71
 USE ${case_db};
@@ -997,7 +997,7 @@ create table all_t1 (
 -- query 128
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_t1 SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM TABLE(generate_series(1,  300000)) as g(x);
+insert into all_t1 SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM TABLE(sequence(1,  300000)) as g(x);
 
 -- query 129
 USE ${case_db};

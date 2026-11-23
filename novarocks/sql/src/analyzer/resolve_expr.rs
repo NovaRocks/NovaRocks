@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::parser::{expression_for_diagnostic, type_for_diagnostic};
@@ -294,15 +295,6 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Simple column reference
             ast::Expr::Identifier(ident) => {
-                if let Some(param) = scope.resolve_lambda_param(&ident.value) {
-                    return Ok(TypedExpr {
-                        kind: ExprKind::LambdaParamRef {
-                            name: param.name,
-                            slot_id: param.slot_id,
-                        },
-                        value_type: param.value_type.clone(),
-                    });
-                }
                 // If the scope has a synthetic expression for this name
                 // (FULL OUTER USING column → COALESCE), return that
                 // expression directly so the merged value is computed.
@@ -634,15 +626,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 ));
             }
         };
-        let name = "__map_element_at";
-        let bound = self.type_scalar_call(
-            NodeShape::CatalogCall {
-                name,
-                expected_result: None,
-            },
-            vec![base, index_typed],
-            span,
-        )?;
+        let name = "__map_subscript";
+        let bound =
+            self.type_scalar_call(NodeShape::MapSubscript, vec![base, index_typed], span)?;
         let value_type = bound.value_type().clone();
         debug_assert_eq!(value_type.data_type(), &output_type);
         Ok(TypedExpr {
@@ -713,23 +699,7 @@ impl<'a> super::AnalyzerContext<'a> {
         //   3. `col.field.field…` — implicit qualifier, the leading identifier
         //      *is* the column and the rest walk into a STRUCT.
         //
-        // Lambda parameters short-circuit before column lookup.
         let base_name = &parts[0].value;
-        if let Some(param) = scope.resolve_lambda_param(base_name) {
-            let mut current = TypedExpr {
-                kind: ExprKind::LambdaParamRef {
-                    name: param.name,
-                    slot_id: param.slot_id,
-                },
-                value_type: param.value_type.clone(),
-            };
-            for field in &parts[1..] {
-                current =
-                    self.analyze_struct_field_access(current, field.value.clone(), field.span)?;
-            }
-            return Ok(current);
-        }
-
         let build_column_ref =
             |column_id, value_type, qualifier: Option<String>, column: &str| TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -1446,13 +1416,22 @@ impl<'a> super::AnalyzerContext<'a> {
                     left.span(),
                 ));
             }
+            let integer_array_equality =
+                matches!(
+                    operator,
+                    OperatorFunction::Equal | OperatorFunction::NotEqual
+                ) && [&left_typed, &right_typed].into_iter().all(|operand| {
+                    novarocks_functions::PreparedComparisonRecipe::supports_array_equality_operand(
+                        &operand.value_type,
+                    )
+                });
             if !legacy_wide
-                && !crate::common::binary_operator::uses_structural_comparison(
-                    left_typed.value_type.value_type(),
-                )
-                && !crate::common::binary_operator::uses_structural_comparison(
-                    right_typed.value_type.value_type(),
-                )
+                && (integer_array_equality
+                    || !crate::common::binary_operator::uses_structural_comparison(
+                        left_typed.value_type.value_type(),
+                    ) && !crate::common::binary_operator::uses_structural_comparison(
+                        right_typed.value_type.value_type(),
+                    ))
             {
                 return self.analyze_binary_operator(
                     operator,
@@ -1992,6 +1971,25 @@ impl<'a> super::AnalyzerContext<'a> {
         span: Span,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if name == "row" {
+            let args = arguments
+                .iter()
+                .map(|argument| self.analyze_expr(argument, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            let call = self.type_scalar_call(NodeShape::Row, args, span)?;
+            let value_type = call.value_type().clone();
+            let volatility = call.binding.semantics.volatility;
+            return Ok(TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    name: "row".to_owned(),
+                    args: call.args.into(),
+                    distinct: false,
+                    volatility,
+                    binding: call.binding,
+                },
+                value_type,
+            });
+        }
         self.analyze_function_from_metadata(
             FunctionMetadata {
                 original: None,
@@ -2195,34 +2193,20 @@ impl<'a> super::AnalyzerContext<'a> {
         original_arguments: &[&ast::Expr],
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if matches!(
+            original_name.as_str(),
+            "row" | "\"row\"" | "named_struct" | "\"named_struct\""
+        ) {
+            return Err(AnalyzeError::unknown_function(
+                format!("Unknown function: {original_name}"),
+                func.span,
+            ));
+        }
         let name = match original_name.as_str() {
             "every" => "bool_and".to_string(),
             _ => original_name,
         };
-        // Route explicit `element_at(container, key)` calls to the right typed
-        // subscript function. The subscript-syntax path already does this, but
-        // direct function-call syntax bypasses it.
         let mut name = name;
-        if name == "element_at" {
-            // Analyze the first argument to learn its type. Preserve any
-            // authored failure before analyzing another argument or retrying.
-            let first_arg_ty = original_arguments
-                .first()
-                .map(|argument| {
-                    self.analyze_expr(argument, scope)
-                        .map(|typed| typed.value_type)
-                })
-                .transpose()?;
-            match first_arg_ty.as_ref().map(|ty| ty.value_type().kind()) {
-                Some(novarocks_type_contract::ValueKind::Map { .. }) => {
-                    name = "__map_element_at".to_string()
-                }
-                Some(novarocks_type_contract::ValueKind::List(_)) => {
-                    name = "__array_element_at".to_string()
-                }
-                _ => {}
-            }
-        }
 
         // Preserve the original zero-input ORDER BY refusal before aggregate
         // ordering validation. Legacy SEPARATOR is normalized by its parser owner.
@@ -2273,15 +2257,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
             });
         }
-        if matches!(name.as_str(), "array_length" | "cardinality")
-            && arg_exprs.len() == 1
-            && let Some(len) = syntactic_array_literal_len(arg_exprs[0])
-        {
-            return Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Int(len as i64)),
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-            });
-        }
         if matches!(name.as_str(), "group_concat" | "string_agg") && arg_exprs.is_empty() {
             return Err(AnalyzeError::invalid_argument(
                 "group_concat should have at least one input.",
@@ -2313,6 +2288,33 @@ impl<'a> super::AnalyzerContext<'a> {
         } else {
             arg_exprs.as_slice()
         };
+        if let Some(signature) = novarocks_functions::builtin::collection_lambda::signature(&name)
+            && effective_arg_exprs
+                .iter()
+                .any(|argument| matches!(argument, ast::Expr::Lambda(_)))
+        {
+            let [collection, ast::Expr::Lambda(lambda)] = effective_arg_exprs else {
+                return Err(AnalyzeError::unknown_function(
+                    format!("No matching signature for function {name}"),
+                    func.span,
+                ));
+            };
+            let collection = self.analyze_expr(collection, scope)?;
+            if lambda.arguments.len() != signature.arity()
+                || !signature.accepts_collection(&collection.value_type)
+            {
+                return Err(AnalyzeError::unknown_function(
+                    format!("No matching signature for function {name}"),
+                    func.span,
+                ));
+            }
+            return Err(AnalyzeError::function_binding(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(
+                    signature.overload(),
+                ),
+            )
+            .at_type_mismatch(func.span));
+        }
         if effective_arg_exprs
             .iter()
             .any(|arg| matches!(arg, ast::Expr::Lambda(_)))
@@ -2330,84 +2332,12 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
 
-        if let Some(rewritten) =
-            self.try_analyze_higher_order_function(&name, effective_arg_exprs, scope, func.span)?
-        {
-            return Ok(rewritten);
-        }
-        if let Some(rewritten) =
-            self.try_analyze_array_map_cast_lambda(&name, effective_arg_exprs, scope, func.span)?
-        {
-            return Ok(rewritten);
-        }
-
-        // Analyze arguments. For the narrow standalone lambda support needed by
-        // aggregate suite, rewrite `array_sortby((x) -> x.field, arr)` into
-        // `array_sortby(arr, __array_struct_subfield(arr, 'field'))`.
-        let (mut args_typed, mut arg_types) = if name == "array_sortby"
-            && effective_arg_exprs
-                .first()
-                .and_then(|expr| parse_array_sortby_lambda(expr))
-                .is_some()
-        {
-            self.analyze_array_sortby_lambda_arguments(effective_arg_exprs, scope, func.span)?
-        } else if is_map_higher_order_function_with_lambda(&name, effective_arg_exprs) {
-            self.analyze_map_higher_order_lambda_arguments(
-                &name,
-                effective_arg_exprs,
-                scope,
-                func.span,
-            )?
-        } else {
-            let mut args_typed = Vec::with_capacity(effective_arg_exprs.len());
-            let mut arg_types = Vec::with_capacity(effective_arg_exprs.len());
-            for arg in effective_arg_exprs {
-                let typed = self.analyze_expr(arg, scope)?;
-                arg_types.push(typed.value_type.data_type().clone());
-                args_typed.push(typed);
-            }
-            (args_typed, arg_types)
-        };
-
-        if name == "concat"
-            && args_typed
-                .iter()
-                .any(|arg| is_array_carrier(arg.value_type.data_type()))
-        {
-            // CONCAT chooses the array family before implicit string casts.
-            // A scalar contributes one element, including a NULL element;
-            // an existing array contributes its elements and its parent NULL.
-            args_typed = args_typed
-                .into_iter()
-                .map(|arg| {
-                    if is_array_carrier(arg.value_type.data_type()) {
-                        Ok(arg)
-                    } else {
-                        resolved_scalar_call_at(
-                            self.function_catalog,
-                            "__array_literal",
-                            vec![arg],
-                            func.span,
-                            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                            self.constant_policy,
-                            self.control,
-                        )
-                    }
-                })
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-            name = "array_concat".to_string();
-            arg_types = args_typed
-                .iter()
-                .map(|arg| arg.value_type.data_type().clone())
-                .collect();
-        }
-
-        if name == "array_generate" {
-            normalize_array_generate_arguments(&mut args_typed, effective_arg_exprs, func.span)?;
-            arg_types = args_typed
-                .iter()
-                .map(|arg| arg.value_type.data_type().clone())
-                .collect();
+        let mut args_typed = Vec::with_capacity(effective_arg_exprs.len());
+        let mut arg_types = Vec::with_capacity(effective_arg_exprs.len());
+        for arg in effective_arg_exprs {
+            let typed = self.analyze_expr(arg, scope)?;
+            arg_types.push(typed.value_type.data_type().clone());
+            args_typed.push(typed);
         }
 
         let needs_statistical_float_args = matches!(
@@ -2463,7 +2393,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
-        if name == "array_flatten"
+        if name == "flatten"
             && let Some(DataType::List(item)) = arg_types.first()
             && !matches!(item.data_type(), DataType::List(_))
         {
@@ -2689,6 +2619,35 @@ impl<'a> super::AnalyzerContext<'a> {
             });
         }
 
+        if matches!(name.as_str(), "group_concat" | "string_agg") {
+            args_typed = args_typed
+                .into_iter()
+                .map(|arg| {
+                    if matches!(
+                        arg.value_type.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8
+                    ) {
+                        Ok(arg)
+                    } else {
+                        let result = novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            arg.value_type.nullable(),
+                        );
+                        self.cast_with_trino_mode(
+                            arg,
+                            result,
+                            novarocks_type_contract::TrinoCastMode::Explicit,
+                            func.span,
+                        )
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            arg_types = args_typed
+                .iter()
+                .map(|arg| arg.value_type.data_type().clone())
+                .collect();
+        }
+
         if name == "if" && !args_typed.is_empty() {
             let condition = self.require_boolean_predicate(
                 args_typed.remove(0),
@@ -2813,7 +2772,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map_err(|error| error.at_type_mismatch(func.span))?,
             };
             // This overload is also exposed by Trino's named array concat call.
-            if bound.binding.function_id.as_str() == "builtin.scalar/array_concat/v1"
+            if bound.binding.function_id.as_str() == "builtin.scalar/concat/v1"
                 && bound.binding.logical_argument_count > 127
             {
                 return Err(AnalyzeError::too_many_arguments(
@@ -2902,42 +2861,6 @@ impl<'a> super::AnalyzerContext<'a> {
                     self.control,
                 )?,
             };
-            // `named_struct(name0, val0, name1, val1, …)` needs to carry the
-            // user-supplied field *names* in its returned STRUCT schema.
-            // `infer_scalar_return_type` only sees arg types and falls back
-            // to `col1/col2/…`; patch the schema here where we still have the
-            // analyzed arg expressions and can read the string-literal names.
-            if name == "named_struct"
-                && !args_typed.is_empty()
-                && args_typed.len() % 2 == 0
-                && let DataType::Struct(_) = &return_type
-            {
-                let mut fields: Vec<std::sync::Arc<arrow::datatypes::Field>> =
-                    Vec::with_capacity(args_typed.len() / 2);
-                let mut all_have_names = true;
-                for (i, chunk) in args_typed.chunks(2).enumerate() {
-                    let [name_expr, value_expr] = chunk else {
-                        all_have_names = false;
-                        break;
-                    };
-                    let field_name = match &name_expr.kind {
-                        ExprKind::Literal(LiteralValue::String(s)) => s.clone(),
-                        _ => {
-                            all_have_names = false;
-                            break;
-                        }
-                    };
-                    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
-                        field_name,
-                        value_expr.value_type.data_type().clone(),
-                        true,
-                    )));
-                    let _ = i;
-                }
-                if all_have_names {
-                    return_type = DataType::Struct(fields.into());
-                }
-            }
             // variant_get / try_variant_get: the path argument and optional
             // 3rd result-type argument are string literals (Spark-aligned).
             // Surface the type argument as the expression's static type;
@@ -3000,531 +2923,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 value_type,
             })
         }
-    }
-
-    fn analyze_array_sortby_lambda_arguments(
-        &self,
-        arg_exprs: &[&ast::Expr],
-        scope: &AnalyzerScope,
-        span: Span,
-    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), AnalyzeError> {
-        if arg_exprs.len() != 2 {
-            return Err(AnalyzeError::invalid_argument(
-                "array_sortby lambda rewrite currently supports exactly one lambda and one array argument",
-                span,
-            ));
-        }
-        let (param_name, lambda_body) =
-            parse_array_sortby_lambda(arg_exprs[0]).ok_or_else(|| {
-                AnalyzeError::invalid_argument(
-                    "array_sortby lambda rewrite expected a lambda argument",
-                    span,
-                )
-            })?;
-        let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
-        let field_chain = extract_lambda_field_chain(lambda_body, &param_name)
-            .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-        if field_chain.is_empty() {
-            return Err(AnalyzeError::invalid_argument(
-                "array_sortby lambda rewrite requires direct struct field access like (x) -> x.item",
-                span,
-            ));
-        }
-
-        let mut key_expr = array_expr.clone();
-        for field_name in field_chain {
-            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name, scope, span)?;
-        }
-
-        let arg_types = vec![
-            array_expr.value_type.data_type().clone(),
-            key_expr.value_type.data_type().clone(),
-        ];
-        Ok((vec![array_expr, key_expr], arg_types))
-    }
-
-    fn build_array_struct_subfield_expr(
-        &self,
-        base: TypedExpr,
-        field_name: String,
-        scope: &AnalyzerScope,
-        span: Span,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        let DataType::List(item_field) = &base.value_type.data_type() else {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "array_sortby lambda expects ARRAY input, got {:?}",
-                    base.value_type.data_type()
-                ),
-                span,
-            ));
-        };
-        let DataType::Struct(fields) = item_field.data_type() else {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "array_sortby lambda field access expects ARRAY<STRUCT>, got {:?}",
-                    base.value_type.data_type()
-                ),
-                span,
-            ));
-        };
-        // Use the same unique identifier resolver as dot access and binding.
-        let mut field_work = novarocks_type_contract::CompileCheckpoints::try_new(
-            self.control,
-            novarocks_type_contract::CompilePhase::Validate,
-        )
-        .map_err(AnalyzeError::control)?;
-        let ordinal = novarocks_functions::builtin::struct_field_resolution::resolve_struct_field_ordinal_observed(
-            fields, &field_name, || field_work.step().map_err(novarocks_functions::FunctionBindingError::Control),
-        ).map_err(|source| match source {
-            novarocks_functions::FunctionBindingError::Control(source) => AnalyzeError::control(source),
-            source => AnalyzeError::invalid_argument(source.to_string(), span),
-        })?.ok_or_else(|| AnalyzeError::unknown_column(format!("struct field '{}' does not exist", field_name), span))?;
-        field_work.finish().map_err(AnalyzeError::control)?;
-        let field = &fields[ordinal];
-        let field_type = field.data_type().clone();
-        let canonical_field_name = field.name().clone();
-        let field_name_expr = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::String(canonical_field_name)),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-        };
-        let args = vec![base, field_name_expr];
-        let result = resolved_scalar_call_at(
-            self.function_catalog,
-            "__array_struct_subfield",
-            args,
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
-        debug_assert_eq!(
-            result.value_type.data_type(),
-            &DataType::List(Arc::new(arrow::datatypes::Field::new(
-                "item", field_type, true,
-            )))
-        );
-        // The selected subfield binding owns its complete semantic result.
-        // Validate the actual source/port; do not derive an output from fields.
-        self.adapt_bound_output_domains(result, None, scope, span)
-    }
-
-    fn try_analyze_higher_order_function(
-        &self,
-        name: &str,
-        arg_exprs: &[&ast::Expr],
-        scope: &AnalyzerScope,
-        span: Span,
-    ) -> Result<Option<TypedExpr>, AnalyzeError> {
-        if !matches!(
-            name,
-            "array_map"
-                | "transform"
-                | "any_match"
-                | "all_match"
-                | "array_filter"
-                | "filter"
-                | "array_sort"
-        ) {
-            return Ok(None);
-        }
-
-        let Some((lambda_pos, params, lambda_body)) = find_lambda_argument(arg_exprs) else {
-            return Ok(None);
-        };
-        let array_exprs = arg_exprs
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, expr)| (idx != lambda_pos).then_some(*expr))
-            .collect::<Vec<_>>();
-        if array_exprs.is_empty() {
-            return Err(AnalyzeError::invalid_argument(
-                format!("{name} expects at least one ARRAY argument"),
-                span,
-            ));
-        }
-
-        if name == "array_sort" {
-            if array_exprs.len() != 1 || params.len() != 2 {
-                return Err(AnalyzeError::invalid_argument(
-                    "array_sort lambda comparator expects one ARRAY argument and two lambda parameters",
-                    span,
-                ));
-            }
-            let source = self.analyze_expr(array_exprs[0], scope)?;
-            let item_type = match &source.value_type.data_type() {
-                DataType::List(_) => {
-                    array_item_value_type_observed(&source.value_type, self.control)?
-                }
-                DataType::Null => {
-                    novarocks_type_contract::FunctionValueType::new(DataType::Null, true)
-                }
-                other => {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!("array_sort expects ARRAY argument, got {other:?}"),
-                        span,
-                    ));
-                }
-            };
-            let lambda_params = params
-                .iter()
-                .map(|param_name| LambdaParam {
-                    name: param_name.clone(),
-                    slot_id: self.alloc_lambda_slot_id(),
-                    value_type: item_type.clone(),
-                })
-                .collect::<Vec<_>>();
-            let mut lambda_scope = scope.clone();
-            for param in &lambda_params {
-                lambda_scope.add_lambda_param(param.clone());
-            }
-            let body = self.analyze_expr(lambda_body, &lambda_scope)?;
-            if typed_expr_contains_column_ref(&body)
-                || typed_expr_contains_nondeterministic_call(self.function_catalog, &body)
-                || !typed_expr_references_all_lambda_params(&body, &lambda_params)
-            {
-                return Err(AnalyzeError::invalid_argument(
-                    "Lambda function in sort_array should only depend on both two arguments and contain no non-deterministic functions",
-                    span,
-                ));
-            }
-            let lambda = TypedExpr {
-                value_type: body.value_type.clone(),
-
-                kind: ExprKind::LambdaFunction {
-                    params: lambda_params,
-                    body: novarocks_parser::ast::AstBox::new(body),
-                },
-            };
-            let args = vec![source, lambda];
-            return resolved_scalar_call_at(
-                self.function_catalog,
-                "array_sort_lambda",
-                args,
-                span,
-                self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                self.constant_policy,
-                self.control,
-            )
-            .map(Some);
-        }
-
-        let mut array_args = Vec::with_capacity(array_exprs.len());
-        let mut lambda_params = Vec::with_capacity(params.len());
-        for (idx, array_expr) in array_exprs.iter().enumerate() {
-            let typed = self.analyze_expr(array_expr, scope)?;
-            let value_type = match &typed.value_type.data_type() {
-                DataType::List(_) => {
-                    array_item_value_type_observed(&typed.value_type, self.control)?
-                }
-                DataType::Null => {
-                    novarocks_type_contract::FunctionValueType::new(DataType::Null, true)
-                }
-                other => {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!("{name} expects ARRAY argument, got {other:?}"),
-                        span,
-                    ));
-                }
-            };
-            let Some(param_name) = params.get(idx) else {
-                return Err(AnalyzeError::invalid_argument(
-                    format!(
-                        "{name} lambda argument count {} does not match ARRAY argument count {}",
-                        params.len(),
-                        array_exprs.len()
-                    ),
-                    span,
-                ));
-            };
-            lambda_params.push(LambdaParam {
-                name: param_name.clone(),
-                slot_id: self.alloc_lambda_slot_id(),
-                value_type,
-            });
-            array_args.push(typed);
-        }
-        if params.len() != array_args.len() {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "{name} lambda argument count {} does not match ARRAY argument count {}",
-                    params.len(),
-                    array_args.len()
-                ),
-                span,
-            ));
-        }
-
-        let mut lambda_scope = scope.clone();
-        for param in &lambda_params {
-            lambda_scope.add_lambda_param(param.clone());
-        }
-        let body = self.analyze_expr(lambda_body, &lambda_scope)?;
-        let lambda = TypedExpr {
-            value_type: body.value_type.clone(),
-
-            kind: ExprKind::LambdaFunction {
-                params: lambda_params,
-                body: novarocks_parser::ast::AstBox::new(body),
-            },
-        };
-
-        match name {
-            "array_map" | "transform" => {
-                let mut args = Vec::with_capacity(array_args.len() + 1);
-                args.push(lambda);
-                args.extend(array_args);
-                resolved_scalar_call_at(
-                    self.function_catalog,
-                    "array_map",
-                    args,
-                    span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )
-                .map(Some)
-            }
-            "any_match" | "all_match" => {
-                let mut map_args = Vec::with_capacity(array_args.len() + 1);
-                map_args.push(lambda);
-                map_args.extend(array_args);
-                let mapped = resolved_scalar_call_at(
-                    self.function_catalog,
-                    "array_map",
-                    map_args,
-                    span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )?;
-                let args = vec![mapped];
-                resolved_scalar_call_at(
-                    self.function_catalog,
-                    name,
-                    args,
-                    span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )
-                .map(Some)
-            }
-            "array_filter" | "filter" => {
-                let source = array_args.first().cloned().ok_or_else(|| {
-                    AnalyzeError::invalid_argument("array_filter missing ARRAY argument", span)
-                })?;
-                let mut map_args = Vec::with_capacity(array_args.len() + 1);
-                map_args.push(lambda);
-                map_args.extend(array_args);
-                let filter = resolved_scalar_call_at(
-                    self.function_catalog,
-                    "array_map",
-                    map_args,
-                    span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )?;
-                let args = vec![source, filter];
-                resolved_scalar_call_at(
-                    self.function_catalog,
-                    "array_filter",
-                    args,
-                    span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )
-                .map(Some)
-            }
-            _ => unreachable!("higher-order function match is exhaustive"),
-        }
-    }
-
-    /// Bind two-parameter map lambdas to the actual input key and value types.
-    fn analyze_map_higher_order_lambda_arguments(
-        &self,
-        name: &str,
-        arg_exprs: &[&ast::Expr],
-        scope: &AnalyzerScope,
-        span: Span,
-    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), AnalyzeError> {
-        let (param_names, body_expr) = parse_multi_param_lambda(arg_exprs[0]).ok_or_else(|| {
-            AnalyzeError::invalid_argument(
-                format!("{name} expects a lambda function as its first argument"),
-                span,
-            )
-        })?;
-        if param_names.len() != 2 {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "{name} lambda must take exactly 2 parameters (key, value); got {}",
-                    param_names.len()
-                ),
-                span,
-            ));
-        }
-
-        let map_typed = self.analyze_expr(arg_exprs[1], scope)?;
-        let (key_type, value_type) = match &map_typed.value_type.data_type() {
-            DataType::Map(field, _) => match field.data_type() {
-                DataType::Struct(fields) if fields.len() == 2 => (
-                    container_child_value_type_observed(&map_typed.value_type, 0, self.control)?,
-                    container_child_value_type_observed(&map_typed.value_type, 1, self.control)?,
-                ),
-                other => {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "{name} expects MAP argument with struct<key,value> entries, got {:?}",
-                            other
-                        ),
-                        span,
-                    ));
-                }
-            },
-            DataType::Null => (
-                novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
-                novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
-            ),
-            other => {
-                return Err(AnalyzeError::invalid_argument(
-                    format!("{name} expects a MAP argument, got {:?}", other),
-                    span,
-                ));
-            }
-        };
-
-        // Bind the (key, value) lambda parameters as proper lambda slots, NOT
-        // scope columns. `add_column` mints a fresh ColumnId per parameter, so
-        // body references would resolve to a `ColumnRef` carrying that phantom
-        // id — an id no scan produces. The ColumnId-binding verifier then
-        // rejects it ("ColumnId(N) is not produced by child scope"), which
-        // broke `map_apply` / `transform_keys` / `transform_values` in
-        // projections, filters, and join conditions. Binding them via
-        // `add_lambda_param` makes body references resolve to `LambdaParamRef`,
-        // mirroring the array higher-order path (`try_analyze_higher_order_function`).
-        let lambda_params = vec![
-            LambdaParam {
-                name: param_names[0].to_lowercase(),
-                slot_id: self.alloc_lambda_slot_id(),
-                value_type: super::helpers::with_nullability(key_type.clone(), true),
-            },
-            LambdaParam {
-                name: param_names[1].to_lowercase(),
-                slot_id: self.alloc_lambda_slot_id(),
-                value_type: super::helpers::with_nullability(value_type.clone(), true),
-            },
-        ];
-        let mut inner_scope = scope.clone();
-        for param in &lambda_params {
-            inner_scope.add_lambda_param(param.clone());
-        }
-
-        // Both map transforms use the same executor over single-entry maps.
-        let lambda_param_ref =
-            |param: &LambdaParam, _value_type: novarocks_type_contract::FunctionValueType| {
-                TypedExpr {
-                    kind: ExprKind::LambdaParamRef {
-                        name: param.name.clone(),
-                        slot_id: param.slot_id,
-                    },
-                    value_type: param.value_type.clone(),
-                }
-            };
-        let (new_key, new_value) = match name {
-            "transform_keys" => (
-                self.analyze_expr(body_expr, &inner_scope)?,
-                lambda_param_ref(&lambda_params[1], value_type.clone()),
-            ),
-            // transform_values
-            _ => (
-                lambda_param_ref(&lambda_params[0], key_type.clone()),
-                self.analyze_expr(body_expr, &inner_scope)?,
-            ),
-        };
-
-        // The rebuilt map type is `map`'s own resolved result. Restating the
-        // entries field here would duplicate the key/value nullability rule
-        // that `TypeSpec::Map` already owns, and a second statement of it can
-        // only drift: a map key is nullable, which this engine relies on to
-        // carry a NULL key through.
-        let args = vec![new_key, new_value];
-        let body_typed = resolved_scalar_call_at(
-            self.function_catalog,
-            "map",
-            args,
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
-        let body_type = body_typed.value_type.clone();
-
-        let lambda_typed = TypedExpr {
-            kind: ExprKind::LambdaFunction {
-                params: lambda_params,
-                body: novarocks_parser::ast::AstBox::new(body_typed),
-            },
-            value_type: body_type,
-        };
-
-        let args_typed = vec![lambda_typed.clone(), map_typed.clone()];
-        let arg_types = vec![
-            lambda_typed.value_type.data_type().clone(),
-            map_typed.value_type.data_type().clone(),
-        ];
-        Ok((args_typed, arg_types))
-    }
-
-    fn try_analyze_array_map_cast_lambda(
-        &self,
-        name: &str,
-        arg_exprs: &[&ast::Expr],
-        scope: &AnalyzerScope,
-        span: Span,
-    ) -> Result<Option<TypedExpr>, AnalyzeError> {
-        if !matches!(name, "array_map" | "transform") {
-            return Ok(None);
-        }
-        if arg_exprs.len() != 2 {
-            return Ok(None);
-        }
-
-        let Some((param_name, lambda_body)) = parse_array_sortby_lambda(arg_exprs[0]) else {
-            return Ok(None);
-        };
-        if !lambda_body_casts_param_to_utf8(lambda_body, &param_name) {
-            return Err(AnalyzeError::unsupported_expression(
-                "array_map lambda rewrite currently supports x -> CAST(x AS STRING)",
-                span,
-            ));
-        }
-
-        let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
-        if !matches!(array_expr.value_type.data_type(), DataType::List(_)) {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "array_map lambda expects ARRAY input, got {:?}",
-                    array_expr.value_type.data_type()
-                ),
-                span,
-            ));
-        }
-        let target = DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Utf8,
-            true,
-        )));
-        Ok(Some(TypedExpr {
-            kind: ExprKind::Cast {
-                cast_mode: None,
-                expr: novarocks_parser::ast::AstBox::new(array_expr),
-                target: target.clone(),
-                decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(target, true),
-        }))
     }
 
     fn validate_percentile_arguments(
@@ -4168,183 +3566,6 @@ fn compares_element_wise_with_nulls(data_type: &DataType) -> bool {
 }
 
 // Literal classification chooses a type; actual parsing remains an ordinary CAST.
-fn array_generate_literal_temporal_type(value: &str) -> Option<DataType> {
-    let bytes = value.as_bytes();
-    let date_shape = bytes.len() >= 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[..10]
-            .iter()
-            .enumerate()
-            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
-    if !date_shape || chrono::NaiveDate::parse_from_str(&value[..10], "%Y-%m-%d").is_err() {
-        return None;
-    }
-    if bytes.len() == 10 {
-        return Some(DataType::Date32);
-    }
-    let clock_shape = (bytes.len() == 19 || (21..=26).contains(&bytes.len()))
-        && bytes[10] == b' '
-        && bytes[13] == b':'
-        && bytes[16] == b':'
-        && bytes[11..19]
-            .iter()
-            .enumerate()
-            .all(|(i, b)| i == 2 || i == 5 || b.is_ascii_digit())
-        && (bytes.len() == 19 || (bytes[19] == b'.' && bytes[20..].iter().all(u8::is_ascii_digit)));
-    if clock_shape && chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").is_ok() {
-        Some(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        ))
-    } else {
-        None
-    }
-}
-
-fn normalize_array_generate_arguments(
-    args: &mut [TypedExpr],
-    source: &[&ast::Expr],
-    span: Span,
-) -> Result<(), AnalyzeError> {
-    if args.is_empty() || args.len() > 4 {
-        return Err(AnalyzeError::invalid_argument(
-            "array_generate expects 1 to 4 arguments",
-            span,
-        ));
-    }
-    let mut temporal = None;
-    for arg in args.iter().take(2) {
-        let inferred = match &arg.value_type.data_type() {
-            DataType::Date32 | DataType::Timestamp(_, _) => {
-                Some(arg.value_type.data_type().clone())
-            }
-            DataType::Utf8 => match &arg.kind {
-                ExprKind::Literal(LiteralValue::String(value)) => {
-                    array_generate_literal_temporal_type(value)
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(inferred) = inferred {
-            temporal = Some(match (temporal, inferred) {
-                (Some(DataType::Timestamp(unit, tz)), DataType::Date32) => {
-                    DataType::Timestamp(unit, tz)
-                }
-                (
-                    Some(DataType::Timestamp(left_unit, left_tz)),
-                    DataType::Timestamp(right_unit, right_tz),
-                ) if left_unit != right_unit || left_tz != right_tz => {
-                    return Err(AnalyzeError::unsupported_expression(
-                        "array_generate requires an explicit common DATETIME cast for differing timestamp types",
-                        span,
-                    ));
-                }
-                (_, inferred) => inferred,
-            });
-        }
-    }
-    let Some(mut temporal) = temporal else {
-        if novarocks_type_contract::array_generate_item_type(
-            &args
-                .iter()
-                .map(|arg| arg.value_type.data_type().clone())
-                .collect::<Vec<_>>(),
-        )
-        .is_none()
-        {
-            return Err(AnalyzeError::unsupported_expression(
-                "array_generate cannot freeze unanchored temporal or NULL bounds; use explicit DATE or DATETIME casts",
-                span,
-            ));
-        }
-        return Ok(());
-    };
-    if args.len() < 2 {
-        return Err(AnalyzeError::invalid_argument(
-            "array_generate temporal range requires two bounds",
-            span,
-        ));
-    }
-    if args.len() >= 3 && !is_integer_const_literal(source[2]) {
-        return Err(AnalyzeError::invalid_argument(
-            "array_generate requires step parameter must be a constant integer",
-            source[2].span(),
-        ));
-    }
-    let unit = if args.len() == 4 {
-        match &args[3].kind {
-            ExprKind::Literal(LiteralValue::String(unit)) => unit.to_ascii_lowercase(),
-            _ => {
-                return Err(AnalyzeError::unsupported_expression(
-                    "array_generate requires a constant temporal unit",
-                    source[3].span(),
-                ));
-            }
-        }
-    } else {
-        "day".to_string()
-    };
-    if !matches!(
-        unit.as_str(),
-        "year"
-            | "quarter"
-            | "month"
-            | "week"
-            | "day"
-            | "hour"
-            | "minute"
-            | "second"
-            | "millisecond"
-            | "microsecond"
-    ) {
-        return Err(AnalyzeError::invalid_argument(
-            format!("array_generate unsupported time unit: {unit}"),
-            span,
-        ));
-    }
-    if temporal == DataType::Date32
-        && matches!(
-            unit.as_str(),
-            "hour" | "minute" | "second" | "millisecond" | "microsecond"
-        )
-    {
-        temporal = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
-    }
-    for arg in args.iter_mut().take(2) {
-        let mut input = arg.clone();
-        if !matches!(
-            input.value_type.data_type(),
-            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8 | DataType::Null
-        ) {
-            if !matches!(input.kind, ExprKind::Literal(_)) {
-                return Err(AnalyzeError::unsupported_expression(
-                    "array_generate temporal bounds require temporal values or VARCHAR casts",
-                    span,
-                ));
-            }
-            // Preserve legacy invalid numeric-literal parsing, not epoch-day casts.
-            input = cast_null_preserving_target_type(
-                input,
-                &DataType::Utf8,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            );
-        }
-        let parse_can_fail = *input.value_type.data_type() == DataType::Utf8;
-        *arg = cast_null_preserving_target_type(
-            input,
-            &temporal,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        );
-        arg.value_type = arg
-            .value_type
-            .with_nullable(arg.value_type.nullable() || (parse_can_fail))
-            .expect("validated root NULL contract");
-    }
-    Ok(())
-}
-
 pub(super) fn cast_null_preserving_target_type(
     expr: TypedExpr,
     target: &DataType,
@@ -4462,13 +3683,6 @@ fn is_integer_day_offset(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}
-
-fn is_array_carrier(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
     )
 }
 
@@ -5672,156 +4886,6 @@ fn format_percentile_error_value(value: f64) -> String {
     }
 }
 
-fn extract_lambda_field_chain(expr: &ast::Expr, param_name: &str) -> Result<Vec<String>, String> {
-    let mut current = expr;
-    let mut fields = Vec::new();
-    loop {
-        match current {
-            ast::Expr::Dereference(node) => {
-                let Some(field) = &node.field else {
-                    return Err("array_sortby lambda rewrite only supports dotted struct field access".to_string());
-                };
-                fields.push(field.value.clone());
-                current = &node.base;
-            }
-            ast::Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case(param_name) => {
-                fields.reverse();
-                return Ok(fields);
-            }
-            _ => return Err(
-                "array_sortby lambda rewrite only supports direct struct field access like (x) -> x.item".to_string(),
-            ),
-        }
-    }
-}
-
-fn parse_array_sortby_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
-    match expr {
-        ast::Expr::Lambda(lambda) => lambda
-            .arguments
-            .first()
-            .map(|argument| (argument.name.value.to_lowercase(), &lambda.body)),
-        _ => None,
-    }
-}
-
-fn find_lambda_argument<'a>(
-    arg_exprs: &[&'a ast::Expr],
-) -> Option<(usize, Vec<String>, &'a ast::Expr)> {
-    if let Some((idx, params, body)) = arg_exprs
-        .first()
-        .and_then(|expr| parse_lambda_expr(expr))
-        .map(|(params, body)| (0, params, body))
-    {
-        return Some((idx, params, body));
-    }
-    arg_exprs
-        .last()
-        .and_then(|expr| parse_lambda_expr(expr))
-        .map(|(params, body)| (arg_exprs.len() - 1, params, body))
-}
-
-fn parse_lambda_expr(expr: &ast::Expr) -> Option<(Vec<String>, &ast::Expr)> {
-    match expr {
-        ast::Expr::Lambda(lambda) => Some((
-            lambda
-                .arguments
-                .iter()
-                .map(|argument| argument.name.value.to_lowercase())
-                .collect(),
-            &lambda.body,
-        )),
-        _ => None,
-    }
-}
-
-fn lambda_body_casts_param_to_utf8(expr: &ast::Expr, param_name: &str) -> bool {
-    match expr {
-        ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expression, param_name) => {
-            matches!(
-                super::helpers::sql_type_to_value_type(
-                    &cast.data_type,
-                    true,
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                ),
-                Ok(ref ty) if matches!(ty.value_type().kind(),
-                    novarocks_type_contract::ValueKind::String
-                    | novarocks_type_contract::ValueKind::BoundedCharacter(_)
-                )
-            )
-        }
-        _ => false,
-    }
-}
-
-fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
-    match expr {
-        ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
-        _ => false,
-    }
-}
-
-fn parse_multi_param_lambda(expr: &ast::Expr) -> Option<(Vec<String>, &ast::Expr)> {
-    match expr {
-        ast::Expr::Lambda(lambda) => Some((
-            lambda
-                .arguments
-                .iter()
-                .map(|argument| argument.name.value.to_lowercase())
-                .collect(),
-            &lambda.body,
-        )),
-        _ => None,
-    }
-}
-
-/// Map-shaped higher-order functions: `(k, v) -> body` over a MAP argument.
-/// `map_apply` (body returns 2-tuple), `transform_keys` (body returns scalar
-/// new key), `transform_values` (body returns scalar new value).
-fn is_map_higher_order_function_with_lambda(name: &str, arg_exprs: &[&ast::Expr]) -> bool {
-    matches!(name, "transform_keys" | "transform_values")
-        && arg_exprs.len() == 2
-        && arg_exprs
-            .first()
-            .and_then(|expr| parse_multi_param_lambda(expr))
-            .is_some()
-}
-
-/// Return `true` when `expr` is a constant integer literal (including
-/// negation of one) suitable for `INTERVAL N UNIT`. Decimals and floats
-/// (`3.2`) are explicitly rejected.
-fn is_integer_const_literal(expr: &ast::Expr) -> bool {
-    match expr {
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Long { .. },
-            ..
-        }) => true,
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::String(value),
-            ..
-        }) => value.parse::<i64>().is_ok(),
-        ast::Expr::Unary(unary)
-            if matches!(
-                unary.operator,
-                ast::UnaryOperator::Minus | ast::UnaryOperator::Plus
-            ) =>
-        {
-            is_integer_const_literal(&unary.expression)
-        }
-        _ => false,
-    }
-}
-
-fn syntactic_array_literal_len(expr: &ast::Expr) -> Option<usize> {
-    match expr {
-        ast::Expr::Array(array) => Some(array.values.len()),
-        ast::Expr::Cast(cast) => syntactic_array_literal_len(&cast.expression),
-        _ => None,
-    }
-}
-
-/// Render an Arrow `DataType` as the StarRocks-style type name used when the
-/// analyzer folds `typeof(<expr>)` into a string literal.
 fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
     typeof_name(dt, None)
 }
@@ -6082,67 +5146,7 @@ fn column_name_of_expr(expr: &TypedExpr) -> String {
 }
 
 #[recursive::recursive]
-fn typed_expr_contains_column_ref(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::ColumnRef { .. } => true,
-        ExprKind::BinaryOp { left, right, .. } => {
-            typed_expr_contains_column_ref(left) || typed_expr_contains_column_ref(right)
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => typed_expr_contains_column_ref(expr),
-        ExprKind::AggregateCall {
-            args,
-            order_by,
-            filter,
-            ..
-        } => args
-            .iter()
-            .chain(order_by.iter().map(|item| &item.expr))
-            .chain(filter.as_deref())
-            .any(typed_expr_contains_column_ref),
-        ExprKind::FunctionCall { args, .. } | ExprKind::WindowCall { args, .. } => {
-            args.iter().any(typed_expr_contains_column_ref)
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|expr| typed_expr_contains_column_ref(expr))
-                || when_then.iter().any(|(when, then)| {
-                    typed_expr_contains_column_ref(when) || typed_expr_contains_column_ref(then)
-                })
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|expr| typed_expr_contains_column_ref(expr))
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            typed_expr_contains_column_ref(expr)
-                || typed_expr_contains_column_ref(low)
-                || typed_expr_contains_column_ref(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            typed_expr_contains_column_ref(expr) || typed_expr_contains_column_ref(pattern)
-        }
-        ExprKind::InList { expr, list, .. } => {
-            typed_expr_contains_column_ref(expr) || list.iter().any(typed_expr_contains_column_ref)
-        }
-        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
-            typed_expr_contains_column_ref(body)
-        }
-        _ => false,
-    }
-}
-
-#[recursive::recursive]
+#[cfg(test)]
 fn typed_expr_contains_nondeterministic_call(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     expr: &TypedExpr,
@@ -6207,104 +5211,7 @@ fn typed_expr_contains_nondeterministic_call(
     }
 }
 
-fn typed_expr_references_all_lambda_params(expr: &TypedExpr, params: &[LambdaParam]) -> bool {
-    let mut referenced = std::collections::HashSet::new();
-    collect_lambda_param_refs(expr, &mut referenced);
-    params
-        .iter()
-        .all(|param| referenced.contains(param.name.as_str()))
-}
-
-#[recursive::recursive]
-fn collect_lambda_param_refs<'a>(
-    expr: &'a TypedExpr,
-    referenced: &mut std::collections::HashSet<&'a str>,
-) {
-    match &expr.kind {
-        ExprKind::LambdaParamRef { name, .. } => {
-            referenced.insert(name.as_str());
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_lambda_param_refs(left, referenced);
-            collect_lambda_param_refs(right, referenced);
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => collect_lambda_param_refs(expr, referenced),
-        ExprKind::FunctionCall { args, .. }
-        | ExprKind::AggregateCall { args, .. }
-        | ExprKind::WindowCall { args, .. } => {
-            for arg in args {
-                collect_lambda_param_refs(arg, referenced);
-            }
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                collect_lambda_param_refs(operand, referenced);
-            }
-            for (when, then) in when_then {
-                collect_lambda_param_refs(when, referenced);
-                collect_lambda_param_refs(then, referenced);
-            }
-            if let Some(else_expr) = else_expr {
-                collect_lambda_param_refs(else_expr, referenced);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_lambda_param_refs(expr, referenced);
-            collect_lambda_param_refs(low, referenced);
-            collect_lambda_param_refs(high, referenced);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_lambda_param_refs(expr, referenced);
-            collect_lambda_param_refs(pattern, referenced);
-        }
-        ExprKind::InList { expr, list, .. } => {
-            collect_lambda_param_refs(expr, referenced);
-            for item in list {
-                collect_lambda_param_refs(item, referenced);
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
-            collect_lambda_param_refs(body, referenced);
-        }
-        _ => {}
-    }
-}
-
-/// If the two types are both complex (ARRAY/MAP/STRUCT) but their nested
-/// shapes cannot be reconciled, return a short human-readable description of
-/// the incompatibility. Used to short-circuit comparison operators that would
-/// otherwise fall into a CAST kernel and crash at runtime with a less
-/// actionable message.
-///
-/// Returns `None` for any pair the analyzer should still attempt — scalar vs
-/// scalar (handled by literal coercion), compatible container shapes (let
-/// `cast_with_special_rules` widen at runtime), or one-side-only complex
-/// types (rare; let the downstream layer surface its own error).
-/// Module-visible wrapper around `incompatible_complex_compare` so the
-/// IN-subquery rewriter (`subquery_rewrite::rewrite_in_subquery`) can
-/// apply the same shape compatibility check before it synthesises an
-/// EQ join condition. Without this, `x IN (SELECT y …)` where `x` and
-/// `y` are STRUCT / MAP / ARRAY of incompatible element types would
-/// silently produce zero rows instead of erroring at analyzer time.
-pub(super) fn incompatible_complex_compare_pub(
-    left: &DataType,
-    right: &DataType,
-) -> Option<String> {
-    incompatible_complex_compare(left, right)
-}
-
-fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<String> {
+pub(super) fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<String> {
     fn is_complex(dt: &DataType) -> bool {
         matches!(
             dt,
@@ -6462,6 +5369,7 @@ mod tests {
             control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            table_sequence: None,
             catalog: &EmptyCatalog,
             current_database: "default",
             function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -6472,7 +5380,6 @@ mod tests {
             ctes: Default::default(),
             pending_ctes: Default::default(),
             next_subquery_id: Default::default(),
-            next_lambda_slot_id: Default::default(),
             collected_subqueries: Default::default(),
             cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
         }
@@ -7615,94 +6522,72 @@ mod tests {
     }
 
     #[test]
-    fn map_higher_order_preserves_complete_json_and_same_carrier_string_children() {
+    fn map_constructor_preserves_complete_json_and_same_carrier_string_children() {
         use novarocks_type_contract::ValueLogicalType;
-        for function in ["transform_values", "transform_keys"] {
-            let body = if function == "transform_keys" {
-                "k"
-            } else {
-                "v"
+        let mut outputs = Vec::new();
+        for (input, domain) in [
+            ("parse_json('{}')", Some(ValueLogicalType::Json)),
+            ("'{}'", None),
+        ] {
+            let sql = format!("SELECT map(ARRAY[1], ARRAY[{input}])");
+            let expression =
+                analyze_projection_expr(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let ExprKind::FunctionCall { binding, .. } = &expression.kind else {
+                panic!("selected MAP call")
             };
-            let mut outputs = Vec::new();
-            for (input, domain) in [
-                ("parse_json('{}')", Some(ValueLogicalType::Json)),
-                ("'{}'", None),
-            ] {
-                let sql = format!("select {function}((k,v)->{body},map(1,{input}))");
-                let expression = analyze_projection_expr(&sql).expect("complete MAP lambda");
-                let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
-                    panic!("selected MAP higher-order call")
-                };
-                let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
-                    panic!("resolved lambda slots")
-                };
-                assert!(params[0].value_type.nullable());
-                assert!(params[1].value_type.nullable());
-                assert_eq!(params[1].value_type.value_type().domain(), domain, "{sql}");
-                assert_eq!(params[1].value_type.data_type(), &DataType::Utf8);
-                assert_eq!(args[0].value_type, body.value_type, "lambda result owner");
-                let novarocks_functions::FunctionResultType::Scalar(selected) =
-                    &binding.selected.result_type
-                else {
-                    panic!("scalar map result")
-                };
-                assert_eq!(selected, &expression.value_type);
-                let child = expression
-                    .value_type
-                    .typed_binding()
-                    .borrowed()
-                    .child_at(1)
-                    .unwrap();
-                assert_eq!(child.value_type().domain(), domain, "{sql}");
-                let DataType::Map(entries, _) = expression.value_type.data_type() else {
-                    panic!("MAP")
-                };
-                let DataType::Struct(fields) = entries.data_type() else {
-                    panic!("entries")
-                };
-                assert!(entries.metadata().as_arc().is_none());
-                assert!(
-                    fields
-                        .iter()
-                        .all(|field| field.metadata().as_arc().is_none())
-                );
-                outputs.push(expression.value_type);
-            }
-            assert_eq!(outputs[0].data_type(), outputs[1].data_type());
-            assert_ne!(outputs[0], outputs[1], "equal carriers do not erase JSON");
+            let novarocks_functions::FunctionResultType::Scalar(selected) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar MAP result")
+            };
+            assert_eq!(selected, &expression.value_type);
+            let child = expression
+                .value_type
+                .typed_binding()
+                .borrowed()
+                .child_at(1)
+                .unwrap();
+            assert_eq!(child.value_type().domain(), domain, "{sql}");
+            let DataType::Map(entries, _) = expression.value_type.data_type() else {
+                panic!("MAP")
+            };
+            let DataType::Struct(fields) = entries.data_type() else {
+                panic!("entries")
+            };
+            assert!(entries.metadata().as_arc().is_none());
+            assert!(
+                fields
+                    .iter()
+                    .all(|field| field.metadata().as_arc().is_none())
+            );
+            outputs.push(expression.value_type);
         }
+        assert_eq!(outputs[0].data_type(), outputs[1].data_type());
+        assert_ne!(
+            outputs[0], outputs[1],
+            "equal carriers preserve distinct nominal domains"
+        );
     }
 
     #[test]
-    fn map_higher_order_preserves_named_struct_children_and_nested_nulls() {
-        let source = analyze_projection_expr(
-            "select map(1,named_struct('j',parse_json('{}'),'s',cast(null as varchar)))",
-        )
-        .unwrap();
-        let output = analyze_projection_expr("select transform_values((k,v)->v,map(1,named_struct('j',parse_json('{}'),'s',cast(null as varchar))))").unwrap();
+    fn map_selector_preserves_row_children_and_nested_nulls() {
+        let row = "CAST(ROW(parse_json('{}'), CAST(NULL AS VARCHAR)) AS ROW(j JSON, s VARCHAR))";
+        let map = format!("map(ARRAY[1], ARRAY[{row}])");
+        let source = analyze_projection_expr(&format!("SELECT {map}")).unwrap();
+        let output = analyze_projection_expr(&format!("SELECT element_at({map}, 1)")).unwrap();
         let expected = super::container_child_value_type_observed(
             &source.value_type,
             1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
-        let actual = super::container_child_value_type_observed(
-            &output.value_type,
-            1,
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap();
-        assert_eq!(actual, expected.with_nullable(true).unwrap());
+        let actual = &output.value_type;
+        assert_eq!(actual, &expected.with_nullable(true).unwrap());
         let DataType::Struct(fields) = actual.data_type() else {
-            panic!("named Struct")
+            panic!("named ROW")
         };
         assert_eq!(fields[0].name(), "j");
         assert_eq!(fields[1].name(), "s");
-        let DataType::Struct(expected_fields) = expected.data_type() else {
-            panic!("source Struct")
-        };
-        assert_eq!(fields[0].is_nullable(), expected_fields[0].is_nullable());
-        assert_eq!(fields[1].is_nullable(), expected_fields[1].is_nullable());
         assert!(fields[1].is_nullable());
         assert_eq!(
             actual.value_type().child_type_at(0).unwrap().domain(),
@@ -7728,7 +6613,7 @@ mod tests {
                 self.cancel_at.is_some_and(|at| poll >= at)
             }
         }
-        let source = analyze_projection_expr("select map(1,parse_json('{}'))")
+        let source = analyze_projection_expr("select map(ARRAY[1], ARRAY[parse_json('{}')])")
             .unwrap()
             .value_type;
         let observation = Arc::new(Observation {
@@ -7813,7 +6698,7 @@ mod tests {
     }
 
     #[test]
-    fn json_array_literal_and_sortby_keep_complete_exact_owner_bindings() {
+    fn json_array_literal_and_concat_keep_complete_exact_owner_bindings() {
         let expression =
             analyze_projection_expr("select [json_object('k':1), json_object('k':2), null]")
                 .unwrap();
@@ -7854,21 +6739,21 @@ mod tests {
             assert!(!expr.value_type.nullable());
         }
         for sql in [
-            "select array_sortby([json_object('k':1), json_object('k':2)], [2,1])",
-            "select array_sortby(cast(['not JSON', '123'] as array<json>), [2,1])",
-            "with q as (select cast(['not JSON', '123'] as array<json>) as j) select array_sortby(j,[2,1]) from q",
-            "select array_sortby(j2,[2,1]) from (select cast(['not JSON','123'] as array<json>) as j, j as j2) q",
-            "select array_sortby(CAST([json_object('k':1), json_object('k':2)] AS ARRAY<json>), [2,1])",
-            "select array_sortby(cast([json_object('k':1), json_object('k':2)] as array<json>), [2,1])",
-            "with q as (select [json_object('k':1), json_object('k':2)] as j) select array_sortby(j,[2,1]) from q",
-            "select array_sortby(j2,[2,1]) from (select [json_object('k':1),json_object('k':2)] as j, j as j2) q",
-            "select array_sortby(j,[2,1]) from (values ([json_object('k':1),json_object('k':2)]), (null)) q(j)",
-            "select array_sortby(j,[2,1]) from (select [json_object('k':1),json_object('k':2)] as j union all select null) q",
-            "select array_sortby(case when true then [json_object('k':1),json_object('k':2)] else null end,[2,1])",
+            "select concat([json_object('k':1), json_object('k':2)], CAST(ARRAY[] AS ARRAY(JSON)))",
+            "select concat(cast(['not JSON', '123'] as array<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
+            "with q as (select cast(['not JSON', '123'] as array<json>) as j) select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from q",
+            "select concat(j2, CAST(ARRAY[] AS ARRAY(JSON))) from (select cast(['not JSON','123'] as array<json>) as j, j as j2) q",
+            "select concat(CAST([json_object('k':1), json_object('k':2)] AS ARRAY<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
+            "select concat(cast([json_object('k':1), json_object('k':2)] as array<json>), CAST(ARRAY[] AS ARRAY(JSON)))",
+            "with q as (select [json_object('k':1), json_object('k':2)] as j) select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from q",
+            "select concat(j2, CAST(ARRAY[] AS ARRAY(JSON))) from (select [json_object('k':1),json_object('k':2)] as j, j as j2) q",
+            "select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from (values ([json_object('k':1),json_object('k':2)]), (null)) q(j)",
+            "select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from (select [json_object('k':1),json_object('k':2)] as j union all select null) q",
+            "select concat(case when true then [json_object('k':1),json_object('k':2)] else null end, CAST(ARRAY[] AS ARRAY(JSON)))",
         ] {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
-            assert_json_list_scalar_owner(&expression, "builtin.scalar/array_sortby/v1");
+            assert_json_list_scalar_owner(&expression, "builtin.scalar/concat/v1");
         }
         for (sql, cast_boundary, owner_id) in [
             (
@@ -7882,14 +6767,14 @@ mod tests {
                 "builtin.scalar/__array_literal/v1",
             ),
             (
-                r#"select array_sortby(['{"k":1}', '{"k":2}'], [2,1])"#,
+                r#"select concat(['{"k":1}', '{"k":2}'], CAST(ARRAY[] AS ARRAY(VARCHAR)))"#,
                 false,
-                "builtin.scalar/array_sortby/v1",
+                "builtin.scalar/concat/v1",
             ),
             (
-                "select array_sortby(cast([json_object('k':1), json_object('k':2)] as array<varchar>), [2,1])",
+                "select concat(cast([json_object('k':1), json_object('k':2)] as array<varchar>), CAST(ARRAY[] AS ARRAY(VARCHAR)))",
                 false,
-                "builtin.scalar/array_sortby/v1",
+                "builtin.scalar/concat/v1",
             ),
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
@@ -8150,9 +7035,9 @@ mod tests {
             assert_array_agg_json_owner(&expression);
         }
         for sql in [
-            "select array_sortby(ja,[2,1]) from json_input",
-            "select array_sortby(q.payload,[2,1]) from (select ja as renamed from json_input) q(payload)",
-            "with q as (select ja as payload from json_input) select array_sortby(payload,[2,1]) from q",
+            "select concat(ja, CAST(ARRAY[] AS ARRAY(JSON))) from json_input",
+            "select concat(q.payload, CAST(ARRAY[] AS ARRAY(JSON))) from (select ja as renamed from json_input) q(payload)",
+            "with q as (select ja as payload from json_input) select concat(payload, CAST(ARRAY[] AS ARRAY(JSON))) from q",
         ] {
             let expression = analyze_projection_expr_with_catalog(
                 sql,
@@ -8160,7 +7045,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
             )
             .unwrap();
-            assert_json_list_scalar_owner(&expression, "builtin.scalar/array_sortby/v1");
+            assert_json_list_scalar_owner(&expression, "builtin.scalar/concat/v1");
         }
     }
 
@@ -8219,124 +7104,33 @@ mod tests {
     }
 
     #[test]
-    fn array_generate_seals_literal_and_common_temporal_domains() {
-        let timestamp = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
-        for (query, expected) in [
+    fn scalar_sequence_selects_exact_bigint_and_date_declarations() {
+        for (sql, item) in [
+            ("SELECT sequence(1, 3)", DataType::Int64),
+            ("SELECT sequence(1, 3, 2)", DataType::Int64),
             (
-                "select array_generate('2025-10-01','2025-10-03',1, 'day')",
-                DataType::Date32,
-            ),
-            (
-                "select array_generate('2025-10-01 14:28:31','2025-10-01 14:28:32.8',500000, 'microsecond')",
-                timestamp.clone(),
-            ),
-            (
-                "select array_generate(DATE '2025-10-01',TIMESTAMP '2025-10-02 01:00:00',1, 'day')",
-                timestamp.clone(),
-            ),
-            (
-                "select array_generate(TIMESTAMP '2025-10-02 01:00:00',DATE '2025-10-01',1, 'day')",
-                timestamp.clone(),
-            ),
-            (
-                "select array_generate(DATE '2025-10-01',DATE '2025-10-02',12, 'hour')",
-                timestamp,
-            ),
-            (
-                "select array_generate('2025-10-01','abc',1)",
-                DataType::Date32,
-            ),
-            (
-                "select array_generate('2025-10-01',10000,0, 'day')",
-                DataType::Date32,
-            ),
-            (
-                "select array_generate(NULL,DATE '2025-10-01',1)",
+                "SELECT sequence(DATE '2025-10-01', DATE '2025-10-03')",
                 DataType::Date32,
             ),
         ] {
-            let bound =
-                analyze_projection_expr(query).unwrap_or_else(|error| panic!("{query}: {error}"));
-            let ExprKind::FunctionCall { args, binding, .. } = bound.kind else {
-                panic!("expected sealed call");
+            let selected =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let ExprKind::FunctionCall { binding, .. } = &selected.kind else {
+                panic!("selected sequence call")
             };
-            let novarocks_functions::FunctionResultType::Scalar(selected) =
-                &binding.resolved().selected.result_type
-            else {
-                panic!("expected scalar selection");
+            assert_eq!(binding.function_id.as_str(), "builtin.scalar/sequence/v1");
+            let DataType::List(actual) = selected.value_type.data_type() else {
+                panic!("sequence result ARRAY")
             };
-            assert_eq!(selected.data_type(), bound.value_type.data_type());
-            for selected in binding.resolved().selected.argument_types.iter().take(2) {
-                let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
-                    panic!("expected value bound");
-                };
-                assert_eq!(selected.data_type().clone(), expected);
-            }
-            assert_eq!(
-                bound.value_type.data_type().clone(),
-                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    expected.clone(),
-                    true
-                )))
-            );
-            assert_eq!(args[0].value_type.data_type().clone(), expected);
-            assert_eq!(args[1].value_type.data_type().clone(), expected);
-            if query.contains("'abc'") || query.contains("10000") {
-                assert!(args[1].value_type.nullable());
-            }
+            assert_eq!(actual.data_type(), &item);
         }
-    }
-
-    #[test]
-    fn array_generate_rejects_unanchored_or_unfrozen_domains() {
-        for query in [
-            "select array_generate('abc','def',1)",
-            "select array_generate(NULL,NULL,1, 'day')",
-            "select array_generate(NULL,NULL,1)",
-            "select array_generate('2025-02-30','2025-99-99',1)",
-            "select array_generate('2025-10-01T01:00:00','2025-10-02T01:00:00',1)",
+        for sql in [
+            "SELECT sequence('a', 'b')",
+            "SELECT sequence(1)",
+            "SELECT array_generate(1, 3)",
         ] {
-            assert!(
-                analyze_projection_expr(query)
-                    .unwrap_err()
-                    .contains("cannot freeze"),
-                "{query}"
-            );
+            assert!(analyze_projection_expr(sql).is_err(), "{sql}");
         }
-        assert!(
-            analyze_projection_expr(
-                "select array_generate(DATE '2025-10-01', DATE '2025-10-02',NULL)"
-            )
-            .unwrap_err()
-            .contains("constant integer")
-        );
-    }
-
-    #[test]
-    fn array_generate_anchored_varchar_column_uses_ordinary_cast() {
-        // A real column expression stays explicit: the DATE peer supplies its domain.
-        let bound = analyze_projection_expr_with_catalog(
-            "select array_generate(DATE '2025-10-01',CAST(offset AS VARCHAR),1) from offsets",
-            &BigintOffsetCatalog,
-            crate::functions::builtin_sql_function_catalog(),
-        )
-        .unwrap();
-        let ExprKind::FunctionCall { args, .. } = bound.kind else {
-            panic!("expected call");
-        };
-        assert!(matches!(
-            args[1].kind,
-            ExprKind::Cast {
-                target: DataType::Date32,
-                ..
-            }
-        ));
-        assert!(args[1].value_type.nullable());
-        assert!(analyze_projection_expr_with_catalog(
-            "select array_generate(CAST(offset AS VARCHAR),CAST(offset AS VARCHAR),1) from offsets",
-            &BigintOffsetCatalog, crate::functions::builtin_sql_function_catalog(),
-        ).unwrap_err().contains("cannot freeze"));
     }
 
     #[test]
@@ -8834,7 +7628,7 @@ mod tests {
         let ExprKind::FunctionCall { name, .. } = &expr.kind else {
             panic!("bitnot must keep the original nonliteral NULL argument");
         };
-        assert_eq!(name, "__array_element_at");
+        assert_eq!(name, "element_at");
     }
 
     fn named_bitnot_operand(expression: &TypedExpr) -> &TypedExpr {
@@ -8862,6 +7656,7 @@ mod tests {
             purpose: super::super::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
+            table_sequence: None,
             catalog: &EmptyCatalog,
             current_database: "default",
             function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -8873,7 +7668,6 @@ mod tests {
             ctes: HashMap::new(),
             pending_ctes: HashSet::new(),
             next_subquery_id: Cell::new(0),
-            next_lambda_slot_id: Cell::new(0),
             collected_subqueries: RefCell::new(Vec::new()),
             cte_registry: RefCell::new(crate::analysis::cte::CTERegistry::new()),
         };
@@ -10275,97 +9069,83 @@ mod tests {
         }
     }
 
-    fn assert_array_concat_binding(expression: &crate::analysis::TypedExpr) {
-        let ExprKind::FunctionCall {
-            name,
-            args,
-            binding,
-            ..
-        } = &expression.kind
-        else {
-            panic!("expected bound array_concat");
-        };
-        assert_eq!(name, "array_concat");
-        assert!(matches!(
-            expression.value_type.data_type(),
-            DataType::List(_)
-        ));
-        for (arg, target) in args.iter().zip(&binding.selected.argument_types) {
-            let novarocks_functions::FunctionArgumentType::Value(value) = target else {
-                panic!("array_concat consumes values");
-            };
-            assert_eq!(arg.value_type.data_type(), value.data_type());
-            assert!(matches!(arg.value_type.data_type(), DataType::List(_)));
-        }
-        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
-        else {
-            panic!("scalar result");
-        };
-        assert_eq!(expression.value_type.data_type(), result.data_type());
-    }
-
     #[test]
-    fn concat_array_family_wraps_scalars_before_string_coercion() {
-        for sql in [
-            "select concat('a', cast('[]' as array<string>))",
-            "select concat('a', ['b'], 'c')",
-            "select concat(cast(null as string), ['b'])",
-            "select concat('a', cast(null as array<string>))",
-            "select concat(cast(9223372036854775807 as bigint), cast([1] as array<bigint>))",
-            "select concat(cast('9007199254740993.00' as decimal(20,2)), cast([1] as array<decimal(20,2)>))",
+    fn concat_array_family_preserves_the_exact_argument_shapes() {
+        for (sql, list_arguments) in [
+            (
+                "SELECT concat('a', CAST(ARRAY[] AS ARRAY(VARCHAR)))",
+                &[false, true][..],
+            ),
+            ("SELECT concat(ARRAY['a'], 'b')", &[true, false][..]),
+            (
+                "SELECT concat(ARRAY['a'], ARRAY['b'], ARRAY['c'])",
+                &[true, true, true][..],
+            ),
+            (
+                "SELECT concat(CAST(NULL AS VARCHAR), ARRAY['b'])",
+                &[false, true][..],
+            ),
+            (
+                "SELECT concat(CAST(9223372036854775807 AS BIGINT), CAST(ARRAY[1] AS ARRAY(BIGINT)))",
+                &[false, true][..],
+            ),
+            ("SELECT concat(1, ARRAY[2147483648])", &[false, true][..]),
         ] {
-            let expression = analyze_projection_expr(sql).expect(sql);
-            assert_array_concat_binding(&expression);
-            let ExprKind::FunctionCall { args, .. } = &expression.kind else {
-                unreachable!()
+            let expression =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let ExprKind::FunctionCall {
+                name,
+                args,
+                binding,
+                ..
+            } = &expression.kind
+            else {
+                panic!("expected original concat call")
             };
-            assert!(
-                matches!(&args[0].kind, ExprKind::FunctionCall { name, args, .. }
-                if name == "__array_literal" && args.len() == 1),
-                "{sql}"
-            );
+            assert_eq!(name, "concat");
+            assert_eq!(binding.function_id.as_str(), "builtin.scalar/concat/v1");
+            assert!(matches!(
+                expression.value_type.data_type(),
+                DataType::List(_)
+            ));
+            assert_eq!(args.len(), list_arguments.len());
+            for ((arg, target), &is_array) in args
+                .iter()
+                .zip(binding.selected.argument_types.iter())
+                .zip(list_arguments)
+            {
+                let novarocks_functions::FunctionArgumentType::Value(value) = target else {
+                    panic!("concat value argument")
+                };
+                assert_eq!(arg.value_type.data_type(), value.data_type());
+                assert_eq!(
+                    matches!(arg.value_type.data_type(), DataType::List(_)),
+                    is_array
+                );
+            }
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("concat result")
+            };
+            assert_eq!(result, &expression.value_type);
         }
-    }
-
-    #[test]
-    fn array_map_concat_body_has_nested_array_binding_and_keeps_lambda_identity() {
-        let expression = analyze_projection_expr("select array_map(x -> concat(x, []), ['a','b'])")
-            .expect("higher order array concat");
-        let DataType::List(outer) = &expression.value_type.data_type() else {
-            panic!("array_map result");
-        };
-        assert!(
-            matches!(outer.data_type(), DataType::List(item) if item.data_type() == &DataType::Utf8)
-        );
-        let ExprKind::FunctionCall { args, .. } = &expression.kind else {
-            panic!("array_map call");
-        };
-        let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
-            panic!("lambda");
-        };
-        assert_array_concat_binding(body);
-        let ExprKind::FunctionCall { args, .. } = &body.kind else {
-            unreachable!()
-        };
-        let ExprKind::FunctionCall { name, args, .. } = &args[0].kind else {
-            panic!("singleton wrapper");
-        };
-        assert_eq!(name, "__array_literal");
-        assert!(
-            matches!(&args[0].kind, ExprKind::LambdaParamRef { slot_id, .. } if *slot_id == params[0].slot_id)
-        );
     }
 
     #[test]
     fn concat_array_incompatible_domain_fails_without_stringification() {
-        let error = analyze_projection_expr("select concat(['a'], map(1,2))")
-            .expect_err("incompatible array item shapes must fail during binding");
-        assert!(error.contains("array_concat"), "{error}");
-        let array = analyze_projection_expr("select ['a']").expect("array argument");
-        assert!(
-            super::bind_scalar_function_call("concat", vec![array]).is_err(),
-            "a direct typed string binding must not stringify an array"
-        );
+        for sql in [
+            "SELECT concat(ARRAY['a'], map(ARRAY[1], ARRAY[2]))",
+            "SELECT concat(ARRAY['a'], ARRAY[1])",
+            "SELECT concat(ARRAY[1], ARRAY['a'])",
+            "SELECT concat(ARRAY['a'], 1)",
+            "SELECT concat(1, ARRAY['a'])",
+        ] {
+            let error = analyze_projection_expr(sql)
+                .expect_err("incompatible array item shapes must fail during binding");
+            assert_eq!(error, "no matching declared overload", "{sql}");
+        }
+        assert!(analyze_projection_expr("SELECT concat('a', ARRAY['b'], 'c')").is_err());
     }
 
     #[test]
@@ -10714,7 +9494,7 @@ mod tests {
     #[test]
     fn nested_decimal_cast_preserves_array_admission_and_map_row_capability_errors() {
         for sql in [
-            "SELECT CAST(map(1, DECIMAL '123.5') AS MAP(INTEGER, DECIMAL(3,0)))",
+            "SELECT CAST(MAP(ARRAY[1], ARRAY[DECIMAL '123.5']) AS MAP(INTEGER, DECIMAL(3,0)))",
             "SELECT CAST(ROW(DECIMAL '123.5') AS ROW(a DECIMAL(3,0)))",
         ] {
             let query = novarocks_parser::parser::parse_query(sql).unwrap();
@@ -10815,12 +9595,9 @@ mod tests {
     }
     #[test]
     fn unavailable_builtin_is_explicitly_rejected_before_false_filter_pruning() {
-        for sql in [
-            "select array_reverse([1,2]) where false",
-            "select array_to_string([1,2], ',') where false",
-            "select isnull(1) where false",
-            "select cosh(1) where false",
-        ] {
+        let error = analyze_projection_expr("select reverse(ARRAY[1,2]) where false").unwrap_err();
+        assert!(error.contains("builtin.scalar/reverse/(list"), "{error}");
+        for sql in ["select isnull(1) where false", "select cosh(1) where false"] {
             let error = analyze_projection_expr(sql).unwrap_err();
             assert!(
                 error.contains("no admitted selected scalar implementation"),
@@ -10828,6 +9605,8 @@ mod tests {
             );
         }
         for sql in [
+            "select array_reverse([1,2]) where false",
+            "select array_to_string([1,2], ',') where false",
             "select next_day('2020-01-01') where false",
             "select next_day(cast('2020-01-01' as date), 'Monday') where false",
         ] {
@@ -11171,18 +9950,9 @@ mod tests {
 #[path = "group_concat_source_tests.rs"]
 mod group_concat_source_tests;
 
-/// A pure SQL author projects the exact already-authored child through the
-/// original control. It preserves both old child semantics and physical-source
-/// custody; it neither interprets annotations nor creates a memory grant.
-fn array_item_value_type_observed(
-    source: &novarocks_type_contract::FunctionValueType,
-    control: &crate::compiler::SqlCompileControl,
-) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
-    container_child_value_type_observed(source, 0, control)
-}
-
 /// Project one complete child and its exact physical layout through the same
 /// pure SQL construction body and the original cancellation/deadline observer.
+#[cfg(test)]
 fn container_child_value_type_observed(
     source: &novarocks_type_contract::FunctionValueType,
     index: usize,

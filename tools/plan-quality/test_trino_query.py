@@ -48,14 +48,14 @@ class ToolTests(unittest.TestCase):
             output = agg.run_novarocks(endpoint,sql,5,"tpch",artifact_receipt=str(receipt),nr_catalog="ice")
             self.assertEqual(output,"PLAN FRAGMENT 0\n  HASH AGGREGATE (LOCAL)\n")
             captured = json.loads(capture.read_text())
-            self.assertEqual(captured["sql"],"EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 'a;b';")
+            self.assertEqual(captured["sql"],"EXPLAIN WITH SESSION explain_detail = 'VERBOSE' SELECT 'a;b';")
             self.assertEqual(captured["args"], ["--host","127.0.0.1","--port","8088","--user","root","--time-zone","UTC","--timeout-secs","5","--mode","text-column","--catalog","ice","--schema","tpch"])
             rf_output = rf.run_novarocks(rf.Endpoint("nr","127.0.0.1","8088","root"),
                                          "-- input comment\nSELECT 'a;b';",5,
                                          artifact_receipt=str(receipt))
             self.assertEqual(rf_output,output)
             captured = json.loads(capture.read_text())
-            self.assertEqual(captured["sql"],"EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) SELECT 'a;b';")
+            self.assertEqual(captured["sql"],"EXPLAIN WITH SESSION explain_detail = 'VERBOSE' SELECT 'a;b';")
             tool.write_text("changed")
             with self.assertRaisesRegex(RuntimeError,"binding failed"):
                 trino_query.run_text_column(endpoint,sql,5,"tpch",receipt=receipt)

@@ -30,19 +30,19 @@ CREATE TABLE ${case_db}.test_map (
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.test_map VALUES
-    ROW(1, map('a',1,'b',2)),
-    ROW(2, map('c',3)),
-    ROW(3, map('d',4,'e',5));
+    ROW(1, MAP(ARRAY['a', 'b'], ARRAY[1, 2])),
+    ROW(2, MAP(ARRAY['c'], ARRAY[3])),
+    ROW(3, MAP(ARRAY['d', 'e'], ARRAY[4, 5]));
 
 -- query 2
 -- map_concat: non-empty map on left, empty map on right
 WITH t0 AS (SELECT c1 FROM (VALUES ROW(map())) AS t(c1))
-SELECT map_concat(map('a', 1, 'b', 2), c1) FROM t0;
+SELECT map_concat(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), c1) FROM t0;
 
 -- query 3
 -- map_concat: empty map on left, non-empty map on right
 WITH t0 AS (SELECT c1 FROM (VALUES ROW(map())) AS t(c1))
-SELECT map_concat(c1, map('a', 1, 'b', 2)) FROM t0;
+SELECT map_concat(c1, MAP(ARRAY['a', 'b'], ARRAY[1, 2])) FROM t0;
 
 -- query 4
 -- map_concat: both empty → empty map
@@ -51,25 +51,25 @@ FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 5
 -- map_concat: empty + int-keyed map
-SELECT map_concat(c1, map(1, 2))
+SELECT map_concat(c1, MAP(ARRAY[1], ARRAY[2]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 6
 -- @expect_error=Map key don't supported type: MAP
 -- FE error: MAP type used as a map key
-SELECT map_concat(c1, map(map(), map()))
+SELECT map_concat(c1, MAP(ARRAY[map()], ARRAY[map()]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 7
 -- @expect_error=Map key don't supported type: ARRAY
 -- FE error: ARRAY type used as a map key
-SELECT map_concat(c1, map([], map()))
+SELECT map_concat(c1, MAP(ARRAY[[]], ARRAY[map()]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 8
 -- @expect_error=Map key don't supported type: struct
 -- FE error: STRUCT type used as a map key
-SELECT map_concat(c1, map(named_struct('1', 2), named_struct('A', [map()])))
+SELECT map_concat(c1, MAP(ARRAY[CAST(ROW(2) AS ROW("1" INTEGER))], ARRAY[CAST(ROW(ARRAY[MAP()]) AS ROW("A" ARRAY(MAP(INTEGER, INTEGER))))]))
 FROM (SELECT c1 FROM (VALUES ROW(map())) AS t(c1)) t;
 
 -- query 9

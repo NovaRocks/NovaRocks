@@ -57,7 +57,7 @@ SELECT
   CAST(n % 5 AS INT) AS user_id,
   concat('u', CAST(n % 25 AS VARCHAR)) AS user_name,
   CAST(n % 7 AS INT) AS tag_id
-FROM TABLE(generate_series(1, 3000)) t(n);
+FROM TABLE(sequence(1, 3000)) t(n);
 
 -- query 5
 -- @skip_result_check=true

@@ -58,7 +58,7 @@ SELECT
   CASE WHEN number % 3 = 0 THEN 'east' WHEN number % 3 = 1 THEN 'west' ELSE 'north' END AS region,
   CASE WHEN number % 2 = 0 THEN 'd1' ELSE 'd2' END AS day,
   CAST(number % 100 AS BIGINT) AS amount
-FROM TABLE(generate_series(1, 12000)) t(number);
+FROM TABLE(sequence(1, 12000)) t(number);
 
 -- query 5
 -- @skip_result_check=true

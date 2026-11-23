@@ -36,17 +36,17 @@ create table t0 (
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(generate_series(1,  20000));
+INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(sequence(1,  20000)) AS generate_series(generate_series);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(generate_series(1,  20000));
+INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(sequence(1,  20000)) AS generate_series(generate_series);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(generate_series(1,  20000));
+INSERT INTO t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(sequence(1,  20000)) AS generate_series(generate_series);
 
 -- query 6
 -- @skip_result_check=true
@@ -190,12 +190,12 @@ create table t4 (
 -- query 34
 -- @skip_result_check=true
 USE ${case_db};
-insert into t4 SELECT generate_series % 4, generate_series % 9, CAST(generate_series % 9 AS VARCHAR), generate_series % 9 FROM TABLE(generate_series(1,  9000));
+insert into t4 SELECT generate_series % 4, generate_series % 9, CAST(generate_series % 9 AS VARCHAR), generate_series % 9 FROM TABLE(sequence(1,  9000)) AS generate_series(generate_series);
 
 -- query 35
 -- @skip_result_check=true
 USE ${case_db};
-insert into t4 SELECT generate_series % 4, null, null, null FROM TABLE(generate_series(1,  9000));
+insert into t4 SELECT generate_series % 4, null, null, null FROM TABLE(sequence(1,  9000)) AS generate_series(generate_series);
 
 -- query 36
 -- @skip_result_check=true
@@ -257,7 +257,7 @@ create table t6 (
 -- query 47
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t6 SELECT generate_series, generate_series, CAST(generate_series AS VARCHAR), generate_series FROM TABLE(generate_series(1,  10000));
+INSERT INTO t6 SELECT generate_series, generate_series, CAST(generate_series AS VARCHAR), generate_series FROM TABLE(sequence(1,  10000)) AS generate_series(generate_series);
 
 -- query 48
 USE ${case_db};
@@ -305,7 +305,7 @@ create table tarray (
 -- query 56
 -- @skip_result_check=true
 USE ${case_db};
-insert into tarray SELECT generate_series, ARRAY[CAST(generate_series AS INTEGER)], generate_series FROM TABLE(generate_series(1,  10000));
+insert into tarray SELECT generate_series, ARRAY[CAST(generate_series AS INTEGER)], generate_series FROM TABLE(sequence(1,  10000)) AS generate_series(generate_series);
 
 -- query 57
 USE ${case_db};

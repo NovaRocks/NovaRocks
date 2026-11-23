@@ -25,5 +25,5 @@
 -- 2. Extract nested array by key.
 -- 3. Aggregate extracted array and assert scalar outputs.
 SELECT
-    ELEMENT_AT(MAP('a', [1, 2, 3], 'b', [4]), 'a') AS arr_a,
-    ARRAY_CONCAT(ELEMENT_AT(MAP('x', [1, 2]), 'x'), [3]) AS concat_arr;
+    ELEMENT_AT(MAP(ARRAY['a', 'b'], ARRAY[[1, 2, 3], [4]]), 'a') AS arr_a,
+    concat(ELEMENT_AT(MAP(ARRAY['x'], ARRAY[[1, 2]]), 'x'), [3]) AS concat_arr;

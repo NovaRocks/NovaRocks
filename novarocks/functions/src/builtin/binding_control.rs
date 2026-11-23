@@ -165,9 +165,6 @@ impl<'a> ScalarCarriers<'a> {
             ScalarCarrierSource::DataTypes(types) => types.len(),
         }
     }
-    pub(super) fn is_empty(self) -> bool {
-        self.len() == 0
-    }
     pub(super) fn get(self, index: usize) -> Option<&'a arrow_schema::DataType> {
         match self.0 {
             ScalarCarrierSource::Values(values) => {

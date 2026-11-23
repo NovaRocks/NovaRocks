@@ -28,8 +28,8 @@ use crate::{
     specialize_frozen_scalar, specialize_scalar,
 };
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Int8Array, Int32Array, LargeListArray, ListArray, MapArray,
-    StringArray, StructArray, builder::FixedSizeBinaryBuilder, types::Int8Type,
+    Array, ArrayRef, DictionaryArray, Int8Array, Int32Array, Int64Array, LargeListArray, ListArray,
+    MapArray, StringArray, StructArray, builder::FixedSizeBinaryBuilder, types::Int8Type,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
@@ -116,7 +116,7 @@ fn policy() -> ConstantPolicy {
     }
 }
 fn target() -> FunctionValueType {
-    FunctionValueType::new(DataType::Int32, true)
+    FunctionValueType::new(DataType::Int64, true)
 }
 fn ty(array: &ArrayRef, nullable: bool) -> FunctionValueType {
     FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), nullable)
@@ -132,12 +132,12 @@ fn instance(source: &FunctionValueType) -> ScalarEvaluationInstance {
     )
     .unwrap()
 }
-fn output(result: &SelectedValues<'_>) -> Vec<Option<i32>> {
+fn output(result: &SelectedValues<'_>) -> Vec<Option<i64>> {
     assert!(result.errors().is_empty());
     result
         .values()
         .as_any()
-        .downcast_ref::<Int32Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap()
         .iter()
         .collect()
@@ -838,7 +838,7 @@ fn cardinality_large_list_is_a_binding_coercion_not_a_raw_prepared_profile() {
             .is_err()
     );
     for raw in [
-        FunctionValueType::new(DataType::Int32, true),
+        FunctionValueType::new(DataType::Int64, true),
         FunctionValueType::new(DataType::Null, true),
     ] {
         assert!(
@@ -983,7 +983,7 @@ fn cardinality_every_compile_callback_keeps_three_causes_and_ordinary_tail() {
     for sources in [
         vec![ty(&array, true)],
         vec![],
-        vec![FunctionValueType::new(DataType::Int32, true)],
+        vec![FunctionValueType::new(DataType::Int64, true)],
     ] {
         let good = CompileControl::default();
         let success = sources.len() == 1 && matches!(sources[0].data_type(), DataType::List(_));
@@ -1172,14 +1172,14 @@ fn cardinality_actual_offset_and_null_loops_reach_quantum_with_sampled_first_cau
 }
 
 #[test]
-fn cardinality_output_layout_rejects_unrepresentable_i32_and_validity_before_allocation() {
+fn cardinality_output_layout_rejects_unrepresentable_bigint_and_validity_before_allocation() {
     use super::super::collection_offset_count::output_capacity;
     use novarocks_failure_contract::{FailureClass, FailureProjection};
     assert!(output_capacity(0).is_ok());
     assert!(output_capacity(320).is_ok());
     for rows in [
         usize::MAX,
-        isize::MAX as usize / std::mem::size_of::<i32>() + 1,
+        isize::MAX as usize / std::mem::size_of::<i64>() + 1,
     ] {
         assert_eq!(
             output_capacity(rows).unwrap_err().failure_fact().class(),

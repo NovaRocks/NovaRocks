@@ -55,6 +55,29 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
+pub(super) fn map_effects() -> FunctionEffectDeclaration {
+    FunctionEffectDeclaration {
+        own_row_error: FunctionIntrinsicRowError::MayRaise,
+        null_behavior: FunctionNullBehavior::Strict,
+        ..effects()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Constructor {
+    Array,
+    Map,
+}
+
+impl Constructor {
+    fn effects(self) -> FunctionEffectDeclaration {
+        match self {
+            Self::Array => effects(),
+            Self::Map => map_effects(),
+        }
+    }
+}
+
 pub(super) fn definition(
     name: &str,
     declaration: FunctionBindingDeclaration,
@@ -63,13 +86,14 @@ pub(super) fn definition(
     let owner = Arc::new(ArrayLiteralOwner::new(name, declaration, resolver)?);
     FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
         |error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin __array_literal pure owner",
+            subject: "builtin collection constructor owner",
             value: error.to_string().into(),
         },
     )
 }
 
 struct ArrayLiteralOwner {
+    constructor: Constructor,
     resolver: Arc<BuiltinDynamicScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -80,23 +104,27 @@ impl ArrayLiteralOwner {
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinDynamicScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        if !operation(name) {
-            return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "builtin __array_literal name",
-                value: name.into(),
-            });
-        }
+        let (constructor, overload_count) = match name {
+            "map" => (Constructor::Map, 2),
+            name if operation(name) => (Constructor::Array, 1),
+            _ => {
+                return Err(FunctionCatalogError::InvalidStableIdentity {
+                    subject: "builtin collection constructor",
+                    value: name.into(),
+                });
+            }
+        };
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let expected = constructor.effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || declaration.overloads().len() != overload_count
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "builtin __array_literal pure declaration",
+                subject: "builtin collection constructor declaration",
                 value: declaration.function_id().as_str().into(),
             });
         }
@@ -112,6 +140,7 @@ impl ArrayLiteralOwner {
             })
             .collect();
         Ok(Self {
+            constructor,
             resolver: Arc::new(resolver),
             declaration,
             implementations,
@@ -119,7 +148,7 @@ impl ArrayLiteralOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = self.constructor.effects();
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -241,6 +270,7 @@ impl PureScalarImplementation for ArrayLiteralOwner {
 
 #[derive(Debug)]
 struct PreparedArrayLiteral {
+    map: Option<super::map_constructor::Recipe>,
     contract: Arc<ScalarCallContract>,
 }
 impl PreparedScalarKernel for PreparedArrayLiteral {
@@ -253,22 +283,27 @@ impl PreparedScalarKernel for PreparedArrayLiteral {
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(ArrayLiteralInstance))
+        Ok(Box::new(ArrayLiteralInstance { map: self.map }))
     }
 }
 
-struct ArrayLiteralInstance;
+struct ArrayLiteralInstance {
+    map: Option<super::map_constructor::Recipe>,
+}
 impl ScalarKernelInstance for ArrayLiteralInstance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::collection_selected::evaluate(
-            super::collection_selected::Operation::ArrayLiteral,
-            input,
-            control,
-        )
+        match self.map {
+            Some(recipe) => recipe.evaluate(input, control),
+            None => super::collection_selected::evaluate(
+                super::collection_selected::Operation::ArrayLiteral,
+                input,
+                control,
+            ),
+        }
     }
 
     fn retained_bytes(&self) -> usize {
@@ -301,7 +336,7 @@ impl ArrayLiteralOwner {
                     && input.proof_scope != input.context.proof_scope()
             {
                 return Err(FunctionBindingError::InvalidBinding(
-                    "__array_literal has no environment dependencies and requires an exact proof scope"
+                    "collection constructor has no environment dependencies and requires an exact proof scope"
                         .into(),
                 )
                 .into());
@@ -342,23 +377,33 @@ impl ArrayLiteralOwner {
                 || !input.environment.is_empty()
             {
                 return Err(invalid(
-                    "__array_literal preparation differs from its exact checked call",
+                    "collection constructor preparation differs from its exact checked call",
                 ));
             }
             work.flush().map_err(compile_failure)?;
             validate().map_err(|error| match error {
                 FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("__array_literal preparation has a stale selected binding"),
+                _ => invalid("collection constructor preparation has a stale selected binding"),
             })?;
-            super::collection_selected::validate_profile(
-                super::collection_selected::Operation::ArrayLiteral,
-                &contract,
-                || work.step().map_err(compile_failure),
-            )?;
+            let map = match self.constructor {
+                Constructor::Array => {
+                    super::collection_selected::validate_profile(
+                        super::collection_selected::Operation::ArrayLiteral,
+                        &contract,
+                        || work.step().map_err(compile_failure),
+                    )?;
+                    None
+                }
+                Constructor::Map => {
+                    Some(super::map_constructor::Recipe::prepare(&contract, || {
+                        work.step().map_err(compile_failure)
+                    })?)
+                }
+            };
             work.step().map_err(compile_failure)?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
-            Ok(Arc::new(PreparedArrayLiteral { contract }) as Arc<dyn PreparedScalarKernel>)
+            Ok(Arc::new(PreparedArrayLiteral { map, contract }) as Arc<dyn PreparedScalarKernel>)
         })();
         if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;

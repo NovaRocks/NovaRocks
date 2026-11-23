@@ -138,9 +138,6 @@ mod map_entries_selected;
 pub mod map_projection_core;
 mod map_projection_owner;
 mod map_projection_selected;
-pub mod map_size_core;
-mod map_size_owner;
-mod map_size_selected;
 mod md5_selected;
 pub mod md5_shared;
 mod murmur;
@@ -197,8 +194,6 @@ pub mod string_measure;
 mod string_measure_owner;
 mod string_pad;
 mod string_pad_owner;
-mod string_repeat;
-mod string_repeat_owner;
 mod string_replace;
 mod string_replace_owner;
 mod string_reverse;
@@ -260,7 +255,9 @@ mod regexp_position_owner;
 
 pub mod array_literal_core;
 mod array_literal_owner;
+pub mod collection_lambda;
 mod collection_selected;
+mod map_constructor;
 mod map_element_at_owner;
 pub mod map_lookup_core;
 
@@ -271,9 +268,6 @@ mod array_element_at_owner;
 pub mod calendar_unixtime;
 mod calendar_unixtime_owner;
 
-pub mod array_append_core;
-mod array_append_owner;
-mod array_append_selected;
 mod array_concat;
 
 pub mod regexp_count;
@@ -300,10 +294,6 @@ mod synopse_owner;
 mod uuid_owner;
 mod vector_distance_owner;
 
-pub mod array_match_core;
-mod array_match_owner;
-mod array_match_selected;
-
 pub mod aggregate_map_core;
 mod aggregate_map_source_failure;
 
@@ -313,9 +303,6 @@ mod aggregate_map_owner;
 mod array_invocation_source;
 #[cfg(test)]
 mod array_invocation_test_support;
-pub mod array_sortby_core;
-mod array_sortby_owner;
-mod array_sortby_selected;
 mod array_struct_subfield_actual;
 pub mod array_struct_subfield_core;
 mod array_struct_subfield_owner;

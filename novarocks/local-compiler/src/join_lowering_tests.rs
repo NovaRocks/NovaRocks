@@ -284,7 +284,13 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
     let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     let kind = kind_of(case.family);
-    let canonical = kind == JoinKind::LeftMark;
+    let canonical = matches!(
+        case.family,
+        Family::Hash {
+            kind: JoinKind::LeftMark,
+            ..
+        }
+    );
     let key_ty = if canonical {
         FunctionValueType::new(DataType::Utf8, false)
     } else {
@@ -364,7 +370,7 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
                 )
                 .unwrap();
             // NAA evaluates the nullable predicate value; ordinary join predicates only demand truth.
-            let demand = if kind == JoinKind::NullAwareLeftAnti {
+            let demand = if matches!(kind, JoinKind::NullAwareLeftAnti | JoinKind::LeftMark) {
                 EvaluationDemand::Value
             } else {
                 EvaluationDemand::TruthOnly
@@ -1028,6 +1034,7 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
         (JoinKind::LeftOuter, NestedLoopJoinType::LeftOuter, LEFT),
         (JoinKind::LeftSemi, NestedLoopJoinType::LeftSemi, LEFT),
         (JoinKind::LeftAnti, NestedLoopJoinType::LeftAnti, LEFT),
+        (JoinKind::LeftMark, NestedLoopJoinType::LeftMark, LEFT),
         (JoinKind::RightSemi, NestedLoopJoinType::LeftSemi, RIGHT),
         (JoinKind::RightAnti, NestedLoopJoinType::LeftAnti, RIGHT),
         (JoinKind::RightOuter, NestedLoopJoinType::RightOuter, LEFT),
@@ -1071,7 +1078,7 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
                 .unwrap();
             assert_eq!(
                 root.demand,
-                if matches!(physical, JoinKind::NullAwareLeftAnti) {
+                if matches!(physical, JoinKind::NullAwareLeftAnti | JoinKind::LeftMark) {
                     novarocks_type_contract::EvaluationDemand::Value
                 } else {
                     novarocks_type_contract::EvaluationDemand::TruthOnly

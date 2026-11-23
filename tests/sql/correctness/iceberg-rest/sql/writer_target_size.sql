@@ -22,7 +22,7 @@
 CREATE SCHEMA iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t (p BIGINT, id BIGINT) WITH (partitioning = ARRAY['p'], target_max_file_size = '1024B', parquet_writer_row_group_size = '512B');
 INSERT INTO iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t
-SELECT CAST(1 AS BIGINT), generate_series FROM TABLE(generate_series(1, 20000));
+SELECT CAST(1 AS BIGINT), generate_series FROM TABLE(sequence(1, 20000)) AS generate_series(generate_series);
 
 -- query 2
 SELECT count(*) > 1 AS rolled, sum(record_count) AS rows_in_files

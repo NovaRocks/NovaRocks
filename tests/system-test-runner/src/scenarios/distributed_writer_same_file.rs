@@ -151,8 +151,8 @@ pub(super) fn run(
     // the generated input, and the following observations verify the outcome.
     control.execute("SET SESSION pipeline_dop = 1")?;
     let seed_result = control.execute(format!(
-        "INSERT INTO {table} SELECT generate_series,generate_series \
-         FROM TABLE(generate_series(1,{SEED_ROWS})) ORDER BY generate_series"
+        "INSERT INTO {table} SELECT sequential_number,sequential_number \
+         FROM TABLE(sequence(1,{SEED_ROWS})) ORDER BY sequential_number"
     ))?;
     assert_affected(
         &seed_result,

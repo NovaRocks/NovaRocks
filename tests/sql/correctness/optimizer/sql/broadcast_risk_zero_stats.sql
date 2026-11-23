@@ -30,13 +30,13 @@ SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 WITH big_probe AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 1000000))
+    FROM TABLE(sequence(1, 1000000)) AS generate_series(generate_series)
 ),
 no_stats AS (
     SELECT k
     FROM (
         SELECT generate_series + 0 AS k
-        FROM TABLE(generate_series(1, 100000000))
+        FROM TABLE(sequence(1, 100000000)) AS generate_series(generate_series)
     ) projected
     WHERE k > 0
 )

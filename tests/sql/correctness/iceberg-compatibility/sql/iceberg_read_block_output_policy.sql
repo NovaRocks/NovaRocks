@@ -24,7 +24,7 @@ CREATE TABLE ${case_db}.m06a08_default_blocks (v BIGINT) WITH (format_version = 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ${case_db}.m06a08_default_blocks
-SELECT generate_series FROM TABLE(generate_series(1, 1024));
+SELECT generate_series FROM TABLE(sequence(1, 1024)) AS generate_series(generate_series);
 
 -- query 3
 -- @be_log_contains=NOVAROCKS_CONNECTOR_PARQUET_FIRST_BATCH max_read_rows=8192 max_read_bytes=16777216
@@ -41,7 +41,7 @@ CREATE TABLE m06a08_blocks_${uuid0}.m06a08_reader_${uuid0}.read_blocks (v BIGINT
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO m06a08_blocks_${uuid0}.m06a08_reader_${uuid0}.read_blocks SELECT generate_series FROM TABLE(generate_series(1, 1024));
+INSERT INTO m06a08_blocks_${uuid0}.m06a08_reader_${uuid0}.read_blocks SELECT generate_series FROM TABLE(sequence(1, 1024)) AS generate_series(generate_series);
 
 -- query 7
 -- @be_log_contains=NOVAROCKS_CONNECTOR_PARQUET_FIRST_BATCH max_read_rows=512 max_read_bytes=33554432 reader_batch_rows=512 decoded_rows=512

@@ -18,8 +18,7 @@
 //! SQL literal author causes. No input expression, type tree or value storage
 //! is kept alive by its diagnostic; external domain facts remain their own.
 use novarocks_failure_contract::{
-    BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason, ResourceDimension,
-    ResourceFacts, domain,
+    BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason, domain,
 };
 use std::{error::Error, fmt, num::NonZeroU16};
 #[derive(Debug)]
@@ -34,29 +33,16 @@ enum Cause {
     },
     Base64(base64::DecodeError),
     JsonSerialize(serde_json::Error),
+    #[cfg(test)]
     DecimalParameters(arrow::error::ArrowError),
-    Address {
-        required: u128,
-        source: std::num::TryFromIntError,
-    },
     Variant {
         context: &'static str,
         source: novarocks_types::value::variant_encode::VariantEncodeFailure,
     },
     Bitmap(novarocks_types::value::bitmap::BitmapValueFailure),
-    Layout {
-        required: u128,
-        source: std::alloc::LayoutError,
-    },
-    Allocation {
-        required: u128,
-        source: std::collections::TryReserveError,
-    },
 }
 impl LiteralFailure {
-    pub(super) fn address(required: u128, source: std::num::TryFromIntError) -> Self {
-        Self(Box::new(Cause::Address { required, source }))
-    }
+    #[cfg(test)]
     pub(super) fn decimal_parameters(source: arrow::error::ArrowError) -> Self {
         Self(Box::new(Cause::DecimalParameters(source)))
     }
@@ -86,12 +72,6 @@ impl LiteralFailure {
     ) -> Self {
         Self(Box::new(Cause::Variant { context, source }))
     }
-    pub(super) fn layout(required: u128, source: std::alloc::LayoutError) -> Self {
-        Self(Box::new(Cause::Layout { required, source }))
-    }
-    pub(super) fn allocation(required: u128, source: std::collections::TryReserveError) -> Self {
-        Self(Box::new(Cause::Allocation { required, source }))
-    }
 }
 impl From<novarocks_types::value::bitmap::BitmapValueFailure> for LiteralFailure {
     fn from(source: novarocks_types::value::bitmap::BitmapValueFailure) -> Self {
@@ -104,10 +84,7 @@ impl fmt::Display for LiteralFailure {
             Cause::Rejected(detail) => f.write_str(detail.as_str()),
             Cause::Numeric(detail) => f.write_str(detail),
             Cause::Hex { context, source } => write!(f, "{}: {source}", context.as_str()),
-            Cause::Address { required, source } => write!(
-                f,
-                "literal value storage requires {required} bytes beyond its addressable count: {source}"
-            ),
+            #[cfg(test)]
             Cause::DecimalParameters(source) => {
                 write!(f, "invalid literal DECIMAL parameters: {source}")
             }
@@ -115,14 +92,6 @@ impl fmt::Display for LiteralFailure {
             Cause::JsonSerialize(source) => write!(f, "json_object stringify failed: {source}"),
             Cause::Variant { context, source } => write!(f, "{context}: {source}"),
             Cause::Bitmap(source) => source.fmt(f),
-            Cause::Layout { required, source } => write!(
-                f,
-                "literal value storage requires {required} bytes: {source}"
-            ),
-            Cause::Allocation { required, source } => write!(
-                f,
-                "literal value storage allocation requires {required} bytes: {source}"
-            ),
         }
     }
 }
@@ -131,13 +100,11 @@ impl Error for LiteralFailure {
         match self.0.as_ref() {
             Cause::Hex { source, .. } => Some(source),
             Cause::Base64(source) => Some(source),
+            #[cfg(test)]
             Cause::DecimalParameters(source) => Some(source),
-            Cause::Address { source, .. } => Some(source),
             Cause::JsonSerialize(source) => Some(source),
             Cause::Variant { source, .. } => Some(source),
             Cause::Bitmap(source) => Some(source),
-            Cause::Layout { source, .. } => Some(source),
-            Cause::Allocation { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -146,8 +113,8 @@ impl FailureProjection for LiteralFailure {
     fn failure_fact(&self) -> FailureFact {
         let (class, code) = match self.0.as_ref() {
             Cause::Rejected(_) => (FailureClass::Data, 1),
+            #[cfg(test)]
             Cause::DecimalParameters(_) => (FailureClass::Data, 2),
-            Cause::Address { .. } => (FailureClass::Resource, 6),
             Cause::Numeric(_) => {
                 return novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact();
             }
@@ -157,35 +124,11 @@ impl FailureProjection for LiteralFailure {
             Cause::Variant { source, .. } => return source.failure_fact(),
             Cause::Bitmap(source) => return source.failure_fact(),
             Cause::JsonSerialize(_) => (FailureClass::Invariant, 3),
-            Cause::Layout { .. } => (FailureClass::Resource, 4),
-            Cause::Allocation { .. } => (FailureClass::Resource, 5),
         };
-        let fact = FailureFact::new(
+        FailureFact::new(
             class,
             FailureReason::new(domain::SQL, NonZeroU16::new(code).unwrap()),
-        );
-        match self.0.as_ref() {
-            Cause::Layout { required, .. }
-            | Cause::Allocation { required, .. }
-            | Cause::Address { required, .. } => fact.with_resource(ResourceFacts {
-                request_scope: None,
-                constraint_scope: None,
-                dimension: ResourceDimension::Bytes,
-                requested: u64::try_from(*required).ok(),
-                required_growth: None,
-                limit: if matches!(
-                    self.0.as_ref(),
-                    Cause::Layout { .. } | Cause::Address { .. }
-                ) {
-                    Some(isize::MAX as u64)
-                } else {
-                    None
-                },
-                live: None,
-                committed: None,
-            }),
-            _ => fact,
-        }
+        )
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for LiteralFailure {}

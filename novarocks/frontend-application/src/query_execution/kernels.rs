@@ -323,6 +323,10 @@ impl DmlExecutionKernel {
                 Arc::clone(&self.view_service),
                 self.system_relations.clone(),
                 Arc::clone(&self.mv_readiness),
+                Arc::new(crate::RequiredConstantInterpreter::new(
+                    Arc::clone(&self.sealed_functions),
+                    self.constant_policy,
+                )),
             )
             .with_state_store_original(self.state_store.clone()),
         )
@@ -416,6 +420,7 @@ impl DmlExecutionKernel {
 pub struct ViewExecutionKernel {
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -435,10 +440,12 @@ impl ViewExecutionKernel {
         view_service: Arc<dyn ViewService>,
         constant_policy: novarocks_functions::ConstantPolicy,
         system_relations: Arc<SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             constant_policy,
             functions,
+            sealed_functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -449,6 +456,10 @@ impl ViewExecutionKernel {
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    pub(crate) fn sealed_functions(&self) -> &Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        &self.sealed_functions
     }
 
     pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {

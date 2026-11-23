@@ -321,9 +321,18 @@ mod capability_projection_tests {
         .unwrap_err();
         assert_eq!(arithmetic, A::Unsupported);
         assert_primitive_source(arithmetic);
-        let comparison =
-            PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &from, &from, &control)
-                .unwrap_err();
+        let text_array = value(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))));
+        let comparison = PreparedComparisonRecipe::try_new(
+            ComparisonOperator::Eq,
+            &text_array,
+            &text_array,
+            &control,
+        )
+        .unwrap_err();
         assert_eq!(comparison, B::Unsupported);
         assert_primitive_source(comparison);
         let binary = value(DataType::Binary);
@@ -509,7 +518,7 @@ mod comparison_source_projection_tests {
     fn actual_comparison_recipe_refusal_and_mismatch_keep_distinct_original_sources() {
         let nested = domain(DataType::List(Arc::new(Field::new(
             "item",
-            DataType::Int32,
+            DataType::Utf8,
             true,
         ))));
         let left = domain(DataType::Int32);

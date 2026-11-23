@@ -113,32 +113,62 @@ impl FrontendCompletionCustody {
         Vec<novarocks_sql::compiler::CatalogRelationFact>,
         novarocks_sql::compiler::SqlCompileError,
     > {
-        use novarocks_query_application::preparation::SqlCompletionFactSource;
+        use novarocks_sql::compiler::{SqlCompileError, SqlFactBatch, SqlNeedBatch};
+        let batch = SqlNeedBatch::CatalogRelations(needs.to_vec().into_boxed_slice());
+        match self.resolve_analysis_facts(batch).await? {
+            SqlFactBatch::CatalogRelations(answer) => Ok(answer.into_vec()),
+            _ => Err(SqlCompileError::Compilation(
+                "completion catalog port returned another fact family".into(),
+            )),
+        }
+    }
+
+    /// Evaluate table arguments on the installed statement owner before the
+    /// original DML planner proceeds to statistics and optimization.
+    pub(crate) async fn analyze_dml_source(
+        &self,
+        preparation: novarocks_sql::compiler::SqlDmlCatalogPreparation,
+        functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+        policy: novarocks_functions::ConstantPolicy,
+    ) -> Result<novarocks_sql::compiler::SqlAnalyzedQuery, novarocks_sql::compiler::SqlCompileError>
+    {
+        use novarocks_sql::compiler::{
+            SqlCompileError, SqlDmlAnalysisProgress, SqlFactBatch, SqlNeedBatch,
+        };
+        match preparation.begin_analysis(functions, sealed_functions, policy)? {
+            SqlDmlAnalysisProgress::Ready(analyzed) => Ok(*analyzed),
+            SqlDmlAnalysisProgress::TableSequence(pending) => {
+                let batch = SqlNeedBatch::TableSequenceArguments(pending.needs());
+                match self.resolve_analysis_facts(batch).await? {
+                    SqlFactBatch::TableSequenceArguments(facts) => pending.resume(facts),
+                    _ => Err(SqlCompileError::Compilation(
+                        "completion table sequence port returned another fact family".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn resolve_analysis_facts(
+        &self,
+        batch: novarocks_sql::compiler::SqlNeedBatch,
+    ) -> Result<novarocks_sql::compiler::SqlFactBatch, novarocks_sql::compiler::SqlCompileError>
+    {
+        use novarocks_query_application::preparation::{ReadAccessSink, SqlCompletionFactSource};
+        use novarocks_sql::compiler::SqlCompileError;
         let facts = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.joined || state.health.is_some() {
-                return Err(novarocks_sql::compiler::SqlCompileError::Compilation(
+                return Err(SqlCompileError::Compilation(
                     "completion fact source is closed or unhealthy".into(),
                 ));
             }
             state.facts.clone().ok_or_else(|| {
-                novarocks_sql::compiler::SqlCompileError::Compilation(
-                    "completion fact source is not installed".to_owned(),
-                )
+                SqlCompileError::Compilation("completion fact source is not installed".into())
             })?
         };
-        let batch = novarocks_sql::compiler::SqlNeedBatch::CatalogRelations(
-            needs.to_vec().into_boxed_slice(),
-        );
-        let taken = novarocks_query_application::preparation::ReadAccessSink::new();
-        match facts.resolve(&batch, &taken).await? {
-            novarocks_sql::compiler::SqlFactBatch::CatalogRelations(answer) => {
-                Ok(answer.into_vec())
-            }
-            _ => Err(novarocks_sql::compiler::SqlCompileError::Compilation(
-                "completion catalog port returned another fact family".into(),
-            )),
-        }
+        facts.resolve(&batch, &ReadAccessSink::new()).await
     }
 
     /// The original statement retains this Provider across the borrowed wait.

@@ -38,15 +38,15 @@ CREATE TABLE ${case_db}.t0 (
   "v4" VARCHAR NOT NULL
 ) WITH (format_version = 3);
 
-insert into ${case_db}.sc3 values ROW(1, [1,2,3],[row(1,11),row(2,21),row(3,31)], map(1,11, 2,21), map(1,row(11, [111, 221, 331]), 2,row(22, [221, 221, 331])), row(1, [row(1,1), row(2,1)], map(1,11, 2,21), row(1,1)));
-insert into ${case_db}.sc3 values ROW(2, [2,2,3],[row(1,12),row(2,22),row(3,32)], map(1,12, 2,22), map(1,row(12, [112, 222, 332]), 2,row(22, [222, 222, 332])), row(1, [row(1,2), row(2,2)], map(1,12, 2,22), row(1,2)));
-insert into ${case_db}.sc3 values ROW(3, [3,2,3],[row(1,13),row(2,23),row(3,33)], map(1,13, 2,23), map(1,row(13, [113, 223, 333]), 2,row(22, [223, 223, 333])), row(1, [row(1,3), row(2,3)], map(1,13, 2,23), row(1,3)));
-insert into ${case_db}.sc3 values ROW(1, [4,2,3],[row(1,14),row(2,24),row(3,34)], map(1,14, 2,24), map(1,row(14, [114, 224, 334]), 2,row(22, [224, 224, 334])), row(1, [row(1,4), row(2,4)], map(1,14, 2,24), row(1,4)));
-insert into ${case_db}.sc3 values ROW(2, [5,2,3],[row(1,15),row(2,25),row(3,35)], map(1,15, 2,25), map(1,row(15, [115, 225, 335]), 2,row(22, [225, 225, 335])), row(1, [row(1,5), row(2,5)], map(1,15, 2,25), row(1,5)));
-insert into ${case_db}.sc3 values ROW(3, [6,2,3],[row(1,16),row(2,26),row(3,36)], map(1,16, 2,26), map(1,row(16, [116, 226, 336]), 2,row(22, [226, 226, 336])), row(1, [row(1,6), row(2,6)], map(1,16, 2,26), row(1,6)));
-insert into ${case_db}.sc3 values ROW(1, [7,2,3],[row(1,17),row(2,27),row(3,37)], map(1,17, 2,27), map(1,row(17, [117, 227, 337]), 2,row(22, [227, 227, 337])), row(1, [row(1,7), row(2,7)], map(1,17, 2,27), row(1,7)));
-insert into ${case_db}.sc3 values ROW(2, [8,2,3],[row(1,18),row(2,28),row(3,38)], map(1,18, 2,28), map(1,row(18, [118, 228, 338]), 2,row(22, [228, 228, 338])), row(1, [row(1,8), row(2,8)], map(1,18, 2,28), row(1,8)));
-insert into ${case_db}.sc3 values ROW(3, [9,2,3],[row(1,19),row(2,29),row(3,39)], map(1,19, 2,29), map(1,row(19, [119, 229, 339]), 2,row(22, [229, 229, 339])), row(1, [row(1,9), row(2,9)], map(1,19, 2,29), row(1,9)));
+insert into ${case_db}.sc3 values ROW(1, [1,2,3],[row(1,11),row(2,21),row(3,31)], MAP(ARRAY[1, 2], ARRAY[11, 21]), MAP(ARRAY[1, 2], ARRAY[row(11, [111, 221, 331]), row(22, [221, 221, 331])]), row(1, [row(1,1), row(2,1)], MAP(ARRAY[1, 2], ARRAY[11, 21]), row(1,1)));
+insert into ${case_db}.sc3 values ROW(2, [2,2,3],[row(1,12),row(2,22),row(3,32)], MAP(ARRAY[1, 2], ARRAY[12, 22]), MAP(ARRAY[1, 2], ARRAY[row(12, [112, 222, 332]), row(22, [222, 222, 332])]), row(1, [row(1,2), row(2,2)], MAP(ARRAY[1, 2], ARRAY[12, 22]), row(1,2)));
+insert into ${case_db}.sc3 values ROW(3, [3,2,3],[row(1,13),row(2,23),row(3,33)], MAP(ARRAY[1, 2], ARRAY[13, 23]), MAP(ARRAY[1, 2], ARRAY[row(13, [113, 223, 333]), row(22, [223, 223, 333])]), row(1, [row(1,3), row(2,3)], MAP(ARRAY[1, 2], ARRAY[13, 23]), row(1,3)));
+insert into ${case_db}.sc3 values ROW(1, [4,2,3],[row(1,14),row(2,24),row(3,34)], MAP(ARRAY[1, 2], ARRAY[14, 24]), MAP(ARRAY[1, 2], ARRAY[row(14, [114, 224, 334]), row(22, [224, 224, 334])]), row(1, [row(1,4), row(2,4)], MAP(ARRAY[1, 2], ARRAY[14, 24]), row(1,4)));
+insert into ${case_db}.sc3 values ROW(2, [5,2,3],[row(1,15),row(2,25),row(3,35)], MAP(ARRAY[1, 2], ARRAY[15, 25]), MAP(ARRAY[1, 2], ARRAY[row(15, [115, 225, 335]), row(22, [225, 225, 335])]), row(1, [row(1,5), row(2,5)], MAP(ARRAY[1, 2], ARRAY[15, 25]), row(1,5)));
+insert into ${case_db}.sc3 values ROW(3, [6,2,3],[row(1,16),row(2,26),row(3,36)], MAP(ARRAY[1, 2], ARRAY[16, 26]), MAP(ARRAY[1, 2], ARRAY[row(16, [116, 226, 336]), row(22, [226, 226, 336])]), row(1, [row(1,6), row(2,6)], MAP(ARRAY[1, 2], ARRAY[16, 26]), row(1,6)));
+insert into ${case_db}.sc3 values ROW(1, [7,2,3],[row(1,17),row(2,27),row(3,37)], MAP(ARRAY[1, 2], ARRAY[17, 27]), MAP(ARRAY[1, 2], ARRAY[row(17, [117, 227, 337]), row(22, [227, 227, 337])]), row(1, [row(1,7), row(2,7)], MAP(ARRAY[1, 2], ARRAY[17, 27]), row(1,7)));
+insert into ${case_db}.sc3 values ROW(2, [8,2,3],[row(1,18),row(2,28),row(3,38)], MAP(ARRAY[1, 2], ARRAY[18, 28]), MAP(ARRAY[1, 2], ARRAY[row(18, [118, 228, 338]), row(22, [228, 228, 338])]), row(1, [row(1,8), row(2,8)], MAP(ARRAY[1, 2], ARRAY[18, 28]), row(1,8)));
+insert into ${case_db}.sc3 values ROW(3, [9,2,3],[row(1,19),row(2,29),row(3,39)], MAP(ARRAY[1, 2], ARRAY[19, 29]), MAP(ARRAY[1, 2], ARRAY[row(19, [119, 229, 339]), row(22, [229, 229, 339])]), row(1, [row(1,9), row(2,9)], MAP(ARRAY[1, 2], ARRAY[19, 29]), row(1,9)));
 insert into ${case_db}.sc3 values ROW(4, [9,2,3],NULL, NULL, NULL, NULL);
 insert into ${case_db}.sc3 values ROW(4, [9,2,3],NULL, NULL, NULL, NULL);
 insert into ${case_db}.sc3 values ROW(4, [9,2,3],NULL, NULL, NULL, NULL);
@@ -94,7 +94,7 @@ select any_value(12), any_value(123), any_value('a') from ${case_db}.t0;
 
 -- query 7
 -- any_value of literal complex values: always same result
-select any_value([9,2,3]), any_value(map(1,row(19, [119, 229, 339]), 2,row(22, [229, 229, 339]))), any_value(row(1, [row(1,9), row(2,9)], map(1,19, 2,29), row(1,9))) from ${case_db}.sc3;
+select any_value([9,2,3]), any_value(MAP(ARRAY[1, 2], ARRAY[row(19, [119, 229, 339]), row(22, [229, 229, 339])])), any_value(row(1, [row(1,9), row(2,9)], MAP(ARRAY[1, 2], ARRAY[19, 29]), row(1,9))) from ${case_db}.sc3;
 
 -- query 8
 -- any_value(distinct ...) is a syntax error

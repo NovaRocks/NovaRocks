@@ -38,12 +38,12 @@ CREATE TABLE "ss" (
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(1,'Tom','English',90, [1,2],map(2,'name'));
+insert into ss values ROW(1,'Tom','English',90, [1,2],MAP(ARRAY[2], ARRAY['name']));
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(1,'Tom','Math',80, [1,2], map(2,'name'));
+insert into ss values ROW(1,'Tom','Math',80, [1,2], MAP(ARRAY[2], ARRAY['name']));
 
 -- query 5
 -- @skip_result_check=true
@@ -58,12 +58,12 @@ insert into ss values ROW(2,'Tom',NULL,NULL,null,null);
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(3,'May',NULL,NULL,[2],map(3,'3',4,'4'));
+insert into ss values ROW(3,'May',NULL,NULL,[2],MAP(ARRAY[3, 4], ARRAY['3', '4']));
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(3,'Ti','English',98, [null],map(5,null));
+insert into ss values ROW(3,'Ti','English',98, [null],MAP(ARRAY[5], ARRAY[null]));
 
 -- query 9
 -- @skip_result_check=true
@@ -78,7 +78,7 @@ insert into ss values ROW(NULL,NULL,NULL,NULL,null,null);
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(NULL,'Ti','物理Phy',99,[3,4],map(9,''));
+insert into ss values ROW(NULL,'Ti','物理Phy',99,[3,4],MAP(ARRAY[9], ARRAY['']));
 
 -- query 12
 -- @skip_result_check=true
@@ -88,17 +88,17 @@ insert into ss values ROW(11,'张三此地无银三百两','英文English',98,[0
 -- query 13
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(11,'张三掩耳盗铃','Math数学欧拉方程',78,[],map(7,'y'));
+insert into ss values ROW(11,'张三掩耳盗铃','Math数学欧拉方程',78,[],MAP(ARRAY[7], ARRAY['y']));
 
 -- query 14
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(12,'李四大闹天空','英语外语美誉',NULL,[89], map(6,'6'));
+insert into ss values ROW(12,'李四大闹天空','英语外语美誉',NULL,[89], MAP(ARRAY[6], ARRAY['6']));
 
 -- query 15
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values ROW(2,'王武程咬金','语文北京上海',22,[23],map(8,''));
+insert into ss values ROW(2,'王武程咬金','语文北京上海',22,[23],MAP(ARRAY[8], ARRAY['']));
 
 -- query 16
 -- @skip_result_check=true
@@ -1197,12 +1197,12 @@ select array_agg(distinct [JSON_OBJECT('2:3': NULL)]) from ss;
 
 -- query 284
 USE ${case_db};
-select array_agg(map(2,3)) from ss;
+select array_agg(MAP(ARRAY[2], ARRAY[3])) from ss;
 
 -- query 285
 -- @expect_error=Unknown error
 USE ${case_db};
-select array_agg(distinct map(2,3)) from ss;
+select array_agg(distinct MAP(ARRAY[2], ARRAY[3])) from ss;
 
 -- query 286
 USE ${case_db};
@@ -1257,13 +1257,13 @@ create table test_array_agg (
 -- @skip_result_check=true
 USE ${case_db};
 insert into test_array_agg values
-ROW(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map('key1', 1, 'key2', 2), row(1, 'test1')),
-ROW(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map('key3', 3, 'key4', 4), row(2, 'test2')),
+ROW(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], MAP(ARRAY['key1', 'key2'], ARRAY[1, 2]), row(1, 'test1')),
+ROW(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], MAP(ARRAY['key3', 'key4'], ARRAY[3, 4]), row(2, 'test2')),
 ROW(3, null, 30, 300, 3000, 30000, 300000, 5.5, 6.6, null, null, null, null, null, null, null),
-ROW(4, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map('key1', 1, 'key2', 2), row(1, 'test1')),
-ROW(5, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map('key3', 3, 'key4', 4), row(2, 'test2')),
-ROW(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map('key1', 1, 'key2', 2), row(1, 'test1')),
-ROW(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map('key3', 3, 'key4', 4), row(2, 'test2'));
+ROW(4, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], MAP(ARRAY['key1', 'key2'], ARRAY[1, 2]), row(1, 'test1')),
+ROW(5, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], MAP(ARRAY['key3', 'key4'], ARRAY[3, 4]), row(2, 'test2')),
+ROW(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], MAP(ARRAY['key1', 'key2'], ARRAY[1, 2]), row(1, 'test1')),
+ROW(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], MAP(ARRAY['key3', 'key4'], ARRAY[3, 4]), row(2, 'test2'));
 
 -- query 294
 -- @skip_result_check=true

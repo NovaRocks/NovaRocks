@@ -19,18 +19,19 @@
 use super::{
     array_access_core::{AccessFailure, AccessRows, ArrayAccessInputs, lookup_observed},
     array_literal_core::CollectionObservation,
-    collection_selected::{compact, copy_error, nullable_take_type},
+    collection_selected::{compact, copy_error, nullable_take_type, reserve},
 };
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallContract,
-    ScalarCallInput, SelectedValues,
+    DataFailureReason, EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl,
+    KernelFailure, RowDataError, ScalarCallContract, ScalarCallInput, SelectedValues, Selection,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
     selected_copy,
 };
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, ListArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-use std::{alloc::Layout, cell::RefCell};
+use std::{alloc::Layout, cell::RefCell, sync::Arc};
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
     strict: bool,
@@ -92,6 +93,22 @@ pub(super) fn evaluate<'a>(
     strict: bool,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
+    evaluate_with_index_policy(input, strict, false, control)
+}
+
+pub(super) fn evaluate_element_at<'a>(
+    input: ScalarCallInput<'_, 'a>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    evaluate_with_index_policy(input, false, true, control)
+}
+
+fn evaluate_with_index_policy<'a>(
+    input: ScalarCallInput<'_, 'a>,
+    strict: bool,
+    trino_element_at: bool,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
     let work = RefCell::new(EvaluationCheckpoints::new(control));
     let result = (|| {
@@ -105,7 +122,11 @@ pub(super) fn evaluate<'a>(
         };
         Layout::array::<Option<u32>>(selection.len())
             .map_err(|_| KernelFailure::ResourceExhausted)?;
-        let normalized_index = compact(*index, selection, &work)?;
+        let (normalized_index, errors) = if trino_element_at {
+            normalize_element_at(*list, *index, selection, &work)?
+        } else {
+            (compact(*index, selection, &work)?, Box::default())
+        };
         let mut observer = |event| match event {
             CollectionObservation::Step => work.borrow_mut().step(),
             CollectionObservation::OpaqueBoundary => work.borrow_mut().flush(),
@@ -156,11 +177,69 @@ pub(super) fn evaluate<'a>(
             AccessFailure::Control(cause) => cause,
             AccessFailure::Operation(cause) => cause,
         })?;
-        SelectedValues::try_new(selection, target.data_type(), values, row_errors)
+        let errors = if trino_element_at { errors } else { row_errors };
+        SelectedValues::try_new(selection, target.data_type(), values, errors)
             .map_err(|_| internal("array element compact output violates its frozen contract"))
     })();
     work.into_inner().finish_result(result)
 }
+fn normalize_element_at(
+    array: EvaluatedArgument<'_>,
+    index: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    work: &RefCell<EvaluationCheckpoints<'_>>,
+) -> Result<(ArrayRef, Box<[RowDataError]>), KernelFailure> {
+    let list = array
+        .array()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| internal("element_at source is outside its prepared List profile"))?;
+    let indices = index
+        .array()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| internal("element_at index is outside its prepared BIGINT profile"))?;
+    let mut normalized = reserve::<Option<i32>>(selection.len(), work)?;
+    let mut errors = reserve::<RowDataError>(selection.len(), work)?;
+    for (ordinal, row) in selection.iter().enumerate() {
+        work.borrow_mut().step()?;
+        let array_row = array.value_row(ordinal, row);
+        let index_row = index.value_row(ordinal, row);
+        if array_row >= list.len() || index_row >= indices.len() {
+            return Err(internal(
+                "element_at selection is outside its prepared carriers",
+            ));
+        }
+        if list.is_null(array_row) || indices.is_null(index_row) {
+            normalized.push(None);
+            continue;
+        }
+        let index = indices.value(index_row);
+        let len = i64::from(list.value_length(array_row));
+        let position = match index {
+            0 => {
+                errors.push(RowDataError::with_reason(
+                    ordinal,
+                    DataFailureReason::Domain(
+                        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                    ),
+                    "SQL array indices start at 1",
+                ));
+                None
+            }
+            value if value > len || value < -len => None,
+            value if value < 0 => i32::try_from(len + 1 + value).ok(),
+            value => i32::try_from(value).ok(),
+        };
+        normalized.push(position);
+    }
+    work.borrow_mut().flush()?;
+    Ok((
+        Arc::new(Int32Array::from(normalized)),
+        errors.into_boxed_slice(),
+    ))
+}
+
 #[cfg(test)]
 #[path = "array_access_selected_tests.rs"]
 mod tests;

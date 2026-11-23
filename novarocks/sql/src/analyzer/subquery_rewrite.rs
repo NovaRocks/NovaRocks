@@ -401,6 +401,7 @@ impl<'a> AnalyzerContext<'a> {
         select.apply_specs.push(ApplyScalarSpec {
             mark_probe: None,
             mark_key_bindings: None,
+            relation_mark: None,
             subquery_id: sq_info.id,
             clause,
             output_column,
@@ -478,6 +479,22 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
+                if is_composite_in_operand(&lhs.value_type)
+                    && !json_query_references_outer_scope(&resolved_sub, &inner_scope, scope)
+                {
+                    let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
+                        unreachable!("only IN has a probe")
+                    };
+                    self.rewrite_composite_in_value_form(
+                        select,
+                        resolved_sub,
+                        lhs,
+                        sq_info.id,
+                        *negated,
+                        in_expr.span(),
+                    )?;
+                    return Ok(true);
+                }
                 if super::resolve_expr::is_json_in_subquery_operand(&lhs, scope)
                     || inner_col.value_type.logical_type()
                         == novarocks_type_contract::ValueLogicalType::Json
@@ -488,7 +505,7 @@ impl<'a> AnalyzerContext<'a> {
                     ));
                 }
 
-                if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
+                if let Some(reason) = super::resolve_expr::incompatible_complex_compare(
                     lhs.value_type.data_type(),
                     inner_col.value_type.data_type(),
                 ) {
@@ -1993,6 +2010,7 @@ impl<'a> AnalyzerContext<'a> {
             select.apply_specs.push(ApplyScalarSpec {
                 mark_probe: Some(lhs_typed_list[0].clone()),
                 mark_key_bindings,
+                relation_mark: None,
                 subquery_id: sq_info.id,
                 clause,
                 output_column: crate::analysis::AnalyzedOutputField {
@@ -2022,7 +2040,7 @@ impl<'a> AnalyzerContext<'a> {
             .zip(resolved_sub.output_columns.iter())
         {
             self.check_control()?;
-            if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
+            if let Some(reason) = super::resolve_expr::incompatible_complex_compare(
                 lhs_i.value_type.data_type(),
                 sub_col.value_type.data_type(),
             ) {
@@ -2096,18 +2114,20 @@ impl<'a> AnalyzerContext<'a> {
             ));
         }
 
-        if value_form
-            && matches!(
-                lhs_typed.value_type.data_type(),
-                DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
-            )
-        {
+        if value_form && is_composite_in_operand(&lhs_typed.value_type) {
+            if json_query_references_outer_scope(&resolved_sub, &inner_scope, scope) {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "Composite IN requires an independent right relation",
+                    sq_info.subquery.span,
+                ));
+            }
             return self.rewrite_composite_in_value_form(
                 select,
                 resolved_sub,
                 lhs_typed,
                 sq_info.id,
                 negated,
+                in_expr_ast.span(),
             );
         }
 
@@ -2424,11 +2444,9 @@ impl<'a> AnalyzerContext<'a> {
         Ok(())
     }
 
-    /// A global build-NULL marker is insufficient for composite equality:
-    /// UNKNOWN depends on each probe/build pair, and a definite mismatch wins
-    /// over a NULL leaf. Collect the uncorrelated build once, then reduce exact
-    /// comparisons with ANY_MATCH (TRUE wins over UNKNOWN). The scalar build
-    /// relation preserves outer duplicates and also produces a row when empty.
+    /// Every actual candidate row participates in the same ordinary equality
+    /// as an explicit pairwise comparison.
+    // Design: ADR-0255 (docs/adr/ADR-0255-collection-calls-and-relational-sequence.md)
     fn rewrite_composite_in_value_form(
         &self,
         select: &mut ResolvedSelect,
@@ -2436,222 +2454,104 @@ impl<'a> AnalyzerContext<'a> {
         lhs: TypedExpr,
         sq_id: usize,
         negated: bool,
+        span: novarocks_parser::Span,
     ) -> Result<(), AnalyzeError> {
-        use super::resolve_expr::resolved_scalar_call_at;
-        use novarocks_functions::FunctionResultType;
-        use novarocks_type_contract::DecimalOverflowPolicy;
+        use crate::analysis::RelationMarkSpec;
+        use novarocks_type_contract::{FunctionValueType, OperatorFunction};
 
-        let span = novarocks_parser::Span::new(0, 0);
         let clause = locate_scalar_placeholder_clause(select, sq_id).ok_or_else(|| {
             AnalyzeError::unsupported_query_shape(
-                "composite IN value requires a clause-owned scalar Apply insertion point",
+                "composite IN requires a clause-owned insertion point",
                 span,
             )
         })?;
-        let alias = format!("__sq_values_{sq_id}");
-        let name = format!("__in_values_{sq_id}");
-        let output = &source.output_columns[0];
-        let argument = TypedExpr {
+        let (guard, mut demand_projections) =
+            self.composite_mark_demand(select, clause, sq_id, span)?;
+        let (lhs, demand_column) = match guard {
+            Some(guard) => {
+                let guard = self.project_mark_demand(guard, &mut demand_projections, sq_id);
+                (case_for_mark_demand(guard.clone(), lhs), Some(guard))
+            }
+            None => (lhs, None),
+        };
+        let rhs = &source.output_columns[0];
+        let probe_name = format!("__in_probe_{sq_id}");
+        let probe_type = lhs.value_type.clone();
+        let probe_id = self.alloc_column_id(None, probe_name.clone(), probe_type.clone());
+        let probe_column = OutputColumn {
+            column_id: probe_id,
+            field_name: Some(probe_name.clone()),
+            name: probe_name.clone(),
+            value_type: probe_type.clone(),
+            is_internal: true,
+        };
+        let equality = self.analyze_binary_operator(
+            OperatorFunction::Equal,
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: probe_id,
+                    qualifier: None,
+                    column: probe_name,
+                },
+                value_type: probe_type,
+            },
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: rhs.column_id,
+                    qualifier: None,
+                    column: rhs.name.clone(),
+                },
+                value_type: rhs.value_type.clone(),
+            },
+            span,
+        )?;
+        let predicate = demand_column.map_or_else(
+            || equality.clone(),
+            |guard| mark_demand_case(guard, equality.clone(), bool_literal(false)),
+        );
+        let value_type = FunctionValueType::new(DataType::Boolean, true);
+        let mark = self.alloc_column_id(None, format!("__in_mark_{sq_id}"), value_type.clone());
+        let output = JoinKind::LeftMark { mark }
+            .mark_output()
+            .expect("mark output");
+        let mut replacement = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: output.column_id,
+                column_id: mark,
                 qualifier: None,
                 column: output.name.clone(),
             },
-            value_type: output.value_type.clone(),
+            value_type: value_type.clone(),
         };
-        let resolved = super::resolve_expr::resolve_aggregate_function_call(
-            self.function_catalog,
-            "array_agg",
-            std::slice::from_ref(&argument),
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
-        let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
-            unreachable!("array_agg has a scalar result");
-        };
-        let result = result.clone();
-        let column_id = self.alloc_column_id(
-            None,
-            name.clone(),
-            super::helpers::with_nullability(result.clone(), true),
-        );
-        let collection_output = OutputColumn {
-            field_name: Some(name.clone()),
-            column_id,
-            name: name.clone(),
-            value_type: (result.clone())
-                .with_nullable(true)
-                .expect("valid value root nullability transform"),
-
-            is_internal: true,
-        };
-        // ARRAY_REPEAT evaluates the probe once in its owning clause's row
-        // domain, before ARRAY_MAP expands candidates. A projection below FROM
-        // would evaluate HAVING/aggregate probes before grouping, and a probe
-        // embedded in the lambda would run once per candidate instead.
-        let probe_param = LambdaParam {
-            name: format!("__in_probe_{sq_id}"),
-            slot_id: self.alloc_lambda_slot_id(),
-            value_type: lhs.value_type.clone(),
-        };
-        let probe = TypedExpr {
-            kind: ExprKind::LambdaParamRef {
-                name: probe_param.name.clone(),
-                slot_id: probe_param.slot_id,
-            },
-            value_type: lhs.value_type.clone(),
-        };
-        let param = LambdaParam {
-            name: format!("__in_item_{sq_id}"),
-            slot_id: self.alloc_lambda_slot_id(),
-            value_type: output.value_type.clone(),
-        };
-        let item = TypedExpr {
-            kind: ExprKind::LambdaParamRef {
-                name: param.name.clone(),
-                slot_id: param.slot_id,
-            },
-            value_type: param.value_type.clone(),
-        };
-        let common = self.require_common_trino_type(&probe.value_type, &item.value_type, span)?;
-        let probe = self.coerce_common_value(probe, &common, span)?;
-        let item = self.coerce_common_value(item, &common, span)?;
-        let comparison = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(probe),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(item),
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        };
-        let lambda = TypedExpr {
-            kind: ExprKind::LambdaFunction {
-                params: vec![probe_param, param],
-                body: novarocks_parser::ast::AstBox::new(comparison),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        };
-        let values = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id,
-                qualifier: None,
-                column: name.clone(),
-            },
-            value_type: (result.clone())
-                .with_nullable(collection_output.value_type.nullable())
-                .expect("valid value root nullability transform"),
-        };
-        let length = resolved_scalar_call_at(
-            self.function_catalog,
-            "cardinality",
-            vec![values.clone()],
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
-        let probes = resolved_scalar_call_at(
-            self.function_catalog,
-            "array_repeat",
-            vec![lhs, length],
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
-        let mapped = resolved_scalar_call_at(
-            self.function_catalog,
-            "array_map",
-            vec![lambda, probes, values],
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
-        // ARRAY_AGG emits a non-null empty list for zero input rows;
-        // ANY_MATCH reduces that list to FALSE even for a NULL probe.
-        let mut replacement = resolved_scalar_call_at(
-            self.function_catalog,
-            "any_match",
-            vec![mapped],
-            span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )?;
         if negated {
             replacement = TypedExpr {
                 kind: ExprKind::UnaryOp {
                     op: UnOp::Not,
                     expr: novarocks_parser::ast::AstBox::new(replacement),
                 },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
+                value_type,
             };
         }
-        let source_outputs = source.output_columns.clone();
-        let mut inner_output = collection_output.clone();
-        inner_output.column_id = self.alloc_column_id(Some(alias), name.clone(), result.clone());
-        inner_output.value_type = inner_output
-            .value_type
-            .with_nullable(result.nullable())
-            .expect("validated root NULL contract");
-        let query = ResolvedQuery {
-            body: QueryBody::Select(ResolvedSelect {
-                from: Some(Relation::Subquery {
-                    query: novarocks_parser::ast::AstBox::new(source),
-                    alias: format!("__sq_values_src_{sq_id}"),
-                    output_columns: source_outputs,
-                }),
-                filter: None,
-                group_by: vec![],
-                having: None,
-                projection: vec![ProjectItem {
-                    field_name: Some(name.clone()),
-                    expr: TypedExpr {
-                        kind: ExprKind::AggregateCall {
-                            occurrence: crate::analysis::AggregateOccurrence::new(),
-                            filter: None,
-                            name: "array_agg".to_string(),
-                            args: (vec![argument]).into(),
-                            distinct: false,
-                            order_by: (vec![]).into(),
-                            resolved,
-                        },
-                        value_type: result,
-                    },
-                    output_name: name,
-                    output_column_id: inner_output.column_id,
-                }],
-                has_aggregation: true,
-                distinct: false,
-                repeat: None,
-                apply_specs: (vec![]).into(),
-                predicate_apply_specs: (vec![]).into(),
-            }),
-            order_by: vec![],
-            limit: None,
-            offset: None,
-            output_columns: vec![inner_output],
-            local_cte_ids: vec![],
-        };
-        // Reuse the scalar Apply's clause boundary: HAVING and projection
-        // collections must be installed after Aggregate, never as group keys.
         select.apply_specs.push(ApplyScalarSpec {
-            mark_probe: None,
+            mark_probe: Some(lhs),
             mark_key_bindings: None,
+            relation_mark: Some(RelationMarkSpec {
+                probe_column,
+                demand_projections,
+                predicate,
+            }),
             subquery_id: sq_id,
             clause,
-            output_column: collection_output,
-            inner: query,
-            correlation_column_ids: vec![],
+            output_column: OutputColumn {
+                column_id: mark,
+                field_name: Some(output.name.clone()),
+                name: output.name,
+                value_type: output.value_type,
+                is_internal: true,
+            },
+            inner: source,
+            correlation_column_ids: Vec::new(),
             need_check_max_rows: false,
-            subquery_text: "composite IN build collection".to_string(),
+            subquery_text: "composite IN".to_owned(),
         });
         Self::replace_placeholder_in_filter(&mut select.filter, sq_id, &replacement);
         Self::replace_placeholder_in_filter(&mut select.having, sq_id, &replacement);
@@ -3026,6 +2926,7 @@ impl<'a> AnalyzerContext<'a> {
             purpose: self.purpose,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
+            table_sequence: self.table_sequence,
             control: self.control,
             constant_policy: self.constant_policy,
             catalog: self.catalog,
@@ -3037,7 +2938,6 @@ impl<'a> AnalyzerContext<'a> {
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-            next_lambda_slot_id: std::cell::Cell::new(self.next_lambda_slot_id.get()),
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
@@ -3045,8 +2945,6 @@ impl<'a> AnalyzerContext<'a> {
         let result = child_ctx.analyze_query_with_outer_scope_inner(query, outer_scope)?;
 
         self.next_subquery_id.set(child_ctx.next_subquery_id.get());
-        self.next_lambda_slot_id
-            .set(child_ctx.next_lambda_slot_id.get());
 
         let nested_sqs: Vec<SubqueryInfo> = child_ctx
             .collected_subqueries
@@ -4880,6 +4778,320 @@ pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: u
     }
 }
 
+fn is_composite_in_operand(ty: &novarocks_type_contract::FunctionValueType) -> bool {
+    matches!(
+        ty.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    )
+}
+
+fn mark_demand_case(condition: TypedExpr, selected: TypedExpr, otherwise: TypedExpr) -> TypedExpr {
+    let value_type = super::helpers::with_nullability(
+        selected.value_type.clone(),
+        selected.value_type.nullable() || otherwise.value_type.nullable(),
+    );
+    TypedExpr {
+        kind: ExprKind::Case {
+            ieee_float_equality: false,
+            operand: None,
+            when_then: vec![(condition, selected)].into(),
+            else_expr: Some(novarocks_parser::ast::AstBox::new(otherwise)),
+        },
+        value_type,
+    }
+}
+
+fn case_for_mark_demand(condition: TypedExpr, selected: TypedExpr) -> TypedExpr {
+    let otherwise = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Null),
+        value_type: super::helpers::with_nullability(selected.value_type.clone(), true),
+    };
+    mark_demand_case(condition, selected, otherwise)
+}
+
+struct MarkDemand<'a, 'b> {
+    analyzer: &'a AnalyzerContext<'b>,
+    subquery: usize,
+    span: novarocks_parser::Span,
+    projections: Vec<ProjectItem>,
+    before_aggregate_input: bool,
+}
+impl MarkDemand<'_, '_> {
+    fn truth_test(
+        &self,
+        expression: TypedExpr,
+        value: bool,
+        negated: bool,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let equality = self.analyzer.analyze_binary_operator(
+            novarocks_type_contract::OperatorFunction::Identical,
+            expression,
+            bool_literal(value),
+            self.span,
+        )?;
+        if !negated {
+            return Ok(equality);
+        }
+        Ok(TypedExpr {
+            value_type: equality.value_type.clone(),
+            kind: ExprKind::UnaryOp {
+                op: UnOp::Not,
+                expr: novarocks_parser::ast::AstBox::new(equality),
+            },
+        })
+    }
+
+    fn bind_condition(
+        &mut self,
+        expression: &mut TypedExpr,
+        guard: &Option<TypedExpr>,
+    ) -> TypedExpr {
+        let source = expression.clone();
+        let source = match guard {
+            Some(guard) => case_for_mark_demand(guard.clone(), source),
+            None => source,
+        };
+        *expression =
+            self.analyzer
+                .project_mark_demand(source, &mut self.projections, self.subquery);
+        expression.clone()
+    }
+
+    fn extend_guard(guard: Option<TypedExpr>, next: TypedExpr) -> Option<TypedExpr> {
+        Some(match guard {
+            Some(guard) => mark_demand_case(guard, next, bool_literal(false)),
+            None => next,
+        })
+    }
+
+    fn error(&self, detail: &'static str) -> AnalyzeError {
+        AnalyzeError::unsupported_query_shape(detail, self.span)
+    }
+
+    fn visit(
+        &mut self,
+        expression: &mut TypedExpr,
+        guard: Option<TypedExpr>,
+    ) -> Result<Option<TypedExpr>, AnalyzeError> {
+        self.analyzer.check_control()?;
+        if is_placeholder(expression, self.subquery) {
+            return Ok(guard);
+        }
+        match &mut expression.kind {
+            ExprKind::BinaryOp {
+                left, right, op, ..
+            } => {
+                if expr_contains_placeholder(left, self.subquery) {
+                    self.visit(left, guard)
+                } else {
+                    let guard = match op {
+                        BinOp::And | BinOp::Or if !self.before_aggregate_input => {
+                            let condition = self.bind_condition(left, &guard);
+                            Self::extend_guard(
+                                guard,
+                                self.truth_test(condition, *op == BinOp::Or, true)?,
+                            )
+                        }
+                        _ => guard,
+                    };
+                    self.visit(right, guard)
+                }
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+                ieee_float_equality,
+            } => {
+                if let Some(operand) = operand
+                    && expr_contains_placeholder(operand, self.subquery)
+                {
+                    return self.visit(operand, guard);
+                }
+                let mut guard = guard;
+                let operand = if self.before_aggregate_input {
+                    None
+                } else {
+                    operand
+                        .as_mut()
+                        .map(|operand| self.bind_condition(operand, &guard))
+                };
+                for (condition, result) in when_then.iter_mut() {
+                    if expr_contains_placeholder(condition, self.subquery) {
+                        return self.visit(condition, guard);
+                    }
+                    if self.before_aggregate_input {
+                        if expr_contains_placeholder(result, self.subquery) {
+                            return self.visit(result, guard);
+                        }
+                        continue;
+                    }
+                    let condition = self.bind_condition(condition, &guard);
+                    let matched = match &operand {
+                        Some(operand) => TypedExpr {
+                            kind: ExprKind::Case {
+                                operand: Some(novarocks_parser::ast::AstBox::new(operand.clone())),
+                                when_then: vec![(condition, bool_literal(true))].into(),
+                                else_expr: Some(novarocks_parser::ast::AstBox::new(bool_literal(
+                                    false,
+                                ))),
+                                ieee_float_equality: *ieee_float_equality,
+                            },
+                            value_type: bool_literal(true).value_type,
+                        },
+                        None => self.truth_test(condition, true, false)?,
+                    };
+                    let matched = self.analyzer.project_mark_demand(
+                        matched,
+                        &mut self.projections,
+                        self.subquery,
+                    );
+                    if expr_contains_placeholder(result, self.subquery) {
+                        return self.visit(result, Self::extend_guard(guard, matched));
+                    }
+                    guard = Self::extend_guard(guard, self.truth_test(matched, false, false)?);
+                }
+                self.visit(
+                    else_expr
+                        .as_deref_mut()
+                        .ok_or_else(|| self.error("Missing CASE expression for composite IN"))?,
+                    guard,
+                )
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::IsTruthValue { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::Nested(expr) => self.visit(expr, guard),
+            ExprKind::FunctionCall { args, binding, .. } => {
+                use novarocks_type_contract::ArgumentControl;
+                let position = args
+                    .iter()
+                    .position(|arg| expr_contains_placeholder(arg, self.subquery))
+                    .ok_or_else(|| self.error("Missing function argument for composite IN"))?;
+                if self.before_aggregate_input {
+                    return self.visit(&mut args[position], guard);
+                }
+                let selected = binding.resolved();
+                let declaration = self
+                    .analyzer
+                    .function_catalog
+                    .pure_overload_declaration_observed(
+                        &selected.function_id,
+                        selected.kind,
+                        &selected.selected.overload,
+                        self.analyzer.control,
+                    )
+                    .map_err(|error| match error {
+                        novarocks_functions::FunctionSpecializationFailure::Control(error) => {
+                            AnalyzeError::control(error)
+                        }
+                        novarocks_functions::FunctionSpecializationFailure::Binding(error) => {
+                            AnalyzeError::function_binding(error)
+                        }
+                        novarocks_functions::FunctionSpecializationFailure::MissingPureImplementation(overload) => {
+                            AnalyzeError::function_binding(
+                                novarocks_functions::FunctionBindingError::UnavailableImplementation(overload),
+                            )
+                        }
+                        error => AnalyzeError::shared_domain_source(
+                            novarocks_failure_contract::SharedFailureCause::new(error),
+                        ),
+                    })?;
+                let guard = match declaration.effects().argument_control {
+                    ArgumentControl::If if position > 0 => {
+                        let condition = self.bind_condition(&mut args[0], &guard);
+                        Self::extend_guard(guard, self.truth_test(condition, true, position == 2)?)
+                    }
+                    ArgumentControl::Coalesce => {
+                        let mut guard = guard;
+                        for earlier in &mut args[..position] {
+                            let earlier = self.bind_condition(earlier, &guard);
+                            guard = Self::extend_guard(guard, is_null_expr(earlier, false));
+                        }
+                        guard
+                    }
+                    ArgumentControl::NoArguments | ArgumentControl::TypeOnly => {
+                        Some(bool_literal(false))
+                    }
+                    ArgumentControl::If | ArgumentControl::Eager => guard,
+                    _ => return Err(self.error(
+                        "Composite IN inside this function requires its original argument demand",
+                    )),
+                };
+                self.visit(&mut args[position], guard)
+            }
+            ExprKind::AggregateCall { args, .. } => {
+                let argument = args
+                    .iter_mut()
+                    .find(|arg| expr_contains_placeholder(arg, self.subquery))
+                    .ok_or_else(|| {
+                        self.error("Composite IN requires an aggregate value argument")
+                    })?;
+                // The final aggregate result's demand is outside this input domain.
+                self.before_aggregate_input = false;
+                self.visit(argument, None)
+            }
+            _ => Err(self.error("Composite IN has no supported demand in this expression")),
+        }
+    }
+}
+
+impl AnalyzerContext<'_> {
+    fn project_mark_demand(
+        &self,
+        expression: TypedExpr,
+        projects: &mut Vec<ProjectItem>,
+        sq_id: usize,
+    ) -> TypedExpr {
+        let name = format!("__in_demand_{sq_id}_{}", projects.len());
+        let value_type = expression.value_type.clone();
+        let column_id = self.alloc_column_id(None, name.clone(), value_type.clone());
+        projects.push(ProjectItem {
+            field_name: Some(name.clone()),
+            expr: expression,
+            output_name: name.clone(),
+            output_column_id: column_id,
+        });
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: name,
+            },
+            value_type,
+        }
+    }
+
+    fn composite_mark_demand(
+        &self,
+        select: &mut ResolvedSelect,
+        clause: ApplyClause,
+        sq_id: usize,
+        span: novarocks_parser::Span,
+    ) -> Result<(Option<TypedExpr>, Vec<ProjectItem>), AnalyzeError> {
+        let expression = match clause {
+            ApplyClause::Where => select.filter.as_mut(),
+            ApplyClause::Having => select.having.as_mut(),
+            ApplyClause::Projection | ApplyClause::AggregateInput => select
+                .projection
+                .iter_mut()
+                .map(|item| &mut item.expr)
+                .find(|expr| expr_contains_placeholder(expr, sq_id)),
+        }
+        .ok_or_else(|| AnalyzeError::internal("composite IN lost its owning expression"))?;
+        let mut demand = MarkDemand {
+            analyzer: self,
+            subquery: sq_id,
+            span,
+            projections: Vec::new(),
+            before_aggregate_input: clause == ApplyClause::AggregateInput,
+        };
+        let guard = demand.visit(expression, None)?;
+        Ok((guard, demand.projections))
+    }
+}
+
 fn predicate_placeholder_is_value_form(select: &ResolvedSelect, placeholder_id: usize) -> bool {
     select
         .projection
@@ -6132,9 +6344,11 @@ mod tests {
     }
 
     #[test]
-    fn composite_in_evaluates_volatile_probe_outside_candidate_lambda() {
-        let query =
-            &novarocks_parser::parser::parse_query("SELECT [random()] IN (SELECT [0.0])").unwrap();
+    fn composite_in_materializes_volatile_probe_once() {
+        let query = &novarocks_parser::parser::parse_query(
+            "SELECT ARRAY[CAST(floor(random()) AS BIGINT)] IN (SELECT ARRAY[CAST(0 AS BIGINT)])",
+        )
+        .unwrap();
         let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
         let (resolved, _, _) = super::super::analyze_with_function_catalog(
             query,
@@ -6148,36 +6362,27 @@ mod tests {
         let QueryBody::Select(select) = resolved.body else {
             panic!("select");
         };
-        let ExprKind::FunctionCall { name, args, .. } = &select.projection[0].expr.kind else {
-            panic!("reduction");
+        let [spec] = select.apply_specs.as_slice() else {
+            panic!("one mark occurrence");
         };
-        assert_eq!(name, "any_match");
-        let ExprKind::FunctionCall { name, args, .. } = &args[0].kind else {
-            panic!("map");
+        let mark = spec.relation_mark.as_ref().expect("ordinary mark");
+        assert!(matches!(
+            select.projection[0].expr.kind,
+            ExprKind::ColumnRef { .. }
+        ));
+        assert!(format!("{:?}", spec.mark_probe).contains("Volatile"));
+        assert!(!format!("{:?}", mark.predicate).contains("Volatile"));
+        let [build] = spec.inner.output_columns.as_slice() else {
+            panic!("original right relation yields one value");
         };
-        assert_eq!(name, "array_map");
-        let ExprKind::FunctionCall {
-            name,
-            args: probe_args,
-            ..
-        } = &args[1].kind
-        else {
-            panic!("probe repetition");
-        };
-        assert_eq!(name, "array_repeat");
-        assert!(format!("{:?}", probe_args[0].kind).contains("Volatile"));
-        let ExprKind::LambdaFunction { body, .. } = &args[0].kind else {
-            panic!("lambda");
-        };
-        let ExprKind::BinaryOp { left, .. } = &body.kind else {
-            panic!("comparison");
-        };
-        assert!(matches!(left.kind, ExprKind::LambdaParamRef { .. }));
-        assert!(!format!("{:?}", body.kind).contains("Volatile"));
+        let mut columns = Vec::new();
+        collect_column_ids_in_expr(&mark.predicate, &mut columns);
+        assert!(columns.contains(&mark.probe_column.column_id));
+        assert!(columns.contains(&build.column_id));
     }
 
     #[test]
-    fn composite_in_collection_uses_owning_clause_apply_boundary() {
+    fn composite_in_mark_uses_owning_clause_apply_boundary() {
         for (sql, clause) in [
             (
                 "SELECT x, count(*) FROM (VALUES (1),(2)) t(x) GROUP BY x HAVING [x] IN (SELECT [1]) OR count(*) = 0",

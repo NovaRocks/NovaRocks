@@ -26,7 +26,7 @@ CREATE TABLE ${case_db}.row_util_base (
   k1 BIGINT
 ) WITH (format_version = 3);
 
-INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 16 - 1));
+INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(sequence(0, 16 - 1)) AS generate_series(generate_series);
 
 CREATE TABLE ${case_db}.row_util (
   idx BIGINT

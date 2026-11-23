@@ -2286,10 +2286,9 @@ fn p2_order_by_derived_values_extra_preserves_source_column_id() {
 
 #[test]
 fn p2_order_by_generate_series_extra_preserves_source_column_id() {
-    let plan = parse_analyze_and_plan(
-        "SELECT 1 FROM TABLE(generate_series(1, 3, 1)) AS gs(x) ORDER BY gs.x + 1",
-    )
-    .expect("planner should succeed");
+    let plan =
+        parse_analyze_and_plan("SELECT 1 FROM TABLE(sequence(1, 3, 1)) AS gs(x) ORDER BY gs.x + 1")
+            .expect("planner should succeed");
 
     let (_, _, inner_proj) = root_strip_sort_inner_project(&plan);
     let inner_proj_plan = plan.unary_input().unary_input();
@@ -2358,7 +2357,7 @@ fn p2_values_output_uses_single_column_id() {
 
 #[test]
 fn p2_generate_series_output_has_column_id_through_planner() {
-    let plan = parse_analyze_and_plan("SELECT x FROM TABLE(generate_series(1, 3, 1)) AS gs(x)")
+    let plan = parse_analyze_and_plan("SELECT x FROM TABLE(sequence(1, 3, 1)) AS gs(x)")
         .expect("planner should succeed");
     let LogicalPlanKind::Project(project) = &plan.kind else {
         panic!("expected Project root, got {plan:?}");
@@ -3502,7 +3501,12 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     assert_m07_planned_domains(
-        "select array_sortby(CAST([] AS ARRAY<json>),[1]) as x,array_sortby(CAST([] AS ARRAY<json>),[1]) as y",
+        "SELECT
+            concat(ARRAY[json_object('k': o_orderkey), json_object('m': o_orderkey)],
+                   ARRAY[json_object('n': o_orderkey), json_object('p': o_orderkey)]) AS x,
+            concat(ARRAY[json_object('k': o_orderkey), json_object('m': o_orderkey)],
+                   ARRAY[json_object('n': o_orderkey), json_object('p': o_orderkey)]) AS y
+         FROM orders",
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     // Exercise the duplicate-ID builder path with an actual analyzer-owned

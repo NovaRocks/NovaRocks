@@ -554,8 +554,8 @@ fn unmatched_inserts(
     for file in 0..6_i64 {
         let base = file * 64;
         control.execute(format!(
-            "INSERT INTO {source} SELECT generate_series, generate_series*10, TRUE \
-             FROM TABLE(generate_series({},{}))",
+            "INSERT INTO {source} SELECT sequential_number, sequential_number*10, TRUE \
+             FROM TABLE(sequence({},{}))",
             base + 1,
             base + 64
         ))?;
@@ -798,8 +798,8 @@ fn partition_replacement_after_spec_evolution(
     // observations prove its shape; the tested mutation restores DOP below.
     control.execute("SET SESSION pipeline_dop = 1")?;
     let seed_result = control.execute(format!(
-        "INSERT INTO {table} SELECT generate_series,generate_series,0 \
-             FROM TABLE(generate_series(1,3)) ORDER BY generate_series"
+        "INSERT INTO {table} SELECT sequential_number,sequential_number,0 \
+             FROM TABLE(sequence(1,3)) ORDER BY sequential_number"
     ))?;
     assert_affected(
         &seed_result,

@@ -626,7 +626,7 @@ impl Scenario for MvRewriteBindingBarrier {
             context,
             &mut conn,
             "seed MV rewrite cost fixture",
-            "INSERT INTO orders SELECT number % 3, CAST(number % 10 AS BIGINT) FROM TABLE(generate_series(1, 1200)) t(number)",
+            "INSERT INTO orders SELECT number % 3, CAST(number % 10 AS BIGINT) FROM TABLE(sequence(1, 1200)) t(number)",
         )?;
         execute(
             context,

@@ -17,6 +17,7 @@
 
 mod assert_true;
 mod cast;
+mod collection_functions;
 mod comparison;
 mod from_binary;
 mod kernel_control;

@@ -378,13 +378,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // repeat(str, n) -> str
-    add(
-        m,
-        "repeat",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
-    );
-
     // Stable relational identity for IMV join coalesce rows. Object-ID salts
     // are opaque connector bytes, not UTF-8 UUIDs.
     add(
@@ -958,21 +951,15 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // cardinality / array_length / array_size : List<T> -> Int32
-    for name in ["cardinality", "array_length", "array_size"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
-                TypeSpec::Int32,
-            ),
-        );
-    }
-
-    // cardinality also counts a map's entries. The executor dispatches it
-    // through the map family as well, so declaring only the array form named
-    // half of what it does.
+    // Trino CARDINALITY counts either collection's offsets as BIGINT.
+    add(
+        m,
+        "cardinality",
+        Signature::new(
+            vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
+            TypeSpec::Int64,
+        ),
+    );
     add(
         m,
         "cardinality",
@@ -981,17 +968,11 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 Box::new(TypeSpec::Any("K")),
                 Box::new(TypeSpec::Any("V")),
             )],
-            TypeSpec::Int32,
+            TypeSpec::Int64,
         ),
     );
 
-    // array_position(List<T>, T) -> Int32 — note Int32 not Int64, matching legacy.
-    //
-    // Widening is right here and not on array_append: the element variable
-    // only picks the type the two sides are compared at, and never reaches
-    // the return type. An array literal is typed from its own values while a
-    // bare integer literal is BIGINT, so `array_position([1,2,3], 1)` pairs a
-    // TINYINT element with a BIGINT probe and must compare as BIGINT.
+    // ARRAY_POSITION returns the one-based BIGINT position, or zero.
     add(
         m,
         "array_position",
@@ -1000,39 +981,34 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
                 TypeSpec::Any("T"),
             ],
-            TypeSpec::Int32,
+            TypeSpec::Int64,
         )
         .with_widening(),
     );
 
-    // array_append(List<T>, T) -> List<T>
+    let item = TypeSpec::Any("T");
+    let array = TypeSpec::List(Box::new(item.clone()));
     add(
         m,
-        "array_append",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Any("T"),
-            ],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
+        "concat",
+        Signature::variadic(vec![array.clone(), array.clone()], array.clone()).with_widening(),
     );
-
-    // array_concat(List<T>, ...) -> List<T> — variadic
     add(
         m,
-        "array_concat",
-        Signature::variadic(
-            vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
+        "concat",
+        Signature::new(vec![array.clone(), item.clone()], array.clone()).with_widening(),
+    );
+    add(
+        m,
+        "concat",
+        Signature::new(vec![item, array.clone()], array).with_widening(),
     );
 
     // array_contains(List<T>, T) -> bool. Widening for the same reason as
     // array_position: T is only the comparison type.
     add(
         m,
-        "array_contains",
+        "contains",
         Signature::new(
             vec![
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
@@ -1043,38 +1019,18 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         .with_widening(),
     );
 
-    // all_match / any_match read one already-evaluated boolean array: the
-    // lambda form is rewritten before binding, so the predicate never
-    // reaches the registry as a second argument.
-    for name in ["all_match", "any_match"] {
+    // Each comparison resolves an identical common element domain.
+    for name in ["contains_sequence", "arrays_overlap"] {
+        let array = TypeSpec::List(Box::new(TypeSpec::Any("T")));
         add(
             m,
             name,
-            Signature::new(
-                vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
-                TypeSpec::Boolean,
-            ),
-        );
-    }
-
-    // Two-list boolean predicates. Each side carries its own element
-    // variable: these compare membership, not a shared element type.
-    for name in ["array_contains_seq", "arrays_overlap"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![
-                    TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                    TypeSpec::List(Box::new(TypeSpec::Any("U"))),
-                ],
-                TypeSpec::Boolean,
-            ),
+            Signature::new(vec![array.clone(), array], TypeSpec::Boolean).with_widening(),
         );
     }
 
     // Element-preserving transforms of one list.
-    for name in ["array_distinct", "array_sort", "array_reverse"] {
+    for name in ["array_distinct", "array_sort", "reverse"] {
         add(
             m,
             name,
@@ -1099,38 +1055,9 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         .with_widening(),
     );
 
-    // array_filter(List<T>, List<Boolean>) -> List<T>. The lambda form is
-    // rewritten into this evaluated-mask shape before binding.
     add(
         m,
-        "array_filter",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::List(Box::new(TypeSpec::Any("M"))),
-            ],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
-    );
-
-    // array_top_n(List<T>, n) -> List<T>
-
-    // array_slice(List<T>, offset[, length]) -> List<T>. The executor reads
-    // both positions as BIGINT.
-    add(
-        m,
-        "array_slice",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Int64,
-            ],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
-    );
-    add(
-        m,
-        "array_slice",
+        "slice",
         Signature::new(
             vec![
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
@@ -1140,24 +1067,6 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
             TypeSpec::List(Box::new(TypeSpec::Any("T"))),
         ),
     );
-
-    // array_sortby(List<T>, key list, ...) -> List<T>. Each key list sorts
-    // the previous ties, so the keys are independent types rather than
-    // repeats of one variable -- which is what a variadic spec would force.
-    // The registry vocabulary names type variables one at a time, so the
-    // supported key counts are spelled out.
-    const SORTBY_KEYS: [&str; 6] = ["K1", "K2", "K3", "K4", "K5", "K6"];
-    for keys in 1..=SORTBY_KEYS.len() {
-        let mut args = vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))];
-        for name in SORTBY_KEYS.iter().take(keys) {
-            args.push(TypeSpec::List(Box::new(TypeSpec::Any(name))));
-        }
-        add(
-            m,
-            "array_sortby",
-            Signature::new(args, TypeSpec::List(Box::new(TypeSpec::Any("T")))),
-        );
-    }
 
     // array_min / array_max : List<T> -> T
     for name in ["array_min", "array_max"] {
@@ -1170,6 +1079,18 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ),
         );
     }
+
+    add(
+        m,
+        "element_at",
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::Int64,
+            ],
+            TypeSpec::Any("T"),
+        ),
+    );
 
     // __array_element_at(List<T>, Int32) -> T
     //
@@ -1200,17 +1121,46 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         ),
     );
 
-    // array_join / array_to_string: List<*> + Utf8 -> Utf8
-    for name in ["array_join", "array_to_string"] {
+    let array = TypeSpec::List(Box::new(TypeSpec::Any("T")));
+    add(
+        m,
+        "array_join",
+        Signature::new(vec![array.clone(), TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "array_join",
+        Signature::new(vec![array, TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+
+    let item = TypeSpec::Any("T");
+    add(
+        m,
+        "repeat",
+        Signature::new(
+            vec![item.clone(), TypeSpec::Int64],
+            TypeSpec::List(Box::new(item)),
+        ),
+    );
+
+    for count in [2, 3] {
         add(
             m,
-            name,
-            Signature::variadic(
-                vec![TypeSpec::List(Box::new(TypeSpec::Any("T"))), TypeSpec::Utf8],
-                TypeSpec::Utf8,
+            "sequence",
+            Signature::new(
+                vec![TypeSpec::Int64; count],
+                TypeSpec::List(Box::new(TypeSpec::Int64)),
             ),
         );
     }
+    add(
+        m,
+        "sequence",
+        Signature::new(
+            vec![TypeSpec::Date, TypeSpec::Date],
+            TypeSpec::List(Box::new(TypeSpec::Date)),
+        ),
+    );
 
     // split(str, str) -> List<Utf8>
     add(
@@ -1228,6 +1178,14 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    add(
+        m,
+        "split_to_map",
+        Signature::new(
+            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+            TypeSpec::Map(Box::new(TypeSpec::Utf8), Box::new(TypeSpec::Utf8)),
+        ),
+    );
     // map_keys(Map<K, V>) -> List<K>
     add(
         m,
@@ -1255,17 +1213,6 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
 
     // map_size(Map<K, V>) -> Int32 (matches legacy)
-    add(
-        m,
-        "map_size",
-        Signature::new(
-            vec![TypeSpec::Map(
-                Box::new(TypeSpec::Any("K")),
-                Box::new(TypeSpec::Any("V")),
-            )],
-            TypeSpec::Int32,
-        ),
-    );
 
     // Map-preserving value functions. Lambda-bearing transforms are bound by
     // the dynamic exact resolver because their lambda contract is part of the
@@ -1282,34 +1229,35 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
         ),
     );
 
-    // The frozen non-null Null key domain is uninhabited. Preserve this
-    // original Map and the independent evaluated probe, without key coercion.
-    add(
-        m,
-        "__map_element_at",
-        Signature::new(
-            vec![
-                TypeSpec::MapWithUninhabitedKey {
-                    map: "M",
-                    value: "V",
-                },
-                TypeSpec::AnyType,
-            ],
-            TypeSpec::Any("V"),
-        ),
-    );
-    // __map_element_at(Map<K, V>, K) -> V
-    add(
-        m,
-        "__map_element_at",
-        Signature::new(
-            vec![
-                TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
-                TypeSpec::Any("K"),
-            ],
-            TypeSpec::Any("V"),
-        ),
-    );
+    for name in ["element_at", "__map_element_at", "__map_subscript"] {
+        // The empty UNKNOWN Map has an uninhabited key domain. Preserve
+        // its independent evaluated probe without key coercion.
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![
+                    TypeSpec::MapWithUninhabitedKey {
+                        map: "M",
+                        value: "V",
+                    },
+                    TypeSpec::AnyType,
+                ],
+                TypeSpec::Any("V"),
+            ),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![
+                    TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
+                    TypeSpec::Any("K"),
+                ],
+                TypeSpec::Any("V"),
+            ),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

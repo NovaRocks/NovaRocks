@@ -29,8 +29,8 @@ SELECT row_number() OVER () AS row_number_value;
 SELECT -CAST(1 AS SMALLINT) AS negated, typeof(CAST(1 AS TINYINT)) AS narrow_type;
 
 -- query 5
--- @expect_error=no admitted selected scalar implementation
-SELECT array_reverse([1]) WHERE FALSE;
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT reverse(ARRAY[1]) WHERE FALSE;
 
 -- query 6
 -- Invalid arity must be rejected even when the row predicate is false.
@@ -42,11 +42,22 @@ SELECT next_day('2020-01-01') WHERE FALSE;
 SELECT intrinsic_definitely_unknown(1) WHERE FALSE;
 
 -- query 8
--- @expect_error=no admitted selected scalar implementation
-SELECT map_filter(map(1,10),[TRUE]) WHERE FALSE;
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT map_filter(map(ARRAY[1], ARRAY[10]), (k, v) -> TRUE) WHERE FALSE;
 
 -- query 9
-SELECT array_sort([]) AS sorted_empty,
-       array_min([NULL]) IS NULL AS minimum_null,
-       array_max([NULL]) IS NULL AS maximum_null,
-       array_sortby([[2],[1]],[NULL,NULL]) AS null_key_order;
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, ordinal) AS null_key_order
+FROM (VALUES (1, ARRAY[2], NULL), (2, ARRAY[1], NULL))
+    AS input_rows(ordinal, payload_value, k1);
+
+-- query 10
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT array_sort(ARRAY[]);
+
+-- query 11
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT array_min(ARRAY[NULL]);
+
+-- query 12
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT array_max(ARRAY[NULL]);

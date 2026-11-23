@@ -23,13 +23,13 @@ CREATE TABLE map_aggregate_contract (id INT, m MAP<INT,INT>) WITH (format_versio
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO map_aggregate_contract VALUES ROW(1,NULL),ROW(2,map()),ROW(3,map(1,NULL)),ROW(4,map(1,7));
+INSERT INTO map_aggregate_contract VALUES ROW(1,NULL),ROW(2,MAP(CAST(ARRAY[] AS ARRAY(INTEGER)), CAST(ARRAY[] AS ARRAY(INTEGER)))),ROW(3,MAP(ARRAY[1], ARRAY[CAST(NULL AS INTEGER)])),ROW(4,MAP(ARRAY[1], ARRAY[7]));
 -- query 3
 USE ${case_db};
-SELECT id, m IS NULL AS parent_null, m[1] AS value_at_one FROM map_aggregate_contract ORDER BY id;
+SELECT id, m IS NULL AS parent_null, element_at(m, 1) AS value_at_one FROM map_aggregate_contract ORDER BY id;
 -- query 4
 USE ${case_db};
-SELECT COUNT(*) AS rows_total, COUNT(m) AS maps_present, COUNT(m[1]) AS values_present FROM map_aggregate_contract;
+SELECT COUNT(*) AS rows_total, COUNT(m) AS maps_present, COUNT(element_at(m, 1)) AS values_present FROM map_aggregate_contract;
 -- query 5
 USE ${case_db};
 SELECT COUNT(m) AS maps_present FROM map_aggregate_contract WHERE id >= 2;

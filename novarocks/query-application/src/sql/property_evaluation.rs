@@ -428,11 +428,7 @@ fn evaluate_properties(
                 DdlPropertyChange::Reset(value)
             }
             DdlPropertyAssignmentValue::Expression(expression) => {
-                let value = if value_type == DdlPropertyType::MapVarcharVarchar {
-                    evaluate_map(scope, source, &name, expression, port, control)?
-                } else {
-                    evaluate_value(scope, source, expression, value_type, port, control)?
-                };
+                let value = evaluate_value(scope, source, expression, value_type, port, control)?;
                 if value == DdlPropertyValue::Null {
                     return Err(invalid(
                         scope,
@@ -514,9 +510,7 @@ pub(super) fn evaluate_required_property_value(
         DdlPropertyType::Double => RequiredConstantTarget::Double,
         DdlPropertyType::Varchar => RequiredConstantTarget::Varchar,
         DdlPropertyType::ArrayVarchar => RequiredConstantTarget::ArrayVarchar,
-        DdlPropertyType::MapVarcharVarchar => {
-            return Err(invariant("MAP uses its structural owner"));
-        }
+        DdlPropertyType::MapVarcharVarchar => RequiredConstantTarget::MapVarcharVarchar,
     };
     let constant = evaluate_required_constant(expression, target, port, control, invalid_value)?;
     // The required-constant port must return the complete declared target,
@@ -532,6 +526,7 @@ pub(super) fn evaluate_required_property_value(
             (DdlPropertyType::ArrayVarchar, ValueKind::List(child)) => {
                 matches!(child.kind(), ValueKind::String)
             }
+            (DdlPropertyType::MapVarcharVarchar, _) => target.admits_map_source(binding),
             _ => false,
         };
     if !matches {
@@ -601,116 +596,48 @@ pub(super) fn evaluate_required_property_value(
             DdlPropertyValue::ArrayVarchar(items)
         }
         DdlPropertyType::MapVarcharVarchar => {
-            return Err(invariant("MAP uses its structural owner"));
+            let ValueKind::Map { key, value } = binding.value_type().kind() else {
+                return Err(missing());
+            };
+            if matches!(
+                key.kind(),
+                ValueKind::Scalar(arrow::datatypes::DataType::Null)
+            ) {
+                let empty = constant
+                    .unknown_map_is_empty_observed(phase, control)
+                    .map_err(constant_failure)?
+                    .ok_or_else(missing)?;
+                if !empty {
+                    return Err(invariant(
+                        "Required UNKNOWN-key map contains a resident entry",
+                    ));
+                }
+                DdlPropertyValue::MapVarcharVarchar(Vec::new())
+            } else {
+                let map = if matches!(
+                    value.kind(),
+                    ValueKind::Scalar(arrow::datatypes::DataType::Null)
+                ) {
+                    constant.utf8_map_with_unknown_values_observed(phase, control)
+                } else {
+                    constant.utf8_map_observed(phase, control)
+                }
+                .map_err(constant_failure)?
+                .ok_or_else(missing)?;
+                let mut entries = Vec::with_capacity(map.len());
+                for index in 0..map.len() {
+                    checkpoint(control, 1)?;
+                    let (key, value) = map.item(index, phase, control).map_err(constant_failure)?;
+                    let key = copy_string(key.ok_or_else(missing)?, control)?;
+                    let value = value.map(|text| copy_string(text, control)).transpose()?;
+                    entries.push((key, value));
+                }
+                DdlPropertyValue::MapVarcharVarchar(entries)
+            }
         }
     };
     checkpoint(control, 0)?;
     Ok(value)
-}
-
-fn evaluate_map(
-    scope: DdlPropertyScope,
-    source: &str,
-    property_name: &str,
-    expression: &Expr,
-    port: &mut dyn DdlPropertyConstantPort,
-    control: &dyn PureCompileControl,
-) -> Result<DdlPropertyValue, QueryServiceError> {
-    let shape = || {
-        invalid(
-            scope,
-            source,
-            expression.span(),
-            format!(
-                "Map property '{property_name}' requires MAP with two equal-length ARRAY constructors"
-            ),
-        )
-    };
-    let Expr::FunctionCall(call) = expression else {
-        return Err(shape());
-    };
-    // QualifiedName's pinned suffix identity lowercases even delimited names.
-    // No catalog lookup is guessed for a qualified function name.
-    let [name] = call.name.parts.as_slice() else {
-        return Err(shape());
-    };
-    if !name.value.eq_ignore_ascii_case("map") {
-        return Err(shape());
-    }
-    let [keys, values] = call.arguments.as_slice() else {
-        return Err(shape());
-    };
-    if call.distinct
-        || call.order_by.is_some()
-        || call.filter.is_some()
-        || call.window.is_some()
-        || call.null_treatment.is_some()
-        || call.processing_mode.is_some()
-        || call
-            .arguments
-            .iter()
-            .any(|argument| argument.name.is_some())
-    {
-        return Err(shape());
-    }
-    let (Expr::Array(keys), Expr::Array(values)) = (&keys.value, &values.value) else {
-        return Err(shape());
-    };
-    if keys.values.len() != values.values.len() {
-        return Err(shape());
-    }
-    let mut evaluated_keys = Vec::with_capacity(keys.values.len());
-    // Evaluate every original key, then every original value. Key validation
-    // follows both arrays, so a NULL/duplicate key never hides a value failure.
-    for key in &keys.values {
-        evaluated_keys.push(
-            match evaluate_value(scope, source, key, DdlPropertyType::Varchar, port, control)? {
-                DdlPropertyValue::Null => None,
-                DdlPropertyValue::Varchar(key) => Some(key),
-                _ => return Err(invariant("Map key lost its required VARCHAR target")),
-            },
-        );
-    }
-    let mut evaluated_values = Vec::with_capacity(values.values.len());
-    for value in &values.values {
-        evaluated_values.push(
-            match evaluate_value(
-                scope,
-                source,
-                value,
-                DdlPropertyType::Varchar,
-                port,
-                control,
-            )? {
-                DdlPropertyValue::Null => None,
-                DdlPropertyValue::Varchar(value) => Some(value),
-                _ => return Err(invariant("Map value lost its required VARCHAR target")),
-            },
-        );
-    }
-    let mut seen = HashSet::new();
-    let mut entries = Vec::with_capacity(evaluated_keys.len());
-    for (key, value) in evaluated_keys.into_iter().zip(evaluated_values) {
-        checkpoint(control, 1)?;
-        let Some(key) = key else {
-            return Err(invalid(
-                scope,
-                source,
-                expression.span(),
-                format!("Map property key cannot be NULL in property '{property_name}'"),
-            ));
-        };
-        if !seen.insert(copy_string(&key, control)?) {
-            return Err(invalid(
-                scope,
-                source,
-                expression.span(),
-                format!("Duplicate map property key '{key}' in property '{property_name}'"),
-            ));
-        }
-        entries.push((key, value));
-    }
-    Ok(DdlPropertyValue::MapVarcharVarchar(entries))
 }
 
 fn invariant(message: &str) -> QueryServiceError {

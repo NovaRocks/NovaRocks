@@ -25,6 +25,6 @@
 -- 2. Apply slice/concat/distinct.
 -- 3. Assert scalar output arrays.
 SELECT
-    ARRAY_SLICE([1, 2, 3, 4], 2, 2) AS sliced,
-    ARRAY_CONCAT([1, 2], [3, NULL]) AS concated,
+    slice([1, 2, 3, 4], 2, 2) AS sliced,
+    concat([1, 2], [3, NULL]) AS concated,
     ARRAY_DISTINCT([1, 2, 2, NULL, 1, NULL]) AS deduped;

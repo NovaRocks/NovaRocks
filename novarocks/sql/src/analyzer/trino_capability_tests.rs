@@ -304,10 +304,14 @@ fn assert_unknown_table_function(source: &str, owner: &str) {
         &query,
         source,
         owner,
-        AnalyzeErrorKind::UnsupportedQueryShape,
-        "sql.analyze.unsupported_query_shape",
+        AnalyzeErrorKind::UnknownFunction,
+        "sql.analyze.unknown_function",
     );
-    assert_eq!(error.message(), "unsupported table function: x", "{owner}");
+    assert_eq!(
+        error.message(),
+        "Table function 'x' not registered",
+        "{owner}"
+    );
     assert_eq!(actual_span, function.name.span, "{owner}");
 }
 
@@ -368,17 +372,11 @@ fn relation_grammar_cases_use_the_first_actual_table_free_analyzer_owner() {
 }
 
 #[test]
-fn admitted_table_function_distinguishes_argument_profiles_and_value_types() {
+fn admitted_table_function_rejects_unimplemented_argument_profiles() {
     for source in [
-        "SELECT * FROM TABLE (generate_series(1, 2))",
-        "SELECT * FROM TABLE (generate_series(start => 1, \"end\" => 2))",
-    ] {
-        assert_single_analyzed_type(source, DataType::Int64, false);
-    }
-    for source in [
-        "WITH x(x) AS (VALUES 1) SELECT * FROM TABLE (generate_series(TABLE(x)))",
-        "SELECT * FROM TABLE (generate_series(DESCRIPTOR(x)))",
-        "SELECT * FROM TABLE (generate_series(1, 2 COPARTITION (x, x)))",
+        "WITH x(x) AS (VALUES 1) SELECT * FROM TABLE (sequence(TABLE(x)))",
+        "SELECT * FROM TABLE (sequence(DESCRIPTOR(x)))",
+        "SELECT * FROM TABLE (sequence(1, 2 COPARTITION (x, x)))",
     ] {
         assert_relation_capability(
             source,
@@ -386,21 +384,6 @@ fn admitted_table_function_distinguishes_argument_profiles_and_value_types() {
             "table_function_argument_profile",
         );
     }
-    let source = "SELECT * FROM TABLE (generate_series('1', 2))";
-    let query = parse_query(source).unwrap();
-    let (error, span) = assert_analyzer_rejection(
-        &query,
-        source,
-        "integer constant requirement",
-        AnalyzeErrorKind::InvalidLiteral,
-        "sql.analyze.invalid_literal",
-    );
-    assert!(
-        error
-            .message()
-            .starts_with("expected constant integer expression")
-    );
-    assert_eq!(&source[span.start()..span.end()], "'1'");
 }
 
 #[test]

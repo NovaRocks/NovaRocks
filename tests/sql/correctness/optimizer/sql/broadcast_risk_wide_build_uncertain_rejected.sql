@@ -25,9 +25,9 @@ USE ${case_db};
 CREATE TABLE probe_1m_exact (k INT);
 CREATE TABLE build_wide_unanalyzed (k INT, pad VARCHAR(500)) WITH (statistics_collect_on_write = false);
 INSERT INTO probe_1m_exact
-    SELECT generate_series FROM TABLE(generate_series(1, 1000000));
+    SELECT generate_series FROM TABLE(sequence(1, 1000000)) AS generate_series(generate_series);
 INSERT INTO build_wide_unanalyzed
-    SELECT generate_series, repeat('z', 500) FROM TABLE(generate_series(1, 200000));
+    SELECT generate_series, rpad('', 500, 'z') FROM TABLE(sequence(1, 200000)) AS generate_series(generate_series);
 ANALYZE probe_1m_exact;
 -- build_wide_unanalyzed intentionally not analyzed: Fallback + empty colstats
 -- is treated as uninformative and rejected by broadcast feasibility.

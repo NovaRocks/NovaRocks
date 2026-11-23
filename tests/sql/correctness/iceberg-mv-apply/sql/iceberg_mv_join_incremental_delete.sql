@@ -88,10 +88,10 @@ ORDER BY f.id, d.label;
 -- @skip_result_check=true
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0}
 SELECT id, concat('bulk-', cast(id as varchar))
-FROM TABLE(generate_series(1000, 3499)) AS gs(id);
+FROM TABLE(sequence(1000, 3499)) AS gs(id);
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0}
 SELECT id, id, id * 10
-FROM TABLE(generate_series(1000, 3499)) AS gs(id);
+FROM TABLE(sequence(1000, 3499)) AS gs(id);
 REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 
 -- query 9
@@ -107,10 +107,10 @@ SET label = concat('bulk-new-', cast(id as varchar))
 WHERE id >= 3000 AND id <= 3499;
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0}
 SELECT id, concat('bulk-', cast(id as varchar))
-FROM TABLE(generate_series(3500, 3999)) AS gs(id);
+FROM TABLE(sequence(3500, 3999)) AS gs(id);
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0}
 SELECT id, id, id * 10
-FROM TABLE(generate_series(3500, 3999)) AS gs(id);
+FROM TABLE(sequence(3500, 3999)) AS gs(id);
 
 -- query 11
 -- @skip_result_check=true

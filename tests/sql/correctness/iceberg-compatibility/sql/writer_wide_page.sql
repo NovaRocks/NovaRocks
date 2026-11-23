@@ -28,8 +28,8 @@ CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
 SET SESSION group_concat_max_len = 17825792;
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
 SELECT CAST(1 AS BIGINT),
-       string_agg(repeat('x', 1048576 - generate_series), '')
-FROM TABLE(generate_series(1, 17));
+       string_agg(rpad('', 1048576 - generate_series, 'x'), '')
+FROM TABLE(sequence(1, 17)) AS generate_series(generate_series);
 
 -- query 2
 -- Spark reads the stored value independently of NovaRocks' scan batch budget.

@@ -16,7 +16,7 @@
 // under the License.
 //! ONE original root-NULL and i32-offset counting body shared by CARDINALITY and MAP_SIZE.
 use super::array_literal_core::CollectionObservation;
-use arrow_array::{Array, ArrayRef, Int32Array};
+use arrow_array::{Array, ArrayRef, Int64Array};
 use std::sync::Arc;
 #[derive(Debug)]
 pub enum OffsetCountFailure<E> {
@@ -25,7 +25,7 @@ pub enum OffsetCountFailure<E> {
 }
 /// The offset supplier preserves each raw shell's original classification/allocation order.
 /// Arrays and offsets are exact borrowed facts; this function does not decode children.
-pub fn count_observed<'a, E>(
+pub(super) fn count_observed<'a, E>(
     array: &dyn Array,
     offsets: impl FnOnce() -> Result<&'a [i32], crate::KernelFailure>,
     selection: crate::Selection<'_>,
@@ -63,11 +63,11 @@ pub fn count_observed<'a, E>(
                         "collection offset count requires monotone representable offsets",
                     ))
                 })?;
-            out.push(Some(count));
+            out.push(Some(i64::from(count)));
         }
     }
     observer(CollectionObservation::OpaqueBoundary).map_err(OffsetCountFailure::Control)?;
-    let out = Arc::new(Int32Array::from(out)) as ArrayRef;
+    let out = Arc::new(Int64Array::from(out)) as ArrayRef;
     observer(CollectionObservation::OpaqueBoundary).map_err(OffsetCountFailure::Control)?;
     Ok(out)
 }
@@ -113,7 +113,7 @@ impl novarocks_failure_contract::FailureProjection for CountOutputLayout {
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for CountOutputLayout {}
-/// Validate real original Vec<Option<i32>>, final values and bitmap geometry.
+/// Validate the actual temporary Vec, final values and bitmap geometry.
 /// This observes format addressability; it does not reserve any memory budget.
 pub(super) fn output_capacity(rows: usize) -> Result<(), crate::KernelFailure> {
     fn array<T>(rows: usize) -> Result<(), crate::KernelFailure> {
@@ -126,9 +126,9 @@ pub(super) fn output_capacity(rows: usize) -> Result<(), crate::KernelFailure> {
         })?;
         Ok(())
     }
-    array::<Option<i32>>(rows)?;
-    array::<i32>(rows)?;
-    // The checked Option<i32> extent proves this ceil operation fits usize.
+    array::<Option<i64>>(rows)?;
+    array::<i64>(rows)?;
+    // The checked output extent proves this ceil operation fits usize.
     array::<u8>((rows / 64 + usize::from(!rows.is_multiple_of(64))) * 8)
 }
 

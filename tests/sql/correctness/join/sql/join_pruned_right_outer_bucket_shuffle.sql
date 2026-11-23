@@ -35,7 +35,7 @@ CREATE TABLE ${case_db}.t1 (
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 SELECT generate_series, generate_series FROM TABLE(generate_series(0, 10000 - 1));
+INSERT INTO ${case_db}.t1 SELECT generate_series, generate_series FROM TABLE(sequence(0, 10000 - 1)) AS generate_series(generate_series);
 
 -- query 3
 WITH

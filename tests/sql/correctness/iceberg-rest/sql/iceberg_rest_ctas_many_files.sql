@@ -27,7 +27,7 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.ctas_files_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}.dst_${uuid0} WITH (partitioning = ARRAY['part']) AS SELECT CAST(generate_series AS INT) AS part,
           CAST(generate_series * 2 AS INT) AS value
-   FROM TABLE(generate_series(1, 240));
+   FROM TABLE(sequence(1, 240)) AS generate_series(generate_series);
 
 -- query 3
 SELECT COUNT(*) AS row_count, SUM(part) AS part_sum, SUM(value) AS value_sum

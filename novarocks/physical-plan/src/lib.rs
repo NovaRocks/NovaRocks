@@ -116,7 +116,8 @@ pub fn grouped_state_topn_key_supported(
 /// Revision 37 adds an optional per-call aggregate FILTER root.
 /// Revision 38 adds exact temporal declarations, statement-time facts, and
 /// capability-dependent temporal result schemas.
-pub const PLAN_CONTRACT_REVISION: u32 = 38;
+/// Revision 39 admits composite predicate LeftMark over the full right relation.
+pub const PLAN_CONTRACT_REVISION: u32 = 39;
 
 #[cfg(test)]
 mod tests;

@@ -22,7 +22,7 @@ use super::*;
 use crate::planner::distributed::build::lowered_draft::SqlOperationalChannelRole;
 use arrow::datatypes::Field;
 
-fn array_map_source<'source>(
+fn lambda_fixture_source<'source>(
     view: &OriginalEmissionView<'source>,
 ) -> (
     FragmentId,
@@ -37,13 +37,13 @@ fn array_map_source<'source>(
             if let Some(source) = unit.definitions().find(|source| {
                 matches!(&source.kind,
                 ContractExprKind::FunctionCall { function, .. }
-                    if function.function_id.as_str() == "builtin.scalar/array_map/v1")
+                    if function.function_id.as_str() == LAMBDA_FIXTURE_ID)
             }) {
                 return (fragment, actual, source);
             }
         }
     }
-    panic!("actual original ARRAY_MAP source with a Lambda argument")
+    panic!("actual lambda fixture source with a Lambda argument")
 }
 struct Observe<F> {
     calls: usize,
@@ -80,7 +80,7 @@ fn observe_original_lambda(
         version(),
         dop(),
         None,
-        crate::functions::builtin_sql_function_catalog().snapshot(),
+        lambda_fixture_catalog(),
         false,
         policy(),
         &control,
@@ -89,7 +89,7 @@ fn observe_original_lambda(
     assert_eq!(observer.calls, 1);
     assert!(matches!(result, Err(ContractLoweringError::FunctionBinding(
         novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
-    )) if overload.as_str() == "builtin.scalar/array_map/dynamic-v1"));
+    )) if overload.as_str() == LAMBDA_FIXTURE_OVERLOAD));
 }
 fn original_operational_arguments(
     view: &OriginalEmissionView<'_>,
@@ -227,11 +227,10 @@ fn assert_lambda_projection(
 }
 
 #[test]
-fn operational_lambda_analyzed_source_loans_original_parameters_and_actual_body_scope() {
-    // Inspect the actual analyzer/emitter before mandatory capability admission.
-    // ARRAY_MAP remains unsupported after the successful callback.
-    observe_original_lambda(analyzed_lambda_expression_for_test(), |view, work| {
-        let (fragment, unit_node, source) = array_map_source(&view);
+fn operational_lambda_source_loans_original_parameters_and_actual_body_scope() {
+    // Inspect the actual emitter before the metadata-only fixture is refused.
+    observe_original_lambda(lower_lambda_fixture(), |view, work| {
+        let (fragment, unit_node, source) = lambda_fixture_source(&view);
         let receipt = view
             .checked_scalar_source(fragment, unit_node.id, source.id, work)
             .unwrap();
@@ -290,9 +289,8 @@ fn operational_lambda_analyzed_source_loans_original_parameters_and_actual_body_
 }
 
 fn nested_identity_lambda_expression() -> (TypedExpr, ValueType) {
-    // Honest already-typed emitter fixture, resolved by the actual ARRAY_MAP
-    // catalog. No declaration is added and no nested runtime capability is
-    // inferred from this generic source signature projection.
+    // The typed emitter fixture retains metadata on the original nested
+    // parameter without installing a higher-order implementation.
     let field = Arc::new(
         Field::new("provider_leaf", DataType::Utf8, false).with_metadata(
             std::collections::HashMap::<String, String>::from([(
@@ -330,39 +328,15 @@ fn nested_identity_lambda_expression() -> (TypedExpr, ValueType) {
         kind: ExprKind::Literal(LiteralValue::Null),
         value_type: array_type,
     };
-    let expressions = vec![lambda, array];
-    let arguments = expressions
-        .iter()
-        .map(|expression| {
-            crate::analysis::function_argument(expression, policy(), &Control::default()).unwrap()
-        })
-        .collect::<Vec<_>>();
-    let resolved = crate::functions::builtin_sql_function_catalog()
-        .resolve_scalar_binding("array_map", &arguments, &Control::default())
-        .unwrap();
-    let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
-        panic!("scalar ARRAY_MAP")
-    };
-    let value_type = result.clone();
-    let volatility = resolved.semantics.volatility;
-    let expression = TypedExpr {
-        kind: ExprKind::FunctionCall {
-            name: "array_map".into(),
-            args: (expressions).into(),
-            distinct: false,
-            binding: SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError),
-            volatility,
-        },
-        value_type,
-    };
+    let expression = bound_lambda_fixture(lambda, array, DecimalOverflowPolicy::ReportError);
     (expression, parameter_type)
 }
 
 #[test]
-fn operational_lambda_actual_catalog_typed_emitter_preserves_nested_parameter_metadata() {
+fn operational_lambda_typed_emitter_preserves_nested_parameter_metadata() {
     let (expression, expected) = nested_identity_lambda_expression();
     observe_original_lambda(expression, |view, work| {
-        let (fragment, unit_node, source) = array_map_source(&view);
+        let (fragment, unit_node, source) = lambda_fixture_source(&view);
         let receipt = view
             .checked_scalar_source(fragment, unit_node.id, source.id, work)
             .unwrap();
@@ -398,8 +372,8 @@ fn operational_lambda_actual_catalog_typed_emitter_preserves_nested_parameter_me
 
 #[test]
 fn operational_lambda_projector_preserves_every_actual_small_control_prefix() {
-    observe_original_lambda(analyzed_lambda_expression_for_test(), |view, work| {
-        let (fragment, unit_node, source) = array_map_source(&view);
+    observe_original_lambda(lower_lambda_fixture(), |view, work| {
+        let (fragment, unit_node, source) = lambda_fixture_source(&view);
         let receipt = view
             .checked_scalar_source(fragment, unit_node.id, source.id, work)
             .unwrap();

@@ -35,6 +35,7 @@ use novarocks_sql::compiler::{
     CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact, MaterializedViewNeed,
     ProviderReadFact, ProviderReadNeed, SqlCompileError, SqlFactBatch, SqlNeedBatch,
     StatisticsFact, StatisticsNeed, SystemTableSnapshotFact, SystemTableSnapshotNeed,
+    TableSequenceArgumentFact, TableSequenceArgumentNeed,
 };
 
 use super::{final_plan::SqlCompletionFactSource, runtime_access::ReadAccessSink};
@@ -99,6 +100,15 @@ pub trait SystemTableSnapshotFactPort: Send + Sync {
     ) -> Result<Vec<SystemTableSnapshotFact>, SqlCompileError>;
 }
 
+/// Evaluates row-free table arguments in the statement's original CPU scope.
+#[async_trait]
+pub trait TableSequenceArgumentFactPort: Send + Sync {
+    async fn resolve_table_sequence(
+        &self,
+        needs: &[TableSequenceArgumentNeed],
+    ) -> Result<Vec<TableSequenceArgumentFact>, SqlCompileError>;
+}
+
 /// The one place that knows which owner answers which kind of question.
 pub struct QueryCompletionFactSource<A> {
     catalog: Arc<dyn CatalogFactPort>,
@@ -106,6 +116,7 @@ pub struct QueryCompletionFactSource<A> {
     materialized_views: Arc<dyn MaterializedViewFactPort>,
     provider_reads: Arc<dyn ProviderReadFactPort<Access = A>>,
     system_tables: Arc<dyn SystemTableSnapshotFactPort>,
+    table_sequence: Option<Arc<dyn TableSequenceArgumentFactPort>>,
 }
 
 impl<A> QueryCompletionFactSource<A> {
@@ -122,7 +133,13 @@ impl<A> QueryCompletionFactSource<A> {
             materialized_views,
             provider_reads,
             system_tables,
+            table_sequence: None,
         }
+    }
+
+    pub fn with_table_sequence(mut self, owner: Arc<dyn TableSequenceArgumentFactPort>) -> Self {
+        self.table_sequence = Some(owner);
+        self
     }
 }
 
@@ -152,6 +169,16 @@ impl<A: Send + Sync> SqlCompletionFactSource for QueryCompletionFactSource<A> {
         taken: &ReadAccessSink<A>,
     ) -> Result<SqlFactBatch, SqlCompileError> {
         match needs {
+            SqlNeedBatch::TableSequenceArguments(needs) => {
+                let owner = self.table_sequence.as_ref().ok_or_else(|| {
+                    SqlCompileError::InvalidRequest("Missing table sequence argument owner".into())
+                })?;
+                let facts = owner.resolve_table_sequence(needs).await?;
+                let facts = expect_one_answer_each("table sequence argument", needs.len(), facts)?;
+                Ok(SqlFactBatch::TableSequenceArguments(
+                    facts.into_boxed_slice(),
+                ))
+            }
             SqlNeedBatch::CatalogRelations(needs) => self
                 .catalog
                 .resolve_relations(needs)

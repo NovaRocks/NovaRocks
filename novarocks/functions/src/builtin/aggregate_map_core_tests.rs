@@ -443,3 +443,68 @@ fn map_agg_actual_wrong_carrier_is_an_outer_contract_without_input_ownership() {
     drop(input);
     assert!(weak.upgrade().is_none());
 }
+
+#[test]
+fn map_agg_core_uses_map_identity_in_update_and_partial_merge() {
+    use arrow_array::Float64Array;
+
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let input = |keys, values| MapUpdateInput {
+        keys: Arc::new(Float64Array::from(keys)),
+        values: Arc::new(StringArray::from(values)),
+    };
+    let mut first = MapAggState::new(allocator.clone());
+    update(
+        &mut first,
+        &input(
+            vec![-0.0, f64::NAN, 0.0, -f64::NAN],
+            vec!["first zero", "first NaN", "duplicate zero", "duplicate NaN"],
+        ),
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(first.entries.len(), 2);
+
+    let mut second = MapAggState::new(allocator.clone());
+    update(
+        &mut second,
+        &input(
+            vec![0.0, -f64::NAN, 2.0],
+            vec!["later zero", "later NaN", "two"],
+        ),
+        &Control::default(),
+    )
+    .unwrap();
+    let target = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Float64, false),
+                    Field::new("value", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let partial = build_array(&target, [&second].into_iter(), &mut ScalarWork::new(None)).unwrap();
+    let input = merge_input(&partial).unwrap();
+    merge_row(&mut first, &input, 0, &mut ScalarWork::new(None)).unwrap();
+    let result = build_array(&target, [&first].into_iter(), &mut ScalarWork::new(None)).unwrap();
+    let map = result.as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(map.value_offsets(), &[0, 3]);
+    let keys = map.keys().as_any().downcast_ref::<Float64Array>().unwrap();
+    assert_eq!(keys.value(0).to_bits(), (-0.0_f64).to_bits());
+    assert!(keys.value(1).is_nan());
+    assert_eq!(keys.value(2), 2.0);
+    let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [Some("first zero"), Some("first NaN"), Some("two")],
+    );
+    drop((first, second, allocator));
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}

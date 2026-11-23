@@ -24,6 +24,8 @@ mod signed_cast_nullability;
 mod write_layout;
 
 mod partition_topn;
+#[cfg(debug_assertions)]
+mod table_sequence;
 
 mod bitnot;
 mod constant_entry_parity;

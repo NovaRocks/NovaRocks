@@ -1121,13 +1121,14 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
             .continue_catalog(facts.into_boxed_slice())
             .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     }
-    let analyzed = preparation
-        .analyze(
-            &[],
+    let analyzed = provider_source
+        .analyze_dml_source(
+            preparation,
             DmlQueryExecutionKernel::function_catalog(state),
             Arc::clone(DmlQueryExecutionKernel::sealed_functions(state)),
             DmlQueryExecutionKernel::constant_policy(state),
         )
+        .await
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
         state, Arc::clone(&table_bindings), connector_context,

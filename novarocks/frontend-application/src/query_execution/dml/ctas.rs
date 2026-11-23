@@ -1114,13 +1114,14 @@ async fn plan_query_for_ctas_source_async(
             .continue_catalog(facts.into_boxed_slice())
             .map_err(CtasFailure::from_compile)?;
     }
-    let analyzed = preparation
-        .analyze(
-            &[],
+    let analyzed = provider_source
+        .analyze_dml_source(
+            preparation,
             state.function_catalog().as_ref(),
             Arc::clone(state.sealed_functions()),
             state.constant_policy(),
         )
+        .await
         .map_err(CtasFailure::from_compile)?;
     let statistics =
         crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(

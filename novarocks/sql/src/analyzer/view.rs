@@ -78,6 +78,7 @@ impl AnalyzerContext<'_> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: None,
+            table_sequence: self.table_sequence,
             catalog: &catalog,
             current_database: &view.default_database,
             function_catalog: self.function_catalog,
@@ -87,7 +88,6 @@ impl AnalyzerContext<'_> {
             ctes: Default::default(),
             pending_ctes: Default::default(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-            next_lambda_slot_id: std::cell::Cell::new(self.next_lambda_slot_id.get()),
             collected_subqueries: Default::default(),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };

@@ -193,6 +193,7 @@ mod tests {
             control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            table_sequence: None,
             catalog: &NO_TABLES,
             current_database: "default",
             function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -203,7 +204,6 @@ mod tests {
             ctes: Default::default(),
             pending_ctes: Default::default(),
             next_subquery_id: Default::default(),
-            next_lambda_slot_id: Default::default(),
             collected_subqueries: Default::default(),
             cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
         }

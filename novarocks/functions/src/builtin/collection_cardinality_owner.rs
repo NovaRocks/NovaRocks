@@ -299,12 +299,12 @@ fn canonical_arguments(
     }
     let result = matches!(
         &input.selected.result_type,
-        FunctionResultType::Scalar(value) if value.data_type() == &DataType::Int32 && value.nullable() && value.logical_type() == ValueLogicalType::Physical
+        FunctionResultType::Scalar(value) if value.data_type() == &DataType::Int64 && value.nullable() && value.logical_type() == ValueLogicalType::Physical
     );
     work.step().map_err(compile_failure)?;
     if !result {
         return Err(invalid(
-            "collection_cardinality preparation requires its exact nullable Physical Int32 result",
+            "collection_cardinality preparation requires its exact nullable Physical Int64 result",
         ));
     }
     Ok(())

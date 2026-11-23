@@ -227,7 +227,7 @@ fn first_original_reader_failure_sends_exact_peer_deletes_before_remaining_actua
             &root.path().join(format!("client-{client}")),
         )?;
         let query = format!(
-            "SELECT CONCAT('client-{client}:', CAST(generate_series AS VARCHAR), ':', REPEAT('x', 512)) AS payload FROM TABLE(generate_series(1, 4096)) ORDER BY generate_series"
+            "SELECT CONCAT('client-{client}:', CAST(sequential_number AS VARCHAR), ':', rpad('', 512, 'x')) AS payload FROM TABLE(sequence(1, 4096)) ORDER BY sequential_number"
         );
         let post = actor.submit(&query)?;
         let id = post.json()?["id"]

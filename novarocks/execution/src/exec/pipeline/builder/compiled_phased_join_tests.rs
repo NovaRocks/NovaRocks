@@ -284,6 +284,74 @@ fn empty_build_probe(
     f.begin_exit().unwrap();
     (q, declaration, runtime, construction)
 }
+
+#[test]
+fn nested_loop_mark_cancel_releases_an_open_probe_and_its_build_pages() {
+    let right_rows = vec![(None, Some(20)); 600];
+    let mut packages = packages(&single_plan(
+        Spec::nested(JoinKind::LeftMark, true),
+        &LEFT_ROWS[..1],
+        &right_rows,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+    let declaration = declaration(
+        &program,
+        JoinParticipants {
+            inputs: 1,
+            finalizers: NonZeroUsize::MIN,
+            probes: 1,
+            tails: 0,
+        },
+    );
+    let runtime = RuntimeState::default();
+    let error = runtime.error_state();
+    let tracker = MemTracker::new_root("left mark cancelled probe");
+    let construction = super::super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        error.clone(),
+    );
+    let mut build =
+        CompiledJoinInputSinkFactory::new(declaration.clone(), error.clone(), None).create(1, 0);
+    let mut finalize_build =
+        CompiledJoinFinalizeSourceFactory::new(declaration.clone(), error.clone()).create(1, 0);
+    let mut probe =
+        CompiledJoinProbeProcessorFactory::new(declaration.clone(), error.clone()).create(1, 0);
+    for operator in [&mut build, &mut finalize_build, &mut probe] {
+        bind(operator.as_mut(), &runtime, &tracker, &construction);
+    }
+    let mut build_driver = TestDriver::new(build.as_mut(), &runtime);
+    build_driver
+        .input_without_output(input(&program, &construction, false, &right_rows))
+        .unwrap();
+    build_driver.signal_eos().unwrap();
+    assert!(matches!(
+        build_driver.advance_to_boundary().unwrap().next,
+        NextStep::Finished
+    ));
+    finalize(std::slice::from_mut(&mut finalize_build), &runtime);
+    let mut turn = TurnWork::new(NonZeroU64::MIN, 64);
+    let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut step = DriverStep::new(&error, &mut turn, &mut conversions);
+    let InputResult::Accepted(admission) = probe.try_push(
+        &mut step,
+        RawInput::new(input(&program, &construction, true, &LEFT_ROWS[..1]), None),
+    ) else {
+        panic!("expected an accepted probe while build pages are held");
+    };
+    assert!(admission.unwrap().output.is_none());
+    assert!(probe.drive(&mut step).unwrap().output.is_none());
+    assert!(tracker.current() > 0);
+    probe.cancel();
+    for mut operator in [probe, build, finalize_build] {
+        operator.begin_exit().unwrap();
+        operator.close().unwrap();
+    }
+    drop(construction);
+    drop(declaration);
+    assert!(runtime.error().is_none());
+    assert_eq!(tracker.current(), 0);
+}
+
 #[test]
 fn b3_b0_control_finishes_without_unadmitted_probe_input_or_upstream_eos() {
     let mut packages = packages(&single_plan(

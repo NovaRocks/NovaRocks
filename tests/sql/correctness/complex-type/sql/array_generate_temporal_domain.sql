@@ -15,7 +15,7 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Test Objective: freeze ARRAY_GENERATE temporal domains before executing real columns.
+-- Test Objective: exercise Trino scalar sequence on typed date and timestamp endpoints.
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
@@ -27,82 +27,49 @@ ROW(3,NULL,NULL,NULL);
 
 -- query 2
 USE ${case_db};
-SELECT id, array_generate(d,t,1, 'day') AS forward,
-       array_generate(t,d,1, 'day') AS reverse,
-       array_generate(d,v,1, 'day') AS anchored_text
-FROM temporal_range ORDER BY id;
+SELECT id, sequence(CAST(d AS TIMESTAMP(6)), t, INTERVAL '1' DAY) AS forward, sequence(t, CAST(d AS TIMESTAMP(6)), INTERVAL '-1' DAY) AS reverse, sequence(d, TRY_CAST(v AS DATE), INTERVAL '1' DAY) AS anchored_text FROM temporal_range ORDER BY id;
 
 -- query 3
-USE ${case_db};
-SELECT array_generate('2025-10-01','2025-10-03',1, 'day') AS dates,
-       array_generate('2025-01-31','2025-04-30',1, 'month') AS month_end,
-       array_generate('2025-10-03','2025-10-01',1, 'day') AS descending;
+SELECT sequence(DATE '2025-10-01',DATE '2025-10-03') AS dates, sequence(DATE '2025-01-31',DATE '2025-04-30', INTERVAL '1' MONTH) AS month_end, sequence(DATE '2025-10-03',DATE '2025-10-01') AS descending;
 
 -- query 4
-USE ${case_db};
-SELECT array_generate('2025-10-01 14:28:31','2025-10-01 14:28:32.800000',500000, 'microsecond') AS forward,
-       array_generate('2025-10-01 14:28:32.800000','2025-10-01 14:28:31',500000, 'microsecond') AS reverse;
+SELECT sequence(CAST(TIMESTAMP '2025-10-01 14:28:31' AS TIMESTAMP(6)),CAST(TIMESTAMP '2025-10-01 14:28:32.800' AS TIMESTAMP(6)), INTERVAL '0.5' SECOND) AS forward, sequence(CAST(TIMESTAMP '2025-10-01 14:28:32.800' AS TIMESTAMP(6)),CAST(TIMESTAMP '2025-10-01 14:28:31' AS TIMESTAMP(6)), INTERVAL '-0.5' SECOND) AS reverse;
 
 -- query 5
-USE ${case_db};
-SELECT array_generate(DATE '2025-10-01',DATE '2025-10-02',12, 'hour') AS subday,
-       array_generate(DATE '2025-10-01',TIMESTAMP '2025-10-02 01:00:00',12, 'hour') AS mixed;
+SELECT sequence(CAST(TIMESTAMP '2025-10-01 00:00:00' AS TIMESTAMP(6)),CAST(TIMESTAMP '2025-10-02 00:00:00' AS TIMESTAMP(6)), INTERVAL '12' HOUR) AS subday, sequence(CAST(DATE '2025-10-01' AS TIMESTAMP(6)),CAST(TIMESTAMP '2025-10-02 01:00:00' AS TIMESTAMP(6)), INTERVAL '12' HOUR) AS mixed;
 
 -- query 6
-USE ${case_db};
-SELECT array_generate('2025-10-01','2025-10-02',0, 'day') AS empty_range,
-       array_generate('2025-10-01',10000,0, 'day') AS invalid_bound,
-       array_generate('2025-10-01','abc',1) AS invalid_text,
-       array_generate(NULL,DATE '2025-10-01',1) AS null_bound,
-       array_generate(1,1,NULL) AS numeric_null_step;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT sequence('2025-10-01','2025-10-02');
 
 -- query 7
--- @expect_error=cannot freeze unanchored temporal or NULL bounds
-USE ${case_db};
-SELECT array_generate(v,v,1) FROM temporal_range;
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT sequence(DATE '2025-10-01',DATE '2025-10-02', INTERVAL '0' DAY);
 
 -- query 8
--- @expect_error=cannot freeze unanchored temporal or NULL bounds
-USE ${case_db};
-SELECT array_generate(NULL,NULL,1, 'day');
+SELECT sequence(CAST(NULL AS DATE),DATE '2025-10-01',INTERVAL '1' DAY) AS null_bound, sequence(1,1,NULL) AS numeric_null_step;
 
 -- query 9
--- @expect_error=step parameter must be a constant integer
-USE ${case_db};
-SELECT array_generate(d,t,id, 'day') FROM temporal_range;
+WITH temporal(id,d) AS (VALUES (2,DATE '2025-10-01')) SELECT sequence(d,d + INTERVAL '3' DAY,id * INTERVAL '1' DAY) AS value FROM temporal;
 
 -- query 10
--- @expect_error=step parameter must be a constant integer
-USE ${case_db};
-SELECT array_generate(DATE '2025-10-01',DATE '2025-10-02',NULL);
+SELECT sequence(DATE '2025-10-01',DATE '2025-10-02',CAST(NULL AS INTERVAL DAY TO SECOND)) AS value;
 
 -- query 11
--- @expect_error=step parameter must be non-negative
-USE ${case_db};
-SELECT array_generate('2025-10-01','2025-10-02',-1, 'day');
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT sequence(DATE '2025-10-01',DATE '2025-10-02',INTERVAL '-1' DAY);
 
 -- query 12
--- @expect_error=cannot freeze unanchored temporal or NULL bounds
-USE ${case_db};
-SELECT array_generate('2025-02-30','2025-99-99',1);
+-- @expect_trino_error=INVALID_LITERAL,USER_ERROR
+SELECT sequence(DATE '2025-02-30',DATE '2025-10-02');
 
 -- query 13
-USE ${case_db};
-SELECT array_generate(3,1) AS default_desc,
-       array_generate(1,5,2) AS numeric_step,
-       array_generate(1,NULL,1) AS numeric_null;
+SELECT sequence(3,1) AS default_desc, sequence(1,5,2) AS numeric_step, sequence(1,NULL,1) AS numeric_null;
 
 -- query 14
+SELECT sequence(DATE '2025-10-01',DATE '2025-10-02',INTERVAL '2147483647' MONTH) AS value;
+
+-- query 15
 -- @skip_result_check=true
 USE ${case_db};
 DROP TABLE temporal_range;
-
--- query 15
--- @expect_error=temporal step is out of range
-USE ${case_db};
-SELECT array_generate(DATE '2025-10-01', DATE '2025-10-02', 9223372036854775807, 'day');
-
--- query 16
--- @expect_error=temporal step is out of range
-USE ${case_db};
-SELECT array_generate(DATE '2025-10-01', DATE '2025-10-02', 2147483647, 'month');

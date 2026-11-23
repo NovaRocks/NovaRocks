@@ -34,7 +34,7 @@ SET SESSION iceberg_dml_cat_${suite_uuid0}.max_partitions_per_writer = 1;
 -- query 4
 -- @expect_trino_error=ICEBERG_TOO_MANY_OPEN_PARTITIONS,USER_ERROR
 INSERT INTO ${case_db}.rwm13_open_limit
-SELECT generate_series FROM TABLE(generate_series(1, 17));
+SELECT generate_series FROM TABLE(sequence(1, 17)) AS generate_series(generate_series);
 
 -- query 5
 SELECT count(*) AS n FROM ${case_db}.rwm13_open_limit;

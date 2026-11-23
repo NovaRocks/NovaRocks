@@ -22,11 +22,11 @@ SET SESSION cbo_broadcast_backend_count = 1;
 EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH sp AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 1000000))
+    FROM TABLE(sequence(1, 1000000)) AS generate_series(generate_series)
 ),
 sb AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 10000))
+    FROM TABLE(sequence(1, 10000)) AS generate_series(generate_series)
 )
 SELECT COUNT() AS cnt
 FROM sp p JOIN sb b ON p.k = b.k;

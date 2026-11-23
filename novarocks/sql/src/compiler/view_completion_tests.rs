@@ -375,6 +375,7 @@ fn definition_capture_freezes_exact_context_and_recognizes_replacement_before_ol
     assert!(source.needs().is_empty());
     let result = source.analyze_view_definition(
         crate::functions::builtin_sql_function_catalog(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         crate::constant::test_constant_policy(),
     );
     assert!(matches!(result, Err(SqlCompileError::Analyze(error))

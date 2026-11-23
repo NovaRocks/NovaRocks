@@ -72,7 +72,7 @@ create table t1 (
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 SELECT generate_series, 4096 - generate_series FROM TABLE(generate_series(1,  4096)) union all select null,null;
+insert into t1 SELECT generate_series, 4096 - generate_series FROM TABLE(sequence(1,  4096)) AS generate_series(generate_series) union all select null,null;
 
 -- query 12
 USE ${case_db};

@@ -179,6 +179,8 @@ pub enum NodeShape<'a> {
         name: &'a str,
         expected_result: Option<&'a FunctionValueType>,
     },
+    Row,
+    MapSubscript,
     Operator(OperatorFunction),
     Coalesce,
     UnaryPlus,
@@ -236,6 +238,7 @@ pub struct ValueDomainConversion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueConversionOrigin {
     ValueDomain,
+    ArrayCommonCoercion,
     OperatorDecimalFloat,
 }
 
@@ -428,6 +431,50 @@ pub fn type_node(
                 })?;
             type_catalog_call(context, "coalesce", None, children, work)?
         }
+        NodeShape::Row => {
+            let function = FunctionId::try_new("builtin.scalar/row/v1")
+                .expect("valid ROW constructor function identity");
+            let overload = FunctionOverloadId::try_new("builtin.scalar/row/dynamic-v1")
+                .expect("valid ROW constructor overload identity");
+            let arguments = arguments(children, work)?;
+            work.flush()?;
+            let binding = context.catalog.select_exact_scalar(
+                &function,
+                &overload,
+                request(&arguments, None),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, None, children, work)?
+        }
+        NodeShape::MapSubscript => {
+            let arguments = arguments(children, work)?;
+            let function = FunctionId::try_new("builtin.scalar/__map_subscript/v1")
+                .expect("valid MAP subscript function identity");
+            let Some(child) = children.first() else {
+                return Err(TypingError::InvalidShape(
+                    "MAP subscript needs its collection",
+                ));
+            };
+            // This candidate is selected by the actual uninhabited-key domain,
+            // not by the syntax or a reconstructed probe carrier.
+            let overload = if novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
+                &child.value_type,
+            ) {
+                "builtin.scalar/__map_subscript/(map-with-uninhabited-key<M,V>,any)->any<V>;strict;legacy"
+            } else {
+                "builtin.scalar/__map_subscript/(map<any<K>,any<V>>,any<K>)->any<V>;strict;legacy"
+            };
+            let overload = FunctionOverloadId::try_new(overload)
+                .expect("valid MAP subscript overload identity");
+            work.flush()?;
+            let binding = context.catalog.select_exact_scalar(
+                &function,
+                &overload,
+                request(&arguments, None),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, None, children, work)?
+        }
         NodeShape::Operator(operator) => {
             let unary = matches!(
                 operator,
@@ -613,6 +660,9 @@ fn type_selected_call(
     check_shape(&binding, children.len())?;
     let arithmetic = OperatorFunction::from_function_id(&binding.function_id)
         .is_some_and(|operator| operator.arithmetic().is_some());
+    let array_concat = binding.function_id.as_str() == "builtin.scalar/concat/v1"
+        && matches!(&binding.selected.result_type, FunctionResultType::Scalar(result)
+            if matches!(result.data_type(), DataType::List(_)));
     let conversions = binding
         .selected
         .argument_types
@@ -624,6 +674,9 @@ fn type_selected_call(
                     "selected scalar expects a lambda argument",
                 ));
             };
+            if array_concat && matches!(target.data_type(), DataType::List(_)) {
+                return conversion::array_common(context, child, target, work);
+            }
             if arithmetic
                 && matches!(child.value_type.data_type(), DataType::Decimal128(..))
                 && matches!(target.data_type(), DataType::Float32 | DataType::Float64)

@@ -80,6 +80,21 @@ const INVALID_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const MISSING_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.missing_argument"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const INVALID_FUNCTION_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.invalid_function_argument"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const EXPRESSION_NOT_CONSTANT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.expression_not_constant"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INVALID_TYPE_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.invalid_type_argument"),
     phase: ErrorPhase::Analyze,
@@ -165,6 +180,9 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     EXPRESSION_NOT_SCALAR,
     INVALID_LITERAL,
     INVALID_ARGUMENT,
+    MISSING_ARGUMENT,
+    INVALID_FUNCTION_ARGUMENT,
+    EXPRESSION_NOT_CONSTANT,
     INVALID_TYPE_ARGUMENT,
     INVALID_ANALYZE_PROPERTY,
     TOO_MANY_ARGUMENTS,
@@ -195,6 +213,9 @@ pub enum AnalyzeErrorKind {
     ExpressionNotScalar,
     InvalidLiteral,
     InvalidArgument,
+    MissingArgument,
+    InvalidFunctionArgument,
+    ExpressionNotConstant,
     InvalidTypeArgument,
     InvalidAnalyzeProperty,
     TooManyArguments,
@@ -227,6 +248,9 @@ impl AnalyzeErrorKind {
             Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
+            Self::MissingArgument => MISSING_ARGUMENT,
+            Self::InvalidFunctionArgument => INVALID_FUNCTION_ARGUMENT,
+            Self::ExpressionNotConstant => EXPRESSION_NOT_CONSTANT,
             Self::InvalidTypeArgument => INVALID_TYPE_ARGUMENT,
             Self::InvalidAnalyzeProperty => INVALID_ANALYZE_PROPERTY,
             Self::TooManyArguments => TOO_MANY_ARGUMENTS,
@@ -621,6 +645,18 @@ impl AnalyzeError {
         Self::at(AnalyzeErrorKind::InvalidArgument, message, span)
     }
 
+    pub(crate) fn missing_argument(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::MissingArgument, message, span)
+    }
+
+    pub(crate) fn invalid_function_argument(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::InvalidFunctionArgument, message, span)
+    }
+
+    pub(crate) fn expression_not_constant(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::ExpressionNotConstant, message, span)
+    }
+
     pub fn invalid_query_shape(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::InvalidQueryShape, message, span)
     }
@@ -932,6 +968,9 @@ mod tests {
                 "sql.analyze.expression_not_scalar",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.invalid_argument",
+                "sql.analyze.missing_argument",
+                "sql.analyze.invalid_function_argument",
+                "sql.analyze.expression_not_constant",
                 "sql.analyze.invalid_type_argument",
                 "sql.analyze.invalid_analyze_property",
                 "sql.analyze.too_many_arguments",

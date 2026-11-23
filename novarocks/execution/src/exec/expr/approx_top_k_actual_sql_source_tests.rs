@@ -29,7 +29,16 @@ fn source(full: bool) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
         Field::new("w", DataType::Int64, true),
     ];
     let sql = if full {
-        "WITH w1 AS (SELECT approx_top_k(v,3) AS x FROM fixture) SELECT array_sortby((x)->x.item,x) AS top_items FROM w1"
+        "WITH w1 AS (
+            SELECT approx_top_k(v, 3) AS x FROM fixture
+         ), entries AS (
+            SELECT ordinal, x[ordinal] AS entry,
+                   __array_struct_subfield(x, 'item')[ordinal] AS item
+            FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+            WHERE ordinal <= cardinality(x)
+         )
+         SELECT array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS top_items
+         FROM entries"
     } else {
         "SELECT approx_top_k(v) AS a,approx_top_k(v,3) AS b,approx_top_k(v,3,100) AS c FROM fixture"
     };

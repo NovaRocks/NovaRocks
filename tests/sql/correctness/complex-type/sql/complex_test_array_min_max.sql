@@ -109,7 +109,7 @@ WHERE array_boolean IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_boolean) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_boolean) > 3 ORDER BY id;
+WHERE cardinality(array_boolean) > 3 ORDER BY id;
 
 -- query 7
 USE ${case_db};
@@ -126,7 +126,7 @@ WHERE array_tinyint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_tinyint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_tinyint) > 3 ORDER BY id;
+WHERE cardinality(array_tinyint) > 3 ORDER BY id;
 
 -- query 10
 USE ${case_db};
@@ -143,7 +143,7 @@ WHERE array_smallint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_smallint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_smallint) > 3 ORDER BY id;
+WHERE cardinality(array_smallint) > 3 ORDER BY id;
 
 -- query 13
 USE ${case_db};
@@ -160,7 +160,7 @@ WHERE array_int IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_int) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_int) > 3 ORDER BY id;
+WHERE cardinality(array_int) > 3 ORDER BY id;
 
 -- query 16
 USE ${case_db};
@@ -177,7 +177,7 @@ WHERE array_bigint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_bigint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_bigint) > 3 ORDER BY id;
+WHERE cardinality(array_bigint) > 3 ORDER BY id;
 
 -- query 19
 USE ${case_db};
@@ -194,7 +194,7 @@ WHERE array_largeint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_largeint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_largeint) > 3 ORDER BY id;
+WHERE cardinality(array_largeint) > 3 ORDER BY id;
 
 -- query 22
 USE ${case_db};
@@ -211,7 +211,7 @@ WHERE array_float IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_float) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_float) > 3 ORDER BY id;
+WHERE cardinality(array_float) > 3 ORDER BY id;
 
 -- query 25
 USE ${case_db};
@@ -228,7 +228,7 @@ WHERE array_decimal32 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_decimal32) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimal32) > 3 ORDER BY id;
+WHERE cardinality(array_decimal32) > 3 ORDER BY id;
 
 -- query 28
 USE ${case_db};
@@ -245,7 +245,7 @@ WHERE array_decimal64 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_decimal64) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimal64) > 3 ORDER BY id;
+WHERE cardinality(array_decimal64) > 3 ORDER BY id;
 
 -- query 31
 USE ${case_db};
@@ -262,7 +262,7 @@ WHERE array_decimal128 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_decimal128) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimal128) > 3 ORDER BY id;
+WHERE cardinality(array_decimal128) > 3 ORDER BY id;
 
 -- query 34
 USE ${case_db};
@@ -279,7 +279,7 @@ WHERE array_double IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_double) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_double) > 3 ORDER BY id;
+WHERE cardinality(array_double) > 3 ORDER BY id;
 
 -- query 37
 USE ${case_db};
@@ -296,7 +296,7 @@ WHERE array_decimalv2 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_decimalv2) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimalv2) > 3 ORDER BY id;
+WHERE cardinality(array_decimalv2) > 3 ORDER BY id;
 
 -- query 40
 USE ${case_db};
@@ -313,7 +313,7 @@ WHERE array_date IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_date) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_date) > 3 ORDER BY id;
+WHERE cardinality(array_date) > 3 ORDER BY id;
 
 -- query 43
 USE ${case_db};
@@ -330,7 +330,7 @@ WHERE array_datetime IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_datetime) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_datetime) > 3 ORDER BY id;
+WHERE cardinality(array_datetime) > 3 ORDER BY id;
 
 -- query 46
 USE ${case_db};
@@ -347,7 +347,7 @@ WHERE array_varchar IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_min(array_varchar) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_varchar) > 3 ORDER BY id;
+WHERE cardinality(array_varchar) > 3 ORDER BY id;
 
 -- query 49
 USE ${case_db};
@@ -364,7 +364,7 @@ WHERE array_boolean IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_boolean) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_boolean) > 3 ORDER BY id;
+WHERE cardinality(array_boolean) > 3 ORDER BY id;
 
 -- query 52
 USE ${case_db};
@@ -381,7 +381,7 @@ WHERE array_tinyint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_tinyint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_tinyint) > 3 ORDER BY id;
+WHERE cardinality(array_tinyint) > 3 ORDER BY id;
 
 -- query 55
 USE ${case_db};
@@ -398,7 +398,7 @@ WHERE array_smallint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_smallint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_smallint) > 3 ORDER BY id;
+WHERE cardinality(array_smallint) > 3 ORDER BY id;
 
 -- query 58
 USE ${case_db};
@@ -415,7 +415,7 @@ WHERE array_int IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_int) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_int) > 3 ORDER BY id;
+WHERE cardinality(array_int) > 3 ORDER BY id;
 
 -- query 61
 USE ${case_db};
@@ -432,7 +432,7 @@ WHERE array_bigint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_bigint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_bigint) > 3 ORDER BY id;
+WHERE cardinality(array_bigint) > 3 ORDER BY id;
 
 -- query 64
 USE ${case_db};
@@ -449,7 +449,7 @@ WHERE array_largeint IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_largeint) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_largeint) > 3 ORDER BY id;
+WHERE cardinality(array_largeint) > 3 ORDER BY id;
 
 -- query 67
 USE ${case_db};
@@ -466,7 +466,7 @@ WHERE array_float IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_float) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_float) > 3 ORDER BY id;
+WHERE cardinality(array_float) > 3 ORDER BY id;
 
 -- query 70
 USE ${case_db};
@@ -483,7 +483,7 @@ WHERE array_decimal32 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_decimal32) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimal32) > 3 ORDER BY id;
+WHERE cardinality(array_decimal32) > 3 ORDER BY id;
 
 -- query 73
 USE ${case_db};
@@ -500,7 +500,7 @@ WHERE array_decimal64 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_decimal64) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimal64) > 3 ORDER BY id;
+WHERE cardinality(array_decimal64) > 3 ORDER BY id;
 
 -- query 76
 USE ${case_db};
@@ -517,7 +517,7 @@ WHERE array_decimal128 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_decimal128) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimal128) > 3 ORDER BY id;
+WHERE cardinality(array_decimal128) > 3 ORDER BY id;
 
 -- query 79
 USE ${case_db};
@@ -534,7 +534,7 @@ WHERE array_double IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_double) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_double) > 3 ORDER BY id;
+WHERE cardinality(array_double) > 3 ORDER BY id;
 
 -- query 82
 USE ${case_db};
@@ -551,7 +551,7 @@ WHERE array_decimalv2 IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_decimalv2) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_decimalv2) > 3 ORDER BY id;
+WHERE cardinality(array_decimalv2) > 3 ORDER BY id;
 
 -- query 85
 USE ${case_db};
@@ -568,7 +568,7 @@ WHERE array_date IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_date) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_date) > 3 ORDER BY id;
+WHERE cardinality(array_date) > 3 ORDER BY id;
 
 -- query 88
 USE ${case_db};
@@ -585,7 +585,7 @@ WHERE array_datetime IS NOT NULL ORDER BY id;
 USE ${case_db};
 SELECT id, array_max(array_datetime) AS result 
 FROM test_array_min_max 
-WHERE array_length(array_datetime) > 3 ORDER BY id;
+WHERE cardinality(array_datetime) > 3 ORDER BY id;
 
 -- query 91
 USE ${case_db};

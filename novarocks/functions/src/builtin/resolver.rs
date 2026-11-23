@@ -607,6 +607,24 @@ fn value_signature_decision_with_creation<'a, H>(
         work.step()?;
         work.flush()?;
         let spec = signature_spec_at(signature, index);
+        if allow_coercion
+            && index == 1
+            && let (TypeSpec::Any(probe), TypeSpec::Map(key, _)) =
+                (spec, signature_spec_at(signature, 0))
+            && matches!(key.as_ref(), TypeSpec::Any(map_key) if map_key == probe)
+            && let Some(key) = bindings.lookup_value_borrowed(probe)
+        {
+            // A lookup coerces its probe to the existing key type. Widening
+            // the binding would demand a different MAP and change key identity.
+            if !novarocks_type_contract::trino_can_coerce(
+                actual.value_type(),
+                key.value_type(),
+                work,
+            )? {
+                return Ok(None);
+            }
+            continue;
+        }
         let matched = with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
             super::signature::unify_value_with_construction(
                 spec,
@@ -1031,10 +1049,11 @@ mod tests {
                 ],
             ),
             (
-                "array_slice",
+                "slice",
                 vec![
                     FunctionValueType::new(list_of(DataType::Int32), true),
                     FunctionValueType::new(DataType::Int32, false),
+                    FunctionValueType::new(DataType::Int64, true),
                 ],
             ),
             (
@@ -1112,16 +1131,14 @@ mod tests {
             ),
             true,
         );
-        let (_, promoted) = resolve_scalar_value_signature_with_overload(
-            "__map_element_at",
-            &[narrow_map, FunctionValueType::new(DataType::Int64, false)],
-            &Control,
-        )
-        .unwrap();
-        assert_eq!(
-            promoted.argument_types[0].child_at(0).unwrap().data_type(),
-            &DataType::Int64,
-            "both MAP key and probe bind the same covariant target",
+        assert!(
+            resolve_scalar_value_signature_with_overload(
+                "__map_element_at",
+                &[narrow_map, FunctionValueType::new(DataType::Int64, false)],
+                &Control,
+            )
+            .is_err(),
+            "a MAP lookup may coerce only its probe to the original key type",
         );
         let repeated = Signature::new(
             vec![TypeSpec::Any("T"), TypeSpec::Any("T"), TypeSpec::Int64],
@@ -1136,25 +1153,6 @@ mod tests {
                 "ordinary repeated T stays strict in both orders"
             );
         }
-        let list = FunctionValueType::new(list_of(DataType::Int64), false);
-        let item = FunctionValueType::new(DataType::Int32, false);
-        assert!(
-            resolve_scalar_function_signature_with_overload(
-                "array_append",
-                &[list.data_type().clone(), DataType::Int32]
-            )
-            .is_err(),
-            "List<T> does not grant the Map key role"
-        );
-        let (_, resolved) = resolve_scalar_value_signature_with_overload(
-            "array_append",
-            &[list.clone(), item],
-            &Control,
-        )
-        .unwrap();
-        assert_eq!(resolved.argument_types[0], list);
-        assert_eq!(resolved.argument_types[1].data_type(), &DataType::Int64);
-
         assert!(
             resolve_scalar_value_signature_with_overload(
                 "lead",
@@ -1280,20 +1278,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_array_append_propagates_element_type() {
+    fn resolve_array_concat_propagates_element_type() {
         // `array_append(List<T>, T) -> List<T>` — polymorphic.
-        let r =
-            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Int64]);
+        let r = resolve_scalar_function("concat", &[list_of(DataType::Int64), DataType::Int64]);
         assert_eq!(r, Ok(list_of(DataType::Int64)));
-    }
-
-    #[test]
-    fn resolve_array_append_rejects_mismatched_element_type() {
-        // `array_append(List<Int64>, Utf8)` should not match — T is bound
-        // to Int64 by the first arg, second arg violates the binding.
-        let r =
-            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Utf8]);
-        assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
     }
 
     #[test]

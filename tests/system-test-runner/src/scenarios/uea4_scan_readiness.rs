@@ -254,8 +254,8 @@ impl IcebergTable {
         // ORDER BY is what makes this one data file of one row group.
         control
             .execute(format!(
-                "INSERT INTO {qualified} SELECT generate_series FROM \
-                 TABLE(generate_series(1, {rows})) ORDER BY generate_series"
+                "INSERT INTO {qualified} SELECT sequential_number FROM \
+                 TABLE(sequence(1, {rows})) ORDER BY sequential_number"
             ))
             .map(|_| ())
             .with_context(|| format!("write {qualified}"))?;

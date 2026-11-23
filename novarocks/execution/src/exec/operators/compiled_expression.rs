@@ -960,7 +960,7 @@ impl TransformKernel for CompiledProjectProcessor {
                 output,
                 |ordinal| Ok(source_at(ordinal)?.typed_binding()),
                 |ordinal| {
-                    Ok(ProjectEncodingSource::OriginalField(
+                    Ok(ProjectEncodingSource::FinalResultField(
                         source_at(ordinal)?.field(),
                     ))
                 },

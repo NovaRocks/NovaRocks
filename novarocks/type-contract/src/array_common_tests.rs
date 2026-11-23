@@ -351,3 +351,30 @@ fn common_coercion_cannot_borrow_explicit_cast_or_narrowing_profiles() {
         );
     }
 }
+
+#[test]
+fn array_common_does_not_promote_temporal_integer_carriers() {
+    use crate::{TemporalPrecision, TemporalType};
+
+    let declaration = TemporalType::Time(TemporalPrecision::DEFAULT);
+    let carrier = declaration.carrier();
+    let storage = ValueTypeStorageLifetime::pure();
+    let time = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(ValueKind::Temporal(declaration), false, storage.clone()).unwrap(),
+        ValueLayout::try_new(&carrier, storage).unwrap(),
+    )
+    .unwrap();
+    let bigint = physical(DataType::Int64, false);
+    assert_eq!(time.data_type(), bigint.data_type());
+    for args in [[&time, &bigint], [&bigint, &time]] {
+        assert!(matches!(
+            infer(&args),
+            Err(ArrayCommonTypeFailure::Rule(
+                ArrayCommonRuleFailure::UnreviewedHeterogeneousFamily
+            ))
+        ));
+    }
+    let item = item_of(&infer(&[&time, &time]).unwrap());
+    assert_eq!(item.value_type().temporal(), Some(declaration));
+    assert_eq!(item.data_type(), &carrier);
+}
