@@ -1,0 +1,62 @@
+-- query 3
+-- types	bigint
+snapshots
+1
+
+-- query 6
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	1	true	true
+
+-- query 9
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	1	true	true
+
+-- query 10
+-- types	bigint
+id
+2
+4
+5
+
+-- query 11
+-- types	bigint
+snapshots
+3
+
+-- query 14
+-- types	bigint
+empty_delete_snapshots
+2
+
+-- query 15
+-- types	bigint
+snapshots
+5
+
+-- query 18
+-- types	bigint
+snapshots
+5
+
+-- query 19
+-- types	bigint
+id
+2
+4
+5
+
+-- query 21
+-- types	bigint
+snapshots
+0
+
+-- query 24
+-- types	bigint
+snapshots
+0
+
+-- query 25
+-- types	bigint
+id

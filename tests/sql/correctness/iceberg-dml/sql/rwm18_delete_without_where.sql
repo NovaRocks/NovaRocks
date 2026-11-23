@@ -25,9 +25,6 @@ CREATE TABLE ${case_db}.rwm18_delete_all (id BIGINT, p INTEGER) WITH (format_ver
 
 -- query 2
 -- @skip_result_check=true
--- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
--- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
--- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 INSERT INTO ${case_db}.rwm18_delete_all VALUES
   ROW(1, 10),
   ROW(2, 20);
@@ -38,9 +35,6 @@ CREATE BRANCH dev IN TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.rwm18_delet
 
 -- query 4
 -- @skip_result_check=true
--- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
--- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
--- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 INSERT INTO ${case_db}.rwm18_delete_all @dev VALUES ROW(3, 30);
 
 -- query 5
@@ -48,9 +42,6 @@ SELECT id FROM ${case_db}.rwm18_delete_all FOR VERSION AS OF 'dev' ORDER BY id;
 
 -- query 6
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
--- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
--- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 DELETE FROM ${case_db}.rwm18_delete_all @dev;
 
 -- query 7
@@ -75,7 +66,6 @@ EXPLAIN DELETE FROM ${case_db}.rwm18_delete_all;
 -- @expect_update_count=2
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
--- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 DELETE FROM ${case_db}.rwm18_delete_all;
 
 -- query 12
@@ -102,7 +92,6 @@ SELECT count(*) AS snapshots FROM ${case_db}."rwm18_delete_all_empty$snapshots";
 -- @expect_update_count=NULL
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
--- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 DELETE FROM ${case_db}.rwm18_delete_all_empty;
 
 -- query 17

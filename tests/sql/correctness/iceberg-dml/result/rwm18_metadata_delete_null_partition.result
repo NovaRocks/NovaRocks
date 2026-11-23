@@ -1,0 +1,31 @@
+-- query 3
+-- types	bigint
+data_manifests
+1
+
+-- query 6
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	1	true	true
+
+-- query 7
+-- types	bigint	integer
+id	part
+1	NULL
+3	30
+
+-- query 11
+-- types	bigint
+data_manifests
+2
+
+-- query 14
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	1	true	true
+
+-- query 15
+-- types	bigint	integer
+id	part
+1	NULL
+3	30

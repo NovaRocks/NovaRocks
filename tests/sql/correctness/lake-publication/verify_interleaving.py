@@ -30,6 +30,11 @@ from pathlib import Path
 WORKSPACE = Path(__file__).resolve().parents[4]
 SPARK_ORACLE = WORKSPACE / "tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala"
 ROLLBACK_CASE = "rwm12_rollback_start"
+METADATA_DELETE_COMPANIONS = {
+    "rwm18_metadata_delete_append": ("append", "append", 2),
+    "rwm18_metadata_delete_concurrent_delete": ("delete_partition", "delete", 2),
+    "rwm18_metadata_delete_evolution_conflict": ("evolve_and_append_mixed", "append", 1),
+}
 
 
 def traffic(uri):
@@ -37,8 +42,8 @@ def traffic(uri):
         return json.load(response)
 
 
-def spark(source, marker, log):
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".scala") as command:
+def spark(source, marker, log, *, script_dir=None):
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".scala", dir=script_dir) as command:
         command.write(SPARK_ORACLE.read_text())
         command.write(f'\nIru5SparkCommitInterop.checked("{marker}") {{\n{source}\n}}\n')
         command.flush()
@@ -63,7 +68,8 @@ def check_table_name(table):
 def evidence_dir(case, run):
     if not all(re.fullmatch(r"[a-zA-Z_0-9-]+", value) for value in (case, run)):
         raise ValueError("invalid fixture run name")
-    return WORKSPACE / "logs/rwm12/sql-interleavings" / run / case
+    owner = "rwm18" if case in METADATA_DELETE_COMPANIONS else "rwm12"
+    return WORKSPACE / "logs" / owner / "sql-interleavings" / run / case
 
 
 def companion(case, run, table):
@@ -325,11 +331,252 @@ def truncate_companion(case, table, action, uri, location):
     print("RWM17B_COMPANION_OK")
 
 
+def metadata_delete_scope(run, table):
+    check_table_name(table)
+    # The SQL runner rewrites the table namespace and the case's evidence
+    # name separately. Validate both against its inherited ownership.
+    sys.path.insert(0, str(WORKSPACE / "docker/iceberg-rest"))
+    try:
+        from scratch import RUN_STORAGE_ENV, RunStorageScope
+    finally:
+        sys.path.pop(0)
+    scope = RunStorageScope.from_dict(json.loads(os.environ[RUN_STORAGE_ENV]))
+    context = json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"])
+    if context["identity"] != scope.identity.as_dict():
+        raise ValueError("The original fixture run and its storage binding disagree")
+    namespace, name = table.split(".")
+    if name != "rows_under_test" or not scope.owns_namespace(namespace) or not scope.owns_namespace(run):
+        raise ValueError("RWM-18 requires the original case-owned namespace and table")
+
+
+def metadata_delete_spark_source(table):
+    return f"""
+val qualified = "ice_rest.{table}"
+val t = Iru5SparkCommitInterop.table(spark, qualified)
+def members(at: Snapshot): Map[Long, String] = {{
+  val rows = spark.sql(s"SELECT id, _file FROM $qualified VERSION AS OF ${{at.snapshotId()}}")
+    .collect().map(row => row.getLong(0) -> row.getString(1))
+  val keyed = rows.toMap
+  require(keyed.size == rows.length, s"Duplicate fixture ids in snapshot ${{at.snapshotId()}}")
+  keyed
+}}
+def liveDataPaths(at: Snapshot): Set[String] = {{
+  val scan = t.newScan().useSnapshot(at.snapshotId()).planFiles()
+  try scan.asScala.map(_.file().location()).toSet finally scan.close()
+}}
+def liveDeleteCount: Long =
+  spark.sql(s"SELECT count(*) FROM $qualified.delete_files").head().getLong(0)
+"""
+
+
+def metadata_delete_companion(case, run, table, action, uri, location):
+    metadata_delete_scope(run, table)
+    expected_action, operation, _ = METADATA_DELETE_COMPANIONS[case]
+    if action != expected_action or uri is None:
+        raise ValueError(f"unexpected RWM-18 companion action {action!r} for {case!r}")
+    e_id = int(main_snapshot(uri, table)["snapshot-id"])
+    source = metadata_delete_spark_source(table) + f"""
+val e = t.currentSnapshot()
+require(e != null && e.snapshotId() == {e_id}L && e.operation() == "append",
+  "The held DELETE requires the original seed append snapshot")
+val oldSpec = t.spec()
+val seeded = members(e)
+require(seeded.values.toSet == liveDataPaths(e) && liveDeleteCount == 0L,
+  "The original scan must expose exactly the seed data files with no deletes")
+require(oldSpec.fields().size() == 1, "Expected a single original partition field")
+val partition = oldSpec.fields().get(0)
+"""
+    if action == "evolve_and_append_mixed":
+        mutate = """
+require(seeded.keySet == Set(1L, 2L) && seeded(1L) != seeded(2L) &&
+  partition.transform().toString == "day" && partition.sourceId() == t.schema().findField("ts").fieldId(),
+  "The original two rows must be in distinct day partitions")
+val oldSnapshots = t.snapshots().asScala.map(_.snapshotId()).toSet
+val bucket = org.apache.iceberg.expressions.Expressions.bucket[java.lang.Integer]("id", 1)
+t.updateSpec().removeField(partition.name()).addField(bucket).commit()
+t.refresh()
+val newSpec = t.spec()
+require(t.currentSnapshot().snapshotId() == e.snapshotId() &&
+  t.snapshots().asScala.map(_.snapshotId()).toSet == oldSnapshots,
+  "Partition evolution must publish metadata while leaving the original snapshots intact")
+require(newSpec.specId() != oldSpec.specId() && t.specs().containsKey(oldSpec.specId()) &&
+  newSpec.fields().size() == 1 && newSpec.fields().get(0).transform().toString == "bucket[1]" &&
+  newSpec.fields().get(0).sourceId() == t.schema().findField("id").fieldId(),
+  "The new write spec must bucket id and retain the historical day spec")
+spark.sql(s"INSERT INTO $qualified VALUES " +
+  "(3, TIMESTAMP_NTZ '2024-01-01 12:00:00'), (4, TIMESTAMP_NTZ '2024-01-02 12:00:00')").collect()
+"""
+        verify = """
+require(added.size == 1, "A single new-spec file must contain the concurrent append")
+val mixed = added.head
+require(mixed.specId() == newSpec.specId() && mixed.recordCount() == 2L &&
+  after.keySet == Set(1L, 2L, 3L, 4L) &&
+  seeded.forall { case (id, path) => after(id) == path } &&
+  after(3L) == mixed.location() && after(4L) == mixed.location() &&
+  !seeded.values.toSet.contains(mixed.location()) && removed.isEmpty,
+  "The concurrent append must put both new rows in one new-spec file")
+val matching = spark.sql(s"SELECT id FROM $qualified WHERE " +
+  "ts >= TIMESTAMP_NTZ '2024-01-01 00:00:00' AND ts < TIMESTAMP_NTZ '2024-01-02 00:00:00' ORDER BY id")
+  .collect().map(_.getLong(0)).toVector
+require(matching == Vector(1L, 3L),
+  "Exactly one row of the concurrent file must match the held DELETE")
+println("RWM18_SPARK_MIXED_FILE spec=" + newSpec.specId() + " path=" + mixed.location())
+"""
+    else:
+        source += """
+require(seeded.keySet == Set(1L, 2L, 3L) && seeded(1L) != seeded(3L) &&
+  seeded(2L) != seeded(3L) && partition.transform().isIdentity() &&
+  partition.sourceId() == t.schema().findField("part").fieldId(),
+  "The seed requires identity partition data on both sides of the held predicate")
+"""
+        if action == "append":
+            mutate = 'spark.sql(s"INSERT INTO $qualified VALUES (4, 10, 400)").collect()\n'
+            verify = """
+require(added.size == 1, "A single data file must hold the matching append")
+val appended = added.head
+require(appended.specId() == oldSpec.specId() &&
+  appended.partition().get(0, classOf[java.lang.Integer]).intValue() == 10 &&
+  appended.recordCount() == 1L && after.keySet == Set(1L, 2L, 3L, 4L) &&
+  seeded.forall { case (id, path) => after(id) == path } &&
+  after(4L) == appended.location() && !seeded.values.toSet.contains(appended.location()) &&
+  removed.isEmpty,
+  "Spark must append a separate matching data file and leave the seed files live")
+println("RWM18_SPARK_APPENDED_FILE " + appended.location())
+"""
+        else:
+            mutate = 'spark.sql(s"DELETE FROM $qualified WHERE part = 10").collect()\n'
+            verify = """
+require(removed == Set(seeded(1L), seeded(2L)) && added.isEmpty &&
+  b.summary().get("deleted-records") == "2" && after == Map(3L -> seeded(3L)),
+  "Spark must delete both matching rows by removing their data files")
+println("RWM18_SPARK_DELETED_FILES " + removed.toVector.sorted.mkString(","))
+"""
+    source += mutate + f"""
+t.refresh()
+val b = t.currentSnapshot()
+require(b != null && b.snapshotId() != e.snapshotId() && b.parentId() != null &&
+  b.parentId().longValue() == e.snapshotId() && b.sequenceNumber() > e.sequenceNumber() &&
+  b.operation() == "{operation}", "The Spark snapshot must be the exact expected child of E")
+val after = members(b)
+val added = b.addedDataFiles(t.io()).asScala.toVector
+val removed = b.removedDataFiles(t.io()).asScala.map(_.location()).toSet
+require(b.addedDeleteFiles(t.io()).asScala.isEmpty && liveDeleteCount == 0L,
+  "The companion must not leave row-level delete files")
+""" + verify + """
+println("RWM18_SPARK_COMPANION_ENDPOINTS " + e.snapshotId() + " " + b.snapshotId() + " " + t.spec().specId())
+"""
+    marker = "RWM18_SPARK_COMPANION_OK"
+    log = location / "spark-companion.log"
+    output = spark(source, marker, log, script_dir=location)
+    endpoints = [
+        match.groups() for line in output.splitlines()
+        if (match := re.fullmatch(r"RWM18_SPARK_COMPANION_ENDPOINTS (-?\d+) (-?\d+) (\d+)", line))
+    ]
+    if len(endpoints) != 1:
+        raise RuntimeError(f"expected one exact E/B/spec observation (see {log})")
+    start, committed, spec = map(int, endpoints[0])
+    head = main_snapshot(uri, table)
+    if (start != e_id or committed == start or head["snapshot-id"] != committed
+            or head.get("parent-snapshot-id") != start or head["summary"]["operation"] != operation):
+        raise RuntimeError(f"Spark evidence and the held Catalog target disagree (see {log})")
+    with (location / "metadata-delete-companion.json").open("x") as saved:
+        json.dump({"table": table, "start": start, "committed": committed, "spec": spec},
+                  saved, sort_keys=True)
+    print(marker)
+
+
+def verify_maintenance_traffic(uri, location, commit_requests, conflicts):
+    before = json.loads((location / "traffic-before.json").read_text())
+    after = traffic(uri)
+    with (location / "traffic-after.json").open("x") as saved:
+        json.dump(after, saved, sort_keys=True)
+    actual = {
+        "conflicts": after["by_status"].get("409", 0) - before["by_status"].get("409", 0),
+        "commit_requests": after["table_commit_requests"] - before["table_commit_requests"],
+    }
+    expected = {"conflicts": conflicts, "commit_requests": commit_requests}
+    if actual != expected:
+        raise RuntimeError(f"Catalog traffic {actual} differs from {expected}")
+    return actual
+
+
+def metadata_delete_finish(uri, case, run, table):
+    metadata_delete_scope(run, table)
+    action, operation, requests = METADATA_DELETE_COMPANIONS[case]
+    location = evidence_dir(case, run)
+    binding = json.loads((location / "metadata-delete-companion.json").read_text())
+    if binding["table"] != table:
+        raise RuntimeError("The companion evidence belongs to a different Catalog target")
+    actual = verify_maintenance_traffic(uri, location, requests, 1)
+    print("RWM18_TRAFFIC_DELTA " + json.dumps(actual, sort_keys=True))
+    start, committed, spec = (int(binding[key]) for key in ("start", "committed", "spec"))
+    source = metadata_delete_spark_source(table) + f"""
+val e = t.snapshot({start}L)
+val b = t.snapshot({committed}L)
+val head = t.currentSnapshot()
+require(e != null && b != null && b.parentId() != null &&
+  b.parentId().longValue() == e.snapshotId() && b.operation() == "{operation}" &&
+  t.spec().specId() == {spec}, "The exact companion snapshot or its partition spec was lost")
+require(liveDeleteCount == 0L, "The current table may not retain a delete file")
+val original = members(e)
+val after = members(head)
+"""
+    if action == "evolve_and_append_mixed":
+        source += """
+val added = b.addedDataFiles(t.io()).asScala.toVector
+require(head.snapshotId() == b.snapshotId() && after.keySet == Set(1L, 2L, 3L, 4L) &&
+  original.keySet == Set(1L, 2L) && original.forall { case (id, path) => after(id) == path } &&
+  added.size == 1 && added.head.specId() == t.spec().specId() &&
+  after(3L) == added.head.location() && after(4L) == added.head.location() &&
+  liveDataPaths(head) == original.values.toSet + added.head.location(),
+  "The rejected DELETE must leave the exact mixed-file Spark snapshot live")
+val rows = spark.sql(s"SELECT id, date_format(ts, 'yyyy-MM-dd HH:mm:ss') FROM $qualified ORDER BY id")
+  .collect().map(row => (row.getLong(0), row.getString(1))).toVector
+require(rows == Vector((1L, "2024-01-01 04:00:00"), (2L, "2024-01-02 01:00:00"),
+  (3L, "2024-01-01 12:00:00"), (4L, "2024-01-02 12:00:00")),
+  s"The failed statement changed the Spark companion rows: $rows")
+"""
+    else:
+        source += """
+require(head.operation() == "delete" && head.parentId() != null &&
+  head.parentId().longValue() == b.snapshotId() && head.snapshotId() != b.snapshotId() &&
+  head.sequenceNumber() > b.sequenceNumber(),
+  "NovaRocks must publish its own delete snapshot after the exact Spark companion")
+val removed = head.removedDataFiles(t.io()).asScala.map(_.location()).toSet
+require(head.addedDataFiles(t.io()).asScala.isEmpty && head.addedDeleteFiles(t.io()).asScala.isEmpty &&
+  after == Map(3L -> original(3L)) && liveDataPaths(head) == Set(original(3L)),
+  "NovaRocks must preserve the original file outside the selected partition")
+val rows = spark.sql(s"SELECT id, part, value FROM $qualified ORDER BY id").collect()
+  .map(row => (row.getLong(0), row.getInt(1), row.getLong(2))).toVector
+require(rows == Vector((3L, 20, 300L)), s"Unexpected final Spark readback: $rows")
+"""
+        if action == "append":
+            source += """
+val appended = b.addedDataFiles(t.io()).asScala.map(_.location()).toSet
+val selected = Set(original(1L), original(2L))
+require(appended.nonEmpty && appended.intersect(selected).isEmpty &&
+  removed == selected.union(appended) && head.summary().get("deleted-records") == "3",
+  "The winning DELETE must remove both the original and the concurrent matching files")
+"""
+        else:
+            source += """
+require(b.removedDataFiles(t.io()).asScala.map(_.location()).toSet == Set(original(1L), original(2L)) &&
+  removed.isEmpty && !head.summary().containsKey("deleted-records"),
+  "The second successful DELETE must publish an empty snapshot")
+"""
+    source += 'println("RWM18_SPARK_CURRENT_HEAD " + head.snapshotId())\n'
+    marker = "RWM18_SPARK_READBACK_OK"
+    spark(source, marker, location / "spark-readback.log", script_dir=location)
+    print(marker)
+
+
 def maintenance_companion(case, run, table, action, uri=None):
     check_table_name(table)
     location = evidence_dir(case, run)
     if case in TRUNCATE_COMPANIONS:
         return truncate_companion(case, table, action, uri, location)
+    if case in METADATA_DELETE_COMPANIONS:
+        return metadata_delete_companion(case, run, table, action, uri, location)
     source = f"""
 val qualified = "ice_rest.{table}"
 val t = Iru5SparkCommitInterop.table(spark, qualified)
@@ -399,17 +646,7 @@ def maintenance_finish(uri, case, run, table, commit_requests, conflicts, column
                        expected_text, operation):
     check_table_name(table)
     location = evidence_dir(case, run)
-    before = json.loads((location / "traffic-before.json").read_text())
-    after = traffic(uri)
-    with (location / "traffic-after.json").open("x") as saved:
-        json.dump(after, saved, sort_keys=True)
-    actual = {
-        "conflicts": after["by_status"].get("409", 0) - before["by_status"].get("409", 0),
-        "commit_requests": after["table_commit_requests"] - before["table_commit_requests"],
-    }
-    expected_traffic = {"conflicts": int(conflicts), "commit_requests": int(commit_requests)}
-    if actual != expected_traffic:
-        raise RuntimeError(f"Catalog traffic {actual} differs from {expected_traffic}")
+    actual = verify_maintenance_traffic(uri, location, int(commit_requests), int(conflicts))
     print("RWM17B_TRAFFIC_DELTA " + json.dumps(actual, sort_keys=True))
 
     if any(not re.fullmatch(r"[a-z_]+", column) for column in columns.split(",")):
@@ -594,4 +831,5 @@ if __name__ == "__main__":
         "verify-rollback": verify_rollback_error,
         "maintenance-companion": maintenance_companion,
         "maintenance-finish": maintenance_finish,
+        "metadata-delete-finish": metadata_delete_finish,
     }[method](*arguments)
