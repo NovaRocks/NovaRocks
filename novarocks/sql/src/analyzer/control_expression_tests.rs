@@ -431,20 +431,36 @@ fn case_result_cast_path_preserves_original_constant_ordinal() {
     let mut ctx = context(&control);
     ctx.materialized_values = Some(original.view());
     let scope = ctx.new_scope();
-    let mut expected = ctx
+    let expected = ctx
         .analyze_expr(&case.when_clauses[0].result, &scope)
         .unwrap();
     let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
     let ExprKind::Case { when_then, .. } = &actual.kind else {
         panic!("original CASE IR")
     };
-    expected.value_type = expected.value_type.with_nullable(true).unwrap();
-    same_typed(&when_then[0].1, &expected, &control);
+    let branch = &when_then[0].1;
     assert_eq!(
-        when_then[0].1.value_type,
+        branch.value_type,
         FunctionValueType::new(DataType::Int64, true)
     );
-    let ExprKind::Cast { expr, target, .. } = &when_then[0].1.kind else {
+    let ExprKind::Cast {
+        expr: original_conversion,
+        target,
+        cast_mode: None,
+        ..
+    } = &branch.kind
+    else {
+        panic!("CASE result nullability conversion")
+    };
+    assert_eq!(target, &DataType::Int64);
+    same_typed(original_conversion, &expected, &control);
+    let ExprKind::Cast {
+        expr,
+        target,
+        cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+        ..
+    } = &original_conversion.kind
+    else {
         panic!("original source conversion")
     };
     assert_eq!(target, &DataType::Int64);

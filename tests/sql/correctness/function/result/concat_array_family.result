@@ -4,7 +4,7 @@ empty_tail
 ["a"]
 
 -- query 2
--- types	array(varchar)
+-- types	array(varchar(1))
 mixed
 ["a","b","c"]
 
