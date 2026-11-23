@@ -80,7 +80,7 @@ select
     idx,
     idx,
     idx,
-    uuid()
+    CAST(uuid() AS VARCHAR)
 from ${case_db}.__row_util;
 
 -- Inner join tests

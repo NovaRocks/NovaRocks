@@ -55,7 +55,7 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;
 
 -- query 3
 -- first_value IGNORE NULLS
@@ -69,7 +69,7 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;
 
 -- query 4
 -- last_value
@@ -83,7 +83,7 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;
 
 -- query 5
 -- last_value IGNORE NULLS
@@ -97,7 +97,7 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;
 
 -- query 6
 -- lead
@@ -111,7 +111,7 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;
 
 -- query 7
 -- lead IGNORE NULLS
@@ -125,7 +125,7 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;
 
 -- query 8
 -- lag
@@ -139,7 +139,7 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;
 
 -- query 9
 -- lag IGNORE NULLS
@@ -153,4 +153,4 @@ WITH cte AS (
 cte1 AS (
     SELECT a = c[1] AND b = c[2] AS pred FROM cte
 )
-SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
+SELECT count(pred) = count(IF(pred, 1, NULL)) FROM cte1;

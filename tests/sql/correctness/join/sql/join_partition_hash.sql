@@ -79,7 +79,7 @@ CREATE TABLE ${case_db}.phj_t1 (
 -- query 11
 -- @skip_result_check=true
 INSERT INTO ${case_db}.phj_t1
-SELECT idx, idx, substr(uuid(), 1, 6)
+SELECT idx, idx, substr(CAST(uuid() AS VARCHAR), 1, 6)
 FROM ${case_db}.phj_row_util;
 
 -- query 12

@@ -117,7 +117,7 @@ insert into ${case_db}.t2 (k1) select 32000;
 
 -- query 16
 -- @skip_result_check=true
-insert into ${case_db}.t2 select idx, idx, idx, uuid(), uuid(), uuid(), uuid() from ${case_db}.__row_util where idx <= 1000;
+insert into ${case_db}.t2 select idx, idx, idx, CAST(uuid() AS VARCHAR), CAST(uuid() AS VARCHAR), CAST(uuid() AS VARCHAR), CAST(uuid() AS VARCHAR) from ${case_db}.__row_util where idx <= 1000;
 
 -- join on c_str4 with =
 -- query 17
