@@ -1475,7 +1475,18 @@ impl IcebergWriteSessionControl {
                         ))),
                     ));
                 }
-                return Err(unavailable(error.to_string()));
+                let observation_failure = unavailable(error.to_string());
+                if handle.commit_protocol().operation().style()
+                    == crate::commit::model::CommitStyle::Transaction
+                {
+                    // The checked dispatch is still unknown. Present the failed
+                    // read as detail of that outcome and keep its original evidence.
+                    return Ok(ExternalMutationOutcome::CommitUnknown {
+                        failure: ConnectorMutationFailure::from_connector(observation_failure),
+                        evidence: evidence.clone(),
+                    });
+                }
+                return Err(observation_failure);
             }
         };
         let table = physical.into_table();
