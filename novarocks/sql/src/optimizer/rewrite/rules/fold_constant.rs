@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::binding::SqlFunctionBinding;
-use crate::common::{BinOp, UnOp};
+use crate::common::{BinOp, LiteralValue, UnOp};
 use crate::compiler::SqlAuthoredScalarUnit;
 use novarocks_functions::PureCallLifecycle;
 
@@ -46,7 +46,7 @@ use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
+use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
 
 mod admission;
 mod evaluation;
@@ -65,55 +65,11 @@ mod evaluation;
 /// These functions consult the process clock or timezone for at least one
 /// admitted argument shape.
 ///
-/// The `now`-family names are already `Volatile` in
-/// `crate::functions::builtin_function_volatility`, so gate 2 alone would stop
-/// them; they are repeated here so the denylist stays readable as the single
-/// "never fold this on the FE" statement even if a volatility classification
-/// ever changes.
 const ENVIRONMENT_SENSITIVE_FUNCTIONS: &[&str] = &[
-    // Wall clock / session clock.
-    "now",
-    "current_timestamp",
-    "localtime",
-    "localtimestamp",
-    "curdate",
-    "current_date",
-    "curtime",
-    "current_time",
-    "unix_timestamp",
-    // Process/session timezone conversions.
-    "convert_tz",
-    "from_unixtime",
-    "from_unixtime_ms",
-    "to_datetime",
-    "timestamp",
     "get_variant_date",
     "get_variant_datetime",
     "get_variant_time",
 ];
-
-/// Functions whose string values carry raw bytes rather than text.
-///
-/// NovaRocks represents binary payloads inside `Utf8` values for this family,
-/// and the byte convention is not preserved by the literal representation: a
-/// folded `aes_encrypt(..)` re-materializes as an ordinary string literal, and
-/// downstream consumers such as `to_base64` then read different bytes than the
-/// runtime produced. Excluding the family keeps folded output bit-identical to
-/// runtime output; the cost is only a missed optimization.
-const BYTE_CARRYING_STRING_FUNCTIONS: &[&str] = &[
-    "from_base64",
-    "from_binary",
-    "base64_decode_binary",
-    "base64_decode_string",
-    "unhex",
-];
-
-fn is_byte_carrying_string_function(name: &str) -> bool {
-    let lowered = name.to_ascii_lowercase();
-    BYTE_CARRYING_STRING_FUNCTIONS
-        .iter()
-        .any(|denied| *denied == lowered)
-}
 
 fn is_environment_sensitive_function(name: &str) -> bool {
     let lowered = name.to_ascii_lowercase();
@@ -577,6 +533,14 @@ fn fold_scalar_uncached(
         _ => {}
     }
 
+    if ordered_regexp_null(arena, &node, ctx, work)? {
+        return arena.intern_observed(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            value_type,
+            work.control(),
+        );
+    }
+
     // Post-order: children first, so a node only ever sees already-folded
     // children and "all children are literals" is decidable locally.
     match &mut node {
@@ -680,6 +644,67 @@ fn fold_scalar_uncached(
     Ok(try_fold_node_current(arena, rebuilt, ctx, work)?.unwrap_or(rebuilt))
 }
 
+fn ordered_regexp_null(
+    arena: &ScalarArena,
+    node: &ScalarNode,
+    ctx: &RewriteContext<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    use novarocks_functions::{FunctionArgumentEvaluation, FunctionSpecializationFailure};
+    use novarocks_type_contract::ArgumentControl;
+
+    let ScalarNode::FunctionCall { binding, args, .. } = node else {
+        return Ok(false);
+    };
+    if binding.semantics.argument_evaluation != FunctionArgumentEvaluation::ShortCircuit {
+        return Ok(false);
+    }
+    let Some(functions) = ctx.sealed_functions() else {
+        return Ok(false);
+    };
+    let mut known_null = false;
+    for &argument in args {
+        let mut argument = argument;
+        loop {
+            work.step()?;
+            match arena.node(argument) {
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Null)) => known_null = true,
+                ScalarNode::Constant(value) => {
+                    known_null = value
+                        .is_null_observed(CompilePhase::FunctionSpecialization, work.control())?;
+                }
+                ScalarNode::Nested(child) | ScalarNode::Cast { child, .. } => {
+                    argument = *child;
+                    continue;
+                }
+                _ => {}
+            }
+            break;
+        }
+        if known_null {
+            break;
+        }
+    }
+    if !known_null {
+        return Ok(false);
+    }
+    let selected = functions
+        .metadata()
+        .pure_overload_declaration_observed(
+            &binding.function_id,
+            binding.kind,
+            &binding.selected.overload,
+            work.control(),
+        )
+        .map_err(|cause| match cause {
+            FunctionSpecializationFailure::Control(cause) => cause.into(),
+            cause => SqlCompileError::CompilationSource(
+                novarocks_failure_contract::SharedFailureCause::new(cause),
+            ),
+        })?;
+    Ok(selected.effects().argument_control == ArgumentControl::OrderedRegexp)
+}
+
 /// Fold a rebuilt node only after every direct child has become a constant.
 fn try_fold_node_current(
     arena: &mut ScalarArena,
@@ -690,6 +715,13 @@ fn try_fold_node_current(
     work.step()?;
     let node = arena.node(id);
     let out_type = arena.value_type(id);
+    if ordered_regexp_null(arena, node, ctx, work)? {
+        return Ok(Some(arena.intern_observed(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            out_type.clone(),
+            work.control(),
+        )?));
+    }
     if !is_wire_encodable_literal_type(out_type) {
         return Ok(None);
     }
@@ -728,11 +760,7 @@ fn try_fold_node_current(
             distinct: false,
             volatility: FunctionVolatility::Immutable,
             ..
-        } if !is_environment_sensitive_function(name)
-            && !is_byte_carrying_string_function(name) =>
-        {
-            args
-        }
+        } if !is_environment_sensitive_function(name) => args,
         _ => return Ok(None),
     };
     if let Some(outcome) = ctx.cached_fold(id) {

@@ -968,9 +968,9 @@ impl Scenario for AsyncSchedulingPressure {
                         .context("publish Exchange query start")?;
                     connection.execute(
                         "SELECT sleep(2), COUNT(*) FROM (\
-                           SELECT generate_series AS x FROM TABLE(generate_series(1, 100000)) \
+                           SELECT sequential_number AS x FROM TABLE(sequence(1, 100000)) \
                            UNION ALL \
-                           SELECT generate_series AS x FROM TABLE(generate_series(100001, 200000))\
+                           SELECT sequential_number AS x FROM TABLE(sequence(100001, 200000))\
                          ) t",
                     )?;
                     Ok(())

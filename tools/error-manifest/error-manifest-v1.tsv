@@ -5,6 +5,7 @@ UnsupportedCompiledShape	Execution
 query.execution.cancelled	Execution
 query.execution.commit_unknown	Execution
 query.execution.control	Execution
+query.execution.date_result_out_of_range	Execution
 query.execution.deadline_exceeded	Execution
 query.execution.dependency	Execution
 query.execution.division_by_zero	Execution
@@ -17,6 +18,7 @@ query.execution.numeric_out_of_range	Execution
 query.execution.representation	Execution
 query.execution.resource_exhausted	Execution
 query.execution.unexpected	Execution
+query.execution.unknown_epoch_time_zone	Execution
 query.execution.unsupported	Execution
 query.execution.update_target_row_multiple_matches	Execution
 sql.admit.client_type_unsupported	Admit
@@ -55,18 +57,21 @@ sql.admit.unsupported_statement	Admit
 sql.admit.update_unsupported_form	Admit
 sql.analyze.ambiguous_function_call	Analyze
 sql.analyze.duplicate_column_name	Analyze
+sql.analyze.expression_not_constant	Analyze
 sql.analyze.expression_not_scalar	Analyze
 sql.analyze.function_not_aggregate	Analyze
 sql.analyze.internal	Analyze
 sql.analyze.invalid_analyze_property	Analyze
 sql.analyze.invalid_argument	Analyze
+sql.analyze.invalid_function_argument	Analyze
 sql.analyze.invalid_literal	Analyze
 sql.analyze.invalid_query_shape	Analyze
 sql.analyze.invalid_type_argument	Analyze
 sql.analyze.invalid_view	Analyze
 sql.analyze.mismatched_column_aliases	Analyze
+sql.analyze.missing_argument	Analyze
 sql.analyze.missing_column_name	Analyze
-sql.analyze.numeric_value_out_of_range	Analyze
+sql.analyze.numeric_out_of_range	Analyze
 sql.analyze.too_many_arguments	Analyze
 sql.analyze.type_mismatch	Analyze
 sql.analyze.unavailable_implementation	Analyze
@@ -75,6 +80,7 @@ sql.analyze.unknown_column	Analyze
 sql.analyze.unknown_function	Analyze
 sql.analyze.unknown_schema	Analyze
 sql.analyze.unknown_table	Analyze
+sql.analyze.unknown_type	Analyze
 sql.analyze.unsupported_expression	Analyze
 sql.analyze.unsupported_query_shape	Analyze
 sql.analyze.view_is_recursive	Analyze

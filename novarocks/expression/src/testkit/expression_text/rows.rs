@@ -343,6 +343,7 @@ fn call_inapplicability(
             | ArgumentControl::If
             | ArgumentControl::Coalesce
             | ArgumentControl::Try
+            | ArgumentControl::OrderedRegexp
             | ArgumentControl::NoArguments => None,
             _ => Some(CallInapplicability::ArgumentControl),
         });
@@ -400,8 +401,18 @@ fn evaluate(
         input_columns: batch.num_columns(),
         input_rows: batch.num_rows(),
     };
-    let mut instance = CompiledExpressionInstance::try_new(compiled, root, control)
-        .map_err(|cause| TextError::Instance(Box::new(cause)))?;
+    let needs_regexp_host = compiled
+        .calls()
+        .values()
+        .any(|call| matches!(call.prepared(), PreparedPureKernel::OrderedRegexp(_)));
+    let allocator = needs_regexp_host.then(|| {
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            Arc::new(crate::testkit::CountingAllocator::new(usize::MAX));
+        host
+    });
+    let mut instance =
+        CompiledExpressionInstance::try_new_with_allocator(compiled, root, control, allocator)
+            .map_err(|cause| TextError::Instance(Box::new(cause)))?;
     let selection = Selection::all(batch.num_rows());
     let result = instance
         .evaluate(

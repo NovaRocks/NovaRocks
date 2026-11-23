@@ -1,7 +1,7 @@
 -- query 3
--- types	varchar	varchar	varchar	varchar
-_col0	_col1	_col2	_col3
-AB01	ABAB	ABAC	61623031
+-- types	varchar	varchar	varchar	varchar	bigint	bigint	bigint
+_col0	_col1	_col2	_col3	c1_bytes	c2_bytes	c3_bytes
+AB01	ABAB	ABAC	61623031	2	2	2
 
 -- query 5
 -- types	varchar	varchar	varchar	varchar
@@ -19,3 +19,18 @@ AB01	ABAB	ABAC	61623031
 -- types	integer	varbinary
 c1	c2
 1	MTIzNA==
+
+-- query 12
+-- types	varchar	bigint	varchar
+bytes_type	byte_count	padded_hex
+varbinary	8	000000000000001A
+
+-- query 13
+-- types	integer	bigint	varchar	varchar
+ordinal	n	padded_hex	hex_display
+1	0	0000000000000000	0
+2	26	000000000000001A	1A
+3	-1	FFFFFFFFFFFFFFFF	FFFFFFFFFFFFFFFF
+4	-9223372036854775808	8000000000000000	8000000000000000
+5	9223372036854775807	7FFFFFFFFFFFFFFF	7FFFFFFFFFFFFFFF
+6	NULL	NULL	NULL

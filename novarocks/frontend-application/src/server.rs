@@ -463,6 +463,7 @@ async fn build_frontend_role_products(
             view_service.clone(),
             system_relations.clone(),
             mv_readiness.clone(),
+            host.required_constant_interpreter(),
         ),
         execution: (
             host.connector_blocking_io_supervisor(),
@@ -486,6 +487,7 @@ async fn build_frontend_role_products(
                 view_service.clone(),
                 system_relations.clone(),
                 mv_readiness.clone(),
+                host.required_constant_interpreter(),
             ),
             (
                 host.connector_blocking_io_supervisor(),
@@ -535,6 +537,7 @@ async fn build_frontend_role_products(
             view_service.clone(),
             system_relations.clone(),
             mv_readiness.clone(),
+            host.required_constant_interpreter(),
         ),
         connector_control: typed_connector_control.clone(),
         blocking: host.connector_blocking_io_supervisor(),
@@ -643,6 +646,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&products.view_service),
             host.constant_policy(),
             products.system_relations.clone(),
+            host.required_constant_interpreter().sealed_functions(),
         ));
     let iceberg_ref_command_executor = core_capabilities::iceberg_ref_command_executor(
         core_capabilities::IcebergRefCommandPorts::new(

@@ -196,8 +196,6 @@ pub fn claim(context: ExpressionEffectContext, control: ArgumentControl) -> Expr
         },
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         temporal_source: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
     }
 }
 pub fn no_calls(

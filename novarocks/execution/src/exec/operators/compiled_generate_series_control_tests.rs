@@ -17,12 +17,18 @@
 //! Processor lifecycle probes, independent of compile/source transport tests.
 use super::*;
 use crate::exec::chunk::ChunkSchema;
-use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime::task::ExecutionFailureCause;
+use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionFailureCause};
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use novarocks_failure_contract::FailureProjection;
-use novarocks_functions::{KernelDiagnostic, generate_series_core::SeriesError};
+use novarocks_functions::{KernelDiagnostic, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK};
+use novarocks_local_program::StaticLayout;
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, TypedValueBinding, ValueKind,
+    ValueLayout, ValueTypeRef,
+};
 use novarocks_types::SlotId;
 use std::sync::Mutex;
 
@@ -65,11 +71,40 @@ fn instance(values: [i64; 3], control: Arc<Control>) -> (CompiledGenerateSeriesP
         &[SlotId::new(81), SlotId::new(6), SlotId::new(900)],
     )
     .unwrap();
-    let output = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        &Schema::new(vec![Field::new("public-series", DataType::Int64, false)]),
-        &[SlotId::new(71)],
+    struct NoCompileRefusal;
+    impl PureCompileControl for NoCompileRefusal {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let storage = ValueTypeStorageLifetime::pure();
+    let binding = TypedValueBinding::try_new(
+        ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int64), false, storage.clone()).unwrap(),
+        ValueLayout::try_new(&DataType::Int64, storage.clone()).unwrap(),
     )
     .unwrap();
+    let output_layout = StaticLayout::try_new_typed_for_compile(
+        Arc::new(Schema::new(vec![Field::new(
+            "public-series",
+            DataType::Int64,
+            false,
+        )])),
+        Arc::from([SlotId::new(71)]),
+        vec![(binding, None)],
+        storage,
+        |_| Ok(()),
+        &NoCompileRefusal,
+    )
+    .unwrap();
+    let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        crate::runtime::mem_tracker::MemTracker::new_root("series control fixture"),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let output = construction
+        .create_compiled_chunk_schema(&output_layout)
+        .unwrap();
     let arrays = values
         .into_iter()
         .map(|value| Arc::new(Int64Array::from(vec![value])) as arrow::array::ArrayRef)
@@ -83,18 +118,11 @@ fn instance(values: [i64; 3], control: Arc<Control>) -> (CompiledGenerateSeriesP
         name: "control-fixture".to_owned(),
         input,
         parameters: Arc::from([0, 1, 2]),
-        output_layout: novarocks_local_program::StaticLayout::try_new(
-            output.arrow_schema_ref(),
-            Arc::from([SlotId::new(71)]),
-        )
-        .unwrap(),
-        // This fixture isolates the kernel control journal; typed construction
-        // ownership is verified through the production factory tests.
+        output_layout,
         output: Some(output),
-        construction: None,
+        construction: Some(construction),
         control,
-        pending: None,
-        offset: 0,
+        cursor: None,
         accepted: false,
         batch_rows: std::num::NonZeroU32::new(4096).unwrap(),
         failed: false,
@@ -145,6 +173,9 @@ fn compiled_generate_series_control_seven_causes_exact_prefix_no_tail_and_failed
     let baseline = control(None, KernelFailure::Cancelled);
     let (mut original, chunk) = instance(values, Arc::clone(&baseline));
     apply(&mut original, &state, chunk).unwrap();
+    let bounds_checkpoints = baseline.trace.lock().unwrap().len();
+    assert_eq!(*baseline.trace.lock().unwrap(), [0, 3]);
+    drive(&mut original, &state).unwrap();
     let trace = baseline.trace.lock().unwrap().clone();
     assert!(trace.contains(&MAX_UNOBSERVED_KERNEL_WORK));
     assert!(
@@ -164,10 +195,15 @@ fn compiled_generate_series_control_seven_causes_exact_prefix_no_tail_and_failed
         for at in 0..trace.len() {
             let injection = control(Some(at), cause.clone());
             let (mut processor, chunk) = instance(values, Arc::clone(&injection));
-            let error = apply(&mut processor, &state, chunk.clone()).unwrap_err();
+            let error = if at < bounds_checkpoints {
+                apply(&mut processor, &state, chunk.clone()).unwrap_err()
+            } else {
+                apply(&mut processor, &state, chunk.clone()).unwrap();
+                drive(&mut processor, &state).unwrap_err()
+            };
             assert_eq!(error.cause(), &ExecutionFailureCause::Kernel(cause.clone()));
             assert_eq!(*injection.trace.lock().unwrap(), trace[..=at]);
-            assert!(processor.pending.is_none());
+            assert!(processor.cursor.is_none());
             assert!(processor.failed);
             let before = injection.trace.lock().unwrap().len();
             for result in [
@@ -221,7 +257,6 @@ fn compiled_generate_series_control_finishing_owes_exact_output_then_latches_fin
     let installed = processor.drive(&mut ctx).unwrap();
     assert!(installed.output.is_none());
     assert!(matches!(installed.next, NextStep::Runnable));
-    assert!(matches!(installed.next, NextStep::Runnable));
     let result = processor.drive(&mut ctx).unwrap();
     assert!(matches!(result.next, NextStep::Finished));
     let out = result.output.expect("the bounds port's final output");
@@ -241,4 +276,39 @@ fn compiled_generate_series_control_finishing_owes_exact_output_then_latches_fin
     let ended = processor.drive(&mut ctx).unwrap();
     assert!(ended.output.is_none());
     assert!(matches!(ended.next, NextStep::Finished));
+}
+
+#[test]
+fn compiled_generate_series_control_stops_before_constructing_a_second_full_domain_batch() {
+    let state = RuntimeState::default();
+    let control = control(None, KernelFailure::Cancelled);
+    let (mut processor, chunk) = instance([i64::MIN, i64::MAX, 1], Arc::clone(&control));
+    processor.batch_rows = std::num::NonZeroU32::new(3).unwrap();
+    apply(&mut processor, &state, chunk).unwrap();
+    assert_eq!(*control.trace.lock().unwrap(), [0, 3]);
+    let yielded = with_context(&state, |ctx| {
+        let remaining = ctx.work().remaining();
+        assert!(ctx.work().try_consume(remaining));
+        processor.drive(ctx)
+    })
+    .unwrap();
+    assert!(matches!(yielded.next, NextStep::Yield));
+    assert!(yielded.output.is_none());
+    assert_eq!(*control.trace.lock().unwrap(), [0, 3]);
+
+    let output = drive(&mut processor, &state).unwrap();
+    assert!(matches!(output.next, NextStep::Runnable));
+    let output = output.output.unwrap();
+    let values = output.record_batch().column(0);
+    let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        values.values().as_ref(),
+        &[i64::MIN, i64::MIN + 1, i64::MIN + 2]
+    );
+    assert_eq!(processor.cursor.unwrap().current, i128::from(i64::MIN) + 3);
+    let checkpoints = control.trace.lock().unwrap().len();
+    processor.cancel();
+    assert!(processor.cursor.is_none());
+    assert_failed_instance(drive(&mut processor, &state).unwrap_err());
+    assert_eq!(control.trace.lock().unwrap().len(), checkpoints);
 }

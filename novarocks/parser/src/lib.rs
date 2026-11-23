@@ -37,4 +37,4 @@ pub use error::{
 };
 pub use keyword::KeywordClass;
 pub use span::{LineCol, SYNTHETIC, Span};
-pub use syntax_call::{CanonicalCall, UnsupportedCallSyntax, canonical_call};
+pub use syntax_call::{CanonicalCall, UnsupportedCallSyntax, canonical_call, extract_call_name};

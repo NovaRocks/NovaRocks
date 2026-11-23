@@ -106,7 +106,7 @@ impl Scenario for ClientProgress {
         let mut failures = Vec::new();
         let primary = (|| -> Result<()> {
             let query = format!(
-                "SELECT REPEAT('q', {BASE_CELL_BYTES} + generate_series) AS payload FROM TABLE(generate_series(1, {ROWS})) ORDER BY generate_series"
+                "SELECT rpad('', {BASE_CELL_BYTES} + sequential_number, 'q') AS payload FROM TABLE(sequence(1, {ROWS})) ORDER BY sequential_number"
             );
             let post = actor.submit(&query)?;
             oracle.id = post.json()?["id"]
@@ -504,7 +504,7 @@ fn independent_progress(
     for (query, expected, expected_type) in [
         ("SELECT 1 AS value", 1, "integer"),
         (
-            "SELECT SUM(generate_series) AS value FROM TABLE(generate_series(1, 100))",
+            "SELECT SUM(sequential_number) AS value FROM TABLE(sequence(1, 100))",
             5050,
             "bigint",
         ),

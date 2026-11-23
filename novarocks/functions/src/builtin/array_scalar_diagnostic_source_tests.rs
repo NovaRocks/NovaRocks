@@ -26,7 +26,6 @@ use arrow_array::{Array, ArrayRef, Int32Array, ListArray, StringArray, StructArr
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::DataType;
 use arrow_schema::Field;
-use novarocks_type_contract::DecimalOverflowPolicy;
 use std::collections::HashMap;
 use std::{
     alloc::Layout,
@@ -160,12 +159,11 @@ fn causes() -> [KernelFailure; 7] {
     ]
 }
 fn contract() -> Arc<ScalarCallContract> {
-    // The actual installed MD5 author supplies immutable scalar identity for
+    // The actual installed SIGN author supplies immutable scalar identity for
     // diagnostic-only tests. These are not ARRAY producer/ABI acceptance probes.
-    let prepared = super::super::string_md5_owner::prepared_for_test_with_policy(
-        "md5",
-        &[FunctionValueType::new(DataType::Utf8, true)],
-        DecimalOverflowPolicy::OutputNull,
+    let prepared = super::super::numeric_elementary_owner::prepared_for_test(
+        "sign",
+        &[FunctionValueType::new(DataType::Int64, true)],
     )
     .unwrap();
     Arc::clone(prepared.contract())

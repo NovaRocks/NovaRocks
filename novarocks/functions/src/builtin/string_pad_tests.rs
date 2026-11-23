@@ -16,8 +16,7 @@
 // under the License.
 
 use super::super::string_pad_owner::{
-    effects, operation, owner_for_test, prepared_for_test_with_control,
-    prepared_for_test_with_policy,
+    operation, owner_for_test, prepared_for_test_with_control, prepared_for_test_with_policy,
 };
 use super::*;
 use crate::{
@@ -37,6 +36,38 @@ use std::{sync::Mutex, time::Duration};
 struct Control {
     trace: Mutex<Vec<u32>>,
     refusal: Option<(usize, KernelFailure)>,
+}
+
+#[test]
+fn string_pad_char_projection_writes_declared_spaces_without_a_padded_source() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    let row = PadRow::Text {
+        source: "é中",
+        fill: "xé",
+        char_width: Some(4),
+    };
+    for (length, expected) in [(1, "é"), (3, "é中 "), (4, "é中  "), (6, "xéé中  ")] {
+        let mut output = Vec::new();
+        let bytes = row
+            .render(
+                length,
+                true,
+                true,
+                CompactPadProjection {
+                    bytes: Some(&mut output),
+                    total: expected.len(),
+                    extent: 0,
+                    char_width: None,
+                    source_spaces: 0,
+                    work: &mut work,
+                },
+            )
+            .unwrap();
+        assert_eq!(bytes, Some(expected.len()));
+        assert_eq!(output, expected.as_bytes());
+    }
+    work.finish().unwrap();
 }
 impl KernelEvaluationControl for Control {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
@@ -243,7 +274,7 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
         assert!(canonical.effects().observable_effects.is_empty());
         assert_eq!(
             canonical.effects().own_row_error,
-            crate::FunctionIntrinsicRowError::NoRowError
+            crate::FunctionIntrinsicRowError::MayRaise
         );
         assert_eq!(
             canonical.effects().argument_control,
@@ -258,7 +289,10 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
             owner.binding_declaration().function_id().as_str(),
             format!("builtin.scalar/{name}/v1")
         );
-        assert_eq!(owner.implementation_declarations().len(), 1);
+        assert_eq!(
+            owner.implementation_declarations().len(),
+            if name == "lpad" { 3 } else { 2 }
+        );
         assert_eq!(
             owner.implementation_declarations()[0]
                 .implementation
@@ -267,9 +301,12 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
         );
         assert_eq!(
             owner.binding_declaration().overloads()[0].effects.as_ref(),
-            Some(&effects())
+            Some(&super::super::string_pad_owner::trino_effects())
         );
-        assert_eq!(owner.binding_declaration().overloads().len(), 1);
+        assert_eq!(
+            owner.binding_declaration().overloads().len(),
+            if name == "lpad" { 3 } else { 2 }
+        );
         for count in [0, 1, 2, 4] {
             let bad_args: Vec<_> = (0..count)
                 .map(|i| arguments[i.min(arity - 1)].clone())
@@ -466,8 +503,8 @@ fn string_pad_two_actual_profiles_preserve_independent_unicode_cycle_oracles() {
         ("aé", 4, "中ß", Some("中ßaé"), Some("aé中ß")),
         ("a\u{301}b", 2, "x", Some("a\u{301}"), Some("a\u{301}")),
         ("👩‍💻", 2, "x", Some("👩‍"), Some("👩‍")),
-        ("abc", 5, "", Some("abc"), Some("abc")),
-        ("abc", 2, "", Some("ab"), Some("ab")),
+        ("abc", 5, "", None, None),
+        ("abc", 2, "", None, None),
         ("", 3, "é中", Some("é中é"), Some("é中é")),
         ("x\0y", 2, "p", Some("x\0"), Some("x\0")),
         ("abc", 0, "x", Some(""), Some("")),
@@ -510,7 +547,35 @@ fn string_pad_two_actual_profiles_preserve_independent_unicode_cycle_oracles() {
                     .iter()
                     .map(|(_, _, _, l, r)| (if name == "lpad" { l } else { r }).map(str::to_owned))
                     .collect();
-                assert_eq!(output(&result), wanted);
+                let values = result
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(
+                    values
+                        .iter()
+                        .map(|text| text.map(str::to_owned))
+                        .collect::<Vec<_>>(),
+                    wanted
+                );
+                let error_rows: Vec<_> = wanted
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, text)| text.is_none().then_some(row))
+                    .collect();
+                assert_eq!(
+                    result
+                        .errors()
+                        .iter()
+                        .map(|error| error.selected_ordinal())
+                        .collect::<Vec<_>>(),
+                    error_rows
+                );
+                assert!(result.errors().iter().all(|error| error.reason()
+                    == crate::DataFailureReason::Domain(
+                        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
+                    )));
             }
         }
     }
@@ -720,7 +785,7 @@ fn string_pad_strict_null_and_inactive_payload_skip_work_but_do_not_mask_bad_met
 }
 
 #[test]
-fn string_pad_character_and_byte_size_gates_are_independent_inclusive_successful_null() {
+fn string_pad_character_and_byte_sizes_can_exceed_one_mib() {
     let empty = strings(vec![Some(""), Some(""), Some(""), Some("a"), Some("abc")]);
     let lengths = integers(vec![
         Some(MAX_PAD_LENGTH as i64),
@@ -747,12 +812,13 @@ fn string_pad_character_and_byte_size_gates_are_independent_inclusive_successful
             .unwrap();
         assert_eq!(values.value(0).len(), MAX_PAD_LENGTH);
         assert!(values.value(0).bytes().all(|byte| byte == b'x'));
-        assert!(values.is_null(1));
-        assert!(values.is_null(2));
+        assert_eq!(values.value(1).len(), MAX_PAD_LENGTH + 1);
+        assert_eq!(values.value(2).len(), MAX_PAD_LENGTH + 2);
         assert_eq!(values.value(3).len(), MAX_PAD_LENGTH - 1);
         assert_eq!(values.value(3).chars().count(), MAX_PAD_LENGTH / 2);
-        assert_eq!(values.value(4), "abc");
-        assert!(result.errors().is_empty());
+        assert!(values.is_null(4));
+        assert_eq!(result.errors().len(), 1);
+        assert_eq!(result.errors()[0].selected_ordinal(), 4);
     }
     assert!(output_capacity(0, 0).is_ok());
     assert_eq!(
@@ -900,7 +966,7 @@ fn string_pad_every_runtime_callback_preserves_all_seven_causes_and_failure_latc
 }
 
 #[test]
-fn string_pad_exact_unicode_byte_limit_and_truncated_multibyte_overflow_keep_null_semantics() {
+fn string_pad_exact_unicode_bytes_and_empty_fill_rejection() {
     let long_source = "🙂".repeat(MAX_PAD_LENGTH / 4 + 1);
     let text = strings(vec![Some(""), Some(&long_source)]);
     let lengths = integers(vec![
@@ -927,6 +993,7 @@ fn string_pad_exact_unicode_byte_limit_and_truncated_multibyte_overflow_keep_nul
         assert_eq!(values.value(0).chars().count(), MAX_PAD_LENGTH / 2);
         assert!(values.value(0).chars().all(|ch| ch == 'é'));
         assert!(values.is_null(1));
-        assert!(result.errors().is_empty());
+        assert_eq!(result.errors().len(), 1);
+        assert_eq!(result.errors()[0].selected_ordinal(), 1);
     }
 }

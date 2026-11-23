@@ -33,12 +33,14 @@ doctest = false
 novarocks-arrow-batch-codec.workspace = true
 novarocks-failure-contract.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
-url.workspace = true
 arrow-arith = "60.1.0"
 arrow-ord = "60.1.0"
 regex.workspace = true
+regex-syntax = "=0.8.8"
 # Reuse the locked Unicode property author for Trino's BMP decimal digits.
 icu_properties = "=2.1.2"
+icu_normalizer = { version = "=2.1.1", default-features = false, features = ["compiled_data", "utf8_iter"] }
+icu_casemap = "=2.1.1"
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

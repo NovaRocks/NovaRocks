@@ -42,7 +42,7 @@ impl KernelEvaluationControl for Trace {
 }
 #[test]
 fn string_measure_shared_all_profiles_seven_causes_actual_callbacks_and_failed_latch() {
-    for name in ["ascii", "length", "char_length"] {
+    for name in ["length"] {
         for (source, rows) in [
             (
                 Arc::new(StringArray::from(vec![

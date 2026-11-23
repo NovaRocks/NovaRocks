@@ -35,6 +35,13 @@ fn argument(dtype: DataType) -> FunctionArgument {
         constant: None,
     }
 }
+fn array_argument() -> FunctionArgument {
+    argument(DataType::List(Arc::new(arrow::datatypes::Field::new(
+        "item",
+        DataType::Int64,
+        true,
+    ))))
+}
 #[test]
 fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate() {
     let original = builtin_sql_function_catalog().snapshot();
@@ -73,19 +80,18 @@ fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate
         admitted.admitted_execution_abi = None;
         assert_eq!(admitted, original_binding);
     }
-    let repeat = [argument(DataType::Int64), argument(DataType::Int64)];
+    // ARRAY sort has an original selected declaration without a pure owner.
+    let array = [array_argument()];
     let bound = original
-        .resolve_scalar_binding("array_repeat", &repeat, &control)
+        .resolve_scalar_binding("array_sort", &array, &control)
         .unwrap();
     for scope in [scoped.as_ref(), again.as_ref()] {
         assert!(
-            matches!(scope.resolve_scalar_binding("array_repeat", &repeat, &control), Err(FunctionBindingError::UnavailableImplementation(ref id)) if id == &bound.selected.overload)
+            matches!(scope.resolve_scalar_binding("array_sort", &array, &control), Err(FunctionBindingError::UnavailableImplementation(ref id)) if id == &bound.selected.overload)
         );
     }
     // This uses the actual registered table owner, separately from scalar admission.
-    let bounds = [argument(DataType::List(Arc::new(
-        arrow::datatypes::Field::new("item", DataType::Int64, true),
-    )))];
+    let bounds = [array_argument()];
     let table = original
         .resolve_table_binding("unnest", &bounds, &control)
         .unwrap();
@@ -118,9 +124,9 @@ fn sql_presence_candidate_exact_selected_loan_cannot_bypass_missing_owner() {
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    let args = [argument(DataType::Int64), argument(DataType::Int64)];
+    let args = [array_argument()];
     let bound = original
-        .resolve_scalar_binding("array_repeat", &args, &control)
+        .resolve_scalar_binding("array_sort", &args, &control)
         .unwrap();
     let request = novarocks_functions::FunctionBindingRequest {
         arguments: &args,

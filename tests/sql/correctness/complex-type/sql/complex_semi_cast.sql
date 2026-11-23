@@ -26,7 +26,7 @@
 CREATE TABLE ${case_db}.row_util_base (
   k1 bigint
 ) WITH (format_version = 3);
-insert into ${case_db}.row_util_base select generate_series from TABLE(generate_series(0, 5000 - 1));
+insert into ${case_db}.row_util_base select generate_series from TABLE(sequence(0, 5000 - 1)) AS generate_series(generate_series);
 insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 10000
 insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 20000
 insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 40000
@@ -51,8 +51,8 @@ SELECT
     idx,
     json_object('k1': idx, 'k2': idx + 1),
     [idx, idx + 1, idx + 2, idx + 3],
-    map(0, idx, 1, idx + 1, 2, idx + 2),
-    struct(idx, idx + 1)
+    MAP(ARRAY[0, 1, 2], ARRAY[idx, idx + 1, idx + 2]),
+    ROW(idx, idx + 1)
 FROM ${case_db}.row_util;
 
 INSERT INTO ${case_db}.t1 (k1) SELECT idx from ${case_db}.row_util order by idx limit 1000;
@@ -105,26 +105,26 @@ select count(1) from ${case_db}.t1 where
 -- query 9
 -- CastMapExpr: IN/NOT IN with map literals
 select count(1) from ${case_db}.t1 where (
-    c_map in (map(0, 10, 1, 10 + 1, 2, 10 + 2), map(0, 1000, 1, 1000 + 1, 2, 1000 + 2), map(0, 10000, 1, 10000 + 1, 2, 10000 + 2))
-    OR c_map not in (map(0, 10, 1, 10 + 1, 2, 10 + 2), map(0, 1000, 1, 1000 + 1, 2, 1000 + 2), map(0, 10000, 1, 10000 + 1, 2, 10000 + 2))
+    c_map in (MAP(ARRAY[0, 1, 2], ARRAY[10, 10 + 1, 10 + 2]), MAP(ARRAY[0, 1, 2], ARRAY[1000, 1000 + 1, 1000 + 2]), MAP(ARRAY[0, 1, 2], ARRAY[10000, 10000 + 1, 10000 + 2]))
+    OR c_map not in (MAP(ARRAY[0, 1, 2], ARRAY[10, 10 + 1, 10 + 2]), MAP(ARRAY[0, 1, 2], ARRAY[1000, 1000 + 1, 1000 + 2]), MAP(ARRAY[0, 1, 2], ARRAY[10000, 10000 + 1, 10000 + 2]))
 );
 
 -- query 10
 -- CastMapExpr: cast from string key map
 select count(1) from ${case_db}.t1 where
     c_int > 0 and (
-    c_map in (cast (map(0, '10', 1, 11, 2, 12) as map<int, int>))
-    OR c_map in (cast (map(0, '20', 1, 21, 2, 22) as map<int, int>))
+    c_map in (cast (MAP(ARRAY[0, 1, 2], ARRAY['10', 11, 12]) as map<int, int>))
+    OR c_map in (cast (MAP(ARRAY[0, 1, 2], ARRAY['20', 21, 22]) as map<int, int>))
 );
 
 -- query 11
 -- CastMapExpr element access
 select count(1) from ${case_db}.t1 where
-    c_int = cast (map(0, '10', 1, 11, 2, 12) as map<int, int>)[0]
-    OR c_int = cast (map(0, '20', 1, 21, 2, 22) as map<int, int>)[0];
+    c_int = cast (MAP(ARRAY[0, 1, 2], ARRAY['10', 11, 12]) as map<int, int>)[0]
+    OR c_int = cast (MAP(ARRAY[0, 1, 2], ARRAY['20', 21, 22]) as map<int, int>)[0];
 
 -- query 12
 -- CastStructExpr: struct IN/NOT IN with struct literal
 select count(1) from ${case_db}.t1 where
-    c_struct in (struct(10, 11))
-    OR c_struct not in (struct(20, 21)) ;
+    c_struct in (ROW(10, 11))
+    OR c_struct not in (ROW(20, 21)) ;

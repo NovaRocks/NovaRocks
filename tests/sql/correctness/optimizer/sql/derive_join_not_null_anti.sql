@@ -25,10 +25,10 @@ CREATE TABLE ${case_db}.t_dnn_al (k INT, v INT);
 CREATE TABLE ${case_db}.t_dnn_ar (k INT);
 INSERT INTO ${case_db}.t_dnn_al
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END, generate_series
-    FROM TABLE(generate_series(1, 2000));
+    FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t_dnn_ar
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END
-    FROM TABLE(generate_series(1, 2000));
+    FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.t_dnn_al;
 ANALYZE ${case_db}.t_dnn_ar;
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'

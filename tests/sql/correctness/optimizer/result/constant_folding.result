@@ -1,6 +1,6 @@
 -- query 4
 -- types	integer
-_col0
+int_sum
 42096
 
 -- query 5
@@ -20,7 +20,7 @@ id
 
 -- query 13
 -- types	integer
-_col0
+int_sum
 42096
 
 -- query 14
@@ -29,12 +29,12 @@ id
 2
 
 -- query 17
--- types	varchar
+-- types	varchar(5)
 folded_upper
 MIXED
 
 -- query 18
--- legacy
+-- types	bigint
 folded_abs
 7
 
@@ -119,12 +119,12 @@ folded_decimal_overflow
 NULL
 
 -- query 36
--- types	varchar
+-- types	varchar(5)
 folded_upper
 MIXED
 
 -- query 37
--- legacy
+-- types	bigint
 folded_abs
 7
 

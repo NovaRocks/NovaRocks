@@ -94,7 +94,7 @@ fn row_counts_reject_null_and_negative_facts_at_their_use_site() {
     .unwrap();
     for (value, code) in [
         (None, "sql.analyze.invalid_argument"),
-        (Some(-1), "sql.analyze.numeric_value_out_of_range"),
+        (Some(-1), "sql.analyze.numeric_out_of_range"),
     ] {
         let error = parameters
             .with_contextual_values(query, vec![count(value)], &SqlCompileControl::unbounded())

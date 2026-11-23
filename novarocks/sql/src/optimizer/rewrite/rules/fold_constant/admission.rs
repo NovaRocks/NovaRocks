@@ -88,6 +88,9 @@ pub(super) fn compiled_unit_can_fold(
             PreparedPureKernel::Scalar(kernel)
                 if kernel.instance_inline_allocation_bytes() == 0 => {}
             PreparedPureKernel::ControlIntrinsic(_) => {}
+            // The optional optimizer has no original evaluation allocator.
+            // Ordered calls with known NULL are simplified before this step.
+            PreparedPureKernel::OrderedRegexp(_) => return Ok(false),
             _ => return Ok(false),
         }
         let effects = call.call_contract().effects();
@@ -158,7 +161,12 @@ pub(super) fn admit_result(
         ));
         let data = output.to_data();
         work.flush()?;
-        let pool = ConstantPool::try_new(field, arena_type.clone(), data, policy, phase, control)?;
+        let pool =
+            match ConstantPool::try_new(field, arena_type.clone(), data, policy, phase, control) {
+                Ok(pool) => pool,
+                Err(novarocks_functions::ConstantError::Limit(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
         work.step()?;
         Ok(Some(pool.value(0)?))
     })();

@@ -411,6 +411,10 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
             Arc::new(novarocks_query_application::view::QueryViewService::new()),
             trc_system_relations,
             Arc::clone(&inventory),
+            Arc::new(
+                crate::query_execution::required_constant_eval::test_required_constant_interpreter(
+                ),
+            ),
         )
     };
     drop(inventory);

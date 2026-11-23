@@ -41,9 +41,9 @@ INSERT INTO ${case_db}.t_fold_dates VALUES
 -- ---------------------------------------------------------------------------
 -- 1. Constant arithmetic collapses to one literal.
 -- ---------------------------------------------------------------------------
--- @explain_contains=[42096 AS
--- @explain_not_contains=[40000 + 2000 + 96 AS
-SELECT 40000 + 2000 + 96;
+-- @explain_contains=[42096 AS int_sum]
+-- @explain_not_contains=40000 + 2000
+SELECT 40000 + 2000 + 96 AS int_sum;
 
 -- ---------------------------------------------------------------------------
 -- 2. A constant function call collapses to its result literal. The DATE cast
@@ -69,24 +69,23 @@ SELECT id FROM ${case_db}.t_fold_dates WHERE dt = CAST('2020-01-01' AS DATE);
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = DATE '2020-01-01';
 
 -- ---------------------------------------------------------------------------
--- 5. Volatile builtins survive in the plan.
+-- 5. A volatile call stays in the plan.
 -- ---------------------------------------------------------------------------
 -- @skip_result_check=true
 -- @result_contains=[rand()]
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT rand();
-
--- @skip_result_check=true
--- @result_contains=[now()]
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT now();
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE' SELECT rand();
 
 -- ---------------------------------------------------------------------------
--- 6. Environment-sensitive builtins are immutable but read the process
---    timezone, so folding them on the frontend would move that read off the
---    backend. They must survive in the plan too.
+-- 6. Explicit epoch inputs can use the same frozen folding path as date_format.
+--    A failing selected epoch call keeps its original runtime data reason.
 -- ---------------------------------------------------------------------------
 -- @skip_result_check=true
--- @result_contains=[from_unixtime(1577836800)]
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT from_unixtime(1577836800);
+-- @result_not_contains=[from_unixtime(
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT from_unixtime(DOUBLE '1577836800', 'UTC');
+
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT TRY(from_unixtime(DOUBLE '0', 'Not/AZone'));
 
 -- ---------------------------------------------------------------------------
 -- 7. Integer division by zero is a typed error in folded and runtime paths.
@@ -100,10 +99,10 @@ SELECT 1 / 0;
 -- ---------------------------------------------------------------------------
 SET SESSION disable_optimizer_rules = 'FoldConstant';
 
--- @explain_contains=[40000 + 2000 + 96 AS
-SELECT 40000 + 2000 + 96;
+-- @explain_contains=40000 + 2000
+SELECT 40000 + 2000 + 96 AS int_sum;
 
--- @explain_contains=predicates: dt = CAST('2020-01-01' AS Date32)
+-- @explain_contains=predicate: dt = CAST('2020-01-01' AS Date32)
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = CAST('2020-01-01' AS DATE);
 
 -- ---------------------------------------------------------------------------
@@ -167,7 +166,7 @@ SELECT CAST('2020-01-02' AS DATE) AS folded_date_parse;
 SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS folded_decimal_rounding;
 
 -- @explain_contains=[NULL AS folded_decimal_overflow]
-SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
+SELECT TRY_CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
 
 -- ---------------------------------------------------------------------------
 -- 10. Disable folding and require the original operation to remain visible.
@@ -205,7 +204,7 @@ SELECT NOT CAST(NULL AS BOOLEAN) AS folded_not;
 -- @explain_contains= = CAST(
 SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decimal_compare;
 
--- @explain_contains= = CAST(
+-- @explain_contains=[CAST('2020-01-01' AS Date32) = 2020-01-01 AS folded_temporal_compare]
 SELECT CAST('2020-01-01' AS DATE) = DATE '2020-01-01' AS folded_temporal_compare;
 
 -- @explain_contains=IS NOT DISTINCT FROM
@@ -226,8 +225,8 @@ SELECT CAST('2020-01-02' AS DATE) AS folded_date_parse;
 -- @explain_contains=[CAST(CAST(12.345 AS
 SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS folded_decimal_rounding;
 
--- @explain_contains=[CAST(1000 AS
-SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
+-- @explain_contains=[CAST(1000 AS Decimal128(3, 0)) AS folded_decimal_overflow]
+SELECT TRY_CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
 
 -- ---------------------------------------------------------------------------
 -- 11. ERROR_IF_OVERFLOW still folds successful rounding, and an actual row

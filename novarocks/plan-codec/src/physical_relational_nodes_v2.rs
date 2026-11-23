@@ -555,8 +555,10 @@ fn prepare_encode(
             null_extended,
             ..
         } => {
-            if *kind == p::JoinKind::NullAwareLeftAnti && predicate.is_none() {
-                return Err(invalid("null-aware nested-loop predicate is absent"));
+            if matches!(kind, p::JoinKind::NullAwareLeftAnti | p::JoinKind::LeftMark)
+                && predicate.is_none()
+            {
+                return Err(invalid("three-valued nested-loop predicate is absent"));
             }
             model.request::<u32>(null_extended.len(), 1)?;
             model.refs = add(model.refs, null_extended.len())?;
@@ -828,8 +830,11 @@ fn prepare_decode(
             )?
         }
         Some(wire::physical_node::Kind::NestLoopJoin(v)) => {
-            if v.kind == wire::JoinKind::NullAwareLeftAnti as i32 && v.predicate_root.is_none() {
-                return Err(invalid("null-aware nested-loop predicate is absent"));
+            if (v.kind == wire::JoinKind::NullAwareLeftAnti as i32
+                || v.kind == wire::JoinKind::LeftMark as i32)
+                && v.predicate_root.is_none()
+            {
+                return Err(invalid("three-valued nested-loop predicate is absent"));
             }
             model.request::<p::ValueId>(v.null_extended_value_ids.len(), 2)?;
             model.refs = add(model.refs, v.null_extended_value_ids.len())?;

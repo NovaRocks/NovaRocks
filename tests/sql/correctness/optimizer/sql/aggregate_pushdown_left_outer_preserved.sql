@@ -30,9 +30,9 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_pd_lo_b;
 CREATE TABLE ${case_db}.t_agg_pd_lo_a (k INT, v INT);
 CREATE TABLE ${case_db}.t_agg_pd_lo_b (k INT);
 INSERT INTO ${case_db}.t_agg_pd_lo_a
-    SELECT generate_series % 100, generate_series FROM TABLE(generate_series(1, 20000));
+    SELECT generate_series % 100, generate_series FROM TABLE(sequence(1, 20000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t_agg_pd_lo_b
-    SELECT DISTINCT generate_series % 50 FROM TABLE(generate_series(1, 50));
+    SELECT DISTINCT generate_series % 50 FROM TABLE(sequence(1, 50)) AS generate_series(generate_series);
 ANALYZE ${case_db}.t_agg_pd_lo_a;
 ANALYZE ${case_db}.t_agg_pd_lo_b;
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'

@@ -1,4 +1,4 @@
 -- query 1
--- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
-sp_neg1	sp_neg2	sp_empty_d1	sp_empty_d4	rep2	rep_neg	left2	left_neg	right2	right_neg	lpad_empty_shrink	lpad_neg	rpad_empty_shrink	rpad_neg
-c	b	a	""	abab	""	ab	""	bc	""	a	NULL	a	NULL
+-- types	varchar(5)	varchar(3)	varchar(3)	varchar(3)	varchar(3)	varchar(3)	varchar	varchar	array(varchar(4))
+third_field	empty_separator_first	empty_separator_missing	first_two	last_two	empty_substring	lpad_shrink	rpad_shrink	trailing_empty_field
+c	a	NULL	ab	bc	""	a	a	["a","b",""]

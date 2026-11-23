@@ -136,7 +136,7 @@ pub struct TrinoDescriptionAction {
     pub target: Box<TrinoStatementAction>,
 }
 
-// Design: ADR-0256 (docs/adr/ADR-0256-prepared-sql-request-snapshots-and-semantic-authors.md)
+// Design: ADR-0258 (docs/adr/ADR-0258-prepared-sql-request-snapshots-and-semantic-authors.md)
 /// Open the request wrapper once, preserving the source, effective AST,
 /// parameter occurrences and original owner selected for the effective action.
 pub fn admit_trino_statement_request(

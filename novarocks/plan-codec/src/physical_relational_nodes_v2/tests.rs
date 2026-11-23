@@ -2273,6 +2273,66 @@ fn null_aware_scope_capacity_and_complete_nested_loop_predicate_are_accounted() 
 }
 
 #[test]
+fn nested_loop_left_mark_roundtrips_the_complete_predicate() {
+    let fixture = Fixture::new();
+    let control = Control::default();
+    let window = source(5);
+    let mut node = source(1);
+    node.kind = p::NodeKind::NestLoopJoin {
+        kind: p::JoinKind::LeftMark,
+        distribution: p::NestLoopJoinDistribution::Singleton,
+        predicate: Some(RootOrdinal::new(2)),
+        null_extended: Box::default(),
+    };
+    fixture.with_tokens(
+        &window,
+        &control,
+        |values, expressions, read, functions, aggregates| {
+            let (encoded, _) =
+                encode_relational_node(&node, values, expressions, SOURCE, limits()).unwrap();
+            let decode = |input| {
+                decode_relational_node(
+                    input,
+                    read,
+                    functions,
+                    aggregates,
+                    binding_limits(),
+                    SOURCE,
+                    limits(),
+                )
+            };
+            assert_eq!(decode(&encoded).unwrap().0, node);
+            let mut missing_predicate = encoded.clone();
+            let Some(wire::physical_node::Kind::NestLoopJoin(join)) =
+                missing_predicate.kind.as_mut()
+            else {
+                unreachable!()
+            };
+            assert_eq!(join.kind, wire::JoinKind::LeftMark as i32);
+            assert_eq!(
+                join.distribution,
+                wire::NestLoopJoinDistribution::Singleton as i32
+            );
+            assert_eq!(join.predicate_root, Some(2));
+            join.predicate_root = None;
+            assert!(matches!(
+                decode(&missing_predicate),
+                Err(Error::InvalidShape(_))
+            ));
+            let mut incomplete = node.clone();
+            let p::NodeKind::NestLoopJoin { predicate, .. } = &mut incomplete.kind else {
+                unreachable!()
+            };
+            *predicate = None;
+            assert!(matches!(
+                encode_relational_node(&incomplete, values, expressions, SOURCE, limits()),
+                Err(Error::InvalidShape(_))
+            ));
+        },
+    );
+}
+
+#[test]
 fn relational_window_calls_keep_actual_order_frame_addresses_and_optional_aggregate() {
     use novarocks_type_contract::{
         AggregateStateArgumentContract, AggregateStateFormatId, FunctionArgumentType, FunctionKind,

@@ -289,8 +289,6 @@ fn scalar_claim(
         effects: declared_effects(FunctionKind::Scalar, CallProofScope::Region(current.region)),
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         temporal_source: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
     }
 }
 fn make_unit(

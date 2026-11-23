@@ -24,8 +24,8 @@
 CREATE SCHEMA iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t (p BIGINT, id BIGINT, payload VARCHAR) WITH (partitioning = ARRAY['p']);
 INSERT INTO iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t
-SELECT CAST(11 AS BIGINT), generate_series, repeat('x', 2048)
-FROM TABLE(generate_series(1, 240000));
+SELECT CAST(11 AS BIGINT), generate_series, rpad('', 2048, 'x')
+FROM TABLE(sequence(1, 240000)) AS generate_series(generate_series);
 
 -- query 2
 SELECT count(*) > 1 AS spread, sum(record_count) AS rows_in_files

@@ -218,24 +218,34 @@ impl BinaryOperatorOwner {
             }
         } else {
             let [left, right] = inputs;
-            let common =
-                assignment_common_value_type(left, right, work).map_err(|error| match error {
-                    AssignmentCommonTypeError::Control(error) => {
-                        FunctionBindingError::Control(error)
-                    }
-                    AssignmentCommonTypeError::Construction(error) => {
-                        FunctionBindingError::ValueType(error.into())
-                    }
-                    AssignmentCommonTypeError::IncompatibleShape(_) => {
-                        FunctionBindingError::NoMatchingOverload
-                    }
-                })?;
-            let args = [
-                common.with_nullable(left_null)?,
-                common.with_nullable(right_null)?,
-            ];
+            let args = if matches!(left.data_type(), DataType::List(_))
+                && matches!(right.data_type(), DataType::List(_))
+            {
+                // The equality recipe widens only the actual signed elements.
+                // The two independently authored ARRAY layouts stay intact.
+                [left.clone(), right.clone()]
+            } else {
+                let common =
+                    assignment_common_value_type(left, right, work).map_err(
+                        |error| match error {
+                            AssignmentCommonTypeError::Control(error) => {
+                                FunctionBindingError::Control(error)
+                            }
+                            AssignmentCommonTypeError::Construction(error) => {
+                                FunctionBindingError::ValueType(error.into())
+                            }
+                            AssignmentCommonTypeError::IncompatibleShape(_) => {
+                                FunctionBindingError::NoMatchingOverload
+                            }
+                        },
+                    )?;
+                [
+                    common.with_nullable(left_null)?,
+                    common.with_nullable(right_null)?,
+                ]
+            };
             work.flush()?;
-            BinaryOperatorKernel::validate_comparison(
+            let nullable = BinaryOperatorKernel::validate_comparison(
                 self.operator,
                 [&args[0], &args[1]],
                 work.control(),
@@ -245,7 +255,7 @@ impl BinaryOperatorOwner {
                 arguments: args,
                 result: FunctionValueType::new(
                     DataType::Boolean,
-                    !self.operator.is_null_safe_comparison() && (left_null || right_null),
+                    !self.operator.is_null_safe_comparison() && nullable,
                 ),
             }
         };
@@ -404,14 +414,15 @@ impl FunctionBindingResolver for BinaryOperatorOwner {
                 )
             } else {
                 work.flush()?;
-                BinaryOperatorKernel::validate_comparison(self.operator, inputs, work.control())?;
+                let nullable = BinaryOperatorKernel::validate_comparison(
+                    self.operator,
+                    inputs,
+                    work.control(),
+                )?;
                 (
                     "(comparable T,comparable T)",
                     DataType::Boolean,
-                    !self.operator.is_null_safe_comparison()
-                        && (left.nullable()
-                            || right.nullable()
-                            || *left.data_type() == DataType::Null),
+                    !self.operator.is_null_safe_comparison() && nullable,
                 )
             };
             work.step()?;

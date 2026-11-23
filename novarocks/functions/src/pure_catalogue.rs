@@ -175,10 +175,19 @@ impl PureKernelAbi {
                             | ArgumentControl::SimpleCase
                             | ArgumentControl::SearchedCase
                             | ArgumentControl::TemporalSource(_)
+                            | ArgumentControl::OrderedRegexp
                     )
-                    && (base.own_row_error == FunctionIntrinsicRowError::NoRowError
-                        || (matches!(base.argument_control, ArgumentControl::TemporalSource(_))
-                            && base.own_row_error == FunctionIntrinsicRowError::MayRaise))
+                    && match base.argument_control {
+                        ArgumentControl::OrderedRegexp => {
+                            base.own_row_error == FunctionIntrinsicRowError::MayRaise
+                        }
+                        ArgumentControl::TemporalSource(_) => matches!(
+                            base.own_row_error,
+                            FunctionIntrinsicRowError::NoRowError
+                                | FunctionIntrinsicRowError::MayRaise
+                        ),
+                        _ => base.own_row_error == FunctionIntrinsicRowError::NoRowError,
+                    }
                     && base.instance_state == FunctionInstanceState::None
                     && base.observable_effects == ObservableEffects::NONE
                     && base.environment_dependencies.is_empty()
@@ -519,6 +528,7 @@ pub enum PreparedPureKernel {
     /// Exact typed control facts for LocalProgram's intrinsic controller;
     /// this variant never pretends to be an ordinary evaluated-argument CPU.
     ControlIntrinsic(Arc<FunctionCallContract>),
+    OrderedRegexp(crate::PreparedRegexp),
 }
 impl PreparedPureKernel {
     /// Borrow the exact call owned by this resolved lifecycle implementation.
@@ -533,6 +543,7 @@ impl PreparedPureKernel {
             Self::Window(kernel) => kernel.contract().call(),
             Self::Table(kernel) => kernel.contract().call(),
             Self::ControlIntrinsic(call) => call,
+            Self::OrderedRegexp(prepared) => prepared.call(),
         }
     }
 }
@@ -1560,7 +1571,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: PreparedPureKernel::ControlIntrinsic(call),
+            prepared: prepared_control_call(call)?,
         })
     }
 
@@ -1594,9 +1605,18 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: PreparedPureKernel::ControlIntrinsic(call),
+            prepared: prepared_control_call(call)?,
         })
     }
+}
+
+fn prepared_control_call(
+    call: Arc<FunctionCallContract>,
+) -> Result<PreparedPureKernel, FunctionSpecializationFailure> {
+    if call.effects().argument_control == ArgumentControl::OrderedRegexp {
+        return crate::PreparedRegexp::from_call(call).map(PreparedPureKernel::OrderedRegexp);
+    }
+    Ok(PreparedPureKernel::ControlIntrinsic(call))
 }
 
 type RegisteredParts<O> = (
@@ -1608,24 +1628,37 @@ fn register_owner<O: PureFunctionMetadataOwner + 'static>(
     owner: Arc<O>,
     allowed: &[PureKernelAbi],
 ) -> Result<RegisteredParts<O>, PureCatalogError> {
+    register_owner_with_declared_only(owner, allowed, &[])
+}
+
+fn register_owner_with_declared_only<O: PureFunctionMetadataOwner + 'static>(
+    owner: Arc<O>,
+    allowed: &[PureKernelAbi],
+    declared_only: &[FunctionOverloadId],
+) -> Result<RegisteredParts<O>, PureCatalogError> {
     let declaration = owner.binding_declaration();
     declaration.validate_complete_effects()?;
     let mut implementations = owner.implementation_declarations().to_vec();
     implementations.sort_unstable();
-    if implementations.len() != declaration.overloads().len()
-        || implementations
-            .windows(2)
-            .any(|rows| rows[0].overload == rows[1].overload)
-    {
-        return Err(PureCatalogError::ImplementationCoverage(
-            declaration.function_id().clone(),
-        ));
+    let coverage_error =
+        || PureCatalogError::ImplementationCoverage(declaration.function_id().clone());
+    if implementations.len() + declared_only.len() != declaration.overloads().len() {
+        return Err(coverage_error());
     }
-    for (overload, implementation) in declaration.overloads().iter().zip(&implementations) {
+    let mut remaining = implementations.iter().peekable();
+    for overload in declaration.overloads() {
+        if declared_only.contains(&overload.identity) {
+            if remaining
+                .peek()
+                .is_some_and(|installed| installed.overload == overload.identity)
+            {
+                return Err(coverage_error());
+            }
+            continue;
+        }
+        let implementation = remaining.next().ok_or_else(coverage_error)?;
         if overload.identity != implementation.overload {
-            return Err(PureCatalogError::ImplementationCoverage(
-                declaration.function_id().clone(),
-            ));
+            return Err(coverage_error());
         }
         if !allowed.contains(&implementation.abi)
             || (declaration.has_scalar_invocation_data(&overload.identity)?
@@ -1640,6 +1673,9 @@ fn register_owner<O: PureFunctionMetadataOwner + 'static>(
                 overload: overload.identity.clone(),
             });
         }
+    }
+    if remaining.next().is_some() {
+        return Err(coverage_error());
     }
     let declaration = Arc::new(declaration.clone());
     Ok((
@@ -1728,6 +1764,48 @@ ordinary_registration!(
     TableV1
 );
 impl FunctionDefinition {
+    /// A gap approved by the declaration's pure registration. Missing
+    /// attachments and unknown overload identities cannot supply this fact.
+    pub fn is_declared_only_pure_overload(&self, overload: &FunctionOverloadId) -> bool {
+        let Some(binding) = &self.binding else {
+            return false;
+        };
+        let Some(attachment) = &binding.pure else {
+            return false;
+        };
+        binding
+            .declaration
+            .overloads()
+            .iter()
+            .any(|item| &item.identity == overload)
+            && attachment
+                .implementations
+                .binary_search_by(|implementation| implementation.overload.cmp(overload))
+                .is_err()
+    }
+
+    /// Freeze explicitly declared capability gaps without adding a kernel to
+    /// the installed manifest. Ordinary registration still requires closure.
+    pub(crate) fn try_new_pure_scalar_with_declared_only<
+        O: PureFunctionMetadataOwner + PureScalarImplementation + 'static,
+    >(
+        name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        owner: Arc<O>,
+        declared_only: &[FunctionOverloadId],
+    ) -> Result<Self, PureCatalogError> {
+        let (registered, implementations) =
+            register_owner_with_declared_only(owner, &[PureKernelAbi::ScalarV1], declared_only)?;
+        attach_definition(
+            name,
+            visibility,
+            registered.clone(),
+            implementations,
+            Arc::new(ScalarOwner(registered)),
+            None,
+        )
+    }
+
     pub fn try_new_pure_scalar_higher_order<
         O: PureFunctionMetadataOwner
             + PureScalarImplementation
@@ -1840,12 +1918,17 @@ impl EngineFunctionCatalogBuilder {
             let attachment = binding.pure.as_ref().ok_or_else(|| {
                 PureCatalogError::MissingOwner(binding.declaration.function_id().clone())
             })?;
-            for (overload, implementation) in binding
-                .declaration
-                .overloads()
-                .iter()
-                .zip(attachment.implementations.iter())
-            {
+            for implementation in attachment.implementations.iter() {
+                let overload = binding
+                    .declaration
+                    .overloads()
+                    .iter()
+                    .find(|overload| overload.identity == implementation.overload)
+                    .ok_or_else(|| {
+                        PureCatalogError::ImplementationCoverage(
+                            binding.declaration.function_id().clone(),
+                        )
+                    })?;
                 let base = binding
                     .declaration
                     .effect_declaration(&implementation.overload)?;
@@ -2051,11 +2134,8 @@ fn lookup_installed_overload<'a>(
         .implementations
         .binary_search_by(|record| record.overload.cmp(overload));
     work.step()?;
-    let implementation_index = index.map_err(|_| {
-        FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownOverload(
-            overload.clone(),
-        ))
-    })?;
+    let implementation_index = index
+        .map_err(|_| FunctionSpecializationFailure::MissingPureImplementation(overload.clone()))?;
     Ok(PureOverloadDeclaration {
         attachment,
         implementation_index,

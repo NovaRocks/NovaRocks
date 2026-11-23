@@ -188,19 +188,19 @@ wv
 [1.23,2.35,3.46]
 
 -- query 23
--- legacy
+-- types	bigint
 _col0
-7698522700
+16455694905
 
 -- query 24
--- legacy
+-- types	bigint
 _col0
-9489753355
+372576410
 
 -- query 25
--- legacy
+-- types	bigint
 _col0
--2908793330
+11202951620
 
 -- query 26
 -- legacy
@@ -743,19 +743,19 @@ wv
 NULL
 
 -- query 88
--- legacy
+-- types	bigint
 _col0
-6158818160
+13164555924
 
 -- query 89
--- legacy
+-- types	bigint
 _col0
-7591802684
+298061128
 
 -- query 90
--- legacy
+-- types	bigint
 _col0
--2327034664
+8962361296
 
 -- query 91
 -- legacy
@@ -1298,19 +1298,19 @@ NULL
 NULL
 
 -- query 153
--- legacy
+-- types	bigint
 _col0
-4619113620
+9873416943
 
 -- query 154
--- legacy
+-- types	bigint
 _col0
-5693852013
+223545846
 
 -- query 155
--- legacy
+-- types	bigint
 _col0
--1745275998
+6721770972
 
 -- query 156
 -- legacy
@@ -1592,19 +1592,19 @@ NULL
 [1.23,2.35,3.46]
 
 -- query 194
--- legacy
+-- types	bigint
 _col0
-6158818160
+13164555924
 
 -- query 195
--- legacy
+-- types	bigint
 _col0
-7591802684
+298061128
 
 -- query 196
--- legacy
+-- types	bigint
 _col0
--2327034664
+8962361296
 
 -- query 197
 -- legacy

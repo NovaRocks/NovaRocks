@@ -50,8 +50,8 @@ SELECT
     d76_0,
     CAST(d76_0 AS VARCHAR) as d76_string,
     LENGTH(CAST(d76_0 AS VARCHAR)) as string_length,
-    STRLEFT(CAST(d76_0 AS VARCHAR), 10) as left_10_chars,
-    STRRIGHT(CAST(d76_0 AS VARCHAR), 10) as right_10_chars,
+    SUBSTR(CAST(d76_0 AS VARCHAR), 1, 10) as left_10_chars,
+    SUBSTR(CAST(d76_0 AS VARCHAR), GREATEST(1, LENGTH(CAST(d76_0 AS VARCHAR)) - 9), 10) as right_10_chars,
     SUBSTR(CAST(d76_0 AS VARCHAR), 1, 20) as first_20_chars
 FROM ${case_db}.decimal_string_test
 ORDER BY id;
@@ -62,8 +62,8 @@ SELECT
     id,
     d50_15,
     CAST(d50_15 AS VARCHAR) as decimal_string,
-    LOCATE('.', CAST(d50_15 AS VARCHAR)) as decimal_point_position,
-    LOCATE('-', CAST(d50_15 AS VARCHAR)) as negative_sign_position,
+    STRPOS(CAST(d50_15 AS VARCHAR), '.') as decimal_point_position,
+    STRPOS(CAST(d50_15 AS VARCHAR), '-') as negative_sign_position,
     CASE WHEN CAST(d50_15 AS VARCHAR) LIKE '%-%.%' THEN 'NEGATIVE_DECIMAL'
          WHEN CAST(d50_15 AS VARCHAR) LIKE '%.%' THEN 'POSITIVE_DECIMAL'
          WHEN CAST(d50_15 AS VARCHAR) LIKE '-%' THEN 'NEGATIVE_INTEGER'
@@ -79,9 +79,9 @@ SELECT
     d76_20,
     CAST(d76_20 AS VARCHAR) as decimal_string,
     REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '^(-?[0-9]+)', 1) as integer_part,
-    REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '\.([0-9]+)$', 1) as decimal_part,
-    REGEXP_REPLACE(CAST(d76_20 AS VARCHAR), '0+$', '') as trimmed_trailing_zeros,
-    REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '^(-?[0-9]+\.[0-9]{0,5})', 1) as first_5_decimal_places
+    REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '\.([0-9]+)\z', 1) as decimal_part,
+    REGEXP_REPLACE(CAST(d76_20 AS VARCHAR), '0+\z', '') as trimmed_trailing_zeros,
+    REGEXP_EXTRACT(CAST(d76_20 AS VARCHAR), '^(-?[0-9]+\.[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?)', 1) as first_5_decimal_places
 FROM ${case_db}.decimal_string_test
 WHERE d76_20 != 0
 ORDER BY id;
@@ -113,7 +113,7 @@ ORDER BY id;
 SELECT
     'Test7_CASE_SPECIAL_FORMATTING' as test_name,
     id,
-    category,
+    CAST(category AS VARCHAR(10)) as category,
     d50_15,
     UPPER(CONCAT(category, '_', CAST(d50_15 AS VARCHAR))) as upper_formatted,
     LOWER(CONCAT(category, '_', CAST(d50_15 AS VARCHAR))) as lower_formatted

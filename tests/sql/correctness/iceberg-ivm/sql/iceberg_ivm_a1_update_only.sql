@@ -47,7 +47,7 @@ SELECT
   generate_series AS id,
   CASE WHEN generate_series % 3 = 0 THEN 'EMEA' ELSE 'APAC' END AS region,
   (generate_series * 7 % 1000) + 1 AS amount
-FROM TABLE(generate_series(1, 1000));
+FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 
 -- query 3
 -- @skip_result_check=true

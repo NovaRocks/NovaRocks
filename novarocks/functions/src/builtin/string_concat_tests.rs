@@ -79,6 +79,23 @@ impl PureCompileControl for CompileControl {
 fn source(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Utf8, nullable)
 }
+
+#[test]
+fn string_concat_char_padding_uses_code_points_only_before_nonempty_right() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    assert_eq!(
+        char_concat_padding("é中".as_bytes(), b"x", 4, &mut work).unwrap(),
+        2
+    );
+    assert_eq!(
+        char_concat_padding("é中".as_bytes(), b"", 4, &mut work).unwrap(),
+        0
+    );
+    assert_eq!(char_concat_padding(b"", b"x", 4, &mut work).unwrap(), 4);
+    assert!(char_concat_padding(b"two", b"x", 2, &mut work).is_err());
+}
+
 fn instance(sources: &[FunctionValueType]) -> ScalarEvaluationInstance {
     ScalarEvaluationInstance::instantiate(
         prepared_for_test_with_policy("concat", sources, DecimalOverflowPolicy::OutputNull)
@@ -138,7 +155,7 @@ fn string_concat_variadic_unicode_null_and_policy_oracles_preserve_actual_minimu
         DecimalOverflowPolicy::ReportError,
     ] {
         for nullable in [false, true] {
-            for count in [1, 2, 4] {
+            for count in [2, 4] {
                 let array = strings(vec![Some("é👩‍💻\0"), Some("")]);
                 let types = vec![source(nullable); count];
                 let prepared = prepared_for_test_with_policy("concat", &types, policy).unwrap();
@@ -150,7 +167,6 @@ fn string_concat_variadic_unicode_null_and_policy_oracles_preserve_actual_minimu
                     .evaluate(Selection::all(2), &arguments, &Control::default())
                     .unwrap();
                 let expected = match count {
-                    1 => "é👩‍💻\0",
                     2 => "é👩‍💻\0é👩‍💻\0",
                     4 => "é👩‍💻\0é👩‍💻\0é👩‍💻\0é👩‍💻\0",
                     _ => unreachable!(),
@@ -256,8 +272,8 @@ fn string_concat_independent_sliced_compact_scalar_and_constant_addresses_keep_o
 }
 
 #[test]
-fn string_concat_original_one_mib_row_boundary_is_successful_null_not_resource_failure() {
-    // The expected row limit is authored from the legacy 1_048_576 rule.
+fn string_concat_raises_typed_row_errors_beyond_the_one_mib_limit() {
+    // Trino permits exactly 1 MiB, including complete UTF-8 characters.
     let at = "a".repeat(1_048_576);
     let below = "b".repeat(1_048_575);
     let a = strings(vec![Some(&at), Some(&below), Some(&at)]);
@@ -267,7 +283,19 @@ fn string_concat_original_one_mib_row_boundary_is_successful_null_not_resource_f
     let result = kernel
         .evaluate(Selection::all(3), &arguments, &Control::default())
         .unwrap();
-    assert!(result.errors().is_empty());
+    assert_eq!(
+        result
+            .errors()
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.reason()))
+            .collect::<Vec<_>>(),
+        [1, 2].map(|row| (
+            row,
+            crate::DataFailureReason::Domain(
+                novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
+            )
+        )),
+    );
     let values = result
         .values()
         .as_any()
@@ -320,10 +348,14 @@ fn string_concat_hidden_null_and_inactive_payloads_do_not_create_copy_work() {
 #[test]
 fn string_concat_empty_child_error_and_wrong_shapes_never_publish_or_retry() {
     let array = strings(vec![Some("A")]);
-    let arguments = [EvaluatedArgument::Column(&array)];
+    let empty_text = strings(vec![Some("")]);
+    let arguments = [
+        EvaluatedArgument::Column(&array),
+        EvaluatedArgument::Column(&empty_text),
+    ];
     let rows = [];
     let empty = Selection::try_sparse(1, &rows).unwrap();
-    let mut kernel = instance(&[source(false)]);
+    let mut kernel = instance(&[source(false), source(false)]);
     let result = kernel
         .evaluate(empty, &arguments, &Control::default())
         .unwrap();
@@ -361,15 +393,21 @@ fn string_concat_empty_child_error_and_wrong_shapes_never_publish_or_retry() {
     );
     assert!(after.trace.lock().unwrap().is_empty());
     let wrong = Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef;
-    let arguments = [EvaluatedArgument::Column(&wrong)];
-    let mut kernel = instance(&[source(false)]);
+    let arguments = [
+        EvaluatedArgument::Column(&wrong),
+        EvaluatedArgument::Column(&empty_text),
+    ];
+    let mut kernel = instance(&[source(false), source(false)]);
     assert!(matches!(
         kernel.evaluate(selection, &arguments, &Control::default()),
         Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let hidden_null = strings(vec![None]);
-    let arguments = [EvaluatedArgument::Column(&hidden_null)];
-    let mut kernel = instance(&[source(false)]);
+    let arguments = [
+        EvaluatedArgument::Column(&hidden_null),
+        EvaluatedArgument::Column(&empty_text),
+    ];
+    let mut kernel = instance(&[source(false), source(false)]);
     assert!(matches!(
         kernel.evaluate(selection, &arguments, &Control::default()),
         Err(ref cause) if crate::kernel_control::test_contract::input(cause)
@@ -445,14 +483,15 @@ fn string_concat_runtime_small_and_argument_and_copy_quantum_keep_first_cause_an
 fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources() {
     for name in ["concat"] {
         let owner = owner_for_test(name);
-        let arguments = [FunctionArgument::Value {
+        let argument = FunctionArgument::Value {
             value_type: source(false),
             constant: None,
-        }];
+        };
+        let arguments = [argument.clone(), argument];
         let request = FunctionBindingRequest {
             expected_result_type: None,
             arguments: &arguments,
-            logical_argument_count: 1,
+            logical_argument_count: 2,
         };
         let selected = Arc::new(
             owner
@@ -468,7 +507,10 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
             region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
-        let uses = [Some(ExpressionUseId::new(42))];
+        let uses = [
+            Some(ExpressionUseId::new(42)),
+            Some(ExpressionUseId::new(43)),
+        ];
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
             context: context.into(),
@@ -520,7 +562,7 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
         assert!(canonical.effects().observable_effects.is_empty());
         assert_eq!(
             canonical.effects().own_row_error,
-            crate::FunctionIntrinsicRowError::NoRowError
+            crate::FunctionIntrinsicRowError::MayRaise
         );
         assert_eq!(
             canonical.effects().argument_control,
@@ -535,16 +577,25 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
             owner.binding_declaration().function_id().as_str(),
             "builtin.scalar/concat/v1"
         );
-        assert_eq!(owner.implementation_declarations().len(), 1);
+        assert_eq!(owner.implementation_declarations().len(), 6);
+        let string_implementation = owner
+            .implementation_declarations()
+            .iter()
+            .find(|implementation| implementation.overload == selected.overload)
+            .unwrap();
         assert_eq!(
-            owner.implementation_declarations()[0]
-                .implementation
-                .as_str(),
+            string_implementation.implementation.as_str(),
             "builtin.scalar/concat/selected-v1"
         );
+        let string_overload = owner
+            .binding_declaration()
+            .overloads()
+            .iter()
+            .find(|overload| overload.identity == selected.overload)
+            .unwrap();
         assert_eq!(
-            owner.binding_declaration().overloads()[0].effects.as_ref(),
-            Some(&effects(ConcatKind::String))
+            string_overload.effects.as_ref(),
+            Some(&effects(ConcatKind::TrinoScalar))
         );
         let pattern_arguments = [];
         assert!(
@@ -626,14 +677,6 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Binary, true),
-            FunctionValueType::from_legacy_declared_projection(
-                DataType::List(Arc::new(arrow_schema::Field::new(
-                    "item",
-                    DataType::Int64,
-                    true,
-                ))),
-                true,
-            ),
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap(),
         ] {
@@ -647,13 +690,13 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
 
 #[test]
 fn string_concat_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
-    for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
+    for ty in [source(true), FunctionValueType::new(DataType::Int64, true)] {
         let good = CompileControl::default();
         let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "concat",
-                std::slice::from_ref(&ty),
+                &[ty.clone(), ty.clone()],
                 DecimalOverflowPolicy::OutputNull,
                 &good
             )
@@ -674,7 +717,7 @@ fn string_concat_compile_success_and_ordinary_tail_preserve_all_callback_causes(
                 };
                 let actual = prepared_for_test_with_control(
                     "concat",
-                    std::slice::from_ref(&ty),
+                    &[ty.clone(), ty.clone()],
                     DecimalOverflowPolicy::OutputNull,
                     &control,
                 )
@@ -736,7 +779,14 @@ fn string_concat_complete_success_traces_and_bounded_all_seven_causes() {
             let selection = Selection::all(arrays[0].len());
             let good = Control::default();
             let result = make().evaluate(selection, &arguments, &good).unwrap();
-            let actual = output(&result);
+            assert_eq!(result.errors().len(), usize::from(case == 4));
+            let actual = result
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>();
             let trace = good.trace.lock().unwrap().clone();
             println!(
                 "C12-P2 trace name=concat policy={policy:?} case={case} output={actual:?} units={trace:?}"

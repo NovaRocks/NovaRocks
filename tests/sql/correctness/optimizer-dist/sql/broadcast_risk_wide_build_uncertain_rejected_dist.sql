@@ -21,9 +21,9 @@ USE ${case_db};
 CREATE TABLE probe_1m_exact (k INT);
 CREATE TABLE build_wide_unanalyzed (k INT, pad VARCHAR(500)) WITH (statistics_collect_on_write = false);
 INSERT INTO probe_1m_exact
-    SELECT generate_series FROM TABLE(generate_series(1, 1000000));
+    SELECT generate_series FROM TABLE(sequence(1, 1000000)) AS generate_series(generate_series);
 INSERT INTO build_wide_unanalyzed
-    SELECT generate_series, repeat('z', 500) FROM TABLE(generate_series(1, 200000));
+    SELECT generate_series, rpad('', 500, 'z') FROM TABLE(sequence(1, 200000)) AS generate_series(generate_series);
 ANALYZE probe_1m_exact;
 SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (PARTITIONED
@@ -60,11 +60,11 @@ SELECT COUNT() AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k 
 EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH p AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 1000))
+    FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series)
 ),
 b AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 10))
+    FROM TABLE(sequence(1, 10)) AS generate_series(generate_series)
 )
 SELECT COUNT() AS cnt
 FROM p JOIN b ON p.k = b.k;

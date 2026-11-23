@@ -105,9 +105,9 @@ pub(super) fn evaluate_string_replace<'a>(
     let result = (|| {
         let types = input.contract().selected().argument_types.as_ref();
         let arguments = input.arguments();
-        if types.len() != 3 || types.len() != arguments.len() {
+        if !matches!(types.len(), 2 | 3) || types.len() != arguments.len() {
             return Err(invalid(
-                "replace requires its exact three checked arguments",
+                "replace requires two checked arguments and an optional replacement",
             ));
         }
         for ty in types {
@@ -126,7 +126,6 @@ pub(super) fn evaluate_string_replace<'a>(
         let target = input.contract().result_type();
         if target.logical_type() != ValueLogicalType::Physical
             || target.data_type() != &DataType::Utf8
-            || !target.nullable()
         {
             return Err(invalid(
                 "replace differs from its exact installed result profile",
@@ -142,11 +141,16 @@ pub(super) fn evaluate_string_replace<'a>(
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| internal("replace selected needle is not Utf8"))?;
-        let replacements = arguments[2]
-            .array()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| internal("replace selected replacement is not Utf8"))?;
+        let replacements = arguments
+            .get(2)
+            .map(|argument| {
+                argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| internal("replace selected replacement is not Utf8"))
+            })
+            .transpose()?;
         let selected_texts = |ordinal,
                               batch_row,
                               work: &mut EvaluationCheckpoints<'_>|
@@ -178,7 +182,7 @@ pub(super) fn evaluate_string_replace<'a>(
             Ok(Some([
                 strings.value(rows[0]),
                 needles.value(rows[1]),
-                replacements.value(rows[2]),
+                replacements.map_or("", |values| values.value(rows[2])),
             ]))
         };
         let selection = input.selection();

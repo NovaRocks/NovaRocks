@@ -70,8 +70,8 @@ message ExpressionCallClaim {
   CallEffects effects = 3;
   optional DecimalOverflowPolicy decimal_overflow_policy = 4;
   TemporalSourcePlan temporal_source = 5;
-  optional RegexpCountPatternSource regexp_count_pattern_source = 6;
-  optional ToBase64ByteSource to_base64_byte_source = 7;
+  reserved 6, 7;
+  reserved "regexp_count_pattern_source", "to_base64_byte_source";
 }
 message RelationEffectId {
   optional uint32 call_id = 1;
@@ -100,10 +100,6 @@ message FrozenCall {
   // to CallEffects or ALLOW_THROW_EXCEPTION. Typed
   // decode rejects absence, UNSPECIFIED and unknown values without a default.
   optional DecimalOverflowPolicy decimal_overflow_policy = 4;
-
-  // Explicit presence preserves proved dynamic versus missing source facts.
-
-  // Required positive source receipt only for exact TO_BASE64 calls.
 
   // Exact original writer Value scope. Required only for WriterPartial/Final;
   // its root domain is retained, while it is not an expression invocation.
@@ -199,6 +195,8 @@ enum SimpleArgumentControl {
   SIMPLE_ARGUMENT_CONTROL_TABLE = 9;
   SIMPLE_ARGUMENT_CONTROL_NO_ARGUMENTS = 10;
   SIMPLE_ARGUMENT_CONTROL_TRY = 11;
+  // Demand the original arguments in order and convert the pattern at ordinal 1.
+  SIMPLE_ARGUMENT_CONTROL_ORDERED_REGEXP = 12;
 }
 enum InstanceState {
   INSTANCE_STATE_UNSPECIFIED = 0;
@@ -303,16 +301,4 @@ message TemporalSourcePlan {
   novarocks.physical_control_v2.TemporalSourceShape shape = 1;
   repeated TemporalCastKind cast_chain = 2;
   repeated TemporalSourceOccurrence sources = 3;
-}
-
-// Actual emitted native-v1 source; no lexical Literal/known-constant inference.
-enum RegexpCountPatternSource {
-  REGEXP_COUNT_DYNAMIC = 0;
-  REGEXP_COUNT_NATIVE_V1_UTF8_LITERAL_WHEN_PRESENT = 1;
-}
-
-// Ordinary and missing source facts are distinct.
-enum ToBase64ByteSource {
-  TO_BASE64_ORDINARY = 0;
-  TO_BASE64_NATIVE_V1_ENCRYPTION_LATIN1 = 1;
 }

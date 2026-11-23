@@ -19,16 +19,20 @@
 -- @order_sensitive=true
 
 -- query 1
-SELECT array_sortby([30,10,20], [NULL,NULL,NULL]) AS ties;
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, ordinal) AS ties
+FROM (VALUES (1, 30, NULL), (2, 10, NULL), (3, 20, NULL)) AS input_rows(ordinal, payload_value, k1);
 
 -- query 2
-SELECT array_sortby([30,10,20], [NULL,NULL,NULL], [3,1,2]) AS refined;
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS refined
+FROM (VALUES (1, 30, NULL, 3), (2, 10, NULL, 1), (3, 20, NULL, 2)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 3
-SELECT array_sortby([30,10,20], [3,1,2], [NULL,NULL,NULL]) AS trailing_null_key;
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS trailing_null_key
+FROM (VALUES (1, 30, 3, NULL), (2, 10, 1, NULL), (3, 20, 2, NULL)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 4
 SELECT array_sort([NULL,NULL,NULL]) AS sorted, array_min([NULL,NULL,NULL]) AS smallest, array_max([NULL,NULL,NULL]) AS largest;
 
 -- query 5
-SELECT array_sortby([NULL,8,7], [NULL,NULL,NULL], [3,1,2]) AS null_value_moves;
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS null_value_moves
+FROM (VALUES (1, NULL, NULL, 3), (2, 8, NULL, 1), (3, 7, NULL, 2)) AS input_rows(ordinal, payload_value, k1, k2);

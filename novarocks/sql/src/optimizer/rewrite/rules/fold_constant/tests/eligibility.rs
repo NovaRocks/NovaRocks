@@ -134,7 +134,7 @@ fn does_not_fold_distinct_function_call() {
 
 #[test]
 fn does_not_fold_denylisted_function_even_when_marked_immutable() {
-    for name in ["from_unixtime", "FROM_UNIXTIME", "now"] {
+    for name in ["get_variant_date", "GET_VARIANT_DATE", "get_variant_time"] {
         let mut fixture = Fixture::new();
         let one = fixture.int_literal(1);
         let call = fixture.function_call(
@@ -145,32 +145,6 @@ fn does_not_fold_denylisted_function_even_when_marked_immutable() {
             // what must stop this fold.
             FunctionVolatility::Immutable,
             DataType::Int64,
-            false,
-        );
-        let plan = project(call);
-
-        assert!(
-            matches!(fixture.apply(plan), RewriteResult::Unchanged),
-            "{name} must not be folded"
-        );
-        assert_eq!(fixture.calls(), 0, "{name} must not create a fold unit");
-    }
-}
-
-#[test]
-fn does_not_fold_byte_carrying_string_function() {
-    // These carry raw bytes inside a Utf8 value. Folding one turns it into
-    // an ordinary string literal, after which a consumer such as
-    // `to_base64` reads different bytes than the runtime produced.
-    for name in ["from_base64", "FROM_BASE64", "unhex"] {
-        let mut fixture = Fixture::new();
-        let one = fixture.int_literal(1);
-        let call = fixture.function_call(
-            name,
-            vec![one],
-            false,
-            FunctionVolatility::Immutable,
-            DataType::Utf8,
             false,
         );
         let plan = project(call);

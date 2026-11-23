@@ -19,7 +19,9 @@
 
 #[cfg(test)]
 use arrow::datatypes::{DataType, Field};
-use novarocks_parser::{Span, ast};
+#[cfg(test)]
+use novarocks_parser::Span;
+use novarocks_parser::ast;
 #[cfg(test)]
 use novarocks_types::logical::LogicalType;
 #[cfg(test)]
@@ -27,9 +29,12 @@ use novarocks_types::logical::field_with_logical_type;
 use novarocks_types::schema::SqlType;
 
 use super::{AnalyzerContext, scope::AnalyzerScope};
-use crate::analysis::{ExprKind, TypedExpr};
+#[cfg(test)]
+use crate::analysis::ExprKind;
+use crate::analysis::TypedExpr;
 use crate::analyze_error::AnalyzeError;
 
+#[cfg(test)]
 #[path = "logical_container.rs"]
 mod container;
 
@@ -233,6 +238,7 @@ mod scalar_domain_tests {
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
             prepared_parameters: None,
+            table_sequence: None,
             constant_policy: crate::constant::test_constant_policy(),
             control,
             catalog: &Catalog,
@@ -244,7 +250,6 @@ mod scalar_domain_tests {
             ctes: Default::default(),
             pending_ctes: Default::default(),
             next_subquery_id: Cell::new(0),
-            next_lambda_slot_id: Cell::new(0),
             collected_subqueries: RefCell::new(Vec::new()),
             cte_registry: RefCell::new(Default::default()),
         }
@@ -258,7 +263,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "with q as (select CAST([] AS ARRAY<json>) as j) select array_sortby(j,[1]) from q"
+                "with q as (select CAST([] AS ARRAY<json>) as j) select concat(j, CAST(ARRAY[] AS ARRAY(JSON))) from q"
             ),
             vec![Some(SqlType::Array(Box::new(SqlType::Json)))],
         );
@@ -377,16 +382,23 @@ mod scalar_domain_tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
-        let bound = super::super::resolve_expr::resolved_scalar_call_at(
-            context.function_catalog,
-            "row",
-            vec![value],
-            Span::new(0, 0),
-            context.sql_semantics.sql_mode().decimal_overflow_policy(),
-            context.constant_policy,
-            context.control,
-        )
-        .unwrap();
+        let call = context
+            .type_scalar_call(
+                novarocks_expression::typing::NodeShape::Row,
+                vec![value],
+                Span::new(0, 0),
+            )
+            .unwrap();
+        let bound = TypedExpr {
+            value_type: call.value_type().clone(),
+            kind: ExprKind::FunctionCall {
+                name: "row".to_owned(),
+                args: call.args.into(),
+                distinct: false,
+                volatility: call.binding.semantics.volatility,
+                binding: call.binding,
+            },
+        };
         (context, scope, bound)
     }
     fn typed_list_source(json: bool, item_nullable: bool) -> TypedExpr {
@@ -959,7 +971,7 @@ mod scalar_domain_tests {
         }
         // A NULL default cannot erase a known sibling in a partial Struct or
         // a nested Map value. SqlType has no complete Null-bearing counterpart.
-        let sql = "with q as (select row(null,map('k',b)) as r from t) select lead(r,1,null) over (),lag(r,1,null) over () from q";
+        let sql = "with q as (select row(null,map(ARRAY['k'],ARRAY[b])) as r from t) select lead(r,1,null) over (),lag(r,1,null) over () from q";
         for expression in output_expressions(sql) {
             let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
                 unreachable!()
@@ -1587,7 +1599,7 @@ mod scalar_domain_tests {
     fn m07_scalar_nested_wrappers_and_selectors_keep_exact_value_origins() {
         assert_eq!(
             output_domains(
-                "select element_at([b,null],1),element_at(map(1,h),1),element_at(map_values(map(1,p)),1),named_struct('value',b).value from t"
+                "select element_at([b,null],1),element_at(map(ARRAY[1], ARRAY[h]),1),element_at(map_values(map(ARRAY[1], ARRAY[p])),1),r.bitmap from t"
             ),
             vec![
                 Some(SqlType::Bitmap),
@@ -1598,7 +1610,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "select element_at(array_slice([h],1),1),element_at(array_sortby([b],[1]),1),element_at(map_from_arrays([cast(1 as bigint)],[p]),1) from t"
+                "select element_at(slice(ARRAY[h],1,1),1),element_at(ARRAY[b],1),element_at(map(ARRAY[cast(1 as bigint)],ARRAY[p]),1) from t"
             ),
             vec![
                 Some(SqlType::Hll),
@@ -1618,8 +1630,7 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_scalar_null_companion_retains_actual_null_and_independent_marker() {
-        let expressions =
-            output_expressions("select row(null,b),named_struct('missing',null,'value',p) from t");
+        let expressions = output_expressions("select ROW(NULL,b),ROW(NULL,p) from t");
         for (expression, marker, names) in [
             (
                 &expressions[0],
@@ -1629,7 +1640,7 @@ mod scalar_domain_tests {
             (
                 &expressions[1],
                 novarocks_type_contract::ValueLogicalType::Percentile,
-                ["missing", "value"],
+                ["col1", "col2"],
             ),
         ] {
             let DataType::Struct(fields) = &expression.value_type.data_type() else {
@@ -1645,8 +1656,8 @@ mod scalar_domain_tests {
         // rather than a fabricated all-members SqlType or a plain opaque value.
         assert_eq!(output_domains("select row(null,b) from t"), vec![None]);
         assert_eq!(
-            output_domains("select named_struct('missing',null,'value',p).value from t"),
-            vec![Some(SqlType::Percentile)]
+            output_domains("select r.bitmap from t"),
+            vec![Some(SqlType::Bitmap)]
         );
     }
 
@@ -1793,7 +1804,7 @@ mod scalar_domain_tests {
     fn m07_container_transforms_forward_exact_leaf_domains() {
         assert_eq!(
             output_domains(
-                "select element_at(array_flatten([[b]]),1),element_at(array_repeat(parse_json('{}'),2),1),element_at(__array_struct_subfield([named_struct('payload',b)],'PAYLOAD'),1) from t"
+                "select element_at(flatten([[b]]),1),element_at(repeat(parse_json('{}'),2),1),element_at(__array_struct_subfield(ARRAY[r],'BITMAP'),1) from t"
             ),
             vec![
                 Some(SqlType::Bitmap),
@@ -1802,17 +1813,17 @@ mod scalar_domain_tests {
             ]
         );
         let expressions = output_expressions(
-            "select array_flatten([[parse_json('{}')]]),array_repeat(b,2),__array_struct_subfield([named_struct('payload',parse_json('{}'))],'PAYLOAD') from t",
+            "select flatten([[parse_json('{}')]]),repeat(b,2),__array_struct_subfield(ARRAY[r],'JSON') from t",
         );
         for (expression, id, marker) in [
             (
                 &expressions[0],
-                "builtin.scalar/array_flatten/v1",
+                "builtin.scalar/flatten/v1",
                 novarocks_type_contract::ValueLogicalType::Json,
             ),
             (
                 &expressions[1],
-                "builtin.scalar/array_repeat/v1",
+                "builtin.scalar/repeat/v1",
                 novarocks_type_contract::ValueLogicalType::Bitmap,
             ),
             (
@@ -1850,13 +1861,13 @@ mod scalar_domain_tests {
     #[test]
     fn m07_container_zip_preserves_selected_names_nullability_and_partial_null() {
         assert_eq!(
-            output_domains("select arrays_zip([b],[parse_json('{}')]) from t"),
+            output_domains("select zip([b],[parse_json('{}')]) from t"),
             vec![Some(SqlType::Array(Box::new(SqlType::Struct(vec![
                 ("col1".to_owned(), SqlType::Bitmap),
                 ("col2".to_owned(), SqlType::Json),
             ]))))]
         );
-        let sql = "select arrays_zip([row(null,b)],null) from t";
+        let sql = "select zip([row(null,b)],null) from t";
         assert_eq!(output_domains(sql), vec![None]);
         let expression = output_expressions(sql).remove(0);
         let ExprKind::FunctionCall { binding, .. } = &original_transform(&expression).kind else {
@@ -1901,9 +1912,9 @@ mod scalar_domain_tests {
     #[test]
     fn m07_container_transforms_preserve_null_siblings_and_ordinary_values() {
         for sql in [
-            "select array_flatten([[row(null,b)]]) from t",
-            "select array_repeat(row(null,b),2) from t",
-            "select __array_struct_subfield([named_struct('v',row(null,b))],'v') from t",
+            "select flatten([[row(null,b)]]) from t",
+            "select repeat(row(null,b),2) from t",
+            "select ARRAY[ROW(NULL,b)] from t",
         ] {
             assert_eq!(output_domains(sql), vec![None]);
             let expression = output_expressions(sql).remove(0);
@@ -1921,9 +1932,9 @@ mod scalar_domain_tests {
             );
         }
         for sql in [
-            "select array_flatten([[1,2]])",
-            "select array_repeat('plain',2)",
-            "select arrays_zip([1],[2])",
+            "select flatten([[1,2]])",
+            "select repeat('plain',2)",
+            "select zip([1],[2])",
         ] {
             let expression = output_expressions(sql).remove(0);
             let DataType::List(item) = &expression.value_type.data_type() else {
@@ -1931,7 +1942,7 @@ mod scalar_domain_tests {
             };
             assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
         }
-        let expression = output_expressions("select array_repeat(null,2)").remove(0);
+        let expression = output_expressions("select repeat(null,2)").remove(0);
         let DataType::List(item) = &expression.value_type.data_type() else {
             panic!("NULL List");
         };
@@ -1940,7 +1951,7 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_container_keeps_json_casts_and_rejects_public_variant_casts() {
-        let expression = output_expressions("select array_repeat(cast(null as json),2)").remove(0);
+        let expression = output_expressions("select repeat(cast(null as json),2)").remove(0);
         let DataType::List(item) = expression.value_type.data_type() else {
             panic!("typed NULL List");
         };
@@ -1952,7 +1963,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "select array_repeat(cast(j as json),2),element_at(array_repeat(cast(j as json),2),1) from t"
+                "select repeat(cast(j as json),2),element_at(repeat(cast(j as json),2),1) from t"
             ),
             vec![
                 Some(SqlType::Array(Box::new(SqlType::Json))),
@@ -1960,9 +1971,9 @@ mod scalar_domain_tests {
             ],
         );
         for sql in [
-            "select array_repeat(cast(null as variant),2)",
-            "select array_repeat(cast(v as variant),2) from t",
-            "select array_repeat(cast('x' as variant),2)",
+            "select repeat(cast(null as variant),2)",
+            "select repeat(cast(v as variant),2) from t",
+            "select repeat(cast('x' as variant),2)",
         ] {
             assert_public_variant_cast_unsupported(sql);
         }
@@ -1970,7 +1981,7 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_container_transform_requires_selected_identity_kind_and_result() {
-        let original = output_expressions("select array_repeat(b,2) from t").remove(0);
+        let original = output_expressions("select repeat(b,2) from t").remove(0);
         let (binding, args) = match &original.kind {
             ExprKind::FunctionCall { binding, args, .. }
             | ExprKind::WindowCall { binding, args, .. } => (binding, args),
@@ -2044,121 +2055,52 @@ mod scalar_domain_tests {
     }
 
     #[test]
-    fn typed_container_sortby_subfield_keeps_selected_source_and_real_conversion_owner() {
-        let expression = output_expressions(
-            "select array_sortby((x)->x.key,[named_struct('key',1,'payload',b)]) from t",
-        )
-        .remove(0);
-        assert_eq!(
-            expression
-                .value_type
-                .value_type()
-                .child_type_at(0)
-                .unwrap()
-                .child_type_at(1)
-                .unwrap()
-                .domain(),
-            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
-        );
+    fn array_subfield_keeps_the_exact_selected_source_and_nominal_children() {
         let (resolved, _, factory) = super::super::analyze(
-            &query("select array_sortby((x)->x.key,[named_struct('key',parse_json('{}'),'payload',1)])"), &Catalog, "db",
-        ).unwrap();
+            &query("SELECT __array_struct_subfield(ARRAY[r], 'JSON') FROM t"),
+            &Catalog,
+            "db",
+        )
+        .unwrap();
         let crate::analysis::QueryBody::Select(select) = resolved.body else {
-            panic!("select");
+            panic!("select")
         };
         let output = select.projection[0].expr.clone();
         let ExprKind::FunctionCall { binding, args, .. } = &output.kind else {
-            panic!("original sortby");
+            panic!("selected subfield")
         };
-        let selection = binding.resolved().clone();
-        let original_arguments = format!("{args:?}");
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/__array_struct_subfield/v1"
+        );
         let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
         else {
-            panic!("selected result");
+            panic!("scalar subfield result")
         };
         assert_eq!(result, &output.value_type);
         assert_eq!(
-            output
-                .value_type
-                .value_type()
-                .child_type_at(0)
-                .unwrap()
-                .child_type_at(0)
-                .unwrap()
-                .domain(),
-            Some(novarocks_type_contract::ValueLogicalType::Json)
-        );
-        let novarocks_functions::FunctionArgumentType::Value(key) =
-            &binding.selected.argument_types[1]
-        else {
-            panic!("selected key");
-        };
-        assert_eq!(&args[1].value_type, key);
-        assert_eq!(
-            key.value_type().child_type_at(0).unwrap().domain(),
-            Some(novarocks_type_contract::ValueLogicalType::Json)
-        );
-        let subfield = original_transform(&args[1]);
-        let ExprKind::FunctionCall {
-            binding: subfield_binding,
-            args: source_args,
-            ..
-        } = &subfield.kind
-        else {
-            panic!("selected subfield");
-        };
-        assert_eq!(
-            subfield_binding.function_id.as_str(),
-            "builtin.scalar/__array_struct_subfield/v1"
-        );
-        let novarocks_functions::FunctionResultType::Scalar(subfield_result) =
-            &subfield_binding.selected.result_type
-        else {
-            panic!("subfield result");
-        };
-        assert_eq!(&subfield.value_type, subfield_result);
-        assert_eq!(
-            subfield_result
-                .value_type()
-                .child_type_at(0)
-                .unwrap()
-                .domain(),
+            domain_at(&output, &[0]),
             Some(novarocks_type_contract::ValueLogicalType::Json)
         );
         assert_eq!(
-            source_args[0]
-                .value_type
-                .value_type()
-                .child_type_at(0)
-                .unwrap()
-                .child_type_at(0)
-                .unwrap()
-                .domain(),
+            domain_at(&args[0], &[0, 0]),
             Some(novarocks_type_contract::ValueLogicalType::Json)
         );
-        assert!(
-            matches!(&source_args[1].kind, ExprKind::Literal(crate::analysis::LiteralValue::String(name)) if name == "key")
+        assert_eq!(
+            domain_at(&args[0], &[0, 1]),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
-        let DataType::List(item) = source_args[0].value_type.data_type() else {
-            panic!("source List");
-        };
-        let DataType::Struct(fields) = item.data_type() else {
-            panic!("source Struct");
-        };
-        assert_eq!(fields[0].name(), "key");
-        assert!(fields[0].metadata().as_arc().is_none());
+        let original = binding.resolved().clone();
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
-        let context = context(factory);
-        let validated = context
+        let validated = context(factory)
             .adapt_bound_output_domains(output.clone(), None, &scope, Span::new(0, 0))
             .unwrap();
         assert_eq!(validated.value_type, output.value_type);
-        let ExprKind::FunctionCall { binding, args, .. } = &validated.kind else {
-            panic!("same original sortby");
+        let ExprKind::FunctionCall { binding, .. } = &validated.kind else {
+            panic!("original subfield")
         };
-        assert_eq!(binding.resolved(), &selection);
-        assert_eq!(format!("{args:?}"), original_arguments);
+        assert_eq!(binding.resolved(), &original);
     }
 
     #[test]
@@ -2267,42 +2209,17 @@ mod scalar_domain_tests {
     #[test]
     fn structure_projection_case_collisions_fail_at_analysis_and_unique_case_keeps_domain() {
         for sql in [
-            "select s.id from (select named_struct('ID',1,'id',2) s) t",
-            "select __array_struct_subfield([named_struct('ID',1,'id',2)],'id')",
-            "select array_sortby((x)->x.id,[named_struct('ID',1,'id',2)])",
+            r#"SELECT s.id FROM (SELECT CAST(ROW(1,2) AS ROW("ID" INTEGER,"id" INTEGER)) s) t"#,
+            r#"SELECT __array_struct_subfield(ARRAY[CAST(ROW(1,2) AS ROW("ID" INTEGER,"id" INTEGER))],'id')"#,
         ] {
-            let result = super::super::analyze(&query(sql), &Catalog, "db");
-            match result {
-                Err(source) => assert!(source.to_string().contains("ambiguous"), "{sql}: {source}"),
-                Ok(_) => panic!("case collision accepted: {sql}"),
-            }
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert!(error.to_string().contains("ambiguous"), "{sql}: {error}");
         }
-        let expression = output_expressions(
-            "select __array_struct_subfield([named_struct('Payload',b)],'pAYLOAD') from t",
-        )
-        .remove(0);
+        let expression =
+            output_expressions("SELECT __array_struct_subfield(ARRAY[r],'bItMaP') FROM t")
+                .remove(0);
         assert_eq!(
-            expression
-                .value_type
-                .value_type()
-                .child_type_at(0)
-                .unwrap()
-                .domain(),
-            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
-        );
-        let expression = output_expressions(
-            "select array_sortby((x)->x.kEY,[named_struct('Key',1,'payload',b)]) from t",
-        )
-        .remove(0);
-        assert_eq!(
-            expression
-                .value_type
-                .value_type()
-                .child_type_at(0)
-                .unwrap()
-                .child_type_at(1)
-                .unwrap()
-                .domain(),
+            domain_at(&expression, &[0]),
             Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
     }

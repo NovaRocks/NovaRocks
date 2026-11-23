@@ -30,11 +30,11 @@ CREATE TABLE ${case_db}.map_top_n (
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.map_top_n VALUES
-    ROW(1, map('key1',1)),
-    ROW(2, map('key1',5, 'key2',6)),
-    ROW(3, map('key1',2, 'key2',3, 'key4',4)),
-    ROW(4, map('key1',12, 'key2',13, 'key3',14, 'key4',15)),
-    ROW(5, map('key1',7, 'key2',8, 'key3',9, 'key4',10, 'key5',11));
+    ROW(1, MAP(ARRAY['key1'], ARRAY[1])),
+    ROW(2, MAP(ARRAY['key1', 'key2'], ARRAY[5, 6])),
+    ROW(3, MAP(ARRAY['key1', 'key2', 'key4'], ARRAY[2, 3, 4])),
+    ROW(4, MAP(ARRAY['key1', 'key2', 'key3', 'key4'], ARRAY[12, 13, 14, 15])),
+    ROW(5, MAP(ARRAY['key1', 'key2', 'key3', 'key4', 'key5'], ARRAY[7, 8, 9, 10, 11]));
 
 -- query 2
 -- Full result ordered by map subscript value
@@ -67,19 +67,19 @@ LIMIT  10;
 
 -- query 8
 -- element_at() on a map literal
-SELECT element_at(map('a',1,'b',2), 'a');
+SELECT element_at(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), 'a');
 
 -- query 9
 -- [] subscript on a map literal
-SELECT map('a',1,'b',2)['a'];
+SELECT MAP(ARRAY['a', 'b'], ARRAY[1, 2])['a'];
 
 -- query 10
 -- Null-value lookup: key exists but maps to NULL
-SELECT map('a',NULL,'b',2)['a'];
+SELECT MAP(ARRAY['a', 'b'], ARRAY[NULL, 2])['a'];
 
 -- query 11
 -- Empty map lookup → NULL
-SELECT map()['a'];
+SELECT element_at(map(), 'a');
 
 -- query 12
 -- Subscript access on a table column; order by pk for determinism
@@ -87,14 +87,14 @@ SELECT c2['key1'] FROM ${case_db}.map_top_n ORDER BY c1;
 
 -- query 13
 -- Map literal indexed by row column: c1=1→"a", c1=2→"b", c1>=3→NULL
-SELECT map(1, 'a', 2, 'b')[c1] FROM ${case_db}.map_top_n ORDER BY c1;
+SELECT element_at(MAP(ARRAY[1, 2], ARRAY['a', 'b']), c1) FROM ${case_db}.map_top_n ORDER BY c1;
 
 -- query 14
 -- Frozen Map keys are non-null. Match both the constructor cause and the
 -- execution phase so a preparation or protocol failure cannot satisfy this case.
--- @expect_error=phase=EXECUTION, detail=fragment execution error (pipeline): operator[1] Push: map key must not be NULL
-SELECT map(null, 'a', 2, 'b')[null];
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT MAP(ARRAY[null, 2], ARRAY['a', 'b'])[null];
 
 -- query 15
 -- A NULL probe into a valid Map remains a successful NULL result.
-SELECT map(1, 'a', 2, 'b')[null] AS null_probe;
+SELECT MAP(ARRAY[1, 2], ARRAY['a', 'b'])[null] AS null_probe;

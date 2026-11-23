@@ -33,7 +33,7 @@ value
 value
 [8,7,null]
 
--- query 9
--- legacy
-row_count	null_key_rows	fingerprint
-26	2	-52114540094
+-- query 8
+-- types	bigint	bigint	bigint
+row_count	null_key_rows	correct_order_rows
+26	2	26

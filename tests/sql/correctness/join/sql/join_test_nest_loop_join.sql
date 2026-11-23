@@ -51,19 +51,19 @@ CREATE TABLE ${case_db}.t4 (
 
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 5));
+FROM TABLE(sequence(1, 5)) AS generate_series(generate_series);
 
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 2));
+FROM TABLE(sequence(1, 2)) AS generate_series(generate_series);
 
 INSERT INTO ${case_db}.t3
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 9));
+FROM TABLE(sequence(1, 9)) AS generate_series(generate_series);
 
 INSERT INTO ${case_db}.t4
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(2, 8));
+FROM TABLE(sequence(2, 8)) AS generate_series(generate_series);
 
 -- Base semantics across all non-equality NL join types.
 SELECT scenario, row_count, left_non_null, right_non_null, sum_left, sum_right
@@ -303,10 +303,10 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4098));
+FROM TABLE(sequence(1, 4098)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(2, 8));
+FROM TABLE(sequence(2, 8)) AS generate_series(generate_series);
 
 SELECT 'left_large' AS scenario,
        COUNT(*) AS row_count,
@@ -338,10 +338,10 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(2, 8));
+FROM TABLE(sequence(2, 8)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4098));
+FROM TABLE(sequence(1, 4098)) AS generate_series(generate_series);
 
 SELECT 'right_large' AS scenario,
        COUNT(*) AS row_count,
@@ -369,10 +369,10 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4098));
+FROM TABLE(sequence(1, 4098)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4098));
+FROM TABLE(sequence(1, 4098)) AS generate_series(generate_series);
 
 SELECT 'multi_chunk_equal' AS scenario,
        COUNT(*) AS row_count,
@@ -402,10 +402,10 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4096));
+FROM TABLE(sequence(1, 4096)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4098));
+FROM TABLE(sequence(1, 4098)) AS generate_series(generate_series);
 
 SELECT 'multi_chunk_left_boundary' AS scenario,
        COUNT(*) AS row_count,
@@ -435,10 +435,10 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4098));
+FROM TABLE(sequence(1, 4098)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 4096));
+FROM TABLE(sequence(1, 4096)) AS generate_series(generate_series);
 
 SELECT 'multi_chunk_right_boundary' AS scenario,
        COUNT(*) AS row_count,
@@ -468,10 +468,10 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 77));
+FROM TABLE(sequence(1, 77)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 133));
+FROM TABLE(sequence(1, 133)) AS generate_series(generate_series);
 
 SELECT 'multi_small_chunk' AS scenario,
        COUNT(*) AS row_count,
@@ -499,10 +499,10 @@ TRUNCATE TABLE ${case_db}.t1;
 TRUNCATE TABLE ${case_db}.t2;
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 10000));
+FROM TABLE(sequence(1, 10000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t2
 SELECT generate_series, generate_series
-FROM TABLE(generate_series(1, 1));
+FROM TABLE(sequence(1, 1)) AS generate_series(generate_series);
 
 -- Runtime filter on scan path should preserve the single surviving row.
 SELECT t1.c1

@@ -148,7 +148,7 @@ impl Scenario for MvStorageContract {
                 "INSERT INTO {CATALOG}.{NAMESPACE}.orders \
                  SELECT CASE WHEN n % 2 = 0 THEN 1 ELSE 2 END, \
                  CAST(n % 100 AS BIGINT) \
-                 FROM TABLE(generate_series(1, 4000)) t(n)"
+                 FROM TABLE(sequence(1, 4000)) t(n)"
             ),
         )?;
         select_catalog_and_namespace(context, &mut conn, CATALOG)?;

@@ -26,10 +26,10 @@ CREATE TABLE ${case_db}.topn_outer_result_left (id INT, score INT);
 CREATE TABLE ${case_db}.topn_outer_result_right (id INT, payload INT);
 INSERT INTO ${case_db}.topn_outer_result_left
     SELECT generate_series, 100000 - generate_series
-    FROM TABLE(generate_series(1, 100000));
+    FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.topn_outer_result_right
     SELECT generate_series, generate_series * 10
-    FROM TABLE(generate_series(1, 990));
+    FROM TABLE(sequence(1, 990)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.topn_outer_result_right VALUES
     ROW(99999, 1999990), ROW(99997, 1999970), ROW(100001, 2000000);
 ANALYZE ${case_db}.topn_outer_result_left;

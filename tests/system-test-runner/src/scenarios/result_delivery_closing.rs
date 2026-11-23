@@ -96,7 +96,7 @@ impl Scenario for Closing {
             let before = observation(context, "closing-before")?;
             let (sql, names, byte) = match self {
                 Self::Unread => (
-                    "SELECT REPEAT('x', 1048576) AS payload FROM TABLE(generate_series(1, 1))"
+                    "SELECT rpad('', 1048576, 'x') AS payload FROM TABLE(sequence(1, 1))"
                         .to_owned(),
                     vec!["payload"],
                     b'x',
@@ -263,7 +263,7 @@ impl Scenario for Closing {
         }
         let mut health = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
         let result = health
-            .execute("SELECT SUM(generate_series) AS total FROM TABLE(generate_series(1, 100))")?;
+            .execute("SELECT SUM(sequential_number) AS total FROM TABLE(sequence(1, 100))")?;
         ensure!(
             result.columns.len() == 1
                 && result.columns[0].name == "total"
@@ -278,10 +278,10 @@ impl Scenario for Closing {
 
 fn large_sql(columns: usize) -> String {
     let fields = (0..columns)
-        .map(|index| format!("REPEAT('q', 1048575 + generate_series) AS c{index}"))
+        .map(|index| format!("rpad('', 1048575 + sequential_number, 'q') AS c{index}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("SELECT {fields} FROM TABLE(generate_series(1, 1))")
+    format!("SELECT {fields} FROM TABLE(sequence(1, 1))")
 }
 
 fn advance(

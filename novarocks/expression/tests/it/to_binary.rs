@@ -15,62 +15,108 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::stateful_call_fixtures::{
-    GUARDED_DIAGNOSTICS, binary_batch, binary_program, binary_values,
-};
+use super::stateful_call_fixtures::{GUARDED_DIAGNOSTICS, binary_program, binary_values};
+use arrow::array::{ArrayRef, StringArray};
 use novarocks_expression::testkit::CallbackControl;
 use novarocks_expression::{
     CompiledExpressionInstance, EvaluationInput, ExprEvaluationFailure,
     testkit::{HarnessControl as Control, PassThroughCallHost, callback_causes},
 };
 use novarocks_functions::{
-    KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
+    DataFailureReason, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
 use std::sync::Arc;
 
+const BYTE_FUNCTIONS: [&str; 3] = ["from_hex", "from_base64", "to_utf8"];
+
 #[test]
-fn to_binary_corrected_called_on_null_eager_both_overloads_compile_and_evaluate() {
-    use novarocks_type_contract::FunctionNullBehavior;
-    for count in [1, 2] {
-        let program = binary_program(count);
-        let batch = binary_batch(&program, count);
+fn byte_functions_compile_strict_eager_and_preserve_selected_values_and_data() {
+    use novarocks_type_contract::{ArgumentControl, FunctionNullBehavior};
+
+    let cases = [
+        (
+            "from_hex",
+            [
+                Some("fF"),
+                Some(""),
+                Some("ff00"),
+                None,
+                Some("00"),
+                Some("!"),
+            ],
+            [
+                Some(&b"\xff"[..]),
+                Some(&b""[..]),
+                Some(&b"\xff\0"[..]),
+                None,
+                Some(&b"\0"[..]),
+                None,
+            ],
+            Some(5),
+        ),
+        (
+            "from_base64",
+            [
+                Some("/w=="),
+                Some(""),
+                Some("/wA="),
+                None,
+                Some("AA=="),
+                Some("!"),
+            ],
+            [
+                Some(&b"\xff"[..]),
+                Some(&b""[..]),
+                Some(&b"\xff\0"[..]),
+                None,
+                Some(&b"\0"[..]),
+                None,
+            ],
+            Some(5),
+        ),
+        (
+            "to_utf8",
+            [
+                Some("é"),
+                Some(""),
+                Some("abc"),
+                None,
+                Some("中"),
+                Some("\0"),
+            ],
+            [
+                Some("é".as_bytes()),
+                Some(&b""[..]),
+                Some(&b"abc"[..]),
+                None,
+                Some("中".as_bytes()),
+                Some(&b"\0"[..]),
+            ],
+            None,
+        ),
+    ];
+    for (name, input, all_expected, malformed_row) in cases {
+        let program = binary_program(name);
+        let batch = program.batch(vec![Arc::new(StringArray::from(input.to_vec()))]);
         for call in program.unit.calls().values() {
             assert_eq!(
                 call.call_contract().effects().null_behavior,
-                FunctionNullBehavior::CalledOnNull
+                FunctionNullBehavior::Strict
             );
             assert_eq!(
                 call.call_contract().effects().argument_control,
-                novarocks_type_contract::ArgumentControl::Eager
+                ArgumentControl::Eager
             );
         }
-        let all_expected = if count == 1 {
-            vec![
-                Some(vec![255]),
-                Some(vec![]),
-                None,
-                None,
-                Some(vec![0]),
-                None,
-            ]
-        } else {
-            vec![
-                Some(vec![255]),
-                Some(vec![]),
-                Some(b"abc".to_vec()),
-                None,
-                Some(vec![0]),
-                None,
-            ]
-        };
         for selection in [
             Selection::all(6),
             Selection::try_sparse(6, &[0, 2, 3, 4]).unwrap(),
+            Selection::try_sparse(6, &[0, 3, 5]).unwrap(),
             Selection::try_sparse(6, &[]).unwrap(),
         ] {
             let expected: Vec<_> = selection
                 .iter()
-                .map(|row| all_expected[row].clone())
+                .map(|row| all_expected[row].map(<[u8]>::to_vec))
                 .collect();
             let mut instance =
                 CompiledExpressionInstance::try_new(program.unit.clone(), program.root, &Control)
@@ -88,15 +134,32 @@ fn to_binary_corrected_called_on_null_eager_both_overloads_compile_and_evaluate(
                 )
                 .unwrap();
             assert_eq!(binary_values(out.values()), expected);
-            assert!(out.errors().is_empty());
+            let expected_errors: Vec<_> = selection
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, row)| (malformed_row == Some(row)).then_some(ordinal))
+                .collect();
+            assert_eq!(
+                out.errors()
+                    .iter()
+                    .map(|error| error.selected_ordinal())
+                    .collect::<Vec<_>>(),
+                expected_errors
+            );
+            assert!(out.errors().iter().all(|error| {
+                error.reason()
+                    == DataFailureReason::Domain(
+                        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                    )
+            }));
         }
     }
 }
 
 #[test]
-fn to_binary_both_overloads_constructor_preserves_every_callback_cause() {
-    for count in [1, 2] {
-        let program = binary_program(count);
+fn byte_functions_constructor_preserves_every_callback_cause() {
+    for name in BYTE_FUNCTIONS {
+        let program = binary_program(name);
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         let _ = CompiledExpressionInstance::try_new(program.unit.clone(), program.root, &recorder)
             .unwrap();
@@ -115,10 +178,9 @@ fn to_binary_both_overloads_constructor_preserves_every_callback_cause() {
     }
 }
 #[test]
-fn to_binary_both_overloads_evaluation_preserves_every_callback_cause_and_latch() {
-    use arrow::array::{ArrayRef, StringArray};
-    for count in [1, 2] {
-        let program = binary_program(count);
+fn byte_functions_evaluation_preserves_every_callback_cause_and_latch() {
+    for name in BYTE_FUNCTIONS {
+        let program = binary_program(name);
         let long = "00ff".repeat(160);
         let input: ArrayRef = Arc::new(StringArray::from(
             (0..321)
@@ -135,15 +197,7 @@ fn to_binary_both_overloads_evaluation_preserves_every_callback_cause_and_latch(
                 })
                 .collect::<Vec<_>>(),
         ));
-        let mut arrays = vec![input];
-        if count == 2 {
-            arrays.push(Arc::new(StringArray::from(
-                (0..321)
-                    .map(|i| if i % 2 == 0 { None } else { Some("hex") })
-                    .collect::<Vec<_>>(),
-            )));
-        }
-        let batch = program.batch(arrays);
+        let batch = program.batch(vec![input]);
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         let mut evaluator =
             CompiledExpressionInstance::try_new(program.unit.clone(), program.root, &Control)

@@ -52,7 +52,7 @@ insert into t0 select i
        ,[3,2,5,1,2] as c4
        ,[3,2,5,1,2] as c5
        ,[3,2,5,1,2] as c6
-from table(generate_series(0,10000)) t(i);
+from table(sequence(0,10000)) t(i);
 
 -- query 5
 USE ${case_db};
@@ -84,11 +84,11 @@ SELECT distinct array_sort(c6, (x, y) -> IF(x < y, 1, IF(x = y, 0, -1))) from t0
 
 -- query 12
 USE ${case_db};
-SELECT distinct array_sort(array_map(x->cast(x as decimal(7,2)),c6), (x, y) -> IF(x < y, 1, IF(x = y, 0, -1))) from t0;
+SELECT distinct array_sort(transform(c6, x->cast(x as decimal(7,2))), (x, y) -> IF(x < y, 1, IF(x = y, 0, -1))) from t0;
 
 -- query 13
 USE ${case_db};
-SELECT distinct array_sort(array_map(x->cast(x as decimal(19,5)),c6), (x, y) -> IF(x < y, 1, IF(x = y, 0, -1))) from t0;
+SELECT distinct array_sort(transform(c6, x->cast(x as decimal(19,5))), (x, y) -> IF(x < y, 1, IF(x = y, 0, -1))) from t0;
 
 -- query 14
 USE ${case_db};
@@ -196,7 +196,7 @@ USE ${case_db};
 insert into t0 select i
        ,['bc','ab','dc'] as c0
        ,['a','abcd','abc'] as c1
-from table(generate_series(0,10000)) t(i);
+from table(sequence(0,10000)) t(i);
 
 -- query 33
 USE ${case_db};
@@ -242,7 +242,7 @@ create table t0 (
 USE ${case_db};
 insert into t0 select i
        ,[3,2,null,5,null,1,2] as c0
-from table(generate_series(0,10000)) t(i);
+from table(sequence(0,10000)) t(i);
 
 -- query 42
 -- @expect_error=Comparator violates irreflexivity
@@ -285,7 +285,7 @@ create table t0 (
 USE ${case_db};
 insert into t0 select i
       ,[[2, 3, 1], [4, 2, 1, 4], [1, 2]] c0
-from table(generate_series(0,10000)) t(i);
+from table(sequence(0,10000)) t(i);
 
 -- query 50
 USE ${case_db};

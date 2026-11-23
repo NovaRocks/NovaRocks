@@ -26,6 +26,9 @@ import subprocess
 import sys
 
 
+VERBOSE_EXPLAIN = "EXPLAIN WITH SESSION explain_detail = 'VERBOSE'"
+
+
 def bound_tool(receipt: str | Path | None) -> str:
     receipt = receipt or os.environ.get("NOVA_CI_ARTIFACT_RECEIPT")
     if not receipt:

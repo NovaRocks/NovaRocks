@@ -71,7 +71,6 @@ static SCALAR_FN_SIGNATURES: LazyLock<HashMap<String, Vec<Signature>>> = LazyLoc
     let mut m: HashMap<String, Vec<Signature>> = HashMap::new();
     register_string_fns(&mut m);
     register_numeric_fns(&mut m);
-    register_datetime_fns(&mut m);
     register_condition_fns(&mut m);
     register_array_fns(&mut m);
     register_map_fns(&mut m);
@@ -136,254 +135,292 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             TypeSpec::Boolean,
         ),
     );
-    // (Utf8) -> Utf8 — single-arg string transforms.
-    for name in [
-        "upper",
-        "lower",
-        "trim",
-        "ltrim",
-        "rtrim",
-        "reverse",
-        "initcap",
-        "md5",
-        "to_base64",
-        "from_base64",
-        "url_encode",
-        "url_decode",
-        "char",
+    use super::signature::CharacterWidth;
+    use novarocks_type_contract::CharacterKind;
+    let varchar_width = |width| TypeSpec::Character(CharacterKind::Varchar, width);
+    let varchar = varchar_width(CharacterWidth::Argument("x"));
+    let varchar_y = varchar_width(CharacterWidth::Argument("y"));
+    let varchar_z = varchar_width(CharacterWidth::Argument("z"));
+    let varchar_one = varchar_width(CharacterWidth::Fixed(1));
+    let fixed_char = TypeSpec::Character(CharacterKind::Char, CharacterWidth::Argument("x"));
+    for (name, arguments, result) in [
+        ("to_utf8", vec![varchar.clone()], TypeSpec::Binary),
+        ("to_utf8", vec![fixed_char.clone()], TypeSpec::Binary),
+        ("from_utf8", vec![TypeSpec::Binary], TypeSpec::Utf8),
+        (
+            "from_utf8",
+            vec![TypeSpec::Binary, varchar.clone()],
+            TypeSpec::Utf8,
+        ),
+        (
+            "from_utf8",
+            vec![TypeSpec::Binary, TypeSpec::Int64],
+            TypeSpec::Utf8,
+        ),
+        ("to_big_endian_64", vec![TypeSpec::Int64], TypeSpec::Binary),
+        ("to_hex", vec![TypeSpec::Binary], TypeSpec::Utf8),
+        ("from_hex", vec![varchar.clone()], TypeSpec::Binary),
+        ("from_hex", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("to_base64", vec![TypeSpec::Binary], TypeSpec::Utf8),
+        ("from_base64", vec![varchar.clone()], TypeSpec::Binary),
+        ("from_base64", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("md5", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("sha256", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("sha512", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("crc32", vec![TypeSpec::Binary], TypeSpec::Int64),
     ] {
         add(
             m,
             name,
-            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+            Signature::new(arguments, result).with_argument_coercion(),
         );
     }
 
+    for (name, result) in [
+        ("url_extract_protocol", varchar.clone()),
+        ("url_extract_host", varchar.clone()),
+        ("url_extract_port", TypeSpec::Int64),
+        ("url_extract_path", varchar.clone()),
+        ("url_extract_query", varchar.clone()),
+        ("url_extract_fragment", varchar.clone()),
+        ("url_decode", varchar.clone()),
+        (
+            "url_encode",
+            TypeSpec::Character(CharacterKind::Varchar, CharacterWidth::UrlEncode("x")),
+        ),
+    ] {
+        add(
+            m,
+            name,
+            Signature::new(vec![varchar.clone()], result).with_argument_coercion(),
+        );
+    }
     add(
         m,
-        "unhex",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Binary),
+        "url_extract_parameter",
+        Signature::new(vec![varchar.clone(), varchar_y.clone()], varchar.clone())
+            .with_argument_coercion(),
     );
 
-    // md5sum hashes the bytes of whatever it is given, over any number of
-    // arguments -- it is not one of the string transforms it was grouped with.
-
-    // These were grouped with the one-argument string transforms above, but
-    // none of them is one: they differ in arity, in what they take, or in
-    // both. The executor's own arity is what each declares here.
-    //
-    // hex renders bytes or a number as text.
-    for argument in [TypeSpec::Utf8, TypeSpec::Binary, TypeSpec::Int64] {
-        add(m, "hex", Signature::new(vec![argument], TypeSpec::Utf8));
-    }
-    // bar(value, lo, hi, width) draws a proportional bar.
-    add(
-        m,
-        "bar",
-        Signature::new(
-            vec![
-                TypeSpec::Int64,
-                TypeSpec::Int64,
-                TypeSpec::Int64,
-                TypeSpec::Int64,
-            ],
+    for (name, arguments, result) in [
+        ("chr", vec![TypeSpec::Int64], varchar_one.clone()),
+        ("codepoint", vec![varchar_one], TypeSpec::Int32),
+        ("length", vec![varchar.clone()], TypeSpec::Int64),
+        ("length", vec![fixed_char.clone()], TypeSpec::Int64),
+        ("length", vec![TypeSpec::Binary], TypeSpec::Int64),
+        ("title_case", vec![varchar.clone()], varchar.clone()),
+        ("title_case", vec![fixed_char.clone()], fixed_char.clone()),
+        ("reverse", vec![varchar.clone()], varchar.clone()),
+        ("reverse", vec![TypeSpec::Binary], TypeSpec::Binary),
+        (
+            "strpos",
+            vec![varchar.clone(), varchar_y.clone()],
+            TypeSpec::Int64,
+        ),
+        (
+            "strpos",
+            vec![varchar.clone(), varchar_y.clone(), TypeSpec::Int64],
+            TypeSpec::Int64,
+        ),
+        (
+            "normalize",
+            vec![varchar.clone(), varchar_y.clone()],
             TypeSpec::Utf8,
         ),
-    );
-    add(
-        m,
-        "parse_url",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
-    );
-    add(
-        m,
-        "parse_url",
-        Signature::new(
-            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+        (
+            "split",
+            vec![varchar.clone(), varchar_y.clone()],
+            TypeSpec::List(Box::new(varchar.clone())),
+        ),
+        (
+            "split",
+            vec![varchar.clone(), varchar_y.clone(), TypeSpec::Int64],
+            TypeSpec::List(Box::new(varchar.clone())),
+        ),
+        (
+            "split_part",
+            vec![varchar.clone(), varchar_y.clone(), TypeSpec::Int64],
+            varchar.clone(),
+        ),
+        (
+            "replace",
+            vec![varchar.clone(), varchar_y.clone()],
+            varchar.clone(),
+        ),
+        (
+            "replace",
+            vec![varchar.clone(), varchar_y.clone(), varchar_z.clone()],
+            varchar_width(CharacterWidth::Replace {
+                source: "x",
+                replacement: "z",
+            }),
+        ),
+        (
+            "translate",
+            vec![varchar.clone(), varchar_y.clone(), varchar_z],
             TypeSpec::Utf8,
         ),
-    );
-    // from_binary reads bytes and returns text; to_binary is its inverse. The
-    // optional second argument names the encoding.
-    add(
-        m,
-        "from_binary",
-        Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
-    );
-    add(
-        m,
-        "from_binary",
-        Signature::new(vec![TypeSpec::Binary, TypeSpec::Utf8], TypeSpec::Utf8),
-    );
-    add(
-        m,
-        "to_binary",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Binary),
-    );
-    add(
-        m,
-        "to_binary",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Binary),
-    );
-
-    // (Utf8) -> Int32 — length / position / ascii family.
-    for name in ["length", "char_length", "character_length", "ascii"] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int32),
-        );
-    }
-
-    // (Utf8, Utf8) -> Int32 — multi-string position / compare.
-    for name in ["instr", "locate", "position", "regexp_position"] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int32),
-        );
-    }
-    // locate and regexp_position also take the position to start from.
-    for name in ["locate", "regexp_position"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int64],
-                TypeSpec::Int32,
-            ),
-        );
-    }
-    // regexp_position additionally selects which occurrence to report.
-    add(
-        m,
-        "regexp_position",
-        Signature::new(
+        (
+            "lpad",
+            vec![fixed_char.clone(), TypeSpec::Int64, varchar_y.clone()],
+            TypeSpec::Utf8,
+        ),
+        (
+            "bar",
+            vec![TypeSpec::Float64, TypeSpec::Int64],
+            TypeSpec::Utf8,
+        ),
+        (
+            "width_bucket",
             vec![
-                TypeSpec::Utf8,
-                TypeSpec::Utf8,
-                TypeSpec::Int64,
+                TypeSpec::Float64,
+                TypeSpec::Float64,
+                TypeSpec::Float64,
                 TypeSpec::Int64,
             ],
-            TypeSpec::Int32,
+            TypeSpec::Int64,
         ),
-    );
-    // FIELD's SQL owner normalizes all arguments to one comparison type.
-    // Two fixed arguments plus the repeated variadic tail enforce min arity 2.
-    // `equiwidth_bucket` and `regexp_count` return Int64 instead of Int32.
-    add(
-        m,
-        "regexp_count",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int64),
-    );
-    // The executable equiwidth_bucket profile takes four BIGINT arguments.
-    add(
-        m,
-        "equiwidth_bucket",
-        Signature::new(vec![TypeSpec::Int64; 4], TypeSpec::Int64),
-    );
+    ] {
+        add(
+            m,
+            name,
+            Signature::new(arguments, result).with_argument_coercion(),
+        );
+    }
 
-    // (Utf8, ...) -> Utf8 — variadic concat / format family.
-    // CONCAT requires one string before the repeated tail. A single repeated
-    // spec alone permits zero arguments in the signature grammar.
+    for name in ["lower", "upper", "ltrim", "rtrim", "trim"] {
+        let char_result = if matches!(name, "lower" | "upper") {
+            fixed_char.clone()
+        } else {
+            varchar.clone()
+        };
+        for (argument, result) in [
+            (varchar.clone(), varchar.clone()),
+            (fixed_char.clone(), char_result),
+        ] {
+            add(
+                m,
+                name,
+                Signature::new(vec![argument], result).with_argument_coercion(),
+            );
+        }
+    }
+    for name in ["lpad", "rpad"] {
+        for (argument, fill, result) in [
+            (varchar.clone(), varchar_y.clone(), TypeSpec::Utf8),
+            (TypeSpec::Binary, TypeSpec::Binary, TypeSpec::Binary),
+        ] {
+            add(
+                m,
+                name,
+                Signature::new(vec![argument, TypeSpec::Int64, fill], result)
+                    .with_argument_coercion(),
+            );
+        }
+    }
+
+    for name in ["substr", "substring"] {
+        let text = [
+            (varchar.clone(), varchar.clone()),
+            (fixed_char.clone(), varchar.clone()),
+        ];
+        let bytes = (name == "substr").then_some((TypeSpec::Binary, TypeSpec::Binary));
+        for (argument, result) in text.into_iter().chain(bytes) {
+            for indices in [vec![TypeSpec::Int64], vec![TypeSpec::Int64; 2]] {
+                let mut arguments = vec![argument.clone()];
+                arguments.extend(indices);
+                add(
+                    m,
+                    name,
+                    Signature::new(arguments, result.clone()).with_argument_coercion(),
+                );
+            }
+        }
+    }
+
+    // Two fixed parameters establish the minimum arity; the last spec repeats.
+    for (name, ty) in [
+        ("concat", TypeSpec::Utf8),
+        ("concat", TypeSpec::Binary),
+        ("concat_ws", TypeSpec::Utf8),
+    ] {
+        add(
+            m,
+            name,
+            Signature::variadic(vec![ty.clone(); 3], ty).with_argument_coercion(),
+        );
+    }
     add(
         m,
         "concat",
-        Signature::variadic(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+        Signature::new(
+            vec![
+                fixed_char,
+                TypeSpec::Character(CharacterKind::Char, CharacterWidth::Argument("y")),
+            ],
+            TypeSpec::Character(CharacterKind::Char, CharacterWidth::Sum("x", "y")),
+        )
+        .with_argument_coercion(),
     );
-    // CONCAT_WS requires the separator and one value before its repeated tail.
     add(
         m,
         "concat_ws",
-        Signature::variadic(
-            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+        Signature::new(
+            vec![TypeSpec::Utf8, TypeSpec::List(Box::new(TypeSpec::Utf8))],
             TypeSpec::Utf8,
-        ),
+        )
+        .with_argument_coercion(),
     );
     add(
         m,
         "format",
-        Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+        Signature::variadic(vec![TypeSpec::Utf8, TypeSpec::AnyType], TypeSpec::Utf8)
+            .with_argument_coercion(),
     );
 
-    // (Utf8, Utf8, Utf8) -> Utf8 — three-arg string rewrites. The executor
-    // takes exactly three arguments for each of these and the analyzer coerces
-    // all three to text; a two-argument declaration named a call none of them
-    // can evaluate.
-    for name in ["replace", "regexp_replace", "translate"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
-                TypeSpec::Utf8,
-            ),
-        );
-    }
-
-    // (Utf8, Utf8, Int32) -> Utf8 — three-arg string extraction, where the
-    // third argument selects which piece and is a number rather than text.
-    //
-    // It is 32-bit and coercing for the same reason `substring`'s position is:
-    // a literal ordinal analyzes as `Int32`, and a wider declaration would
-    // match none of the calls anyone writes.
-    for name in ["regexp_extract", "regexp_extract_all", "split_part"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int32],
-                TypeSpec::Utf8,
-            )
-            .with_argument_coercion(),
-        );
-    }
-
-    // substring(str, start) / substring(str, start, length) — overloaded.
-    for name in ["substr", "substring"] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int32], TypeSpec::Utf8)
-                .with_argument_coercion(),
-        );
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Utf8, TypeSpec::Int32, TypeSpec::Int32],
-                TypeSpec::Utf8,
-            )
-            .with_argument_coercion(),
-        );
-    }
-
-    for name in ["left", "right", "strleft", "strright"] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
-        );
-    }
-
-    // lpad(str, length, pad) / rpad(str, length, pad)
-    for name in ["lpad", "rpad"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Utf8, TypeSpec::Int64, TypeSpec::Utf8],
-                TypeSpec::Utf8,
-            ),
-        );
-    }
-
-    // repeat(str, n) -> str
-    add(
-        m,
-        "repeat",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
+    let source = TypeSpec::Character(CharacterKind::Varchar, CharacterWidth::Argument("x"));
+    let pattern = TypeSpec::Character(CharacterKind::Varchar, CharacterWidth::Argument("p"));
+    let replacement = TypeSpec::Character(CharacterKind::Varchar, CharacterWidth::Argument("y"));
+    let replaced = TypeSpec::Character(
+        CharacterKind::Varchar,
+        CharacterWidth::RegexpReplace {
+            source: "x",
+            replacement: "y",
+        },
     );
+    let base = vec![source.clone(), pattern];
+    for (name, late, result) in [
+        ("regexp_count", vec![], TypeSpec::Int64),
+        ("regexp_position", vec![], TypeSpec::Int32),
+        ("regexp_position", vec![TypeSpec::Int32], TypeSpec::Int32),
+        (
+            "regexp_position",
+            vec![TypeSpec::Int32, TypeSpec::Int32],
+            TypeSpec::Int32,
+        ),
+        ("regexp_extract", vec![], source.clone()),
+        ("regexp_extract", vec![TypeSpec::Int64], source.clone()),
+        (
+            "regexp_extract_all",
+            vec![],
+            TypeSpec::List(Box::new(source.clone())),
+        ),
+        (
+            "regexp_extract_all",
+            vec![TypeSpec::Int64],
+            TypeSpec::List(Box::new(source.clone())),
+        ),
+        ("regexp_replace", vec![], source),
+        ("regexp_replace", vec![replacement], replaced),
+    ] {
+        let mut arguments = base.clone();
+        arguments.extend(late);
+        add(
+            m,
+            name,
+            Signature::new(arguments, result).with_argument_coercion(),
+        );
+    }
 
     // Stable relational identity for IMV join coalesce rows. Object-ID salts
     // are opaque connector bytes, not UTF-8 UUIDs.
@@ -399,15 +436,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ],
             TypeSpec::Utf8,
         ),
-    );
-
-    // space(n) -> str
-
-    // sha2(str, bits) -> str
-    add(
-        m,
-        "sha2",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
     );
 
     // group_concat / string_agg accept any number of args (variadic) and
@@ -545,13 +573,6 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // crc32 returns Int64.
-    add(
-        m,
-        "crc32",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int64),
-    );
-
     // `greatest` / `least` are intentionally NOT registered: StarRocks
     // widens pure Date32 inputs to Datetime (because the BE only ships
     // a DATETIME-typed implementation), and that semantic isn't
@@ -563,312 +584,6 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 // Datetime functions
 // ---------------------------------------------------------------------------
-
-fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // now / current_timestamp / curdate / current_date all return Datetime
-    // (Timestamp(Microsecond, None)) in NovaRocks today, matching the legacy
-    // codegen-side inference. `curdate` / `current_date` are *not* Date
-    // despite their names; rely on cast at projection if needed.
-    for name in [
-        "now",
-        "current_timestamp",
-        "current_time",
-        "curtime",
-        "localtimestamp",
-        "localtime",
-        "curdate",
-        "current_date",
-    ] {
-        add(m, name, Signature::new(vec![], TypeSpec::Datetime));
-    }
-
-    // to_datetime(epoch[, scale]) reads a unix timestamp; it is not one of
-    // the no-argument clock functions it used to be grouped with.
-    add(
-        m,
-        "to_datetime",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Datetime),
-    );
-    add(
-        m,
-        "to_datetime",
-        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Datetime),
-    );
-
-    // convert_tz(datetime, str, str) -> datetime
-    add(
-        m,
-        "convert_tz",
-        Signature::new(
-            vec![TypeSpec::Datetime, TypeSpec::Utf8, TypeSpec::Utf8],
-            TypeSpec::Datetime,
-        ),
-    );
-
-    // timestamp(...) -> datetime (1-arg form).
-    add(
-        m,
-        "timestamp",
-        Signature::new(vec![TypeSpec::Datetime], TypeSpec::Datetime),
-    );
-    add(
-        m,
-        "timestamp",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Datetime),
-    );
-
-    // add_months always returns Datetime regardless of input width.
-    add(
-        m,
-        "add_months",
-        Signature::new(
-            vec![TypeSpec::Datetime, TypeSpec::Int64],
-            TypeSpec::Datetime,
-        ),
-    );
-    add(
-        m,
-        "add_months",
-        Signature::new(vec![TypeSpec::Date, TypeSpec::Int64], TypeSpec::Datetime),
-    );
-
-    // date_format / time_format / from_unixtime -> Utf8 (regardless of
-    // arity — NovaRocks's legacy path returns Utf8 for `from_unixtime`
-    // unconditionally, including the bare `from_unixtime(unix_ts)` form
-    // which arguably should return Datetime; matching legacy for now).
-    for name in ["date_format", "from_unixtime"] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Datetime, TypeSpec::Utf8], TypeSpec::Utf8),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Date, TypeSpec::Utf8], TypeSpec::Utf8),
-        );
-    }
-    // from_unixtime(int64) -> Utf8 (no format string).
-    add(
-        m,
-        "from_unixtime",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Utf8),
-    );
-
-    // date_add / date_sub family: preserve first-arg date/datetime type.
-    let date_shift_fns: &[&str] = &[
-        "date_add",
-        "date_sub",
-        "adddate",
-        "subdate",
-        "days_add",
-        "days_sub",
-        "weeks_add",
-        "weeks_sub",
-        "months_add",
-        "months_sub",
-        "years_add",
-        "years_sub",
-        "hours_add",
-        "hours_sub",
-        "minutes_add",
-        "minutes_sub",
-        "seconds_add",
-        "seconds_sub",
-    ];
-    // The interval position accepts anything that spells a whole number --
-    // a string, a float, a decimal -- and an interval that does not spell one
-    // makes the shift NULL rather than a binding error.
-    for name in date_shift_fns {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Datetime, TypeSpec::Int64],
-                TypeSpec::Datetime,
-            )
-            .with_argument_coercion(),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Date, TypeSpec::Int64], TypeSpec::Date)
-                .with_argument_coercion(),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Datetime)
-                .with_argument_coercion(),
-        );
-    }
-    // sec_to_time formats an integer second count as a TIME string.
-
-    // date_trunc(unit, datetime) -> datetime; date_trunc(unit, date) -> date
-    add(
-        m,
-        "date_trunc",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Datetime], TypeSpec::Datetime),
-    );
-    add(
-        m,
-        "date_trunc",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Date], TypeSpec::Date),
-    );
-    add(
-        m,
-        "date_trunc",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Datetime),
-    );
-
-    // Datetime extractors -> Int32.
-    for name in [
-        "year",
-        "month",
-        "day",
-        "dayofmonth",
-        "hour",
-        "minute",
-        "second",
-        "dayofweek",
-        "dayofyear",
-        "weekofyear",
-        "quarter",
-    ] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Datetime], TypeSpec::Int32),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::LargeInt], TypeSpec::Int32),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Date], TypeSpec::Int32),
-        );
-        // A date written as a string is a date. The engine parses one
-        // wherever it takes a datetime, and refusing it here refused calls it
-        // has always answered.
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int32),
-        );
-    }
-
-    // hour_from_unixtime reads a unix second count, not a datetime.
-
-    // Diff family -> Int64.
-    for name in [
-        "datediff",
-        "months_diff",
-        "years_diff",
-        "weeks_diff",
-        "days_diff",
-        "hours_diff",
-        "minutes_diff",
-        "seconds_diff",
-    ] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Datetime, TypeSpec::Datetime],
-                TypeSpec::Int64,
-            ),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Date, TypeSpec::Date], TypeSpec::Int64),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int64),
-        );
-    }
-
-    // TIMESTAMPDIFF reads the unit before its two temporal operands.
-    for source in [TypeSpec::Datetime, TypeSpec::Date, TypeSpec::Utf8] {
-        add(
-            m,
-            "timestampdiff",
-            Signature::new(
-                vec![TypeSpec::Utf8, source.clone(), source],
-                TypeSpec::Int64,
-            ),
-        );
-    }
-
-    // to_days / time_to_sec measure one instant, not the distance between two.
-    // unix_timestamp / to_unix_timestamp - 0 or 1 arg
-    for name in ["unix_timestamp", "to_unix_timestamp"] {
-        add(m, name, Signature::new(vec![], TypeSpec::Int64));
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Datetime], TypeSpec::Int64),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Date], TypeSpec::Int64),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int64),
-        );
-    }
-
-    // Match the actual native date helper argument shapes and supported carriers.
-    add(
-        m,
-        "str_to_date",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Date),
-    );
-    for argument in [TypeSpec::Date, TypeSpec::Datetime, TypeSpec::Utf8] {
-        add(
-            m,
-            "last_day",
-            Signature::new(vec![argument.clone()], TypeSpec::Date),
-        );
-        add(
-            m,
-            "last_day",
-            Signature::new(vec![argument.clone(), TypeSpec::Utf8], TypeSpec::Date),
-        );
-    }
-    // `date(x)` extracts a Date from a Datetime or Date.
-    add(
-        m,
-        "date",
-        Signature::new(vec![TypeSpec::Datetime], TypeSpec::Date),
-    );
-    add(
-        m,
-        "date",
-        Signature::new(vec![TypeSpec::Date], TypeSpec::Date),
-    );
-    add(
-        m,
-        "date",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Date),
-    );
-
-    // SQL normalizes each call to its frozen temporal domain before binding.
-    // StarRocks TIME_SLICE is DATETIME -> DATETIME; DATE_SLICE is DATE -> DATE.
-}
 
 // ---------------------------------------------------------------------------
 // Condition functions
@@ -958,21 +673,15 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // cardinality / array_length / array_size : List<T> -> Int32
-    for name in ["cardinality", "array_length", "array_size"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
-                TypeSpec::Int32,
-            ),
-        );
-    }
-
-    // cardinality also counts a map's entries. The executor dispatches it
-    // through the map family as well, so declaring only the array form named
-    // half of what it does.
+    // Trino CARDINALITY counts either collection's offsets as BIGINT.
+    add(
+        m,
+        "cardinality",
+        Signature::new(
+            vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
+            TypeSpec::Int64,
+        ),
+    );
     add(
         m,
         "cardinality",
@@ -981,17 +690,11 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 Box::new(TypeSpec::Any("K")),
                 Box::new(TypeSpec::Any("V")),
             )],
-            TypeSpec::Int32,
+            TypeSpec::Int64,
         ),
     );
 
-    // array_position(List<T>, T) -> Int32 — note Int32 not Int64, matching legacy.
-    //
-    // Widening is right here and not on array_append: the element variable
-    // only picks the type the two sides are compared at, and never reaches
-    // the return type. An array literal is typed from its own values while a
-    // bare integer literal is BIGINT, so `array_position([1,2,3], 1)` pairs a
-    // TINYINT element with a BIGINT probe and must compare as BIGINT.
+    // ARRAY_POSITION returns the one-based BIGINT position, or zero.
     add(
         m,
         "array_position",
@@ -1000,39 +703,34 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
                 TypeSpec::Any("T"),
             ],
-            TypeSpec::Int32,
+            TypeSpec::Int64,
         )
         .with_widening(),
     );
 
-    // array_append(List<T>, T) -> List<T>
+    let item = TypeSpec::Any("T");
+    let array = TypeSpec::List(Box::new(item.clone()));
     add(
         m,
-        "array_append",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Any("T"),
-            ],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
+        "concat",
+        Signature::variadic(vec![array.clone(), array.clone()], array.clone()).with_widening(),
     );
-
-    // array_concat(List<T>, ...) -> List<T> — variadic
     add(
         m,
-        "array_concat",
-        Signature::variadic(
-            vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
+        "concat",
+        Signature::new(vec![array.clone(), item.clone()], array.clone()).with_widening(),
+    );
+    add(
+        m,
+        "concat",
+        Signature::new(vec![item, array.clone()], array).with_widening(),
     );
 
     // array_contains(List<T>, T) -> bool. Widening for the same reason as
     // array_position: T is only the comparison type.
     add(
         m,
-        "array_contains",
+        "contains",
         Signature::new(
             vec![
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
@@ -1043,38 +741,18 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         .with_widening(),
     );
 
-    // all_match / any_match read one already-evaluated boolean array: the
-    // lambda form is rewritten before binding, so the predicate never
-    // reaches the registry as a second argument.
-    for name in ["all_match", "any_match"] {
+    // Each comparison resolves an identical common element domain.
+    for name in ["contains_sequence", "arrays_overlap"] {
+        let array = TypeSpec::List(Box::new(TypeSpec::Any("T")));
         add(
             m,
             name,
-            Signature::new(
-                vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
-                TypeSpec::Boolean,
-            ),
-        );
-    }
-
-    // Two-list boolean predicates. Each side carries its own element
-    // variable: these compare membership, not a shared element type.
-    for name in ["array_contains_seq", "arrays_overlap"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![
-                    TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                    TypeSpec::List(Box::new(TypeSpec::Any("U"))),
-                ],
-                TypeSpec::Boolean,
-            ),
+            Signature::new(vec![array.clone(), array], TypeSpec::Boolean).with_widening(),
         );
     }
 
     // Element-preserving transforms of one list.
-    for name in ["array_distinct", "array_sort", "array_reverse"] {
+    for name in ["array_distinct", "array_sort", "reverse"] {
         add(
             m,
             name,
@@ -1099,38 +777,9 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         .with_widening(),
     );
 
-    // array_filter(List<T>, List<Boolean>) -> List<T>. The lambda form is
-    // rewritten into this evaluated-mask shape before binding.
     add(
         m,
-        "array_filter",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::List(Box::new(TypeSpec::Any("M"))),
-            ],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
-    );
-
-    // array_top_n(List<T>, n) -> List<T>
-
-    // array_slice(List<T>, offset[, length]) -> List<T>. The executor reads
-    // both positions as BIGINT.
-    add(
-        m,
-        "array_slice",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Int64,
-            ],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
-    );
-    add(
-        m,
-        "array_slice",
+        "slice",
         Signature::new(
             vec![
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
@@ -1140,24 +789,6 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
             TypeSpec::List(Box::new(TypeSpec::Any("T"))),
         ),
     );
-
-    // array_sortby(List<T>, key list, ...) -> List<T>. Each key list sorts
-    // the previous ties, so the keys are independent types rather than
-    // repeats of one variable -- which is what a variadic spec would force.
-    // The registry vocabulary names type variables one at a time, so the
-    // supported key counts are spelled out.
-    const SORTBY_KEYS: [&str; 6] = ["K1", "K2", "K3", "K4", "K5", "K6"];
-    for keys in 1..=SORTBY_KEYS.len() {
-        let mut args = vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))];
-        for name in SORTBY_KEYS.iter().take(keys) {
-            args.push(TypeSpec::List(Box::new(TypeSpec::Any(name))));
-        }
-        add(
-            m,
-            "array_sortby",
-            Signature::new(args, TypeSpec::List(Box::new(TypeSpec::Any("T")))),
-        );
-    }
 
     // array_min / array_max : List<T> -> T
     for name in ["array_min", "array_max"] {
@@ -1170,6 +801,18 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ),
         );
     }
+
+    add(
+        m,
+        "element_at",
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::Int64,
+            ],
+            TypeSpec::Any("T"),
+        ),
+    );
 
     // __array_element_at(List<T>, Int32) -> T
     //
@@ -1200,25 +843,44 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         ),
     );
 
-    // array_join / array_to_string: List<*> + Utf8 -> Utf8
-    for name in ["array_join", "array_to_string"] {
+    let array = TypeSpec::List(Box::new(TypeSpec::Any("T")));
+    add(
+        m,
+        "array_join",
+        Signature::new(vec![array.clone(), TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "array_join",
+        Signature::new(vec![array, TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+
+    let item = TypeSpec::Any("T");
+    add(
+        m,
+        "repeat",
+        Signature::new(
+            vec![item.clone(), TypeSpec::Int64],
+            TypeSpec::List(Box::new(item)),
+        ),
+    );
+
+    for count in [2, 3] {
         add(
             m,
-            name,
-            Signature::variadic(
-                vec![TypeSpec::List(Box::new(TypeSpec::Any("T"))), TypeSpec::Utf8],
-                TypeSpec::Utf8,
+            "sequence",
+            Signature::new(
+                vec![TypeSpec::Int64; count],
+                TypeSpec::List(Box::new(TypeSpec::Int64)),
             ),
         );
     }
-
-    // split(str, str) -> List<Utf8>
     add(
         m,
-        "split",
+        "sequence",
         Signature::new(
-            vec![TypeSpec::Utf8, TypeSpec::Utf8],
-            TypeSpec::List(Box::new(TypeSpec::Utf8)),
+            vec![TypeSpec::Date, TypeSpec::Date],
+            TypeSpec::List(Box::new(TypeSpec::Date)),
         ),
     );
 }
@@ -1228,6 +890,14 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    add(
+        m,
+        "split_to_map",
+        Signature::new(
+            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+            TypeSpec::Map(Box::new(TypeSpec::Utf8), Box::new(TypeSpec::Utf8)),
+        ),
+    );
     // map_keys(Map<K, V>) -> List<K>
     add(
         m,
@@ -1255,17 +925,6 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
 
     // map_size(Map<K, V>) -> Int32 (matches legacy)
-    add(
-        m,
-        "map_size",
-        Signature::new(
-            vec![TypeSpec::Map(
-                Box::new(TypeSpec::Any("K")),
-                Box::new(TypeSpec::Any("V")),
-            )],
-            TypeSpec::Int32,
-        ),
-    );
 
     // Map-preserving value functions. Lambda-bearing transforms are bound by
     // the dynamic exact resolver because their lambda contract is part of the
@@ -1282,34 +941,35 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
         ),
     );
 
-    // The frozen non-null Null key domain is uninhabited. Preserve this
-    // original Map and the independent evaluated probe, without key coercion.
-    add(
-        m,
-        "__map_element_at",
-        Signature::new(
-            vec![
-                TypeSpec::MapWithUninhabitedKey {
-                    map: "M",
-                    value: "V",
-                },
-                TypeSpec::AnyType,
-            ],
-            TypeSpec::Any("V"),
-        ),
-    );
-    // __map_element_at(Map<K, V>, K) -> V
-    add(
-        m,
-        "__map_element_at",
-        Signature::new(
-            vec![
-                TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
-                TypeSpec::Any("K"),
-            ],
-            TypeSpec::Any("V"),
-        ),
-    );
+    for name in ["element_at", "__map_element_at", "__map_subscript"] {
+        // The empty UNKNOWN Map has an uninhabited key domain. Preserve
+        // its independent evaluated probe without key coercion.
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![
+                    TypeSpec::MapWithUninhabitedKey {
+                        map: "M",
+                        value: "V",
+                    },
+                    TypeSpec::AnyType,
+                ],
+                TypeSpec::Any("V"),
+            ),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![
+                    TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
+                    TypeSpec::Any("K"),
+                ],
+                TypeSpec::Any("V"),
+            ),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,24 +1338,6 @@ fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
     ] {
         add(m, name, Signature::new(vec![], TypeSpec::Utf8));
     }
-    // These read the bytes of each argument independently and return a fixed
-    // type that never names the argument type. `AnyType` is what says that --
-    // as it already does for `md5sum` -- where `Any("T")` would instead make
-    // every position bind the same concrete type and reject the mixed
-    // argument lists these are called with.
-    //
-    // murmur_hash3_32 -> Int32
-    add(
-        m,
-        "murmur_hash3_32",
-        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int32),
-    );
-    add(
-        m,
-        "to_binary",
-        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
-    );
-
     // cast: preserves first-arg type. (Special — analyzer's type_hint is
     // usually authoritative for cast, so the registry answer is rarely
     // used; we register defensively to avoid UnknownFunction.)

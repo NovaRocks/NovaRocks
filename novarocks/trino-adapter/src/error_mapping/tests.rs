@@ -35,8 +35,6 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("USER_CANCELED", 3, "USER_ERROR"),
     ("PERMISSION_DENIED", 4, "USER_ERROR"),
     ("NOT_FOUND", 5, "USER_ERROR"),
-    ("EXPRESSION_NOT_CONSTANT", 75, "USER_ERROR"),
-    ("INVALID_PARAMETER_USAGE", 80, "USER_ERROR"),
     ("FUNCTION_NOT_FOUND", 6, "USER_ERROR"),
     ("INVALID_FUNCTION_ARGUMENT", 7, "USER_ERROR"),
     ("DIVISION_BY_ZERO", 8, "USER_ERROR"),
@@ -75,12 +73,15 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
     ("FUNCTION_NOT_AGGREGATE", 72, "USER_ERROR"),
     ("EXPRESSION_NOT_SCALAR", 74, "USER_ERROR"),
+    ("EXPRESSION_NOT_CONSTANT", 75, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
     ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
     ("DUPLICATE_PROPERTY", 79, "USER_ERROR"),
+    ("INVALID_PARAMETER_USAGE", 80, "USER_ERROR"),
     ("VIEW_IS_STALE", 81, "USER_ERROR"),
     ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
+    ("MISSING_ARGUMENT", 111, "USER_ERROR"),
     ("MERGE_TARGET_ROW_MULTIPLE_MATCHES", 119, "USER_ERROR"),
     ("ICEBERG_INVALID_METADATA", 0x0504_0001, "EXTERNAL"),
     ("ICEBERG_FILESYSTEM_ERROR", 0x0504_0008, "EXTERNAL"),
@@ -189,16 +190,19 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
         "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
-        "sql.analyze.numeric_value_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
         "sql.admit.prepared_statement_not_found" => "NOT_FOUND",
         "sql.admit.expression_not_constant" => "EXPRESSION_NOT_CONSTANT",
         "sql.admit.invalid_parameter_usage" => "INVALID_PARAMETER_USAGE",
         "sql.analyze.function_not_aggregate" => "FUNCTION_NOT_AGGREGATE",
         "sql.analyze.expression_not_scalar" => "EXPRESSION_NOT_SCALAR",
-        "sql.admit.unknown_type" => "TYPE_NOT_FOUND",
+        "sql.admit.unknown_type" | "sql.analyze.unknown_type" => "TYPE_NOT_FOUND",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
+        "sql.analyze.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
         "sql.analyze.invalid_type_argument" => "INVALID_FUNCTION_ARGUMENT",
+        "sql.analyze.invalid_function_argument" => "INVALID_FUNCTION_ARGUMENT",
+        "sql.analyze.missing_argument" => "MISSING_ARGUMENT",
+        "sql.analyze.expression_not_constant" => "EXPRESSION_NOT_CONSTANT",
         "sql.analyze.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
         "sql.admit.invalid_catalog_property" => "INVALID_CATALOG_PROPERTY",
         "sql.admit.invalid_default_column_value" => "INVALID_DEFAULT_COLUMN_VALUE",
@@ -237,7 +241,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "sql.admit.insert_unsupported_form"
         | "sql.admit.create_table_unsupported_form"
         | "UnsupportedCompiledShape"
-        | "query.execution.unsupported" => "NOT_SUPPORTED",
+        | "query.execution.unsupported"
+        | "query.execution.unknown_epoch_time_zone" => "NOT_SUPPORTED",
         "sql.admit.invalid_session_property" => "INVALID_SESSION_PROPERTY",
         "sql.admit.session_catalog_not_found" => "CATALOG_NOT_FOUND",
         "sql.admit.kill_denied" => "PERMISSION_DENIED",
@@ -245,7 +250,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "query.execution.invariant"
         | "query.execution.unexpected"
         | "query.execution.control"
-        | "query.execution.commit_unknown" => "GENERIC_INTERNAL_ERROR",
+        | "query.execution.commit_unknown"
+        | "query.execution.date_result_out_of_range" => "GENERIC_INTERNAL_ERROR",
         "query.execution.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
         "query.execution.division_by_zero" => "DIVISION_BY_ZERO",
         "query.execution.invalid_cast_argument" => "INVALID_CAST_ARGUMENT",
@@ -903,6 +909,37 @@ fn invalid_function_argument_keeps_the_original_fact_at_both_client_exits() {
             sql: "SELECT CAST(ARRAY['invalid raw JSON'] AS ARRAY(JSON))"
         })
     );
+}
+
+#[test]
+fn temporal_row_errors_keep_their_data_fact_at_both_client_exits() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+
+    for (code, expected) in [(53, "GENERIC_INTERNAL_ERROR"), (54, "NOT_SUPPORTED")] {
+        let reason = FailureReason::new(domain::KERNEL, NonZeroU16::new(code).unwrap());
+        let fact = FailureFact::new(FailureClass::Data, reason);
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("temporal value failure"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let original = error.execution_failure().unwrap();
+        assert_eq!(original.fact(), fact);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT 1",
+        });
+        assert_wire(&wire, expected);
+        let service = QueryServiceError::from_execution_failure(original.clone());
+        assert_eq!(
+            wire,
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "SELECT 1",
+            }),
+        );
+    }
 }
 
 #[test]

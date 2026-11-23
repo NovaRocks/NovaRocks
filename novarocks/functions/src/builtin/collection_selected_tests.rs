@@ -85,6 +85,7 @@ fn prepared(
             literal::prepared_with_control("__array_literal", types, control)
         }
         Operation::MapLookup => access::prepared_with_control("__map_element_at", types, control),
+        Operation::MapSubscript => access::prepared_with_control("__map_subscript", types, control),
     }
 }
 fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayRef {

@@ -25,7 +25,7 @@ CREATE CATALOG "rwm13_large_${uuid0}" USING iceberg WITH ("iceberg.catalog.type"
 CREATE SCHEMA rwm13_large_${uuid0}.rwm13_${uuid0};
 CREATE TABLE rwm13_large_${uuid0}.rwm13_${uuid0}.t (p BIGINT) WITH (partitioning = ARRAY['p']);
 INSERT INTO rwm13_large_${uuid0}.rwm13_${uuid0}.t
-SELECT generate_series FROM TABLE(generate_series(1, 16385));
+SELECT generate_series FROM TABLE(sequence(1, 16385)) AS generate_series(generate_series);
 
 -- query 2
 SELECT count(*) AS n, sum(p) AS partition_sum FROM rwm13_large_${uuid0}.rwm13_${uuid0}.t;

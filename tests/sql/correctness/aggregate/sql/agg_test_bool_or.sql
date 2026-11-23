@@ -40,7 +40,7 @@ select bool_or(c0), boolor_agg(c1), bool_or(c2), bool_or(c3), bool_or(null) from
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 SELECT generate_series, generate_series, generate_series, null FROM TABLE(generate_series(1,  40960));
+insert into t1 SELECT generate_series, generate_series, generate_series, null FROM TABLE(sequence(1,  40960)) AS generate_series(generate_series);
 
 -- query 5
 USE ${case_db};

@@ -66,7 +66,6 @@ fn span_length(total: usize, length: usize) -> Result<usize, KernelFailure> {
 
 const UNMAPPED: i16 = -1;
 const DELETED: i16 = -2;
-const UNICODE_OUTPUT_MAX: usize = 1024 * 1024;
 type MappingEntry = (char, Option<char>, usize);
 
 // Keep the finite ASCII table inline: boxing it would introduce an extra
@@ -188,19 +187,16 @@ impl TranslateMap {
         &self,
         text: &str,
         work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<Option<usize>, KernelFailure> {
+    ) -> Result<usize, KernelFailure> {
         let mut bytes = 0usize;
         for ch in text.chars() {
             work.step()?;
             if let Some(mapped) = self.mapped(ch, work)? {
                 bytes = span_length(bytes, mapped.len_utf8())?;
                 work.step()?;
-                if matches!(self, Self::Unicode(_)) && bytes > UNICODE_OUTPUT_MAX {
-                    return Ok(None);
-                }
             }
         }
-        Ok(Some(bytes))
+        Ok(bytes)
     }
 
     fn emit(
@@ -321,10 +317,8 @@ pub(super) fn evaluate_string_translate<'a>(
         for (ordinal, batch_row) in selection.iter().enumerate() {
             if let Some([text, from, to]) = selected_texts(ordinal, batch_row, &mut work)? {
                 let map = TranslateMap::prepare(from, to, &mut work)?;
-                if let Some(length) = map.length(text, &mut work)? {
-                    total = span_length(total, length)?;
-                    work.step()?;
-                }
+                total = span_length(total, map.length(text, &mut work)?)?;
+                work.step()?;
             }
         }
         output_capacity(selection.len(), total)?;
@@ -351,13 +345,8 @@ pub(super) fn evaluate_string_translate<'a>(
                 }
                 Some([text, from, to]) => {
                     let map = TranslateMap::prepare(from, to, &mut work)?;
-                    if map.length(text, &mut work)?.is_some() {
-                        map.emit(text, &mut bytes, total, &mut work)?;
-                        validity.append(true);
-                    } else {
-                        has_null = true;
-                        validity.append(false);
-                    }
+                    map.emit(text, &mut bytes, total, &mut work)?;
+                    validity.append(true);
                 }
             }
             offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);

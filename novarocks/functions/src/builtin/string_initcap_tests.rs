@@ -33,24 +33,24 @@ use novarocks_type_contract::{
 };
 use std::{sync::Mutex, time::Duration};
 
-const NAMES: [&str; 1] = ["initcap"];
-// Independent legacy per-char rules, including non-contextual Greek sigma.
+const NAMES: [&str; 1] = ["title_case"];
+// Trino uses simple case mappings and whitespace word boundaries.
 const ORACLES: [(&str, &str); 16] = [
     ("", ""),
     ("hELLO wORLD", "Hello World"),
-    ("aBC\0dEF", "Abc\0Def"),
+    ("aBC\0dEF", "Abc\0def"),
     ("123ABC", "123abc"),
     ("a12BC_34DEF", "A12bc_34def"),
-    ("ßß", "SSß"),
-    ("ﬃABC", "FFIabc"),
+    ("ßß", "ßß"),
+    ("ﬃABC", "ﬃabc"),
     ("İ", "İ"),
-    ("aİ", "Ai\u{307}"),
+    ("aİ", "Ai"),
     ("ΟΣ", "Οσ"),
     ("ΟΣΑ", "Οσα"),
     ("aΣ", "Aσ"),
-    ("a\u{301}b", "A\u{301}B"),
-    ("Ο\u{301}ΣΑ", "Ο\u{301}Σα"),
-    ("你好👩‍💻hELLO", "你好👩‍💻Hello"),
+    ("a\u{301}b", "A\u{301}b"),
+    ("Ο\u{301}ΣΑ", "Ο\u{301}σα"),
+    ("你好👩‍💻hELLO", "你好👩‍💻hello"),
     ("٣ABC", "٣abc"),
 ];
 #[derive(Default)]
@@ -73,7 +73,7 @@ impl KernelEvaluationControl for Control {
         }
     }
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        panic!("initcap never waits")
+        panic!("title_case never waits")
     }
 }
 #[derive(Default)]
@@ -471,8 +471,8 @@ fn string_initcap_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
         .unwrap();
         let canonical = fresh.prepared().contract().clone();
         assert!(Arc::ptr_eq(canonical.call().selected_owner(), &selected));
-        assert_eq!(owner.implementation_declarations().len(), 1);
-        assert_eq!(owner.binding_declaration().overloads().len(), 1);
+        assert_eq!(owner.implementation_declarations().len(), 2);
+        assert_eq!(owner.binding_declaration().overloads().len(), 2);
         assert_eq!(
             owner.implementation_declarations()[0].abi,
             crate::PureKernelAbi::ScalarV1
@@ -481,7 +481,7 @@ fn string_initcap_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
             owner.implementation_declarations()[0]
                 .implementation
                 .as_str(),
-            "builtin.scalar/initcap/selected-v1"
+            "builtin.scalar/title_case/selected-v1"
         );
         assert_eq!(
             canonical.effects().own_row_error,
@@ -632,7 +632,7 @@ fn string_initcap_compile_success_and_ordinary_tail_preserve_all_callback_causes
         let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
-                "initcap",
+                "title_case",
                 &ty,
                 DecimalOverflowPolicy::OutputNull,
                 &good
@@ -653,7 +653,7 @@ fn string_initcap_compile_success_and_ordinary_tail_preserve_all_callback_causes
                     refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
-                    "initcap",
+                    "title_case",
                     &ty,
                     DecimalOverflowPolicy::OutputNull,
                     &control,
@@ -683,7 +683,7 @@ fn string_initcap_compile_success_and_ordinary_tail_preserve_all_callback_causes
 fn string_initcap_long_output_has_no_legacy_absent_one_mib_cap_or_batch_dependence() {
     let text = "a".repeat(1024 * 1024 + 1);
     let array = strings(vec![Some(&text), Some("123ABC"), None]);
-    let mut kernel = instance("initcap", true);
+    let mut kernel = instance("title_case", true);
     let control = Control::default();
     let arguments = [EvaluatedArgument::Column(&array)];
     let whole = kernel

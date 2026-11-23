@@ -21,11 +21,11 @@
 -- @order_sensitive=true
 
 -- query 1
-SELECT array_contains([], NULL) AS empty_contains,
+SELECT contains([], NULL) AS empty_contains,
        array_position([], NULL) AS empty_position,
-       array_contains([NULL], NULL) AS singleton_contains,
+       contains([NULL], NULL) AS singleton_contains,
        array_position([NULL], NULL) AS singleton_position,
-       array_contains([NULL, NULL], NULL) AS repeated_contains,
+       contains([NULL, NULL], NULL) AS repeated_contains,
        array_position([NULL, NULL], NULL) AS repeated_position;
 
 -- query 2
@@ -35,10 +35,10 @@ SELECT array_remove([NULL, NULL], NULL) AS removed,
        array_intersect([NULL], []) AS empty_intersection,
        arrays_overlap([NULL], [NULL]) AS shared_null,
        arrays_overlap([], [NULL]) AS empty_overlap,
-       array_contains_seq([NULL, NULL], [NULL]) AS contains_null_seq;
+       contains_sequence([NULL, NULL], [NULL]) AS contains_null_seq;
 
 -- query 3
-SELECT array_contains(CAST(NULL AS ARRAY<INT>), NULL) AS null_contains,
+SELECT contains(CAST(NULL AS ARRAY<INT>), NULL) AS null_contains,
        array_position(CAST(NULL AS ARRAY<INT>), NULL) AS null_position,
        array_remove(CAST(NULL AS ARRAY<INT>), NULL) AS null_removed,
        array_distinct(CAST(NULL AS ARRAY<INT>)) AS null_distinct,
@@ -46,7 +46,7 @@ SELECT array_contains(CAST(NULL AS ARRAY<INT>), NULL) AS null_contains,
        arrays_overlap(CAST(NULL AS ARRAY<INT>), [NULL]) AS null_overlap;
 
 -- query 4
-SELECT id, array_contains(a, NULL) AS contains_null,
+SELECT id, contains(a, NULL) AS contains_null,
        array_position(a, NULL) AS null_position,
        array_remove(a, NULL) AS removed,
        array_distinct(a) AS deduplicated
@@ -56,7 +56,7 @@ FROM (SELECT 1 AS id, [] AS a
 ORDER BY id;
 
 -- query 5
-SELECT array_contains([1, NULL, 2], NULL) AS typed_contains,
+SELECT contains([1, NULL, 2], NULL) AS typed_contains,
        array_position([1, NULL, 2], NULL) AS typed_position,
        array_remove([1, NULL, 2], NULL) AS typed_removed,
        array_distinct([[NULL], [NULL]]) AS nested_distinct,

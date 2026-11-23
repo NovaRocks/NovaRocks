@@ -61,10 +61,10 @@ SELECT
   CAST(n % 5 AS INT) AS lo_linenumber,
   CAST(n % 50 AS INT) AS lo_quantity,
   CAST(n % 1000 AS INT) AS lo_revenue
-FROM TABLE(generate_series(1, 2400)) t(n);
+FROM TABLE(sequence(1, 2400)) t(n);
 INSERT INTO mvrw_${uuid0}.ns_${uuid0}.lineorder
 SELECT 10000, 2, CAST(n AS INT), CAST(n AS INT)
-FROM TABLE(generate_series(1, 24000)) t(n);
+FROM TABLE(sequence(1, 24000)) t(n);
 
 -- query 5
 -- @skip_result_check=true

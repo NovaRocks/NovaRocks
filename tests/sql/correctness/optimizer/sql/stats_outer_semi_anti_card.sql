@@ -24,10 +24,10 @@ CREATE TABLE ${case_db}.oq12_stats_join_l (k INT, payload INT);
 CREATE TABLE ${case_db}.oq12_stats_join_r (k INT, flag INT);
 INSERT INTO ${case_db}.oq12_stats_join_l
     SELECT generate_series % 100, generate_series
-    FROM TABLE(generate_series(1, 1000));
+    FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.oq12_stats_join_r
     SELECT generate_series % 80, generate_series % 2
-    FROM TABLE(generate_series(1, 800));
+    FROM TABLE(sequence(1, 800)) AS generate_series(generate_series);
 ANALYZE ${case_db}.oq12_stats_join_l;
 ANALYZE ${case_db}.oq12_stats_join_r;
 

@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-mod left_right {
+mod substring {
     //! The actual SQL case with no-op folding retains the original emitted call and request authors.
     //! Prior native PASS alone does not establish that a call survived real constant folding.
     use arrow::datatypes::DataType;
@@ -24,16 +24,19 @@ mod left_right {
         novarocks_physical_plan::{FunctionArgumentType, StaticFunctionArgument},
     };
 
-    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    use novarocks_type_contract::{CharacterKind, CharacterType, ValueKind, ValueLogicalType};
     const SQL: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/sql/correctness/project/sql/project_string_int_argument_semantics.sql"
     ));
     fn check() {
-        let query = SQL
-            .trim()
-            .strip_suffix(';')
-            .expect("one terminated suite query");
+        let (_, queries) = SQL
+            .split_once("-- query 1\n")
+            .expect("successful query block");
+        let (query, _) = queries
+            .split_once("-- query 2\n")
+            .expect("next query block");
+        let query = query.trim().strip_suffix(';').expect("terminated query");
         let owner = sql_source(query, DataType::Int64);
         let mut count = 0;
         for fragment in owner.plan().fragments().values() {
@@ -47,16 +50,14 @@ mod left_right {
                 let ExprKind::FunctionCall { function, args } = &node.kind else {
                     continue;
                 };
-                if !["builtin.scalar/strleft/v1", "builtin.scalar/strright/v1"]
-                    .contains(&function.function_id.as_str())
-                {
+                if function.function_id.as_str() != "builtin.scalar/substr/v1" {
                     continue;
                 }
                 let request = unit.requests().get(&id).unwrap();
-                assert_eq!(args.len(), 2);
-                assert_eq!(request.logical_argument_count, 2);
-                assert_eq!(request.arguments.len(), 2);
-                assert_eq!(function.argument_types.len(), 2);
+                assert_eq!(args.len(), 3);
+                assert_eq!(request.logical_argument_count, 3);
+                assert_eq!(request.arguments.len(), 3);
+                assert_eq!(function.argument_types.len(), 3);
                 for (index, ((argument, selected), child)) in request
                     .arguments
                     .iter()
@@ -83,23 +84,28 @@ mod left_right {
                     assert_eq!(&unit.definition(*child).unwrap().ty, bound);
                 }
                 assert_eq!(node.ty, function.result_type);
-                assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
+                assert_eq!(
+                    node.ty.value_type().kind(),
+                    &ValueKind::BoundedCharacter(
+                        CharacterType::new(CharacterKind::Varchar, 3).unwrap()
+                    )
+                );
                 eprintln!(
-                    "left_right actual retained source mode=compiled fragment={:?} definition={id:?} signature={function:?} original_request={request:?} ordered_children={args:?}",
+                    "substr actual retained source mode=compiled fragment={:?} definition={id:?} signature={function:?} original_request={request:?} ordered_children={args:?}",
                     fragment.id()
                 );
                 count += 1;
             }
         }
         assert!(
-            count == 4,
+            count == 3,
             "actual corpus SQL keeps a real function call with no-op fold"
         );
-        eprintln!("left_right actual retained call count mode=compiled count={count}");
+        eprintln!("substr actual retained call count mode=compiled count={count}");
     }
 
     #[test]
-    fn left_right_actual_candidate_sql_kept_call_source() {
+    fn substring_actual_candidate_sql_kept_call_source() {
         check()
     }
 }

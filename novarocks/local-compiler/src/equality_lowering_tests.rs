@@ -241,8 +241,6 @@ fn seal_units(
                     effects: token.call_contract().effects().clone(),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             );
         }
@@ -1037,7 +1035,7 @@ fn actual_fragment_compilation_preserves_primitive_capability_refusals() {
     let nested = FunctionValueType::new(
         DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
-            DataType::Int64,
+            DataType::Float32,
             true,
         ))),
         true,

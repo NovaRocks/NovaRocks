@@ -82,7 +82,7 @@ CALL proc_ice_${uuid0}.system.expire_snapshots("table" => 'ns_${uuid0}.orders', 
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- @expect_trino_error=PROCEDURE_NOT_FOUND,USER_ERROR
 -- @expect_error=Procedure not registered: system.rewrite_data_files
-CALL proc_ice_${uuid0}.system.rewrite_data_files("table" => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
+CALL proc_ice_${uuid0}.system.rewrite_data_files("table" => 'ns_${uuid0}.orders', options => MAP(ARRAY['rewrite-all'], ARRAY['true']));
 
 -- query 9
 -- @skip_result_check=true

@@ -40,51 +40,51 @@ insert into t values ROW(1,[1,2],[1,2],[0,1]),ROW(2,[1,2],null,[1,1]),ROW(3,[1,2
 
 -- query 4
 USE ${case_db};
-select array_filter(arr_0, arr_2) from t order by k;
+select CASE WHEN arr_0 IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(arr_0, slice(coalesce(arr_2, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(arr_0))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 5
 USE ${case_db};
-select array_filter(arr_1, arr_2) from t order by k;
+select CASE WHEN arr_1 IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(arr_1, slice(coalesce(arr_2, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(arr_1))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 6
 USE ${case_db};
-select array_filter(arr_0,[0,0,0,1]) from t order by k;
+select CASE WHEN arr_0 IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(arr_0, slice(coalesce([0,0,0,1], CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(arr_0))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 7
 USE ${case_db};
-select array_filter(arr_0,[1,0,1]) from t order by k;
+select CASE WHEN arr_0 IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(arr_0, slice(coalesce([1,0,1], CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(arr_0))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 8
 USE ${case_db};
-select array_filter(arr_0,null) from t order by k;
+select CASE WHEN arr_0 IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(arr_0, slice(coalesce(null, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(arr_0))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 9
 USE ${case_db};
-select array_filter(arr_1,null) from t order by k;
+select CASE WHEN arr_1 IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(arr_1, slice(coalesce(null, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(arr_1))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 10
 USE ${case_db};
-select array_filter([1,2,3,4],arr_2) from t order by k;
+select CASE WHEN [1,2,3,4] IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip([1,2,3,4], slice(coalesce(arr_2, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality([1,2,3,4]))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 11
 USE ${case_db};
-select array_filter(null, arr_2) from t order by k;
+select CASE WHEN CAST(NULL AS ARRAY(BIGINT)) IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(CAST(NULL AS ARRAY(BIGINT)), slice(coalesce(arr_2, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(CAST(NULL AS ARRAY(BIGINT))))), pair -> pair[2] <> 0), pair -> pair[1]) END from t order by k;
 
 -- query 12
 USE ${case_db};
-select array_filter([1,2,3,4],[0,0,1,1]) from t;
+select CASE WHEN [1,2,3,4] IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip([1,2,3,4], slice(coalesce([0,0,1,1], CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality([1,2,3,4]))), pair -> pair[2] <> 0), pair -> pair[1]) END from t;
 
 -- query 13
 USE ${case_db};
-select array_filter(null, null) from t;
+select CASE WHEN CAST(NULL AS ARRAY(BIGINT)) IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(CAST(NULL AS ARRAY(BIGINT)), slice(coalesce(null, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(CAST(NULL AS ARRAY(BIGINT))))), pair -> pair[2] <> 0), pair -> pair[1]) END from t;
 
 -- query 14
 USE ${case_db};
-select array_filter([1,2,3,4],null) from t;
+select CASE WHEN [1,2,3,4] IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip([1,2,3,4], slice(coalesce(null, CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality([1,2,3,4]))), pair -> pair[2] <> 0), pair -> pair[1]) END from t;
 
 -- query 15
 USE ${case_db};
-select array_filter(null, [1,0,1,null]) from t;
+select CASE WHEN CAST(NULL AS ARRAY(BIGINT)) IS NULL THEN CAST(NULL AS ARRAY(BIGINT)) ELSE transform(filter(zip(CAST(NULL AS ARRAY(BIGINT)), slice(coalesce([1,0,1,null], CAST(ARRAY[] AS ARRAY(BIGINT))), 1, cardinality(CAST(NULL AS ARRAY(BIGINT))))), pair -> pair[2] <> 0), pair -> pair[1]) END from t;
 
 -- query 16
 -- @skip_result_check=true

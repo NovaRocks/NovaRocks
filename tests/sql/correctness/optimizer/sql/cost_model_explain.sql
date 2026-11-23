@@ -33,7 +33,7 @@ DROP TABLE IF EXISTS ${case_db}.cost_model_explain_t;
 CREATE TABLE ${case_db}.cost_model_explain_t (k INT, v INT);
 INSERT INTO ${case_db}.cost_model_explain_t
     SELECT generate_series, generate_series * 10
-    FROM TABLE(generate_series(1, 1000));
+    FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.cost_model_explain_t;
 
 EXPLAIN WITH SESSION explain_detail = 'COSTS'
@@ -42,7 +42,7 @@ SELECT * FROM ${case_db}.cost_model_explain_t WHERE v > 10;
 EXPLAIN WITH SESSION explain_detail = 'COSTS'
 SELECT cost_model_explain_t.k, cost_model_explain_t.v, gs.generate_series AS rk
 FROM ${case_db}.cost_model_explain_t
-JOIN TABLE(generate_series(1, 100)) gs
+JOIN TABLE(sequence(1, 100)) gs(generate_series)
     ON cost_model_explain_t.k = gs.generate_series;
 
 EXPLAIN WITH SESSION explain_detail = 'COSTS'

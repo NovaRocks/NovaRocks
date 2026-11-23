@@ -46,7 +46,8 @@ use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ExpressionUseId, OperatorFunction, PureCompileControl,
+    CharacterKind, CharacterType, CompileControlError, CompilePhase, ExpressionUseId,
+    OperatorFunction, PureCompileControl, ValueKind,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -473,7 +474,9 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             if matches!(family, Family::Call("builtin.scalar/upper/v1")) {
                 assert_eq!(
                     fixture.ty(at).value_type().kind(),
-                    &novarocks_type_contract::ValueKind::String
+                    &ValueKind::BoundedCharacter(
+                        CharacterType::new(CharacterKind::Varchar, 3).unwrap()
+                    )
                 );
             }
         }
@@ -546,6 +549,30 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             "frozen root: {expression}"
         );
         fixture.assert_both(&functions, outcome, Expected::Value(expected));
+    }
+}
+
+#[test]
+fn constant_entry_temporal_format_and_epoch_match_the_local_program() {
+    let functions = shared_installed_builtin_owner_catalogue();
+    for (expression, function, expected) in [
+        (
+            "date_format(TIMESTAMP '2024-03-01 12:00:00.123456', '%c %M %f')",
+            "builtin.scalar/date_format/v1",
+            "3 March 123000",
+        ),
+        (
+            "date_format(from_unixtime(-0.0005e0, 'UTC'), '%Y-%m-%d %H:%i:%s.%f')",
+            "builtin.scalar/date_format/v1",
+            "1969-12-31 23:59:59.999000",
+        ),
+    ] {
+        let fixture = Fixture::compile(expression, Family::Call(function), "32", &functions);
+        fixture.assert_both(
+            &functions,
+            FoldOutcome::Folded,
+            Expected::Value(text(expected)),
+        );
     }
 }
 

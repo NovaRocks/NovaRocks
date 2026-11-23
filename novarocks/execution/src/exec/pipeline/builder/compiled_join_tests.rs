@@ -356,6 +356,7 @@ fn add_join(
     right: (NodeId, [ValueId; 2]),
     spec: Spec,
     placement: Placement,
+    checked_right: bool,
 ) -> Vec<ValueId> {
     let (left_node, l) = left;
     let (right_node, r) = right;
@@ -374,11 +375,15 @@ fn add_join(
             .unwrap()
             .add(None, int64(true), ExprKind::Value(l[1]))
             .unwrap();
-        let y = builder
-            .unit(join)
-            .unwrap()
-            .add(None, int64(true), ExprKind::Value(r[1]))
-            .unwrap();
+        let y = if checked_right {
+            overflowing(builder, join, r[1])
+        } else {
+            builder
+                .unit(join)
+                .unwrap()
+                .add(None, int64(true), ExprKind::Value(r[1]))
+                .unwrap()
+        };
         builder
             .unit(join)
             .unwrap()
@@ -667,6 +672,16 @@ pub(super) fn single_plan_with_dop(
     right: &[Row],
     pipeline_dop: u32,
 ) -> PhysicalPlan {
+    single_plan_with_predicate(spec, left, right, pipeline_dop, false)
+}
+
+fn single_plan_with_predicate(
+    spec: Spec,
+    left: &[Row],
+    right: &[Row],
+    pipeline_dop: u32,
+    checked_right: bool,
+) -> PhysicalPlan {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
 
     let mut builder =
@@ -696,6 +711,7 @@ pub(super) fn single_plan_with_dop(
         (right_node, [right_values[0], right_values[1]]),
         spec,
         Placement::Single,
+        checked_right,
     );
     super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
@@ -710,10 +726,21 @@ pub(super) fn single_plan_with_dop(
         version(),
         &fixture_sources,
     );
+    if checked_right {
+        plan = plan.with_semantic_parameters(
+            SemanticParameters::try_new([(
+                ALLOW.id,
+                SemanticParameterValue::AllowThrowException(true),
+            )])
+            .unwrap(),
+        );
+    }
     plan.add_fragment(fragment).unwrap();
     let mut port = result_port(SINGLE, join, &output);
     if spec.kind == JoinKind::LeftMark {
-        port.fields.last_mut().unwrap().ty = FunctionValueType::new(DataType::Boolean, true);
+        let mark = port.fields.last_mut().unwrap();
+        mark.ty = FunctionValueType::new(DataType::Boolean, true);
+        mark.domain = crate::test_result_domain::result_value_domain(&mark.ty);
     }
     plan.set_result_port(port).unwrap();
     plan.finish_observed(&FixtureControl)
@@ -795,6 +822,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         (build_node, [build[0], build[1]]),
         spec,
         placement,
+        false,
     );
     super::family_fixture::seal_no_call_units(&mut builder);
     let join_fragment = builder
@@ -3524,6 +3552,99 @@ fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlie
 
 /// JSON values deliberately use different object member order, SQL NULL and
 /// the JSON value `null`. Expected marks follow SQL ANY's three-valued table.
+#[test]
+fn nested_loop_left_mark_reduces_across_pair_pages_and_preserves_probe_occurrences() {
+    use arrow::array::BooleanArray;
+
+    let lhs = [
+        (Some(1), Some(10)),
+        (Some(2), Some(20)),
+        (Some(3), None),
+        (Some(1), Some(10)),
+    ];
+    let false_only = vec![(Some(1), Some(8)); 530];
+    let mut unknown_then_true = vec![(Some(1), None)];
+    unknown_then_true.extend_from_slice(&false_only);
+    unknown_then_true.push((Some(1), Some(12)));
+    for (rhs, expected) in [
+        (vec![], [Some(false); 4]),
+        (false_only, [Some(false), Some(false), None, Some(false)]),
+        (unknown_then_true, [Some(true), None, None, Some(true)]),
+    ] {
+        let spec = Spec::nested(JoinKind::LeftMark, true);
+        let mut packages = packages(&single_plan(spec, &lhs, &rhs));
+        let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+        assert!(matches!(
+            join_kind(&program),
+            ProgramNodeKind::NestedLoopJoin {
+                join_type: NestedLoopJoinType::LeftMark,
+                ..
+            }
+        ));
+        let output = ResultSinkBuffer::new();
+        try_run(
+            &program,
+            result_sink(&program, SINGLE_FINST, &output),
+            ExchangeBindings::default(),
+            SINGLE_FINST,
+        )
+        .unwrap();
+        let actual = output
+            .take_chunks()
+            .iter()
+            .flat_map(|chunk| {
+                chunk.columns()[2]
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{} RHS physical rows", rhs.len());
+    }
+}
+
+#[test]
+fn nested_loop_left_mark_preserves_a_late_required_error_after_true() {
+    let mut rhs = vec![(None, Some(0)); 530];
+    rhs.push((None, Some(1)));
+    let spec = Spec::nested(JoinKind::LeftMark, true);
+    let plan = single_plan_with_predicate(spec, &[(None, Some(10))], &rhs, 1, true);
+    let mut packages = packages(&plan);
+    let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+    let output = ResultSinkBuffer::new();
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("left mark required pair");
+    let prepared = prepare_compiled_program_pipeline_execution(
+        program,
+        Duration::from_millis(10),
+        Box::new(ResultSinkFactory::new(output.clone())),
+        ExchangeBindings::default(),
+        None,
+        1,
+        Arc::new(RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(tracker.clone()),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        )),
+        Arc::new(NoopTaskEventSink),
+    )
+    .unwrap();
+    let failure = prepared
+        .start()
+        .join()
+        .expect_err("later pair remains required");
+    let ExecutionFailureCause::RequiredRow(required) = failure.cause() else {
+        panic!("expected the original required predicate error: {failure:?}");
+    };
+    assert!(required.error().message().contains("Arithmetic overflow"));
+    assert!(output.take_chunks().is_empty());
+    assert_eq!(tracker.current(), 0);
+}
+
 #[test]
 fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() {
     use arrow::array::{Array, BooleanArray};

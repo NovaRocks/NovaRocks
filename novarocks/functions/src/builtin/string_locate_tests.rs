@@ -17,7 +17,7 @@
 
 use super::super::string_locate_owner::{
     effects, operation, owner_for_test, prepared_for_test_with_control,
-    prepared_for_test_with_policy,
+    prepared_for_test_with_policy, strpos_effects,
 };
 use super::*;
 use crate::{
@@ -90,12 +90,12 @@ fn instance(name: &str, arity: usize) -> ScalarEvaluationInstance {
 fn strings(values: Vec<Option<&str>>) -> ArrayRef {
     Arc::new(StringArray::from(values))
 }
-fn output(result: &SelectedValues<'_>) -> Vec<Option<i32>> {
+fn output(result: &SelectedValues<'_>) -> Vec<Option<i64>> {
     assert!(result.errors().is_empty());
     result
         .values()
         .as_any()
-        .downcast_ref::<Int32Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap()
         .iter()
         .collect()
@@ -131,7 +131,7 @@ fn pool(array: ArrayRef) -> ConstantPool {
     .unwrap()
 }
 
-const NAMES: [&str; 2] = ["locate", "instr"];
+const NAMES: [&str; 1] = ["strpos"];
 fn sources(arity: usize) -> Vec<FunctionValueType> {
     (0..arity)
         .map(|i| {
@@ -147,86 +147,65 @@ fn sources(arity: usize) -> Vec<FunctionValueType> {
         .collect()
 }
 fn target() -> FunctionValueType {
-    FunctionValueType::new(DataType::Int32, true)
+    FunctionValueType::new(DataType::Int64, true)
 }
 fn integers(values: Vec<Option<i64>>) -> ArrayRef {
     Arc::new(Int64Array::from(values))
 }
-fn ordinary_args<'a>(
-    name: &str,
-    haystack: &'a ArrayRef,
-    needle: &'a ArrayRef,
-) -> [EvaluatedArgument<'a>; 2] {
-    if name == "instr" {
-        [
-            EvaluatedArgument::Column(haystack),
-            EvaluatedArgument::Column(needle),
-        ]
-    } else {
-        [
-            EvaluatedArgument::Column(needle),
-            EvaluatedArgument::Column(haystack),
-        ]
-    }
+fn ordinary_args<'a>(haystack: &'a ArrayRef, needle: &'a ArrayRef) -> [EvaluatedArgument<'a>; 2] {
+    [
+        EvaluatedArgument::Column(haystack),
+        EvaluatedArgument::Column(needle),
+    ]
 }
 
 #[test]
-fn string_locate_actual_three_profiles_preserve_independent_scalar_positions_and_start_edges() {
+fn strpos_preserves_overlapping_unicode_and_signed_occurrences() {
     let cases = [
-        ("aé中é", "é", 1, 2),
-        ("aé中é", "é", 3, 4),
-        ("aé中é", "中", 2, 3),
-        ("👩‍💻x", "x", 1, 4),
-        ("a\u{301}b", "\u{301}", 1, 2),
-        ("x\0y", "\0", 1, 2),
-        ("aaaa", "aa", 2, 2),
-        ("abc", "z", 1, 0),
-        ("abc", "", 1, 1),
-        ("abc", "", 3, 3),
-        ("abc", "", 4, 0),
-        ("", "", 1, 1),
-        ("", "", 2, 0),
-        ("", "x", 1, 0),
-        ("abc", "a", 0, 0),
-        ("abc", "a", -1, 0),
-        ("abc", "", i64::MIN, 0),
-        ("abc", "a", i64::MAX, 0),
-        ("abc", "", i64::MAX, 0),
+        ("aé中é", "é", 1, Some(2)),
+        ("aé中é", "é", 2, Some(4)),
+        ("aé中é", "é", -1, Some(4)),
+        ("aé中é", "é", -2, Some(2)),
+        ("👩‍💻x", "x", 1, Some(4)),
+        ("a\u{301}b", "\u{301}", 1, Some(2)),
+        ("x\0y", "\0", 1, Some(2)),
+        ("aaaa", "aa", 2, Some(2)),
+        ("aaaa", "aa", -2, Some(2)),
+        ("abc", "z", 1, Some(0)),
+        ("abc", "", 3, Some(1)),
+        ("", "", -1, Some(1)),
+        ("abc", "a", i64::MAX, Some(0)),
+        ("abc", "a", 0, None),
+        ("abc", "", i64::MIN, None),
     ];
-    let haystack = strings(cases.iter().map(|(h, _, _, _)| Some(*h)).collect());
-    let needle = strings(cases.iter().map(|(_, n, _, _)| Some(*n)).collect());
-    let starts = integers(cases.iter().map(|(_, _, start, _)| Some(*start)).collect());
-    let args = [
-        EvaluatedArgument::Column(&needle),
+    let haystack = strings(cases.iter().map(|case| Some(case.0)).collect());
+    let needle = strings(cases.iter().map(|case| Some(case.1)).collect());
+    let instances = integers(cases.iter().map(|case| Some(case.2)).collect());
+    let arguments = [
         EvaluatedArgument::Column(&haystack),
-        EvaluatedArgument::Column(&starts),
+        EvaluatedArgument::Column(&needle),
+        EvaluatedArgument::Column(&instances),
     ];
-    for policy in [
-        DecimalOverflowPolicy::OutputNull,
-        DecimalOverflowPolicy::ReportError,
-    ] {
-        let mut types = sources(3);
-        for ty in &mut types {
-            *ty = ty
-                .with_nullable(false)
-                .expect("valid function nullability declaration");
-        }
-        let prepared = prepared_for_test_with_policy("locate", &types, policy).unwrap();
-        assert_eq!(prepared.contract().result_type(), &target());
-        assert_eq!(prepared.contract().decimal_overflow_policy(), policy);
-        let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
-        assert_eq!(
-            output(
-                &kernel
-                    .evaluate(Selection::all(cases.len()), &args, &Control::default())
-                    .unwrap()
-            ),
-            cases
-                .iter()
-                .map(|(_, _, _, expected)| Some(*expected))
-                .collect::<Vec<_>>()
-        );
-    }
+    let result = instance("strpos", 3)
+        .evaluate(Selection::all(cases.len()), &arguments, &Control::default())
+        .unwrap();
+    let values = result
+        .values()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.iter().collect::<Vec<_>>(), cases.map(|case| case.3));
+    let invalid = crate::DataFailureReason::Domain(
+        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+    );
+    assert_eq!(
+        result
+            .errors()
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.reason()))
+            .collect::<Vec<_>>(),
+        [(13, invalid), (14, invalid)]
+    );
     let cases = [
         ("aé中é", "é", 2),
         ("👩‍💻x", "x", 4),
@@ -238,7 +217,7 @@ fn string_locate_actual_three_profiles_preserve_independent_scalar_positions_and
     let haystack = strings(cases.iter().map(|(h, _, _)| Some(*h)).collect());
     let needle = strings(cases.iter().map(|(_, n, _)| Some(*n)).collect());
     for name in NAMES {
-        let args = ordinary_args(name, &haystack, &needle);
+        let args = ordinary_args(&haystack, &needle);
         let mut kernel = instance(name, 2);
         assert_eq!(
             output(
@@ -270,16 +249,16 @@ fn string_locate_sparse_slice_compact_scalar_and_nonzero_constant_ordinals_are_i
     let compact = SelectedValues::try_new(
         selection,
         &DataType::Int64,
-        integers(vec![Some(1), Some(3)]),
+        integers(vec![Some(1), Some(2)]),
         Box::default(),
     )
     .unwrap();
     let args = [
-        EvaluatedArgument::Scalar(&needle),
         EvaluatedArgument::Column(&haystack),
+        EvaluatedArgument::Scalar(&needle),
         EvaluatedArgument::SelectedColumn(&compact),
     ];
-    let mut kernel = instance("locate", 3);
+    let mut kernel = instance("strpos", 3);
     let result = kernel
         .evaluate(selection, &args, &Control::default())
         .unwrap();
@@ -295,17 +274,10 @@ fn string_locate_sparse_slice_compact_scalar_and_nonzero_constant_ordinals_are_i
     )
     .unwrap();
     for name in NAMES {
-        let args = if name == "instr" {
-            [
-                EvaluatedArgument::Constant(&constant),
-                EvaluatedArgument::SelectedColumn(&compact_needle),
-            ]
-        } else {
-            [
-                EvaluatedArgument::SelectedColumn(&compact_needle),
-                EvaluatedArgument::Constant(&constant),
-            ]
-        };
+        let args = [
+            EvaluatedArgument::Constant(&constant),
+            EvaluatedArgument::SelectedColumn(&compact_needle),
+        ];
         let mut kernel = instance(name, 2);
         assert_eq!(
             output(
@@ -325,7 +297,7 @@ fn string_locate_sparse_slice_compact_scalar_and_nonzero_constant_ordinals_are_i
 }
 
 #[test]
-fn string_locate_strict_null_inactive_and_nonpositive_start_never_search_hidden_payload() {
+fn string_locate_strict_null_and_inactive_rows_never_search_hidden_payload() {
     let huge = "中".repeat(320 * 1024);
     let mut bytes = huge.as_bytes().to_vec();
     bytes.push(b'x');
@@ -342,20 +314,18 @@ fn string_locate_strict_null_inactive_and_nonpositive_start_never_search_hidden_
     let null_needles = strings(vec![None, Some("x")]);
     let starts = integers(vec![Some(1), Some(1)]);
     let null_starts = integers(vec![None, Some(1)]);
-    let negative_starts = integers(vec![Some(i64::MIN), Some(1)]);
     for (haystack, needle, start, first) in [
         (&hidden, &needles, &starts, None),
         (&inactive, &null_needles, &starts, None),
         (&inactive, &needles, &null_starts, None),
-        (&inactive, &needles, &negative_starts, Some(0)),
     ] {
         let args = [
-            EvaluatedArgument::Column(needle),
             EvaluatedArgument::Column(haystack),
+            EvaluatedArgument::Column(needle),
             EvaluatedArgument::Column(start),
         ];
         let control = Control::default();
-        let mut kernel = instance("locate", 3);
+        let mut kernel = instance("strpos", 3);
         assert_eq!(
             output(&kernel.evaluate(Selection::all(2), &args, &control).unwrap()),
             vec![first, Some(1)]
@@ -364,9 +334,9 @@ fn string_locate_strict_null_inactive_and_nonpositive_start_never_search_hidden_
     }
     let rows = [1];
     let selection = Selection::try_sparse(2, &rows).unwrap();
-    let args = ordinary_args("instr", &inactive, &needles);
+    let args = ordinary_args(&inactive, &needles);
     let control = Control::default();
-    let mut kernel = instance("instr", 2);
+    let mut kernel = instance("strpos", 2);
     assert_eq!(
         output(&kernel.evaluate(selection, &args, &control).unwrap()),
         vec![Some(1)]
@@ -381,13 +351,13 @@ fn string_locate_empty_selection_wrong_carrier_and_child_errors_preserve_failed_
     let starts = integers(vec![Some(1)]);
     let wrong = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
     let args = [
-        EvaluatedArgument::Column(&needle),
         EvaluatedArgument::Column(&haystack),
+        EvaluatedArgument::Column(&needle),
         EvaluatedArgument::Column(&starts),
     ];
     let empty = [];
     let selection = Selection::try_sparse(1, &empty).unwrap();
-    let mut kernel = instance("locate", 3);
+    let mut kernel = instance("strpos", 3);
     assert!(
         output(
             &kernel
@@ -405,8 +375,8 @@ fn string_locate_empty_selection_wrong_carrier_and_child_errors_preserve_failed_
         vec![Some(2)]
     );
     let wrong = [
-        EvaluatedArgument::Column(&needle),
         EvaluatedArgument::Column(&haystack),
+        EvaluatedArgument::Column(&needle),
         EvaluatedArgument::Column(&wrong),
     ];
     assert!(matches!(
@@ -432,7 +402,7 @@ fn string_locate_empty_selection_wrong_carrier_and_child_errors_preserve_failed_
         EvaluatedArgument::Column(&haystack),
         EvaluatedArgument::SelectedColumn(&failed),
     ];
-    let mut kernel = instance("instr", 2);
+    let mut kernel = instance("strpos", 2);
     assert!(matches!(
         kernel.evaluate(Selection::all(1), &args, &Control::default()),
         Err(ref cause) if crate::kernel_control::test_contract::input(cause)
@@ -463,12 +433,12 @@ fn string_locate_every_small_callback_and_real_character_quantum_keep_original_t
             integers(vec![Some(1); haystack.len()])
         };
         let args = [
-            EvaluatedArgument::Column(&needle),
             EvaluatedArgument::Column(&haystack),
+            EvaluatedArgument::Column(&needle),
             EvaluatedArgument::Column(&start),
         ];
         let good = Control::default();
-        let mut kernel = instance("locate", 3);
+        let mut kernel = instance("strpos", 3);
         let result = kernel.evaluate(Selection::all(haystack.len()), &args, &good);
         if wrong {
             assert!(matches!(result, Err(KernelFailure::InvalidProgram(_))));
@@ -492,7 +462,7 @@ fn string_locate_every_small_callback_and_real_character_quantum_keep_original_t
                     trace: Mutex::new(vec![]),
                     refusal: Some((at, cause.clone())),
                 };
-                let mut kernel = instance("locate", 3);
+                let mut kernel = instance("strpos", 3);
                 assert_eq!(
                     kernel
                         .evaluate(Selection::all(haystack.len()), &args, &control)
@@ -515,15 +485,8 @@ fn string_locate_every_small_callback_and_real_character_quantum_keep_original_t
 #[test]
 fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources() {
     for name in NAMES {
-        for arity in 2..=if name == "locate" { 3 } else { 2 } {
-            assert_eq!(
-                operation(name),
-                Some(if name == "locate" {
-                    StringLocateOp::Locate
-                } else {
-                    StringLocateOp::Instr
-                })
-            );
+        for arity in 2..=3 {
+            assert_eq!(operation(name), Some(StringLocateOp::Strpos));
             assert!(operation("substring_index").is_none());
             let owner = owner_for_test(name);
             let arguments: Vec<_> = sources(arity)
@@ -603,7 +566,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
             assert!(canonical.effects().observable_effects.is_empty());
             assert_eq!(
                 canonical.effects().own_row_error,
-                crate::FunctionIntrinsicRowError::NoRowError
+                strpos_effects(arity).own_row_error
             );
             assert_eq!(
                 canonical.effects().argument_control,
@@ -618,10 +581,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
                 owner.binding_declaration().function_id().as_str(),
                 format!("builtin.scalar/{name}/v1")
             );
-            assert_eq!(
-                owner.implementation_declarations().len(),
-                if name == "locate" { 2 } else { 1 }
-            );
+            assert_eq!(owner.implementation_declarations().len(), 2);
             assert_eq!(
                 owner.implementation_declarations()[0]
                     .implementation
@@ -632,10 +592,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
                 owner.binding_declaration().overloads()[0].effects.as_ref(),
                 Some(&effects())
             );
-            assert_eq!(
-                owner.binding_declaration().overloads().len(),
-                if name == "locate" { 2 } else { 1 }
-            );
+            assert_eq!(owner.binding_declaration().overloads().len(), 2);
             for count in [0, 1, 4] {
                 let bad_args: Vec<_> = (0..count)
                     .map(|i| arguments[i.min(arity - 1)].clone())
@@ -646,27 +603,6 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
                             FunctionBindingRequest {
                                 arguments: &bad_args,
                                 logical_argument_count: count,
-                                expected_result_type: None
-                            },
-                            crate::binding_test_control()
-                        )
-                        .is_err()
-                );
-            }
-            if name == "instr" {
-                let forbidden: Vec<_> = sources(3)
-                    .into_iter()
-                    .map(|value_type| FunctionArgument::Value {
-                        value_type,
-                        constant: None,
-                    })
-                    .collect();
-                assert!(
-                    owner
-                        .resolve(
-                            FunctionBindingRequest {
-                                arguments: &forbidden,
-                                logical_argument_count: 3,
                                 expected_result_type: None
                             },
                             crate::binding_test_control()
@@ -761,7 +697,7 @@ fn string_locate_compile_success_and_pre_error_callbacks_preserve_all_causes() {
         let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
-                "locate",
+                "strpos",
                 &[ty.clone(), source(true)],
                 DecimalOverflowPolicy::OutputNull,
                 &good
@@ -785,7 +721,7 @@ fn string_locate_compile_success_and_pre_error_callbacks_preserve_all_causes() {
                     refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
-                    "locate",
+                    "strpos",
                     &[ty.clone(), source(true)],
                     DecimalOverflowPolicy::OutputNull,
                     &control,
@@ -813,7 +749,7 @@ fn string_locate_compile_success_and_pre_error_callbacks_preserve_all_causes() {
 
 #[test]
 fn string_locate_constant_null_prepares_and_empty_invocation_does_not_search() {
-    let owner = owner_for_test("instr");
+    let owner = owner_for_test("strpos");
     let constants = pool(strings(vec![Some("unused"), None, Some("abc")]));
     let constant = constants.value(1).unwrap();
     let types = sources(2);
@@ -985,7 +921,7 @@ fn locate_compile_causes() -> [CompileControlError; 4] {
 #[test]
 fn string_locate_actual_refiner_keeps_identity_and_scope_refusals_before_late_control() {
     use crate::{FunctionBindingError, FunctionEffectOwner, FunctionEffectOwnerError};
-    for (name, arity) in [("locate", 2), ("locate", 3), ("instr", 2)] {
+    for (name, arity) in [("strpos", 2), ("strpos", 3)] {
         let fixture = LocateCompileFixture::new(name, arity);
         let foreign = crate::FunctionId::try_new("fixture/foreign/string-owner").unwrap();
         let environment = [novarocks_type_contract::SemanticParameterRef {
@@ -1055,7 +991,7 @@ fn string_locate_actual_refiner_keeps_identity_and_scope_refusals_before_late_co
 
 #[test]
 fn string_locate_actual_prepare_keeps_stale_contract_refusal_and_releases_original_arc() {
-    for (name, arity) in [("locate", 2), ("locate", 3), ("instr", 2)] {
+    for (name, arity) in [("strpos", 2), ("strpos", 3)] {
         let fixture = LocateCompileFixture::new(name, arity);
         let canonical = fixture.canonical();
         let foreign = crate::FunctionId::try_new("fixture/foreign/string-owner").unwrap();
@@ -1118,7 +1054,7 @@ fn string_locate_actual_prepare_keeps_stale_contract_refusal_and_releases_origin
 #[test]
 fn string_locate_actual_success_keeps_refine_prepare_tails_sources_and_prepared_owner_drop() {
     use crate::{FunctionEffectOwner, FunctionEffectOwnerError};
-    for (name, arity) in [("locate", 2), ("locate", 3), ("instr", 2)] {
+    for (name, arity) in [("strpos", 2), ("strpos", 3)] {
         let fixture = LocateCompileFixture::new(name, arity);
         let input = fixture.input();
         let baseline = CompileControl::default();

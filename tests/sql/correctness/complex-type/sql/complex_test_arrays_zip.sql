@@ -25,35 +25,35 @@ USE ${case_db};
 -- name: test_arrays_zip @mac
 -- query 2
 USE ${case_db};
-SELECT arrays_zip([1, 2], ['1b', '2b']) AS result;
+SELECT zip([1, 2], ['1b', '2b']) AS result;
 
 -- query 3
 USE ${case_db};
-SELECT arrays_zip([1, 2], ['1b', null, '3b']) AS result;
+SELECT zip([1, 2], ['1b', null, '3b']) AS result;
 
 -- query 4
 USE ${case_db};
-SELECT arrays_zip([1, 2, 3], ['a', 'b', 'c'], [10, 20, 30]) AS result;
+SELECT zip([1, 2, 3], ['a', 'b', 'c'], [10, 20, 30]) AS result;
 
 -- query 5
 USE ${case_db};
-SELECT arrays_zip([], []) AS result;
+SELECT zip([], []) AS result;
 
 -- query 6
 USE ${case_db};
-SELECT arrays_zip([1, 2, 3]) AS result;
+SELECT zip([1, 2, 3]) AS result;
 
 -- query 7
 USE ${case_db};
-SELECT arrays_zip(null, [1, 2]) AS result;
+SELECT zip(null, [1, 2]) AS result;
 
 -- query 8
 USE ${case_db};
-SELECT arrays_zip([1, null, 3], ['a', 'b', null]) AS result;
+SELECT zip([1, null, 3], ['a', 'b', null]) AS result;
 
 -- query 9
 USE ${case_db};
-SELECT * FROM (SELECT 1 AS id) a WHERE a.id = 1 AND arrays_zip([1], ['a']) IS NOT NULL;
+SELECT * FROM (SELECT 1 AS id) a WHERE a.id = 1 AND zip([1], ['a']) IS NOT NULL;
 
 -- query 10
 -- @skip_result_check=true
@@ -78,77 +78,77 @@ INSERT INTO arrays_zip_test VALUES ROW(1, ARRAY[1, 2, 3], ARRAY['a', 'b', 'c'], 
 
 -- query 12
 USE ${case_db};
-SELECT pk, arrays_zip(int_array, str_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(int_array, str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 13
 USE ${case_db};
-SELECT pk, arrays_zip(int_array, str_array, double_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(int_array, str_array, double_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 14
 USE ${case_db};
-SELECT pk, arrays_zip(null_array, int_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(null_array, int_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 15
 USE ${case_db};
-SELECT pk, arrays_zip(mixed_null_array, str_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(mixed_null_array, str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 16
 USE ${case_db};
-SELECT pk, arrays_zip(empty_array, int_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(empty_array, int_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 17
 USE ${case_db};
-SELECT pk, arrays_zip(single_element_array, str_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(single_element_array, str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 18
 USE ${case_db};
-SELECT pk, arrays_zip(large_array, double_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(large_array, double_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 19
 USE ${case_db};
-SELECT pk, arrays_zip(int_array, str_array, double_array, decimal_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(int_array, str_array, double_array, decimal_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 20
 USE ${case_db};
-SELECT pk, arrays_zip(int_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(int_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 21
 USE ${case_db};
-SELECT pk FROM arrays_zip_test WHERE arrays_zip(int_array, str_array) IS NOT NULL ORDER BY pk;
+SELECT pk FROM arrays_zip_test WHERE zip(int_array, str_array) IS NOT NULL ORDER BY pk;
 
 -- query 22
 USE ${case_db};
-SELECT pk FROM arrays_zip_test WHERE arrays_zip(null_array, str_array) IS NULL ORDER BY pk;
+SELECT pk FROM arrays_zip_test WHERE zip(null_array, str_array) IS NULL ORDER BY pk;
 
 -- query 23
 USE ${case_db};
-SELECT pk, arrays_zip(int_array, ['const1', 'const2', 'const3']) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(int_array, ['const1', 'const2', 'const3']) FROM arrays_zip_test ORDER BY pk;
 
 -- query 24
 USE ${case_db};
-SELECT pk, arrays_zip(['const_a', 'const_b', 'const_c'], str_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(['const_a', 'const_b', 'const_c'], str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 25
 USE ${case_db};
-SELECT pk, arrays_zip(int_array, decimal_array) FROM arrays_zip_test ORDER BY pk;
+SELECT pk, zip(int_array, decimal_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 26
 USE ${case_db};
-SELECT pk, arrays_zip(int_array, str_array) AS zipped 
+SELECT pk, zip(int_array, str_array) AS zipped
 FROM arrays_zip_test 
 WHERE pk > 5 AND pk <= 15
 ORDER BY pk;
 
 -- query 27
 USE ${case_db};
-SELECT pk, arrays_zip(str_array, double_array, decimal_array) 
+SELECT pk, zip(str_array, double_array, decimal_array)
 FROM arrays_zip_test 
 WHERE int_array IS NOT NULL
 ORDER BY pk;
 
 -- query 28
 USE ${case_db};
-SELECT pk, int_array, str_array, arrays_zip(mixed_null_array, str_array, double_array) 
+SELECT pk, int_array, str_array, zip(mixed_null_array, str_array, double_array)
 FROM arrays_zip_test 
 WHERE pk IN (1, 6, 7, 12)
 ORDER BY pk;
@@ -157,40 +157,40 @@ ORDER BY pk;
 USE ${case_db};
 SELECT pk, 
   CASE 
-    WHEN pk <= 5 THEN arrays_zip(int_array, str_array)
-    WHEN pk <= 10 THEN arrays_zip(str_array, double_array)
-    ELSE arrays_zip(double_array, decimal_array)
+    WHEN pk <= 5 THEN zip(int_array, str_array)
+    WHEN pk <= 10 THEN zip(str_array, double_array)
+    ELSE zip(double_array, decimal_array)
   END AS conditional_zip
 FROM arrays_zip_test
 ORDER BY pk;
 
 -- query 30
 USE ${case_db};
-SELECT pk, arrays_zip(int_array, CASE WHEN pk > 10 THEN str_array ELSE empty_array END) 
+SELECT pk, zip(int_array, CASE WHEN pk > 10 THEN str_array ELSE empty_array END)
 FROM arrays_zip_test 
 ORDER BY pk;
 
 -- query 31
 USE ${case_db};
-SELECT pk, arrays_zip(CAST(int_array AS Array<VARCHAR>), str_array)
+SELECT pk, zip(CAST(int_array AS ARRAY(VARCHAR)), str_array)
 FROM arrays_zip_test 
 ORDER BY pk;
 
 -- query 32
 USE ${case_db};
-SELECT pk, array_length(arrays_zip(int_array, str_array)) AS zip_length
+SELECT pk, cardinality(zip(int_array, str_array)) AS zip_length
 FROM arrays_zip_test
 ORDER BY pk;
 
 -- query 33
 USE ${case_db};
-SELECT DISTINCT arrays_zip([1, 2], ['a', 'b']) FROM arrays_zip_test LIMIT 5;
+SELECT DISTINCT zip([1, 2], ['a', 'b']) FROM arrays_zip_test LIMIT 5;
 
 -- query 34
 USE ${case_db};
-SELECT COUNT(*) AS cnt, arrays_zip([1], ['test'])
+SELECT COUNT(*) AS cnt, zip([1], ['test'])
 FROM arrays_zip_test 
-GROUP BY arrays_zip([1], ['test']);
+GROUP BY zip([1], ['test']);
 
 -- query 35
 -- @skip_result_check=true

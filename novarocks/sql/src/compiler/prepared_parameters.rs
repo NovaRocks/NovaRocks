@@ -16,7 +16,7 @@
 // under the License.
 
 //! Source occurrences and argument expressions for one prepared statement.
-// Design: ADR-0256 (docs/adr/ADR-0256-prepared-sql-request-snapshots-and-semantic-authors.md)
+// Design: ADR-0258 (docs/adr/ADR-0258-prepared-sql-request-snapshots-and-semantic-authors.md)
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -261,7 +261,7 @@ impl PreparedContextNeed<'_> {
                 )
             })?;
             if count < 0 {
-                return Err(AnalyzeError::numeric_value_out_of_range(
+                return Err(AnalyzeError::numeric_out_of_range(
                     format!("{keyword} count must not be negative"),
                     self.span(),
                 )

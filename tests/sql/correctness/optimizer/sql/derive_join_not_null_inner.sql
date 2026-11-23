@@ -24,10 +24,10 @@ CREATE TABLE ${case_db}.t_dnn_l (k INT, v INT);
 CREATE TABLE ${case_db}.t_dnn_r (k INT, v INT);
 INSERT INTO ${case_db}.t_dnn_l
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END, generate_series
-    FROM TABLE(generate_series(1, 2000));
+    FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t_dnn_r
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END, generate_series
-    FROM TABLE(generate_series(1, 2000));
+    FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.t_dnn_l;
 ANALYZE ${case_db}.t_dnn_r;
 -- @explain_contains=IS NOT NULL

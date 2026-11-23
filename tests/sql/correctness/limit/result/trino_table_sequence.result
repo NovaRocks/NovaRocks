@@ -1,0 +1,34 @@
+-- query 1
+-- types	bigint	bigint	bigint
+rows	first_value	last_value
+10001	0	10000
+
+-- query 2
+-- types	bigint
+x
+2
+4
+6
+
+-- query 3
+-- types	bigint
+sequential_number
+5
+
+-- query 4
+-- types	bigint
+x
+-9223372036854775808
+-9223372036854775807
+-9223372036854775806
+
+-- query 5
+-- types	bigint
+x
+-1
+9223372036854775807
+
+-- query 6
+-- types	bigint
+rows
+4

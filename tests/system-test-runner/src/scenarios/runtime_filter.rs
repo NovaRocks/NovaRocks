@@ -1230,13 +1230,13 @@ fn create_runtime_filter_tables(
     )
     .context("create Runtime Filter build table")?;
     rf_execute(control, format!(
-            "INSERT INTO {}.{}.{} SELECT generate_series, generate_series % 600 FROM TABLE(generate_series(1, 6000))",
+            "INSERT INTO {}.{}.{} SELECT sequential_number, sequential_number % 600 FROM TABLE(sequence(1, 6000))",
             tables.catalog, tables.database, tables.probe
         ), deadline)
         .context("write Runtime Filter probe rows")?;
     for partition in 0..REQUIRED_BACKENDS {
         rf_execute(control, format!(
-                "INSERT INTO {}.{}.{} SELECT (generate_series * 3 + {partition}) % 600, CASE WHEN generate_series = 1 THEN 'Y' ELSE 'N' END FROM TABLE(generate_series(1, 200))",
+                "INSERT INTO {}.{}.{} SELECT (sequential_number * 3 + {partition}) % 600, CASE WHEN sequential_number = 1 THEN 'Y' ELSE 'N' END FROM TABLE(sequence(1, 200))",
                 tables.catalog, tables.database, tables.build
             ), deadline)
             .with_context(|| format!("write Runtime Filter build partition {partition}"))?;
@@ -1313,7 +1313,7 @@ fn create_ncp5_pruning_tables(
     for range in 0..REQUIRED_BACKENDS {
         let lower = range * 200;
         rf_execute(control, format!(
-                "INSERT INTO {}.{}.{} SELECT {} + generate_series, {} + FLOOR((generate_series - 1) / 1000) FROM TABLE(generate_series(1, 200000))",
+                "INSERT INTO {}.{}.{} SELECT {} + sequential_number, {} + FLOOR((sequential_number - 1) / 1000) FROM TABLE(sequence(1, 200000))",
                 tables.catalog,
                 tables.database,
                 tables.probe,

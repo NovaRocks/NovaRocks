@@ -1,0 +1,57 @@
+-- query 1
+-- types	boolean	boolean
+unknown_mark	false_mark
+NULL	false
+
+-- query 2
+-- types	boolean	boolean
+unknown_mark	true_mark
+NULL	true
+
+-- query 3
+-- types	boolean	boolean
+empty_mark	null_mark
+false	NULL
+
+-- query 4
+-- types	integer	boolean
+id	mark
+1	true
+2	true
+3	false
+4	NULL
+
+-- query 5
+-- types	boolean
+mark
+true
+
+-- query 6
+-- types	boolean
+mark
+true
+
+-- query 7
+-- types	integer
+id
+1
+
+-- query 8
+-- types	bigint
+matched
+2
+
+-- query 9
+-- types	boolean
+mark
+true
+
+-- query 10
+-- types	integer	bigint
+x	rows
+1	2
+
+-- query 11
+-- types	boolean	boolean
+matched	unmatched
+true	false

@@ -38,5 +38,10 @@ pub const JSON_OUTPUT_CONVERSION_ERROR: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(48).unwrap());
 pub const JSON_VALUE_RESULT_ERROR: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(49).unwrap());
+pub const DATE_RESULT_OUT_OF_RANGE: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(53).unwrap());
+pub const UNKNOWN_EPOCH_TIME_ZONE: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(54).unwrap());
+
 pub const PATH_EVALUATION_ERROR: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(50).unwrap());

@@ -61,6 +61,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
+        "__map_subscript",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
         super::negation_owner::NAME,
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
@@ -76,22 +80,8 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "acos",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "add_months",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "adddate",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "all_match",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "any_match",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
+    ("all_match", BuiltinDisposition::Unavailable),
+    ("any_match", BuiltinDisposition::Unavailable),
     ("any_value", BuiltinDisposition::AggregateBoundary),
     (
         "approx_count_distinct",
@@ -106,36 +96,8 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "array_append",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "array_concat",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    (
-        "array_contains",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "array_contains_seq",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "array_distinct",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "array_filter",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "array_flatten",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "array_generate",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "array_intersect",
@@ -143,14 +105,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "array_join",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    (
-        "array_length",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "array_map",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
@@ -170,39 +124,12 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "array_repeat",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    ("array_reverse", BuiltinDisposition::Unavailable),
-    ("array_size", BuiltinDisposition::Unavailable),
-    (
-        "array_slice",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "array_sort",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "array_sort_lambda",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    (
-        "array_sortby",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    ("array_to_string", BuiltinDisposition::Unavailable),
-    (
         "arrays_overlap",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    (
-        "arrays_zip",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "ascii",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "asin",
@@ -230,7 +157,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "bar",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "bit_shift_left",
@@ -296,26 +223,32 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "ceiling",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("char", BuiltinDisposition::Unavailable),
     (
-        "char_length",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "chr",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
-    ("character_length", BuiltinDisposition::Unavailable),
     (
         "coalesce",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
+        "codepoint",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
         "concat",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "concat_ws",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "contains",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "convert_tz",
+        "contains_sequence",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     ("corr", BuiltinDisposition::AggregateBoundary),
@@ -352,26 +285,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("cume_dist", BuiltinDisposition::WindowBoundary),
     (
-        "curdate",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "current_date",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "current_time",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "current_timestamp",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("current_user", BuiltinDisposition::Unavailable),
-    (
-        "curtime",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("database", BuiltinDisposition::Unavailable),
     (
         "date",
@@ -379,14 +296,14 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "date_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "date_diff",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "date_format",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "date_sub",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -394,36 +311,20 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "datediff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "day",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "dayofmonth",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "day_of_month",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "dayofweek",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "day_of_week",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "dayofyear",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "days_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "days_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "days_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "day_of_year",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "dceil",
@@ -452,6 +353,14 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
+        "dow",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "doy",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
         "dpow",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
@@ -468,7 +377,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "equiwidth_bucket",
+        "element_at",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     ("every", BuiltinDisposition::AggregateBoundary),
@@ -476,7 +385,12 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "exp",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
+    ("filter", BuiltinDisposition::Unavailable),
     ("first_value", BuiltinDisposition::WindowBoundary),
+    (
+        "flatten",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
     (
         "floor",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -492,15 +406,19 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "from_base64",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "from_binary",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "from_hex",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "from_unixtime",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "from_utf8",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "get_json_bool",
@@ -545,23 +463,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ("group_concat", BuiltinDisposition::AggregateBoundary),
     ("grouping", BuiltinDisposition::LoweredOnly),
     (
-        "hex",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "hour",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "hours_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "hours_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "hours_sub",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -570,14 +472,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "ifnull",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "initcap",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "instr",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     ("is_not_null", BuiltinDisposition::Unavailable),
@@ -616,8 +510,8 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("lag", BuiltinDisposition::WindowBoundary),
     (
-        "last_day",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "last_day_of_month",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     ("last_value", BuiltinDisposition::WindowBoundary),
     ("lead", BuiltinDisposition::WindowBoundary),
@@ -626,27 +520,11 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "left",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "length",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "ln",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "localtime",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "localtimestamp",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "locate",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -667,7 +545,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "lpad",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "ltrim",
@@ -687,15 +565,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("map_filter", BuiltinDisposition::Unavailable),
     (
-        "map_from_arrays",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    (
         "map_keys",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "map_size",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -731,40 +601,12 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "minutes_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "minutes_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "minutes_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "mod",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "month",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "months_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "months_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "months_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "murmur_hash3_32",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "mv_group_row_id",
@@ -776,6 +618,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("ndv", BuiltinDisposition::AggregateBoundary),
     ("negative", BuiltinDisposition::LoweredOnly),
+    (
+        "normalize",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
     (
         "now",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -790,10 +636,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "parse_json",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "parse_url",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("percent_rank", BuiltinDisposition::WindowBoundary),
     ("percentile_approx", BuiltinDisposition::AggregateBoundary),
     (
@@ -804,7 +646,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "pi",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    ("position", BuiltinDisposition::Unavailable),
     (
         "positive",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -856,7 +697,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "repeat",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "replace",
@@ -864,10 +705,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "reverse",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "right",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -881,7 +718,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ("row_number", BuiltinDisposition::WindowBoundary),
     (
         "rpad",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "rtrim",
@@ -892,19 +729,15 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "seconds_add",
+        "sequence",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "sha256",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "seconds_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "seconds_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "sha2",
+        "sha512",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -921,11 +754,19 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "split",
+        "slice",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
+        "split",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
         "split_part",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "split_to_map",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -940,30 +781,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ("stddev", BuiltinDisposition::AggregateBoundary),
     ("stddev_pop", BuiltinDisposition::AggregateBoundary),
     ("stddev_samp", BuiltinDisposition::AggregateBoundary),
-    (
-        "str_to_date",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "str_to_map",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("string_agg", BuiltinDisposition::AggregateBoundary),
     (
-        "strleft",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "strright",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "struct",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "subdate",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "strpos",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "substr",
@@ -987,35 +808,30 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("tanh", BuiltinDisposition::Unavailable),
     (
-        "timestamp",
+        "title_case",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "timestampdiff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "to_base64",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "to_binary",
+        "to_big_endian_64",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "to_datetime",
+        "to_hex",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     ("to_json", BuiltinDisposition::Unavailable),
     ("to_unix_timestamp", BuiltinDisposition::Unavailable),
     (
-        "transform_keys",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+        "to_utf8",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "transform_values",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
+    ("transform", BuiltinDisposition::Unavailable),
+    ("transform_keys", BuiltinDisposition::Unavailable),
+    ("transform_values", BuiltinDisposition::Unavailable),
     (
         "translate",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
@@ -1038,14 +854,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("typeof", BuiltinDisposition::LoweredOnly),
     (
-        "unhex",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "unix_timestamp",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "upper",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
@@ -1055,6 +863,34 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "url_encode",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "url_extract_fragment",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "url_extract_host",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "url_extract_parameter",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "url_extract_path",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "url_extract_port",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "url_extract_protocol",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "url_extract_query",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     ("user", BuiltinDisposition::Unavailable),
@@ -1077,35 +913,23 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("version", BuiltinDisposition::Unavailable),
     (
-        "weekofyear",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "week",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "weeks_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "week_of_year",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "weeks_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "weeks_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "width_bucket",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "year",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "years_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "years_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "years_sub",
+        "zip",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
 ];

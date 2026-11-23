@@ -23,7 +23,7 @@ DROP TABLE IF EXISTS ${case_db}.topn_compactness_project_src;
 CREATE TABLE ${case_db}.topn_compactness_project_src (id INT, score INT);
 INSERT INTO ${case_db}.topn_compactness_project_src
     SELECT generate_series, generate_series * 10
-    FROM TABLE(generate_series(1, 3));
+    FROM TABLE(sequence(1, 3)) AS generate_series(generate_series);
 
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT alias_id, alias_score

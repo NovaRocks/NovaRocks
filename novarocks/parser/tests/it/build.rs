@@ -348,10 +348,16 @@ fn expression_combinations_match_parser_without_reparsing_children() {
         "ROW(1, 'x')",
     );
     assert_expression(
-        build::map(vec![(build::string("x"), build::integer(1))]),
-        "map('x', 1)",
+        build::map(
+            build::array(vec![build::string("x")]),
+            build::array(vec![build::integer(1)]),
+        ),
+        "map(['x'], [1])",
     );
-    assert_expression(build::map(Vec::new()), "map()");
+    assert_expression(
+        build::map(build::array(Vec::new()), build::array(Vec::new())),
+        "map([], [])",
+    );
 }
 
 #[test]

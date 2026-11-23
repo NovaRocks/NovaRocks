@@ -17,7 +17,7 @@
 //! Original map key equality, reverse search, take and NULL repair author.
 use super::array_literal_core::CollectionObservation;
 use super::collection_arrow::{ArrowSite, arrow_failure, cast_output, contract};
-use crate::{KernelFailure, largeint};
+use crate::KernelFailure;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -91,126 +91,154 @@ pub fn compare_keys_at(
         .into());
     }
 
-    match keys.data_type() {
-        DataType::Int8 => {
-            let l = keys.as_any().downcast_ref::<Int8Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int8Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Int16 => {
-            let l = keys.as_any().downcast_ref::<Int16Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int16Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Int32 => {
-            let l = keys.as_any().downcast_ref::<Int32Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int32Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Int64 => {
-            let l = keys.as_any().downcast_ref::<Int64Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Int64Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Float32 => {
-            let l = keys.as_any().downcast_ref::<Float32Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Float32Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Float64 => {
-            let l = keys.as_any().downcast_ref::<Float64Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Float64Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Boolean => {
-            let l = keys.as_any().downcast_ref::<BooleanArray>().unwrap();
-            let r = targets.as_any().downcast_ref::<BooleanArray>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Utf8 => {
-            let l = keys.as_any().downcast_ref::<StringArray>().unwrap();
-            let r = targets.as_any().downcast_ref::<StringArray>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Date32 => {
-            let l = keys.as_any().downcast_ref::<Date32Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Date32Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Decimal128(_, _) => {
-            let l = keys.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Decimal256(_, _) => {
-            let l = keys.as_any().downcast_ref::<Decimal256Array>().unwrap();
-            let r = targets.as_any().downcast_ref::<Decimal256Array>().unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Second, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None) => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap();
-            let r = targets
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap();
-            Ok(l.value(key_idx) == r.value(target_idx))
-        }
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let l = keys
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| contract("failed to downcast key to FixedSizeBinaryArray"))?;
-            let r = targets
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| contract("failed to downcast target to FixedSizeBinaryArray"))?;
-            let lv = largeint::i128_from_be_bytes(l.value(key_idx))
-                .map_err(|source| KernelFailure::from_domain(LookupLargeIntFailure(source)))?;
-            let rv = largeint::i128_from_be_bytes(r.value(target_idx))
-                .map_err(|source| KernelFailure::from_domain(LookupLargeIntFailure(source)))?;
-            Ok(lv == rv)
-        }
-        other => Err(KeyComparisonFailure::Row(
-            LookupRowFailure::UnsupportedKeyDomain(BoundedDetail::truncating_display(
-                format_args!("map key compare unsupported type: {:?}", other),
+    let operation = MapKeyOperations::from_carrier(keys.data_type()).ok_or_else(|| {
+        KeyComparisonFailure::Row(LookupRowFailure::UnsupportedKeyDomain(
+            BoundedDetail::truncating_display(format_args!(
+                "map key compare unsupported type: {:?}",
+                keys.data_type(),
             )),
-        )),
+        ))
+    })?;
+    let left = operation.identity(keys.as_ref(), key_idx)?;
+    let right = operation.identity(targets.as_ref(), target_idx)?;
+    Ok(match (left, right) {
+        (Some(MapKeyIdentity::Float(left)), Some(MapKeyIdentity::Float(right))) => {
+            f64::from_bits(left) == f64::from_bits(right)
+        }
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    })
+}
+
+/// The identity hash uses the same normalization for MAP construction and
+/// MAP_AGG state. Ordinary equality still treats NaN as unequal.
+pub(crate) fn map_float_identity(value: f64) -> u64 {
+    if value == 0.0 {
+        0
+    } else if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub(super) enum MapKeyIdentity<'a> {
+    Boolean(bool),
+    Signed(i128),
+    Float(u64),
+    Decimal256([u8; 32]),
+    Bytes(&'a [u8]),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum MapKeyOperations {
+    Unknown,
+    Boolean,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Utf8,
+    Date,
+    Decimal128,
+    Decimal256,
+    TimestampSecond,
+    TimestampMillisecond,
+    TimestampMicrosecond,
+    TimestampNanosecond,
+    Fixed16,
+}
+
+impl MapKeyOperations {
+    pub(super) fn prepare(
+        carrier: &DataType,
+        logical: novarocks_type_contract::ValueLogicalType,
+    ) -> Option<Self> {
+        use novarocks_type_contract::ValueLogicalType;
+        match logical {
+            ValueLogicalType::Physical => Self::from_carrier(carrier),
+            ValueLogicalType::LargeInt | ValueLogicalType::Uuid
+                if carrier == &DataType::FixedSizeBinary(16) =>
+            {
+                Some(Self::Fixed16)
+            }
+            _ => None,
+        }
+    }
+
+    fn from_carrier(carrier: &DataType) -> Option<Self> {
+        use arrow_schema::TimeUnit;
+        Some(match carrier {
+            DataType::Null => Self::Unknown,
+            DataType::Boolean => Self::Boolean,
+            DataType::Int8 => Self::Int8,
+            DataType::Int16 => Self::Int16,
+            DataType::Int32 => Self::Int32,
+            DataType::Int64 => Self::Int64,
+            DataType::Float32 => Self::Float32,
+            DataType::Float64 => Self::Float64,
+            DataType::Utf8 => Self::Utf8,
+            DataType::Date32 => Self::Date,
+            DataType::Decimal128(..) => Self::Decimal128,
+            DataType::Decimal256(..) => Self::Decimal256,
+            DataType::Timestamp(TimeUnit::Second, None) => Self::TimestampSecond,
+            DataType::Timestamp(TimeUnit::Millisecond, None) => Self::TimestampMillisecond,
+            DataType::Timestamp(TimeUnit::Microsecond, None) => Self::TimestampMicrosecond,
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => Self::TimestampNanosecond,
+            DataType::FixedSizeBinary(16) => Self::Fixed16,
+            _ => return None,
+        })
+    }
+
+    pub(super) fn identity<'a>(
+        self,
+        array: &'a dyn Array,
+        index: usize,
+    ) -> Result<Option<MapKeyIdentity<'a>>, KernelFailure> {
+        if index >= array.len() {
+            return Err(contract("map key is outside its prepared carrier"));
+        }
+        if matches!(self, Self::Unknown) || array.is_null(index) {
+            return Ok(None);
+        }
+        macro_rules! value {
+            ($array:ty) => {
+                array
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .ok_or_else(|| contract("map key differs from its prepared carrier"))?
+                    .value(index)
+            };
+        }
+        macro_rules! signed {
+            ($array:ty) => {
+                MapKeyIdentity::Signed(i128::from(value!($array)))
+            };
+        }
+        Ok(Some(match self {
+            Self::Unknown => return Ok(None),
+            Self::Boolean => MapKeyIdentity::Boolean(value!(BooleanArray)),
+            Self::Int8 => signed!(Int8Array),
+            Self::Int16 => signed!(Int16Array),
+            Self::Int32 => signed!(Int32Array),
+            Self::Int64 => signed!(Int64Array),
+            Self::Float32 => {
+                MapKeyIdentity::Float(map_float_identity(f64::from(value!(Float32Array))))
+            }
+            Self::Float64 => MapKeyIdentity::Float(map_float_identity(value!(Float64Array))),
+            Self::Utf8 => MapKeyIdentity::Bytes(value!(StringArray).as_bytes()),
+            Self::Date => signed!(Date32Array),
+            Self::Decimal128 => signed!(Decimal128Array),
+            Self::Decimal256 => MapKeyIdentity::Decimal256(value!(Decimal256Array).to_le_bytes()),
+            Self::TimestampSecond => signed!(TimestampSecondArray),
+            Self::TimestampMillisecond => signed!(TimestampMillisecondArray),
+            Self::TimestampMicrosecond => signed!(TimestampMicrosecondArray),
+            Self::TimestampNanosecond => signed!(TimestampNanosecondArray),
+            Self::Fixed16 => MapKeyIdentity::Bytes(value!(FixedSizeBinaryArray)),
+        }))
     }
 }
 
@@ -310,7 +338,7 @@ pub fn lookup_observed<E>(
             if let Some(flags) = check_arr {
                 let check_idx = row.check.expect("validated flag address");
                 let strict = !flags.is_null(check_idx) && flags.value(check_idx);
-                if strict && !map.is_null(row.map) {
+                if strict && !map.is_null(row.map) && !is_null_probe(key_arr, row.key) {
                     row_error(ordinal, LookupRowFailure::MissingKey)
                         .map_err(MapLookupFailure::Operation)?;
                 }
@@ -343,12 +371,13 @@ pub fn lookup_observed<E>(
         validate_address(inputs, row).map_err(MapLookupFailure::Operation)?;
         let key_idx = row.key;
         let check_idx = row.check;
-        let check_out_of_bounds = check_idx
-            .map(|idx| {
-                let flags = check_arr.expect("check_arr exists when check_idx exists");
-                !flags.is_null(idx) && flags.value(idx)
-            })
-            .unwrap_or(false);
+        let check_out_of_bounds = !is_null_probe(key_arr, key_idx)
+            && check_idx
+                .map(|idx| {
+                    let flags = check_arr.expect("check_arr exists when check_idx exists");
+                    !flags.is_null(idx) && flags.value(idx)
+                })
+                .unwrap_or(false);
         if map.is_null(row.map) {
             indices.push(None);
             continue;
@@ -414,6 +443,10 @@ pub fn lookup_observed<E>(
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     Ok(out)
 }
+fn is_null_probe(key: &ArrayRef, row: usize) -> bool {
+    key.data_type() == &DataType::Null || key.is_null(row)
+}
+
 fn apply_indices_nulls(out: &ArrayRef, indices: &UInt32Array) -> ArrayRef {
     // NullArray already represents NULL at every position and cannot carry a
     // physical validity buffer. The lookup still ran before this storage repair.
@@ -492,24 +525,6 @@ pub fn required_row_error(ordinal: usize, cause: LookupRowFailure) -> KernelFail
         cause,
     })
 }
-#[derive(Debug)]
-struct LookupLargeIntFailure(crate::largeint::LargeIntCarrierFailure);
-impl std::fmt::Display for LookupLargeIntFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "map key LARGEINT decode failed: {}", self.0)
-    }
-}
-impl std::error::Error for LookupLargeIntFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-impl FailureProjection for LookupLargeIntFailure {
-    fn failure_fact(&self) -> FailureFact {
-        self.0.failure_fact()
-    }
-}
-impl novarocks_failure_contract::OuterFailureProjection for LookupLargeIntFailure {}
 fn lookup_fact(class: FailureClass, code: u16) -> FailureFact {
     FailureFact::new(
         class,
@@ -528,104 +543,6 @@ fn validate_address(inputs: &MapLookupInputs<'_>, rows: LookupRows) -> Result<()
         _ => Err(contract(
             "map lookup flag address differs from its prepared input",
         )),
-    }
-}
-
-#[cfg(test)]
-mod source_properties {
-    use super::*;
-    use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
-    use std::{error::Error, sync::Arc};
-    #[test]
-    fn only_explicit_strict_missing_key_becomes_a_required_row_failure() {
-        let (weak_map, weak_key, failure) = {
-            let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
-            builder.keys().append_value("present");
-            builder.values().append_value(7);
-            builder.append(true).unwrap();
-            let map: ArrayRef = Arc::new(builder.finish());
-            let key: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
-            let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
-            let weak_map = Arc::downgrade(&map);
-            let weak_key = Arc::downgrade(&key);
-            let inputs = MapLookupInputs::new(&map, &key, Some(&flags)).unwrap();
-            let error = lookup_observed(
-                &inputs,
-                crate::Selection::all(1),
-                |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
-                None,
-                |_, _| Ok(()),
-                |ordinal, cause| Err(required_row_error(ordinal, cause)),
-                &mut |_| Ok(()),
-            )
-            .unwrap_err();
-            let MapLookupFailure::Operation(failure) = error else {
-                panic!("originating missing-key failure");
-            };
-            let original = failure
-                .source()
-                .unwrap()
-                .source()
-                .unwrap()
-                .downcast_ref::<RequiredLookupRow>()
-                .unwrap();
-            assert_eq!(failure.failure_fact().class(), FailureClass::Data);
-            assert_eq!(failure.failure_fact().reason().code(), 377);
-            assert_eq!(failure.to_string(), "Key not present in map");
-            assert_eq!(original._ordinal, Some(0));
-            (weak_map, weak_key, failure)
-        };
-        assert!(weak_map.upgrade().is_none());
-        assert!(weak_key.upgrade().is_none());
-        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
-    }
-    #[test]
-    fn actual_empty_value_sdk_cast_refusal_is_not_a_row_error_and_has_no_later_observer() {
-        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
-        builder.append(true).unwrap();
-        let map: ArrayRef = Arc::new(builder.finish());
-        let key: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
-        let inputs = MapLookupInputs::new(&map, &key, None).unwrap();
-        let target = DataType::Struct(
-            vec![Arc::new(arrow_schema::Field::new(
-                "ResourceExhausted",
-                DataType::Int32,
-                true,
-            ))]
-            .into(),
-        );
-        let mut calls = 0;
-        let error = lookup_observed(
-            &inputs,
-            crate::Selection::all(1),
-            |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
-            Some(&target),
-            |_, _| Ok(()),
-            |_, _| panic!("SDK/metadata failures cannot enter the row journal"),
-            &mut |_| {
-                calls += 1;
-                assert!(calls <= 3, "callback after the actual SDK cast failure");
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert_eq!(calls, 3);
-        let MapLookupFailure::Operation(failure) = error else {
-            panic!("originating SDK cast failure");
-        };
-        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
-        assert_eq!(failure.failure_fact().reason().code(), 375);
-        assert!(failure.failure_fact().resource().is_none());
-        assert!(
-            failure
-                .source()
-                .unwrap()
-                .source()
-                .unwrap()
-                .source()
-                .unwrap()
-                .is::<arrow_schema::ArrowError>()
-        );
     }
 }
 

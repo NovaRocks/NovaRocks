@@ -23,9 +23,9 @@ DROP TABLE IF EXISTS ${case_db}.oq12_stats_big_b;
 CREATE TABLE ${case_db}.oq12_stats_big_a (k INT);
 CREATE TABLE ${case_db}.oq12_stats_big_b (k INT);
 INSERT INTO ${case_db}.oq12_stats_big_a
-    SELECT generate_series FROM TABLE(generate_series(1, 100));
+    SELECT generate_series FROM TABLE(sequence(1, 100)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.oq12_stats_big_b
-    SELECT generate_series FROM TABLE(generate_series(1, 100));
+    SELECT generate_series FROM TABLE(sequence(1, 100)) AS generate_series(generate_series);
 ANALYZE ${case_db}.oq12_stats_big_a;
 ANALYZE ${case_db}.oq12_stats_big_b;
 

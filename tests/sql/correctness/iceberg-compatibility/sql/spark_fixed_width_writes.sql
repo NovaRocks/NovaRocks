@@ -164,7 +164,7 @@ fi
 printf 'Spark created evidence retained at %s\n' "$spark_diag_dir"
 
 -- query 2
-SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n+1 AS next_n,n
+SELECT id,to_hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n+1 AS next_n,n
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ORDER BY id;
 
 -- query 3
@@ -178,7 +178,7 @@ UPDATE iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0}
 SET n=n+1;
 
 -- query 5
-SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n
+SELECT id,to_hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ORDER BY id;
 
 -- query 6
@@ -479,7 +479,7 @@ fi
 printf 'Spark required_rejected evidence retained at %s\n' "$spark_diag_dir"
 
 -- query 17
-SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n
+SELECT id,to_hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ORDER BY id;
 
 -- query 18

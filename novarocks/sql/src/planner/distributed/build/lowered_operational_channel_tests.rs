@@ -205,10 +205,8 @@ fn operational_channels_canonical_null_keeps_distinct_emission_and_exact_origina
     let projected = constant(&arguments[0]).unwrap();
     let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
     assert_eq!(original.value_type(), &ValueType::new(DataType::Null, true));
-    assert_eq!(
-        projected.value_type(),
-        &ValueType::new(DataType::Utf8, true)
-    );
+    let char_zero = nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0);
+    assert_eq!(projected.value_type(), &char_zero);
     assert_eq!(projected.try_utf8().unwrap(), None);
     assert_ne!(
         projected.pool().backing_identity(),
@@ -253,15 +251,9 @@ fn operational_channels_canonical_null_keeps_distinct_emission_and_exact_origina
     assert_eq!(selected.overload, bound.selected.overload);
     assert_eq!(
         selected.argument_types.as_ref(),
-        &[FunctionArgumentType::Value(ValueType::new(
-            DataType::Utf8,
-            true
-        ))]
+        &[FunctionArgumentType::Value(char_zero.clone())]
     );
-    assert_eq!(
-        selected.result_type,
-        FunctionResultType::Scalar(ValueType::new(DataType::Utf8, true))
-    );
+    assert_eq!(selected.result_type, FunctionResultType::Scalar(char_zero));
     // This asserts metadata selection only; no call effects, final snapshot or
     // whole FE publication proof is constructed by this fixture.
 }

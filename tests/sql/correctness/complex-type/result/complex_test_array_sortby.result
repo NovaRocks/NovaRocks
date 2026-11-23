@@ -41,7 +41,7 @@ id	array_col1	array_col2	_col3
 10	[24,25,26]	NULL	[24,25,26]
 
 -- query 13
--- legacy
+-- types	varchar	array(integer)	array(integer)
 _col0	int_1	int_2
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
@@ -55,7 +55,7 @@ _col0	int_1	int_2
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
 
 -- query 14
--- legacy
+-- types	varchar	array(integer)	array(integer)	array(varchar)	array(date)
 _col0	int_1	int_2	str_1	date_1
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
@@ -69,17 +69,17 @@ _col0	int_1	int_2	str_1	date_1
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
 
 -- query 15
--- legacy
-row_count	fingerprint
-8000	-16035823543285
+-- types	bigint	bigint
+row_count	correct_order_rows
+8000	8000
 
 -- query 16
--- legacy
-row_count	fingerprint
-8000	-13542014146605
+-- types	bigint	bigint
+row_count	correct_order_rows
+8000	8000
 
 -- query 19
--- legacy
+-- types	varchar	array(integer)	array(integer)
 _col0	int_1	int_2
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
@@ -93,7 +93,7 @@ _col0	int_1	int_2
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
 
 -- query 20
--- legacy
+-- types	varchar	array(integer)	array(integer)	array(varchar)	array(date)
 _col0	int_1	int_2	str_1	date_1
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
@@ -107,17 +107,17 @@ _col0	int_1	int_2	str_1	date_1
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
 
 -- query 21
--- legacy
-row_count	fingerprint
-8000	-15021683250133
+-- types	bigint	bigint
+row_count	correct_order_rows
+8000	8000
 
 -- query 22
--- legacy
-row_count	fingerprint
-8000	-12754798689549
+-- types	bigint	bigint
+row_count	correct_order_rows
+8000	8000
 
 -- query 25
--- legacy
+-- types	varchar	array(integer)	array(integer)
 _col0	int_1	int_2
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
@@ -131,7 +131,7 @@ _col0	int_1	int_2
 3-6-9-1-4-7-10-2-5-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]
 
 -- query 26
--- legacy
+-- types	varchar	array(integer)	array(integer)	array(varchar)	array(date)
 _col0	int_1	int_2	str_1	date_1
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
@@ -145,14 +145,14 @@ _col0	int_1	int_2	str_1	date_1
 6-3-9-10-1-7-4-5-2-8	[1,2,3,4,5,6,7,8,9,10]	[1,2,0,1,2,0,1,2,0,1]	["abc-1","abc-2","abc-3","abc-4","abc-0","abc-1","abc-2","abc-3","abc-4","abc-0"]	["2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02","2023-11-01","2023-11-02"]
 
 -- query 27
--- legacy
-row_count	fingerprint
-8000	-16963943008000
+-- types	bigint	bigint
+row_count	correct_order_rows
+8000	8000
 
 -- query 28
--- legacy
-row_count	fingerprint
-8000	-14262456864000
+-- types	bigint	bigint
+row_count	correct_order_rows
+8000	8000
 
 -- query 29
 -- types	bigint
@@ -180,7 +180,7 @@ _col0
 [1,6,5,2,4,3]
 
 -- query 34
--- legacy
+-- types	array(integer)
 _col0
 [1,6,2,5,3,4]
 
@@ -190,7 +190,7 @@ _col0
 [1,6,5,2,4,null]
 
 -- query 36
--- legacy
+-- types	array(integer)
 _col0
 [1,6,2,5,null,4]
 
@@ -205,103 +205,103 @@ _col0
 [4,3,6,1,5,2]
 
 -- query 39
--- legacy
+-- types	array(integer)
 _col0
 [3,4,6,1,5,2]
 
 -- query 40
--- legacy
+-- types	array(integer)
 _col0
 [1,6,2,5,3,4]
 
--- query 45
+-- query 41
 -- types	array(integer)	array(integer)	array(integer)	array(integer)
 _col0	source	key1	key2
 [1,2]	[1,2]	NULL	[1,1]
 [5,6]	[5,6]	NULL	[1,1]
 [4,3]	[3,4]	[40,30]	[1,1]
 
--- query 48
+-- query 44
 -- types	array(boolean)
 _col0
 [true,false]
 
--- query 50
+-- query 45
 -- types	array(integer)
 _col0
 [3,1]
 
--- query 52
+-- query 46
 -- types	array(integer)
 _col0
 [100,50]
 
--- query 54
+-- query 47
 -- types	array(integer)
 _col0
 [5,10]
 
--- query 56
+-- query 48
 -- types	array(bigint)
 _col0
 [500,1000]
 
--- query 58
+-- query 49
 -- types	array(decimal(38, 0))
 _col0
 ["9223372036854775806","9223372036854775807"]
 
--- query 60
+-- query 50
 -- types	array(real)
 _col0
 [1.5,2.5]
 
--- query 62
+-- query 51
 -- types	array(double)
 _col0
 [2.345,1.234]
 
--- query 64
+-- query 52
 -- types	array(decimal(9, 2))
 _col0
 ["45678.90","12345.67"]
 
--- query 66
+-- query 53
 -- types	array(decimal(18, 2))
 _col0
 ["1234567890.12","987654321.12"]
 
--- query 68
+-- query 54
 -- types	array(decimal(38, 10))
 _col0
 ["12345678901234567890.1234567890","9876543210987654321.1234567890"]
 
--- query 70
+-- query 55
 -- types	array(decimal(27, 9))
 _col0
 ["12345.670000000","67890.120000000"]
 
--- query 72
+-- query 56
 -- types	array(varchar)
 _col0
 ["apple","banana"]
 
--- query 74
+-- query 57
 -- types	array(timestamp(6))
 _col0
 ["2025-01-24 10:30:00.000000","2024-12-31 23:59:59.000000"]
 
--- query 76
+-- query 58
 -- types	array(date)
 _col0
 ["2024-12-31","2025-01-24"]
 
--- query 78
+-- query 59
 -- types	array(varchar)
 _col0
 ["{\"key\":\"value1\"}","{\"key\":\"value2\"}"]
 
--- query 80
+-- query 60
 -- types	array(json)
 parsed_json_values
 ["{\"key\": \"value1\"}","{\"key\": \"value2\"}"]

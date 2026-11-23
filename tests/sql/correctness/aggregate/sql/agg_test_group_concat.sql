@@ -1055,7 +1055,7 @@ select group_concat('中国',name order by 2, '第一', id) from ss;
 
 -- query 243
 USE ${case_db};
-select instr(gc, U&'\000A') > 0 as has_lf_separator
+select strpos(gc, U&'\000A') > 0 as has_lf_separator
 from (
   select string_agg('中国',name
 ,
@@ -1104,7 +1104,7 @@ select group_concat(JSON_OBJECT('2:3': NULL)) from ss;
 -- query 250
 -- @expect_error=No matching function with signature: group_concat(map<int(11),int(11)>, varchar).
 USE ${case_db};
-select group_concat(map(2,3)) from ss;
+select group_concat(MAP(ARRAY[2], ARRAY[3])) from ss;
 
 -- query 251
 USE ${case_db};

@@ -26,7 +26,7 @@ CREATE TABLE ${case_db}.rf_side_l (k INT, v INT);
 CREATE TABLE ${case_db}.rf_side_r (k INT, v INT);
 INSERT INTO ${case_db}.rf_side_l
     SELECT generate_series, generate_series
-    FROM TABLE(generate_series(1, 100000));
+    FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.rf_side_r VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
 ANALYZE ${case_db}.rf_side_l;
 ANALYZE ${case_db}.rf_side_r;

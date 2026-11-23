@@ -282,7 +282,7 @@ fn literal_typing_preserves_date_json_and_exact_temporal_values() {
 
 #[test]
 fn shared_route_reserves_special_handling_and_typing_propagates_original_control() {
-    assert_eq!(scalar_typing_route("trim"), ScalarTypingRoute::Legacy);
+    assert_eq!(scalar_typing_route("trim"), ScalarTypingRoute::Shared);
     assert_eq!(scalar_typing_route("btrim"), ScalarTypingRoute::Legacy);
     assert_eq!(scalar_typing_route("coalesce"), ScalarTypingRoute::Shared);
     struct Stop;

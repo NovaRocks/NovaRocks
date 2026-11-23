@@ -1,37 +1,42 @@
 -- query 1
--- types	bigint
-_col0
-1624733713
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1048576	1048576	2474041046
 
 -- query 2
--- types	bigint
-_col0
--308607422
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1046528	1046528	669253969
 
 -- query 3
--- types	bigint
-_col0
-777398045
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1048574	1048576	1823191838
+
+-- query 4
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1048576	3145728	3347635901
 
 -- query 7
--- types	bigint
-_col0
-1624733713
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1048576	1048576	2474041046
 
 -- query 10
--- types	bigint
-_col0
--308607422
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1046528	1046528	669253969
 
 -- query 13
--- types	bigint
-_col0
-777398045
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1048574	1048576	1823191838
 
 -- query 16
--- types	bigint
-_col0
-0
+-- types	bigint	bigint	bigint
+codepoints	utf8_bytes	fingerprint
+1048576	3145728	3347635901
 
 -- query 18
 -- types	varchar
@@ -61,41 +66,41 @@ C|
 -- query 25
 -- types	varchar
 _col0
-测|试
 1|2|c
 1|2|
+测|试
 C|S
 C|
 
 -- query 33
 -- types	bigint
 _col0
--86245165969
+88220303447390
 
 -- query 34
 -- types	bigint
 _col0
-86181275310
+88160233962082
 
 -- query 35
 -- types	bigint
 _col0
-39300678040
+88788480094204
 
 -- query 36
 -- types	bigint
 _col0
-291352620470
+88729922251948
 
 -- query 37
 -- types	bigint
 _col0
--473683291648
+87033542753398
 
 -- query 38
 -- types	bigint
 _col0
--261631635524
+87656355257592
 
 -- query 40
 -- types	varchar
@@ -132,12 +137,12 @@ NULL
 -- query 63
 -- types	bigint
 _col0
--9273119353
+192054914325
 
 -- query 64
 -- types	bigint
 _col0
--22759771935
+175246928357
 
 -- query 65
 -- types	bigint
@@ -147,22 +152,22 @@ _col0
 -- query 66
 -- types	bigint
 _col0
--15403808815
+198037899031
 
 -- query 67
 -- types	bigint
 _col0
--24092076350
+183092025318
 
 -- query 68
 -- types	bigint
 _col0
--1691897153
+206700955391
 
 -- query 69
 -- types	bigint
 _col0
--6047668112
+203308368244
 
 -- query 70
 -- types	bigint
@@ -172,27 +177,27 @@ _col0
 -- query 71
 -- types	bigint
 _col0
--14679810324
+195137072477
 
 -- query 72
 -- types	bigint
 _col0
-6117043467
+205773320177
 
 -- query 73
 -- types	bigint
 _col0
--15175674670
+184999236265
 
 -- query 74
 -- types	bigint
 _col0
-1122895566
+204662597417
 
 -- query 75
 -- types	bigint
 _col0
--9201369252
+204883079630
 
 -- query 76
 -- types	bigint
@@ -202,12 +207,12 @@ _col0
 -- query 77
 -- types	bigint
 _col0
-32149779
+202115259695
 
 -- query 78
 -- types	bigint
 _col0
-8038977823
+183537703066
 
 -- query 79
 -- types	bigint
@@ -217,7 +222,7 @@ _col0
 -- query 80
 -- types	bigint
 _col0
--3519052013
+206400219798
 
 -- query 81
 -- types	bigint
@@ -237,7 +242,7 @@ _col0
 -- query 84
 -- types	bigint
 _col0
-3752409022
+201769516395
 
 -- query 85
 -- types	bigint
@@ -247,32 +252,32 @@ _col0
 -- query 86
 -- types	bigint
 _col0
--20138841983
+210752866947
 
 -- query 87
 -- types	bigint
 _col0
-10595944852
+185241578623
 
 -- query 88
 -- types	bigint
 _col0
-70372815234
+239073970141
 
 -- query 89
 -- types	bigint
 _col0
-11079547357
+218307713497
 
 -- query 90
 -- types	bigint
 _col0
--3203593422
+181639186524
 
 -- query 91
 -- types	bigint
 _col0
--87849464430
+0
 
 -- query 92
 -- types	bigint
@@ -282,42 +287,42 @@ _col0
 -- query 93
 -- types	bigint
 _col0
--30345492435
+134761151369
 
 -- query 94
 -- types	bigint
 _col0
-28728196157
+215355421080
 
 -- query 95
 -- types	bigint
 _col0
--78344961444
+114243085317
 
 -- query 96
 -- types	bigint
 _col0
--119311709439
+294857820665
 
 -- query 97
 -- types	bigint
 _col0
-91564110027
+123215436818
 
 -- query 98
 -- types	bigint
 _col0
--116630637114
+360180839588
 
 -- query 99
 -- types	bigint
 _col0
--88010173341
+15770195379
 
 -- query 100
 -- types	bigint
 _col0
--58659638217
+186133154982
 
 -- query 101
 -- types	varchar
@@ -422,52 +427,52 @@ h
 -- query 121
 -- types	bigint
 _col0
--18777612328
+206846400792
 
 -- query 122
 -- types	bigint
 _col0
--24312133682
+208971367065
 
 -- query 123
 -- types	bigint
 _col0
--17664875903
+199410620338
 
 -- query 124
 -- types	bigint
 _col0
--7748478770
+223183617295
 
 -- query 125
 -- types	bigint
 _col0
--5671249146
+182747221827
 
 -- query 126
 -- types	bigint
 _col0
--21220295577
+193643629677
 
 -- query 127
 -- types	bigint
 _col0
--18656381789
+195832236744
 
 -- query 128
 -- types	bigint
 _col0
--20066567366
+196452295174
 
 -- query 129
 -- types	bigint
 _col0
--10705596896
+190599749842
 
 -- query 130
 -- types	bigint
 _col0
--6254708075
+189348352114
 
 -- query 131
 -- types	varchar

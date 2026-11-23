@@ -32,9 +32,8 @@ use std::{
 };
 
 const SEGMENT_BYTES: usize = 1_048_576;
-const MANY_SQL: &str =
-    "SELECT generate_series FROM TABLE(generate_series(1, 200000)) ORDER BY generate_series";
-const LARGE_SQL: &str = "SELECT REPEAT('q', 1048575 + generate_series) AS c0, REPEAT('q', 1048575 + generate_series) AS c1, REPEAT('q', 1048575 + generate_series) AS c2 FROM TABLE(generate_series(1, 1))";
+const MANY_SQL: &str = "SELECT generate_series FROM TABLE(sequence(1, 200000)) AS src(generate_series) ORDER BY generate_series";
+const LARGE_SQL: &str = "SELECT rpad('', 1048575 + sequential_number, 'q') AS c0, rpad('', 1048575 + sequential_number, 'q') AS c1, rpad('', 1048575 + sequential_number, 'q') AS c2 FROM TABLE(sequence(1, 1))";
 const MANY_VALUE_SHA256: &str = "bc29c9d2007ce126ecf9011853cd852c713f7ccb39905b7556e062a94e3d921f";
 const LARGE_VALUE_SHA256: &str = "9c6f181b4bb3e2acdfed1047fae807b8e9373fa570932fe269d04754420d84ac";
 

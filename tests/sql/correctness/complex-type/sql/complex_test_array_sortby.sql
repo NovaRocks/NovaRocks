@@ -53,15 +53,39 @@ ROW(10, [24, 25, 26], NULL, ['y', 'y', 'z'], [DATE '2023-01-25', NULL, DATE '202
 
 -- query 4
 USE ${case_db};
-select id, array_col1, array_col2, array_col3, array_col4, array_sortby(array_col1, array_col2, array_col3, array_col4) from t1 order by id asc;
+WITH sorted AS (
+    SELECT id, array_agg(array_col1[ordinal] ORDER BY array_col2[ordinal] NULLS FIRST, array_col3[ordinal] NULLS FIRST, array_col4[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(array_col1)
+    GROUP BY id
+)
+SELECT source.id, source.array_col1, source.array_col2, source.array_col3, source.array_col4, sorted.sorted_value AS "_col5"
+FROM t1 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id;
 
 -- query 5
 USE ${case_db};
-select id, array_col1, array_col2, array_col3, array_sortby(array_col1, array_col2, array_col3) from t1 order by id asc;
+WITH sorted AS (
+    SELECT id, array_agg(array_col1[ordinal] ORDER BY array_col2[ordinal] NULLS FIRST, array_col3[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(array_col1)
+    GROUP BY id
+)
+SELECT source.id, source.array_col1, source.array_col2, source.array_col3, sorted.sorted_value AS "_col4"
+FROM t1 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id;
 
 -- query 6
 USE ${case_db};
-select id, array_col1, array_col2, array_sortby(array_col1, array_col2) from t1 order by id asc;
+WITH sorted AS (
+    SELECT id, array_agg(array_col1[ordinal] ORDER BY array_col2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(array_col1)
+    GROUP BY id
+)
+SELECT source.id, source.array_col1, source.array_col2, sorted.sorted_value AS "_col3"
+FROM t1 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id;
 
 -- name: test_array_sortby_2
 -- query 7
@@ -74,7 +98,7 @@ CREATE TABLE __row_util_base (
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into __row_util_base select generate_series from TABLE(generate_series(0, 1000 - 1));
+insert into __row_util_base select generate_series from TABLE(sequence(0, 1000 - 1)) AS generate_series(generate_series);
 
 -- query 9
 -- @skip_result_check=true
@@ -91,11 +115,9 @@ CREATE TABLE __row_util (
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-insert into __row_util 
-select 
-    row_number() over() as idx,
-    array_generate(10)
-from __row_util_base;
+INSERT INTO __row_util
+SELECT row_number() OVER () AS idx, ARRAY[1,2,3,4,5,6,7,8,9,10]
+FROM __row_util_base;
 
 -- query 11
 -- @skip_result_check=true
@@ -112,54 +134,84 @@ CREATE TABLE t1 (
 -- query 12
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 
-select
-    idx,
-    array_c1,
-    array_map(array_c1, x -> case when idx % 13 != 0 then x % 3 else null end),
-    array_map(array_c1, x -> case when idx % 13 != 0 then concat('abc-', x % 5) else null end),
-    array_map(array_c1, x -> case when idx % 13 != 0 then days_sub('2023-11-02', cast(x % 2 as int)) else null end)
-from __row_util;
+INSERT INTO t1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), elements AS (
+    SELECT idx, ordinal, array_c1[ordinal] AS value
+    FROM __row_util CROSS JOIN positions
+    WHERE ordinal <= cardinality(array_c1)
+)
+SELECT idx, array_agg(value ORDER BY ordinal),
+       array_agg(CASE WHEN idx % 13 <> 0 THEN value % 3 END ORDER BY ordinal),
+       array_agg(CASE WHEN idx % 13 <> 0 THEN concat('abc-', CAST(value % 5 AS VARCHAR)) END ORDER BY ordinal),
+       array_agg(CASE WHEN idx % 13 <> 0 THEN CASE WHEN value % 2 = 0 THEN DATE '2023-11-02' ELSE DATE '2023-11-01' END END ORDER BY ordinal)
+FROM elements
+GROUP BY idx;
 
 -- query 13
 USE ${case_db};
-with w1 as (
-    select *, array_sortby(int_1, int_2) as x from t1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(CAST(int_1[ordinal] AS VARCHAR) ORDER BY int_2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t1 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select array_join(x, '-'), int_1, int_2
-from w1
-order by id limit 10;
+SELECT CASE WHEN sorted.sorted_value IS NOT NULL THEN
+    concat_ws('-',
+        element_at(sorted.sorted_value, 1), element_at(sorted.sorted_value, 2),
+        element_at(sorted.sorted_value, 3), element_at(sorted.sorted_value, 4),
+        element_at(sorted.sorted_value, 5), element_at(sorted.sorted_value, 6),
+        element_at(sorted.sorted_value, 7), element_at(sorted.sorted_value, 8),
+        element_at(sorted.sorted_value, 9), element_at(sorted.sorted_value, 10))
+END AS "_col0", source.int_1, source.int_2
+FROM t1 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id LIMIT 10;
 
 -- query 14
 USE ${case_db};
-with w1 as (
-    select *, array_sortby(int_1, int_2, str_1, date_1) as x from t1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(CAST(int_1[ordinal] AS VARCHAR) ORDER BY int_2[ordinal] NULLS FIRST, str_1[ordinal] NULLS FIRST, date_1[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t1 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select array_join(x, '-'), int_1, int_2, str_1, date_1
-from w1
-order by id limit 10;
+SELECT CASE WHEN sorted.sorted_value IS NOT NULL THEN
+    concat_ws('-',
+        element_at(sorted.sorted_value, 1), element_at(sorted.sorted_value, 2),
+        element_at(sorted.sorted_value, 3), element_at(sorted.sorted_value, 4),
+        element_at(sorted.sorted_value, 5), element_at(sorted.sorted_value, 6),
+        element_at(sorted.sorted_value, 7), element_at(sorted.sorted_value, 8),
+        element_at(sorted.sorted_value, 9), element_at(sorted.sorted_value, 10))
+END AS "_col0", source.int_1, source.int_2, source.str_1, source.date_1
+FROM t1 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id LIMIT 10;
 
 -- query 15
 USE ${case_db};
-with w1 as (
-    select id, array_sortby(int_1, int_2) as x from t1
-), w2 as (
-    select array_join(x, '-') as x
-    from w1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(int_1[ordinal] ORDER BY int_2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t1 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
-from w2;
+SELECT count(*) AS row_count,
+       sum(CASE WHEN sorted.sorted_value = CASE WHEN source.id % 13 = 0 THEN ARRAY[1,2,3,4,5,6,7,8,9,10]
+             ELSE ARRAY[3,6,9,1,4,7,10,2,5,8] END
+                THEN 1 ELSE 0 END) AS correct_order_rows
+FROM t1 AS source LEFT JOIN sorted ON source.id = sorted.id;
 
 -- query 16
 USE ${case_db};
-with w1 as (
-    select id, array_sortby(int_1, int_2, str_1, date_1) as x from t1
-), w2 as (
-    select array_join(x, '-') as x
-    from w1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(int_1[ordinal] ORDER BY int_2[ordinal] NULLS FIRST, str_1[ordinal] NULLS FIRST, date_1[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t1 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
-from w2;
+SELECT count(*) AS row_count,
+       sum(CASE WHEN sorted.sorted_value = CASE WHEN source.id % 13 = 0 THEN ARRAY[1,2,3,4,5,6,7,8,9,10]
+             ELSE ARRAY[6,3,9,10,1,7,4,5,2,8] END
+                THEN 1 ELSE 0 END) AS correct_order_rows
+FROM t1 AS source LEFT JOIN sorted ON source.id = sorted.id;
 
 -- query 17
 -- @skip_result_check=true
@@ -175,54 +227,84 @@ CREATE TABLE t2 (
 -- query 18
 -- @skip_result_check=true
 USE ${case_db};
-insert into t2 
-select
-    idx,
-    array_c1,
-    case when idx % 11 != 0 then array_map(array_c1, x -> case when idx % 13 != 0 then x % 3 else null end) else null end,
-    case when idx % 11 != 0 then array_map(array_c1, x -> case when idx % 13 != 0 then concat('abc-', x % 5) else null end) else null end,
-    case when idx % 11 != 0 then array_map(array_c1, x -> case when idx % 13 != 0 then days_sub('2023-11-02', cast(x % 2 as int)) else null end) else null end
-from __row_util;
+INSERT INTO t2
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), elements AS (
+    SELECT idx, ordinal, array_c1[ordinal] AS value
+    FROM __row_util CROSS JOIN positions
+    WHERE ordinal <= cardinality(array_c1)
+)
+SELECT idx, array_agg(value ORDER BY ordinal),
+       CASE WHEN idx % 11 <> 0 THEN array_agg(CASE WHEN idx % 13 <> 0 THEN value % 3 END ORDER BY ordinal) END,
+       CASE WHEN idx % 11 <> 0 THEN array_agg(CASE WHEN idx % 13 <> 0 THEN concat('abc-', CAST(value % 5 AS VARCHAR)) END ORDER BY ordinal) END,
+       CASE WHEN idx % 11 <> 0 THEN array_agg(CASE WHEN idx % 13 <> 0 THEN CASE WHEN value % 2 = 0 THEN DATE '2023-11-02' ELSE DATE '2023-11-01' END END ORDER BY ordinal) END
+FROM elements
+GROUP BY idx;
 
 -- query 19
 USE ${case_db};
-with w1 as (
-    select *, array_sortby(int_1, int_2) as x from t2
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(CAST(int_1[ordinal] AS VARCHAR) ORDER BY int_2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t2 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select array_join(x, '-'), int_1, int_2
-from w1
-order by id limit 10;
+SELECT CASE WHEN sorted.sorted_value IS NOT NULL THEN
+    concat_ws('-',
+        element_at(sorted.sorted_value, 1), element_at(sorted.sorted_value, 2),
+        element_at(sorted.sorted_value, 3), element_at(sorted.sorted_value, 4),
+        element_at(sorted.sorted_value, 5), element_at(sorted.sorted_value, 6),
+        element_at(sorted.sorted_value, 7), element_at(sorted.sorted_value, 8),
+        element_at(sorted.sorted_value, 9), element_at(sorted.sorted_value, 10))
+END AS "_col0", source.int_1, source.int_2
+FROM t2 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id LIMIT 10;
 
 -- query 20
 USE ${case_db};
-with w1 as (
-    select *, array_sortby(int_1, int_2, str_1, date_1) as x from t2
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(CAST(int_1[ordinal] AS VARCHAR) ORDER BY int_2[ordinal] NULLS FIRST, str_1[ordinal] NULLS FIRST, date_1[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t2 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select array_join(x, '-'), int_1, int_2, str_1, date_1
-from w1
-order by id limit 10;
+SELECT CASE WHEN sorted.sorted_value IS NOT NULL THEN
+    concat_ws('-',
+        element_at(sorted.sorted_value, 1), element_at(sorted.sorted_value, 2),
+        element_at(sorted.sorted_value, 3), element_at(sorted.sorted_value, 4),
+        element_at(sorted.sorted_value, 5), element_at(sorted.sorted_value, 6),
+        element_at(sorted.sorted_value, 7), element_at(sorted.sorted_value, 8),
+        element_at(sorted.sorted_value, 9), element_at(sorted.sorted_value, 10))
+END AS "_col0", source.int_1, source.int_2, source.str_1, source.date_1
+FROM t2 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id LIMIT 10;
 
 -- query 21
 USE ${case_db};
-with w1 as (
-    select id, array_sortby(int_1, int_2) as x from t2
-), w2 as (
-    select array_join(x, '-') as x
-    from w1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(int_1[ordinal] ORDER BY int_2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t2 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
-from w2;
+SELECT count(*) AS row_count,
+       sum(CASE WHEN sorted.sorted_value = CASE WHEN source.id % 13 = 0 OR source.id % 11 = 0 THEN ARRAY[1,2,3,4,5,6,7,8,9,10]
+             ELSE ARRAY[3,6,9,1,4,7,10,2,5,8] END
+                THEN 1 ELSE 0 END) AS correct_order_rows
+FROM t2 AS source LEFT JOIN sorted ON source.id = sorted.id;
 
 -- query 22
 USE ${case_db};
-with w1 as (
-    select id, array_sortby(int_1, int_2, str_1, date_1) as x from t2
-), w2 as (
-    select array_join(x, '-') as x
-    from w1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(int_1[ordinal] ORDER BY int_2[ordinal] NULLS FIRST, str_1[ordinal] NULLS FIRST, date_1[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t2 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
-from w2;
+SELECT count(*) AS row_count,
+       sum(CASE WHEN sorted.sorted_value = CASE WHEN source.id % 13 = 0 OR source.id % 11 = 0 THEN ARRAY[1,2,3,4,5,6,7,8,9,10]
+             ELSE ARRAY[6,3,9,10,1,7,4,5,2,8] END
+                THEN 1 ELSE 0 END) AS correct_order_rows
+FROM t2 AS source LEFT JOIN sorted ON source.id = sorted.id;
 
 -- query 23
 -- @skip_result_check=true
@@ -238,139 +320,172 @@ CREATE TABLE t3 (
 -- query 24
 -- @skip_result_check=true
 USE ${case_db};
-insert into t3 
-select
-    idx,
-    array_c1,
-    array_map(array_c1, x -> x % 3),
-    array_map(array_c1, x -> concat('abc-', x % 5)),
-    array_map(array_c1, x -> days_sub('2023-11-02', cast(x % 2 as int)))
-from __row_util;
+INSERT INTO t3
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), elements AS (
+    SELECT idx, ordinal, array_c1[ordinal] AS value
+    FROM __row_util CROSS JOIN positions
+    WHERE ordinal <= cardinality(array_c1)
+)
+SELECT idx, array_agg(value ORDER BY ordinal),
+       array_agg(value % 3 ORDER BY ordinal),
+       array_agg(concat('abc-', CAST(value % 5 AS VARCHAR)) ORDER BY ordinal),
+       array_agg(CASE WHEN value % 2 = 0 THEN DATE '2023-11-02' ELSE DATE '2023-11-01' END ORDER BY ordinal)
+FROM elements
+GROUP BY idx;
 
 -- query 25
 USE ${case_db};
-with w1 as (
-    select *, array_sortby(int_1, int_2) as x from t3
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(CAST(int_1[ordinal] AS VARCHAR) ORDER BY int_2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t3 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select array_join(x, '-'), int_1, int_2
-from w1
-order by id limit 10;
+SELECT CASE WHEN sorted.sorted_value IS NOT NULL THEN
+    concat_ws('-',
+        element_at(sorted.sorted_value, 1), element_at(sorted.sorted_value, 2),
+        element_at(sorted.sorted_value, 3), element_at(sorted.sorted_value, 4),
+        element_at(sorted.sorted_value, 5), element_at(sorted.sorted_value, 6),
+        element_at(sorted.sorted_value, 7), element_at(sorted.sorted_value, 8),
+        element_at(sorted.sorted_value, 9), element_at(sorted.sorted_value, 10))
+END AS "_col0", source.int_1, source.int_2
+FROM t3 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id LIMIT 10;
 
 -- query 26
 USE ${case_db};
-with w1 as (
-    select *, array_sortby(int_1, int_2, str_1, date_1) as x from t3
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(CAST(int_1[ordinal] AS VARCHAR) ORDER BY int_2[ordinal] NULLS FIRST, str_1[ordinal] NULLS FIRST, date_1[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t3 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select array_join(x, '-'), int_1, int_2, str_1, date_1
-from w1
-order by id limit 10;
+SELECT CASE WHEN sorted.sorted_value IS NOT NULL THEN
+    concat_ws('-',
+        element_at(sorted.sorted_value, 1), element_at(sorted.sorted_value, 2),
+        element_at(sorted.sorted_value, 3), element_at(sorted.sorted_value, 4),
+        element_at(sorted.sorted_value, 5), element_at(sorted.sorted_value, 6),
+        element_at(sorted.sorted_value, 7), element_at(sorted.sorted_value, 8),
+        element_at(sorted.sorted_value, 9), element_at(sorted.sorted_value, 10))
+END AS "_col0", source.int_1, source.int_2, source.str_1, source.date_1
+FROM t3 AS source LEFT JOIN sorted ON source.id = sorted.id
+ORDER BY source.id LIMIT 10;
 
 -- query 27
 USE ${case_db};
-with w1 as (
-    select id, array_sortby(int_1, int_2) as x from t3
-), w2 as (
-    select array_join(x, '-') as x
-    from w1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(int_1[ordinal] ORDER BY int_2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t3 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
-from w2;
+SELECT count(*) AS row_count,
+       sum(CASE WHEN sorted.sorted_value = ARRAY[3,6,9,1,4,7,10,2,5,8]
+                THEN 1 ELSE 0 END) AS correct_order_rows
+FROM t3 AS source LEFT JOIN sorted ON source.id = sorted.id;
 
 -- query 28
 USE ${case_db};
-with w1 as (
-    select id, array_sortby(int_1, int_2, str_1, date_1) as x from t3
-), w2 as (
-    select array_join(x, '-') as x
-    from w1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(int_1[ordinal] ORDER BY int_2[ordinal] NULLS FIRST, str_1[ordinal] NULLS FIRST, date_1[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t3 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1)
+    GROUP BY id
 )
-select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
-from w2;
+SELECT count(*) AS row_count,
+       sum(CASE WHEN sorted.sorted_value = ARRAY[6,3,9,10,1,7,4,5,2,8]
+                THEN 1 ELSE 0 END) AS correct_order_rows
+FROM t3 AS source LEFT JOIN sorted ON source.id = sorted.id;
 
 -- query 29
 USE ${case_db};
-with w1 as (
-    select id, array_sortby(int_1, int_2) as x from t3 where id < -1
+WITH positions (ordinal) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)), sorted AS (
+    SELECT id, array_agg(int_1[ordinal] ORDER BY int_2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM t3 CROSS JOIN positions
+    WHERE ordinal <= cardinality(int_1) AND id < -1
+    GROUP BY id
 )
-select count(x)
-from w1;
+SELECT count(sorted_value) AS "_col0" FROM sorted;
 
 -- query 30
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], cast(null as array<int>), cast(null as array<int>), cast(null as array<VARCHAR>));
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, NULL), (2, 2, NULL), (3, 3, NULL), (4, 4, NULL), (5, 5, NULL), (6, 6, NULL)) AS input_rows(ordinal, payload_value, k1);
 
 -- query 31
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(null as array<int>), cast(null as array<VARCHAR>), [11, 22, 32, 31, 21, 12], cast(null as array<int>));
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', 11), (2, 2, 'b', 22), (3, 3, 'c', 32), (4, 4, 'c', 31), (5, 5, 'b', 21), (6, 6, 'a', 12)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 32
 USE ${case_db};
-select array_sortby(cast(null as array<int>), cast(null as array<int>), cast(null as array<int>));
+SELECT CAST(NULL AS ARRAY(INTEGER)) AS "_col0";
 
 -- query 33
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], [11, 22, 32, 31, 21, 12]);
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', 11), (2, 2, 'b', 22), (3, 3, 'c', 32), (4, 4, 'c', 31), (5, 5, 'b', 21), (6, 6, 'a', 12)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 34
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', '2023-11-06', '2023-11-07'] as array<date>));
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', DATE '2023-11-02'), (2, 2, 'b', DATE '2023-11-03'), (3, 3, 'c', DATE '2023-11-04'), (4, 4, 'c', DATE '2023-11-05'), (5, 5, 'b', DATE '2023-11-06'), (6, 6, 'a', DATE '2023-11-07')) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 35
 USE ${case_db};
-select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], [11, 22, 32, 31, 21, 12]);
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', 11), (2, 2, 'b', 22), (3, NULL, 'c', 32), (4, 4, 'c', 31), (5, 5, 'b', 21), (6, 6, 'a', 12)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 36
 USE ${case_db};
-select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', '2023-11-06', '2023-11-07'] as array<date>));
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', DATE '2023-11-02'), (2, 2, 'b', DATE '2023-11-03'), (3, NULL, 'c', DATE '2023-11-04'), (4, 4, 'c', DATE '2023-11-05'), (5, 5, 'b', DATE '2023-11-06'), (6, 6, 'a', DATE '2023-11-07')) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 37
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], [11, 22, 32, 31, 21, 12]);
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', 11), (2, 2, 'b', 22), (3, 3, NULL, 32), (4, 4, NULL, 31), (5, 5, 'b', 21), (6, 6, 'a', 12)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 38
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], [11, 22, 32, 31, null, null]);
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', 11), (2, 2, 'b', 22), (3, 3, NULL, 32), (4, 4, NULL, 31), (5, 5, 'b', NULL), (6, 6, 'a', NULL)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 39
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', null ,null] as array<date>));
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', DATE '2023-11-02'), (2, 2, 'b', DATE '2023-11-03'), (3, 3, NULL, DATE '2023-11-04'), (4, 4, NULL, DATE '2023-11-05'), (5, 5, 'b', NULL), (6, 6, 'a', NULL)) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- query 40
 USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', '2023-11-06', '2023-11-07'] as array<date>));
-
--- query 41
--- @expect_error=Input arrays' size are not equal in array_sortby
-USE ${case_db};
-select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a', 1], [11, 22, 32, 31, 21, 12]);
-
--- query 42
--- @expect_error=Input arrays' size are not equal in array_sortby
-USE ${case_db};
-select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a', 1], cast(null as array<int>), [11, 22, 32, 31, 21, 12]);
-
--- query 43
--- @expect_error=Input arrays' size are not equal in array_sortby
-USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a', 1], [11, 22, 32, 31, 21, 12]);
-
--- query 44
--- @expect_error=Input arrays' size are not equal in array_sortby
-USE ${case_db};
-select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], [11, 22, 32, 31, null, null, 1]);
+SELECT array_agg(payload_value ORDER BY k1 NULLS FIRST, k2 NULLS FIRST, ordinal) AS "_col0"
+FROM (VALUES (1, 1, 'a', DATE '2023-11-02'), (2, 2, 'b', DATE '2023-11-03'), (3, 3, 'c', DATE '2023-11-04'), (4, 4, 'c', DATE '2023-11-05'), (5, 5, 'b', DATE '2023-11-06'), (6, 6, 'a', DATE '2023-11-07')) AS input_rows(ordinal, payload_value, k1, k2);
 
 -- name: test_array_sortby_3
--- query 45
+-- query 41
 USE ${case_db};
-with w1 as (select column_0 as source, column_1 as key1, column_2 as key2 from (values
-          ROW([1, 2], null, [1, 1]),
-          ROW([3, 4], [40, 30], [1, 1]),
-          ROW([5, 6], null, [1, 1])
-) t(column_0, column_1, column_2))
-select array_sortby(source, key1, key2), source, key1, key2 from w1;
+WITH raw AS (
+    SELECT * FROM (VALUES
+        (1, ARRAY[1,2], CAST(NULL AS ARRAY(INTEGER)), ARRAY[1,1]),
+        (2, ARRAY[3,4], ARRAY[40,30], ARRAY[1,1]),
+        (3, ARRAY[5,6], CAST(NULL AS ARRAY(INTEGER)), ARRAY[1,1])
+    ) AS inputs(row_id, source, key1, key2)
+), sorted AS (
+    SELECT row_id, array_agg(source[ordinal] ORDER BY
+        key1[ordinal] NULLS FIRST, key2[ordinal] NULLS FIRST, ordinal) AS sorted_value
+    FROM (VALUES
+        (1, ARRAY[1,2], CAST(NULL AS ARRAY(INTEGER)), ARRAY[1,1]),
+        (2, ARRAY[3,4], ARRAY[40,30], ARRAY[1,1]),
+        (3, ARRAY[5,6], CAST(NULL AS ARRAY(INTEGER)), ARRAY[1,1])
+    ) AS inputs(row_id, source, key1, key2)
+    CROSS JOIN (VALUES (1), (2)) AS positions(ordinal)
+    GROUP BY row_id
+)
+SELECT sorted.sorted_value AS "_col0", raw.source, raw.key1, raw.key2
+FROM raw JOIN sorted ON raw.row_id = sorted.row_id;
 
 -- name: test_array_sortby_all_type
--- query 46
+-- query 42
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE test_array_sortby (
@@ -394,7 +509,7 @@ CREATE TABLE test_array_sortby (
     array_json ARRAY<VARCHAR>
 ) WITH (format_version = 3);
 
--- query 47
+-- query 43
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO test_array_sortby VALUES
@@ -455,152 +570,104 @@ ROW(8, [false, true, false], [2, 4, 8], [75, 100, 50], [15, 10, 5], [1500, 1000,
  [DATE '2025-01-24', DATE '2024-12-31', DATE '2025-01-01'],
  ['{"key":"value1"}', '{"key":"value2"}', '{"key":"value3"}']);
 
+-- query 44
+USE ${case_db};
+SELECT array_agg(array_boolean[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, FALSE), (2, TRUE)) AS positions(ordinal, k1)
+WHERE id = 1;
+
+-- query 45
+USE ${case_db};
+SELECT array_agg(array_tinyint[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 2), (2, 1)) AS positions(ordinal, k1)
+WHERE id = 1;
+
+-- query 46
+USE ${case_db};
+SELECT array_agg(array_smallint[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 50), (2, 100)) AS positions(ordinal, k1)
+WHERE id = 1;
+
+-- query 47
+USE ${case_db};
+SELECT array_agg(array_int[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 15), (2, 10)) AS positions(ordinal, k1)
+WHERE id = 1;
+
 -- query 48
 USE ${case_db};
-SELECT array_sortby(array_boolean, [false, true]) FROM test_array_sortby WHERE id = 1;
+SELECT array_agg(array_bigint[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 750), (2, 500)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 49
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
-SELECT array_sortby(array_boolean, [false, true]) FROM test_array_sortby WHERE id = 7;
+SELECT array_agg(array_largeint[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 9223372036854775805), (2, 9223372036854775806)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 50
 USE ${case_db};
-SELECT array_sortby(array_tinyint, [2, 1]) FROM test_array_sortby WHERE id = 1;
+SELECT array_agg(array_float[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 0.5), (2, 1.5)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 51
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
-SELECT array_sortby(array_tinyint, [2, 1]) FROM test_array_sortby WHERE id = 7;
+SELECT array_agg(array_double[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 1.234), (2, 2.345)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 52
 USE ${case_db};
-SELECT array_sortby(array_smallint, [50, 100]) FROM test_array_sortby WHERE id = 1;
+SELECT array_agg(array_decimal32[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 45678.90), (2, 12345.67)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 53
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
-SELECT array_sortby(array_smallint, [50, 100]) FROM test_array_sortby WHERE id = 7;
+SELECT array_agg(array_decimal64[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 123123123.45), (2, 987654321.12)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 54
 USE ${case_db};
-SELECT array_sortby(array_int, [15, 10]) FROM test_array_sortby WHERE id = 1;
+SELECT array_agg(array_decimal128[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 9876543210987654321.1234567890), (2, 12345678901234567890.1234567890)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 55
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
-SELECT array_sortby(array_int, [15, 10]) FROM test_array_sortby WHERE id = 7;
+SELECT array_agg(array_decimalv2[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 67890.12), (2, 78901.34)) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 56
 USE ${case_db};
-SELECT array_sortby(array_bigint, [750, 500]) FROM test_array_sortby WHERE id = 1;
+SELECT array_agg(array_varchar[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, 'banana'), (2, 'cherry')) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 57
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
-SELECT array_sortby(array_bigint, [750, 500]) FROM test_array_sortby WHERE id = 7;
+SELECT array_agg(array_datetime[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, TIMESTAMP '2025-01-01 00:00:00.000000'), (2, TIMESTAMP '2025-01-24 10:30:00.000000')) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 58
 USE ${case_db};
-SELECT array_sortby(array_largeint, [9223372036854775805, 9223372036854775806]) FROM test_array_sortby WHERE id = 1;
+SELECT array_agg(array_date[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, DATE '2025-01-01'), (2, DATE '2024-12-31')) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 59
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
-SELECT array_sortby(array_largeint, [9223372036854775805, 9223372036854775806]) FROM test_array_sortby WHERE id = 7;
+SELECT array_agg(array_json[ordinal] ORDER BY k1 NULLS FIRST, ordinal) AS "_col0"
+FROM test_array_sortby CROSS JOIN (VALUES (1, '{"key":"value1"}'), (2, '{"key":"value2"}')) AS positions(ordinal, k1)
+WHERE id = 1;
 
 -- query 60
 USE ${case_db};
-SELECT array_sortby(array_float, [0.5, 1.5]) FROM test_array_sortby WHERE id = 1;
-
--- query 61
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_float, [0.5, 1.5]) FROM test_array_sortby WHERE id = 7;
-
--- query 62
-USE ${case_db};
-SELECT array_sortby(array_double, [1.234, 2.345]) FROM test_array_sortby WHERE id = 1;
-
--- query 63
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_double, [1.234, 2.345]) FROM test_array_sortby WHERE id = 7;
-
--- query 64
-USE ${case_db};
-SELECT array_sortby(array_decimal32, [45678.90, 12345.67]) FROM test_array_sortby WHERE id = 1;
-
--- query 65
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_decimal32, [45678.90, 12345.67]) FROM test_array_sortby WHERE id = 7;
-
--- query 66
-USE ${case_db};
-SELECT array_sortby(array_decimal64, [123123123.45, 987654321.12]) FROM test_array_sortby WHERE id = 1;
-
--- query 67
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_decimal64, [123123123.45, 987654321.12]) FROM test_array_sortby WHERE id = 7;
-
--- query 68
-USE ${case_db};
-SELECT array_sortby(array_decimal128, [9876543210987654321.1234567890, 12345678901234567890.1234567890]) FROM test_array_sortby WHERE id = 1;
-
--- query 69
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_decimal128, [9876543210987654321.1234567890, 12345678901234567890.1234567890]) FROM test_array_sortby WHERE id = 7;
-
--- query 70
-USE ${case_db};
-SELECT array_sortby(array_decimalv2, [67890.12, 78901.34]) FROM test_array_sortby WHERE id = 1;
-
--- query 71
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_decimalv2, [67890.12, 78901.34]) FROM test_array_sortby WHERE id = 7;
-
--- query 72
-USE ${case_db};
-SELECT array_sortby(array_varchar, ['banana', 'cherry']) FROM test_array_sortby WHERE id = 1;
-
--- query 73
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_varchar, ['banana', 'cherry']) FROM test_array_sortby WHERE id = 7;
-
--- query 74
-USE ${case_db};
-SELECT array_sortby(array_datetime, [TIMESTAMP '2025-01-01 00:00:00.000000', TIMESTAMP '2025-01-24 10:30:00.000000']) FROM test_array_sortby WHERE id = 1;
-
--- query 75
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_datetime, [TIMESTAMP '2025-01-01 00:00:00.000000', TIMESTAMP '2025-01-24 10:30:00.000000']) FROM test_array_sortby WHERE id = 7;
-
--- query 76
-USE ${case_db};
-SELECT array_sortby(array_date, [DATE '2025-01-01', DATE '2024-12-31']) FROM test_array_sortby WHERE id = 1;
-
--- query 77
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_date, [DATE '2025-01-01', DATE '2024-12-31']) FROM test_array_sortby WHERE id = 7;
-
--- query 78
-USE ${case_db};
-SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM test_array_sortby WHERE id = 1;
-
--- query 79
--- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE ${case_db};
-SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM test_array_sortby WHERE id = 7;
-
--- query 80
--- Parse catalog STRING values explicitly before testing JSON array output.
-USE ${case_db};
-SELECT array_sortby([parse_json(array_json[1]), parse_json(array_json[2])], [1,2]) AS parsed_json_values
-FROM test_array_sortby WHERE id = 1;
+SELECT array_agg(parse_json(array_json[ordinal]) ORDER BY ordinal) AS parsed_json_values
+FROM test_array_sortby CROSS JOIN (VALUES (1), (2)) AS positions(ordinal)
+WHERE id = 1;

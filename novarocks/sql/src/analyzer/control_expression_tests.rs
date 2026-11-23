@@ -45,6 +45,7 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         constant_policy: crate::constant::test_constant_policy(),
         materialized_values: None,
         prepared_parameters: None,
+        table_sequence: None,
         catalog: &NoTables,
         current_database: "default",
         function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -55,7 +56,6 @@ fn context(control: &SqlCompileControl) -> AnalyzerContext<'_> {
         ctes: Default::default(),
         pending_ctes: Default::default(),
         next_subquery_id: Default::default(),
-        next_lambda_slot_id: Default::default(),
         collected_subqueries: Default::default(),
         cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
     }
@@ -319,6 +319,168 @@ fn cast_safe_syntax_distinguishes_conversion_modes_and_preserves_display_contrac
 }
 
 #[test]
+fn array_item_borrow_retains_original_constant_ordinal_through_coercion() {
+    use crate::compiler::materialized_values::MaterializedSourceBorrow;
+    use arrow::array::{Array, Int32Array};
+    use novarocks_functions::ConstantPool;
+    use novarocks_type_contract::CompilePhase;
+    use std::sync::Arc;
+    let control = SqlCompileControl::unbounded();
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "original_array_item",
+        DataType::Int32,
+        false,
+    ));
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        FunctionValueType::new(DataType::Int32, false),
+        Int32Array::from(vec![99, 5]).to_data(),
+        crate::constant::test_constant_policy(),
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let value = pool.value(1).unwrap();
+    let query = query("SELECT ARRAY[only_original_body, CAST(1 AS BIGINT)]");
+    let ast::Expr::Array(array) = projection(&query) else {
+        panic!("array literal")
+    };
+    let original = &array.values[0];
+    let mut source = MaterializedSourceBorrow::empty(&query);
+    source
+        .insert_context_constant(original, value.clone(), &control)
+        .unwrap();
+    assert!(source.view().constant_at(&original.clone()).is_none());
+    let mut ctx = context(&control);
+    ctx.materialized_values = Some(source.view());
+    let scope = ctx.new_scope();
+    let expected = ctx.analyze_expr(original, &scope).unwrap();
+    let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
+    let ExprKind::FunctionCall { args, .. } = &actual.kind else {
+        panic!("original array function binding")
+    };
+    let body = &args[0];
+    assert_eq!(
+        body.value_type,
+        FunctionValueType::new(DataType::Int64, false)
+    );
+    let ExprKind::Cast { expr, target, .. } = &body.kind else {
+        panic!("original write conversion")
+    };
+    assert_eq!(target, &DataType::Int64);
+    same_typed(expr, &expected, &control);
+    let ExprKind::Constant(retained) = &expr.kind else {
+        panic!("original ARRAY item source")
+    };
+    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+    assert_eq!(retained.ordinal(), 1);
+    assert_eq!(retained.field(), field.as_ref());
+    assert_eq!(retained.value_type(), value.value_type());
+}
+
+#[test]
+fn case_result_cast_path_preserves_original_constant_ordinal() {
+    use crate::compiler::materialized_values::{
+        MaterializedValues, SqlConstantExpressionSite, SqlConstantExpressionStep,
+        SqlExpressionConstant,
+    };
+    use arrow::array::{Array, Int32Array};
+    use novarocks_functions::ConstantPool;
+    use novarocks_type_contract::CompilePhase;
+    use std::sync::Arc;
+    let control = SqlCompileControl::unbounded();
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "original_case_source",
+        DataType::Int32,
+        false,
+    ));
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        FunctionValueType::new(DataType::Int32, false),
+        Int32Array::from(vec![99, 5]).to_data(),
+        crate::constant::test_constant_policy(),
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let value = pool.value(1).unwrap();
+    let query = query("SELECT CASE WHEN TRUE THEN CAST(only_original_result AS BIGINT) ELSE 2 END");
+    let ast::Expr::SearchedCase(case) = projection(&query) else {
+        panic!("searched CASE")
+    };
+    let ast::Expr::Cast(cast) = &case.when_clauses[0].result else {
+        panic!("original CAST")
+    };
+    let source = MaterializedValues::try_new_expressions(
+        &query,
+        vec![
+            SqlExpressionConstant::new(
+                vec![],
+                SqlConstantExpressionSite::SelectProjection { column: 0 },
+                value.clone(),
+            )
+            .with_expression_path(vec![
+                SqlConstantExpressionStep::CaseResult(0),
+                SqlConstantExpressionStep::CastExpression,
+            ]),
+        ]
+        .into(),
+        &control,
+    )
+    .unwrap();
+    let original = source.loan(&query, &control).unwrap();
+    let mut ctx = context(&control);
+    ctx.materialized_values = Some(original.view());
+    let scope = ctx.new_scope();
+    let expected = ctx
+        .analyze_expr(&case.when_clauses[0].result, &scope)
+        .unwrap();
+    let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
+    let ExprKind::Case { when_then, .. } = &actual.kind else {
+        panic!("original CASE IR")
+    };
+    let branch = &when_then[0].1;
+    assert_eq!(
+        branch.value_type,
+        FunctionValueType::new(DataType::Int64, true)
+    );
+    let ExprKind::Cast {
+        expr: original_conversion,
+        target,
+        cast_mode: None,
+        ..
+    } = &branch.kind
+    else {
+        panic!("CASE result nullability conversion")
+    };
+    assert_eq!(target, &DataType::Int64);
+    same_typed(original_conversion, &expected, &control);
+    let ExprKind::Cast {
+        expr,
+        target,
+        cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+        ..
+    } = &original_conversion.kind
+    else {
+        panic!("original source conversion")
+    };
+    assert_eq!(target, &DataType::Int64);
+    let ExprKind::Constant(retained) = &expr.kind else {
+        panic!("original CASE result source")
+    };
+    assert_eq!(retained.pool().backing_identity(), pool.backing_identity());
+    assert_eq!(retained.ordinal(), 1);
+    assert_eq!(retained.field(), field.as_ref());
+    assert_eq!(retained.value_type(), value.value_type());
+    assert!(
+        original
+            .view()
+            .constant_at(&cast.expression.clone())
+            .is_none()
+    );
+}
+
+#[test]
 fn named_arguments_and_processing_modes_refuse_before_ordinary_lookup() {
     let source = crate::planning::catalog::PlannerMemoryCatalog::default();
     let functions = crate::compiler::build_builtin_engine_function_catalog().unwrap();
@@ -399,7 +561,7 @@ fn dedicated_controls_keep_original_bindings_display_and_direct_refusals() {
         ("SELECT try(missing_value)", AnalyzeErrorKind::UnknownColumn),
         (
             "SELECT format(missing_format, missing_value)",
-            AnalyzeErrorKind::UnsupportedExpression,
+            AnalyzeErrorKind::UnknownColumn,
         ),
     ] {
         let parsed = query(sql);

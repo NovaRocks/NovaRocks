@@ -93,11 +93,11 @@ SET SESSION pipeline_dop = 1;
 
 -- multi-column NOT IN with large generated dataset (int pair)
 -- query 13
-select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, x0 + 1) not in ( select l3.l_orderkey, l3.l_orderkey + 1 from ${case_db}.lineitem l3 ) order by 1) t;
+select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(sequence(1, 8192)) AS generate_series(generate_series)) t where (x0, x0 + 1) not in ( select l3.l_orderkey, l3.l_orderkey + 1 from ${case_db}.lineitem l3 ) order by 1) t;
 
 -- multi-column NOT IN with large generated dataset (int + string pair)
 -- query 14
-select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, concat('l', x0)) not in ( select l3.l_orderkey, concat('l', l_orderkey) from ${case_db}.lineitem l3 ) order by 1) t;
+select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(sequence(1, 8192)) AS generate_series(generate_series)) t where (x0, concat('l', x0)) not in ( select l3.l_orderkey, concat('l', l_orderkey) from ${case_db}.lineitem l3 ) order by 1) t;
 
 -- query 15
 -- @skip_result_check=true
@@ -109,7 +109,7 @@ CREATE TABLE ${case_db}.aware3 (
 
 -- query 16
 -- @skip_result_check=true
-insert into ${case_db}.aware3 SELECT generate_series, if(generate_series<4095, 1, null), if(generate_series<4095, generate_series, null) FROM TABLE(generate_series(1, 4096));
+insert into ${case_db}.aware3 SELECT generate_series, if(generate_series<4095, 1, null), if(generate_series<4095, generate_series, null) FROM TABLE(sequence(1, 4096)) AS generate_series(generate_series);
 
 -- query 17
 -- @skip_result_check=true

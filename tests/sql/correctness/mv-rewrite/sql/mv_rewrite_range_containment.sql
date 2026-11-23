@@ -64,7 +64,7 @@ SELECT
   END AS dt,
   CASE WHEN n % 200 < 100 THEN 'east' ELSE 'west' END AS region,
   CAST(n % 100 AS BIGINT) AS amount
-FROM TABLE(generate_series(1, 24000)) t(n);
+FROM TABLE(sequence(1, 24000)) t(n);
 
 -- query 5
 -- @skip_result_check=true

@@ -51,7 +51,7 @@ CREATE TABLE ${case_db}.dictionary_plain_fallback (label VARCHAR) WITH (format_v
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO ${case_db}.dictionary_plain_fallback SELECT rpad(CAST(generate_series AS VARCHAR), 16384, 'x') FROM TABLE(generate_series(1, 512));
+INSERT INTO ${case_db}.dictionary_plain_fallback SELECT rpad(CAST(generate_series AS VARCHAR), 16384, 'x') FROM TABLE(sequence(1, 512)) AS generate_series(generate_series);
 
 -- query 9
 -- @iceberg_scan_layout=view

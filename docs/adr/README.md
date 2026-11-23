@@ -115,6 +115,7 @@ code-anchors:
 
 ### join-execution
 
+- [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 不相关复合 IN 如何用实际左右关系、普通等值和可空标记保留三值及原需要求（active）
 - [ADR-0250](ADR-0250-standard-numeric-operator-semantics.md) — 冻结的键匹配如何保留普通浮点谓词、空值安全等值、成员资格和原需用范围（active）
 
 领域哲学：join 的行拓扑（key → 枚举该 key 全部 build 行 + gather 物化）与聚合状态不同，分别归原消费者；实例内键相等类、typed 读取与 bulk 构建共享唯一索引。速度来自算法与数据布局（直接寻址、合并列存、选择向量、membership 零枚举、整列直发），不来自手写 SIMD。受支持 join 类型、null-safe 等值与残差谓词的独立结果必须保留；尚未支持的准确拒绝及既有隔离分别记录，不能冒充成功或正式准入。
@@ -331,13 +332,19 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
+
+- [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
+
 - [ADR-0254](ADR-0254-exact-temporal-values-and-frozen-statement-time.md) — 精确时态值如何保留逐值时区，语句环境与规则如何在折叠、执行、存储和结果呈现之间传递（active）
+
 - [ADR-0253](ADR-0253-aggregate-filters-select-original-rows-per-call.md) — 普通聚合怎样按原行逐调用选行，并保留分组集求值和分阶段状态来源（active）
 
 - [ADR-0252](ADR-0252-trino-casts-and-row-error-scopes.md) — Trino 转换语境、完整类型与选中行错误作用域如何在编译、折叠和执行中保持一致（active）
 - [ADR-0250](ADR-0250-standard-numeric-operator-semantics.md) — 标准数值怎样经共享定型和普通调用冻结，并保留遗留宽数消费者（active）
 
 - [ADR-0249](ADR-0249-trino-public-functions-and-internal-aggregate-identities.md) — Trino 公开候选如何尊重可见性，标准 DISTINCT 如何保留内部准确重载和状态（active）
+- [ADR-0257](ADR-0257-ordered-regexp-evaluation-and-resource-ownership.md) — 正则模式如何在原实参位置受控编译、搜索和归还资源（active）
 - [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
 - [ADR-0244](ADR-0244-operators-are-identified-catalogue-functions.md) — 隐藏目录函数为何按身份表示运算符，如何沿普通调用迁移、渲染和折叠（active；部分替代 ADR-0242 的取负范围）
 
@@ -381,7 +388,8 @@ code-anchors:
 normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
 语言或durable authority。
 
-- [ADR-0256](ADR-0256-prepared-sql-request-snapshots-and-semantic-authors.md) — 预编译语句为何依赖请求定义快照、原参数位置以及 SchemaOnly 描述（active；实现与验证状态独立核对）
+- [ADR-0258](ADR-0258-prepared-sql-request-snapshots-and-semantic-authors.md) — 预编译语句为何依赖请求定义快照、原参数位置以及 SchemaOnly 描述（active；实现与验证状态独立核对）
+- [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 公开集合签名和关系 `TABLE(sequence(...))` 如何独立绑定（active）
 - [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) — Iceberg 元数据维护为何由原语句和准确表对象授权，如何保留 Trino 结果形状、完整有效文件集合、Hadoop 发现根与已确认删除事实（active；部分替代 ADR-0110/0198 的显式扫描和自有 ref 条款，以及 ADR-0111/0114/0232 的首次观察状态）
 - [ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) — Trino SQL 为何是唯一文法，语法扩展、AST 差异、能力准入与 printer 的边界（active；补充 ADR-0090／0101／0231）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator 由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，Catalog 准入与三态 publication 保留）
@@ -396,7 +404,8 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 领域哲学：Map 键域在构造时成立，不能由写出路径或运行时字段放宽来补救。非空且唯一是值语义；构造拒绝与具有明确优先级的合并分开，唯一性复用 GROUP BY 规范键等价。实施覆盖必须如实记录，局部入口的校验不代表所有生产者已经收敛。
 
-- [ADR-0183](ADR-0183-map-keys-are-non-null-and-unique.md) — Map 键为何非空且唯一，构造拒绝为何与合并优先级分开（active；当前字面量与数组构造落实 NULL key 拒绝，重复键与其他入口待收敛）
+- [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 构造、DDL 属性和聚合如何共用 MAP 键契约，查找如何沿普通等值（active；部分替代 ADR-0183 的作者及判重合同）
+- [ADR-0183](ADR-0183-map-keys-are-non-null-and-unique.md) — Map 键为何非空且唯一，构造拒绝为何与合并优先级分开（active；键域和合并规则保留，构造作者及判重合同见 ADR-0255）
 
 ### runtime-role
 

@@ -41,6 +41,7 @@ pub(super) fn test_product() -> (RequiredConstantInterpreter, Arc<EngineFunction
         "if",
         "coalesce",
         "rand",
+        "map",
         "__array_literal",
         novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME,
         OperatorFunction::Add.catalog_name(),

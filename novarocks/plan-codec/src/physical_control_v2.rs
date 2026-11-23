@@ -146,6 +146,7 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
         ControlShape::If => Some(wire::SimpleControl::If),
         ControlShape::Coalesce => Some(wire::SimpleControl::Coalesce),
         ControlShape::Try => Some(wire::SimpleControl::Try),
+        ControlShape::OrderedRegexp => Some(wire::SimpleControl::OrderedRegexp),
         ControlShape::Case { .. }
         | ControlShape::HigherOrder { .. }
         | ControlShape::TemporalSource(_)
@@ -202,6 +203,7 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
             Ok(wire::SimpleControl::If) => Ok(ControlShape::If),
             Ok(wire::SimpleControl::Coalesce) => Ok(ControlShape::Coalesce),
             Ok(wire::SimpleControl::Try) => Ok(ControlShape::Try),
+            Ok(wire::SimpleControl::OrderedRegexp) => Ok(ControlShape::OrderedRegexp),
             _ => Err(ControlCodecError::InvalidShape(
                 "unknown or unspecified control shape",
             )),
@@ -235,6 +237,9 @@ fn encode_guard(guard: RegionGuard) -> wire::RegionGuard {
         GuardKind::CaseThen { arm } => Kind::CaseThenArm(arm),
         GuardKind::BetweenAfterSource { ordinal } => Kind::BetweenAfterSourceOrdinal(ordinal),
         GuardKind::MembershipAfterSource { ordinal } => Kind::MembershipAfterSourceOrdinal(ordinal),
+        GuardKind::OrderedRegexpAfterArgument { ordinal } => {
+            Kind::OrderedRegexpAfterArgumentOrdinal(ordinal)
+        }
         GuardKind::TemporalAfterSource { ordinal } => Kind::TemporalAfterSourceOrdinal(ordinal),
         GuardKind::TemporalInvocationNull => {
             Kind::Simple(wire::SimpleGuard::TemporalInvocationNull as i32)
@@ -276,6 +281,9 @@ fn decode_guard(guard: &wire::RegionGuard) -> Result<RegionGuard, ControlCodecEr
         }
         Kind::MembershipAfterSourceOrdinal(ordinal) => {
             GuardKind::MembershipAfterSource { ordinal: *ordinal }
+        }
+        Kind::OrderedRegexpAfterArgumentOrdinal(ordinal) => {
+            GuardKind::OrderedRegexpAfterArgument { ordinal: *ordinal }
         }
         Kind::TemporalAfterSourceOrdinal(ordinal) => {
             GuardKind::TemporalAfterSource { ordinal: *ordinal }

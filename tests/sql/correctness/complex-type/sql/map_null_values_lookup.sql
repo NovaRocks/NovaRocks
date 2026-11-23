@@ -19,14 +19,18 @@
 -- @order_sensitive=true
 
 -- query 1
-SELECT map(1,NULL)[1] AS found_value, map(1,NULL)[2] AS missing_value,
-       element_at(map(1,NULL), 1) AS explicit_call;
+SELECT MAP(ARRAY[1], ARRAY[NULL])[1] AS found_value, element_at(MAP(ARRAY[1], ARRAY[NULL]), 2) AS missing_value,
+       element_at(MAP(ARRAY[1], ARRAY[NULL]), 1) AS explicit_call;
 
 -- query 2
 WITH input_values AS (
-    SELECT 1 AS id, map(1,NULL) AS m
-    UNION ALL SELECT 2, map(2,NULL)
+    SELECT 1 AS id, MAP(ARRAY[1], ARRAY[NULL]) AS m
+    UNION ALL SELECT 2, MAP(ARRAY[2], ARRAY[NULL])
     UNION ALL SELECT 3, NULL
 )
-SELECT id, m[1] AS found_value, m[99] AS missing_value
+SELECT id, element_at(m, 1) AS found_value, element_at(m, 99) AS missing_value
 FROM input_values ORDER BY id;
+
+-- query 3
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT MAP(ARRAY[1], ARRAY[CAST(NULL AS INTEGER)])[2];

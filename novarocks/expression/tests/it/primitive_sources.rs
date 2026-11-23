@@ -113,7 +113,7 @@ fn every_unsupported_recipe_keeps_its_exact_owner() {
     let integer = FunctionValueType::new(DataType::Int64, true);
     let boolean = FunctionValueType::new(DataType::Boolean, false);
     let nested = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         true,
     );
     let errors = [

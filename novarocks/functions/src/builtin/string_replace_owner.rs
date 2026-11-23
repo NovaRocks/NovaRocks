@@ -96,7 +96,7 @@ impl StringReplaceOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || !(1..=2).contains(&declaration.overloads().len())
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })

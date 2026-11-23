@@ -34,12 +34,12 @@ CREATE TABLE ${case_db}.rf_dist_broadcast_build (
 
 INSERT INTO ${case_db}.rf_dist_broadcast_probe
 SELECT generate_series AS id, generate_series % 600 AS k
-FROM TABLE(generate_series(1, 6000));
+FROM TABLE(sequence(1, 6000)) AS generate_series(generate_series);
 
 INSERT INTO ${case_db}.rf_dist_broadcast_build
 SELECT generate_series % 600 AS k,
        CASE WHEN generate_series % 600 IN (11, 29) THEN 'Y' ELSE 'N' END AS flag
-FROM TABLE(generate_series(1, 600));
+FROM TABLE(sequence(1, 600)) AS generate_series(generate_series);
 
 ANALYZE ${case_db}.rf_dist_broadcast_probe;
 ANALYZE ${case_db}.rf_dist_broadcast_build;

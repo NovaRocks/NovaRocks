@@ -875,7 +875,7 @@ fn string_translate_measured_output_layout_and_byte_extent_refuse_before_request
 }
 
 #[test]
-fn string_translate_original_ascii_uncapped_unicode_cap_and_partitioning_are_exact() {
+fn string_translate_expands_unicode_and_retains_partitioning_above_one_mebibyte() {
     let huge = "a".repeat(1024 * 1024 + 1);
     let unicode_source = "é".repeat(512 * 1024 + 1);
     let cases = [
@@ -886,8 +886,8 @@ fn string_translate_original_ascii_uncapped_unicode_cap_and_partitioning_are_exa
             "x",
             Some(unicode_source.as_str()),
         ),
-        (huge.as_str(), "", "unusedé", None),
-        (huge.as_str(), "unusedé", "", None),
+        (huge.as_str(), "", "unusedé", Some(huge.as_str())),
+        (huge.as_str(), "unusedé", "", Some(huge.as_str())),
         (huge.as_str(), "aé", "", Some("")),
         ("ababa", "aba", "X", Some("XXX")),
     ];
@@ -923,8 +923,8 @@ fn string_translate_original_ascii_uncapped_unicode_cap_and_partitioning_are_exa
     }
     let exact = "a".repeat(1024 * 1024);
     let exact = strings(vec![Some(&exact)]);
-    let from = strings(vec![Some("")]);
-    let to = strings(vec![Some("é")]);
+    let from = strings(vec![Some("a")]);
+    let to = strings(vec![Some("中")]);
     let args = [
         EvaluatedArgument::Column(&exact),
         EvaluatedArgument::Column(&from),
@@ -941,6 +941,6 @@ fn string_translate_original_ascii_uncapped_unicode_cap_and_partitioning_are_exa
             .unwrap()
             .value(0)
             .len(),
-        1024 * 1024
+        3 * 1024 * 1024
     );
 }

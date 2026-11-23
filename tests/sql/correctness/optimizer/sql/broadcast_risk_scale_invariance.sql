@@ -23,13 +23,13 @@ CREATE TABLE build_1x (k INT);
 CREATE TABLE probe_10x (k INT);
 CREATE TABLE build_10x (k INT);
 INSERT INTO probe_1x
-    SELECT generate_series FROM TABLE(generate_series(1, 100000));
+    SELECT generate_series FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 INSERT INTO build_1x
-    SELECT generate_series FROM TABLE(generate_series(1, 10000));
+    SELECT generate_series FROM TABLE(sequence(1, 10000)) AS generate_series(generate_series);
 INSERT INTO probe_10x
-    SELECT generate_series FROM TABLE(generate_series(1, 1000000));
+    SELECT generate_series FROM TABLE(sequence(1, 1000000)) AS generate_series(generate_series);
 INSERT INTO build_10x
-    SELECT generate_series FROM TABLE(generate_series(1, 100000));
+    SELECT generate_series FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 ANALYZE probe_1x;
 ANALYZE build_1x;
 ANALYZE probe_10x;

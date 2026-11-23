@@ -369,8 +369,8 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
         Err(TextError::UnknownColumn { name, .. }) if name == "unknown"
     ));
     for (text, name) in [
-        ("TRIM(x)", "trim"),
         ("count(x)", "count"),
+        ("IF(TRUE, x, x)", "if"),
         ("x.y", "qualified name or field reference"),
     ] {
         assert!(
@@ -381,11 +381,24 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
             "{text}"
         );
     }
-    let conditional = type_text("IF(TRUE, x, x)").unwrap();
+    let conditional = type_text("CASE WHEN TRUE THEN x ELSE x END").unwrap();
     let values = Arc::new(StringArray::from(vec!["original value"]));
     let result = evaluate(&conditional, &batch(&columns, vec![values.clone()]));
-    assert_eq!(result.batch.result_type, columns[0].value_type);
+    assert_eq!(
+        result.batch.result_type,
+        columns[0].value_type.with_nullable(true).unwrap()
+    );
     assert_eq!(result.batch.values.to_data(), values.to_data());
+
+    let trim = type_text("TRIM(x)").unwrap();
+    let values = Arc::new(StringArray::from(vec!["  original value  "]));
+    assert_eq!(
+        evaluate(&trim, &batch(&columns, vec![values]))
+            .batch
+            .values
+            .to_data(),
+        StringArray::from(vec!["original value"]).to_data()
+    );
 
     let cast = type_text("CAST(x AS BIGINT)").unwrap();
     let root = cast
@@ -402,7 +415,12 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     ));
     assert!(matches!(
         type_text("TRIM('a' FROM x)"),
-        Err(TextError::UnsupportedSyntax(cause)) if cause.message == "explicit TRIM characters are not supported"
+        Err(TextError::Typing {
+            cause: TypingError::Binding(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(overload)
+            ),
+            ..
+        }) if overload.as_str() == "builtin.scalar/trim/trino-varchar-codepoints-v1"
     ));
     for source in [
         "-NULL",
@@ -1000,5 +1018,63 @@ fn ordinary_and_null_safe_float_comparisons_preserve_distinct_relations() {
             BooleanArray::from(expected).to_data(),
             "{operator}"
         );
+    }
+}
+
+#[test]
+fn integer_array_equality_keeps_nested_nulls_and_compares_mixed_width_elements() {
+    use arrow::array::{ListArray, types};
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let left: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int32Type, _, _>([
+        Some(vec![Some(1), None]),
+        Some(vec![None, Some(3)]),
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(1)]),
+        Some(vec![None]),
+        None,
+    ]));
+    let right: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int64Type, _, _>([
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(2), Some(4)]),
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![]),
+        Some(vec![]),
+        Some(vec![]),
+    ]));
+    let columns = [
+        column("lhs", 10, left.data_type().clone(), true),
+        column("rhs", 20, right.data_type().clone(), false),
+    ];
+    let batch = batch(&columns, vec![left, right]);
+    for (sql, expected) in [
+        (
+            "lhs = rhs",
+            [
+                None,
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                None,
+            ],
+        ),
+        (
+            "lhs <> rhs",
+            [None, Some(true), Some(false), Some(true), Some(true), None],
+        ),
+    ] {
+        let expression = compile(sql, &columns, &context);
+        let checked = evaluate(&expression, &batch);
+        assert!(checked.batch.errors.is_empty());
+        let values = checked
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), expected, "{sql}");
     }
 }

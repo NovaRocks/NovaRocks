@@ -698,6 +698,7 @@ fn wrap_query(slot: usize, inner: ResolvedQuery) -> ResolvedQuery {
             select.apply_specs = vec![ApplyScalarSpec {
                 mark_probe: None,
                 mark_key_bindings: None,
+                relation_mark: None,
                 subquery_id: 17,
                 clause: ApplyClause::Projection,
                 output_column: output(),

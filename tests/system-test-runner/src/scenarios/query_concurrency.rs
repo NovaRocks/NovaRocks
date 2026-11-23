@@ -71,7 +71,7 @@ const CLIENT_RUNTIME_THREADS: usize = 16;
 // `sleep` evaluates in the BE after the one-row source is distributed. It is
 // deliberately a one-row source so each of the three admitted drivers uses
 // bounded memory while queued roots demonstrate the actual governance limit.
-const HELD_QUERY: &str = "SELECT sleep(10) FROM TABLE(generate_series(1, 1))";
+const HELD_QUERY: &str = "SELECT sleep(10) FROM TABLE(sequence(1, 1))";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -1211,7 +1211,7 @@ impl Drop for PendingConcurrencyQuery {
     }
 }
 
-const FOLLOW_UP_QUERY: &str = "SELECT sleep(1) FROM TABLE(generate_series(1, 1))";
+const FOLLOW_UP_QUERY: &str = "SELECT sleep(1) FROM TABLE(sequence(1, 1))";
 
 fn start_follow_up_query(context: &ScenarioContext) -> Result<PendingConcurrencyQuery> {
     let deadline = context.deadline();

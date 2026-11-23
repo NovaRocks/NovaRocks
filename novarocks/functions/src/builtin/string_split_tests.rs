@@ -69,7 +69,7 @@ fn prepared() -> Arc<dyn crate::PreparedScalarKernel> {
 }
 #[test]
 fn split_actual_instance_seven_causes_every_checkpoint_and_no_failed_replay() {
-    let text = "éx".repeat(70);
+    let text = "éx:".repeat(80);
     let first = Arc::new(StringArray::from(vec![
         Some(text.as_str()),
         None,
@@ -77,10 +77,10 @@ fn split_actual_instance_seven_causes_every_checkpoint_and_no_failed_replay() {
         Some(""),
     ])) as ArrayRef;
     let second = Arc::new(StringArray::from(vec![
-        Some(""),
         Some(":"),
         Some(":"),
-        Some(""),
+        Some(":"),
+        Some(":"),
     ])) as ArrayRef;
     let args = [
         EvaluatedArgument::Column(&first),

@@ -149,62 +149,62 @@ _col0	_col1
 2.0	1250
 
 -- query 34
--- legacy
+-- types	bigint
 fingerprint
--5714598445053
+13214212352462
 
 -- query 35
--- legacy
+-- types	bigint
 fingerprint
--5714598445053
+13214212352462
 
 -- query 36
--- legacy
+-- types	bigint
 fingerprint
--5714598445053
+13214212352462
 
 -- query 37
--- legacy
+-- types	bigint
 fingerprint
--5714598445053
+13214212352462
 
 -- query 38
 -- types	bigint
 fingerprint
--12031151387514
+32033071100705
 
 -- query 39
 -- types	bigint
 fingerprint
--12031151387514
+32033071100705
 
 -- query 40
 -- types	bigint
 fingerprint
--12031151387514
+32033071100705
 
 -- query 41
 -- types	bigint
 fingerprint
--12031151387514
+32033071100705
 
 -- query 42
--- legacy
+-- types	bigint	bigint
 _col0	cnt
 1	1
 
 -- query 43
--- legacy
+-- types	bigint	bigint
 _col0	cnt
 1	1
 
 -- query 44
--- legacy
+-- types	bigint
 cnt
 1
 
 -- query 45
--- legacy
+-- types	bigint
 cnt
 1
 

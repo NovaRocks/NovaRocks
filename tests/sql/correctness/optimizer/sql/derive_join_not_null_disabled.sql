@@ -26,10 +26,10 @@ CREATE TABLE ${case_db}.t_dnn_dl (k INT, v INT);
 CREATE TABLE ${case_db}.t_dnn_dr (k INT, v INT);
 INSERT INTO ${case_db}.t_dnn_dl
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END, generate_series
-    FROM TABLE(generate_series(1, 2000));
+    FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t_dnn_dr
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END, generate_series
-    FROM TABLE(generate_series(1, 2000));
+    FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.t_dnn_dl;
 ANALYZE ${case_db}.t_dnn_dr;
 

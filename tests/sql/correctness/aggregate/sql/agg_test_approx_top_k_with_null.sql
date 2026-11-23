@@ -33,7 +33,7 @@ CREATE TABLE __row_util_base (
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into __row_util_base select generate_series from TABLE(generate_series(0, 1000 - 1));
+insert into __row_util_base select generate_series from TABLE(sequence(0, 1000 - 1)) AS generate_series(generate_series);
 
 -- query 4
 -- @skip_result_check=true
@@ -67,13 +67,29 @@ insert into t1 select idx, idx % 10, idx % 2 from __row_util;
 
 -- query 8
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x from t1) -- non-group-by.
-select array_sortby((x) -> x.item, x) from w1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x FROM t1
+), entries AS (
+    SELECT ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col0"
+FROM entries;
 
 -- query 9
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x, c1 from t1 group by c1) -- group by.
-select c1, array_sortby((x) -> x.item, x) from w1 order by c1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x, c1 FROM t1 GROUP BY c1
+), entries AS (
+    SELECT c1, ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT c1, array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col1"
+FROM entries
+GROUP BY c1
+ORDER BY c1;
 
 -- query 10
 -- @skip_result_check=true
@@ -82,13 +98,29 @@ insert into t1 select idx, idx % 10, null from __row_util order by idx limit 100
 
 -- query 11
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x from t1) -- non-group-by.
-select array_sortby((x) -> x.item, x) from w1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x FROM t1
+), entries AS (
+    SELECT ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col0"
+FROM entries;
 
 -- query 12
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x, c1 from t1 group by c1) -- group by.
-select c1, array_sortby((x) -> x.item, x) from w1 order by c1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x, c1 FROM t1 GROUP BY c1
+), entries AS (
+    SELECT c1, ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT c1, array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col1"
+FROM entries
+GROUP BY c1
+ORDER BY c1;
 
 -- query 13
 -- @skip_result_check=true
@@ -97,13 +129,29 @@ insert into t1 select idx, idx % 10, null from __row_util;
 
 -- query 14
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x from t1) -- non-group-by.
-select array_sortby((x) -> x.item, x) from w1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x FROM t1
+), entries AS (
+    SELECT ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col0"
+FROM entries;
 
 -- query 15
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x, c1 from t1 group by c1) -- group by.
-select c1, array_sortby((x) -> x.item, x) from w1 order by c1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x, c1 FROM t1 GROUP BY c1
+), entries AS (
+    SELECT c1, ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT c1, array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col1"
+FROM entries
+GROUP BY c1
+ORDER BY c1;
 
 -- query 16
 -- @skip_result_check=true
@@ -121,10 +169,26 @@ insert into t2 select idx, null, null from __row_util;
 
 -- query 18
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x from t2) -- non-group-by.
-select array_sortby((x) -> x.item, x) from w1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x FROM t2
+), entries AS (
+    SELECT ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col0"
+FROM entries;
 
 -- query 19
 USE ${case_db};
-with w1 as (select approx_top_k(c2, 3) as x, c1 from t2 group by c1) -- group by.
-select c1, array_sortby((x) -> x.item, x) from w1 order by c1;
+WITH w1 AS (
+    SELECT approx_top_k(c2, 3) AS x, c1 FROM t2 GROUP BY c1
+), entries AS (
+    SELECT c1, ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
+    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
+    WHERE ordinal <= cardinality(x)
+)
+SELECT c1, array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS "_col1"
+FROM entries
+GROUP BY c1
+ORDER BY c1;

@@ -17,121 +17,92 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
-use arrow_schema::DataType;
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use novarocks_functions::{
-    ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionArgument, FunctionBindingRequest,
-    FunctionKind, Selection, builtin::catalogue::build_builtin_engine_function_catalog,
+    DataFailureReason, EvaluatedArgument, FunctionArgument, RowDataError, Selection,
 };
-use novarocks_type_contract::{CompilePhase, FunctionValueType};
+use novarocks_type_contract::FunctionValueType;
 
 use super::scalar_rows::{Control, prepare};
 
-#[test]
-fn bar_and_bucket_use_frozen_constants_and_preserve_original_bounds() {
-    let ty = FunctionValueType::new(DataType::Int64, true);
-    let mut arguments = vec![FunctionArgument::Value {
-        value_type: ty.clone(),
-        constant: None,
-    }];
-    for value in [0, 10, 6] {
-        let pool = ConstantPool::try_new(
-            Arc::new(ty.try_to_field("bound").unwrap()),
-            ty.clone(),
-            Int64Array::from(vec![Some(value)]).to_data(),
-            ConstantPolicy {
-                max_rows: 16,
-                max_array_nodes: 128,
-                max_logical_elements: 1024,
-                max_retained_buffer_bytes: 1 << 20,
-                max_type_depth: 64,
-                max_type_nodes: 4096,
-                max_dictionary_depth: 64,
-                max_metadata_bytes: 1 << 20,
-                max_library_validation_work: 1 << 20,
-                max_library_validation_bytes: 1 << 20,
-            },
-            CompilePhase::Validate,
-            &Control,
-        )
+fn evaluate(name: &str, arrays: &[ArrayRef]) -> (ArrayRef, Box<[RowDataError]>) {
+    let rows = arrays[0].len();
+    let types: Vec<_> = arrays
+        .iter()
+        .map(|array| FunctionArgument::Value {
+            value_type: FunctionValueType::new(array.data_type().clone(), true),
+            constant: None,
+        })
+        .collect();
+    let arguments: Vec<_> = arrays.iter().map(EvaluatedArgument::Column).collect();
+    let output = prepare(name, &types)
+        .evaluate(Selection::all(rows), &arguments, &Control)
         .unwrap();
-        arguments.push(FunctionArgument::Value {
-            value_type: ty.clone(),
-            constant: Some(pool.value(0).unwrap()),
-        });
-    }
-    let data: ArrayRef = Arc::new(Int64Array::from(vec![
-        Some(0),
-        Some(5),
-        Some(10),
-        Some(11),
+    let (_, values, errors) = output.into_parts();
+    (values, errors)
+}
+
+#[test]
+fn bar_accepts_typed_column_arguments_and_preserves_terminal_bytes() {
+    let percentages: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(0.5),
+        Some(1.0),
+        Some(1.0),
         None,
     ]));
-    let mut values = vec![EvaluatedArgument::Column(&data)];
-    for argument in &arguments[1..] {
-        let FunctionArgument::Value {
-            constant: Some(value),
-            ..
-        } = argument
-        else {
-            unreachable!()
-        };
-        values.push(EvaluatedArgument::Constant(value));
-    }
-    let selection = Selection::all(data.len());
-    for name in ["bar", "equiwidth_bucket"] {
-        assert_eq!(
-            prepare(name, &arguments).contract().effects().own_row_error,
-            novarocks_functions::FunctionIntrinsicRowError::MayRaise
-        );
-    }
-    let bar = prepare("bar", &arguments)
-        .evaluate(selection, &values, &Control)
-        .unwrap();
-    let bars = bar.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let widths: ArrayRef = Arc::new(Int64Array::from(vec![6, 1, -1, 1]));
+    let (values, errors) = evaluate("bar", &[percentages, widths]);
+    let bars = values.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(
         bars.iter().collect::<Vec<_>>(),
-        [Some(""), Some("▓▓▓"), Some("▓▓▓▓▓▓"), None, None]
+        [
+            Some("\x1b[38;5;196m█\x1b[38;5;208m█\x1b[38;5;220m█\x1b[0m   "),
+            Some("\x1b[38;5;16m█\x1b[0m"),
+            Some("\x1b[0m"),
+            None,
+        ]
     );
-    assert!(bar.errors()[0].message().contains("size <= max"));
-    let bucket = prepare("equiwidth_bucket", &arguments)
-        .evaluate(selection, &values, &Control)
-        .unwrap();
-    let buckets = bucket
-        .values()
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn width_bucket_accepts_per_row_bounds_and_authors_the_original_row_errors() {
+    let operands: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(-1.0),
+        Some(0.0),
+        Some(2.0),
+        Some(10.0),
+        Some(f64::NAN),
+        None,
+        Some(5.0),
+    ]));
+    let first_bounds: ArrayRef =
+        Arc::new(Float64Array::from(vec![0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0]));
+    let second_bounds: ArrayRef = Arc::new(Float64Array::from(vec![
+        10.0, 10.0, 0.0, 10.0, 10.0, 10.0, 10.0,
+    ]));
+    let counts: ArrayRef = Arc::new(Int64Array::from(vec![5, 5, 5, i64::MAX, 5, 5, 0]));
+    let (values, errors) = evaluate(
+        "width_bucket",
+        &[operands, first_bounds, second_bounds, counts],
+    );
+    let buckets = values.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(
         buckets.iter().collect::<Vec<_>>(),
-        [Some(0), Some(5), Some(10), None, None]
+        [Some(0), Some(1), Some(4), None, None, None, None]
+    );
+    let invalid = DataFailureReason::Domain(
+        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
     );
     assert_eq!(
-        bucket.errors()[0].message(),
-        "equiwidth_bucket requirement: size <= max"
+        errors
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.reason()))
+            .collect::<Vec<_>>(),
+        [
+            (3, DataFailureReason::NumericOutOfRange),
+            (4, invalid),
+            (6, invalid),
+        ]
     );
-
-    let catalog = build_builtin_engine_function_catalog().unwrap();
-    arguments[1] = FunctionArgument::Value {
-        value_type: ty,
-        constant: None,
-    };
-    for name in ["bar", "equiwidth_bucket"] {
-        let error = catalog
-            .resolve_bound_user(
-                name,
-                FunctionKind::Scalar,
-                FunctionBindingRequest {
-                    arguments: &arguments,
-                    logical_argument_count: 4,
-                    expected_result_type: None,
-                },
-                &Control,
-            )
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("argument[min] must be constant"),
-            "{error}"
-        );
-    }
 }
