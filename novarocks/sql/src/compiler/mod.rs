@@ -71,7 +71,9 @@ pub use crate::planner::distributed::build::{
 };
 pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]
-pub(crate) use completion_driver::compile_authored_aggregate_for_test;
+pub(crate) use completion_driver::{
+    compile_authored_aggregate_for_test, complete_with_catalog_for_test,
+};
 pub use dml_catalog::{
     SqlDmlAnalysisProgress, SqlDmlCatalogPreparation, SqlDmlTableSequenceAnalysis,
 };
