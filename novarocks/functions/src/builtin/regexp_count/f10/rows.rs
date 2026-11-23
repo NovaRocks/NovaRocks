@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{RegexpMatch, RegexpSearch};
+use super::search::{RegexpMatch, RegexpSearch};
 use crate::{KernelFailure, kernel_input::EvaluationCheckpoints};
-use regex_automata::util::primitives::PatternID;
 
 #[derive(Debug)]
-pub(super) enum RegexpValueFailure {
+pub(crate) enum RegexpValueFailure {
     Data(&'static str),
     Kernel(KernelFailure),
 }
@@ -31,8 +30,8 @@ impl From<KernelFailure> for RegexpValueFailure {
     }
 }
 
-impl RegexpSearch<'_> {
-    pub(super) fn count(
+impl RegexpSearch<'_, '_> {
+    pub(crate) fn count(
         &mut self,
         source: &str,
         work: &mut EvaluationCheckpoints<'_>,
@@ -51,7 +50,7 @@ impl RegexpSearch<'_> {
         Ok(count)
     }
 
-    pub(super) fn position(
+    pub(crate) fn position(
         &mut self,
         source: &str,
         start: i32,
@@ -98,11 +97,11 @@ impl RegexpSearch<'_> {
         }
         usize::try_from(group)
             .ok()
-            .filter(|group| *group < self.nfa.group_info().group_len(PatternID::ZERO))
+            .filter(|group| *group < self.program.names.len())
             .ok_or(RegexpValueFailure::Data("capture group does not exist"))
     }
 
-    pub(super) fn extract<'s>(
+    pub(crate) fn extract<'s>(
         &mut self,
         source: &'s str,
         group: i64,
@@ -114,7 +113,7 @@ impl RegexpSearch<'_> {
     }
 
     /// Emit one result for each match, including an absent optional group.
-    pub(super) fn extract_all<'s>(
+    pub(crate) fn extract_all<'s>(
         &mut self,
         source: &'s str,
         group: i64,
@@ -138,7 +137,7 @@ impl RegexpSearch<'_> {
 
     /// The output owner admits and observes copies through `emit`. It must
     /// discard this row's staged output if a replacement reference fails.
-    pub(super) fn replace(
+    pub(crate) fn replace(
         &mut self,
         source: &str,
         replacement: &str,
@@ -176,7 +175,7 @@ fn offset_at(
     Ok(None)
 }
 
-impl RegexpMatch<'_> {
+impl RegexpMatch<'_, '_> {
     fn replace_match(
         &self,
         source: &[u8],
@@ -215,8 +214,7 @@ impl RegexpMatch<'_> {
         at: usize,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<(usize, usize), RegexpValueFailure> {
-        let groups = self.nfa.group_info();
-        let group_len = groups.group_len(PatternID::ZERO);
+        let group_len = self.names.len();
         let mut cursor = at;
         if replacement.get(cursor) == Some(&b'{') {
             cursor += 1;
@@ -231,12 +229,12 @@ impl RegexpMatch<'_> {
             // Joni looks up even a name that runs to the end of the template.
             let name = &replacement[start..cursor];
             let end = (cursor + 1).min(replacement.len());
-            for group in 1..group_len {
+            for (group, candidate) in self.names.iter().enumerate().skip(1) {
                 work.step()?;
-                if let Some(candidate) = groups.to_name(PatternID::ZERO, group) {
-                    if equal_name(candidate.as_bytes(), name, work)? {
-                        return Ok((group, end));
-                    }
+                if let Some(candidate) = candidate
+                    && equal_name(candidate.as_bytes(), name, work)?
+                {
+                    return Ok((group, end));
                 }
             }
             return Err(RegexpValueFailure::Data(
