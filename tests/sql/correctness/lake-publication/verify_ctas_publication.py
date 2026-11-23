@@ -29,22 +29,22 @@ FORBIDDEN = "forbidden_after_write"
 UNKNOWN = "unobserved_commit"
 
 
-def storage_probe(namespace, warehouse):
-    root = json.dumps(f"{warehouse}/ns_{namespace}/rwm17a_ctas_")
+def storage_probe(namespace, output_prefix):
+    root = json.dumps(output_prefix)
     return f"""
-val source = Iru5SparkCommitInterop.table(spark, "ice_rest.ns_{namespace}.source_rows")
+val source = Iru5SparkCommitInterop.table(spark, "ice_rest.{namespace}.source_rows")
 val storage = source.io().asInstanceOf[org.apache.iceberg.io.SupportsPrefixOperations]
 def output(name: String) = storage.listPrefix({root} + name + "/")
   .asScala.map(_.location()).toVector
 """
 
 
-def race(namespace, warehouse, table, logs):
+def race(namespace, output_prefix, table, logs):
     winner = RACE_ROWS[table]
     spark(
-        storage_probe(namespace, warehouse)
+        storage_probe(namespace, output_prefix)
         + f"""
-val name = "ice_rest.ns_{namespace}.{table}"
+val name = "ice_rest.{namespace}.{table}"
 require(!spark.catalog.tableExists(name), "The competing CTAS target was already visible")
 val loserFiles = output("{table}")
 require(loserFiles.exists(_.endsWith(".parquet")), "The held CTAS produced no data file")
@@ -57,16 +57,16 @@ spark.sql(s"INSERT INTO $name VALUES ({winner})")
     )
 
 
-def verify(namespace, warehouse, logs):
+def verify(namespace, output_prefix, logs):
     spark(
-        storage_probe(namespace, warehouse)
+        storage_probe(namespace, output_prefix)
         + f"""
 for (name <- Seq("raced_plain", "raced_if_not_exists", "{FORBIDDEN}")) {{
   require(output(name).isEmpty, "Known-uncommitted CTAS retained owned objects at " + name)
 }}
-require(!spark.catalog.tableExists("ice_rest.ns_{namespace}.{FORBIDDEN}"),
+require(!spark.catalog.tableExists("ice_rest.{namespace}.{FORBIDDEN}"),
   "The rejected final CREATE registered a table")
-val qualified = "ice_rest.ns_{namespace}.{UNKNOWN}"
+val qualified = "ice_rest.{namespace}.{UNKNOWN}"
 val table = Iru5SparkCommitInterop.table(spark, qualified)
 val current = table.currentSnapshot()
 require(table.snapshots().asScala.size == 1 && current.operation() == "append",
@@ -90,15 +90,18 @@ require(rows == Vector(1, 2, 3), "Readback differs after the unobserved CREATE")
 
 
 if __name__ == "__main__":
-    action, namespace, warehouse, *arguments = sys.argv[1:]
-    if not re.fullmatch(r"[a-zA-Z_0-9]+", namespace):
-        raise ValueError(f"invalid fixture namespace suffix: {namespace!r}")
-    logs = WORKSPACE / "logs/rwm17a/sql-ctas" / namespace
+    action, namespace, run, warehouse, *arguments = sys.argv[1:]
+    if not all(re.fullmatch(r"[a-zA-Z_0-9]+", value) for value in (namespace, run)):
+        raise ValueError("invalid fixture namespace or run identifier")
+    # The runner projects the declared SQL namespace. Explicit LOCATION
+    # literals still use the independent run identifier.
+    output_prefix = f"{warehouse}/ns_{run}/rwm17a_ctas_"
+    logs = WORKSPACE / "logs/rwm17a/sql-ctas" / run
     logs.mkdir(parents=True, exist_ok=True)
     if action == "race":
         table, = arguments
-        race(namespace, warehouse, table, logs)
+        race(namespace, output_prefix, table, logs)
     elif action == "verify" and not arguments:
-        verify(namespace, warehouse, logs)
+        verify(namespace, output_prefix, logs)
     else:
         raise ValueError(f"invalid CTAS verification action: {action!r}")

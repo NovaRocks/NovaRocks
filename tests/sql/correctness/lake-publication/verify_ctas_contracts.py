@@ -24,10 +24,10 @@ import sys
 from verify_interleaving import WORKSPACE, spark
 
 
-def check(action, token, warehouse):
+def check(action, physical_namespace, token, warehouse):
     logs = WORKSPACE / "logs/rwm17a/sql-ctas-contracts" / token
     logs.mkdir(parents=True, exist_ok=True)
-    namespace = json.dumps(f"ice_rest.ctas_contract_{token}")
+    namespace = json.dumps(f"ice_rest.{physical_namespace}")
     root = json.dumps(f"{warehouse}/ctas-contract-{token}")
     old_staging = json.dumps(f"{warehouse}/_novarocks/ctas-staging/v1/")
     before = logs / "before.log"
@@ -103,7 +103,9 @@ def object_lines(log):
 
 
 if __name__ == "__main__":
-    action, token, warehouse = sys.argv[1:]
-    if action not in {"capture", "verify"} or not re.fullmatch(r"[a-zA-Z_0-9]+", token):
-        raise ValueError("Invalid CTAS verification action or fixture token")
-    check(action, token, warehouse)
+    action, physical_namespace, token, warehouse = sys.argv[1:]
+    if action not in {"capture", "verify"} or any(
+        not re.fullmatch(r"[a-zA-Z_0-9]+", value) for value in (physical_namespace, token)
+    ):
+        raise ValueError("Invalid CTAS verification action or fixture identifier")
+    check(action, physical_namespace, token, warehouse)

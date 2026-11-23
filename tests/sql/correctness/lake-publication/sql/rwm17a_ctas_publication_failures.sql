@@ -27,7 +27,7 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows VALUES (1), 
 -- The held final commit guarantees that Spark creates the competing table
 -- after the NovaRocks writer has produced its own files.
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
--- @publication_catalog_concurrent_shell=python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_publication.py" race '${uuid0}' '${iceberg_rest_warehouse}' raced_plain
+-- @publication_catalog_concurrent_shell=python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_publication.py" race 'ns_${uuid0}' '${uuid0}' '${iceberg_rest_warehouse}' raced_plain
 -- @expect_trino_error=TABLE_ALREADY_EXISTS,USER_ERROR
 -- @expect_error=Table ns_${uuid0}.raced_plain already exists
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.raced_plain
@@ -36,7 +36,7 @@ AS SELECT id FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 3
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
--- @publication_catalog_concurrent_shell=python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_publication.py" race '${uuid0}' '${iceberg_rest_warehouse}' raced_if_not_exists
+-- @publication_catalog_concurrent_shell=python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_publication.py" race 'ns_${uuid0}' '${uuid0}' '${iceberg_rest_warehouse}' raced_if_not_exists
 -- @expect_trino_error=TABLE_ALREADY_EXISTS,USER_ERROR
 -- @expect_error=Table ns_${uuid0}.raced_if_not_exists already exists
 CREATE TABLE IF NOT EXISTS lake_publication_${suite_uuid0}.ns_${uuid0}.raced_if_not_exists
@@ -78,7 +78,7 @@ SELECT id FROM lake_publication_${suite_uuid0}.ns_${uuid0}.unobserved_commit ORD
 -- Spark bypasses the fault proxy. Check actual owned storage rather than
 -- using the absence of a SQL table as evidence that its files were deleted.
 -- @result_contains=RWM17A_CTAS_PUBLICATION_FILES_OK
-shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_publication.py" verify '${uuid0}' '${iceberg_rest_warehouse}'
+shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_publication.py" verify 'ns_${uuid0}' '${uuid0}' '${iceberg_rest_warehouse}'
 
 -- query 9
 -- @cleanup=true

@@ -53,7 +53,7 @@ AS SELECT id FROM no_wh_${uuid0}.ctas_contract_${uuid0}.source_rows;
 
 -- query 6
 -- @result_contains=RWM17A_CREATE_PREFIX_CAPTURED
-shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_contracts.py" capture '${uuid0}' '${iceberg_rest_warehouse}'
+shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_contracts.py" capture 'ctas_contract_${uuid0}' '${uuid0}' '${iceberg_rest_warehouse}'
 
 -- query 7
 -- @expect_trino_error=ICEBERG_FILESYSTEM_ERROR,EXTERNAL
@@ -76,7 +76,7 @@ SHOW STATS FOR no_wh_${uuid0}.ctas_contract_${uuid0}.default_format;
 
 -- query 11
 -- @result_contains=RWM17A_CREATE_CONTRACTS_OK
-shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_contracts.py" verify '${uuid0}' '${iceberg_rest_warehouse}'
+shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-publication/verify_ctas_contracts.py" verify 'ctas_contract_${uuid0}' '${uuid0}' '${iceberg_rest_warehouse}'
 
 -- query 12
 -- @cleanup=true
