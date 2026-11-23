@@ -149,7 +149,7 @@ fn public_overloads_follow_the_trino_collection_string_and_aggregate_owners() {
 
 #[test]
 fn derived_owner_publishes_distinct_real_call_shapes() {
-    use DataType::{Decimal128, Float64, Int64};
+    use DataType::{Decimal128, Float64, Int32, Int64};
     let catalog = shared_installed_builtin_owner_catalogue();
     for (name, kind, inputs, parameters, result, output) in [
         (
@@ -197,14 +197,14 @@ fn derived_owner_publishes_distinct_real_call_shapes() {
             FunctionKind::Scalar,
             vec![Float64],
             "double",
-            "bigint",
-            Int64,
+            "double",
+            Float64,
         ),
         (
             "round",
             FunctionKind::Scalar,
-            vec![Float64, Int64],
-            "double, bigint",
+            vec![Float64, Int32],
+            "double, integer",
             "double",
             Float64,
         ),
@@ -213,8 +213,8 @@ fn derived_owner_publishes_distinct_real_call_shapes() {
             FunctionKind::Scalar,
             vec![Decimal128(8, 4)],
             "decimal(p,s)",
-            "decimal(38,s)",
-            Decimal128(38, 4),
+            "decimal(rp,0)",
+            Decimal128(4, 0),
         ),
     ] {
         let arguments = inputs
