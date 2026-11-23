@@ -341,3 +341,46 @@ fn temporal_arithmetic_live_time_rows_and_typed_date_errors_follow_the_same_oper
         DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT),
     );
 }
+
+#[test]
+fn temporal_date_add_keeps_month_end_and_actual_row_errors() {
+    use novarocks_function_contract::kernel_failure::DATE_RESULT_OUT_OF_RANGE;
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let result = constant("date_add('MoNtH', 1, DATE '2024-01-31')", &context);
+    let days = result
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    assert_eq!(days.value(0), 19782);
+
+    let rejected = compile(
+        "TRY(date_add('day', 1, DATE '+5881580-07-11'))",
+        &[],
+        &context,
+    );
+    let rows = evaluate(&rejected, &batch(&[], vec![]));
+    assert_eq!(rows.batch.errors.len(), 1);
+    assert_eq!(
+        rows.batch.errors[0].reason(),
+        DataFailureReason::Domain(DATE_RESULT_OUT_OF_RANGE)
+    );
+
+    let caught = constant("TRY(date_add('hour', 1, DATE '2024-01-31'))", &context);
+    assert!(caught.batch.values.is_null(0));
+    let unselected = constant(
+        "CASE WHEN false THEN date_add('day', 1, DATE '+5881580-07-11') ELSE DATE '1970-01-01' END",
+        &context,
+    );
+    let days = unselected
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    assert_eq!(days.value(0), 0);
+}

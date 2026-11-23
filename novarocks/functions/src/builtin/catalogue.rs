@@ -3154,6 +3154,7 @@ pub fn contribute_builtin_functions(
 ) -> Result<(), FunctionCatalogError> {
     builder.register(super::value_conversion::value_conversion_definition()?)?;
     builder.register(super::temporal_context::definition()?)?;
+    builder.register(super::date_shift_owner::definition()?)?;
     for operator in super::temporal_arithmetic_owner::OPERATORS {
         builder.register(super::temporal_arithmetic_owner::definition(operator)?)?;
     }

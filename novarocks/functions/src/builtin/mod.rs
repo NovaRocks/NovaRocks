@@ -27,6 +27,8 @@ pub mod signature;
 mod array_invocation_diagnostic_probe_owner;
 pub mod catalogue;
 
+mod date_shift;
+pub(crate) mod date_shift_owner;
 pub(crate) mod temporal_arithmetic_owner;
 #[doc(hidden)]
 pub mod temporal_context;

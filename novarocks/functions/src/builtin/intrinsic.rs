@@ -326,7 +326,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "date_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "date_format",

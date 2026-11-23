@@ -655,7 +655,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // date_add / date_sub family: preserve first-arg date/datetime type.
     let date_shift_fns: &[&str] = &[
-        "date_add",
         "date_sub",
         "adddate",
         "subdate",
