@@ -395,11 +395,18 @@ impl DateShiftResolver {
                     FunctionValueType::new(DataType::Date32, nullable),
                 )
             }
-            (CalendarFunction::LastDay, [stamp]) => (
-                (*stamp).clone(),
-                vec![(*stamp).clone()],
-                FunctionValueType::new(DataType::Date32, nullable),
-            ),
+            (CalendarFunction::LastDay, [stamp]) => {
+                let stamp = if stamp.data_type() == &DataType::Null {
+                    temporal_argument(stamp, &ValueKind::Scalar(DataType::Date32))?
+                } else {
+                    (*stamp).clone()
+                };
+                (
+                    stamp.clone(),
+                    vec![stamp],
+                    FunctionValueType::new(DataType::Date32, nullable),
+                )
+            }
             _ => return Err(FunctionBindingError::NoMatchingOverload),
         };
         let family = self.operation.family(stamp.value_type().kind())?;

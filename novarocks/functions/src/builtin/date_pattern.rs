@@ -267,13 +267,13 @@ pub(super) fn parse(
         if !text.is_empty() {
             return Err(Failure::Value);
         }
-        let initial_year =
-            if !saved[0].is_empty() || !saved[1..6].iter().any(|bucket| !bucket.is_empty()) {
-                1970
-            } else {
-                2000
-            };
-        let mut stamp = gregorian_epoch_day_from_valid_parts(initial_year, 1, 1) * MILLIS_PER_DAY;
+        if saved[0].is_empty() && saved[1..6].iter().any(|bucket| !bucket.is_empty()) {
+            saved[0]
+                .try_reserve(1)
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            saved[0].push((Field::Year, 2000));
+        }
+        let mut stamp = 0;
         let total: usize = saved.iter().map(Vec::len).sum();
         // Preserve order for fields of equal size. On the first pass each
         // field also clears finer portions, and on the second only the last does.
@@ -335,8 +335,15 @@ impl Token {
                     .enumerate()
                     .filter_map(|(index, name)| {
                         let matches = |value: &str| {
-                            text.get(..value.len())
-                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(value))
+                            text.get(..value.len()).is_some_and(|prefix| {
+                                let all_upper =
+                                    prefix.bytes().all(|byte| !byte.is_ascii_lowercase());
+                                let all_lower =
+                                    prefix.bytes().all(|byte| !byte.is_ascii_uppercase());
+                                prefix == value
+                                    || (all_upper || all_lower)
+                                        && prefix.eq_ignore_ascii_case(value)
+                            })
                         };
                         let bytes = if matches(name) {
                             name.len()

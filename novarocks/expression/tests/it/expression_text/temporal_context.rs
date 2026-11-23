@@ -228,6 +228,14 @@ fn temporal_format_and_parse_share_the_en_us_pattern_rules() {
             "2024-02-09 00:00:00.000",
         ),
         (
+            "CAST(date_parse('1','%v') AS VARCHAR)",
+            "2000-01-03 00:00:00.000",
+        ),
+        (
+            "CAST(date_parse('MAR 1','%M %e') AS VARCHAR)",
+            "2000-03-01 00:00:00.000",
+        ),
+        (
             "CAST(date_parse('prefix','prefix') AS VARCHAR)",
             "1970-01-01 00:00:00.000",
         ),
@@ -238,6 +246,9 @@ fn temporal_format_and_parse_share_the_en_us_pattern_rules() {
         "TRY(date_format(DATE '2024-03-01','%D'))",
         "TRY(date_parse(' 2024-02-29 ','%Y-%m-%d'))",
         "TRY(date_parse('10000-02-03','%Y-%m-%e'))",
+        "TRY(date_parse('mArCh 1','%M %e'))",
+        "TRY(date_parse('2024-03-01Pm','%Y-%m-%d%p'))",
+        "last_day_of_month(NULL)",
     ] {
         assert!(constant(sql, &context).batch.values.is_null(0), "{sql}");
     }

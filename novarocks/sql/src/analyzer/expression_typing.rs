@@ -562,6 +562,11 @@ pub(super) fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeErr
     match error {
         TypingError::TypeMismatch(message) => AnalyzeError::type_mismatch(message, span),
         TypingError::InvalidLiteral(message) => AnalyzeError::invalid_literal(message, span),
+        TypingError::NumericOutOfRange(message) => AnalyzeError::at(
+            crate::analyze_error::AnalyzeErrorKind::NumericOutOfRange,
+            message,
+            span,
+        ),
         TypingError::Unsupported(message) => AnalyzeError::unsupported_expression(message, span),
         TypingError::Control(error) => AnalyzeError::control(error),
         TypingError::Binding(error @ FunctionBindingError::AmbiguousOverload) => {

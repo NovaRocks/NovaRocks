@@ -274,6 +274,7 @@ pub enum NodeTyping {
 pub enum TypingError {
     TypeMismatch(String),
     InvalidLiteral(String),
+    NumericOutOfRange(String),
     Unsupported(String),
     InvalidShape(&'static str),
     Binding(FunctionBindingError),
@@ -329,6 +330,7 @@ impl fmt::Display for TypingError {
         match self {
             Self::TypeMismatch(message)
             | Self::InvalidLiteral(message)
+            | Self::NumericOutOfRange(message)
             | Self::Unsupported(message) => f.write_str(message),
             Self::InvalidShape(message) => f.write_str(message),
             Self::Binding(error) => error.fmt(f),

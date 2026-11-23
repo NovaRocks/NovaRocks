@@ -98,7 +98,9 @@ pub fn clock_syntax(
             .ok()
             .and_then(|digits| TemporalPrecision::new(digits).ok())
             .ok_or_else(|| {
-                TypingError::InvalidLiteral(format!("invalid temporal clock precision {digits}"))
+                TypingError::NumericOutOfRange(format!(
+                    "Temporal clock precision must be in range [0, 12]: {digits}"
+                ))
             })?,
     };
     let ty = match syntax {

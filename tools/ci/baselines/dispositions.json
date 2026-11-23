@@ -472,16 +472,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:function/function_to_datetime",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/to_datetime/(i64,i64)->datetime;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:function/function_typeof",
       "failure": {
         "class": "error_code",

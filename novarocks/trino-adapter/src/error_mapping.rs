@@ -773,6 +773,7 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.expression_not_scalar" => ExpressionNotScalar,
         "sql.admit.unknown_type" => TypeNotFound,
         "sql.analyze.invalid_literal" => InvalidLiteral,
+        "sql.analyze.numeric_out_of_range" => NumericOutOfRange,
         "sql.analyze.invalid_function_argument" => InvalidFunctionArgument,
         "sql.analyze.missing_argument" => MissingArgument,
         "sql.analyze.expression_not_constant" => ExpressionNotConstant,
