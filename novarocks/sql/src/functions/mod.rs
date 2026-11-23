@@ -298,12 +298,16 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         request: FunctionBindingRequest<'_>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        self.resolve_bound_trusted_by_id(
-            &operator.function_id(),
-            FunctionKind::Scalar,
-            request,
-            control,
-        )
+        self.resolve_trusted_scalar_binding(&operator.function_id(), request, control)
+    }
+
+    fn resolve_trusted_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted_by_id(function, FunctionKind::Scalar, request, control)
     }
 
     fn finish_scalar_binding(

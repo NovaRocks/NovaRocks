@@ -325,7 +325,7 @@ fn ordered_regexp_folds_known_null_even_with_an_invalid_pattern_or_array_result(
 }
 
 #[test]
-fn public_sql_map_key_transition_reports_uninstalled_conversion_during_analysis() {
+fn public_sql_map_lookup_rejects_a_probe_that_cannot_coerce_to_the_declared_key() {
     use novarocks_sql::analyze_error::AnalyzeErrorKind;
     use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
 
@@ -339,8 +339,8 @@ fn public_sql_map_key_transition_reports_uninstalled_conversion_during_analysis(
     let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = error else {
         panic!("expected a typed analysis error: {error}");
     };
-    assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-    assert!(error.message().contains("Cannot cast Map"));
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
+    assert_eq!(error.message(), "no matching declared overload");
     assert!(error.span().is_some());
 }
 

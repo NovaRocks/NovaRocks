@@ -67,6 +67,16 @@ impl ScalarBindingCatalog for StatementScalarCatalog<'_> {
             .resolve_scalar_operator_binding(operator, request, control)
     }
 
+    fn select_trusted_scalar(
+        &self,
+        function: &FunctionId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.0
+            .resolve_trusted_scalar_binding(function, request, control)
+    }
+
     fn select_exact_scalar(
         &self,
         function: &FunctionId,

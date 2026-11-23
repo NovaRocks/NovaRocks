@@ -439,6 +439,23 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
+    /// Resolve syntax-owned scalar calls by identity before argument conversion.
+    fn resolve_trusted_scalar_binding(
+        &self,
+        _function: &novarocks_functions::FunctionId,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     /// Resolve the already selected overload against the converted inputs.
     fn finish_scalar_binding(
         &self,
