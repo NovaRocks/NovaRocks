@@ -96,8 +96,6 @@ pub mod observation;
 pub mod protocol_delivery;
 
 pub mod persisted_query_definition;
-/// Startup-frozen admission policy for lake-publication attempts.
-
 /// Pure, topology-free preparation and its immutable execution handoff.
 pub mod preparation;
 
