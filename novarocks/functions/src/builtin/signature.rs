@@ -285,6 +285,8 @@ impl TypeSpec {
             Self::AnyDecimal128 | Self::Decimal128Of(_) | Self::Decimal256Of(_) => {
                 output.push_str("decimal(p,s)");
             }
+            Self::DecimalIntegralOf(_) => output.push_str("decimal(rp,0)"),
+            Self::DecimalSign => output.push_str("decimal(1,0)"),
             Self::LargeInt => output.push_str("largeint"),
             Self::List(item) => {
                 output.push_str("array(");
