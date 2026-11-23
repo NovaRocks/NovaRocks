@@ -756,13 +756,27 @@ async fn keyed_conflict_cleans_owned_files_without_another_prepare() {
         novarocks_spi::connector::ConnectorMutationFailureKind::Conflict
     );
     assert_eq!(fixture.catalog.commits().len(), 1);
-    let snapshot = actual_snapshot_updates(&fixture);
-    assert_eq!(snapshot.len(), 1);
-    assert!(!std::path::Path::new(data.strip_prefix("file://").unwrap()).exists());
-    assert!(
-        !std::path::Path::new(snapshot[0].manifest_list().strip_prefix("file://").unwrap())
-            .exists()
+    let snapshots = actual_snapshot_updates(&fixture);
+    let [deleted, appended] = snapshots.as_slice() else {
+        panic!("one rejected Full request contains two snapshots");
+    };
+    assert_eq!(
+        deleted.summary().operation,
+        crate::iceberg::spec::Operation::Delete
     );
+    assert_eq!(
+        appended.summary().operation,
+        crate::iceberg::spec::Operation::Append
+    );
+    assert_eq!(appended.parent_snapshot_id(), Some(deleted.snapshot_id()));
+    assert!(!std::path::Path::new(data.strip_prefix("file://").unwrap()).exists());
+    for snapshot in snapshots {
+        let list = std::path::Path::new(snapshot.manifest_list().strip_prefix("file://").unwrap());
+        assert!(
+            !list.exists(),
+            "rejected manifest list still exists: {list:?}"
+        );
+    }
     assert!(
         fixture
             .catalog
