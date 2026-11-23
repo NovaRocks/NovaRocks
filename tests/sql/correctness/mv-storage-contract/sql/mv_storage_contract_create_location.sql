@@ -20,6 +20,8 @@ CREATE SCHEMA mvcreate_${uuid0}.ns_${uuid0} WITH (location = '${iceberg_rest_war
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvcreate_${uuid0}.ns_${uuid0}.fact (k VARCHAR, v BIGINT) WITH (format_version = 3);
+-- Admit both MV definitions against a source snapshot with v3 row lineage.
+INSERT INTO mvcreate_${uuid0}.ns_${uuid0}.fact VALUES ROW('seed', 1);
 
 -- query 4
 -- @skip_result_check=true
