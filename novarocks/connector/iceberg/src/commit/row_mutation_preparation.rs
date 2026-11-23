@@ -386,8 +386,9 @@ pub(crate) fn prepare_row_mutation(
             "Iceberg row-mutation target layout exceeds u32 ordinals",
         )
     })?;
-    let (before_fields, after_fields) =
-        crate::metadata::with_pure_schema_creation(&request.context, |creation| {
+    let (before_fields, after_fields) = crate::metadata::with_pure_schema_creation(
+        &request.context,
+        |creation| {
             let mut before = creation
                 .reserve(canonical_fields.len())
                 .map_err(crate::metadata::metadata_creation_error)?;
@@ -406,7 +407,7 @@ pub(crate) fn prepare_row_mutation(
                     value.nullable() || insert_eligible,
                     creation,
                 )?;
-                before.push(ConnectorMutationTargetField::try_new_typed(
+                let mut before_field = ConnectorMutationTargetField::try_new_typed(
                     row_mutation_field_token(owner, &request.table, b"before", ordinal),
                     canonical
                         .field()
@@ -414,8 +415,8 @@ pub(crate) fn prepare_row_mutation(
                         .with_nullable(before_value.nullable()),
                     target_start + u32::try_from(ordinal).expect("target ordinal fits u32"),
                     before_value,
-                )?);
-                let after_field = ConnectorMutationTargetField::try_new_typed(
+                )?;
+                let mut after_field = ConnectorMutationTargetField::try_new_typed(
                     row_mutation_field_token(owner, &request.table, b"after", ordinal),
                     canonical.field().clone(),
                     target_start
@@ -423,13 +424,39 @@ pub(crate) fn prepare_row_mutation(
                         + u32::try_from(ordinal).expect("target ordinal fits u32"),
                     value.clone(),
                 )?;
+                let original = &target_iceberg_schema.as_struct().fields()[ordinal];
+                let source = match_source_schema.field(ordinal);
+                if let crate::iceberg::spec::Type::Primitive(primitive) =
+                    original.field_type.as_ref()
+                    && let Some(declaration) = crate::temporal::declaration(primitive)
+                    && source.data_type() != canonical.field().data_type()
+                {
+                    let id_key = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+                    let source_id = source.metadata().get(id_key).and_then(|id| id.parse().ok());
+                    if source_id != Some(original.id)
+                        || source.is_nullable() == original.required
+                        || !crate::temporal::matches_read_storage_layout(
+                            declaration,
+                            source.data_type(),
+                        )
+                    {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "Iceberg temporal row-mutation source differs from its original declaration",
+                        ));
+                    }
+                    before_field = before_field.with_temporal_match_source(source, declaration)?;
+                    after_field = after_field.with_temporal_match_source(source, declaration)?;
+                }
+                before.push(before_field);
                 after.push(match canonical.storage_type() {
                     Some(storage) => after_field.with_storage_type(storage.clone())?,
                     None => after_field,
                 });
             }
             Ok((before, after))
-        })?;
+        },
+    )?;
     let effect_field = ConnectorMutationEffectField::try_new(
         row_mutation_effect_token(owner, &request.table),
         Field::new("__row_mutation_effect", DataType::Int8, false),
@@ -940,6 +967,84 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn delete_keeps_nanos_instant_match_source_and_signed_execution_roles() {
+        use arrow::datatypes::{Schema, TimeUnit};
+        use novarocks_type_contract::{TemporalPrecision, TemporalType};
+
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "ts",
+                    Type::Primitive(PrimitiveType::TimestamptzNs),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let table = metadata_with_schema(FormatVersion::V3, &[], schema);
+        let preparation = prepared(
+            prepare_row_mutation(
+                request(
+                    PayloadSpec::new(&table).handle(),
+                    "main",
+                    ConnectorRowMutationIntent::Delete,
+                ),
+                &owner(),
+            )
+            .unwrap(),
+        );
+        preparation.validate().unwrap();
+        let schema = preparation.match_source_schema();
+        let source = schema.field(1);
+        assert_eq!(
+            source.data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        let id_key = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        assert_eq!(source.metadata()[id_key], "2");
+        let contract = preparation.match_contract();
+        let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::NANOSECONDS);
+        for field in [&contract.before_fields()[1], &contract.after_fields()[1]] {
+            assert_eq!(field.field().name(), "ts");
+            assert_eq!(field.field().data_type(), &declaration.carrier());
+            assert_eq!(
+                field.execution_type().unwrap().value_type().temporal(),
+                Some(declaration)
+            );
+        }
+
+        let mut wrong_metadata = source.metadata().clone();
+        wrong_metadata.insert(id_key.into(), "3".into());
+        let mut wrong_fields = schema.fields().to_vec();
+        wrong_fields[1] = Arc::new(source.clone().with_metadata(wrong_metadata));
+        let error = ConnectorRowMutationPreparation::try_new(
+            preparation.owner().clone(),
+            preparation.operation_id(),
+            preparation.table().clone(),
+            preparation.match_source().clone(),
+            Arc::new(Schema::new(wrong_fields)),
+            preparation.target_ref().clone(),
+            preparation.intent().clone(),
+            preparation.base_version().clone(),
+            contract.clone(),
+            preparation.strategy(),
+            preparation.base_version_ordinal(),
+            preparation.payload().clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "row-mutation match source field differs from its signed match role"
+        );
     }
 
     #[test]
