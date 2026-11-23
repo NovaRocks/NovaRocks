@@ -660,7 +660,9 @@ fn aggregate_type_recipes_core<'a>(
             )
         }
         "min" | "max" | "any_value" => (existing(), existing()),
-        "group_concat" | "string_agg" => (scalar(DataType::Utf8), R::OrderedLists(arguments)),
+        "group_concat" | "string_agg" | "listagg" => {
+            (scalar(DataType::Utf8), R::OrderedLists(arguments))
+        }
         "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => {
             (scalar(DataType::Boolean), scalar(DataType::Boolean))
         }

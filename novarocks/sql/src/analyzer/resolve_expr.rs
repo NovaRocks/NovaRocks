@@ -2195,6 +2195,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         let name = match original_name.as_str() {
             "every" => "bool_and".to_string(),
+            "\"listagg\"" => "listagg".to_string(),
             _ => original_name,
         };
         let mut name = name;
@@ -2443,6 +2444,33 @@ impl<'a> super::AnalyzerContext<'a> {
                 .iter()
                 .map(|arg| arg.value_type.data_type().clone())
                 .collect();
+        }
+
+        if name == "listagg" && args_typed.len() == 5 {
+            if args_typed[0].value_type.data_type() != &DataType::Utf8
+                || args_typed[0].value_type.logical_type()
+                    != novarocks_type_contract::ValueLogicalType::Physical
+            {
+                return Err(AnalyzeError::type_mismatch(
+                    "LISTAGG requires VARCHAR input",
+                    arg_exprs[0].span(),
+                ));
+            }
+            for (index, expected) in [
+                (1, DataType::Utf8),
+                (2, DataType::Boolean),
+                (3, DataType::Utf8),
+                (4, DataType::Boolean),
+            ] {
+                if args_typed[index].value_type.data_type() == &DataType::Null {
+                    let target =
+                        novarocks_type_contract::FunctionValueType::new(expected.clone(), true);
+                    let argument =
+                        self.coerce_common_value(args_typed.remove(index), &target, func.span)?;
+                    args_typed.insert(index, argument);
+                    arg_types[index] = expected;
+                }
+            }
         }
 
         if matches!(name.as_str(), "min" | "max") && args_typed.len() == 2 {
@@ -3048,6 +3076,16 @@ impl<'a> super::AnalyzerContext<'a> {
         args: &[TypedExpr],
     ) -> Result<Vec<SortItem>, AnalyzeError> {
         let func_name = print_object_name(&func.name).to_ascii_lowercase();
+        let trino_order = matches!(func_name.trim_matches('"'), "listagg" | "array_agg");
+        let distinct_order = trino_order && func.distinct;
+        let distinct_arguments = if distinct_order {
+            func.arguments
+                .iter()
+                .map(|argument| ordered_aggregate_syntax(&argument.value))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let visible_args =
             if matches!(func_name.as_str(), "group_concat" | "string_agg") && !args.is_empty() {
                 &args[..args.len() - 1]
@@ -3063,33 +3101,45 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             let mut items = Vec::with_capacity(order_by.items.len());
             for ob in &order_by.items {
-                let typed = if let Some(pos) = function_order_by_position(&ob.sort_key) {
-                    let pos_index = usize::try_from(pos).ok();
-                    if let Some(pos_index) = pos_index
-                        && (1..=visible_args.len()).contains(&pos_index)
-                    {
-                        visible_args[pos_index - 1].clone()
-                    } else if matches!(
-                        func_name.as_str(),
-                        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
-                    ) {
-                        let display_name = if func_name == "string_agg" {
-                            "group_concat"
+                let typed =
+                    if !trino_order && let Some(pos) = function_order_by_position(&ob.sort_key) {
+                        let pos_index = usize::try_from(pos).ok();
+                        if let Some(pos_index) = pos_index
+                            && (1..=visible_args.len()).contains(&pos_index)
+                        {
+                            visible_args[pos_index - 1].clone()
+                        } else if matches!(
+                            func_name.as_str(),
+                            "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
+                        ) {
+                            let display_name = if func_name == "string_agg" {
+                                "group_concat"
+                            } else {
+                                func_name.as_str()
+                            };
+                            return Err(AnalyzeError::invalid_argument(
+                                format!(
+                                    "ORDER BY position {pos} is not in {display_name} output list."
+                                ),
+                                ob.span,
+                            ));
                         } else {
-                            func_name.as_str()
-                        };
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "ORDER BY position {pos} is not in {display_name} output list."
-                            ),
-                            ob.span,
-                        ));
+                            self.analyze_expr(&ob.sort_key, scope)?
+                        }
                     } else {
                         self.analyze_expr(&ob.sort_key, scope)?
-                    }
-                } else {
-                    self.analyze_expr(&ob.sort_key, scope)?
-                };
+                    };
+                if distinct_order
+                    && !matches!(&typed.kind, ExprKind::ColumnRef { column_id, .. }
+                        if args.iter().any(|arg| matches!(&arg.kind,
+                            ExprKind::ColumnRef { column_id: argument_id, .. } if argument_id == column_id)))
+                    && !distinct_arguments.contains(&ordered_aggregate_syntax(&ob.sort_key)?)
+                {
+                    return Err(AnalyzeError::expression_not_in_distinct(
+                        "For aggregate function with DISTINCT, ORDER BY expressions must appear in arguments",
+                        ob.span,
+                    ));
+                }
                 let (asc, nulls_first) = super::helpers::sort_item_flags(ob);
                 items.push(SortItem {
                     expr: typed,
@@ -4303,6 +4353,11 @@ pub(super) fn resolve_aggregate_function_call(
         control,
         super::QueryAnalysisPurpose::Ordinary,
     )
+}
+
+fn ordered_aggregate_syntax(expression: &ast::Expr) -> Result<String, AnalyzeError> {
+    novarocks_parser::printer::print_expression(expression)
+        .map_err(|error| AnalyzeError::unsupported_expression(error.to_string(), expression.span()))
 }
 
 fn resolve_aggregate_function_call_with_order(
@@ -8355,6 +8410,36 @@ mod tests {
                 matches!(original.kind, ExprKind::Literal(LiteralValue::Int(actual)) if actual == value)
             );
             assert!(!args[1].value_type.nullable());
+        }
+    }
+
+    #[test]
+    fn listagg_keeps_trino_argument_and_distinct_order_boundaries() {
+        use crate::analyze_error::AnalyzeErrorKind;
+
+        let analyze_error = |sql| {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            analyze(&query, &EmptyCatalog, "default").unwrap_err()
+        };
+        for sql in [
+            "SELECT LISTAGG(NULL) WITHIN GROUP (ORDER BY 1)",
+            r#"SELECT "listagg"(NULL, '|', true, '...', false)"#,
+        ] {
+            let error = analyze_error(sql);
+            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
+        }
+
+        let error = analyze_error("SELECT LISTAGG(DISTINCT 'a') WITHIN GROUP (ORDER BY 'A')");
+        assert_eq!(error.kind(), AnalyzeErrorKind::ExpressionNotInDistinct);
+
+        for sql in [
+            "SELECT LISTAGG(CAST(NULL AS VARCHAR)) WITHIN GROUP (ORDER BY 1)",
+            r#"SELECT "listagg"(DISTINCT 'a', '|', true, '...', false ORDER BY '|')"#,
+        ] {
+            assert_eq!(
+                analyze_projection_expr(sql).unwrap().value_type.data_type(),
+                &DataType::Utf8
+            );
         }
     }
 

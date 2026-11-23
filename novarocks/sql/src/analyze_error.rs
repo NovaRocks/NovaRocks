@@ -65,6 +65,11 @@ const EXPRESSION_NOT_SCALAR: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const EXPRESSION_NOT_IN_DISTINCT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.expression_not_in_distinct"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const TYPE_MISMATCH: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.type_mismatch"),
     phase: ErrorPhase::Analyze,
@@ -183,6 +188,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     TYPE_MISMATCH,
     FUNCTION_NOT_AGGREGATE,
     EXPRESSION_NOT_SCALAR,
+    EXPRESSION_NOT_IN_DISTINCT,
     INVALID_LITERAL,
     NUMERIC_OUT_OF_RANGE,
     INVALID_ARGUMENT,
@@ -217,6 +223,7 @@ pub enum AnalyzeErrorKind {
     TypeMismatch,
     FunctionNotAggregate,
     ExpressionNotScalar,
+    ExpressionNotInDistinct,
     InvalidLiteral,
     NumericOutOfRange,
     InvalidArgument,
@@ -253,6 +260,7 @@ impl AnalyzeErrorKind {
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
             Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
+            Self::ExpressionNotInDistinct => EXPRESSION_NOT_IN_DISTINCT,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::NumericOutOfRange => NUMERIC_OUT_OF_RANGE,
             Self::InvalidArgument => INVALID_ARGUMENT,
@@ -659,6 +667,10 @@ impl AnalyzeError {
 
     pub(crate) fn invalid_function_argument(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::InvalidFunctionArgument, message, span)
+    }
+
+    pub(crate) fn expression_not_in_distinct(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::ExpressionNotInDistinct, message, span)
     }
 
     pub(crate) fn expression_not_constant(message: impl Into<String>, span: Span) -> Self {

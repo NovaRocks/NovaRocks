@@ -26,6 +26,8 @@ use arrow_array::{Array, ArrayRef, ListArray, StructArray, builder::StringBuilde
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use std::{cmp::Ordering, sync::Arc};
+#[path = "listagg_emission.rs"]
+mod listagg_emission;
 #[path = "aggregate_concat_source_failure.rs"]
 mod source_failure;
 const DEFAULT_SEPARATOR: &str = ",";
@@ -341,6 +343,7 @@ fn compare_optional_scalar<A: ScalarStateAllocator>(
     right: &Option<TrackedAggScalarValue<A>>,
     asc: bool,
     nulls_first: bool,
+    listagg_order: bool,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<Ordering, crate::KernelFailure> {
     let ord = match (left, right) {
@@ -360,7 +363,12 @@ fn compare_optional_scalar<A: ScalarStateAllocator>(
             }
         }
         (Some(left), Some(right)) => {
-            let ord = compare_tracked_scalar_values(left, right, work)?;
+            let ord = if listagg_order {
+                crate::aggregate_scalar::ExtremaDirection::Minimum
+                    .compare_tracked(left, right, work)?
+            } else {
+                compare_tracked_scalar_values(left, right, work)?
+            };
             if asc { ord } else { ord.reverse() }
         }
     };
@@ -368,17 +376,24 @@ fn compare_optional_scalar<A: ScalarStateAllocator>(
 }
 
 fn sort_indices<A: ScalarStateAllocator>(
-    rows: &[ScalarVec<Option<TrackedAggScalarValue<A>>, A>],
+    state: &GroupConcatState<A>,
     layout: GroupConcatLayout,
     is_asc_order: &[bool],
     nulls_first: &[bool],
+    listagg_order: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<usize>, crate::KernelFailure> {
-    for _ in rows {
+) -> Result<ScalarVec<usize, A>, crate::KernelFailure> {
+    let rows = &state.rows;
+    let mut indices = aggregate_vec_with_capacity(
+        &state.allocator,
+        rows.len(),
+        "reserve aggregate sort indices",
+        work,
+    )?;
+    for index in 0..rows.len() {
         work.step()?;
+        indices.push(index);
     }
-    work.flush()?;
-    let mut indices: Vec<usize> = (0..rows.len()).collect();
     work.flush()?;
     if layout.order_by_num == 0 {
         return Ok(indices);
@@ -386,7 +401,7 @@ fn sort_indices<A: ScalarStateAllocator>(
 
     work.flush()?;
     let mut error: Option<crate::KernelFailure> = None;
-    indices.sort_by(|l, r| {
+    indices.sort_unstable_by(|l, r| {
         if error.is_some() {
             return Ordering::Equal;
         }
@@ -397,6 +412,7 @@ fn sort_indices<A: ScalarStateAllocator>(
                 &rows[*r][col],
                 is_asc_order[key],
                 nulls_first[key],
+                listagg_order,
                 work,
             ) {
                 Ok(Ordering::Equal) => continue,
@@ -407,7 +423,7 @@ fn sort_indices<A: ScalarStateAllocator>(
                 }
             }
         }
-        Ordering::Equal
+        l.cmp(r)
     });
     if let Some(err) = error {
         return Err(err);
@@ -765,7 +781,7 @@ pub fn build_final_array<
         let arg_types = IntermediateArgTypes::try_new(intermediate_type)?;
         let layout = GroupConcatLayout::infer(arg_types.len(), is_asc_order.len())?;
 
-        let sorted_indices = sort_indices(&state.rows, layout, is_asc_order, nulls_first, work)?;
+        let sorted_indices = sort_indices(state, layout, is_asc_order, nulls_first, false, work)?;
         let duplicated =
             mark_duplicated_rows(&state.rows, &sorted_indices, layout, is_distinct, work)?;
         let mut last_unique_pos = None;
@@ -896,4 +912,40 @@ mod shape_failure_tests {
         assert!(weak_field.upgrade().is_none());
         assert_eq!(error.failure_fact(), fact);
     }
+}
+
+pub(super) fn build_listagg_array<
+    's,
+    A: ScalarStateAllocator,
+    I: ExactSizeIterator<Item = &'s GroupConcatState<A>>,
+>(
+    states: I,
+    distinct: bool,
+    ascending: &[bool],
+    nulls_first: &[bool],
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<ArrayRef, crate::KernelFailure> {
+    let mut builder = StringBuilder::new();
+    let layout = GroupConcatLayout {
+        output_col_num: 5,
+        separator_idx: None,
+        order_by_start: 5,
+        order_by_num: ascending.len(),
+    };
+    for state in states {
+        work.step()?;
+        let indices = sort_indices(state, layout, ascending, nulls_first, true, work)?;
+        let ordered = indices.iter().map(|index| state.rows[*index].as_slice());
+        if let Some(output) = listagg_emission::emit(ordered, distinct, &state.allocator, work)? {
+            let value = std::str::from_utf8(&output).map_err(|_| {
+                crate::kernel_control::internal("LISTAGG emission did not preserve UTF-8")
+            })?;
+            work.flush()?;
+            builder.append_value(value);
+            work.flush()?;
+        } else {
+            builder.append_null();
+        }
+    }
+    Ok(Arc::new(builder.finish()))
 }

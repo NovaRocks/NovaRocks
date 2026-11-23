@@ -9,6 +9,7 @@ query.execution.date_result_out_of_range	Execution
 query.execution.deadline_exceeded	Execution
 query.execution.dependency	Execution
 query.execution.division_by_zero	Execution
+query.execution.exceeded_function_memory_limit	Execution
 query.execution.invalid_cast_argument	Execution
 query.execution.invalid_data	Execution
 query.execution.invalid_function_argument	Execution
@@ -55,6 +56,7 @@ sql.admit.update_unsupported_form	Admit
 sql.analyze.ambiguous_function_call	Analyze
 sql.analyze.duplicate_column_name	Analyze
 sql.analyze.expression_not_constant	Analyze
+sql.analyze.expression_not_in_distinct	Analyze
 sql.analyze.expression_not_scalar	Analyze
 sql.analyze.function_not_aggregate	Analyze
 sql.analyze.internal	Analyze

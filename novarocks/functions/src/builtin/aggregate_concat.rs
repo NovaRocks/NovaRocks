@@ -25,12 +25,18 @@ use crate::*;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use std::sync::Arc;
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ConcatMode {
+    Legacy { max_len: i64 },
+    Listagg,
+}
+
 #[derive(Debug)]
 pub(super) struct ConcatKernel {
     pub(super) contract: Arc<AggregateCallContract>,
     pub(super) ascending: Box<[bool]>,
     pub(super) nulls_first: Box<[bool]>,
-    pub(super) max_len: i64,
+    pub(super) mode: ConcatMode,
 }
 fn observed<T>(
     control: &dyn KernelEvaluationControl,
@@ -59,7 +65,7 @@ impl PreparedAggregateKernel for ConcatKernel {
             contract,
             ascending: self.ascending.clone(),
             nulls_first: self.nulls_first.clone(),
-            max_len: self.max_len,
+            mode: self.mode,
         }))
     }
     type State = GroupConcatState<HostAggregateAllocator>;
@@ -148,8 +154,24 @@ impl PreparedAggregateKernel for ConcatKernel {
                 }
                 addresses.push((argument.array(), address));
             }
-            let layout = GroupConcatLayout::infer(addresses.len(), self.ascending.len())
-                .map_err(KernelFailure::from_domain)?;
+            let layout = match self.mode {
+                ConcatMode::Legacy { .. } => {
+                    GroupConcatLayout::infer(addresses.len(), self.ascending.len())?
+                }
+                ConcatMode::Listagg => {
+                    if addresses[..5].iter().any(|(array, index)| {
+                        array.data_type() == &DataType::Null || array.is_null(*index)
+                    }) {
+                        return Ok(());
+                    }
+                    GroupConcatLayout {
+                        output_col_num: 5,
+                        separator_idx: None,
+                        order_by_start: 5,
+                        order_by_num: self.ascending.len(),
+                    }
+                }
+            };
             state.update_row(&addresses, layout, &mut ScalarWork::new(Some(work)))
         });
         if result.is_err() {
@@ -245,18 +267,30 @@ impl PreparedAggregateKernel for ConcatKernel {
     {
         observed(control, |work| {
             let states = checked_states(states, work)?;
-            core::build_final_array(
-                self.contract.intermediate_type().data_type(),
-                states.iter().copied(),
-                self.contract
-                    .state_interpretation()
-                    .expect("checked GC state interpretation")
-                    .distinct,
-                &self.ascending,
-                &self.nulls_first,
-                self.max_len,
-                &mut ScalarWork::new(Some(work)),
-            )
+            let distinct = self
+                .contract
+                .state_interpretation()
+                .expect("checked concatenation state interpretation")
+                .distinct;
+            let mut work = ScalarWork::new(Some(work));
+            match self.mode {
+                ConcatMode::Legacy { max_len } => core::build_final_array(
+                    self.contract.intermediate_type().data_type(),
+                    states.iter().copied(),
+                    distinct,
+                    &self.ascending,
+                    &self.nulls_first,
+                    max_len,
+                    &mut work,
+                ),
+                ConcatMode::Listagg => core::build_listagg_array(
+                    states.iter().copied(),
+                    distinct,
+                    &self.ascending,
+                    &self.nulls_first,
+                    &mut work,
+                ),
+            }
         })
     }
 }

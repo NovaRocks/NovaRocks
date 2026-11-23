@@ -22,6 +22,7 @@ mod collection_functions;
 mod comparison;
 mod from_binary;
 mod kernel_control;
+mod listagg;
 mod native_between;
 mod native_inlist;
 mod scalar_rows;

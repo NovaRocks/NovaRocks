@@ -495,6 +495,25 @@ impl BuiltinAggregateResolver {
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
+        if name == "listagg" {
+            for (arg, expected) in request.arguments.iter().zip([
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Boolean,
+                DataType::Utf8,
+                DataType::Boolean,
+            ]) {
+                work.step()?;
+                let FunctionArgument::Value { value_type, .. } = arg else {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                };
+                if value_type.data_type() != &expected
+                    || value_type.logical_type() != ValueLogicalType::Physical
+                {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+            }
+        }
         if declaration.is_top_n()
             && !matches!(
                 request.arguments[1],
@@ -641,7 +660,7 @@ fn builtin_aggregate_intermediate_nullable(name: &str) -> bool {
 fn builtin_supports_ordered_update_channels(name: &str) -> bool {
     matches!(
         name,
-        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
+        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg" | "listagg"
     )
 }
 
@@ -758,6 +777,7 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
         AggregateDeclaration::ranged("multi_distinct_count", 1, usize::MAX, "(any...)->i64"),
         AggregateDeclaration::ranged("group_concat", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::ranged("string_agg", 2, usize::MAX, "(any,utf8...)->utf8"),
+        AggregateDeclaration::exact("listagg", 5, "(utf8,utf8,bool,utf8,bool)->utf8"),
         AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
         AggregateDeclaration::exact("max_by", 2, "(any,any)->any"),
         AggregateDeclaration::exact("min_by", 2, "(any,any)->any"),
@@ -3428,7 +3448,9 @@ pub fn contribute_builtin_functions(
                 })?;
         let overload = FunctionOverloadDeclaration {
             effects: match declaration.name {
-                "group_concat" | "string_agg" => Some(super::aggregate_concat_owner::effects()),
+                "group_concat" | "string_agg" | "listagg" => Some(
+                    super::aggregate_concat_owner::effects(declaration.name == "listagg"),
+                ),
                 "array_agg" | "array_agg_distinct" => Some(super::aggregate_array_owner::effects()),
                 "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
                 "map_agg" => Some(super::aggregate_map_owner::effects()),
@@ -3513,7 +3535,7 @@ pub fn contribute_builtin_functions(
             )?)?;
             continue;
         }
-        if matches!(declaration.name, "group_concat" | "string_agg") {
+        if matches!(declaration.name, "group_concat" | "string_agg" | "listagg") {
             builder.register(super::aggregate_concat_owner::definition(
                 declaration.name,
                 binding_declaration,

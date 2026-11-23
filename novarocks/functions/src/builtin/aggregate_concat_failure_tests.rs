@@ -237,7 +237,7 @@ fn kernel_with_source(
         contract: handle.contract().clone(),
         ascending: Box::new([]),
         nulls_first: Box::new([]),
-        max_len: 1024,
+        mode: super::ConcatMode::Legacy { max_len: 1024 },
     })
 }
 fn kernel(
@@ -935,4 +935,162 @@ fn real_concat_intermediate_constructor_refusal_preserves_arrow_source_without_k
     drop(host);
     assert!(weak_host.upgrade().is_none());
     assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+}
+
+fn listagg_contributors(
+    values: &[Option<&str>],
+    separators: &[Option<&str>],
+    keys: &[i64],
+    error: bool,
+    filler: &str,
+    with_count: bool,
+    distinct: bool,
+) -> Result<ArrayRef, KernelFailure> {
+    let host = Arc::new(Host::default());
+    let mut work = ScalarWork::new(None);
+    let result = {
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let mut state = GroupConcatState::new(allocator);
+        let columns = [
+            Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(separators.to_vec())),
+            Arc::new(arrow_array::BooleanArray::from(vec![error; values.len()])),
+            Arc::new(StringArray::from(vec![filler; values.len()])),
+            Arc::new(arrow_array::BooleanArray::from(vec![
+                with_count;
+                values.len()
+            ])),
+            Arc::new(arrow_array::Int64Array::from(keys.to_vec())),
+        ];
+        let layout = GroupConcatLayout {
+            output_col_num: 5,
+            separator_idx: None,
+            order_by_start: 5,
+            order_by_num: 1,
+        };
+        for index in 0..values.len() {
+            let addresses = columns.each_ref().map(|array| (array, index));
+            state.update_row(&addresses, layout, &mut work).unwrap();
+        }
+        core::build_listagg_array(
+            std::iter::once(&state),
+            distinct,
+            &[true],
+            &[false],
+            &mut work,
+        )
+    };
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+    result
+}
+
+#[test]
+fn listagg_orders_before_freezing_options_and_distinct_compares_all_arguments() {
+    let result = listagg_contributors(
+        &[Some("a"), Some("b"), Some("b"), Some("a"), Some("skip")],
+        &[Some(":"), Some("|"), Some("|"), Some("-"), None],
+        &[3, 2, 4, 5, 1],
+        true,
+        "...",
+        false,
+        true,
+    )
+    .unwrap();
+    let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(result.value(0), "b|a|a");
+}
+
+#[test]
+fn listagg_enforces_whole_value_prefix_and_counts_empty_strings() {
+    let value = "é".repeat(524_288);
+    let result = listagg_contributors(
+        &[Some(&value), Some("b"), Some("c")],
+        &[Some("|"); 3],
+        &[0, 1, 2],
+        false,
+        "!",
+        true,
+        false,
+    )
+    .unwrap();
+    let result = result
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(result.len(), 1_048_581);
+    assert_eq!(&result[..value.len()], value);
+    assert!(result.ends_with("|!(2)"));
+    let result = listagg_contributors(
+        &[Some(""), Some(&value)],
+        &[Some("|"); 2],
+        &[0, 1],
+        false,
+        "!",
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "|!(1)"
+    );
+}
+
+#[test]
+fn listagg_reports_its_own_data_failures_and_returns_null_for_empty() {
+    use novarocks_failure_contract::{FailureProjection, kernel_reason};
+    let value = "a".repeat(1_048_577);
+    let result = listagg_contributors(
+        &[Some(&value)],
+        &[Some("|")],
+        &[0],
+        true,
+        "...",
+        false,
+        false,
+    );
+    assert_eq!(
+        result.unwrap_err().failure_fact().reason(),
+        kernel_reason::EXCEEDED_FUNCTION_MEMORY_LIMIT
+    );
+    let filler = "!".repeat(65_537);
+    let result = listagg_contributors(
+        &[Some("a")],
+        &[Some("|")],
+        &[0],
+        true,
+        &filler,
+        false,
+        false,
+    );
+    assert_eq!(
+        result.unwrap_err().failure_fact().reason(),
+        kernel_reason::INVALID_FUNCTION_ARGUMENT
+    );
+    let result =
+        listagg_contributors(&[None], &[Some("|")], &[0], true, &filler, false, false).unwrap();
+    assert!(result.is_null(0));
+    let result = listagg_contributors(
+        &[Some("a")],
+        &[Some("|")],
+        &[0],
+        true,
+        &filler[1..],
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "a"
+    );
 }
