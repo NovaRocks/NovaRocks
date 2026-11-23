@@ -57,6 +57,141 @@ pub(crate) struct IcebergDeleteConditionFact {
     pub(crate) _retention: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 
+/// Backing formed by the existing author below and by its canonical digest.
+/// Counts come from the exact domains; these extents only invoice the original
+/// request and cannot grant an allocation or impose a predicate size limit.
+pub(crate) fn delete_seal_backing(
+    schema: &SchemaRef,
+    enforced: &TupleDomain<IcebergColumnHandle>,
+    metadata_identity: &str,
+    mut active: impl FnMut() -> std::result::Result<(), novarocks_spi::connector::ConnectorError>,
+) -> std::result::Result<u64, novarocks_spi::connector::ConnectorError> {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    use novarocks_type_contract::owned_resources::{btree, hashmap, layout::arc_layout, vec};
+    use std::alloc::Layout;
+
+    let overflow = || {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Iceberg delete seal backing is unrepresentable",
+        )
+    };
+    let Some(domains) = enforced.domains() else {
+        return Ok(0);
+    };
+    let fact = arc_layout(Layout::new::<IcebergDeleteConditionFact>()).map_err(|_| overflow())?;
+    let erased = arc_layout(Layout::new::<std::sync::Arc<IcebergDeleteConditionFact>>())
+        .map_err(|_| overflow())?;
+    let fields = Layout::array::<DeleteFieldCondition>(domains.len()).map_err(|_| overflow())?;
+    let field_tree = btree::insertion_only::<i32, DeleteFieldCondition>(domains.len())
+        .map_err(|_| overflow())?;
+    let mut total = 0usize;
+    let mut charge = |bytes| -> std::result::Result<(), ConnectorError> {
+        total = total.checked_add(bytes).ok_or_else(overflow)?;
+        Ok(())
+    };
+    charge(fact.size())?;
+    charge(erased.size())?;
+    charge(fields.size())?;
+    charge(field_tree.request_bytes_upper_bound)?;
+    charge(metadata_identity.len())?;
+    for (column, domain) in domains {
+        active()?;
+        let field = schema.field_by_id(column.base_field_id()).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg delete seal field is absent",
+            )
+        })?;
+        let values = domain.values();
+        let ranges = values.ranges();
+        let mut leaves = usize::from(domain.null_allowed());
+        let alternatives = if values.is_none() || values.is_all() {
+            leaves += usize::from(values.is_all());
+            leaves
+        } else {
+            let discrete = ranges.iter().all(|range| range.single_value().is_some());
+            // discrete_values() probes in order before selecting the path.
+            charge(
+                Layout::array::<&Datum>(ranges.len())
+                    .map_err(|_| overflow())?
+                    .size(),
+            )?;
+            if discrete {
+                leaves += 1;
+                charge(
+                    Layout::array::<Datum>(ranges.len())
+                        .map_err(|_| overflow())?
+                        .size(),
+                )?;
+                if ranges.len() > 1 {
+                    let literals = hashmap::fresh_table_layout::<Datum, ()>(ranges.len())
+                        .map_err(|_| overflow())?;
+                    charge(literals.request_bytes_upper_bound)?;
+                    // Digest sorts one owned encoded literal per set entry.
+                    charge(
+                        Layout::array::<crate::iceberg::spec::ByteBuf>(ranges.len())
+                            .map_err(|_| overflow())?
+                            .size(),
+                    )?;
+                }
+                for range in ranges {
+                    active()?;
+                    let value = range.single_value().expect("discrete range");
+                    // SDK storage and digest each make an owned copy.
+                    charge(value.payload_bytes())?;
+                    charge(value.payload_bytes())?;
+                }
+                1 + usize::from(domain.null_allowed())
+            } else {
+                for range in ranges {
+                    active()?;
+                    for bound in [range.low(), range.high()] {
+                        if let Some(value) = bound.value() {
+                            leaves = leaves.checked_add(1).ok_or_else(overflow)?;
+                            charge(value.payload_bytes())?;
+                            charge(value.payload_bytes())?;
+                        }
+                    }
+                }
+                ranges
+                    .len()
+                    .checked_add(usize::from(domain.null_allowed()))
+                    .ok_or_else(overflow)?
+            }
+        };
+        // Direct bound references own the same source field name; the field
+        // and accessor Arcs themselves are borrowed from the pinned schema.
+        charge(
+            field
+                .name
+                .len()
+                .checked_mul(leaves.checked_add(1).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+        )?;
+        let arm_growth =
+            vec::original_partitioned_fresh_push_request_bound::<BoundPredicate>(leaves)
+                .map_err(|_| overflow())?;
+        let alternatives_growth = vec::original_partitioned_fresh_push_request_bound::<
+            Box<[BoundPredicate]>,
+        >(alternatives)
+        .map_err(|_| overflow())?;
+        charge(arm_growth.request_bytes_upper_bound)?;
+        charge(alternatives_growth.request_bytes_upper_bound)?;
+        charge(
+            Layout::array::<BoundPredicate>(leaves)
+                .map_err(|_| overflow())?
+                .size(),
+        )?;
+        charge(
+            Layout::array::<Box<[BoundPredicate]>>(alternatives)
+                .map_err(|_| overflow())?
+                .size(),
+        )?;
+    }
+    u64::try_from(total).map_err(|_| overflow())
+}
+
 impl DeleteCondition {
     pub(crate) fn from_enforced(
         schema: &SchemaRef,

@@ -36,6 +36,7 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::iceberg::spec::{PartitionSpec, Schema, Transform, Type};
+use crate::read_snapshot::PreparedReadManifestList;
 
 use super::column_handle::{
     ColumnIdentityCategory, IcebergColumnHandle, decode_tuple_domain, encode_tuple_domain, invalid,
@@ -206,6 +207,28 @@ pub struct IcebergTableHandleParams {
     pub pinned_data_files: Option<IcebergPinnedDataFileSet>,
 }
 
+/// The original request scope mints this marker for its E read. It has no
+/// storage authority and is absent from every encoded worker handle.
+#[derive(Debug, Default)]
+pub(crate) struct OriginalDeleteFilter;
+
+impl PartialEq for OriginalDeleteFilter {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for OriginalDeleteFilter {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum DeleteFilterProof {
+    #[default]
+    NotRequested,
+    Pending(Arc<OriginalDeleteFilter>),
+    Complete(Arc<OriginalDeleteFilter>),
+    Refused,
+}
+
 /// One planned read of one pinned Iceberg snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergTableHandle {
@@ -228,6 +251,8 @@ pub struct IcebergTableHandle {
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
     mutation_partition_type_json: Option<Arc<str>>,
     rewritten_target: Option<crate::commit::conflict_scope::RewrittenTargetBinding>,
+    prepared_manifest_list: Option<Arc<PreparedReadManifestList>>,
+    delete_filter_proof: DeleteFilterProof,
 }
 
 impl IcebergTableHandle {
@@ -369,6 +394,8 @@ impl IcebergTableHandle {
             pinned_data_files,
             mutation_partition_type_json: None,
             rewritten_target: None,
+            prepared_manifest_list: None,
+            delete_filter_proof: DeleteFilterProof::NotRequested,
         })
     }
 
@@ -581,6 +608,72 @@ impl IcebergTableHandle {
         self.rewritten_target
     }
 
+    pub(crate) fn with_prepared_manifest_list(
+        mut self,
+        list: Option<Arc<PreparedReadManifestList>>,
+        original_delete_target: Option<Arc<OriginalDeleteFilter>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(list) = &list {
+            let domain = self
+                .read_domain()
+                .ok_or_else(|| invalid("Prepared list has no Iceberg read domain"))?;
+            list.validate(domain)?;
+        }
+        self.prepared_manifest_list = list;
+        if let Some(origin) = original_delete_target {
+            self.delete_filter_proof = DeleteFilterProof::Pending(origin);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn prepared_manifest_list(&self) -> Option<&PreparedReadManifestList> {
+        self.prepared_manifest_list.as_deref()
+    }
+
+    pub(crate) fn complete_delete_filter(&self) -> Option<&Arc<OriginalDeleteFilter>> {
+        match &self.delete_filter_proof {
+            DeleteFilterProof::Complete(origin) => Some(origin),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn absorption_spec_ids(&self) -> impl Iterator<Item = i32> + Clone + '_ {
+        let observed = self
+            .prepared_manifest_list()
+            .map(PreparedReadManifestList::spec_ids);
+        let use_inventory = observed.is_none() && self.snapshot_id.is_some();
+        let default = if observed.is_none() && self.snapshot_id.is_none() {
+            self.spec_id
+        } else {
+            None
+        };
+        observed
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(default)
+            .chain(
+                self.partition_spec_jsons
+                    .keys()
+                    .copied()
+                    .filter(move |_| use_inventory),
+            )
+    }
+
+    fn record_delete_filter(&mut self, complete: bool) {
+        self.delete_filter_proof = match std::mem::take(&mut self.delete_filter_proof) {
+            DeleteFilterProof::Pending(origin) | DeleteFilterProof::Complete(origin)
+                if complete =>
+            {
+                DeleteFilterProof::Complete(origin)
+            }
+            DeleteFilterProof::Pending(_) | DeleteFilterProof::Complete(_) => {
+                DeleteFilterProof::Refused
+            }
+            prior => prior,
+        };
+    }
+
     pub const fn unenforced_predicate(&self) -> &TupleDomain<IcebergColumnHandle> {
         &self.unenforced_predicate
     }
@@ -672,32 +765,8 @@ impl IcebergTableHandle {
         effective.intersect(&TupleDomain::with_column_domains(domains)?)
     }
 
-    /// Source field IDs that every partition spec of this snapshot partitions
-    /// by with the identity transform.
-    ///
-    /// Only the intersection is safe: a predicate on a column that one spec
-    /// partitions by and another does not cannot be fully enforced by manifest
-    /// planning alone.
-    pub fn identity_partition_source_field_ids(&self) -> Result<BTreeSet<i32>, ConnectorError> {
-        let mut result: Option<BTreeSet<i32>> = None;
-        for spec_json in self.partition_spec_jsons.values() {
-            let spec = parse_partition_spec(spec_json)?;
-            let ids = identity_partition_source_field_ids(&spec);
-            result = Some(match result {
-                None => ids,
-                Some(previous) => previous.intersection(&ids).copied().collect(),
-            });
-        }
-        Ok(result.unwrap_or_default())
-    }
-
-    /// Accept as much of a constraint as Iceberg can prove from manifests.
-    ///
-    /// A domain over an identity-partition base column becomes enforced: the
-    /// partition value is a manifest fact, so planning alone decides it. Any
-    /// other base-column domain becomes unenforced -- it still prunes files
-    /// through statistics, but the engine must re-check it. Everything else,
-    /// including every residual expression, stays with the engine.
+    /// Accept domains proved by every partition spec used in the snapshot.
+    /// Other transferable domains still prune while SQL keeps its residual.
     pub fn apply_filter(
         &self,
         constraint: &Constraint<IcebergColumnHandle>,
@@ -713,6 +782,9 @@ impl IcebergTableHandle {
             // returns no rows, so no residual filter is needed.
             let mut handle = self.clone();
             handle.enforced_predicate = TupleDomain::none();
+            handle.record_delete_filter(
+                remaining_expression.is_none() && handle.unenforced_predicate.is_all(),
+            );
             return Ok(ConstraintApplicationResult::new(
                 handle,
                 TupleDomain::all(),
@@ -721,15 +793,14 @@ impl IcebergTableHandle {
             ));
         };
 
-        let identity_partition_ids = self.identity_partition_source_field_ids()?;
+        let specs = self
+            .absorption_spec_ids()
+            .map(|id| self.parse_partition_spec(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let schema = self.parse_table_schema()?;
         let mut enforced: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         let mut unenforced: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         let mut remaining: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
-        let temporal_schema = summary_domains
-            .values()
-            .any(|domain| matches!(domain.value_type(), ConnectorValueType::Temporal(_)))
-            .then(|| self.parse_table_schema())
-            .transpose()?;
         for (column, domain) in summary_domains {
             if column.scalar_integer_domain()
                 != self
@@ -748,37 +819,52 @@ impl IcebergTableHandle {
                 remaining.insert(column.clone(), domain.clone());
                 continue;
             }
-            if matches!(domain.value_type(), ConnectorValueType::Temporal(_)) {
-                // The physical-unit projection belongs only to pruning. Even
-                // identity partitions do not consume the original SQL residual.
-                if let Some(projected) = temporal_schema
-                    .as_ref()
-                    .and_then(|schema| project_temporal_domain(schema, column, domain))
-                {
-                    unenforced.insert(column.clone(), projected);
-                }
-                remaining.insert(column.clone(), domain.clone());
-                continue;
-            }
-            // A SQL byte string of any length can be compared with a
-            // projected Fixed value. Iceberg's manifest domain instead uses
-            // its exact fixed-width type, including identity partitions.
+            // SQL VARBINARY bounds can have any width; Iceberg Fixed
+            // comparisons require the original declared width.
             if domain.value_type() == ConnectorValueType::Varbinary
                 && matches!(
                     super::column_handle::parse_type(column.type_json(), "type_json")?,
-                    crate::iceberg::spec::Type::Primitive(
-                        crate::iceberg::spec::PrimitiveType::Fixed(_)
-                    )
+                    Type::Primitive(crate::iceberg::spec::PrimitiveType::Fixed(_))
                 )
             {
                 remaining.insert(column.clone(), domain.clone());
                 continue;
             }
-            if identity_partition_ids.contains(&column.base_field_id()) {
-                enforced.insert(column.clone(), domain.clone());
+            let storage_domain = if matches!(domain.value_type(), ConnectorValueType::Temporal(_)) {
+                let Some(projected) = project_temporal_domain(&schema, column, domain) else {
+                    remaining.insert(column.clone(), domain.clone());
+                    continue;
+                };
+                projected
             } else {
-                unenforced.insert(column.clone(), domain.clone());
-                // An unenforced domain only prunes; the engine keeps it.
+                domain.clone()
+            };
+            let field_id = column.base_field_id();
+            let can_enforce = super::schema_binding::IcebergMetadataColumn::from_field_id(field_id)
+                .is_none()
+                && schema
+                    .as_struct()
+                    .field_by_id(field_id)
+                    .is_some_and(|field| {
+                        let Type::Primitive(primitive) = field.field_type.as_ref() else {
+                            return false;
+                        };
+                        !specs.is_empty()
+                            && specs.iter().all(|spec| {
+                                spec.fields().iter().any(|field| {
+                                    field.source_id == field_id
+                                        && super::absorption::transform_absorbs(
+                                            primitive,
+                                            &field.transform,
+                                            &storage_domain,
+                                        )
+                                })
+                            })
+                    });
+            if can_enforce {
+                enforced.insert(column.clone(), storage_domain);
+            } else {
+                unenforced.insert(column.clone(), storage_domain);
                 remaining.insert(column.clone(), domain.clone());
             }
         }
@@ -791,9 +877,16 @@ impl IcebergTableHandle {
             .unenforced_predicate
             .intersect(&TupleDomain::with_column_domains(unenforced)?)?;
 
+        let remaining = TupleDomain::with_column_domains(remaining)?;
+        handle.record_delete_filter(
+            !summary_domains.is_empty()
+                && remaining.is_all()
+                && remaining_expression.is_none()
+                && handle.unenforced_predicate.is_all(),
+        );
         Ok(ConstraintApplicationResult::new(
             handle,
-            TupleDomain::with_column_domains(remaining)?,
+            remaining,
             remaining_expression,
             false,
         ))
@@ -1484,44 +1577,6 @@ pub(super) mod tests {
         let zero = handle.apply_limit(0).expect("limit");
         assert_eq!(zero.handle().limit(), Some(0));
         assert!(zero.limit_guaranteed());
-    }
-
-    #[test]
-    fn identity_partition_columns_are_intersected_across_every_spec() {
-        let schema = partitioned_schema();
-        let identity_spec = identity_partition_spec(&schema);
-        let bucket_spec = PartitionSpec::builder(StdArc::new(schema.clone()))
-            .with_spec_id(8)
-            .add_partition_field("id", "id_bucket", Transform::Bucket(4))
-            .expect("partition field")
-            .build()
-            .expect("partition spec");
-
-        let mut params = table_handle_params(&schema, Some(&identity_spec));
-        params.partition_spec_jsons.insert(
-            bucket_spec.spec_id(),
-            serde_json::to_string(&bucket_spec).expect("json"),
-        );
-        params.read_domain = Some(crate::delete_semantics::test_read_domain(
-            &schema,
-            &[identity_spec, bucket_spec],
-            11,
-        ));
-        let handle = IcebergTableHandle::try_new(params).expect("handle");
-        assert!(
-            handle
-                .identity_partition_source_field_ids()
-                .expect("identity ids")
-                .is_empty()
-        );
-
-        let single = partitioned_handle();
-        assert_eq!(
-            single
-                .identity_partition_source_field_ids()
-                .expect("identity ids"),
-            BTreeSet::from([2])
-        );
     }
 
     #[test]

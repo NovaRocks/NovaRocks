@@ -988,7 +988,9 @@ fn bind_source(
     })
 }
 
-fn descriptor_bytes<'a>(mut files: impl Iterator<Item = &'a ManifestFile>) -> Result<u64> {
+pub(crate) fn descriptor_bytes<'a>(
+    mut files: impl Iterator<Item = &'a ManifestFile>,
+) -> Result<u64> {
     use crate::iceberg::spec::FieldSummary;
     let overflow = || invalid("target manifest-list descriptor backing overflow");
     files.try_fold(0u64, |total, file| {

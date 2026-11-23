@@ -53,7 +53,7 @@ pub(super) fn lower_provider_predicates(
     let mut predicates = Vec::new();
     for (ordinal, predicate) in scan.predicates.iter().enumerate() {
         work.step()?;
-        if !provider_guarantee_supports_atom(predicate, scan, columns) {
+        if !can_offer_atom(predicate, scan, columns) {
             continue;
         }
         let Ok(occurrence) = u32::try_from(ordinal) else {
@@ -113,10 +113,13 @@ pub(super) fn lower_provider_predicates(
         };
         let domain = complete_datetime_offer(domain, work)?;
         if let Ok(summary) = TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])) {
-            predicates.push(ProviderReadPredicateNeed::new(
-                ProviderPredicateOccurrenceId::new(occurrence),
-                Constraint::of_summary(summary),
-            ));
+            predicates.push(
+                ProviderReadPredicateNeed::new(
+                    ProviderPredicateOccurrenceId::new(occurrence),
+                    Constraint::of_summary(summary),
+                )
+                .with_exact_eligibility(exact_atom(predicate)),
+            );
         }
     }
     Ok(predicates.into_boxed_slice())
@@ -180,7 +183,31 @@ fn complete_datetime_offer(
     ))
 }
 
-fn provider_guarantee_supports_atom(
+/// Prove that the original expression, rather than its transported domain,
+/// has the closed comparison or intrinsic shape accepted by physical plans.
+fn exact_atom(predicate: &TypedExpr) -> bool {
+    let predicate = unnest(predicate);
+    let is_column = |expr: &TypedExpr| matches!(unnest(expr).kind, ExprKind::ColumnRef { .. });
+    let is_literal = |expr: &TypedExpr| {
+        !expr.value_type.nullable()
+            && matches!(
+                unnest(expr).kind,
+                ExprKind::Literal(_) | ExprKind::Constant(_)
+            )
+    };
+    if let Some((_, [left, right])) = crate::common::binary_operator::typed_comparison(predicate) {
+        return left.value_type.data_type() == right.value_type.data_type()
+            && left.value_type.value_type().temporal() == right.value_type.value_type().temporal()
+            && ((is_column(left) && is_literal(right)) || (is_literal(left) && is_column(right)));
+    }
+    match &predicate.kind {
+        ExprKind::IsNull { expr, .. } => is_column(expr),
+        ExprKind::InList { expr, list, .. } => is_column(expr) && list.iter().all(is_literal),
+        _ => false,
+    }
+}
+
+fn can_offer_atom(
     predicate: &TypedExpr,
     scan: &PlanScanNode,
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
@@ -726,6 +753,71 @@ mod tests {
         assert_eq!(offered[1].occurrence().get(), 2);
         assert_eq!(offered[0].constraint().summary().columns().count(), 1);
         assert!(offered[0].constraint().expression().is_constant_true());
+    }
+
+    #[test]
+    fn datetime_predicate_need_proves_plain_micro_and_nanosecond_comparisons() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{
+            CompilePhase, FunctionValueType, TemporalMicros, TemporalValue, ValueKind, ValueLayout,
+            ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for precision in [
+            TemporalPrecision::MICROSECONDS,
+            TemporalPrecision::NANOSECONDS,
+        ] {
+            let declared = TemporalType::Timestamp(precision);
+            let ty = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(
+                    ValueKind::Temporal(declared),
+                    false,
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+                ValueLayout::try_new(&declared.carrier(), ValueTypeStorageLifetime::pure())
+                    .unwrap(),
+            )
+            .unwrap();
+            let constant = novarocks_functions::ConstantValue::from_temporal(
+                Arc::new(Field::new("literal", ty.data_type().clone(), false)),
+                ty.clone(),
+                TemporalValue::Timestamp(TemporalMicros::from_picos(0).unwrap()),
+                crate::constant::test_constant_policy(),
+                CompilePhase::Validate,
+                &control,
+            )
+            .unwrap();
+            let literal = TypedExpr {
+                kind: ExprKind::Constant(constant),
+                value_type: ty.clone(),
+            };
+            let column = TypedExpr {
+                value_type: ty.clone(),
+                ..column_ref()
+            };
+            let mut scan = scan(vec![comparison(BinOp::Ge, column, literal)]);
+            scan.columns[0].value_type = ty;
+            let columns = BTreeMap::from([(
+                ColumnId(1),
+                ProviderPredicateColumn {
+                    ordinal: 0,
+                    value_type: ConnectorValueType::Temporal(declared),
+                },
+            )]);
+            let needs = offered(&scan, &columns);
+            let [need] = needs.as_ref() else {
+                panic!("expected one complete timestamp comparison")
+            };
+            assert!(need.exact_eligible());
+            let domain = need.constraint().summary().domain_for(&0).unwrap();
+            assert_eq!(
+                domain.value_type(),
+                ConnectorValueType::Temporal(TemporalType::Timestamp(
+                    TemporalPrecision::PICOSECONDS
+                ))
+            );
+        }
     }
 
     #[test]

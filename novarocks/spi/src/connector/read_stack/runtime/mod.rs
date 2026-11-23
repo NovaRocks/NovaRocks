@@ -937,8 +937,21 @@ impl ConnectorReadRequestControl {
         }
     }
 
+    /// Inspect only the original, already admitted DELETE target observation.
+    pub fn observe_delete_target(
+        &self,
+        original: &ConnectorReadOriginalTableObservation,
+    ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
+        match &self.attempt_access {
+            ConnectorReadAttemptAccessMode::Provider(sealer) => {
+                sealer.observe_delete_target(original)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Ask the original provider for the exact partition proof behind DELETE.
-    pub fn seal_delete_condition(
+    pub async fn seal_delete_condition(
         &self,
         frozen: &ConnectorReadTableHandle,
     ) -> Result<ConnectorDeleteConditionOutcome, ConnectorError> {
@@ -950,7 +963,7 @@ impl ConnectorReadRequestControl {
         }
         match &self.attempt_access {
             ConnectorReadAttemptAccessMode::Provider(sealer) => {
-                sealer.seal_delete_condition(frozen)
+                sealer.seal_delete_condition(frozen).await
             }
             _ => Ok(ConnectorDeleteConditionOutcome::Refused {
                 reason: "Connector read binding does not provide a delete predicate".into(),
@@ -1015,6 +1028,13 @@ impl ConnectorReadRequestControl {
 /// Provider-owned predicate evidence bound to an exact rewritten-target scan.
 pub type ConnectorRewrittenTargetFact = crate::connector::ConnectorProcessLocalPayload;
 
+/// Read-only facts from the exact admitted main DELETE observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorDeleteTargetFacts {
+    pub snapshot_id: Option<i64>,
+    pub row_delete_strategy: Option<crate::connector::ConnectorRowMutationStrategy>,
+}
+
 /// The provider's disposition after the fully offered predicate was negotiated.
 #[derive(Clone, Debug)]
 pub enum ConnectorDeleteConditionOutcome {
@@ -1036,12 +1056,22 @@ pub trait ConnectorReadAttemptAccessSealer: Send + Sync {
         mint: ConnectorReadAttemptAccessMint,
     ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError>;
 
-    fn seal_delete_condition(
+    fn observe_delete_target(
         &self,
-        _frozen: &ConnectorReadTableHandle,
-    ) -> Result<ConnectorDeleteConditionOutcome, ConnectorError> {
-        Ok(ConnectorDeleteConditionOutcome::Refused {
-            reason: "Connector read binding does not provide a delete predicate".into(),
+        _original: &ConnectorReadOriginalTableObservation,
+    ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
+        Ok(None)
+    }
+
+    fn seal_delete_condition<'a>(
+        &'a self,
+        _frozen: &'a ConnectorReadTableHandle,
+    ) -> futures::future::BoxFuture<'a, Result<ConnectorDeleteConditionOutcome, ConnectorError>>
+    {
+        Box::pin(async {
+            Ok(ConnectorDeleteConditionOutcome::Refused {
+                reason: "Connector read binding does not provide a delete predicate".into(),
+            })
         })
     }
 

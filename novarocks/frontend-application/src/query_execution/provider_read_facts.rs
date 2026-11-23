@@ -954,7 +954,8 @@ async fn prepare_observation(
             relation => return Err(unsupported_family(relation).into()),
         }
     };
-    let request = Request::new(opening.table.clone(), kind);
+    let request =
+        Request::new(opening.table.clone(), kind).with_filter_offer(!need.predicates().is_empty());
     let metadata = opening.request_control.metadata();
     let prepared = metadata
         .prepare_relation(session, &request)
@@ -1826,23 +1827,41 @@ fn provider_constraint(
     )
 }
 
-/// What the provider guaranteed, per predicate occurrence.
-///
-/// Only `Exact` relieves the engine. A provider that merely prunes has
-/// answered about its own work, not about which rows the query returns, so
-/// every occurrence stays the engine's to evaluate.
+/// Whether the provider consumed the entire offer and SQL can prove each
+/// offered occurrence in its original expression. Callers that require the
+/// original WHERE must separately prove that every original atom was offered.
+fn entire_filter_exact(
+    need: &ProviderReadNeed,
+    offer: &OfferedOps,
+    outcomes: &[ReadPushdownOutcome],
+) -> bool {
+    !need.predicates().is_empty()
+        && need
+            .predicates()
+            .iter()
+            .all(|predicate| predicate.exact_eligible())
+        && offer
+            .filter
+            .and_then(|index| outcomes.get(index))
+            .is_some_and(|outcome| {
+                outcome.disposition == ReadPushdownDisposition::Exact
+                    && outcome.residual.as_ref().is_some_and(|residual| {
+                        residual.summary().is_all() && residual.expression().is_constant_true()
+                    })
+            })
+}
+
+/// The whole Filter ownership decision applies to each offered occurrence.
 fn predicate_facts(
     need: &ProviderReadNeed,
     offer: &OfferedOps,
     outcomes: &[ReadPushdownOutcome],
 ) -> Box<[ProviderReadPredicateFact]> {
-    let guarantee = offer
-        .filter
-        .and_then(|index| outcomes.get(index))
-        .filter(|outcome| outcome.disposition == ReadPushdownDisposition::Exact)
-        .map_or(PredicateGuaranteeKind::PruningOnly, |_| {
-            PredicateGuaranteeKind::Exact
-        });
+    let guarantee = if entire_filter_exact(need, offer, outcomes) {
+        PredicateGuaranteeKind::Exact
+    } else {
+        PredicateGuaranteeKind::PruningOnly
+    };
     need.predicates()
         .iter()
         .map(|predicate| ProviderReadPredicateFact::new(predicate.occurrence(), guarantee))
@@ -2282,7 +2301,11 @@ mod tests {
                 PredicateGuaranteeKind::PruningOnly,
             ),
         ] {
-            let outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
+            let mut outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
+            if disposition == ReadPushdownDisposition::Exact {
+                let filter = &mut outcomes[offer.filter.unwrap()];
+                filter.residual = Some(ConnectorReadConstraint::of_summary(TupleDomain::all()));
+            }
             let facts = predicate_facts(&need, &offer, &outcomes);
             assert_eq!(facts.len(), 1);
             assert_eq!(facts[0].guarantee(), expected, "{disposition:?}");
@@ -2304,6 +2327,7 @@ mod tests {
         ] {
             let outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
             let (enforced, unenforced, remaining) = filter_responsibility(&offer, &outcomes);
+            assert!(!entire_filter_exact(&need, &offer, &outcomes));
             assert_eq!(enforced, TupleDomain::all(), "{disposition:?}");
             assert_eq!(unenforced, TupleDomain::all(), "{disposition:?}");
             assert!(remaining.is_none(), "{disposition:?}");
