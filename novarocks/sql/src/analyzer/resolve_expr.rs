@@ -5070,72 +5070,6 @@ fn column_name_of_expr(expr: &TypedExpr) -> String {
     }
 }
 
-#[recursive::recursive]
-#[cfg(test)]
-fn typed_expr_contains_nondeterministic_call(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    expr: &TypedExpr,
-) -> bool {
-    match &expr.kind {
-        ExprKind::FunctionCall { name, args, .. } => {
-            function_catalog.volatility(name).is_volatile()
-                || args
-                    .iter()
-                    .any(|arg| typed_expr_contains_nondeterministic_call(function_catalog, arg))
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            typed_expr_contains_nondeterministic_call(function_catalog, left)
-                || typed_expr_contains_nondeterministic_call(function_catalog, right)
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => {
-            typed_expr_contains_nondeterministic_call(function_catalog, expr)
-        }
-        ExprKind::AggregateCall { args, .. } | ExprKind::WindowCall { args, .. } => args
-            .iter()
-            .any(|arg| typed_expr_contains_nondeterministic_call(function_catalog, arg)),
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            operand.as_ref().is_some_and(|expr| {
-                typed_expr_contains_nondeterministic_call(function_catalog, expr)
-            }) || when_then.iter().any(|(when, then)| {
-                typed_expr_contains_nondeterministic_call(function_catalog, when)
-                    || typed_expr_contains_nondeterministic_call(function_catalog, then)
-            }) || else_expr.as_ref().is_some_and(|expr| {
-                typed_expr_contains_nondeterministic_call(function_catalog, expr)
-            })
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            typed_expr_contains_nondeterministic_call(function_catalog, expr)
-                || typed_expr_contains_nondeterministic_call(function_catalog, low)
-                || typed_expr_contains_nondeterministic_call(function_catalog, high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            typed_expr_contains_nondeterministic_call(function_catalog, expr)
-                || typed_expr_contains_nondeterministic_call(function_catalog, pattern)
-        }
-        ExprKind::InList { expr, list, .. } => {
-            typed_expr_contains_nondeterministic_call(function_catalog, expr)
-                || list
-                    .iter()
-                    .any(|item| typed_expr_contains_nondeterministic_call(function_catalog, item))
-        }
-        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
-            typed_expr_contains_nondeterministic_call(function_catalog, body)
-        }
-        _ => false,
-    }
-}
-
 pub(super) fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<String> {
     fn is_complex(dt: &DataType) -> bool {
         matches!(
@@ -5360,7 +5294,7 @@ mod tests {
         });
         assert_eq!(
             ctx.analyze_expr(&leaf, &scope).unwrap_err().kind(),
-            crate::analyze_error::AnalyzeErrorKind::InvalidLiteral
+            crate::analyze_error::AnalyzeErrorKind::NumericOutOfRange
         );
         // The original ordinary CAST declaration shortcut remains opaque.
         assert!(
@@ -6066,7 +6000,7 @@ mod tests {
                         panic!("resolved SELECT");
                     };
                     let actual = &select.projection[0].expr;
-                    let expected = FunctionValueType::new(expected_type, decimal || nullable);
+                    let expected = FunctionValueType::new(expected_type, nullable);
                     assert_eq!(actual.value_type, expected, "{mode}: {sql}");
                     assert_eq!(resolved.output_columns[0].value_type, expected);
                     assert_eq!(select.projection[0].field_name.as_deref(), Some("result"));
@@ -6093,7 +6027,10 @@ mod tests {
                         let source_child = if decimal {
                             assert_eq!(
                                 computed.value_type,
-                                FunctionValueType::new(DataType::Decimal128(5, 1), true)
+                                FunctionValueType::new(
+                                    DataType::Decimal128(5, 1),
+                                    source.value_type.nullable(),
+                                )
                             );
                             let ExprKind::Cast {
                                 expr,
@@ -6105,7 +6042,10 @@ mod tests {
                                 panic!("original explicit Decimal cast");
                             };
                             assert_eq!(*target, DataType::Decimal128(4, 1));
-                            assert_eq!(*cast_mode, None);
+                            assert_eq!(
+                                *cast_mode,
+                                Some(novarocks_type_contract::TrinoCastMode::Explicit)
+                            );
                             assert_eq!(*decimal_overflow_policy, policy);
                             expr.as_ref()
                         } else {
@@ -7126,7 +7066,7 @@ mod tests {
             "select k+1 from unary_input",
             "select k+NULL from unary_input",
             "select NULL+k from unary_input",
-            "select k+cast(NULL AS largeint) from unary_input",
+            "select k + CASE WHEN TRUE THEN NULL ELSE k END from unary_input",
         ] {
             let expression = analyze_projection_expr_with_catalog(
                 sql,
@@ -7211,181 +7151,150 @@ mod tests {
 
     #[test]
     fn comparisons_freeze_exact_largeint_domains_without_identity_casts() {
+        use crate::analyze_error::AnalyzeErrorKind;
         use novarocks_type_contract::ValueLogicalType;
+
         let catalog = UnaryInputCatalog {
             key_type: DataType::FixedSizeBinary(16),
             nullable: false,
             logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
         };
-        for (sql, operand_nullability, result_nullable) in [
-            ("select k=1 from unary_input", &[false, false][..], false),
+        let functions = crate::functions::builtin_sql_function_catalog();
+        for sql in [
+            "SELECT k = 1 FROM unary_input",
+            "SELECT k IN (1, CAST(2 AS INTEGER)) FROM unary_input",
+            "SELECT k BETWEEN 1 AND CAST(2 AS INTEGER) FROM unary_input",
+            "SELECT CASE k WHEN 1 THEN 7 WHEN CAST(2 AS INTEGER) THEN 8 ELSE 9 END FROM unary_input",
+        ] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let error = super::super::analyze(&query, &catalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
+            assert!(
+                error.message().contains("common Trino type"),
+                "{sql}: {error}"
+            );
+        }
+
+        for (sql, arity, result) in [
             (
-                "select k IN (1,cast(2 AS int)) from unary_input",
-                &[false, false, true][..],
-                true,
+                "SELECT k = k FROM unary_input",
+                2,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
             ),
             (
-                "select k BETWEEN 1 AND cast(2 AS int) from unary_input",
-                &[false, false, true][..],
-                true,
+                "SELECT k IN (k, k) FROM unary_input",
+                3,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
             ),
             (
-                "select CASE k WHEN 1 THEN 7 WHEN cast(2 AS int) THEN 8 ELSE 9 END from unary_input",
-                &[false, false, true][..],
-                true,
+                "SELECT k BETWEEN k AND k FROM unary_input",
+                3,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+            ),
+            (
+                "SELECT CASE k WHEN k THEN 7 WHEN k THEN 8 ELSE 9 END FROM unary_input",
+                3,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
             ),
         ] {
-            let expression = analyze_projection_expr_with_catalog(
-                sql,
-                &catalog,
-                crate::functions::builtin_sql_function_catalog(),
-            )
-            .unwrap();
+            let expression =
+                analyze_projection_expr_with_catalog(sql, &catalog, functions).unwrap();
+            assert_eq!(expression.value_type, result, "{sql}");
             let operands = comparison_operands(&expression);
-            assert!(
-                matches!(operands[0].kind, ExprKind::ColumnRef { .. }),
-                "{sql}"
-            );
-            assert_eq!(operands.len(), operand_nullability.len());
-            for (ordinal, operand) in operands.iter().enumerate() {
+            assert_eq!(operands.len(), arity, "{sql}");
+            for operand in operands {
+                assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }), "{sql}");
                 assert_eq!(
                     operand.value_type.logical_type(),
                     ValueLogicalType::LargeInt,
                     "{sql}"
                 );
                 assert_eq!(
-                    operand.value_type.data_type().clone(),
-                    DataType::FixedSizeBinary(16),
+                    operand.value_type.data_type(),
+                    &DataType::FixedSizeBinary(16),
                     "{sql}"
                 );
-                assert_eq!(
-                    operand.value_type.nullable(),
-                    operand_nullability[ordinal],
-                    "{sql}"
-                );
-                if ordinal > 0 {
-                    let ExprKind::FunctionCall { binding, args, .. } = &operand.kind else {
-                        panic!("signed label needs an exact LARGEINT conversion: {sql}");
-                    };
-                    assert_eq!(
-                        binding.function_id.as_str(),
-                        "builtin.scalar/value_domain_conversion/v1"
-                    );
-                    assert_eq!(
-                        args[0].value_type.logical_type(),
-                        ValueLogicalType::Physical
-                    );
-                    assert!(matches!(
-                        args[0].value_type.data_type(),
-                        DataType::Int32 | DataType::Int64
-                    ));
-                    let novarocks_functions::FunctionResultType::Scalar(result) =
-                        &binding.selected.result_type
-                    else {
-                        panic!("scalar converter");
-                    };
-                    assert_eq!(result, &operand.value_type);
-                    assert_eq!(result.nullable(), args[0].value_type.nullable(), "{sql}");
-                    if operand_nullability[ordinal] {
-                        assert!(
-                            matches!(
-                                args[0].kind,
-                                ExprKind::Cast {
-                                    target: DataType::Int32,
-                                    ..
-                                }
-                            ),
-                            "{sql}"
-                        );
-                    } else {
-                        assert!(
-                            matches!(args[0].kind, ExprKind::Literal(LiteralValue::Int(1))),
-                            "{sql}"
-                        );
-                    }
-                }
+                assert!(!operand.value_type.nullable(), "{sql}");
             }
-            if sql.contains("CASE") {
-                assert_eq!(
-                    expression.value_type.logical_type(),
-                    ValueLogicalType::Physical
-                );
-                assert_eq!(expression.value_type.data_type().clone(), DataType::Int32);
-                assert!(expression.value_type.nullable());
-            } else {
-                assert_eq!(expression.value_type.data_type().clone(), DataType::Boolean);
-                assert_eq!(expression.value_type.nullable(), result_nullable, "{sql}");
-            }
-        }
-        let same = analyze_projection_expr_with_catalog(
-            "select k=k from unary_input",
-            &catalog,
-            crate::functions::builtin_sql_function_catalog(),
-        )
-        .unwrap();
-        for operand in comparison_operands(&same) {
-            assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }));
         }
     }
 
     #[test]
     fn comparison_null_targets_keep_largeint_identity_and_original_nullability() {
-        use novarocks_type_contract::ValueLogicalType;
+        use novarocks_type_contract::{FunctionValueType, TrinoCastMode, ValueLogicalType};
         let catalog = UnaryInputCatalog {
             key_type: DataType::FixedSizeBinary(16),
             nullable: false,
             logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
         };
+        let functions = crate::functions::builtin_sql_function_catalog();
+        let unknown = FunctionValueType::new(DataType::Null, true);
+        let target = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+
         for sql in [
-            "select k=NULL from unary_input",
-            "select k=cast(NULL AS largeint) from unary_input",
-            "select k IN (NULL,cast(NULL AS largeint)) from unary_input",
-            "select k BETWEEN NULL AND cast(NULL AS largeint) from unary_input",
-            "select CASE k WHEN NULL THEN 7 WHEN cast(NULL AS largeint) THEN 8 ELSE 9 END from unary_input",
+            "SELECT k = NULL FROM unary_input",
+            "SELECT k IN (NULL, NULL) FROM unary_input",
+            "SELECT k BETWEEN NULL AND NULL FROM unary_input",
+            "SELECT CASE k WHEN NULL THEN 7 WHEN NULL THEN 8 ELSE 9 END FROM unary_input",
         ] {
-            let expression = analyze_projection_expr_with_catalog(
-                sql,
-                &catalog,
-                crate::functions::builtin_sql_function_catalog(),
-            )
-            .unwrap();
+            let expression =
+                analyze_projection_expr_with_catalog(sql, &catalog, functions).unwrap();
             let operands = comparison_operands(&expression);
             assert!(!operands[0].value_type.nullable(), "{sql}");
             for operand in operands.iter().skip(1) {
-                assert_eq!(
-                    operand.value_type.logical_type(),
-                    ValueLogicalType::LargeInt,
-                    "{sql}"
-                );
-                assert!(operand.value_type.nullable(), "{sql}");
+                assert_eq!(operand.value_type, target, "{sql}");
+                let ExprKind::Cast {
+                    expr,
+                    cast_mode: Some(TrinoCastMode::Implicit),
+                    ..
+                } = &operand.kind
+                else {
+                    panic!("NULL is coerced by the actual comparison owner: {sql}");
+                };
+                assert_eq!(expr.value_type, unknown, "{sql}");
                 assert!(
-                    matches!(operand.kind, ExprKind::Literal(LiteralValue::Null)),
+                    matches!(expr.kind, ExprKind::Literal(LiteralValue::Null)),
                     "{sql}"
                 );
             }
             assert!(expression.value_type.nullable(), "{sql}");
         }
+
         let expression = analyze_projection_expr_with_catalog(
-            "select k=element_at([],1) from unary_input",
+            "SELECT k = CASE WHEN TRUE THEN NULL ELSE k END FROM unary_input",
             &catalog,
-            crate::functions::builtin_sql_function_catalog(),
+            functions,
         )
         .unwrap();
         let operands = comparison_operands(&expression);
         assert!(!operands[0].value_type.nullable());
-        let ExprKind::FunctionCall { binding, args, .. } = &operands[1].kind else {
+        assert_eq!(operands[1].value_type, target);
+        assert!(matches!(operands[1].kind, ExprKind::Case { .. }));
+
+        let expression = analyze_projection_expr_with_catalog(
+            "SELECT k = element_at([], 1) FROM unary_input",
+            &catalog,
+            functions,
+        )
+        .unwrap();
+        let operands = comparison_operands(&expression);
+        assert!(!operands[0].value_type.nullable());
+        assert_eq!(operands[1].value_type, target);
+        let ExprKind::Cast {
+            expr,
+            cast_mode: Some(TrinoCastMode::Implicit),
+            ..
+        } = &operands[1].kind
+        else {
             panic!("nonliteral NULL must preserve its source invocation");
         };
-        assert_eq!(
-            binding.function_id.as_str(),
-            "builtin.scalar/value_domain_conversion/v1"
-        );
-        assert!(matches!(args[0].kind, ExprKind::FunctionCall { .. }));
-        assert_eq!(
-            operands[1].value_type.logical_type(),
-            ValueLogicalType::LargeInt
-        );
-        assert!(operands[1].value_type.nullable());
+        assert_eq!(expr.value_type, unknown);
+        assert!(matches!(&expr.kind, ExprKind::FunctionCall { name, .. } if name == "element_at"));
     }
 
     #[test]
@@ -7525,35 +7434,42 @@ mod tests {
     }
 
     #[test]
-    fn named_bitnot_resolves_unknown_null_without_erasing_a_nonliteral_argument() {
-        use novarocks_type_contract::FunctionValueType;
+    fn named_bitnot_requires_a_width_and_keeps_the_original_null_argument() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
 
         let expected = FunctionValueType::new(DataType::Int8, true);
-        let literal = analyze_projection_expr("select bitnot(NULL)").unwrap();
-        assert_eq!(literal.value_type, expected);
-        let operand = named_bitnot_operand(&literal);
-        assert_eq!(operand.value_type, expected);
-        assert!(matches!(
-            operand.kind,
-            ExprKind::Literal(LiteralValue::Null)
-        ));
+        let unknown = FunctionValueType::new(DataType::Null, true);
+        for (source, literal) in [("NULL", true), ("element_at([], 1)", false)] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT bitnot({source})")).unwrap();
+            let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::AmbiguousFunctionCall);
 
-        let nonliteral = analyze_projection_expr("select bitnot(element_at([],1))").unwrap();
-        assert_eq!(nonliteral.value_type, expected);
-        let operand = named_bitnot_operand(&nonliteral);
-        assert_eq!(operand.value_type, expected);
-        let ExprKind::Cast { expr, target, .. } = &operand.kind else {
-            panic!("named bitnot must bind the Unknown argument at its selected integer width");
-        };
-        assert_eq!(target, &DataType::Int8);
-        assert_eq!(
-            expr.value_type,
-            FunctionValueType::new(DataType::Null, true)
-        );
-        let ExprKind::FunctionCall { name, .. } = &expr.kind else {
-            panic!("bitnot must keep the original nonliteral NULL argument");
-        };
-        assert_eq!(name, "element_at");
+            let bound =
+                analyze_projection_expr(&format!("SELECT bitnot(CAST({source} AS TINYINT))"))
+                    .unwrap();
+            assert_eq!(bound.value_type, expected);
+            let operand = named_bitnot_operand(&bound);
+            assert_eq!(operand.value_type, expected);
+            let ExprKind::Cast {
+                expr,
+                target: DataType::Int8,
+                cast_mode: Some(TrinoCastMode::Explicit),
+                ..
+            } = &operand.kind
+            else {
+                panic!("bitnot must retain the original explicit width: {source}");
+            };
+            assert_eq!(expr.value_type, unknown);
+            if literal {
+                assert!(matches!(expr.kind, ExprKind::Literal(LiteralValue::Null)));
+            } else {
+                assert!(
+                    matches!(&expr.kind, ExprKind::FunctionCall { name, .. } if name == "element_at")
+                );
+            }
+        }
     }
 
     fn named_bitnot_operand(expression: &TypedExpr) -> &TypedExpr {
@@ -7608,11 +7524,12 @@ mod tests {
                 )
                 .unwrap(),
             );
-            for sql in [
-                "select raw+1",
-                "select raw+NULL",
-                "select -raw",
-                "select bitnot(raw)",
+            use crate::analyze_error::AnalyzeErrorKind;
+            for (sql, expected) in [
+                ("select raw+1", AnalyzeErrorKind::TypeMismatch),
+                ("select raw+NULL", AnalyzeErrorKind::TypeMismatch),
+                ("select -raw", AnalyzeErrorKind::TypeMismatch),
+                ("select bitnot(raw)", AnalyzeErrorKind::UnknownFunction),
             ] {
                 let query = &novarocks_parser::parser::parse_query(sql).unwrap();
                 let ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -7624,13 +7541,10 @@ mod tests {
                 assert!(projection_column.alias.is_none(), "anonymous projection");
                 let expr = &projection_column.expression;
                 let error = context.analyze_expr(expr, &scope).unwrap_err();
-                assert!(
-                    matches!(
-                        error.kind(),
-                        crate::analyze_error::AnalyzeErrorKind::TypeMismatch
-                    ),
-                    "{sql}: {error}"
-                );
+                assert_eq!(error.kind(), expected, "{sql}: {error}");
+                if expected == AnalyzeErrorKind::UnknownFunction {
+                    assert_eq!(error.message(), "no matching declared overload");
+                }
             }
         }
         let catalog = UnaryInputCatalog {
@@ -7971,16 +7885,28 @@ mod tests {
             i64::MIN as i128 - 1,
             i64::MAX as i128 + 1,
         ] {
-            let expr = analyze_projection_expr(&format!("select cast('{value}' as largeint)"))
-                .expect("explicit signed LARGEINT boundary should analyze");
-            assert_eq!(
-                expr.value_type.data_type().clone(),
-                DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
-            );
+            use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+            let retired = format!("SELECT CAST('{value}' AS LARGEINT)");
             assert!(
-                expr.value_type.nullable(),
-                "explicit text CAST keeps the original parse-failure NULL law"
+                analyze_projection_expr(&retired)
+                    .unwrap_err()
+                    .contains("Unknown type: largeint")
             );
+
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let ctx = logical_context(&control);
+            let source = analyze_projection_expr(&format!("SELECT '{value}'")).unwrap();
+            let target = FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
+                true,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap();
+            let expr = ctx
+                .cast_to_value_type(source, target.clone(), novarocks_parser::SYNTHETIC)
+                .expect("the internal text conversion retains the full signed range");
+            assert_eq!(expr.value_type, target);
             let ExprKind::FunctionCall { binding, args, .. } = expr.kind else {
                 panic!("exact LARGEINT domain converter");
             };
@@ -8153,42 +8079,81 @@ mod tests {
     }
 
     #[test]
-    fn sqlx1_function_array_sort_lambda_rejects_extended_clock_functions() {
-        // array_sort validates its lambda body through this same helper.  The
-        // seven entries below were missing from the old analyzer-local list
-        // but were already unsafe for optimizer rewrites.
-        for name in [
-            "current_date",
-            "curdate",
-            "curtime",
-            "localtime",
-            "localtimestamp",
+    fn array_sort_lambda_refusal_and_statement_clock_bindings_use_the_real_catalog() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_functions::builtin::temporal_context::TemporalSyntax;
+        use novarocks_type_contract::{
+            SemanticParameterValue, StatementStartUtc, StatementTimeEnvironment, TimeZoneKey,
+        };
+
+        for body in [
+            "0",
+            "IF(CURRENT_DATE IS NULL, -1, 0)",
+            "IF(LOCALTIME IS NULL, -1, 0)",
         ] {
-            let body = crate::analysis::TypedExpr {
-                kind: crate::analysis::ExprKind::FunctionCall {
-                    binding: crate::analysis::test_function_binding(
-                        name,
-                        &[],
-                        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                        false,
-                        crate::functions::builtin_function_volatility(name),
-                    ),
-                    volatility: crate::functions::builtin_function_volatility(name),
-                    name: name.to_string(),
-                    args: (vec![]).into(),
-                    distinct: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                    false,
-                ),
-            };
+            let sql = format!("SELECT array_sort(ARRAY[1, 2], (x, y) -> {body})");
+            let query = novarocks_parser::parser::parse_query(&sql).unwrap();
+            let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::UnavailableImplementation,
+                "{sql}"
+            );
             assert!(
-                super::typed_expr_contains_nondeterministic_call(
-                    crate::functions::builtin_sql_function_catalog(),
-                    &body,
-                ),
-                "{name} must be rejected in array_sort lambda bodies"
+                error
+                    .message()
+                    .contains("builtin.scalar/array_sort/lambda-v1"),
+                "{sql}: {error}"
+            );
+        }
+
+        let start = StatementStartUtc::try_new(1_700_000_000, 0).unwrap();
+        let zone = TimeZoneKey::UTC;
+        let settings = crate::sql_mode::SqlSemanticSettings::default()
+            .with_statement_time(StatementTimeEnvironment { start, zone });
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for (spelling, syntax) in [
+            ("CURRENT_DATE", TemporalSyntax::CurrentDate),
+            ("CURRENT_TIME", TemporalSyntax::CurrentTime),
+            ("CURRENT_TIMESTAMP", TemporalSyntax::CurrentTimestamp),
+            ("LOCALTIME", TemporalSyntax::LocalTime),
+            ("LOCALTIMESTAMP", TemporalSyntax::LocalTimestamp),
+        ] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT {spelling}")).unwrap();
+            let (resolved, _, _) = super::super::analyze_with_function_catalog_and_sql_semantics(
+                &query,
+                &EmptyCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                &settings,
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .unwrap();
+            let QueryBody::Select(select) = &resolved.body else {
+                panic!("projection");
+            };
+            let ExprKind::FunctionCall { binding, args, .. } = &select.projection[0].expr.kind
+            else {
+                panic!("installed statement clock: {spelling}");
+            };
+            assert!(args.is_empty(), "{spelling}");
+            assert_eq!(
+                binding.selected.overload.as_str(),
+                syntax.identity(),
+                "{spelling}"
+            );
+            assert_eq!(
+                binding
+                    .statement_time_parameters()
+                    .map(|(_, value)| value)
+                    .collect::<Vec<_>>(),
+                [
+                    SemanticParameterValue::StatementStartUtc(start),
+                    SemanticParameterValue::TimeZone(zone)
+                ],
+                "{spelling}"
             );
         }
     }
@@ -8902,11 +8867,6 @@ mod tests {
             ("smallint", DataType::Int16, DataType::Int32),
             ("int", DataType::Int32, DataType::Int64),
             ("bigint", DataType::Int64, DataType::FixedSizeBinary(16)),
-            (
-                "largeint",
-                DataType::FixedSizeBinary(16),
-                DataType::FixedSizeBinary(16),
-            ),
         ] {
             let expression =
                 analyze_projection_expr(&format!("select abs(cast(null as {spelling}))")).unwrap();
@@ -8918,6 +8878,32 @@ mod tests {
             assert_eq!(args[0].value_type.data_type().clone(), input);
             assert!(args[0].value_type.nullable());
         }
+        let catalog = UnaryInputCatalog {
+            key_type: DataType::FixedSizeBinary(16),
+            nullable: false,
+            logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
+        };
+        let nominal = analyze_projection_expr_with_catalog(
+            "SELECT abs(CASE WHEN TRUE THEN NULL ELSE k END) FROM unary_input",
+            &catalog,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .unwrap();
+        assert_eq!(
+            nominal.value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        );
+        assert_eq!(
+            nominal.value_type.data_type(),
+            &DataType::FixedSizeBinary(16)
+        );
+        assert!(nominal.value_type.nullable());
+        let ExprKind::FunctionCall { args, .. } = nominal.kind else {
+            panic!("expected nominal ABS call");
+        };
+        assert!(matches!(args[0].kind, ExprKind::Case { .. }));
+        assert_eq!(args[0].value_type, nominal.value_type);
+
         let expression =
             analyze_projection_expr("select cast(abs(cast(-128 as tinyint)) as decimal(38,15))")
                 .unwrap();
@@ -9468,53 +9454,68 @@ mod tests {
 
     #[test]
     fn decimal_largeint_add_sub_seal_exact_result_without_operand_retagging() {
-        let largeint = DataType::FixedSizeBinary(16);
+        use novarocks_type_contract::ValueLogicalType;
+
+        let catalog = UnaryInputCatalog {
+            key_type: DataType::FixedSizeBinary(16),
+            nullable: false,
+            logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
+        };
+        let functions = crate::functions::builtin_sql_function_catalog();
         for op in ["+", "-"] {
             for reverse in [false, true] {
+                let decimal = "CAST(1.25 AS DECIMAL(38,15))";
                 let (left, right) = if reverse {
-                    ("cast(1 as largeint)", "cast(1.25 as decimal(38,15))")
+                    ("k", decimal)
                 } else {
-                    ("cast(1.25 as decimal(38,15))", "cast(1 as largeint)")
+                    (decimal, "k")
                 };
-                let sql = format!("select {left} {op} {right}");
-                let expr = analyze_projection_expr(&sql).unwrap();
-                assert_eq!(
-                    expr.value_type.data_type().clone(),
-                    DataType::Decimal256(55, 15)
-                );
+                let sql = format!("SELECT {left} {op} {right} FROM unary_input");
+                let expr = analyze_projection_expr_with_catalog(&sql, &catalog, functions).unwrap();
+                assert_eq!(expr.value_type.data_type(), &DataType::Decimal256(55, 15));
                 let ExprKind::BinaryOp { left, right, .. } = expr.kind else {
                     panic!("expected frozen arithmetic");
                 };
+                let (wide, decimal) = if reverse {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                assert_eq!(wide.value_type.data_type(), &DataType::FixedSizeBinary(16));
+                assert_eq!(wide.value_type.logical_type(), ValueLogicalType::LargeInt);
+                assert!(!wide.value_type.nullable());
+                assert!(matches!(wide.kind, ExprKind::ColumnRef { .. }));
                 assert_eq!(
-                    left.value_type.data_type().clone(),
-                    if reverse {
-                        largeint.clone()
-                    } else {
-                        DataType::Decimal128(38, 15)
-                    }
+                    decimal.value_type.data_type(),
+                    &DataType::Decimal128(38, 15)
                 );
-                assert_eq!(
-                    right.value_type.data_type().clone(),
-                    if reverse {
-                        DataType::Decimal128(38, 15)
-                    } else {
-                        largeint.clone()
-                    }
-                );
+                assert!(matches!(decimal.kind, ExprKind::Cast { .. }));
             }
         }
-        assert_eq!(analyze_projection_expr("select cast(0.000000000000000000000000000000000001 as decimal(38,36)) + cast(1 as largeint)").unwrap().value_type.data_type().clone(),DataType::Decimal256(76,36));
-        for query in [
-            "select cast(0 as decimal(38,37)) + cast(1 as largeint)",
-            "select cast(1 as decimal(38,15)) * cast(1 as largeint)",
-            "select cast(1 as decimal(38,15)) / cast(1 as largeint)",
-            "select cast(1 as decimal(38,15)) % cast(1 as largeint)",
+        let widest = analyze_projection_expr_with_catalog(
+            "SELECT CAST(0 AS DECIMAL(38,36)) + k FROM unary_input",
+            &catalog,
+            functions,
+        )
+        .unwrap();
+        assert_eq!(widest.value_type.data_type(), &DataType::Decimal256(76, 36));
+
+        for sql in [
+            "SELECT CAST(0 AS DECIMAL(38,37)) + k FROM unary_input",
+            "SELECT CAST(1 AS DECIMAL(38,15)) * k FROM unary_input",
+            "SELECT CAST(1 AS DECIMAL(38,15)) / k FROM unary_input",
+            "SELECT CAST(1 AS DECIMAL(38,15)) % k FROM unary_input",
         ] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let error = super::super::analyze(&query, &catalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::TypeMismatch,
+                "{sql}"
+            );
             assert!(
-                analyze_projection_expr(query)
-                    .unwrap_err()
-                    .contains("no frozen result rule"),
-                "{query}"
+                error.message().contains("no frozen result rule"),
+                "{sql}: {error}"
             );
         }
     }
