@@ -72,6 +72,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::error::CatalogOutcome;
+use crate::commit::model::{CommitOperation, CommitStyle};
 use crate::commit::write_stack::domain::{
     ClaimedWriteFinish, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
     IcebergCreationScope, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
@@ -1356,8 +1357,7 @@ impl IcebergWriteSessionControl {
             .adjudicate_session_inner_async(handle, evidence, context)
             .await?;
         if let ExternalMutationOutcome::CommitUnknown { failure, .. } = &mut outcome
-            && handle.commit_protocol().operation().style()
-                == crate::commit::model::CommitStyle::Transaction
+            && handle.commit_protocol().operation().style() == CommitStyle::Transaction
         {
             *failure = crate::commit::conflict::commit_state_unknown(
                 handle.commit_protocol().operation(),
@@ -1404,15 +1404,16 @@ impl IcebergWriteSessionControl {
                 evidence: evidence.clone(),
             });
         };
-        let known = match journal.catalog_entry_outcome(entry) {
-            known @ ExternalMutationOutcome::KnownUncommitted { .. } => return Ok(known),
-            known @ ExternalMutationOutcome::KnownCommitted { .. } => {
-                if handle.document_publication().is_none() {
-                    return Ok(known);
-                }
-                Some(known)
+        let original = journal.catalog_entry_outcome(entry);
+        let known = match &original {
+            ExternalMutationOutcome::KnownUncommitted { .. } => return Ok(original),
+            ExternalMutationOutcome::KnownCommitted { .. }
+                if handle.document_publication().is_none() =>
+            {
+                return Ok(original);
             }
-            ExternalMutationOutcome::CommitUnknown { .. } => None,
+            ExternalMutationOutcome::KnownCommitted { .. } => true,
+            ExternalMutationOutcome::CommitUnknown { .. } => false,
         };
         let known_snapshot = match journal.commit_outcome(entry) {
             crate::catalog::error::CatalogOutcome::KnownCommitted { receipt, .. } => {
@@ -1420,12 +1421,14 @@ impl IcebergWriteSessionControl {
             }
             _ => None,
         };
-        if known.is_some() && known_snapshot.is_none() {
+        if known && known_snapshot.is_none() {
             return Ok(journal.catalog_entry_outcome(entry));
         }
+        let failed_observation =
+            |error| failed_write_observation(handle.commit_protocol().operation(), original, error);
         // Once a positive verdict exists, reload is optional finalization and
         // consumes the original entry's one finite grant.
-        let read_context = if known.is_some() {
+        let read_context = if known {
             match receive_existing_finalization_context(
                 handle,
                 &journal,
@@ -1447,9 +1450,11 @@ impl IcebergWriteSessionControl {
         } else {
             context.clone()
         };
-        let _finalizing = known
-            .as_ref()
-            .and_then(|_| journal.finalization_activity(entry));
+        let _finalizing = if known {
+            journal.finalization_activity(entry)
+        } else {
+            None
+        };
         let facts = handle.table();
         let physical = match self
             .runtime
@@ -1475,18 +1480,7 @@ impl IcebergWriteSessionControl {
                         ))),
                     ));
                 }
-                let observation_failure = unavailable(error.to_string());
-                if handle.commit_protocol().operation().style()
-                    == crate::commit::model::CommitStyle::Transaction
-                {
-                    // The checked dispatch is still unknown. Present the failed
-                    // read as detail of that outcome and keep its original evidence.
-                    return Ok(ExternalMutationOutcome::CommitUnknown {
-                        failure: ConnectorMutationFailure::from_connector(observation_failure),
-                        evidence: evidence.clone(),
-                    });
-                }
-                return Err(observation_failure);
+                return failed_observation(unavailable(error));
             }
         };
         let table = physical.into_table();
@@ -1503,7 +1497,7 @@ impl IcebergWriteSessionControl {
                     )),
                 ));
             }
-            return Err(invalid(
+            return failed_observation(invalid(
                 "Iceberg write reconciliation loaded a different table identity",
             ));
         }
@@ -1560,7 +1554,7 @@ impl IcebergWriteSessionControl {
                         .replace((snapshot.snapshot_id(), marker.unwrap().clone()))
                         .is_some()
                 {
-                    return Err(corrupt(
+                    return failed_observation(corrupt(
                         "Iceberg write session marker matches multiple snapshots",
                     ));
                 }
@@ -1623,6 +1617,33 @@ impl IcebergWriteSessionControl {
             snapshot_id,
             projection.map(|_| metadata),
         ))
+    }
+}
+
+fn failed_write_observation<R>(
+    operation: CommitOperation,
+    original: ExternalMutationOutcome<R>,
+    error: ConnectorError,
+) -> Result<ExternalMutationOutcome<R>, ConnectorError> {
+    use crate::commit::commit_failure::{CommitFailureKind, commit_failure};
+
+    match original {
+        // A failed or ambiguous observation cannot settle the checked dispatch.
+        // Keep its exact evidence and use the observation as public detail.
+        ExternalMutationOutcome::CommitUnknown { failure, evidence }
+            if operation.style() == CommitStyle::Transaction =>
+        {
+            Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: commit_failure(
+                    operation,
+                    CommitFailureKind::Unknown,
+                    failure,
+                    &error.to_string(),
+                ),
+                evidence,
+            })
+        }
+        _ => Err(error),
     }
 }
 
@@ -4866,6 +4887,9 @@ mod eager_attempt_io_tests {
 
     #[tokio::test]
     async fn commit_unknown_never_stages_or_dispatches_a_fresh_attempt() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_failure_contract::connector_reason::ICEBERG_COMMIT_STATE_UNKNOWN;
+
         let fixture = fixture().await;
         let lost = CountingDispatch::new(DispatchBehavior::LoseResponse);
         let mut attempt = stage_attempt(&fixture, 7, Arc::clone(&lost)).await;
@@ -4876,6 +4900,65 @@ mod eager_attempt_io_tests {
 
         let repeated = attempt.frontier.commit().await;
         assert!(matches!(repeated, CatalogOutcome::CommitUnknown { .. }));
+        let journal = &attempt.frontier.journal;
+        let entry = journal.current_entry().unwrap();
+        let ExternalMutationOutcome::CommitUnknown {
+            failure: original_failure,
+            evidence: original_evidence,
+        } = journal.catalog_entry_outcome(entry)
+        else {
+            panic!("the original dispatch must have retained unknown evidence");
+        };
+        for error in [
+            unavailable("catalog observation unavailable"),
+            invalid("catalog observation returned the next table generation"),
+            corrupt("catalog observation matched the marker twice"),
+        ] {
+            let ExternalMutationOutcome::CommitUnknown { failure, evidence } =
+                failed_write_observation(
+                    CommitOperation::Insert,
+                    journal.catalog_entry_outcome(entry),
+                    error.clone(),
+                )
+                .unwrap()
+            else {
+                panic!("an unusable observation must preserve the original unknown verdict");
+            };
+            assert_eq!(
+                failure.failure_fact().reason(),
+                ICEBERG_COMMIT_STATE_UNKNOWN
+            );
+            let connector = failure.connector_source().unwrap();
+            let detail = connector.public_failure_detail().unwrap();
+            assert!(
+                detail.starts_with(
+                    "Failed to commit the transaction during insert: [CommitUnknown] "
+                )
+            );
+            assert!(detail.ends_with(error.message()));
+            let dispatch = std::error::Error::source(connector)
+                .unwrap()
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .downcast_ref::<ConnectorMutationFailure>();
+            assert_eq!(dispatch, Some(&original_failure));
+            assert_eq!(evidence, original_evidence);
+            let (_, retained_entry) = PublicationJournal::<()>::from_evidence(&evidence)
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained_entry, entry);
+            assert_eq!(
+                failed_write_observation(
+                    CommitOperation::Legacy,
+                    journal.catalog_entry_outcome(entry),
+                    error.clone(),
+                )
+                .unwrap_err(),
+                error
+            );
+        }
         assert_eq!(lost.dispatches.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.trace.attempt_derivative_counts(), before_unknown);
         fixture.trace.assert_data_was_not_reopened();
