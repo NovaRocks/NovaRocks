@@ -17,6 +17,9 @@
 
 //! Statement-local snapshot custody. Borrowed waits only drive its original
 //! finite I/O operation; they never own an SDK future or inventory cursor.
+mod show;
+pub(crate) use show::{PreparedShowQuery, ShowInput};
+
 use super::*;
 use crate::mv::domain::{
     freshness::{
@@ -42,7 +45,11 @@ use novarocks_query_application::{
         SystemTableError, SystemTableProvider, SystemTableRequest, SystemTableSnapshot,
     },
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ProviderMetadataCpuPort};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorOperationControl,
+    ConnectorTableIdentity, DiscoveredColumn, DiscoveredRelation, DiscoveryProjection,
+    DiscoveryRelationKind, ProviderMetadataCpuPort,
+};
 use novarocks_sql::compiler::{SqlCompileError, SystemTableSnapshotFact, SystemTableSnapshotNeed};
 use std::{
     collections::BTreeMap,
@@ -77,6 +84,7 @@ impl Drop for StoreLoan<'_> {
 type Operation = Pin<Box<dyn Future<Output = Response> + Send>>;
 enum Response {
     Names(Result<Vec<String>, SystemTableError>),
+    Discovery(Result<Option<Box<DiscoveredRelation>>, SystemTableError>),
     Exists(Result<bool, SystemTableError>),
     Open(Result<Inventory, SystemTableError>),
     // Keep one loaded row with the original response without inflating every
@@ -97,7 +105,7 @@ struct IoState {
     closing: bool,
     joined: bool,
     pins: BTreeMap<String, Arc<PinnedCatalogListing>>,
-    ports: Vec<Arc<dyn ProviderMetadataCpuPort>>,
+    ports: BTreeMap<String, Arc<dyn ProviderMetadataCpuPort>>,
     health: Option<StatementNativeHealthFailure>,
 }
 #[derive(Debug)]
@@ -179,6 +187,7 @@ pub(super) struct FrontendSystemTableFacts {
     store_foreign: std::sync::atomic::AtomicBool,
     capture: Arc<CurrentMetadataCapture>,
     self_ref: std::sync::Weak<FrontendSystemTableFacts>,
+    show: Mutex<Option<show::ShowFacts>>,
     resolving: tokio::sync::Mutex<()>,
     unproven: StatementNativeHealthFailure,
 }
@@ -276,6 +285,7 @@ impl FrontendSystemTableFacts {
             store_foreign: std::sync::atomic::AtomicBool::new(false),
             capture: crate::mv::domain::staged_create::new_current_metadata_capture(),
             self_ref: this.clone(),
+            show: Mutex::new(None),
             resolving: tokio::sync::Mutex::const_new(()),
             unproven: StatementNativeHealthFailure::actual_exit_unproven(
                 "system table original I/O exit is unproven",
@@ -348,6 +358,34 @@ impl FrontendSystemTableFacts {
             Arc::new(NotifyWake::new(Arc::clone(&self.notify))),
         ))
     }
+    fn metadata_cpu(
+        &self,
+        catalog: &str,
+        pin: &PinnedCatalogListing,
+    ) -> Result<Arc<dyn ProviderMetadataCpuPort>, SystemTableError> {
+        {
+            let state = self.io.lock().unwrap_or_else(|p| p.into_inner());
+            if state.closing {
+                return Err(SystemTableError::InvalidRequest(
+                    "system snapshot is closing".into(),
+                ));
+            }
+            if let Some(port) = state.ports.get(catalog) {
+                return Ok(Arc::clone(port));
+            }
+        }
+        let port = self.factory()?.port_for(pin.pin()).map_err(work_error)?;
+        let mut state = self.io.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closing {
+            return Err(SystemTableError::InvalidRequest(
+                "system snapshot is closing".into(),
+            ));
+        }
+        Ok(Arc::clone(
+            state.ports.entry(catalog.to_owned()).or_insert(port),
+        ))
+    }
+
     fn install(&self, future: Operation) -> Result<(), SystemTableError> {
         let mut state = self.io.lock().unwrap_or_else(|p| p.into_inner());
         if state.closing || state.in_foreign || state.future.is_some() || state.response.is_some() {
@@ -524,7 +562,11 @@ impl FrontendSystemTableFacts {
     pub(super) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         let (foreign, retained, ports) = {
             let state = self.io.lock().unwrap_or_else(|p| p.into_inner());
-            (state.in_foreign, state.health.clone(), state.ports.clone())
+            (
+                state.in_foreign,
+                state.health.clone(),
+                state.ports.values().cloned().collect::<Vec<_>>(),
+            )
         };
         retained
             .or_else(|| {
@@ -562,7 +604,9 @@ impl FrontendSystemTableFacts {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .ports
-            .clone();
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         for port in ports {
             if let Err(error) = std::future::poll_fn(|cx| port.poll_closed(cx)).await {
                 let mut state = self.io.lock().unwrap_or_else(|p| p.into_inner());
@@ -590,7 +634,8 @@ impl FrontendSystemTableFacts {
                 std::mem::take(&mut state.pins),
             )
         };
-        drop(retired);
+        let show = self.show.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop((retired, show));
         let mut state = self.io.lock().unwrap_or_else(|p| p.into_inner());
         state.in_foreign = false;
         state.joined = true;
@@ -657,6 +702,204 @@ impl CurrentSourceCapture for CurrentSources {
 }
 #[async_trait]
 impl StatementSystemTableSource for FrontendSystemTableFacts {
+    fn runtime_metadata(&self) -> Option<crate::system_tables::RuntimeMetadataObservation<'_>> {
+        self.owners.runtime_metadata.as_deref().map(|metadata| {
+            crate::system_tables::RuntimeMetadataObservation {
+                metadata,
+                capacity: &self.scope.capacity,
+                principal: self.scope.query_observer_principal.as_deref(),
+            }
+        })
+    }
+
+    fn catalog_names(&self) -> Result<crate::system_tables::MetadataNames, SystemTableError> {
+        use novarocks_types::naming::{DEFAULT_CATALOG, SYSTEM_CATALOG};
+        use novarocks_workload_control::WorkError;
+
+        let control = self.scope.connector_context.original_operation_control();
+        control.check_active()?;
+        let registry = self.owners.catalog_service.registry().read().map_err(|_| {
+            SystemTableError::Internal("catalog declaration registry lock poisoned".into())
+        })?;
+        let candidates = || {
+            registry
+                .names()
+                .filter(|name| !matches!(*name, DEFAULT_CATALOG | SYSTEM_CATALOG))
+                .chain([DEFAULT_CATALOG, SYSTEM_CATALOG])
+        };
+        let (count, text_bytes) =
+            candidates().try_fold((0usize, 0usize), |(count, size), name| {
+                control.check_active()?;
+                let add = |left: usize, right| {
+                    left.checked_add(right)
+                        .ok_or_else(|| work_error(WorkError::ArithmeticOverflow))
+                };
+                Ok::<_, SystemTableError>((add(count, 1)?, add(size, name.len())?))
+            })?;
+        let extent = std::alloc::Layout::array::<String>(count)
+            .ok()
+            .and_then(|layout| layout.size().checked_add(text_bytes))
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| work_error(WorkError::ArithmeticOverflow))?;
+        let retained = self
+            .scope
+            .capacity
+            .try_window_alias()
+            .map_err(work_error)?
+            .reserve_payload_bytes(extent)
+            .map_err(work_error)?;
+        let exhausted = || {
+            crate::system_tables::control_error(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+        };
+        let mut names = Vec::new();
+        names.try_reserve_exact(count).map_err(|_| exhausted())?;
+        for name in candidates() {
+            control.check_active()?;
+            let mut copy = String::new();
+            copy.try_reserve_exact(name.len())
+                .map_err(|_| exhausted())?;
+            copy.push_str(name);
+            names.push(copy);
+        }
+        names.sort_unstable();
+        Ok(crate::system_tables::MetadataNames::new(names, retained))
+    }
+
+    fn supports_discovery(&self, catalog: &str) -> Result<bool, SystemTableError> {
+        let local = catalog == novarocks_types::naming::DEFAULT_CATALOG;
+        Ok(local || self.pin(catalog)?.supports_discovery())
+    }
+
+    fn can_probe_discovery_name(
+        &self,
+        catalog: &str,
+        name: &str,
+    ) -> Result<bool, SystemTableError> {
+        Ok(catalog == novarocks_types::naming::DEFAULT_CATALOG
+            || self.pin(catalog)?.can_probe_discovery_name(name))
+    }
+
+    async fn discover_relation(
+        &self,
+        catalog: &str,
+        schema: &str,
+        name: &str,
+        kind: Option<DiscoveryRelationKind>,
+        projection: DiscoveryProjection,
+    ) -> Result<Option<DiscoveredRelation>, SystemTableError> {
+        self.scope
+            .connector_context
+            .original_operation_control()
+            .check_active()?;
+        {
+            let mut show = self.show.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(facts) = show.as_mut()
+                && facts.relation.as_ref().is_some_and(|cached| {
+                    cached.identity.instance_id.as_str() == catalog
+                        && cached.identity.namespace.as_ref() == schema
+                        && cached.identity.table.as_ref() == name
+                        && kind.is_none_or(|kind| cached.kind == kind)
+                })
+            {
+                return Ok(facts.relation.take());
+            }
+        }
+        if catalog == novarocks_types::naming::DEFAULT_CATALOG {
+            if kind == Some(DiscoveryRelationKind::Table) {
+                return Ok(None);
+            }
+            use novarocks_spi::connector::{
+                DiscoveryAllocation, read_stack::ConnectorReadSchemaCreation,
+            };
+
+            let target = novarocks_types::naming::TableIdentity::new(catalog, schema, name);
+            let Some(view) = self.local_views.get(&target) else {
+                return Ok(None);
+            };
+            let storage = crate::system_tables::DiscoveryStorage::try_new(
+                &self.scope.capacity.window_alias(),
+            )
+            .map_err(work_error)?;
+            let control = self.scope.connector_context.original_operation_control();
+            let mut request = |layout| storage.request(layout);
+            let mut work = |_| {
+                control.check_active().map_err(|error| match error.kind() {
+                    ConnectorErrorKind::Cancelled => {
+                        novarocks_type_contract::CompileControlError::Cancelled
+                    }
+                    ConnectorErrorKind::DeadlineExceeded => {
+                        novarocks_type_contract::CompileControlError::DeadlineExceeded
+                    }
+                    _ => {
+                        unreachable!("the operation control exposes only cancellation and deadline")
+                    }
+                })
+            };
+            let mut creation = ConnectorReadSchemaCreation::new(
+                Arc::clone(&storage).retention(),
+                &mut request,
+                &mut work,
+            );
+            let schema = DiscoveredColumn::copy_text(schema, &mut creation)
+                .map_err(crate::connector::schema_creation::connector_schema_error)?;
+            let name = DiscoveredColumn::copy_text(name, &mut creation)
+                .map_err(crate::connector::schema_creation::connector_schema_error)?;
+            let columns = if let Some(projection) = projection.columns {
+                let mut columns = creation
+                    .reserve(view.columns.len())
+                    .map_err(crate::connector::schema_creation::connector_schema_error)?;
+                for column in view.columns.iter() {
+                    creation
+                        .work(1)
+                        .map_err(crate::connector::schema_creation::connector_schema_error)?;
+                    columns.push(DiscoveredColumn {
+                        name: Arc::clone(&column.name),
+                        data_type: projection.data_type.then(|| column.value_type.clone()),
+                        nullable: column.value_type.nullable(),
+                        comment: None,
+                        default_expression: None,
+                    });
+                }
+                columns
+            } else {
+                Vec::new()
+            };
+            return Ok(Some(DiscoveredRelation {
+                identity: ConnectorTableIdentity {
+                    instance_id: ConnectorInstanceId::try_from_canonical(catalog)
+                        .expect("the built-in default catalog is a valid instance id"),
+                    namespace: schema,
+                    table: name,
+                },
+                kind: DiscoveryRelationKind::View,
+                columns,
+                view_definition: projection
+                    .view_definition
+                    .then(|| Arc::clone(&view.raw_sql)),
+                version: Some(Arc::clone(&view.version)),
+                retention: creation.storage(),
+            }));
+        }
+        let pin = self.pin(catalog)?;
+        let cpu = self.metadata_cpu(catalog, &pin)?;
+        let schema = schema.to_owned();
+        let name = name.to_owned();
+        self.install(Box::pin(async move {
+            Response::Discovery(
+                pin.discover_relation(&schema, &name, kind, projection, cpu)
+                    .await
+                    .map(|result| result.map(Box::new))
+                    .map_err(Into::into),
+            )
+        }))?;
+        let Response::Discovery(result) = self.receive().await else {
+            panic!("original relation discovery response");
+        };
+        result.map(|value| value.map(|boxed| *boxed))
+    }
+
     async fn schema_names(
         &self,
         catalog: &str,
@@ -680,6 +923,18 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
         schema: &str,
         _: &ConnectorRequestContext,
     ) -> Result<bool, SystemTableError> {
+        if self
+            .show
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|facts| facts.schema.as_ref())
+            .is_some_and(|(cached_catalog, cached_schema)| {
+                cached_catalog == catalog && cached_schema == schema
+            })
+        {
+            return Ok(true);
+        }
         if catalog == novarocks_types::naming::DEFAULT_CATALOG {
             return Ok(self.local_schemas.iter().any(|name| name == schema));
         }
@@ -717,12 +972,7 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
     ) -> Result<Vec<String>, SystemTableError> {
         let pin = self.pin(catalog)?;
         let schema = schema.to_owned();
-        let cpu = self.factory()?.port_for(pin.pin()).map_err(work_error)?;
-        self.io
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .ports
-            .push(Arc::clone(&cpu));
+        let cpu = self.metadata_cpu(catalog, &pin)?;
         self.install(Box::pin(async move {
             Response::Names(pin.view_names(&schema, cpu).await.map_err(Into::into))
         }))?;
@@ -888,7 +1138,11 @@ impl SystemTableSnapshotFactPort for FrontendSystemTableFacts {
                 self.planning().map_err(sql_error)?.batch_target_rows,
             )
             .map_err(sql_error)?;
-            let snapshot = provider.snapshot(&request).await.map_err(sql_error)?;
+            let snapshot = match need.statement_relation() {
+                Some(kind) => self.snapshot_show(kind, &request).await,
+                None => provider.snapshot(&request).await,
+            }
+            .map_err(sql_error)?;
             facts.push(
                 SystemTableSnapshotFact::try_new(need, snapshot.batches, snapshot.storage)
                     .map_err(|e| SqlCompileError::Compilation(e.to_string()))?,

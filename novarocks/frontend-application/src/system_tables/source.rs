@@ -23,7 +23,10 @@ use novarocks_mv_application::persistence::codec::{PublicationInput, RelationOcc
 use novarocks_mv_application::readiness::{MvKeyedProjectionInventory, MvListedManageability};
 use novarocks_query_application::system_tables::{SystemTableError, SystemTableSnapshot};
 use novarocks_query_application::view::LocalViewSnapshot;
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorRequestContext};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorRequestContext, DiscoveredRelation,
+    DiscoveryProjection, DiscoveryRelationKind,
+};
 use novarocks_sql::system_table::SystemTableDeclaration;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 use std::sync::Arc;
@@ -37,15 +40,18 @@ pub(crate) enum SystemValue {
     Int64(i64),
     Boolean(bool),
     TimestampMillis(i64),
+    ZonedTimestamp([u8; 14]),
     Utf8List(Vec<String>),
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) enum SystemValueRef<'a> {
     Null,
     Utf8(&'a str),
+    FormattedText(&'a (dyn std::fmt::Display + Sync)),
     Int64(i64),
     Boolean(bool),
     TimestampMillis(i64),
+    ZonedTimestamp([u8; 14]),
     Utf8List(&'a [String]),
 }
 impl<'a> From<Option<&'a str>> for SystemValueRef<'a> {
@@ -64,6 +70,7 @@ impl SystemValue {
             Self::Int64(value) => SystemValueRef::Int64(*value),
             Self::Boolean(value) => SystemValueRef::Boolean(*value),
             Self::TimestampMillis(value) => SystemValueRef::TimestampMillis(*value),
+            Self::ZonedTimestamp(value) => SystemValueRef::ZonedTimestamp(*value),
             Self::Utf8List(value) => SystemValueRef::Utf8List(value),
         }
     }
@@ -190,11 +197,75 @@ pub(crate) fn repository_error(
     ConnectorError::from_domain(kind, error).into()
 }
 
+pub(crate) struct MetadataNames {
+    names: Vec<String>,
+    _retained: Option<novarocks_workload_control::ResultPayloadBytes>,
+}
+
+impl MetadataNames {
+    pub(crate) fn new(
+        names: Vec<String>,
+        retained: novarocks_workload_control::ResultPayloadBytes,
+    ) -> Self {
+        Self {
+            names,
+            _retained: Some(retained),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture(names: Vec<String>) -> Self {
+        Self {
+            names,
+            _retained: None,
+        }
+    }
+}
+
+impl std::ops::Deref for MetadataNames {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.names
+    }
+}
+
+impl<'a> IntoIterator for &'a MetadataNames {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.names.iter()
+    }
+}
+
+pub(crate) struct RuntimeMetadataObservation<'a> {
+    pub(crate) metadata: &'a super::runtime::FrontendRuntimeMetadata,
+    pub(crate) capacity:
+        &'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    pub(crate) principal: Option<&'a str>,
+}
+
 /// Implementations retain the original statement pins, I/O owner, CPU sources
 /// and StateStore requests in their stable Source until actual close. Borrowing
 /// or cancelling a provider future does not retire those original resources.
 #[async_trait]
 pub(crate) trait StatementSystemTableSource: Send + Sync {
+    fn runtime_metadata(&self) -> Option<RuntimeMetadataObservation<'_>> {
+        None
+    }
+    fn catalog_names(&self) -> Result<MetadataNames, SystemTableError>;
+    fn supports_discovery(&self, catalog: &str) -> Result<bool, SystemTableError>;
+    fn can_probe_discovery_name(&self, catalog: &str, name: &str)
+    -> Result<bool, SystemTableError>;
+    async fn discover_relation(
+        &self,
+        catalog: &str,
+        schema: &str,
+        name: &str,
+        kind: Option<DiscoveryRelationKind>,
+        projection: DiscoveryProjection,
+    ) -> Result<Option<DiscoveredRelation>, SystemTableError>;
     async fn schema_names(
         &self,
         catalog: &str,

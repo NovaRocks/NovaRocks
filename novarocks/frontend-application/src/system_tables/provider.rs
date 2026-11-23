@@ -16,6 +16,9 @@
 // under the License.
 
 use super::construction::RowStage;
+
+#[path = "metadata_provider.rs"]
+mod metadata_provider;
 use super::source::{StatementSystemTableSource, SystemValueRef};
 use async_trait::async_trait;
 use novarocks_mv_application::freshness::mv_publication_freshness;
@@ -24,8 +27,7 @@ use novarocks_query_application::system_tables::{
     SystemTableSnapshot,
 };
 use novarocks_spi::connector::{ConnectorErrorKind, ConnectorOperationControl};
-use novarocks_sql::system_table::{SystemTableBinding, SystemTableKeyValues};
-use novarocks_types::naming::DEFAULT_CATALOG;
+use novarocks_sql::system_table::SystemTableBinding;
 use std::sync::Arc;
 
 pub(crate) fn materialized_view_states_registration()
@@ -56,6 +58,7 @@ pub(crate) fn materialized_view_states_registration()
     .into_iter()
     .map(|(name, ty, nullable)| SystemTableColumn {
         name: name.into(),
+        hidden: false,
         value_type: FunctionValueType::new(ty, nullable),
     })
     .collect::<Vec<_>>();
@@ -105,7 +108,7 @@ impl FrontendSystemTableProvider {
         Self { registry, source }
     }
 }
-struct Batches<'a> {
+pub(super) struct Batches<'a> {
     provider: &'a FrontendSystemTableProvider,
     request: &'a SystemTableRequest<'a>,
     rows: usize,
@@ -124,7 +127,10 @@ impl<'a> Batches<'a> {
     ) -> Result<(), SystemTableError> {
         self.push_values(&values.map(SystemValueRef::from)).await
     }
-    async fn push_values(&mut self, values: &[SystemValueRef<'_>]) -> Result<(), SystemTableError> {
+    pub(super) async fn push_values(
+        &mut self,
+        values: &[SystemValueRef<'_>],
+    ) -> Result<(), SystemTableError> {
         self.request
             .context
             .original_operation_control()
@@ -320,137 +326,29 @@ impl SystemTableProvider for FrontendSystemTableProvider {
                         .await?;
                 }
             }
-            (binding, "information_schema", "schemata" | "tables") => {
-                let catalog = match binding {
-                    SystemTableBinding::System => "system",
-                    SystemTableBinding::Catalog(name) => name.as_str(),
-                };
-                let schemata = request.declaration.table == "schemata";
-                if !schemata
-                    && !request.key_constraint.allows(3, "BASE TABLE")
-                    && !request.key_constraint.allows(3, "VIEW")
-                {
-                    return batches.finish().await;
-                }
-                let schema_ordinal = 1;
-                let mut schemas = if let Some(SystemTableKeyValues::Values(values)) =
-                    request.key_constraint.values_for(schema_ordinal)
-                {
-                    let mut selected = Vec::new();
-                    for schema in values {
-                        let exists = if matches!(binding, SystemTableBinding::System) {
-                            self.registry.schemas(binding).contains(schema)
-                        } else {
-                            self.source
-                                .schema_exists(catalog, schema, request.context)
-                                .await?
-                        };
-                        if exists {
-                            selected.push(schema.clone());
-                        }
-                    }
-                    selected
+            (SystemTableBinding::System, "runtime", "nodes" | "queries") => {
+                let observation = self.source.runtime_metadata().ok_or_else(|| {
+                    SystemTableError::Internal("runtime observation owner is not installed".into())
+                })?;
+                if request.declaration.table == "nodes" {
+                    observation
+                        .metadata
+                        .nodes(&mut batches, request, observation.capacity)
+                        .await?;
                 } else {
-                    self.schema_names(binding, catalog, request).await?
-                };
-                schemas.sort();
-                schemas.dedup();
-                for schema in schemas {
-                    if !request.key_constraint.allows(1, &schema) {
-                        continue;
-                    }
-                    if schemata && schema == "information_schema" {
-                        continue;
-                    }
-                    if schemata {
-                        batches
-                            .push(&[
-                                Some(catalog),
-                                Some(&schema),
-                                Some("utf8"),
-                                Some("utf8_general_ci"),
-                                None,
-                            ])
-                            .await?;
-                        continue;
-                    }
-                    if matches!(binding, SystemTableBinding::System) {
-                        for declaration in self.registry.declarations(binding) {
-                            if declaration.schema == schema
-                                && request.key_constraint.allows(2, &declaration.table)
-                                && request.key_constraint.allows(3, "BASE TABLE")
-                            {
-                                batches
-                                    .push(&[
-                                        Some(catalog),
-                                        Some(&schema),
-                                        Some(&declaration.table),
-                                        Some("BASE TABLE"),
-                                    ])
-                                    .await?;
-                            }
-                        }
-                        continue;
-                    }
-                    if catalog != DEFAULT_CATALOG && request.key_constraint.allows(3, "BASE TABLE")
-                    {
-                        let mut names = self
-                            .source
-                            .table_names(catalog, &schema, request.context)
-                            .await?;
-                        names.sort();
-                        names.dedup();
-                        for name in names {
-                            if request.key_constraint.allows(2, &name) {
-                                batches
-                                    .push(&[
-                                        Some(catalog),
-                                        Some(&schema),
-                                        Some(&name),
-                                        Some("BASE TABLE"),
-                                    ])
-                                    .await?;
-                            }
-                        }
-                    }
-                    if request.key_constraint.allows(3, "VIEW") {
-                        let mut names = if catalog == DEFAULT_CATALOG {
-                            self.source
-                                .local_view_snapshot()
-                                .names_in_namespace(catalog, &schema)
-                                .map(str::to_owned)
-                                .collect()
-                        } else {
-                            match self
-                                .source
-                                .view_names(catalog, &schema, request.context)
-                                .await
-                            {
-                                Ok(names) => names,
-                                Err(SystemTableError::Provider(error))
-                                    if error.kind() == ConnectorErrorKind::Unsupported =>
-                                {
-                                    vec![]
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        };
-                        names.sort();
-                        names.dedup();
-                        for name in names {
-                            if request.key_constraint.allows(2, &name) {
-                                batches
-                                    .push(&[
-                                        Some(catalog),
-                                        Some(&schema),
-                                        Some(&name),
-                                        Some("VIEW"),
-                                    ])
-                                    .await?;
-                            }
-                        }
-                    }
+                    let principal = observation.principal.ok_or_else(|| {
+                        SystemTableError::Internal(
+                            "runtime queries require an admitted observer".into(),
+                        )
+                    })?;
+                    observation
+                        .metadata
+                        .queries(&mut batches, request, principal)
+                        .await?;
                 }
+            }
+            (_, "information_schema", _) | (SystemTableBinding::System, "jdbc", _) => {
+                self.discovery_snapshot(&mut batches, request).await?;
             }
             _ => {
                 return Err(SystemTableError::InvalidRequest(
@@ -459,19 +357,5 @@ impl SystemTableProvider for FrontendSystemTableProvider {
             }
         }
         batches.finish().await
-    }
-}
-impl FrontendSystemTableProvider {
-    async fn schema_names(
-        &self,
-        binding: &SystemTableBinding,
-        catalog: &str,
-        request: &SystemTableRequest<'_>,
-    ) -> Result<Vec<String>, SystemTableError> {
-        if matches!(binding, SystemTableBinding::System) {
-            Ok(self.registry.schemas(binding))
-        } else {
-            self.source.schema_names(catalog, request.context).await
-        }
     }
 }

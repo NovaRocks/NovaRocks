@@ -32,7 +32,8 @@ use novarocks_query_application::api::{
     StatementNativeHealthFailure,
 };
 use novarocks_query_application::session_control::{
-    GovernedActionContext, GovernedStatementAction, GovernedStatementResidual, StatementActionValue,
+    ClientQueryTiming, GovernedActionContext, GovernedStatementAction, GovernedStatementResidual,
+    StatementActionValue,
 };
 use novarocks_spi::connector::{
     ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoProfile, SharedDependency,
@@ -41,13 +42,23 @@ use novarocks_state_store_api::StateStoreExecutionRequests;
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::task::{Context, Poll};
 
+pub(super) enum ReadQueryInput {
+    Query(Box<ast::Query>),
+    Show(novarocks_query_application::sql::trino_admission::TrinoShowAction),
+}
+
 pub(super) struct ReadPreparationInput {
     pub(super) compiler: FrontendQueryCompiler,
     pub(super) topology: BackendTopologyService,
     pub(super) role: ClusterRole,
     pub(super) optimizer_limit: u64,
     pub(super) sql: Arc<str>,
-    pub(super) query: Box<ast::Query>,
+    pub(super) query: ReadQueryInput,
+    pub(super) principal: Option<Arc<str>>,
+    pub(super) timing: Option<ClientQueryTiming>,
+    pub(super) session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
+    pub(super) session_catalogs: SessionCatalogService,
     pub(super) state: SessionSqlState,
     pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
     pub(super) deadline: Option<Instant>,
@@ -68,7 +79,19 @@ pub(super) async fn prepare_read(
     input: ReadPreparationInput,
 ) -> Result<Result<PreparedQueryOperation, QueryServiceError>, StatementNativeHealthFailure> {
     let prepared: Result<_, QueryServiceError> = async {
-        let query = input.query;
+        let query = match input.query {
+            ReadQueryInput::Query(query) => compiler::ReadCompilerInput::Query(query),
+            ReadQueryInput::Show(action) => compiler::ReadCompilerInput::Show(Box::new(
+                crate::query_execution::completion_facts::ShowInput {
+                    action,
+                    source: Arc::clone(&input.sql),
+                    catalog: input.state.current_catalog().map(str::to_owned),
+                    schema: input.state.explicit_database().map(str::to_owned),
+                    properties: input.session_properties,
+                    catalogs: input.session_catalogs,
+                },
+            )),
+        };
         let topology =
             wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
                 .await?;
@@ -135,7 +158,11 @@ pub(super) async fn prepare_read(
     let result = input
         .compiler
         .prepare_read_async(
-            *query,
+            query,
+            compiler::ReadObservation {
+                principal: input.principal,
+                timing: input.timing,
+            },
             input.purpose,
             &context,
             Some(options),
@@ -799,7 +826,7 @@ pub(super) fn build_read_action(
     environment: &QueryActionEnvironment,
     inputs: QueryActionInputs,
     sql: Arc<str>,
-    query: Box<ast::Query>,
+    query: ReadQueryInput,
     state: SessionSqlState,
     purpose: FrontendQueryPurpose,
 ) -> Result<Box<dyn GovernedStatementAction>, QueryServiceError> {
@@ -809,6 +836,8 @@ pub(super) fn build_read_action(
         cancellation,
         window,
         planning_cpu,
+        principal,
+        timing,
         statement_time,
         #[cfg(novarocks_dev_controls)]
         observation,
@@ -870,6 +899,10 @@ pub(super) fn build_read_action(
         optimizer_limit: environment.optimizer_limit,
         sql,
         query,
+        principal,
+        timing,
+        session_properties: Arc::clone(&environment.session_properties),
+        session_catalogs: Arc::clone(&environment.session_catalogs),
         state,
         statement_time,
         deadline,

@@ -31,6 +31,24 @@ use novarocks_physical_plan::{NodeKind, SystemRelationData};
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageHold, ValueTypeStorageLifetime};
 
 fn declaration(need: &CatalogRelationNeed) -> Arc<SystemTableDeclaration> {
+    let text = FunctionValueType::new(DataType::Utf8, false);
+    let key_type = if need.relation().table == "bounded_fixture" {
+        use novarocks_type_contract::{
+            CharacterKind, CharacterType, ValueKind, ValueLayout, ValueTypeRef,
+        };
+        let storage = ValueTypeStorageLifetime::pure();
+        let character = CharacterType::new(CharacterKind::Varchar, 16).unwrap();
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::BoundedCharacter(character),
+            false,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = ValueLayout::try_new(&DataType::Utf8, storage).unwrap();
+        FunctionValueType::try_from_value(semantic, layout).unwrap()
+    } else {
+        text.clone()
+    };
     Arc::new(SystemTableDeclaration {
         binding: if need.relation().catalog == "system" {
             SystemTableBinding::System
@@ -43,7 +61,12 @@ fn declaration(need: &CatalogRelationNeed) -> Arc<SystemTableDeclaration> {
             .into_iter()
             .map(|name| SystemTableColumn {
                 name: name.into(),
-                value_type: FunctionValueType::new(DataType::Utf8, false),
+                hidden: false,
+                value_type: if name == "schema_name" {
+                    key_type.clone()
+                } else {
+                    text.clone()
+                },
             })
             .collect::<Vec<_>>()
             .into(),
@@ -286,6 +309,60 @@ fn disjunction_and_nonkey_filters_do_not_prune_provider_rows() {
             "{predicate}"
         );
     }
+}
+
+#[test]
+fn exact_like_scope_uses_original_unicode_and_escape_semantics() {
+    for (predicate, expected) in [
+        ("schema_name LIKE 'café'", Some("café")),
+        ("schema_name LIKE 'a!_b!%c!!' ESCAPE '!'", Some("a_b%c!")),
+        ("schema_name LIKE 'b^_%' ESCAPE '^'", None),
+        ("schema_name LIKE 'a_b'", None),
+        ("schema_name LIKE 'a%b'", None),
+        ("schema_name LIKE 'a!z' ESCAPE '!'", None),
+        ("schema_name LIKE 'z' ESCAPE '!!'", None),
+        ("schema_name NOT LIKE 'z'", None),
+        ("payload LIKE 'z'", None),
+        ("schema_name LIKE concat(payload, 'x')", None),
+        ("schema_name LIKE 'z' OR payload = '1'", None),
+    ] {
+        let provider = snapshot_need(&format!(
+            "SELECT payload FROM system.metadata.fixture WHERE {predicate}"
+        ));
+        let SqlNeedBatch::ProviderInputs { system_tables, .. } = provider.needs() else {
+            panic!("expected a system table for {predicate}");
+        };
+        let constraint = system_tables[0].key_constraint();
+        let expected = expected.map(|literal| {
+            crate::system_table::SystemTableKeyValues::Values([literal.to_owned()].into())
+        });
+        assert_eq!(constraint.values_for(0), expected.as_ref(), "{predicate}");
+        // The key proof only narrows discovery; SQL still owns the predicate.
+        let completed = finish(provider);
+        assert!(
+            completed
+                .plan()
+                .fragments()
+                .values()
+                .flat_map(|fragment| fragment.nodes().values())
+                .any(|node| matches!(node.kind, NodeKind::Filter { .. })),
+            "{predicate}"
+        );
+    }
+}
+
+#[test]
+fn system_table_exact_scope_accepts_a_lossless_bounded_character_widening() {
+    let provider = snapshot_need(
+        "SELECT payload FROM system.metadata.bounded_fixture WHERE CAST(schema_name AS varchar) LIKE 'caf!_' ESCAPE '!'",
+    );
+    let SqlNeedBatch::ProviderInputs { system_tables, .. } = provider.needs() else {
+        panic!("expected a system table snapshot need");
+    };
+    let constraint = system_tables[0].key_constraint();
+    assert!(constraint.allows(0, "caf_"));
+    assert!(!constraint.allows(0, "cafz"));
+    let _ = finish(provider);
 }
 
 #[test]

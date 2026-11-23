@@ -24,8 +24,19 @@ use crate::query_execution::completion_facts::{
 };
 use novarocks_query_application::api::StatementNativeHealthFailure;
 
+pub(crate) enum ReadCompilerInput {
+    Query(Box<Query>),
+    Show(Box<crate::query_execution::completion_facts::ShowInput>),
+}
+
+pub(crate) struct ReadObservation {
+    pub(crate) principal: Option<Arc<str>>,
+    pub(crate) timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
+}
+
 struct ReadSqlInput {
-    query: Query,
+    query: ReadCompilerInput,
+    observation: ReadObservation,
     current_catalog: Option<String>,
     current_database: String,
     family: Option<novarocks_result_contract::ClientPresentationFamily>,
@@ -37,7 +48,8 @@ impl FrontendQueryCompiler {
 
     pub(crate) async fn prepare_read_async(
         &self,
-        query: Query,
+        query: ReadCompilerInput,
+        observation: ReadObservation,
         purpose: FrontendQueryPurpose,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
@@ -64,6 +76,7 @@ impl FrontendQueryCompiler {
             purpose,
             ReadSqlInput {
                 query,
+                observation,
                 current_catalog: context.session().current_catalog().map(str::to_owned),
                 current_database: context.session().current_database().to_owned(),
                 family: context.session().presentation().copied(),
@@ -102,6 +115,7 @@ impl FrontendQueryCompiler {
         } = ports;
         let ReadSqlInput {
             query,
+            observation: ReadObservation { principal, timing },
             current_catalog,
             current_database,
             family,
@@ -110,13 +124,7 @@ impl FrontendQueryCompiler {
             Ok(bindings) => Arc::new(bindings),
             Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
         };
-        let request: Result<
-            (
-                novarocks_sql::compiler::SqlFinalPlanCompileRequest,
-                novarocks_physical_plan::PlanVersionId,
-            ),
-            FrontendQueryCompilerError,
-        > = (|| {
+        let install = (|| {
             let connector_context = connector_planning_context.request();
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
@@ -138,39 +146,77 @@ impl FrontendQueryCompiler {
                     sql_compile_control_from_execution(execution),
                     execution.cancellation().clone(),
                     Arc::clone(planning_cpu),
-                ),
+                )
+                .with_query_observer_principal(principal),
                 crate::query_execution::compiler::typed_connector_session()
                     .map_err(FrontendQueryCompilerError::Engine)?,
                 Arc::clone(execution.session_property_inputs()),
             )
-            .map_err(FrontendQueryCompilerError::Engine)?;
-            let version = crate::query_execution::physical_encoding::mint_plan_version();
-            Ok((
-                novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
-                    version,
-                    SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
-                    SqlCompileIntent::Query,
-                    SqlSessionContext {
-                        sql_semantics: execution.sql_semantics().clone(),
-                        current_catalog: current_catalog.clone(),
-                        current_database: current_database.clone(),
-                        optimizer_settings: execution.optimizer_settings().clone(),
-                    },
-                    SqlPlanningEnvironment::Distributed,
-                    novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
-                    self.sealed_functions(),
-                    self.constant_policy(),
-                    sql_compile_control_from_execution(execution),
-                    Self::pipeline_dop_domain(query_options.as_ref())?,
-                    novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
-                ),
-                version,
-            ))
+            .map_err(FrontendQueryCompilerError::Engine)
         })();
-        let (request, version) = match request {
-            Ok(request) => request,
+        if let Err(error) = install {
+            return Ok(Err(error));
+        }
+        let (query, statement) = match query {
+            ReadCompilerInput::Query(query) => {
+                let statement = SqlStatementInput::query_with_admitted_session(query.clone());
+                (query, statement)
+            }
+            ReadCompilerInput::Show(show) => {
+                let prepared = provider_source
+                    .prepare_show(
+                        *show,
+                        self.sealed_functions(),
+                        execution.session_property_inputs(),
+                    )
+                    .await;
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let statement = match prepared.private_relation {
+                    Some((kind, declaration)) => {
+                        match SqlStatementInput::query_with_statement_system_relation(
+                            prepared.query.clone(),
+                            kind,
+                            declaration,
+                        ) {
+                            Ok(statement) => statement,
+                            Err(error) => {
+                                return Ok(Err(FrontendQueryCompilerError::from_compile(error)));
+                            }
+                        }
+                    }
+                    None => SqlStatementInput::query_with_admitted_session(prepared.query.clone()),
+                };
+                (prepared.query, statement)
+            }
+        };
+        let pipeline_dop = match Self::pipeline_dop_domain(query_options.as_ref()) {
+            Ok(dop) => dop,
             Err(error) => return Ok(Err(error)),
         };
+        let version = crate::query_execution::physical_encoding::mint_plan_version();
+        let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
+            version,
+            statement,
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
+                current_catalog: current_catalog.clone(),
+                current_database: current_database.clone(),
+                optimizer_settings: execution.optimizer_settings().clone(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
+            self.sealed_functions(),
+            self.constant_policy(),
+            observe_plan_timing(sql_compile_control_from_execution(execution), timing),
+            pipeline_dop,
+            novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
+        );
+        #[cfg(not(novarocks_dev_controls))]
+        drop(query);
         let encoding_control = request.control().clone();
         planning_cpu.install_catalog_qualification_source(
             bindings,
@@ -188,7 +234,7 @@ impl FrontendQueryCompiler {
                 controls,
                 catalog: current_catalog,
                 database: current_database,
-                query,
+                query: *query,
                 target: rewrite_statement,
                 cancellation: execution.cancellation().clone(),
             }

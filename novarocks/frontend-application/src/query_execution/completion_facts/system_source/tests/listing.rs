@@ -359,6 +359,12 @@ async fn original_metadata_cpu_footer_precedes_source_close_and_window_retiremen
     let mut fixture = Fixture::new(&provider, ResultWindowClass::Client).await;
     let _release_on_panic = Release(gate.clone());
     let source = fixture.source();
+    {
+        let pin = source.pin("catalog").unwrap();
+        let original = source.metadata_cpu("catalog", &pin).unwrap();
+        let alias = source.metadata_cpu("catalog", &pin).unwrap();
+        assert!(Arc::ptr_eq(&original, &alias));
+    }
     let error = tokio::time::timeout(
         Duration::from_secs(5),
         driven(

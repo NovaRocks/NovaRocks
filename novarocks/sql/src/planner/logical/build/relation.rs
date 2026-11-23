@@ -40,19 +40,21 @@ pub(super) fn plan_relation_scoped(
         Relation::SystemTable {
             declaration,
             output_columns,
+            required_columns,
+            statement_relation,
             ..
         } => {
             let columns = output_columns
                 .iter()
                 .map(|column| column.planner_column())
                 .collect::<Vec<_>>();
-            let required_columns = (0..columns.len()).collect();
             Ok(LogicalPlanNode::new(
                 LogicalPlanKind::SystemTable(
                     crate::planner::system_relation::PlanSystemTableNode {
                         declaration,
                         columns,
                         required_columns,
+                        statement_relation,
                     },
                 ),
                 vec![],

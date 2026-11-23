@@ -21,6 +21,7 @@ use async_trait::async_trait;
 
 use crate::cancellation::QueryCancellationReason;
 use crate::protocol_delivery::QuerySessionOutput;
+use crate::query_control::ClientQueryClaim;
 use crate::session_control::ClientQueryId;
 use crate::session_effects::SessionEffects;
 use crate::session_error::QueryServiceError;
@@ -140,6 +141,7 @@ pub struct StatementSessionRequest {
     principal: Arc<str>,
     session: SessionValue,
     admission: StatementAdmissionPublisher,
+    client_query_claim: Option<ClientQueryClaim>,
 }
 impl StatementSessionRequest {
     pub fn new(
@@ -152,13 +154,33 @@ impl StatementSessionRequest {
             principal: principal.into(),
             session,
             admission: StatementAdmissionPublisher::default(),
+            client_query_claim: None,
         }
+    }
+    pub fn with_client_query_claim(mut self, claim: ClientQueryClaim) -> Self {
+        self.client_query_claim = Some(claim);
+        self
     }
     pub fn admission(&self) -> StatementAdmissionPublisher {
         self.admission.clone()
     }
     pub fn into_parts(self) -> (ClientQueryId, Arc<str>, SessionValue) {
         (self.client_query_id, self.principal, self.session)
+    }
+    pub fn into_parts_with_client_query_claim(
+        self,
+    ) -> (
+        ClientQueryId,
+        Arc<str>,
+        SessionValue,
+        Option<ClientQueryClaim>,
+    ) {
+        (
+            self.client_query_id,
+            self.principal,
+            self.session,
+            self.client_query_claim,
+        )
     }
 }
 

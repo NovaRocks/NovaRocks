@@ -24,6 +24,7 @@ mod implementation_availability;
 mod numeric_negation;
 mod numeric_operators;
 mod set_operations;
+mod system_relation_visibility;
 mod truth_test_analysis;
 
 mod installed_domains;

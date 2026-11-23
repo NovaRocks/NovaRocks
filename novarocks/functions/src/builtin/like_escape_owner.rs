@@ -74,7 +74,7 @@ impl LikeEscapeOwner {
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        let function = "builtin.scalar/__like_with_escape/v1";
+        let function = crate::native_like::ESCAPE_FUNCTION_ID;
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar

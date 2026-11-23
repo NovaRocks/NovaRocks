@@ -72,6 +72,7 @@ struct SnapshotInput {
 struct Source {
     local: LocalViewSnapshot,
     calls: Mutex<Vec<String>>,
+    schemas: Vec<String>,
     tables: Vec<String>,
     views: Result<Vec<String>, ConnectorError>,
     table_error: Option<ConnectorError>,
@@ -87,6 +88,7 @@ impl Source {
         Self {
             local: QueryViewService::new().catalog_snapshot().unwrap(),
             calls: Mutex::new(vec![]),
+            schemas: vec!["db".into(), "other".into()],
             tables: vec!["t".into()],
             views: Ok(vec!["v".into()]),
             table_error: None,
@@ -104,13 +106,35 @@ impl Source {
 }
 #[async_trait]
 impl StatementSystemTableSource for Source {
+    fn catalog_names(&self) -> Result<super::MetadataNames, SystemTableError> {
+        Ok(super::MetadataNames::fixture(vec![
+            "ice".into(),
+            "system".into(),
+        ]))
+    }
+    fn supports_discovery(&self, _: &str) -> Result<bool, SystemTableError> {
+        Ok(true)
+    }
+    fn can_probe_discovery_name(&self, _: &str, name: &str) -> Result<bool, SystemTableError> {
+        Ok(novarocks_types::naming::normalize_identifier(name).is_ok_and(|key| key == name))
+    }
+    async fn discover_relation(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<novarocks_spi::connector::DiscoveryRelationKind>,
+        _: novarocks_spi::connector::DiscoveryProjection,
+    ) -> Result<Option<novarocks_spi::connector::DiscoveredRelation>, SystemTableError> {
+        Ok(None)
+    }
     async fn schema_names(
         &self,
         _catalog: &str,
         _context: &ConnectorRequestContext,
     ) -> Result<Vec<String>, SystemTableError> {
         self.call("schemas");
-        Ok(vec!["db".into(), "other".into()])
+        Ok(self.schemas.clone())
     }
     async fn schema_exists(
         &self,
@@ -119,7 +143,8 @@ impl StatementSystemTableSource for Source {
         _context: &ConnectorRequestContext,
     ) -> Result<bool, SystemTableError> {
         self.call(format!("exists:{schema}"));
-        Ok(schema == "db" || schema == "other")
+        let key = novarocks_types::naming::normalize_identifier(schema).unwrap();
+        Ok(self.schemas.contains(&key))
     }
     async fn table_names(
         &self,
@@ -357,22 +382,14 @@ async fn schema_and_type_constraints_prune_provider_calls_and_preserve_literals(
         SystemTableBinding::Catalog("ice".into()),
         "information_schema",
         "schemata",
-        vec![1, 2, 3, 4],
+        vec![1],
         keys(&[(1, &["db", "DB"])]),
         2,
     )
     .await
     .unwrap();
-    assert_eq!(
-        rows(&result),
-        vec![vec![
-            Some("db".into()),
-            Some("utf8".into()),
-            Some("utf8_general_ci".into()),
-            None
-        ]]
-    );
-    assert_eq!(*source.calls.lock().unwrap(), ["exists:DB", "exists:db"]);
+    assert_eq!(rows(&result), vec![vec![Some("db".into())]]);
+    assert_eq!(*source.calls.lock().unwrap(), ["schemas", "exists:db"]);
     let source = Arc::new(Source::new());
     let mut none = SystemTableKeyConstraint::default();
     none.set_values(1, SystemTableKeyValues::None);
@@ -394,10 +411,62 @@ async fn schema_and_type_constraints_prune_provider_calls_and_preserve_literals(
     assert!(source.calls.lock().unwrap().is_empty());
 }
 #[tokio::test]
+async fn discovery_filters_noncanonical_strings_against_original_inventory() {
+    let mut source = Source::new();
+    source.schemas.push("MixedSchema".into());
+    source.tables.push("MixedTable".into());
+    let source = Arc::new(source);
+
+    let schemas = snapshot(
+        source.clone(),
+        SystemTableBinding::Catalog("ice".into()),
+        "information_schema",
+        "schemata",
+        vec![1],
+        keys(&[(1, &["", "DB", "MixedSchema", "db"])]),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(&schemas),
+        vec![vec![Some("MixedSchema".into())], vec![Some("db".into())]]
+    );
+    assert_eq!(*source.calls.lock().unwrap(), ["schemas", "exists:db"]);
+
+    source.calls.lock().unwrap().clear();
+    let tables = snapshot(
+        source.clone(),
+        SystemTableBinding::System,
+        "jdbc",
+        "tables",
+        vec![1, 2],
+        keys(&[
+            (0, &["ice"]),
+            (1, &["MixedSchema"]),
+            (2, &["", "T", "MixedTable", "t$files"]),
+            (3, &["TABLE"]),
+        ]),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(&tables),
+        vec![vec![Some("MixedSchema".into()), Some("MixedTable".into())]]
+    );
+    assert_eq!(
+        *source.calls.lock().unwrap(),
+        ["schemas", "tables:MixedSchema"]
+    );
+}
+
+#[tokio::test]
 async fn unsupported_views_are_empty_but_table_and_io_errors_keep_the_original_fact() {
     let mut source = Source::new();
-    source.views = Err(ConnectorError::new(
+    source.views = Err(ConnectorError::from_domain_static(
         ConnectorErrorKind::Unsupported,
+        novarocks_spi::connector::DiscoveryViewDomainUnavailable("view listing"),
         "no view listing",
     ));
     assert!(
@@ -457,7 +526,12 @@ async fn system_catalog_uses_registry_and_large_zero_column_snapshots_keep_cardi
             .await
             .unwrap()
         ),
-        vec![vec![Some("metadata".into())]]
+        vec![
+            vec![Some("jdbc".into())],
+            vec![Some("metadata".into())],
+            vec![Some("runtime".into())],
+            vec![Some("information_schema".into())],
+        ]
     );
     assert_eq!(
         rows(
@@ -467,7 +541,7 @@ async fn system_catalog_uses_registry_and_large_zero_column_snapshots_keep_cardi
                 "information_schema",
                 "tables",
                 vec![1, 2, 3],
-                SystemTableKeyConstraint::default(),
+                keys(&[(1, &["metadata"])]),
                 2
             )
             .await

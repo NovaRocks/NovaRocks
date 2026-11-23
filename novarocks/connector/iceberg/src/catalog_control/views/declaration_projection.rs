@@ -261,15 +261,7 @@ pub(super) fn columns(
 ) -> Result<Vec<ConnectorViewColumn>, Failure> {
     let mut columns = creation.reserve::<ConnectorViewColumn>(schema.as_struct().fields().len())?;
     for field in schema.as_struct().fields() {
-        let (layout, semantic) = read_type(&field.field_type, true, 1, &mut 0, creation)?;
-        creation.request(ValueLayout::storage_allocation_layout().map_err(|_| resource())?)?;
-        let storage = creation.storage();
-        let layout = ValueLayout::try_from_normalized_arrow_observed(layout, storage, |units| {
-            creation.work(units).map_err(LayoutFailure::Caller)
-        })
-        .map_err(LayoutFailure::into_failure)?;
-        let value_type = FunctionValueType::try_from_value(semantic, layout)
-            .map_err(|_| unsupported_failure())?;
+        let value_type = column_type(field, creation)?;
         columns.push(ConnectorViewColumn {
             name: arc_text(&field.name, creation)?,
             value_type,
@@ -277,6 +269,20 @@ pub(super) fn columns(
     }
     Ok(columns)
 }
+pub(super) fn column_type(
+    field: &NestedField,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    let (layout, semantic) = read_type(&field.field_type, true, 1, &mut 0, creation)?;
+    creation.request(ValueLayout::storage_allocation_layout().map_err(|_| resource())?)?;
+    let storage = creation.storage();
+    let layout = ValueLayout::try_from_normalized_arrow_observed(layout, storage, |units| {
+        creation.work(units).map_err(LayoutFailure::Caller)
+    })
+    .map_err(LayoutFailure::into_failure)?;
+    FunctionValueType::try_from_value(semantic, layout).map_err(|_| unsupported_failure())
+}
+
 fn read_type(
     declaration: &Type,
     nullable: bool,

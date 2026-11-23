@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 fn registry(entries: usize, padding: &str) -> Arc<SystemTableRegistry> {
     let columns: Arc<[SystemTableColumn]> = Arc::from([SystemTableColumn {
         name: "value".into(),
+        hidden: false,
         value_type: FunctionValueType::new(DataType::Utf8, false),
     }]);
     Arc::new(

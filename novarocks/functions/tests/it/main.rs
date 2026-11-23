@@ -22,6 +22,7 @@ mod from_binary;
 mod kernel_control;
 mod native_between;
 mod native_inlist;
+mod public_function_metadata;
 mod scalar_rows;
 mod synopse;
 mod time_text_cast;

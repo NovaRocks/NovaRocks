@@ -253,6 +253,7 @@ pub(crate) fn analyze_mv_definition_with_factory(
         None,
         None,
         false,
+        None,
         QueryAnalysisPurpose::MaterializedViewDefinition,
     )
 }
@@ -318,6 +319,10 @@ pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The statement source and its write or SHOW inputs are supplied under the original analysis control."
+)]
 pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -329,6 +334,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
 ) -> Result<
     (
         ResolvedQuery,
@@ -349,6 +355,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         materialized,
         assignments,
         root_session_admitted,
+        statement_relation,
         QueryAnalysisPurpose::Ordinary,
     )
 }
@@ -449,6 +456,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         materialized,
         None,
         false,
+        None,
         QueryAnalysisPurpose::Ordinary,
     )
 }
@@ -469,6 +477,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
     purpose: QueryAnalysisPurpose,
 ) -> Result<
     (
@@ -510,6 +519,13 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
             other => AnalyzeError::internal(other.to_string()),
         })?;
     let materialized_values = materialized_source.as_ref().map(|source| source.view());
+    let statement_relation = statement_relation
+        .map(|source| {
+            crate::compiler::statement_system_relation_site(&query)
+                .map(|site| (site, source))
+                .map_err(|error| AnalyzeError::internal(error.to_string()))
+        })
+        .transpose()?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         grouping_scope: std::cell::RefCell::new(None),
@@ -519,6 +535,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         function_catalog,
         constant_policy,
         materialized_values,
+        statement_relation,
         control,
         sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
@@ -647,6 +664,10 @@ pub(super) struct AnalyzerContext<'a> {
     pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) constant_policy: novarocks_functions::ConstantPolicy,
     materialized_values: Option<crate::compiler::materialized_values::MaterializedValuesLoan<'a>>,
+    statement_relation: Option<(
+        &'a ast::Table,
+        &'a crate::compiler::StatementSystemRelationSource,
+    )>,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     pub(super) function_catalog: &'a dyn crate::compiler::SqlFunctionCatalog,
@@ -1021,6 +1042,7 @@ impl<'a> AnalyzerContext<'a> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
+            statement_relation: self.statement_relation,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -2799,15 +2821,17 @@ impl<'a> AnalyzerContext<'a> {
         match relation {
             Relation::SystemTable {
                 alias,
+                declaration,
                 output_columns,
+                required_columns,
                 ..
-            } => {
-                for column in output_columns {
-                    self.check_control()?;
-                    scope.add_field(Some(alias), column);
-                }
-                Ok(())
-            }
+            } => self.add_system_table_scope_fields(
+                scope,
+                alias,
+                declaration,
+                output_columns,
+                required_columns,
+            ),
             Relation::Scan(scan) => {
                 let mut local_scope = self.new_scope();
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
@@ -7460,6 +7484,7 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
             catalog: &TestCatalog,
             current_database: "default",
             function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -7803,6 +7828,7 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
             catalog: &TestCatalog,
             current_database: "default",
             function_catalog: crate::functions::builtin_sql_function_catalog(),

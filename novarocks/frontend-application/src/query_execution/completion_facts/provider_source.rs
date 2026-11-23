@@ -105,6 +105,26 @@ impl FrontendCompletionCustody {
         state.system = Some(system);
         Ok(())
     }
+    pub(crate) async fn prepare_show(
+        &self,
+        show: super::ShowInput,
+        functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+        inputs: &novarocks_query_application::sql::session::registry::SessionPropertyInputs,
+    ) -> Result<super::PreparedShowQuery, crate::query::compiler::FrontendQueryCompilerError> {
+        let system = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .system
+            .clone()
+            .ok_or_else(|| {
+                crate::query::compiler::FrontendQueryCompilerError::Engine(
+                    "SHOW requires the original system relation source".into(),
+                )
+            })?;
+        system.prepare_show_query(show, functions, inputs).await
+    }
+
     /// Borrow the already installed catalog port; no second fact source is created.
     pub(crate) async fn resolve_catalog_relations(
         &self,

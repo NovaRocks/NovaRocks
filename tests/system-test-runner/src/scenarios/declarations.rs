@@ -695,6 +695,14 @@ pub(super) fn for_module(
             "tests/fixtures/iceberg-rest-publication/**".into(),
         ]);
     }
+    if module == "trino_protocol" && name == "trino-protocol/show-metadata-type-signatures" {
+        paths.extend([
+            "novarocks/connector/paimon/**".into(),
+            "novarocks/functions/**".into(),
+            "novarocks/query-application/**".into(),
+            "novarocks/sql/**".into(),
+        ]);
+    }
     if module == "trino_protocol" && name == "trino-protocol/command-completion-shape" {
         paths.extend(
             [

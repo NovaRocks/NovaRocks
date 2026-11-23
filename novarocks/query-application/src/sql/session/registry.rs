@@ -39,7 +39,7 @@ pub use catalog::{
     SessionCatalogPropertyPort, admit_catalog_properties,
 };
 pub use constant::SqlPropertyDeclaration;
-pub use inputs::{SessionPropertyInputs, SessionPropertyMetadata};
+pub use inputs::{SessionPropertyInputs, SessionPropertyMetadata, VisibleSessionProperty};
 pub use sql_entry::{ResolvedSqlSessionProperty, sql_session_property_error_at};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

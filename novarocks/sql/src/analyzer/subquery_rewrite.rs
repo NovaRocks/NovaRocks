@@ -3026,6 +3026,7 @@ impl<'a> AnalyzerContext<'a> {
             purpose: self.purpose,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
+            statement_relation: self.statement_relation,
             control: self.control,
             constant_policy: self.constant_policy,
             catalog: self.catalog,

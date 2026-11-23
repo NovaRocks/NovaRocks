@@ -1901,7 +1901,48 @@ impl EngineFunctionCatalogBuilder {
         })
     }
 }
+/// One SQL-visible name and originally installed overload.
+#[derive(Clone, Copy, Debug)]
+pub struct PublicFunctionOverload<'a> {
+    pub name: &'a str,
+    pub function_id: &'a FunctionId,
+    pub overload_id: &'a FunctionOverloadId,
+    pub return_type: &'a str,
+    pub argument_types: &'a str,
+    pub kind: FunctionKind,
+    pub deterministic: bool,
+    pub description: &'a str,
+}
+
 impl PureEngineFunctionCatalog {
+    /// Borrow published overloads without allocating rows or copying strings.
+    pub fn public_function_overloads(&self) -> impl Iterator<Item = PublicFunctionOverload<'_>> {
+        self.catalog
+            .definitions()
+            .iter()
+            .filter_map(|function| {
+                if function.visibility() == FunctionVisibility::Public {
+                    Some((function, function.binding_declaration()?))
+                } else {
+                    None
+                }
+            })
+            .flat_map(|(function, declaration)| {
+                declaration
+                    .public_signatures()
+                    .map(move |(overload, signature)| PublicFunctionOverload {
+                        name: function.canonical_name(),
+                        function_id: declaration.function_id(),
+                        overload_id: &overload.identity,
+                        return_type: &signature.return_type,
+                        argument_types: &signature.argument_types,
+                        kind: declaration.kind(),
+                        deterministic: overload.semantics.volatility.is_replica_deterministic(),
+                        description: &signature.description,
+                    })
+            })
+    }
+
     pub fn metadata(&self) -> &EngineFunctionCatalog {
         &self.catalog
     }

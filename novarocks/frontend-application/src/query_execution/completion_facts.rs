@@ -35,6 +35,7 @@ pub(crate) use planning_cpu::{
     CompletedReadCpuInput, FrontendPlanningCpuSource, LogicalFinishInput, ReadEncodingInput,
     ReadEncodingPurpose,
 };
+pub(crate) use system_source::{PreparedShowQuery, ShowInput};
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(novarocks_dev_controls)]
@@ -88,6 +89,7 @@ use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 pub(crate) struct CompletionFactOwners {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+    runtime_metadata: Option<Arc<crate::system_tables::FrontendRuntimeMetadata>>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<ConnectorControlHost>,
@@ -104,6 +106,14 @@ impl CompletionFactOwners {
         &self,
     ) -> Arc<novarocks_mv_application::management::ManagementEntrance> {
         Arc::clone(self.mv_readiness.management())
+    }
+
+    pub(crate) fn with_runtime_metadata(
+        mut self,
+        metadata: Option<Arc<crate::system_tables::FrontendRuntimeMetadata>>,
+    ) -> Self {
+        self.runtime_metadata = metadata;
+        self
     }
 
     pub(crate) fn with_state_store_original(
@@ -133,6 +143,7 @@ impl CompletionFactOwners {
         Self {
             view_service,
             system_relations,
+            runtime_metadata: None,
             catalog_service,
             catalog_application,
             connector_control,
@@ -165,6 +176,7 @@ pub(crate) struct StatementFactScope {
     bindings: Arc<QueryTableBindingStore>,
     connector_context: ConnectorRequestContext,
     current_catalog: Option<Arc<str>>,
+    query_observer_principal: Option<Arc<str>>,
     capacity: QueryResultCapacityBinding,
     planning: Option<StatementPlanningInputs>,
     query_local_overlays:
@@ -184,6 +196,11 @@ enum StatementStateStore {
     Governed(Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>),
 }
 impl StatementFactScope {
+    pub(crate) fn with_query_observer_principal(mut self, principal: Option<Arc<str>>) -> Self {
+        self.query_observer_principal = principal;
+        self
+    }
+
     pub(crate) fn binding_only(
         bindings: Arc<QueryTableBindingStore>,
         connector_context: ConnectorRequestContext,
@@ -201,6 +218,7 @@ impl StatementFactScope {
             bindings,
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
+            query_observer_principal: None,
             capacity,
             planning: None,
             query_local_overlays: Vec::new(),

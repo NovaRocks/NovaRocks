@@ -964,6 +964,7 @@ fn validate_provider_constraint(
 pub struct SystemTableSnapshotNeed {
     id: CompileNeedId,
     occurrence: crate::system_table::SystemTableOccurrenceId,
+    statement_relation: Option<crate::system_table::StatementSystemRelation>,
     declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
     required_columns: Box<[usize]>,
     key_constraint: crate::system_table::SystemTableKeyConstraint,
@@ -972,6 +973,7 @@ impl SystemTableSnapshotNeed {
     pub(super) fn new(
         id: CompileNeedId,
         occurrence: crate::system_table::SystemTableOccurrenceId,
+        statement_relation: Option<crate::system_table::StatementSystemRelation>,
         declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
         required_columns: Box<[usize]>,
         key_constraint: crate::system_table::SystemTableKeyConstraint,
@@ -979,6 +981,7 @@ impl SystemTableSnapshotNeed {
         Self {
             id,
             occurrence,
+            statement_relation,
             declaration,
             required_columns,
             key_constraint,
@@ -989,6 +992,9 @@ impl SystemTableSnapshotNeed {
     }
     pub const fn occurrence(&self) -> crate::system_table::SystemTableOccurrenceId {
         self.occurrence
+    }
+    pub const fn statement_relation(&self) -> Option<crate::system_table::StatementSystemRelation> {
+        self.statement_relation
     }
     pub fn declaration(&self) -> &std::sync::Arc<crate::system_table::SystemTableDeclaration> {
         &self.declaration

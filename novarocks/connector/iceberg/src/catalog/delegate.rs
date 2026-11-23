@@ -41,13 +41,24 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 pub(crate) fn namespace_ident(
     name: &CatalogNamespaceName,
 ) -> Result<NamespaceIdent, ConnectorError> {
-    let normalized = normalize_identifier(&name.namespace).map_err(invalid)?;
-    Ok(NamespaceIdent::new(normalized))
+    let namespace = if name.exact_discovery {
+        name.namespace.to_string()
+    } else {
+        normalize_identifier(&name.namespace).map_err(invalid)?
+    };
+    Ok(NamespaceIdent::new(namespace))
 }
 
 pub(super) fn table_ident(name: &CatalogTableName) -> Result<TableIdent, ConnectorError> {
-    let namespace = normalize_identifier(&name.namespace).map_err(invalid)?;
-    let table = normalize_identifier(&name.name).map_err(invalid)?;
+    let normalize_or_copy = |value: &str| {
+        if name.exact_discovery {
+            Ok(value.to_owned())
+        } else {
+            normalize_identifier(value).map_err(invalid)
+        }
+    };
+    let namespace = normalize_or_copy(&name.namespace)?;
+    let table = normalize_or_copy(&name.name)?;
     TableIdent::from_strs([namespace.as_str(), table.as_str()])
         .map_err(|error| invalid(format!("build Iceberg identity for {name}: {error}")))
 }

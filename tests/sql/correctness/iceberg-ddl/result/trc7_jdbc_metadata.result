@@ -1,0 +1,65 @@
+-- query 2
+-- types	varchar	varchar	varchar
+table_name	table_type	table_comment
+metadata_base	BASE TABLE	NULL
+metadata_view	VIEW	NULL
+
+-- query 3
+-- types	varchar	bigint	varchar	varchar	varchar	varchar	varchar
+column_name	ordinal_position	column_default	is_nullable	data_type	comment	column_comment
+order_id	1	NULL	NO	bigint	id	id
+total	2	DECIMAL '12.34'	YES	decimal(12,2)	NULL	NULL
+code	3	NULL	YES	varchar	NULL	NULL
+payload	4	NULL	YES	row("x" bigint, "ys" array(decimal(9,2)))	NULL	NULL
+
+-- query 4
+-- types	varchar	boolean
+table_name	has_definition
+metadata_view	true
+
+-- query 5
+-- types	varchar	varchar	varchar	varchar
+Column	Type	Extra	Comment
+order_id	bigint	""	id
+total	decimal(12,2)	""	""
+code	varchar	""	""
+payload	row("x" bigint, "ys" array(decimal(9,2)))	""	""
+
+-- query 6
+-- types	varchar	varchar	varchar
+table_name	table_type	remarks
+metadata_base	TABLE	NULL
+metadata_view	VIEW	NULL
+
+-- query 7
+-- types	varchar	bigint	varchar	bigint	bigint	bigint	bigint	bigint	varchar	varchar	bigint	bigint	varchar
+column_name	data_type	type_name	column_size	buffer_length	decimal_digits	num_prec_radix	nullable	remarks	column_def	char_octet_length	ordinal_position	is_nullable
+order_id	-5	bigint	19	0	NULL	10	0	id	NULL	NULL	1	NO
+total	3	decimal(12,2)	12	0	2	10	1	NULL	NULL	NULL	2	YES
+code	12	varchar	2147483647	0	NULL	NULL	1	NULL	NULL	2147483647	3	YES
+payload	2000	row("x" bigint, "ys" array(decimal(9,2)))	NULL	0	NULL	NULL	1	NULL	NULL	NULL	4	YES
+
+-- query 8
+-- types	varchar	bigint
+column_name	ordinal_position
+total	2
+
+-- query 9
+-- types	varchar
+table_type
+TABLE
+VIEW
+
+-- query 10
+-- types	varchar	bigint	bigint
+type_name	data_type	precision
+array	2003	NULL
+bigint	-5	19
+char	2000	NULL
+decimal	2000	NULL
+real	7	24
+
+-- query 11
+-- types	bigint
+empty_rows
+0

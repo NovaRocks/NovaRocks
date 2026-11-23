@@ -78,6 +78,7 @@ impl AnalyzerContext<'_> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: None,
+            statement_relation: None,
             catalog: &catalog,
             current_database: &view.default_database,
             function_catalog: self.function_catalog,

@@ -68,6 +68,7 @@ struct ExplainPreparationInput {
     sql: String,
     explain: ExplainInput,
     state: SessionSqlState,
+    timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
     statement_time: novarocks_type_contract::StatementTimeEnvironment,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
@@ -176,6 +177,7 @@ async fn make_explain_preparation(
                 cpu: &input.planning_cpu,
                 io: input.io,
                 state_store: input.state_store,
+                timing: input.timing,
             },
         )
         .await?;
@@ -580,11 +582,13 @@ pub(super) fn build_explain_action(
         cancellation,
         window,
         planning_cpu,
+        timing,
         statement_time,
         #[cfg(novarocks_dev_controls)]
         observation,
         #[cfg(novarocks_dev_controls)]
             statement_token: _,
+        principal: _,
     } = inputs;
     environment
         .compiler
@@ -630,6 +634,7 @@ pub(super) fn build_explain_action(
         sql,
         explain,
         state,
+        timing,
         statement_time,
         deadline,
         cancellation,

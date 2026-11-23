@@ -25,6 +25,8 @@ use crate::analyze_error::AnalyzeError;
 use crate::column_id::ColumnId;
 use crate::planner::table::TableDef;
 use crate::planning::catalog::MetadataTableKind;
+use crate::system_table::{StatementSystemRelation, SystemTableDeclaration};
+use std::sync::Arc;
 
 use super::scope::AnalyzerScope;
 
@@ -336,11 +338,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
         if !using_output.is_empty() {
-            let names = using_output
-                .iter()
-                .map(|(name, ..)| name.clone())
-                .collect::<Vec<_>>();
-            current_scope.apply_using_layout(&names, prefer_right);
+            current_scope.apply_using_layout(&using_output, prefer_right);
             current_scope.publish_using_columns(using_output);
         }
         let current_rel = Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
@@ -458,6 +456,20 @@ impl<'a> super::AnalyzerContext<'a> {
         node: &ast::Table,
         alias: Option<RelationAlias<'_>>,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
+        if let Some((site, source)) = self.statement_relation
+            && std::ptr::eq(site, node)
+        {
+            return self.analyze_system_table(
+                source.declaration.clone(),
+                alias,
+                node.name
+                    .parts
+                    .last()
+                    .map(|part| part.value.as_str())
+                    .unwrap_or(&source.declaration.table),
+                Some(source.kind),
+            );
+        }
         let name = &node.name;
         let version = node.query_period.as_ref();
         if let Some(period) = version {
@@ -711,48 +723,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     version.span,
                 ));
             }
-            let alias_name = alias
-                .as_ref()
-                .map(|alias| alias.name.value.clone())
-                .unwrap_or_else(|| tbl.clone());
-            let mut output_columns = declaration
-                .columns
-                .iter()
-                .map(|column| {
-                    self.check_control()?;
-                    Ok(OutputColumn {
-                        column_id: self.alloc_column_id(
-                            Some(alias_name.clone()),
-                            column.name.clone(),
-                            column.value_type.clone(),
-                        ),
-                        name: column.name.clone(),
-                        field_name: Some(column.name.clone()),
-                        value_type: column.value_type.clone(),
-                        is_internal: false,
-                    })
-                })
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-            if let Some(alias) = alias {
-                crate::analysis::schema::apply_column_aliases(
-                    &mut output_columns,
-                    alias.columns,
-                    alias.span,
-                )?;
-            }
-            let mut scope = self.new_scope();
-            for column in &output_columns {
-                self.check_control()?;
-                scope.add_field(Some(&alias_name), column);
-            }
-            return Ok((
-                Relation::SystemTable {
-                    declaration: declaration.clone(),
-                    alias: alias_name,
-                    output_columns,
-                },
-                scope,
-            ));
+            return self.analyze_system_table(declaration.clone(), alias, &tbl, None);
         }
 
         let resolved_table = if let Some(version) = version {
@@ -858,6 +829,83 @@ impl<'a> super::AnalyzerContext<'a> {
             column_ids,
         });
         Ok((relation, scope))
+    }
+
+    fn analyze_system_table(
+        &self,
+        declaration: Arc<SystemTableDeclaration>,
+        alias: Option<RelationAlias<'_>>,
+        qualifier: &str,
+        statement_relation: Option<StatementSystemRelation>,
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
+        let alias_name =
+            alias.map_or_else(|| qualifier.to_owned(), |alias| alias.name.value.clone());
+        let mut output_columns = Vec::new();
+        let mut required_columns = Vec::new();
+        for (ordinal, column) in declaration.columns.iter().enumerate() {
+            self.check_control()?;
+            if column.hidden && alias.is_some_and(|alias| !alias.columns.is_empty()) {
+                continue;
+            }
+            output_columns.push(OutputColumn {
+                column_id: self.alloc_column_id(
+                    Some(alias_name.clone()),
+                    column.name.clone(),
+                    column.value_type.clone(),
+                ),
+                name: column.name.clone(),
+                field_name: Some(column.name.clone()),
+                value_type: column.value_type.clone(),
+                // The scope hides expansion. An explicit reference produces a
+                // regular SQL value and can become a public result column.
+                is_internal: false,
+            });
+            required_columns.push(ordinal);
+        }
+        if let Some(alias) = alias {
+            crate::analysis::schema::apply_column_aliases(
+                &mut output_columns,
+                alias.columns,
+                alias.span,
+            )?;
+        }
+        let mut scope = self.new_scope();
+        self.add_system_table_scope_fields(
+            &mut scope,
+            &alias_name,
+            &declaration,
+            &output_columns,
+            &required_columns,
+        )?;
+        Ok((
+            Relation::SystemTable {
+                declaration,
+                alias: alias_name,
+                output_columns,
+                required_columns,
+                statement_relation,
+            },
+            scope,
+        ))
+    }
+
+    pub(super) fn add_system_table_scope_fields(
+        &self,
+        scope: &mut AnalyzerScope,
+        qualifier: &str,
+        declaration: &SystemTableDeclaration,
+        output_columns: &[OutputColumn],
+        required_columns: &[usize],
+    ) -> Result<(), AnalyzeError> {
+        for (column, &ordinal) in output_columns.iter().zip(required_columns) {
+            self.check_control()?;
+            if declaration.columns[ordinal].hidden {
+                scope.add_hidden_field(qualifier, column);
+            } else {
+                scope.add_field(Some(qualifier), column);
+            }
+        }
+        Ok(())
     }
 
     fn analyze_derived_relation(

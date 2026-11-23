@@ -123,6 +123,7 @@ pub(crate) struct FrontendQueryCompiler {
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
+    runtime_metadata: Option<Arc<crate::system_tables::FrontendRuntimeMetadata>>,
     mv_readiness: Arc<MvReadinessPort>,
     mv_candidate_reader: MvCandidateReader,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -136,6 +137,27 @@ mod async_read;
 pub(crate) use async_explain::{
     ExplainPreparationPorts, PreparedAsyncExplain, PreparedAsyncProfile,
 };
+pub(crate) use async_read::{ReadCompilerInput, ReadObservation};
+
+fn observe_plan_timing(
+    control: novarocks_sql::compiler::SqlCompileControl,
+    timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
+) -> novarocks_sql::compiler::SqlCompileControl {
+    let Some(timing) = timing else {
+        return control;
+    };
+    use novarocks_query_application::query_control::{ClientQueryEvent, ClientQueryTime};
+    use novarocks_sql::compiler::SqlFinalPlanEvent;
+    control.with_final_plan_observer(Arc::new(move |event| {
+        let event = match event {
+            SqlFinalPlanEvent::AnalysisStarted => ClientQueryEvent::AnalysisStarted,
+            SqlFinalPlanEvent::AnalysisFinished => ClientQueryEvent::AnalysisFinished,
+            SqlFinalPlanEvent::PlanningStarted => ClientQueryEvent::PlanningStarted,
+            SqlFinalPlanEvent::PlanningFinished => ClientQueryEvent::PlanningFinished,
+        };
+        timing.record(event, ClientQueryTime::now());
+    }))
+}
 
 impl FrontendQueryCompiler {
     pub(crate) fn validate_original_read_runtime(
@@ -175,11 +197,20 @@ impl FrontendQueryCompiler {
             query,
             view,
             system_tables,
+            runtime_metadata: None,
             mv_readiness,
             mv_candidate_reader,
             mv_storage_observation,
             connector_blocking_io,
         }
+    }
+
+    pub(crate) fn with_runtime_metadata(
+        mut self,
+        runtime_metadata: Option<Arc<crate::system_tables::FrontendRuntimeMetadata>>,
+    ) -> Self {
+        self.runtime_metadata = runtime_metadata;
+        self
     }
 
     pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
@@ -296,6 +327,7 @@ impl FrontendQueryCompiler {
             self.system_tables.system_relations().clone(),
             Arc::clone(&self.mv_readiness),
         )
+        .with_runtime_metadata(self.runtime_metadata.clone())
     }
 
     /// Freeze the same per-instance driver width that request construction

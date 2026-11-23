@@ -70,6 +70,10 @@ impl CatalogRegistry {
         Ok(())
     }
 
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.catalogs.keys().map(String::as_str)
+    }
+
     pub fn get_catalog(&self, name: &str) -> Result<Arc<dyn Catalog>, String> {
         self.catalogs
             .get(&name.to_ascii_lowercase())
@@ -172,6 +176,7 @@ mod tests {
         let mut registry = CatalogRegistry::new();
         registry.register(Arc::new(TestCatalog::new("Ice", 1)));
         registry.register(Arc::new(TestCatalog::new("ICE", 2)));
+        assert_eq!(registry.names().collect::<Vec<_>>(), vec!["ice"]);
 
         assert_eq!(
             registry
@@ -184,6 +189,7 @@ mod tests {
         );
 
         registry.unregister("iCe");
+        assert_eq!(registry.names().count(), 0);
         assert_eq!(
             registry.resolve("ICE", "ns", "t").map(|_| ()),
             Err("unknown catalog: ICE".to_string())

@@ -59,6 +59,7 @@ mod result_delivery_trino_protocol;
 mod result_delivery_trino_retention;
 mod result_delivery_trino_rows;
 mod runtime_filter;
+mod show_metadata_type_signatures;
 mod sql_client;
 mod sql_client_ctas;
 mod state_family;
@@ -133,6 +134,9 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(table_maintenance::scenarios());
     scenarios.extend(trino_interop::scenarios());
     scenarios.extend(trino_protocol::scenarios());
+    scenarios.push(Box::new(
+        show_metadata_type_signatures::ShowMetadataTypeSignatures,
+    ));
     scenarios.push(Box::new(sql_client::SharedSqlClient::default()));
     scenarios.push(Box::new(sql_client_ctas::SharedCtasCount::default()));
     scenarios.push(Box::new(query_tool::QueryTool));

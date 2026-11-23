@@ -1220,11 +1220,38 @@ impl Default for StandaloneServerConfig {
     }
 }
 
+/// The recent-query diagnostic budget of a single FE process.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendQueryHistoryRuntimeConfig {
+    pub max_bytes: std::num::NonZeroUsize,
+    pub max_age_ms: std::num::NonZeroU64,
+}
+
+impl FrontendQueryHistoryRuntimeConfig {
+    pub(crate) fn client_query_history(
+        &self,
+    ) -> anyhow::Result<novarocks_query_application::query_control::ClientQueryHistoryConfig> {
+        let max_age = std::time::Duration::from_millis(self.max_age_ms.get());
+        anyhow::ensure!(
+            std::time::Instant::now().checked_add(max_age).is_some(),
+            "runtime.frontend_workload.query_history.max_age_ms exceeds the monotonic clock range"
+        );
+        Ok(
+            novarocks_query_application::query_control::ClientQueryHistoryConfig {
+                max_bytes: self.max_bytes.get(),
+                max_age,
+            },
+        )
+    }
+}
+
 /// Explicit FE-local governance bounds. These are Server configuration facts,
 /// not defaults manufactured by the Frontend application host.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FrontendWorkloadRuntimeConfig {
+    pub query_history: Option<FrontendQueryHistoryRuntimeConfig>,
     /// Warehouse-wide admitted compute queries. This is the Frontend's only
     /// query-load control: it covers planning through protocol terminality.
     pub concurrency_limit: usize,
@@ -1260,6 +1287,7 @@ pub struct FrontendWorkloadRuntimeConfig {
 impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
+            query_history: None,
             concurrency_limit: 256,
             client_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
                 .all_objects_bytes[0],

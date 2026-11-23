@@ -223,6 +223,21 @@ pub trait ConnectorViewMetadata: Send + Sync {
         .into())
     }
 
+    /// Project only requested discovery facts from one original view version.
+    fn discover_view_async(
+        &self,
+        _request: ConnectorViewRequest,
+        _projection: super::DiscoveryProjection,
+        _cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> futures::future::BoxFuture<'_, Result<super::DiscoveredRelation, ConnectorError>> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not expose view discovery metadata",
+            ))
+        })
+    }
+
     fn list_views(
         &self,
         request: ConnectorListViewsRequest,

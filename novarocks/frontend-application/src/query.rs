@@ -1041,7 +1041,7 @@ impl FrontendQueryService {
         request: StatementSessionRequest,
     ) -> Result<Arc<FrontendQuerySession>, StatementSessionError> {
         let admission = request.admission();
-        let (query_id, principal, value) = request.into_parts();
+        let (query_id, principal, value, claim) = request.into_parts_with_client_query_claim();
         let state = SessionSqlState::from_session_value(
             value,
             &self.session_properties,
@@ -1050,7 +1050,10 @@ impl FrontendQueryService {
         let identity = SessionIdentity::client_statement(query_id.clone(), Arc::clone(&principal));
         let lease = self
             .serving_admission
-            .register_session(|| self.query_control.register_session(identity))
+            .register_session(|| match claim {
+                Some(claim) => self.query_control.register_claimed_session(identity, claim),
+                None => self.query_control.register_session(identity),
+            })
             .map_err(query_service_admission_error)?
             .map_err(|error| {
                 internal_error(format!(
@@ -1171,6 +1174,11 @@ impl FrontendQuerySession {
 
         let (governed, deadline) =
             self.begin_session_action(&source, matches!(&work, TrinoSessionWork::Mutation(_)))?;
+        self.service.query_control.record_client_query_event(
+            governed.token(),
+            novarocks_query_application::query_control::ClientQueryEvent::ControlStarted,
+            novarocks_query_application::query_control::ClientQueryTime::now(),
+        );
         let output = match work {
             TrinoSessionWork::Use { catalog, schema } => {
                 self.execute_session_use(

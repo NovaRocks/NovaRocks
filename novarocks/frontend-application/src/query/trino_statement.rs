@@ -3,6 +3,8 @@
 //! Temporary typed statement entrance for Trino compatibility tests.
 
 use super::*;
+
+mod kill_query;
 use crate::query_execution::dml::truncate::{TruncateCommand, TruncateTarget};
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
@@ -10,6 +12,7 @@ use novarocks_query_application::{
     session_control::{GovernedQueryStatementOwner, StatementCompletionProjection},
     sql::trino_admission::{
         TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement,
+        admit_trino_statement_in_namespace,
     },
     statement_kind::StatementKind,
 };
@@ -81,10 +84,22 @@ impl FrontendQuerySession {
             .map_err(internal_error)?;
         let statement = novarocks_query_application::sql::parse_single_statement(&source)
             .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(&source)))?;
-        match admit_trino_statement(&source, statement)? {
+        let admitted = if matches!(&statement, ast::TrinoStatement::Call(call) if call.name.parts.len() < 3)
+        {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            admit_trino_statement_in_namespace(
+                &source,
+                statement,
+                state.current_catalog(),
+                state.explicit_database(),
+            )?
+        } else {
+            admit_trino_statement(&source, statement)?
+        };
+        match admitted {
             TrinoStatementAction::Query(action) => {
                 let kind = match &action {
-                    TrinoQueryAction::Read(_) => StatementKind::Query,
+                    TrinoQueryAction::Read(_) | TrinoQueryAction::Show(_) => StatementKind::Query,
                     TrinoQueryAction::Explain(_) | TrinoQueryAction::ExplainAnalyze(_) => {
                         StatementKind::Explain
                     }
@@ -389,6 +404,7 @@ fn preparation_plan(
         Prep::Update(_) => CommandPlan::write(Update, true),
         Prep::Merge(_) => CommandPlan::write(Merge, true),
         Prep::Call(_) => CommandPlan::management(Call, UndeterminedCall, true),
+        Prep::KillQuery(_) => CommandPlan::management(Call, Empty, false),
         Prep::CreateView(_) => management(CreateView),
         Prep::DropView(_) => management(DropView),
         Prep::ShowCreateView(_) => CommandPlan::management(ShowCreateView, ResultSet, false),
@@ -844,6 +860,11 @@ impl FrontendQuerySession {
                         TrinoWrite::Merge(node),
                         CommandEntry { statement, input },
                     )
+                    .await;
+            }
+            Prep::KillQuery(call) => {
+                return self
+                    .execute_kill_query(source, call, CommandEntry { statement, input })
                     .await;
             }
             Prep::Call(node) => {

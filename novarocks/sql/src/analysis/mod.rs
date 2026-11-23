@@ -191,6 +191,8 @@ pub(crate) enum Relation {
         declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
         alias: String,
         output_columns: Vec<AnalyzedOutputField>,
+        required_columns: Vec<usize>,
+        statement_relation: Option<crate::system_table::StatementSystemRelation>,
     },
     /// A base table scan.
     Scan(ScanRelation),

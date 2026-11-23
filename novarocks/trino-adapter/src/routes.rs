@@ -147,8 +147,11 @@ async fn cancel(
     let Some(entry) = registry.lookup(&id, &slug) else {
         return StatusCode::NOT_FOUND;
     };
-    registry.cancel(&entry).await;
-    StatusCode::NO_CONTENT
+    if registry.cancel(&entry).await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 async fn heartbeat(
     State(registry): State<Arc<TrinoQueryRegistry>>,
@@ -157,7 +160,9 @@ async fn heartbeat(
     if token.parse::<u64>().is_err() {
         return StatusCode::NOT_FOUND;
     }
-    if registry.lookup(&id, &slug).is_some() {
+    if let Some(entry) = registry.lookup(&id, &slug)
+        && registry.heartbeat(&entry).await
+    {
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND

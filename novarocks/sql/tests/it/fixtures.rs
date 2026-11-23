@@ -64,10 +64,24 @@ pub(super) fn table_free_request(
     session: SqlSessionContext,
     control: &SqlCompileControl,
 ) -> SqlFinalPlanCompileRequest {
-    SqlFinalPlanCompileRequest::new(
-        PlanVersionId::try_new([84; 16]).unwrap(),
+    plan_request(
         SqlStatementInput::parsed_query(novarocks_sql_testkit::parse_query(sql)),
         SqlCompileIntent::Query,
+        session,
+        control,
+    )
+}
+
+pub(super) fn plan_request(
+    statement: SqlStatementInput,
+    intent: SqlCompileIntent,
+    session: SqlSessionContext,
+    control: &SqlCompileControl,
+) -> SqlFinalPlanCompileRequest {
+    SqlFinalPlanCompileRequest::new(
+        PlanVersionId::try_new([84; 16]).unwrap(),
+        statement,
+        intent,
         session,
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),

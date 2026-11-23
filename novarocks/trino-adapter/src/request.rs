@@ -18,6 +18,7 @@
 //! HTTP syntax is checked at submission; session semantics are checked at dispatch.
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header::InvalidHeaderValue};
 use novarocks_query_application::{
+    query_control::ClientQueryText,
     session_effects::SessionEffects,
     session_value::{SessionValue, StatementSessionError},
 };
@@ -81,8 +82,8 @@ pub(crate) enum StatementBody {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedStatementRequest {
-    sql: String,
-    principal: String,
+    sql: Option<ClientQueryText>,
+    principal: std::sync::Arc<str>,
     catalog: Option<String>,
     schema: Option<String>,
     properties: Vec<(String, String)>,
@@ -175,19 +176,19 @@ impl ParsedStatementRequest {
                         limit.units()
                     )
                 });
-                (sql, error)
+                (error.is_none().then_some(sql), error)
             }
             // No complete text or character count exists after early body stop.
             // Keep an empty diagnostic view; typed refusal precedes Session creation.
             StatementBody::ByteLimitExceeded => (
-                String::new(),
+                None,
                 Some(format!(
                     "Query text exceeds the maximum length ({})",
                     limit.units()
                 )),
             ),
         };
-        if query_text_too_large.is_none() && sql.trim().is_empty() {
+        if sql.as_ref().is_some_and(|text| text.trim().is_empty()) {
             return Err(RequestRejection::malformed("SQL statement is empty"));
         }
         let catalog = trim_empty(singleton(headers, "x-trino-catalog")?);
@@ -289,7 +290,7 @@ impl ParsedStatementRequest {
         let trace_token = trim_empty(singleton(headers, "x-trino-trace-token")?);
         let language = singleton(headers, "x-trino-language")?.map(str::to_owned);
         Ok(Self {
-            sql,
+            sql: sql.map(ClientQueryText::new),
             principal: configured_user.into(),
             catalog,
             schema,
@@ -308,10 +309,16 @@ impl ParsedStatementRequest {
         })
     }
     pub fn sql(&self) -> &str {
-        &self.sql
+        self.sql.as_ref().map_or("", ClientQueryText::as_str)
     }
-    pub fn principal(&self) -> &str {
-        &self.principal
+    pub fn original_text(&self) -> Option<&ClientQueryText> {
+        self.sql.as_ref()
+    }
+    pub fn into_original_text(self) -> Option<ClientQueryText> {
+        self.sql
+    }
+    pub fn principal(&self) -> std::sync::Arc<str> {
+        std::sync::Arc::clone(&self.principal)
     }
     pub fn observation(&self) -> &RequestObservation {
         &self.observation
@@ -766,7 +773,7 @@ mod tests {
         input.insert("x-trino-language", HeaderValue::from_static("en-US"));
         let request = parse(&input).unwrap();
         assert_eq!(request.sql(), "SELECT 1");
-        assert_eq!(request.principal(), "root");
+        assert_eq!(request.principal().as_ref(), "root");
         assert_eq!(
             request.session_value().unwrap().presentation(),
             &ClientPresentationFamily::TrinoJson(TrinoJsonFacts {

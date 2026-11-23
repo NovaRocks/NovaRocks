@@ -20,7 +20,10 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
     ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorListViewsRequest,
     ConnectorListingPageSize, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
-    ConnectorRequestContext, ProviderMetadataCpuPort,
+    ConnectorOperationControl, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution, ConnectorViewIdentity, ConnectorViewRequest,
+    DiscoveredRelation, DiscoveryProjection, DiscoveryRelationKind, DiscoveryViewDomainUnavailable,
+    ProviderMetadataCpuPort,
 };
 use std::sync::Arc;
 
@@ -106,6 +109,104 @@ impl PinnedCatalogListing {
             .map(|table| table.table.to_string())
             .collect())
     }
+    pub(crate) fn supports_discovery(&self) -> bool {
+        self.pin.binding().metadata().supports_table_discovery()
+    }
+
+    pub(crate) fn can_probe_discovery_name(&self, name: &str) -> bool {
+        let metadata = self.pin.binding().metadata();
+        !metadata.supports_table_discovery() || metadata.can_probe_discovery_name(name)
+    }
+
+    /// Observe a requested object under the same pin used for discovery.
+    /// A previously listed object stays in that domain if it disappears.
+    pub(crate) async fn discover_relation(
+        &self,
+        schema: &str,
+        name: &str,
+        kind: Option<DiscoveryRelationKind>,
+        projection: DiscoveryProjection,
+        cpu: Arc<dyn ProviderMetadataCpuPort>,
+    ) -> Result<Option<DiscoveredRelation>, ConnectorError> {
+        self.context.original_operation_control().check_active()?;
+        let identity = ConnectorTableIdentity {
+            instance_id: self.pin.binding().descriptor().instance_id.clone(),
+            namespace: schema.into(),
+            table: name.into(),
+        };
+        if kind != Some(DiscoveryRelationKind::View) {
+            let observed = self
+                .pin
+                .binding()
+                .metadata()
+                .discover_table_async(
+                    ConnectorTableRequest {
+                        table: identity.clone(),
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: self.context.clone(),
+                    },
+                    projection,
+                    Arc::clone(&cpu),
+                )
+                .await;
+            match observed {
+                Ok(observed) => {
+                    return Self::check_discovery(
+                        observed,
+                        &identity,
+                        DiscoveryRelationKind::Table,
+                    );
+                }
+                Err(error) if error.kind() == ConnectorErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if kind == Some(DiscoveryRelationKind::Table) {
+            return Ok(None);
+        }
+        let Some(capability) = self.pin.binding().view_metadata() else {
+            return Ok(None);
+        };
+        let observed = capability
+            .discover_view_async(
+                ConnectorViewRequest {
+                    view: ConnectorViewIdentity {
+                        instance_id: identity.instance_id.clone(),
+                        namespace: identity.namespace.clone(),
+                        view: identity.table.clone(),
+                    },
+                    context: self.context.clone(),
+                },
+                projection,
+                cpu,
+            )
+            .await;
+        match observed {
+            Ok(observed) => Self::check_discovery(observed, &identity, DiscoveryRelationKind::View),
+            Err(error)
+                if error.kind() == ConnectorErrorKind::NotFound
+                    || DiscoveryViewDomainUnavailable::is_reported(&error) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn check_discovery(
+        observed: DiscoveredRelation,
+        expected: &ConnectorTableIdentity,
+        kind: DiscoveryRelationKind,
+    ) -> Result<Option<DiscoveredRelation>, ConnectorError> {
+        if &observed.identity != expected || observed.kind != kind {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "system discovery returned another relation identity",
+            ));
+        }
+        Ok(Some(observed))
+    }
+
     pub(crate) async fn view_names(
         &self,
         schema: &str,
@@ -113,9 +214,9 @@ impl PinnedCatalogListing {
     ) -> Result<Vec<String>, ConnectorError> {
         let namespace = self.namespace(schema);
         let capability = self.pin.binding().view_metadata().ok_or_else(|| {
-            ConnectorError::new(
+            ConnectorError::from_domain(
                 ConnectorErrorKind::Unsupported,
-                "connector generation has no view listing capability",
+                DiscoveryViewDomainUnavailable("list_views"),
             )
         })?;
         let views = capability

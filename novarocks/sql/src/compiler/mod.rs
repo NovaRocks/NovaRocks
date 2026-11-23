@@ -50,6 +50,7 @@ mod write_assignment;
 pub use write_assignment::{SqlWriteAssignmentSite, SqlWriteAssignments};
 mod logical_explain;
 mod scalar_presence_catalog;
+mod statement_system_relation;
 pub use crate::planner::distributed::build::{
     AggregateRuntimeDemand, CheckedSqlResultDeclaration, ResultDeclarationError,
     SqlAuthoredPhysicalPlan, SqlCallDependencyLoan, SqlCallDependencyProvenance,
@@ -79,6 +80,8 @@ pub use mv_rewrite::{
     SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation,
     SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
 };
+pub(crate) use statement_system_relation::StatementSystemRelationSource;
+pub(crate) use statement_system_relation::statement_system_relation_site;
 
 // The request profile has one owner; application test fixtures may author
 // their explicit ceiling without a second default or translation vocabulary.
@@ -760,6 +763,10 @@ pub struct SqlStatementInput {
 enum SqlStatementInputKind {
     ParsedQuery(Box<novarocks_parser::ast::Query>),
     AdmittedSessionQuery(Box<novarocks_parser::ast::Query>),
+    StatementSystemRelationQuery {
+        query: Box<novarocks_parser::ast::Query>,
+        source: StatementSystemRelationSource,
+    },
     MaterializedValuesQuery {
         query: Box<novarocks_parser::ast::Query>,
         source: materialized_values::MaterializedValues,
@@ -791,7 +798,11 @@ impl SqlStatementInput {
     }
 
     fn root_session_admitted(&self) -> bool {
-        matches!(&self.kind, SqlStatementInputKind::AdmittedSessionQuery(_))
+        matches!(
+            &self.kind,
+            SqlStatementInputKind::AdmittedSessionQuery(_)
+                | SqlStatementInputKind::StatementSystemRelationQuery { .. }
+        )
     }
 
     pub fn quoted_metadata_catalogs(
@@ -810,8 +821,32 @@ impl SqlStatementInput {
                     control,
                 )
             }
+            SqlStatementInputKind::StatementSystemRelationQuery { query, .. } => {
+                completion_catalog::quoted_metadata_catalogs_with_statement_relation(
+                    query,
+                    session.current_catalog.as_deref(),
+                    &session.current_database,
+                    control,
+                )
+            }
             SqlStatementInputKind::LogicalPlan { .. } => Ok(Vec::new()),
         }
+    }
+
+    /// Bind a trusted SHOW rewrite to its own root FROM table and frozen type
+    /// declaration. Public SQL admission has no input for this relation.
+    pub fn query_with_statement_system_relation(
+        query: Box<novarocks_parser::ast::Query>,
+        kind: crate::system_table::StatementSystemRelation,
+        declaration: Arc<crate::system_table::SystemTableDeclaration>,
+    ) -> Result<Self, SqlCompileError> {
+        statement_system_relation_site(&query)?;
+        Ok(Self {
+            kind: SqlStatementInputKind::StatementSystemRelationQuery {
+                query,
+                source: StatementSystemRelationSource { kind, declaration },
+            },
+        })
     }
 
     /// Bind complete constants to exact expressions of the same owned query.
@@ -884,12 +919,25 @@ pub enum SqlPlanningEnvironment {
     NotApplicable,
 }
 
+/// Actual boundaries of the final-plan completion driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlFinalPlanEvent {
+    AnalysisStarted,
+    AnalysisFinished,
+    PlanningStarted,
+    PlanningFinished,
+}
+
+/// Passive observation only. Compilation takes no authority from the observer.
+pub type SqlFinalPlanObserver = dyn Fn(SqlFinalPlanEvent) + Send + Sync;
+
 /// Read-only request control observed by compiler phases.
 #[derive(Clone)]
 pub struct SqlCompileControl {
     deadline: Option<Instant>,
     cancellation: Arc<dyn SqlCancellationObservation>,
     fold_dependency_observer: Option<Arc<dyn SqlFoldDependencyObserver>>,
+    final_plan_observer: Option<Arc<SqlFinalPlanObserver>>,
 }
 
 struct SqlNeverCancelled;
@@ -909,6 +957,7 @@ impl SqlCompileControl {
             deadline,
             cancellation,
             fold_dependency_observer: None,
+            final_plan_observer: None,
         }
     }
 
@@ -920,6 +969,7 @@ impl SqlCompileControl {
             deadline: None,
             cancellation: Arc::new(SqlNeverCancelled),
             fold_dependency_observer: None,
+            final_plan_observer: None,
         }
     }
 
@@ -932,6 +982,17 @@ impl SqlCompileControl {
         self.fold_dependency_observer = Some(observer);
         self
     }
+    pub fn with_final_plan_observer(mut self, observer: Arc<SqlFinalPlanObserver>) -> Self {
+        self.final_plan_observer = Some(observer);
+        self
+    }
+
+    fn observe_final_plan(&self, event: SqlFinalPlanEvent) {
+        if let Some(observer) = &self.final_plan_observer {
+            observer(event);
+        }
+    }
+
     pub(crate) fn fold_dependency_observer(&self) -> Option<&Arc<dyn SqlFoldDependencyObserver>> {
         self.fold_dependency_observer.as_ref()
     }
@@ -1764,6 +1825,12 @@ impl SqlCompiler {
                         },
                         request.write_assignments.as_deref(),
                         request.statement.root_session_admitted(),
+                        match &request.statement.kind {
+                            SqlStatementInputKind::StatementSystemRelationQuery {
+                                source, ..
+                            } => Some(source),
+                            _ => None,
+                        },
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
@@ -2068,7 +2135,10 @@ fn parse_query(
     match &statement.kind {
         SqlStatementInputKind::ParsedQuery(query)
         | SqlStatementInputKind::AdmittedSessionQuery(query)
-        | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => Ok((**query).clone()),
+        | SqlStatementInputKind::MaterializedValuesQuery { query, .. }
+        | SqlStatementInputKind::StatementSystemRelationQuery { query, .. } => {
+            Ok((**query).clone())
+        }
         SqlStatementInputKind::LogicalPlan { .. } => Err(SqlCompileError::InvalidRequest(
             "logical SQL compiler input must bypass parsing".to_string(),
         )),

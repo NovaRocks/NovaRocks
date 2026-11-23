@@ -19,12 +19,15 @@
 
 use super::distributed_writer::{assert_commit_never_invoked, publication_terminals};
 use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use super::trino_protocol::require_error;
 use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue};
+use crate::actors::trino_protocol::TrinoClient;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_failpoint::target_binding::StatementExecutionBinding;
-use std::fs;
+use novarocks_types::{BackendProcessId, FrontendProcessId};
+use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -35,9 +38,11 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 
 const REQUIRED_BACKENDS: usize = 3;
 
@@ -149,12 +154,19 @@ struct BackendSelfRegistration;
 
 impl Scenario for BackendSelfRegistration {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module(
+        let mut declaration = crate::scenarios::declarations::for_module(
             "backend_membership",
             self.name(),
             self.is_explicit_stage(),
             self.is_compatibility_stage(),
-        )
+        );
+        declaration.impact.paths.extend([
+            "novarocks/query-application/src/sql/trino_admission.rs".into(),
+            "novarocks/query-application/src/system_tables/**".into(),
+            "novarocks/query-application/src/query_control/**".into(),
+            "tests/system-test-runner/src/actors/trino_protocol.rs".into(),
+        ]);
+        declaration
     }
 
     fn name(&self) -> &'static str {
@@ -185,13 +197,25 @@ impl Scenario for BackendSelfRegistration {
             initial_process_ids.len()
         ));
 
+        let actor = membership_http_actor(context, "original")?;
         query_one(context, "before FE restart")?;
+        let original_fe = require_nodes(context, &actor, "initial", &initial_process_ids)?;
         let deadline = context.deadline();
         context
             .handle()
             .drain_be_until(REQUIRED_BACKENDS - 1, deadline)
             .context("gracefully drain one BE through SIGTERM")?;
         query_one(context, "while one BE is draining")?;
+        let after_drain_fe = require_nodes(
+            context,
+            &actor,
+            "after-single-drain",
+            &initial_process_ids[..REQUIRED_BACKENDS - 1],
+        )?;
+        ensure!(
+            after_drain_fe == original_fe,
+            "BE drain changed the FE identity"
+        );
         context.action(
             "proved SIGTERM removes a BE from future eligibility while the remaining BEs serve queries",
         );
@@ -207,6 +231,15 @@ impl Scenario for BackendSelfRegistration {
             live_process_ids[REQUIRED_BACKENDS - 1] != initial_process_ids[REQUIRED_BACKENDS - 1],
             "replacement after drain must receive a new BackendProcessId"
         );
+        ensure!(
+            require_nodes(
+                context,
+                &actor,
+                "after-drained-replacement",
+                &live_process_ids
+            )? == original_fe,
+            "BE replacement changed FE identity",
+        );
 
         let deadline = context.deadline();
         context
@@ -219,6 +252,12 @@ impl Scenario for BackendSelfRegistration {
         ensure!(
             after_fe_restart == live_process_ids,
             "FE restart must rebuild membership from the same live BE process identities"
+        );
+        let actor = membership_http_actor(context, "restarted")?;
+        let restarted_fe = require_nodes(context, &actor, "after-fe-restart", &after_fe_restart)?;
+        ensure!(
+            restarted_fe != original_fe,
+            "FE restart reused the original process identity"
         );
         context.action("proved FE restart rebuilds only from BE renew announce and heartbeat");
 
@@ -233,11 +272,317 @@ impl Scenario for BackendSelfRegistration {
             "same endpoint replacement must receive a new BackendProcessId"
         );
         query_one(context, "after endpoint replacement")?;
+        let live_after_same_endpoint = (0..REQUIRED_BACKENDS)
+            .map(|index| context.handle().backend_process_id(index))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            require_nodes(
+                context,
+                &actor,
+                "after-endpoint-replacement",
+                &live_after_same_endpoint
+            )? == restarted_fe,
+            "same-endpoint replacement changed the current FE identity",
+        );
         context.action(
             "proved endpoint replacement cannot inherit the prior process identity and remains queryable only after re-verification",
         );
-        Ok(())
+        no_available_backends(context, &actor)
     }
+}
+
+fn membership_http_actor(context: &ScenarioContext, launch: &str) -> Result<TrinoClient> {
+    TrinoClient::new(
+        context.trino_port(),
+        context.sql_user(),
+        context.deadline(),
+        &context
+            .scenario_root()
+            .join(format!("trino-membership-http-{launch}")),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct ObservedBackend {
+    process_id: String,
+    build_identity: String,
+    reported_state: String,
+    eligible: bool,
+    lease_valid: bool,
+    identity_verified: bool,
+    endpoint_owned: bool,
+}
+
+impl ObservedBackend {
+    fn expected_node_state(&self) -> &str {
+        if self.eligible {
+            "active"
+        } else if self.reported_state == "Draining"
+            && self.lease_valid
+            && self.identity_verified
+            && self.endpoint_owned
+        {
+            "draining"
+        } else {
+            "inactive"
+        }
+    }
+}
+
+fn management_backends(
+    context: &mut ScenarioContext,
+    phase: &str,
+) -> Result<BTreeMap<String, ObservedBackend>> {
+    context.remaining("read management topology")?;
+    let response = context
+        .handle()
+        .frontend_management_get("/v1/frontend/backends", Duration::from_secs(1))?;
+    fs::write(
+        context
+            .scenario_root()
+            .join(format!("membership-{phase}.json")),
+        &response.body,
+    )?;
+    ensure!(
+        response.status == 200,
+        "{phase}: management topology returned HTTP {}",
+        response.status
+    );
+    let document: serde_json::Value = serde_json::from_str(&response.body)?;
+    ensure!(
+        document["schema_version"] == 1,
+        "{phase}: unexpected topology document {document}"
+    );
+    let rows: Vec<ObservedBackend> = serde_json::from_value(document["backends"].clone())?;
+    let mut backends = BTreeMap::new();
+    for row in rows {
+        ensure!(
+            backends.insert(row.process_id.clone(), row).is_none(),
+            "{phase}: management reported a duplicate BE process",
+        );
+    }
+    Ok(backends)
+}
+
+fn require_nodes(
+    context: &mut ScenarioContext,
+    actor: &TrinoClient,
+    phase: &str,
+    live_backends: &[BackendProcessId],
+) -> Result<FrontendProcessId> {
+    let before = management_backends(context, &format!("{phase}-before"))?;
+    let info = actor.get(&format!("{}/v1/info", actor.base()))?;
+    ensure!(info.status == 200, "{phase}: FE ServerInfo is unavailable");
+    let info = info.json()?;
+    let fe_version = info["nodeVersion"]["version"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .context("ServerInfo omitted original FE version")?;
+    let pages = actor.execute(
+        "SELECT node_id, http_uri, node_version, coordinator, state FROM system.runtime.nodes ORDER BY node_id",
+    ).with_context(|| format!("observe SQL nodes at {phase}"))?;
+    let mut metadata = None;
+    let mut rows = Vec::new();
+    for page in &pages {
+        let body = page.assert_success()?;
+        if let Some(columns) = body["columns"].as_array() {
+            if let Some(prior) = &metadata {
+                ensure!(
+                    prior == columns,
+                    "{phase}: node column signatures changed while paging"
+                );
+            } else {
+                metadata = Some(columns.clone());
+            }
+        }
+        if let Some(data) = body["data"].as_array() {
+            rows.extend(data.iter().cloned());
+        }
+        if page.next_uri()?.is_none() {
+            ensure!(
+                body["stats"]["state"] == "FINISHED",
+                "{phase}: invalid nodes terminal page"
+            );
+        }
+    }
+    let columns = metadata.context("nodes response omitted column declarations")?;
+    let after = management_backends(context, &format!("{phase}-after"))?;
+    let expected_columns = [
+        ("node_id", "varchar"),
+        ("http_uri", "varchar"),
+        ("node_version", "varchar"),
+        ("coordinator", "boolean"),
+        ("state", "varchar"),
+    ];
+    ensure!(
+        columns.len() == expected_columns.len()
+            && columns
+                .iter()
+                .zip(expected_columns)
+                .all(|(column, (name, ty))| {
+                    column["name"] == name && column["typeSignature"]["rawType"] == ty
+                }),
+        "{phase}: unexpected nodes declaration: {columns:?}"
+    );
+    let mut frontend = None;
+    let mut observed = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    for row in &rows {
+        use serde_json::Value;
+        let Some(
+            [
+                Value::String(id),
+                uri,
+                Value::String(version),
+                Value::Bool(coordinator),
+                Value::String(state),
+            ],
+        ) = row.as_array().map(Vec::as_slice)
+        else {
+            bail!("{phase}: wrong nodes row shape: {row:?}");
+        };
+        ensure!(
+            observed.insert(id.as_str()),
+            "{phase}: repeated node ID {id}"
+        );
+        if *coordinator {
+            let uri = uri
+                .as_str()
+                .context("FE has an HTTP listener but its SQL row has no URI")?;
+            let uri = reqwest::Url::parse(uri)?;
+            ensure!(
+                uri.scheme() == "http"
+                    && uri.port() == Some(context.trino_port())
+                    && version == fe_version
+                    && state == "active",
+                "{phase}: coordinator projection differs from its original HTTP listener: {row:?}"
+            );
+            let id = id
+                .parse::<FrontendProcessId>()
+                .map_err(anyhow::Error::msg)?;
+            ensure!(
+                frontend.replace(id).is_none(),
+                "{phase}: expected exactly one FE row"
+            );
+        } else {
+            ensure!(
+                uri.is_null(),
+                "{phase}: native BE endpoint advertised as HTTP"
+            );
+            let matches_management =
+                before.get(id).into_iter().chain(after.get(id)).any(|fact| {
+                    version == &fact.build_identity && state == fact.expected_node_state()
+                });
+            ensure!(
+                matches_management,
+                "{phase}: SQL node changed original topology facts: {row:?}"
+            );
+            if state == "active" {
+                active.insert(id.parse::<BackendProcessId>().map_err(anyhow::Error::msg)?);
+            }
+        }
+    }
+    for id in before.keys().filter(|id| after.contains_key(*id)) {
+        ensure!(
+            observed.contains(id.as_str()),
+            "{phase}: retained BE omitted from nodes: {id}"
+        );
+    }
+    let expected_active = live_backends.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        active == expected_active,
+        "{phase}: active SQL processes {active:?} != {expected_active:?}"
+    );
+    context.action(format!(
+        "checked FE version and HTTP endpoint, BE topology facts and exact active process IDs at {phase}",
+    ));
+    frontend.with_context(|| format!("{phase}: missing FE node"))
+}
+
+fn no_available_backends(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
+    for index in 0..REQUIRED_BACKENDS {
+        let deadline = context.deadline();
+        context
+            .handle()
+            .drain_be_until(index, deadline)
+            .with_context(|| format!("drain BE[{index}] before the FE-only control check"))?;
+    }
+    let backends = management_backends(context, "zero-available")?;
+    ensure!(
+        backends.values().all(|row| !row.eligible),
+        "a BE remains eligible: {backends:?}"
+    );
+
+    let remaining = actor.execute("SELECT * FROM system.runtime.nodes")?;
+    let end = remaining
+        .last()
+        .context("metadata SELECT omitted its terminal response")?
+        .json()?;
+    ensure!(
+        end.get("error").is_some()
+            && end.get("nextUri").is_none()
+            && remaining
+                .iter()
+                .all(|page| page.json().is_ok_and(|body| body.get("data").is_none())),
+        "ordinary metadata SELECT did not preserve its BE admission requirement: {end}",
+    );
+
+    let post = actor.submit("SELECT BIGINT '234'")?;
+    let initial = post.assert_success()?;
+    let uri = post
+        .next_uri()?
+        .context("zero-BE POST omitted original URI")?;
+    let control = (|| -> Result<()> {
+        let id = initial["id"]
+            .as_str()
+            .context("zero-BE POST omitted query ID")?;
+        ensure!(
+            initial["stats"]["state"] == "QUEUED",
+            "target was not queued: {initial}"
+        );
+        let pages = actor.execute(&format!(
+            "CALL system.runtime.kill_query(query_id => '{id}', message => 'zero eligible backends')"
+        ))?;
+        for page in &pages {
+            page.assert_success()?;
+        }
+        let call = pages
+            .last()
+            .context("FE-only cancellation omitted its terminal page")?
+            .json()?;
+        ensure!(
+            call["stats"]["state"] == "FINISHED",
+            "FE-only cancellation did not finish: {call}"
+        );
+        let killed = require_error(
+            &actor.get(&uri)?,
+            (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
+        )?;
+        ensure!(
+            killed["id"] == id
+                && killed["error"]["message"]
+                    == format!(
+                        "Query killed by user '{}'. Message: zero eligible backends",
+                        context.sql_user(),
+                    ),
+            "wrong original target or management receipt: {killed}",
+        );
+        Ok(())
+    })();
+    if control.is_err() {
+        let cleanup = actor.delete(&uri).and_then(|response| {
+            ensure!(
+                response.status == 204 || response.status == 404,
+                "target cleanup HTTP {}",
+                response.status
+            );
+            Ok(())
+        });
+        return membership_cleanup(control, cleanup);
+    }
+
+    context.action("at zero eligible BEs verified management topology, ordinary metadata admission refusal and the original FE-only cancellation receipt");
+    Ok(())
 }
 
 fn query_one(context: &mut ScenarioContext, phase: &str) -> Result<()> {

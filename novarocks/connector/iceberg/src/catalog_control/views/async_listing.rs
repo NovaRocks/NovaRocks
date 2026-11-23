@@ -141,7 +141,7 @@ impl Work {
             }
         } else {
             self.namespace = Some(crate::catalog::delegate::namespace_ident(
-                &crate::catalog::CatalogNamespaceName::new(
+                &crate::catalog::CatalogNamespaceName::discovery(
                     self.request.namespace.namespace.clone(),
                 ),
             )?);

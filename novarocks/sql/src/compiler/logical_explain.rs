@@ -66,6 +66,7 @@ impl SqlLogicalExplainCatalog {
         qualifications: super::CatalogQualifications,
     ) -> Result<Self, SqlCompileError> {
         control.check()?;
+        control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisStarted);
         let (query, root_session_admitted) = match input.kind {
             super::SqlStatementInputKind::ParsedQuery(query) => (*query, false),
             super::SqlStatementInputKind::AdmittedSessionQuery(query) => (*query, true),
@@ -143,7 +144,10 @@ impl SqlLogicalExplainCatalog {
             policy,
             self.control.clone(),
         );
-        SqlCompiler::analyze(request)?
+        let analyzed = SqlCompiler::analyze(request);
+        self.control
+            .observe_final_plan(super::SqlFinalPlanEvent::AnalysisFinished);
+        analyzed?
             .into_complete()?
             .into_explain_lines(level, true, &self.control)
     }
