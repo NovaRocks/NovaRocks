@@ -57,10 +57,10 @@ SELECT id + 100 AS id, region, amount * 2 AS amount
 -- After INSERT...SELECT (2 more rows): count = 5.
 SELECT COUNT(*) AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
 
--- query 11
+-- query 8
 -- @skip_result_check=true
 DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0};
 
--- query 12
+-- query 9
 -- @skip_result_check=true
 DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0};

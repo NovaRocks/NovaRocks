@@ -29,10 +29,10 @@ INSERT INTO ${case_db}.t_partition_evolution_unsupported VALUES ROW(1, 10, 100);
 ALTER TABLE ${case_db}.t_partition_evolution_unsupported SET PROPERTIES partitioning = ARRAY[];
 ALTER TABLE ${case_db}.t_partition_evolution_unsupported SET PROPERTIES partitioning = ARRAY['bucket(user_id, 8)'];
 
--- query 3
+-- query 2
 -- @expect_error=ADD EQUALITY DELETE on an evolved Iceberg table is not supported yet
 ALTER TABLE ${case_db}.t_partition_evolution_unsupported EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(1)]);
 
--- query 4
+-- query 3
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_partition_evolution_unsupported ;
