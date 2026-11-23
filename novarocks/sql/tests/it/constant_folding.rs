@@ -308,23 +308,23 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
 }
 
 #[test]
-fn public_sql_map_key_transition_reports_uninstalled_conversion_during_analysis() {
+fn public_sql_map_subscript_rejects_an_incompatible_probe_during_analysis() {
     use novarocks_sql::analyze_error::AnalyzeErrorKind;
     use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
 
     let probe = Arc::new(FoldProbe::default());
-    let error = compile_table_free(
-        "SELECT map_agg(CAST(1 AS INTEGER),'one')[1e0]",
-        session(Default::default(), true),
-        &probe.control(),
-    )
-    .unwrap_err();
+    let expression = "map_agg(CAST(1 AS INTEGER),'one')[1e0]";
+    let sql = format!("SELECT {expression}");
+    let error =
+        compile_table_free(&sql, session(Default::default(), true), &probe.control()).unwrap_err();
     let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = error else {
         panic!("expected a typed analysis error: {error}");
     };
-    assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-    assert!(error.message().contains("Cannot cast Map"));
-    assert!(error.span().is_some());
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
+    assert_eq!(error.code().as_str(), "sql.analyze.unknown_function");
+    assert_eq!(error.message(), "no matching declared overload");
+    let span = error.span().expect("the original MAP subscript has a span");
+    assert_eq!(&sql[span.start()..span.end()], expression);
 }
 
 #[test]

@@ -134,12 +134,14 @@ fn empty_unknown_original_precision_and_duplicate_occurrences_keep_their_facts()
     ));
     let integer = physical(DataType::Int32, false);
     let text = physical(DataType::Utf8, false);
-    assert!(matches!(
-        infer(&[&integer, &text]),
-        Err(ArrayCommonTypeFailure::Rule(
-            ArrayCommonRuleFailure::IncompatibleScalarTypes
-        ))
-    ));
+    for args in [[&integer, &text], [&text, &integer]] {
+        assert!(matches!(
+            infer(&args),
+            Err(ArrayCommonTypeFailure::Rule(
+                ArrayCommonRuleFailure::UnreviewedHeterogeneousFamily
+            ))
+        ));
+    }
 }
 
 #[test]
