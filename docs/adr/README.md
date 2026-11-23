@@ -332,6 +332,8 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
+
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
 
 - [ADR-0254](ADR-0254-exact-temporal-values-and-frozen-statement-time.md) — 精确时态值如何保留逐值时区，语句环境与规则如何在折叠、执行、存储和结果呈现之间传递（active）

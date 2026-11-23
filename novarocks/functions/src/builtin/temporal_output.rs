@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow_array::{
     ArrayRef,
     builder::{FixedSizeBinaryBuilder, PrimitiveBuilder, StringBuilder},
-    types::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType},
+    types::{Date32Type, Float64Type, Int32Type, Int64Type, TimestampMicrosecondType},
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{TemporalCarrier, TemporalType, TemporalValue};
@@ -36,6 +36,7 @@ pub(crate) enum TemporalOutputBuilder {
     Date(PrimitiveBuilder<Date32Type>),
     I32(PrimitiveBuilder<Int32Type>),
     I64(PrimitiveBuilder<Int64Type>),
+    F64(PrimitiveBuilder<Float64Type>),
     Timestamp(PrimitiveBuilder<TimestampMicrosecondType>),
     Fixed(FixedSizeBinaryBuilder),
     Text(StringBuilder),
@@ -49,8 +50,8 @@ impl TemporalOutputBuilder {
                 Self::Date(PrimitiveBuilder::with_capacity(count))
             }
             Type::Text => {
-                extent(count, 128)?;
-                Self::Text(StringBuilder::with_capacity(count, count * 128))
+                extent(count, 4)?;
+                Self::Text(StringBuilder::with_capacity(count, 0))
             }
             Type::Bigint => {
                 extent(count, 8)?;
@@ -83,6 +84,19 @@ impl TemporalOutputBuilder {
                 }
             }
         })
+    }
+
+    pub(crate) fn double(count: usize) -> Result<Self, KernelFailure> {
+        extent(count, 8)?;
+        Ok(Self::F64(PrimitiveBuilder::with_capacity(count)))
+    }
+
+    pub(crate) fn append_double(&mut self, value: f64) -> Result<(), KernelFailure> {
+        let Self::F64(out) = self else {
+            return Err(internal("unexpected DOUBLE result"));
+        };
+        out.append_value(value);
+        Ok(())
     }
 
     pub(crate) fn temporal(
@@ -128,6 +142,12 @@ impl TemporalOutputBuilder {
         let Self::Text(out) = self else {
             return Err(internal("unexpected VARCHAR result"));
         };
+        let total = out
+            .values_slice()
+            .len()
+            .checked_add(value.len())
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        i32::try_from(total).map_err(|_| KernelFailure::ResourceExhausted)?;
         out.append_value(value);
         Ok(())
     }
@@ -137,6 +157,7 @@ impl TemporalOutputBuilder {
             Self::Date(out) => out.append_null(),
             Self::I32(out) => out.append_null(),
             Self::I64(out) => out.append_null(),
+            Self::F64(out) => out.append_null(),
             Self::Timestamp(out) => out.append_null(),
             Self::Fixed(out) => out.append_null(),
             Self::Text(out) => out.append_null(),
@@ -148,6 +169,7 @@ impl TemporalOutputBuilder {
             Self::Date(mut out) => Arc::new(out.finish()),
             Self::I32(mut out) => Arc::new(out.finish()),
             Self::I64(mut out) => Arc::new(out.finish()),
+            Self::F64(mut out) => Arc::new(out.finish()),
             Self::Timestamp(mut out) => Arc::new(out.finish()),
             Self::Fixed(mut out) => Arc::new(out.finish()),
             Self::Text(mut out) => Arc::new(out.finish()),

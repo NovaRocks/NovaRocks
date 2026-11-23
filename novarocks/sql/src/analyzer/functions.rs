@@ -544,14 +544,6 @@ fn arrays_overlap_decimal_family(precision: u8, scale: i8) -> &'static str {
     }
 }
 
-fn infer_date_trunc_return_type(arg_types: &[DataType]) -> DataType {
-    match arg_types.get(1) {
-        Some(DataType::Date32) => DataType::Date32,
-        Some(DataType::Timestamp(unit, tz)) => DataType::Timestamp(*unit, tz.clone()),
-        _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-    }
-}
-
 pub(super) fn is_aggregate_function(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
@@ -705,36 +697,15 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
             }
         }
 
-        // Date/time
-        "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" | "to_datetime"
-        | "timestamp" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        "date" => DataType::Date32,
-        // These function domains are fixed even in legacy return-type-only
-        // inference. Executable calls still require the exact sealed binding.
-        "date_format" | "from_unixtime" => DataType::Utf8,
-        // `add_months` always returns DATETIME.
-        "add_months" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
-        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" | "hours_add"
-        | "hours_sub" | "minutes_add" | "minutes_sub" | "seconds_add" | "seconds_sub" => {
-            // Return the same type as the date/timestamp input argument.
-            if let Some(dt) = arg_types.first() {
-                match dt {
-                    DataType::Date32 => DataType::Date32,
-                    DataType::Timestamp(u, tz) => DataType::Timestamp(*u, tz.clone()),
-                    _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                }
-            } else {
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-            }
+        // These call sites without a bound catalogue can only describe the
+        // physically fixed results. Temporal precision is decided by the owner.
+        "date" | "last_day_of_month" => DataType::Date32,
+        "date_format" => DataType::Utf8,
+        "date_diff" | "year" | "month" | "day" | "day_of_month" | "hour" | "minute" | "second"
+        | "day_of_week" | "dow" | "day_of_year" | "doy" | "week" | "week_of_year" | "quarter" => {
+            DataType::Int64
         }
-        "date_trunc" => infer_date_trunc_return_type(arg_types),
-        "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
-        | "dayofyear" | "weekofyear" | "quarter" => DataType::Int32,
-        "unix_timestamp" | "to_unix_timestamp" | "datediff" | "timestampdiff" | "months_diff"
-        | "years_diff" | "weeks_diff" | "days_diff" | "hours_diff" | "minutes_diff"
-        | "seconds_diff" => DataType::Int64,
-        "str_to_date" | "last_day" => DataType::Date32,
+        "to_unixtime" => DataType::Float64,
 
         // Misc
         "version" | "database" | "current_user" | "user" | "uuid" => DataType::Utf8,

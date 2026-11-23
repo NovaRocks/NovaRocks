@@ -69,24 +69,23 @@ SELECT id FROM ${case_db}.t_fold_dates WHERE dt = CAST('2020-01-01' AS DATE);
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = DATE '2020-01-01';
 
 -- ---------------------------------------------------------------------------
--- 5. Volatile builtins survive in the plan.
+-- 5. A volatile call stays in the plan.
 -- ---------------------------------------------------------------------------
 -- @skip_result_check=true
 -- @result_contains=[rand()]
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT rand();
-
--- @skip_result_check=true
--- @result_contains=[now()]
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT now();
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE' SELECT rand();
 
 -- ---------------------------------------------------------------------------
--- 6. Environment-sensitive builtins are immutable but read the process
---    timezone, so folding them on the frontend would move that read off the
---    backend. They must survive in the plan too.
+-- 6. Explicit epoch inputs can use the same frozen folding path as date_format.
+--    A failing selected epoch call keeps its original runtime data reason.
 -- ---------------------------------------------------------------------------
 -- @skip_result_check=true
--- @result_contains=[from_unixtime(1577836800)]
-EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT from_unixtime(1577836800);
+-- @result_not_contains=[from_unixtime(
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT from_unixtime(DOUBLE '1577836800', 'UTC');
+
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT TRY(from_unixtime(DOUBLE '0', 'Not/AZone'));
 
 -- ---------------------------------------------------------------------------
 -- 7. Integer division by zero is a typed error in folded and runtime paths.

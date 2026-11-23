@@ -65,28 +65,7 @@ mod evaluation;
 /// These functions consult the process clock or timezone for at least one
 /// admitted argument shape.
 ///
-/// The `now`-family names are already `Volatile` in
-/// `crate::functions::builtin_function_volatility`, so gate 2 alone would stop
-/// them; they are repeated here so the denylist stays readable as the single
-/// "never fold this on the FE" statement even if a volatility classification
-/// ever changes.
 const ENVIRONMENT_SENSITIVE_FUNCTIONS: &[&str] = &[
-    // Wall clock / session clock.
-    "now",
-    "current_timestamp",
-    "localtime",
-    "localtimestamp",
-    "curdate",
-    "current_date",
-    "curtime",
-    "current_time",
-    "unix_timestamp",
-    // Process/session timezone conversions.
-    "convert_tz",
-    "from_unixtime",
-    "from_unixtime_ms",
-    "to_datetime",
-    "timestamp",
     "get_variant_date",
     "get_variant_datetime",
     "get_variant_time",

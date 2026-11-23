@@ -203,6 +203,7 @@ fn installed_records(
     declaration
         .overloads()
         .iter()
+        .filter(|overload| !definition.is_declared_only_pure_overload(&overload.identity))
         .map(|overload| {
             let installed = metadata
                 .pure_overload_declaration_observed(

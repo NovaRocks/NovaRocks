@@ -184,6 +184,74 @@ pub fn bind_temporal_syntax(
     )?)
 }
 
+/// Validate the special syntax before selecting the field's original overload.
+pub fn bind_extract(
+    catalog: &dyn super::ScalarBindingCatalog,
+    field: ast::ExtractField,
+    argument: &novarocks_functions::FunctionArgument,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_functions::ResolvedFunctionBinding, TypingError> {
+    use TemporalType as T;
+    use ast::ExtractField as F;
+    use novarocks_functions::FunctionArgument;
+    use novarocks_type_contract::{FunctionId, FunctionOverloadId};
+
+    let FunctionArgument::Value { value_type, .. } = argument else {
+        return Err(TypingError::InvalidShape("EXTRACT requires a value"));
+    };
+    let invalid = || {
+        TypingError::TypeMismatch(format!(
+            "EXTRACT field {} is unavailable for {:?}",
+            field.as_str(),
+            value_type.value_type().kind()
+        ))
+    };
+    let clock = matches!(field, F::Hour | F::Minute | F::Second);
+    let offset = matches!(field, F::TimezoneHour | F::TimezoneMinute);
+    let family = match value_type.value_type().kind() {
+        ValueKind::Scalar(arrow::datatypes::DataType::Date32) if !clock && !offset => "date",
+        ValueKind::Temporal(T::Time(_)) if clock => "time",
+        ValueKind::Temporal(T::TimeWithTimeZone(_)) if clock || offset => "time_with_time_zone",
+        ValueKind::Temporal(T::Timestamp(_)) if !offset => "timestamp",
+        ValueKind::Temporal(T::TimestampWithTimeZone(_)) => "timestamp_with_time_zone",
+        ValueKind::Temporal(T::Interval(qualifier)) => {
+            let requested = match field {
+                F::Year => IntervalField::Year,
+                F::Month => IntervalField::Month,
+                F::Day => IntervalField::Day,
+                F::Hour => IntervalField::Hour,
+                F::Minute => IntervalField::Minute,
+                F::Second => IntervalField::Second,
+                _ => return Err(invalid()),
+            };
+            if !(qualifier.start()..=qualifier.end()).contains(&requested) {
+                return Err(invalid());
+            }
+            if qualifier.is_year_month() {
+                "interval_year_month"
+            } else {
+                "interval_day_time"
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    let name = novarocks_parser::extract_call_name(field);
+    let function = FunctionId::try_new(format!("builtin.scalar/{name}/v1"))
+        .map_err(|_| TypingError::InvalidShape("invalid EXTRACT function identity"))?;
+    let overload = FunctionOverloadId::try_new(format!("builtin.scalar/{name}/{family}/v1"))
+        .map_err(|_| TypingError::InvalidShape("invalid EXTRACT overload identity"))?;
+    Ok(catalog.select_exact_scalar(
+        &function,
+        &overload,
+        novarocks_functions::FunctionBindingRequest {
+            arguments: std::slice::from_ref(argument),
+            logical_argument_count: 1,
+            expected_result_type: None,
+        },
+        control,
+    )?)
+}
+
 /// Author a complete temporal type from the original parser type shape.
 pub fn declared_temporal_type(name: &ast::TypeName) -> Result<Option<TemporalType>, TypingError> {
     Ok(Some(match &name.kind {

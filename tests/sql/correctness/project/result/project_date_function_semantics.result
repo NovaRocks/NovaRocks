@@ -1,4 +1,4 @@
 -- query 1
 -- types	bigint	bigint
 years_diff_v	years_diff_neg_v
-1	-1
+2	-2

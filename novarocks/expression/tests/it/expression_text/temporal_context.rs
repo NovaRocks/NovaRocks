@@ -140,3 +140,105 @@ fn temporal_cast_rounds_at_the_selected_precision_and_try_keeps_input_errors() {
     assert_eq!(result.batch.errors.len(), 1);
     assert_eq!(result.batch.errors[0].selected_ordinal(), 0);
 }
+
+#[test]
+fn temporal_public_clocks_and_epoch_share_the_frozen_environment() {
+    let functions = fixture();
+    let parameters = statement_parameters();
+    let context = context(&functions, &parameters);
+    assert_text(
+        "CAST(now() AS VARCHAR)",
+        "2023-12-31 19:00:00.123 America/New_York",
+        &context,
+    );
+    assert_text(
+        "CAST(\"current_date\"() AS VARCHAR)",
+        "2023-12-31",
+        &context,
+    );
+    assert_text(
+        "CAST(from_unixtime(0) AS VARCHAR)",
+        "1969-12-31 19:00:00.000 America/New_York",
+        &context,
+    );
+    assert_text(
+        "CAST(from_unixtime(DOUBLE '-0.0005', 'UTC') AS VARCHAR)",
+        "1969-12-31 23:59:59.999 UTC",
+        &context,
+    );
+    assert_text(
+        "CAST(at_timezone(with_timezone(TIMESTAMP '2024-10-27 02:30:00', 'Europe/Paris'), 'UTC') AS VARCHAR)",
+        "2024-10-27 01:30:00 UTC",
+        &context,
+    );
+
+    let sql = "TRY(from_unixtime(DOUBLE '0.0', 'Not/AZone'))";
+    let unit = compile(sql, &[], &context);
+    let result = evaluate(&unit, &batch(&[], vec![]));
+    assert_eq!(result.batch.errors.len(), 1);
+    assert_eq!(
+        result.batch.errors[0].reason(),
+        DataFailureReason::Domain(
+            novarocks_function_contract::kernel_failure::UNKNOWN_EPOCH_TIME_ZONE,
+        )
+    );
+    assert!(
+        constant(
+            "TRY(at_timezone(TIMESTAMP '2024-01-01 00:00:00 UTC', 'Not/AZone'))",
+            &context
+        )
+        .batch
+        .values
+        .is_null(0)
+    );
+}
+
+#[test]
+fn temporal_format_and_parse_share_the_en_us_pattern_rules() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for (sql, expected) in [
+        (
+            "date_format(DATE '2024-03-01', '%c %M %a %r %% %z')",
+            "3 March Fri 12:00:00 AM % z",
+        ),
+        (
+            "date_format(TIMESTAMP '1969-12-31 23:59:59.9995000', '%Y-%m-%d %T.%f')",
+            "1970-01-01 00:00:00.000000",
+        ),
+        (
+            "CAST(date_parse('02-29','%m-%d') AS VARCHAR)",
+            "2000-02-29 00:00:00.000",
+        ),
+        (
+            "CAST(date_parse('March 4','%M %e') AS VARCHAR)",
+            "2000-03-04 00:00:00.000",
+        ),
+        (
+            "CAST(date_parse('2024-02-29 061','%Y-%m-%d %j') AS VARCHAR)",
+            "2024-03-29 00:00:00.000",
+        ),
+        (
+            "CAST(date_parse('10000-02-03','%Y-%m-%d') AS VARCHAR)",
+            "+10000-02-03 00:00:00.000",
+        ),
+        (
+            "CAST(date_parse('2024-2-9','%Y-%m-%d') AS VARCHAR)",
+            "2024-02-09 00:00:00.000",
+        ),
+        (
+            "CAST(date_parse('prefix','prefix') AS VARCHAR)",
+            "1970-01-01 00:00:00.000",
+        ),
+    ] {
+        assert_text(sql, expected, &context);
+    }
+    for sql in [
+        "TRY(date_format(DATE '2024-03-01','%D'))",
+        "TRY(date_parse(' 2024-02-29 ','%Y-%m-%d'))",
+        "TRY(date_parse('10000-02-03','%Y-%m-%e'))",
+    ] {
+        assert!(constant(sql, &context).batch.values.is_null(0), "{sql}");
+    }
+}

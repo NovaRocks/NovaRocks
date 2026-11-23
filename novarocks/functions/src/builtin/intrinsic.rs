@@ -80,14 +80,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "acos",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "add_months",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "adddate",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("all_match", BuiltinDisposition::Unavailable),
     ("any_match", BuiltinDisposition::Unavailable),
     ("any_value", BuiltinDisposition::AggregateBoundary),
@@ -261,10 +253,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "contains_sequence",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "convert_tz",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("corr", BuiltinDisposition::AggregateBoundary),
     (
         "cos",
@@ -299,26 +287,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("cume_dist", BuiltinDisposition::WindowBoundary),
     (
-        "curdate",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "current_date",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "current_time",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "current_timestamp",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("current_user", BuiltinDisposition::Unavailable),
-    (
-        "curtime",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("database", BuiltinDisposition::Unavailable),
     (
         "date",
@@ -329,11 +301,11 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "date_format",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "date_diff",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "date_sub",
+        "date_format",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -341,36 +313,20 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "datediff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "day",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "dayofmonth",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "day_of_month",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "dayofweek",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "day_of_week",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "dayofyear",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "days_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "days_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "days_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "day_of_year",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "dceil",
@@ -397,6 +353,14 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     (
         "dlog10",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        "dow",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "doy",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "dpow",
@@ -509,18 +473,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "hours_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "hours_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "hours_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "if",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
@@ -572,8 +524,8 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("lag", BuiltinDisposition::WindowBoundary),
     (
-        "last_day",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "last_day_of_month",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     ("last_value", BuiltinDisposition::WindowBoundary),
     ("lead", BuiltinDisposition::WindowBoundary),
@@ -591,14 +543,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "ln",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "localtime",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "localtimestamp",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -679,35 +623,11 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "minutes_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "minutes_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "minutes_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "mod",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "month",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "months_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "months_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "months_sub",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -840,18 +760,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "seconds_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "seconds_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "seconds_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "sequence",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
@@ -900,10 +808,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ("stddev", BuiltinDisposition::AggregateBoundary),
     ("stddev_pop", BuiltinDisposition::AggregateBoundary),
     ("stddev_samp", BuiltinDisposition::AggregateBoundary),
-    (
-        "str_to_date",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("string_agg", BuiltinDisposition::AggregateBoundary),
     (
         "strleft",
@@ -911,10 +815,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "strright",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "subdate",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -939,23 +839,11 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("tanh", BuiltinDisposition::Unavailable),
     (
-        "timestamp",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "timestampdiff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
-    (
         "to_base64",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "to_binary",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "to_datetime",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     ("to_json", BuiltinDisposition::Unavailable),
@@ -986,10 +874,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ("typeof", BuiltinDisposition::LoweredOnly),
     (
         "unhex",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "unix_timestamp",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
@@ -1024,35 +908,15 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     ("version", BuiltinDisposition::Unavailable),
     (
-        "weekofyear",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "week",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "weeks_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "weeks_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "weeks_sub",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        "week_of_year",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "year",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "years_add",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "years_diff",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "years_sub",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (

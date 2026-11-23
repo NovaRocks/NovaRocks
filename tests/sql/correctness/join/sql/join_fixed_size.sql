@@ -97,10 +97,10 @@ select
     if (idx % 16 = 0, idx, null),
     idx,
     if (idx % 16 = 0, idx, null),
-    date_add('2023-01-01', idx % 365),
-    if (idx % 17 = 0, date_add('2023-01-01', idx % 365), null),
-    date_add('2023-01-01 00:00:00', idx % 365 * 24 * 3600 + idx % 86400),
-    if (idx % 18 = 0, date_add('2023-01-01 00:00:00', idx % 365 * 24 * 3600 + idx % 86400), null)
+    date_add('day', idx % 365, DATE '2023-01-01'),
+    if (idx % 17 = 0, date_add('day', idx % 365, DATE '2023-01-01'), null),
+    date_add('day', idx % 365 * 24 * 3600 + idx % 86400, TIMESTAMP '2023-01-01 00:00:00.000000'),
+    if (idx % 18 = 0, date_add('day', idx % 365 * 24 * 3600 + idx % 86400, TIMESTAMP '2023-01-01 00:00:00.000000'), null)
 from ${case_db}.__row_util;
 
 -- join on tinyint_null + smallint_null

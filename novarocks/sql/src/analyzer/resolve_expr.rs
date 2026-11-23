@@ -268,6 +268,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.check_control()?;
             }
         }
+        if let ast::Expr::Extract(extract) = expr {
+            let operand = self.analyze_expr(&extract.expression, scope)?;
+            return self.type_extract(extract.field, operand, extract.span);
+        }
         if let Some(call) = novarocks_parser::canonical_call(expr)
             .map_err(|error| AnalyzeError::unsupported_expression(error.message, error.span))?
         {
@@ -1636,19 +1640,6 @@ impl<'a> super::AnalyzerContext<'a> {
             arithmetic_operator_of(op),
             binary.left_operand_span,
         )?;
-
-        if let Some(date_shift) = date_day_arithmetic_expr(
-            self.function_catalog,
-            &left_typed,
-            op,
-            &right_typed,
-            binary.left_operand_span,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )? {
-            return Ok(date_shift);
-        }
 
         let arithmetic_type = |operator| {
             arithmetic_result_value_type_with_op(
@@ -3588,102 +3579,6 @@ pub(super) fn cast_null_preserving_target_type(
         },
         value_type: novarocks_type_contract::FunctionValueType::new(target.clone(), nullable),
     }
-}
-
-fn date_day_arithmetic_expr(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    left: &TypedExpr,
-    op: &ast::BinaryOperator,
-    right: &TypedExpr,
-    span: Span,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<Option<TypedExpr>, AnalyzeError> {
-    match op {
-        ast::BinaryOperator::Add if is_temporal_day_base(left.value_type.data_type()) => {
-            date_day_shift_expr(
-                function_catalog,
-                "days_add",
-                left.clone(),
-                right.clone(),
-                span,
-                decimal_overflow_policy,
-                constant_policy,
-                control,
-            )
-        }
-        ast::BinaryOperator::Add if is_temporal_day_base(right.value_type.data_type()) => {
-            date_day_shift_expr(
-                function_catalog,
-                "days_add",
-                right.clone(),
-                left.clone(),
-                span,
-                decimal_overflow_policy,
-                constant_policy,
-                control,
-            )
-        }
-        ast::BinaryOperator::Subtract if is_temporal_day_base(left.value_type.data_type()) => {
-            date_day_shift_expr(
-                function_catalog,
-                "days_sub",
-                left.clone(),
-                right.clone(),
-                span,
-                decimal_overflow_policy,
-                constant_policy,
-                control,
-            )
-        }
-        _ => Ok(None),
-    }
-}
-
-fn date_day_shift_expr(
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    function_name: &str,
-    date_expr: TypedExpr,
-    offset_expr: TypedExpr,
-    span: Span,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<Option<TypedExpr>, AnalyzeError> {
-    if !is_integer_day_offset(offset_expr.value_type.data_type()) {
-        return Ok(None);
-    }
-    if !matches!(
-        &date_expr.value_type.data_type(),
-        DataType::Date32 | DataType::Timestamp(_, _)
-    ) {
-        return Ok(None);
-    }
-    let offset_expr =
-        cast_null_preserving_target_type(offset_expr, &DataType::Int64, decimal_overflow_policy);
-    let args = vec![date_expr, offset_expr];
-    resolved_scalar_call_at(
-        function_catalog,
-        function_name,
-        args,
-        span,
-        decimal_overflow_policy,
-        constant_policy,
-        control,
-    )
-    .map(Some)
-}
-
-fn is_temporal_day_base(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Date32 | DataType::Timestamp(_, _))
-}
-
-fn is_integer_day_offset(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
 }
 
 pub(super) struct BoundScalarCall {

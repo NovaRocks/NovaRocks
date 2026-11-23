@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original TIME computation. Source occurrence scheduling belongs to the host.
-use super::calendar_extended::DateInput;
+use super::calendar_input::DateInput;
 use crate::{KernelEvaluationControl, KernelFailure, kernel_input::EvaluationCheckpoints};
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow_schema::DataType;

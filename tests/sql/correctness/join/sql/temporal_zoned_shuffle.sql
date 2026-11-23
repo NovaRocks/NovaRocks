@@ -27,13 +27,21 @@ INSERT INTO ${case_db}.temporal_build VALUES (TIMESTAMP '2024-01-01 00:00:00.000
 SET SESSION cbo_broadcast_node_mem_budget_bytes = 0;
 SET SESSION global_runtime_filter_build_max_size = 10737418240;
 SET SESSION global_runtime_filter_probe_min_selectivity = 0.0;
+SET SESSION disable_optimizer_rules = 'FoldConstant';
 
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
 -- @explain_contains=PARTITION: HASH_PARTITIONED
 -- @be_log_be_count_at_least=NOVAROCKS_EXCHANGE_GRANT_ONLY_PROBE event=deliver_started,2
-WITH p AS (SELECT k AT TIME ZONE 'Asia/Shanghai' AS k, id FROM ${case_db}.temporal_probe),
-     b AS (SELECT k, id FROM ${case_db}.temporal_build)
+WITH p AS (
+    SELECT at_timezone(k, 'Asia/Shanghai') AS k, id, from_unixtime(CAST(id AS DOUBLE)) AS epoch
+    FROM ${case_db}.temporal_probe
+),
+b AS (
+    SELECT k, id, from_unixtime(CAST(id - 100 AS DOUBLE)) AS epoch
+    FROM ${case_db}.temporal_build
+)
 SELECT p.id AS probe_id, b.id AS build_id, CAST(p.k AS VARCHAR) AS probe_zone,
-       CAST(b.k AS VARCHAR) AS build_zone
-FROM p JOIN b ON p.k = b.k
+       CAST(b.k AS VARCHAR) AS build_zone, to_unixtime(p.epoch) AS probe_epoch,
+       now() = CURRENT_TIMESTAMP AS same_statement_clock
+FROM p JOIN b ON p.k = b.k AND p.epoch = b.epoch
 ORDER BY p.id;
