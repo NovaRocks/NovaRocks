@@ -1527,10 +1527,11 @@ fn a_foreign_receipt_is_refused_rather_than_read_as_an_empty_write() {
         7,
     )
     .expect("write proof");
-    let error =
+    let Err(error) =
         crate::write_codec::open_compact_staged_files(foreign.receipt(), metadata, 7, &owner)
-            .err()
-            .expect("a foreign receipt");
+    else {
+        panic!("a foreign receipt must be rejected");
+    };
     assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
 
     let receipt =
