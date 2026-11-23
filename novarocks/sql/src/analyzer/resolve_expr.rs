@@ -28,7 +28,8 @@ use novarocks_parser::printer::print_object_name;
 use crate::analysis::*;
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use novarocks_type_contract::{
-    ArithmeticOperator, TemporalType, ValueTypeRef, arithmetic_result_value_type_with_op,
+    ArithmeticOperator, CharacterKind, TemporalType, ValueKind, ValueTypeRef,
+    arithmetic_result_value_type_with_op,
 };
 
 use super::functions::*;
@@ -4891,6 +4892,13 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
 }
 
 fn typeof_name(dt: &DataType, declared: Option<&ValueTypeRef>) -> String {
+    if let Some(ValueKind::BoundedCharacter(character)) = declared.map(ValueTypeRef::kind) {
+        let name = match character.kind() {
+            CharacterKind::Char => "char",
+            CharacterKind::Varchar => "varchar",
+        };
+        return format!("{name}({})", character.length());
+    }
     fn contains_temporal(ty: &ValueTypeRef) -> bool {
         ty.temporal().is_some()
             || (0..ty.child_count())
@@ -4903,6 +4911,18 @@ fn typeof_cast_name(
     syntax: &ast::TypeName,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<String>, AnalyzeError> {
+    if let ast::TypeKind::Generic(generic) = &syntax.kind
+        && !generic.arguments.is_empty()
+        && (generic.name.value.eq_ignore_ascii_case("char")
+            || generic.name.value.eq_ignore_ascii_case("varchar"))
+    {
+        let declared = super::helpers::sql_type_to_value_type(syntax, false, control)?;
+        return Ok(Some(typeof_name(
+            declared.data_type(),
+            Some(declared.value_type()),
+        )));
+    }
+
     struct ContainsTemporal(bool);
 
     impl ast::Visit for ContainsTemporal {
@@ -5728,6 +5748,24 @@ mod tests {
                 panic!("expected a type name: {source}");
             };
             assert_eq!(actual, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn typeof_preserves_the_width_of_bounded_character_values() {
+        for (expression, expected) in [
+            ("''", "varchar(0)"),
+            ("'é中'", "varchar(2)"),
+            ("CAST(only_missing_child AS CHAR(3))", "char(3)"),
+            ("CAST(only_missing_child AS VARCHAR(5))", "varchar(5)"),
+            ("CAST(only_missing_child AS VARCHAR(2147483647))", "varchar"),
+        ] {
+            let sql = format!("SELECT typeof({expression})");
+            let actual = analyze_projection_expr(&sql).expect("character type should resolve");
+            let ExprKind::Literal(LiteralValue::String(actual)) = actual.kind else {
+                panic!("expected a type name: {sql}");
+            };
+            assert_eq!(actual, expected, "{sql}");
         }
     }
 
