@@ -59,10 +59,10 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | V2 表读 | ✅ | |
-| V2 表写（INSERT / OVERWRITE / DELETE / UPDATE） | ✅ | |
+| V2 表写（INSERT / DELETE / UPDATE） | ✅ | |
 | V3 表读（含 row-lineage / DV / equality-delete） | ✅ | |
 | V3 表写（含 row-lineage 全链路） | ✅ | |
-| V1 表（read-only legacy 兼容） | ❌ | |
+| V1 表创建与追加（CREATE TABLE / CTAS / INSERT） | ✅ | CTAS 要求 REST Catalog |
 | V1 → V2 / V2 → V3 表升级 | ❌ | |
 
 ## 4. 数据类型
@@ -94,7 +94,7 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | variant（读） | ✅ 顶层 | 含 shredded；嵌套与 manifest bounds 限制见 [Variant](../variant.md) |
-| variant（INSERT / OVERWRITE / UPDATE / MERGE 数据写出） | ❌ | Provider 提前拒绝，含只插入 MERGE |
+| variant（INSERT / UPDATE / MERGE 数据写出） | ❌ | Provider 提前拒绝，含只插入 MERGE |
 | Variant 表 DELETE / TRUNCATE / equality delete | 有条件支持 | DV DELETE、元数据 truncate 与非 Variant 等值键；Variant 等值键拒绝 |
 | variant shredding（`typed_value` 子树） | 顶层读 ✅ / 写 ❌ | `write.parquet.variant-shredding.` 属性拒绝 |
 | variant default value（`initial-default` / `write-default`） | ❌ | |
@@ -129,7 +129,6 @@ under the License.
 | DELETE 跨历史 partition spec | ✅ | |
 | OPTIMIZE 跨历史 spec（compact 到当前 spec） | ✅ | |
 | partition transform `void`（V3） | ❌ | |
-| dynamic partition overwrite（仅替换被写到的分区） | ✅ | v3 分区表，目标 ref 未变；当前拒绝跨历史 spec 范围 |
 | partition stats puffin（V3）写入与消费 | ❌ | |
 | partition spec 修复 / 等价合并 | ❌ | |
 
@@ -223,15 +222,13 @@ under the License.
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| INSERT INTO（VALUES / SELECT） | ✅ | |
-| INSERT OVERWRITE（静态分区 + 全表） | ✅ | |
+| INSERT INTO（VALUES / SELECT） | ✅ | 零行结果跳过提交 |
 | DELETE FROM（V2 position-delete + V3 DV 双路径） | ✅ | |
 | UPDATE（MOR + UPDATE FROM source） | ✅ | PR #76 |
 | OPTIMIZE TABLE（whole-table 重写） | ✅ | |
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
-| INSERT OVERWRITE 动态分区（`INSERT OVERWRITE PARTITIONS`） | ✅ | 见 [DML](../dml.md) |
-| CTAS（写 Iceberg） | ✅ | 标准 REST staged-create + 显式 warehouse；Hadoop/HMS 在副作用前拒绝 |
-| CTAS 默认 V3 row-lineage | ✅ | 只创建 v3，不注入 lineage 属性；用户显式属性保留 |
+| CTAS（写 Iceberg） | ✅ | 标准 REST staged create，格式版本 1–3，缺省 2。空结果发布一个空 append 快照 |
+| REST 建表位置 | ✅ | CTAS 与普通 CREATE TABLE 共用显式位置、namespace 下唯一目录或 Catalog 分配规则。见 [DML](../dml.md) |
 | 提交依赖验证、`commit.retry.*` 与有界 owned-object 清理 | ✅ | 见 [lake-publication](../lake-publication.md)；读依赖操作当前要求目标 ref 未变 |
 | Lake publication unknown 人工核对 | ✅ | 见 [lake-publication](../lake-publication.md)：marker、target UUID、ancestry 三项同时为正才是 Published |
 | TRUNCATE TABLE | ✅ | 仅清空目标 ref，保留 schema 和历史 snapshot |
@@ -257,7 +254,7 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `_row_id` / `_last_updated_sequence_number` 元数据列读 | ✅ | |
-| INSERT / OVERWRITE 实际分配 `first_row_id` 与 snapshot row range | ✅ | 包括未赋值历史 EXISTING 文件的首次分配 |
+| 非空 INSERT 实际分配 `first_row_id` 与 snapshot row range | ✅ | 包括未赋值历史 EXISTING 文件的首次分配 |
 | DELETE 不分配新 `_row_id`（DV 合并保留语义） | ✅ | |
 | MOR UPDATE 复用 `_row_id`，新行版本继承实际提交 | ✅ | `_last_updated_sequence_number` 写 NULL |
 | OPTIMIZE 重写后保留每行 `_row_id`（写到 reserved field id `i32::MAX-107` / `-108`） | ✅ | PR #85 |
@@ -291,7 +288,7 @@ under the License.
 | IVM —— V2 position-delete | ✅ | |
 | IVM —— V3 deletion vector | ✅ | |
 | IVM —— Equality delete | ✅ | |
-| IVM —— Insert Overwrite（fallback 到全刷） | ✅ | |
+| IVM 回退到全量刷新 | ✅ | 在一次提交中发布 delete 和 append 快照 |
 | IVM —— V3 row-lineage 行级 delete 复用 `_row_id` | ✅ | |
 | IVM —— Schema evolution 安全 fallback | ✅ | |
 | IVM —— Partition evolution | ✅ | |

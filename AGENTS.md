@@ -195,8 +195,8 @@ SQL client
 
 - `novarocks/parser/src/**`
   拥有 NovaRocks 唯一的 Trino SQL 词法、文法、带位置 AST 和 printer。
-  两条语法扩展是 `INSERT OVERWRITE` 和 `INSERT OVERWRITE PARTITIONS`。
-  文法、AST 及扩展见 [ADR-0241](docs/adr/ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md)。
+  生产语法采用 Trino 文法。AST、printer 与能力准入的分工见
+  [ADR-0259](docs/adr/ADR-0259-trino-sql-without-syntax-extensions.md)。
 
 - `novarocks/sql/src/{analysis,analyzer,semantic}/**`
   Name and expression resolution, type rules and semantic validation.
@@ -220,7 +220,7 @@ SQL client
 - `novarocks/frontend-application/src/query_execution/dml/**`
   DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
   `truncate.rs`, `add_files.rs`, `ctas.rs` / `iceberg_ctas.rs`,
-  `iceberg_writer.rs` (INSERT INTO / INSERT OVERWRITE).
+  `iceberg_writer.rs` (INSERT INTO).
 
 - `novarocks/frontend-application/src/query/{statement_action,read_action,write_action,mutation_action,ctas_action}.rs`
   当前 governed 语句接缝：普通 Read 保留 Client 窗口与流式 handle；Internal 写入由稳定 Action
@@ -235,7 +235,9 @@ SQL client
   Iceberg 的根记录由 `novarocks/frontend-application/src/query_execution/write_result.rs` 组装，
   `novarocks/frontend-application/src/query_execution/write_session/computation.rs` 在原 CPU 范围内逐记录
   解码并交给 Provider。完整写集仍须通过根 EOF、参与方成功与取消/期限检查才交给原发布方。
-  Provider 的接收保管与滚动提交见 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)。
+  Provider 持有计量的紧凑条目并在原 operation 中滚动写出 manifest。CTAS 的有界回执与进程内附件
+  一起交给原建表发布，附件保留紧凑条目和准确计数。见
+  [ADR-0260](docs/adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)。
 
 - `novarocks/frontend-application/src/statistics/{application,attempt_executor,service,read,publication}.rs`
   ANALYZE 在原语句的 Internal Root、冻结会话设置与 query permit 下完成 capture、计算与发布，
@@ -598,10 +600,11 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
 
   Iceberg 意图、依赖与字段契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)，产物责任、复用与有界发布事实见 [ADR-0234](docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)。
-  紧凑接收、滚动写出与条目覆盖见 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)。
+  所有 Iceberg 写会话共用紧凑接收、滚动写出与条目覆盖。收敛后的接收与提交规则见
+  [ADR-0260](docs/adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)。
   - `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 保管所有 flavor 的接收状态。
     `novarocks/connector/iceberg/src/commit/write_stack/receiving/validation.rs` 核对片段的准确身份与归属。
-    紧凑模式逐记录核对索引和删除效果，完整接收前没有新增 manifest。
+    逐记录核对索引和删除效果，完整接收前没有新增 manifest。
   - `novarocks/connector/iceberg/src/commit/new_manifests.rs` 消费 operation 的紧凑 stage，
     按 spec 和内容类型顺序滚动写出并释放已写条目。首次完整核对条目覆盖，各轮保留 manifest 级核对。
   - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑/物理身份与继承字段；对象来源、写入与退休状态、覆盖记录及准确发布引用分别保留。
@@ -839,7 +842,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，
   使用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
   `mysql_port` 与旧 MySQL 载体配置明确拒绝，不转换为 Trino 配置。
-  此入口使用 Trino HTTP 协议、Trino SQL 文法和 [ADR-0241](docs/adr/ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) 的封闭语法扩展。
+  此入口使用 Trino HTTP 协议和 Trino SQL 文法。见
+  [ADR-0259](docs/adr/ADR-0259-trino-sql-without-syntax-extensions.md)。
   客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
@@ -1371,7 +1375,7 @@ the guide differ.
 
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
-  紧凑接收先读 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)，
+  紧凑接收先读 [ADR-0260](docs/adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)，
   对照 `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 的交接与
   `novarocks/connector/iceberg/src/commit/new_manifests.rs` 的 stage 持有、滚动写出和沿用。
   普通行级提交按 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md) 核对准入观察、
@@ -1380,13 +1384,18 @@ the guide differ.
   核对通过后在实际提交基准上定位移除条目。确定的 Catalog 竞争按原 operation 预算重试并沿用新增产物。见
   [ADR-0251](docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
-  `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
+  `commit/attempt/observation.rs`。REST CTAS 和普通 CREATE TABLE 由 `catalog/rest.rs` 选择最终位置。
+  `catalog_control/staged_create/publication.rs` 在一次 assert-create 中发布 CTAS 初始化与追加。
+  零行 CTAS 发布空 append，零行 INSERT 跳过提交。普通 INSERT 的 writer 条件只核对默认分区规范。
+  MV 全量刷新与重分区在同一次基准 CAS 中依次发布 delete 和 append。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
   BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
   精确 operation-owned cleanup 与扫描 GC 各自使用原授权。显式 `EXECUTE remove_orphan_files`
   由原 Iceberg Provider 核对准确表对象、固定截止时间、完整有效文件名与 Hadoop 发现根后逐批删除，
-  保留已确认的部分回执直至实际退出。自有 ref 成熟回收与首次观察状态族已经退役；无表锚 CTAS
-  与自动入口沿原准入。三项元数据维护的提交、删除与 SQL 结果契约见 [ADR-0243](docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)。
+  保留已确认的部分回执直至实际退出。自有 ref 成熟回收、首次观察状态族与无表锚 CTAS 根扫描均已退役。
+  CTAS 确定失败时由原写会话或建表 operation 按准确所有权处理对象。Unknown 和崩溃遗留对象保留。
+  写语句沿原查询或会话期限，Connector 请求及清理仍各按原有期限和预算运行。
+  三项元数据维护的提交、删除与 SQL 结果契约见 [ADR-0243](docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)。
   必要业务事实与原 receipt/cause 由同 canonical `ConnectorWriteNeededReady` Arc 保管；
   `query_execution/write_session/publication_call.rs` 保留同一 Provider F 到真实退出，安全 GC 由同 Call 的残留继续驱动。
   NeededReady、cleanup Pending/Observed、实际 F 退出及库存 Disposed 不可互换；封存必要 finalize 失败不能授权最终 CTAS publication。
