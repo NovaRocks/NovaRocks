@@ -16,7 +16,6 @@
 // under the License.
 
 //! HTTP syntax is checked at submission; session semantics are checked at dispatch.
-use crate::prepared::{IngressError, PreparedStatementIngress};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header::InvalidHeaderValue};
 use novarocks_query_application::{
     session_effects::{PreparedStatementEffect, SessionEffects},
@@ -155,23 +154,11 @@ impl ParsedStatementRequest {
             QueryTextLimit::default(),
         )
     }
-    #[cfg(test)]
     pub(crate) fn parse_body(
         headers: &HeaderMap,
         body: StatementBody,
         configured_user: &str,
         limit: QueryTextLimit,
-    ) -> Result<Self, RequestRejection> {
-        let (_authority, ingress) = crate::prepared::test_ingress();
-        Self::parse_with_ingress(headers, body, configured_user, limit, &ingress)
-    }
-
-    pub(crate) fn parse_with_ingress(
-        headers: &HeaderMap,
-        body: StatementBody,
-        configured_user: &str,
-        limit: QueryTextLimit,
-        ingress: &PreparedStatementIngress,
     ) -> Result<Self, RequestRejection> {
         let user = singleton(headers, "x-trino-user")?.map(str::trim);
         if user != Some(configured_user) {
@@ -297,14 +284,8 @@ impl ParsedStatementRequest {
         let client_info = singleton(headers, "x-trino-client-info")?.map(str::to_owned);
         let trace_token = trim_empty(singleton(headers, "x-trino-trace-token")?);
         let language = singleton(headers, "x-trino-language")?.map(str::to_owned);
-        let prepared = ingress.decode(headers).map_err(|error| RequestRejection {
-            status: if matches!(error, IngressError::Capacity) {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
-            },
-            message: error.to_string(),
-        })?;
+        let prepared = crate::prepared::decode(headers)
+            .map_err(|error| RequestRejection::malformed(error.to_string()))?;
         Ok(Self {
             prepared,
             sql,
@@ -333,6 +314,10 @@ impl ParsedStatementRequest {
     }
     pub fn observation(&self) -> &RequestObservation {
         &self.observation
+    }
+    #[cfg(test)]
+    pub(crate) fn prepared_sql(&self, name: &str) -> Option<&std::sync::Arc<str>> {
+        self.prepared.get(name).map(|definition| definition.sql())
     }
     /// Transfer the admitted POST snapshot on first GET. The request keeps
     /// only the original text and headers needed by the protocol driver.
@@ -740,7 +725,7 @@ mod tests {
         let mut input = headers();
         input.append(
             crate::prepared::HEADER,
-            HeaderValue::from_static("p=SELECT+1,P=SELECT+2"),
+            HeaderValue::from_static("p=SELECT+),P=SELECT+2"),
         );
         input.append(
             crate::prepared::HEADER,
@@ -763,7 +748,10 @@ mod tests {
         for invalid in [
             "missing",
             "p=SELECT+%zz",
+            "p=SELECT+%zz,p=SELECT+3",
+            "p=SELECT+%FF",
             "p=SELECT+)",
+            "p=SELECT+1%3BSELECT+2",
             "p=%24zstd%3Ainvalid",
             "p=SELECT+1,%70=SELECT+2",
         ] {

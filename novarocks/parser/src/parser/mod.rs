@@ -58,7 +58,7 @@ use failure::GrammarError;
 
 pub(crate) use literal::numeric_literal_kind;
 pub use script::{StatementFrame, frame_statements};
-pub use validation::{StatementValidationError, validate_statement_syntax};
+pub use validation::validate_statement_syntax;
 
 struct Parser<'source> {
     source: &'source str,
@@ -98,10 +98,10 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn for_syntax_validation(source: &'source str, tokens: Vec<Token>) -> Self {
-        let mut parser = Self::from_tokens(source, tokens);
+    fn for_syntax_validation(source: &'source str) -> Result<Self, GrammarError> {
+        let mut parser = Self::new(source)?;
         parser.track_parameter_events = false;
-        parser
+        Ok(parser)
     }
 
     fn parse_complete_statement(&mut self) -> Result<TrinoStatement, GrammarError> {

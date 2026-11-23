@@ -14,10 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 
 use novarocks_query_application::{
     session_effects::{PreparedStatementEffect, SessionEffects},
@@ -46,13 +43,10 @@ fn admit(
 }
 
 fn one_definition(name: &str, sql: &str) -> PreparedStatementSnapshot {
-    PreparedStatementSnapshot::new(
-        vec![(
-            name.into(),
-            PreparedStatementDefinition::new(Arc::from(sql), ()),
-        )],
-        (),
-    )
+    PreparedStatementSnapshot::new(vec![(
+        name.into(),
+        PreparedStatementDefinition::new(Arc::from(sql)),
+    )])
     .unwrap()
 }
 
@@ -284,47 +278,27 @@ USING /* é😀 */ missing_column";
     assert_eq!(named.user_error().unwrap().location().unwrap().line(), 2);
 }
 
-struct AllocationDrop(Arc<AtomicUsize>);
-
-impl Drop for AllocationDrop {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
 #[test]
 fn selected_named_source_retains_only_its_definition_after_snapshot_exit() {
-    let mapping = Arc::new(AtomicUsize::new(0));
-    let selected = Arc::new(AtomicUsize::new(0));
-    let other = Arc::new(AtomicUsize::new(0));
-    let snapshot = PreparedStatementSnapshot::new(
-        vec![
-            (
-                "selected".into(),
-                PreparedStatementDefinition::new(
-                    Arc::from("SELECT ?"),
-                    AllocationDrop(selected.clone()),
-                ),
-            ),
-            (
-                "other".into(),
-                PreparedStatementDefinition::new(
-                    Arc::from("SELECT ?"),
-                    AllocationDrop(other.clone()),
-                ),
-            ),
-        ],
-        AllocationDrop(mapping.clone()),
-    )
+    let selected = Arc::<str>::from("SELECT ?");
+    let other = Arc::<str>::from("SELECT 1");
+    let selected_text = Arc::downgrade(&selected);
+    let other_text = Arc::downgrade(&other);
+    let snapshot = PreparedStatementSnapshot::new(vec![
+        (
+            "selected".into(),
+            PreparedStatementDefinition::new(selected),
+        ),
+        ("other".into(), PreparedStatementDefinition::new(other)),
+    ])
     .unwrap();
     let error = admit("EXECUTE selected", &snapshot).unwrap_err();
     let error_alias = error.clone();
     drop(snapshot);
-    assert_eq!(mapping.load(Ordering::SeqCst), 1);
-    assert_eq!(other.load(Ordering::SeqCst), 1);
-    assert_eq!(selected.load(Ordering::SeqCst), 0);
+    assert!(other_text.upgrade().is_none());
+    assert_eq!(selected_text.upgrade().as_deref(), Some("SELECT ?"));
     drop(error);
-    assert_eq!(selected.load(Ordering::SeqCst), 0);
+    assert!(selected_text.upgrade().is_some());
     drop(error_alias);
-    assert_eq!(selected.load(Ordering::SeqCst), 1);
+    assert!(selected_text.upgrade().is_none());
 }

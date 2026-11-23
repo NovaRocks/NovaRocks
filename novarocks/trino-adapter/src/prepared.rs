@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prepared statement header codec and statement-owned ingress capacity.
+//! Prepared statement header codec.
 
 use axum::http::HeaderMap;
 use base64::{
@@ -8,11 +8,11 @@ use base64::{
     alphabet::URL_SAFE,
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
 };
-use novarocks_memory::{Account, ExplicitGrant, FactToken};
+use novarocks_parser::parser::validate_statement_syntax;
 use novarocks_query_application::session_value::{
     PreparedStatementDefinition, PreparedStatementSnapshot,
 };
-use std::{mem::size_of, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use zstd_safe::{DCtx, InBuffer, OutBuffer};
 
 pub(crate) const HEADER: &str = "x-trino-prepared-statement";
@@ -24,13 +24,6 @@ const BASE64: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
-/// The single listener's ordinary FE service account. No control floor or
-/// separate ingress quota participates in prepared statement admission.
-#[derive(Clone, Debug)]
-pub struct PreparedStatementIngress {
-    account: Account,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum IngressError {
     Frame,
@@ -39,7 +32,6 @@ pub(crate) enum IngressError {
     Utf8,
     Syntax,
     Duplicate,
-    Capacity,
 }
 
 impl std::fmt::Display for IngressError {
@@ -51,260 +43,92 @@ impl std::fmt::Display for IngressError {
             Self::Utf8 => "Prepared statement header must encode UTF-8",
             Self::Syntax => "Prepared statement header must contain one valid statement",
             Self::Duplicate => "Duplicate decoded prepared statement name",
-            Self::Capacity => "Prepared statement ingress capacity exhausted",
         })
     }
 }
 
-// Frozen graphs keep this witness after the explicit grant closes. Owners put
-// the governed storage before its token so the actual release is first.
-struct Allocation {
-    token: FactToken,
-    bytes: u64,
+pub(crate) fn decode(headers: &HeaderMap) -> Result<PreparedStatementSnapshot, IngressError> {
+    let mut pairs = BTreeMap::new();
+    for pair in assignments(headers) {
+        let (name, value) = pair?;
+        // Reference parseProperty checks form syntax before applying last-wins
+        // to assignments with the same raw name.
+        if !super::request::valid_form_value(value) {
+            return Err(IngressError::Form);
+        }
+        pairs.insert(name, value);
+    }
+    if pairs.is_empty() {
+        return Ok(PreparedStatementSnapshot::default());
+    }
+    let mut definitions = Vec::with_capacity(pairs.len());
+    for (name, sql) in pairs {
+        let name = super::request::decode_form_value(name).ok_or(IngressError::Form)?;
+        definitions.push((name, decode_sql(sql)?));
+    }
+    PreparedStatementSnapshot::new(definitions).map_err(|_| IngressError::Duplicate)
 }
 
-impl Allocation {
-    fn settle(mut grant: ExplicitGrant, bytes: usize) -> Result<Self, IngressError> {
-        let bytes = u64::try_from(bytes).map_err(|_| IngressError::Capacity)?;
-        let token = grant
-            .record_success(bytes)
-            .map_err(|_| IngressError::Capacity)?;
-        Ok(Self { token, bytes })
-    }
+fn decode_sql(encoded: &str) -> Result<PreparedStatementDefinition, IngressError> {
+    let form = super::request::decode_form_value(encoded).ok_or(IngressError::Form)?;
+    let sql = if let Some(compressed) = form.strip_prefix(COMPRESSED_PREFIX) {
+        String::from_utf8(decompress(compressed)?).map_err(|_| IngressError::Utf8)?
+    } else {
+        form
+    };
+    validate_statement_syntax(&sql).map_err(|_| IngressError::Syntax)?;
+    Ok(PreparedStatementDefinition::new(Arc::from(sql)))
 }
 
-impl Drop for Allocation {
-    fn drop(&mut self) {
-        // SAFETY: This owner is non-Clone, records one exact storage receipt
-        // and is dropped only after the receipt's data has been released.
-        unsafe { self.token.record_deallocation(self.bytes) }
+fn decompress(encoded: &str) -> Result<Vec<u8>, IngressError> {
+    let compressed = BASE64
+        .decode(encoded)
+        .map_err(|_| IngressError::Compression)?;
+    let mut decoder = DCtx::create();
+    // Accept the library's supported frame window range.
+    // SAFETY: This query takes the library's own parameter identity.
+    let bounds = unsafe {
+        zstd_safe::zstd_sys::ZSTD_dParam_getBounds(
+            zstd_safe::zstd_sys::ZSTD_dParameter::ZSTD_d_windowLogMax,
+        )
+    };
+    // SAFETY: The value is the status returned by the bounds query.
+    if unsafe { zstd_safe::zstd_sys::ZSTD_isError(bounds.error) } != 0 {
+        return Err(IngressError::Compression);
     }
-}
-
-#[derive(Default)]
-struct DecodeBuffer {
-    bytes: Vec<u8>,
-    allocation: Option<Allocation>,
-}
-
-impl DecodeBuffer {
-    fn extend(
-        &mut self,
-        bytes: &[u8],
-        ingress: &PreparedStatementIngress,
-    ) -> Result<(), IngressError> {
-        let needed = self
-            .bytes
-            .len()
-            .checked_add(bytes.len())
-            .ok_or(IngressError::Capacity)?;
-        if needed > self.bytes.capacity() {
-            let capacity = self.bytes.capacity().saturating_mul(2).max(needed);
-            let grant = ingress.reserve(capacity)?;
-            let mut replacement = Vec::new();
-            replacement
-                .try_reserve_exact(capacity)
-                .map_err(|_| IngressError::Capacity)?;
-            replacement.extend_from_slice(&self.bytes);
-            replacement.extend_from_slice(bytes);
-            let allocation = Allocation::settle(grant, replacement.capacity())?;
-            // The previous Vec is freed while its charge is still live.
-            self.bytes = replacement;
-            self.allocation = Some(allocation);
-        } else {
-            self.bytes.extend_from_slice(bytes);
-        }
-        Ok(())
-    }
-}
-
-impl PreparedStatementIngress {
-    pub fn new(account: Account) -> Self {
-        Self { account }
-    }
-
-    fn reserve(&self, bytes: usize) -> Result<ExplicitGrant, IngressError> {
-        let bytes = u64::try_from(bytes).map_err(|_| IngressError::Capacity)?;
-        self.account
-            .request_explicit(bytes)
-            .map_err(|_| IngressError::Capacity)
-    }
-
-    pub(crate) fn decode(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<PreparedStatementSnapshot, IngressError> {
-        // Count and validate framing without allocating. Transport owns the
-        // raw HTTP buffer. The temporary framed views keep their own grant.
-        let mut count = 0;
-        for pair in assignments(headers) {
-            let (_, value) = pair?;
-            // Reference parseProperty validates each assignment's form before
-            // applying last-wins to the exact raw name.
-            if !super::request::valid_form_value(value) {
-                return Err(IngressError::Form);
-            }
-            count += 1;
-        }
-        if count == 0 {
-            return Ok(PreparedStatementSnapshot::default());
-        }
-        let _framing_budget = self.reserve(vector_bytes::<(&str, &str, usize)>(count)?)?;
-        let mut pairs = Vec::new();
-        pairs
-            .try_reserve_exact(count)
-            .map_err(|_| IngressError::Capacity)?;
-        for (ordinal, pair) in assignments(headers).enumerate() {
-            let (name, value) = pair?;
-            pairs.push((name, value, ordinal));
-        }
-        pairs.sort_unstable_by(|left, right| left.0.cmp(right.0).then(right.2.cmp(&left.2)));
-        pairs.dedup_by(|left, right| left.0 == right.0);
-        let key_bytes = pairs.iter().try_fold(0usize, |bytes, (name, _, _)| {
-            bytes.checked_add(name.len()).ok_or(IngressError::Capacity)
-        })?;
-        let metadata = PreparedStatementSnapshot::retained_metadata_bytes::<Allocation>()
-            .ok_or(IngressError::Capacity)?;
-        let mapping_bytes = vector_bytes::<(String, PreparedStatementDefinition)>(pairs.len())?;
-        let mapping_grant = self.reserve(
-            mapping_bytes
-                .checked_add(key_bytes)
-                .and_then(|bytes| bytes.checked_add(metadata))
-                .ok_or(IngressError::Capacity)?,
-        )?;
-        let mut definitions = Vec::new();
-        definitions
-            .try_reserve_exact(pairs.len())
-            .map_err(|_| IngressError::Capacity)?;
-        for &(name, sql, _) in &pairs {
-            let name = super::request::decode_form_value(name).ok_or(IngressError::Form)?;
-            let definition = self.decode_sql(sql)?;
-            definitions.push((name, definition));
-        }
-        let capacity =
-            vector_bytes::<(String, PreparedStatementDefinition)>(definitions.capacity())?;
-        let capacity = definitions.iter().try_fold(capacity, |bytes, (name, _)| {
-            bytes
-                .checked_add(name.capacity())
-                .ok_or(IngressError::Capacity)
-        })?;
-        let mapping = Allocation::settle(
-            mapping_grant,
-            capacity
-                .checked_add(metadata)
-                .ok_or(IngressError::Capacity)?,
-        )?;
-        PreparedStatementSnapshot::new(definitions, mapping).map_err(|_| IngressError::Duplicate)
-    }
-
-    fn decode_sql(&self, encoded: &str) -> Result<PreparedStatementDefinition, IngressError> {
-        let _form_budget = self.reserve(encoded.len())?;
-        let form = super::request::decode_form_value(encoded).ok_or(IngressError::Form)?;
-        let expanded;
-        let sql = if let Some(compressed) = form.strip_prefix(COMPRESSED_PREFIX) {
-            expanded = self.decompress(compressed)?;
-            std::str::from_utf8(&expanded.bytes).map_err(|_| IngressError::Utf8)?
-        } else {
-            &form
-        };
-        // The decoded source and the parser's token storage overlap until the
-        // original grammar has validated the statement.
-        use novarocks_parser::parser::{StatementValidationError, validate_statement_syntax};
-        validate_statement_syntax(sql, |bytes| self.reserve(bytes).ok()).map_err(|error| {
-            match error {
-                StatementValidationError::Syntax(_) => IngressError::Syntax,
-                StatementValidationError::TokenCapacity => IngressError::Capacity,
-            }
-        })?;
-        let retained_bytes =
-            PreparedStatementDefinition::retained_content_bytes::<Allocation>(sql.len())
-                .ok_or(IngressError::Capacity)?;
-        let retention_grant = self.reserve(retained_bytes)?;
-        let sql: Arc<str> = Arc::from(sql);
-        let retention = Allocation::settle(retention_grant, retained_bytes)?;
-        Ok(PreparedStatementDefinition::new(sql, retention))
-    }
-
-    fn decompress(&self, encoded: &str) -> Result<DecodeBuffer, IngressError> {
-        let input_capacity = base64::decoded_len_estimate(encoded.len());
-        let _input_budget = self.reserve(input_capacity)?;
-        let mut compressed = Vec::new();
-        compressed
-            .try_reserve_exact(input_capacity)
-            .map_err(|_| IngressError::Capacity)?;
-        compressed.resize(input_capacity, 0);
-        let length = BASE64
-            .decode_slice(encoded, &mut compressed)
+    decoder
+        .set_parameter(zstd_safe::DParameter::WindowLogMax(
+            u32::try_from(bounds.upperBound).map_err(|_| IngressError::Compression)?,
+        ))
+        .map_err(|_| IngressError::Compression)?;
+    let mut input = InBuffer {
+        src: &compressed,
+        pos: 0,
+    };
+    let mut decoded = Vec::new();
+    let mut chunk = [0; 16 * 1024];
+    let declared =
+        zstd_safe::get_frame_content_size(&compressed).map_err(|_| IngressError::Compression)?;
+    loop {
+        let position = input.pos;
+        let mut output = OutBuffer::around(&mut chunk[..]);
+        let remaining = decoder
+            .decompress_stream(&mut output, &mut input)
             .map_err(|_| IngressError::Compression)?;
-        compressed.truncate(length);
-        // The upstream estimator inspects only the frame header. Admission
-        // precedes initialization of any dynamic decompressor workspace.
-        // SAFETY: Zstd reads exactly the supplied borrowed frame prefix.
-        let workspace = unsafe {
-            zstd_safe::zstd_sys::ZSTD_estimateDStreamSize_fromFrame(
-                compressed.as_ptr().cast(),
-                compressed.len(),
-            )
-        };
-        // SAFETY: The value is the return code from the estimator above.
-        if unsafe { zstd_safe::zstd_sys::ZSTD_isError(workspace) } != 0 {
-            return Err(IngressError::Compression);
-        }
-        let _decoder_budget = self.reserve(workspace)?;
-        let mut decoder = DCtx::try_create().ok_or(IngressError::Capacity)?;
-        // The process grant has already qualified the frame's workspace.
-        // Keep the library's representable range instead of its default,
-        // independent streaming-window policy.
-        // SAFETY: This query takes the library's own parameter identity.
-        let bounds = unsafe {
-            zstd_safe::zstd_sys::ZSTD_dParam_getBounds(
-                zstd_safe::zstd_sys::ZSTD_dParameter::ZSTD_d_windowLogMax,
-            )
-        };
-        // SAFETY: The value is the status returned by the bounds query.
-        if unsafe { zstd_safe::zstd_sys::ZSTD_isError(bounds.error) } != 0 {
-            return Err(IngressError::Compression);
-        }
-        decoder
-            .set_parameter(zstd_safe::DParameter::WindowLogMax(
-                u32::try_from(bounds.upperBound).map_err(|_| IngressError::Compression)?,
-            ))
-            .map_err(|_| IngressError::Compression)?;
-        let mut input = InBuffer {
-            src: &compressed,
-            pos: 0,
-        };
-        let mut decoded = DecodeBuffer::default();
-        let mut chunk = [0; 16 * 1024];
-        let declared = zstd_safe::get_frame_content_size(&compressed)
-            .map_err(|_| IngressError::Compression)?;
-        loop {
-            let position = input.pos;
-            let mut output = OutBuffer::around(&mut chunk[..]);
-            let remaining = decoder
-                .decompress_stream(&mut output, &mut input)
-                .map_err(|_| IngressError::Compression)?;
-            let produced = output.pos();
-            decoded.extend(&chunk[..produced], self)?;
-            if remaining == 0 {
-                if input.pos != compressed.len()
-                    || declared.is_some_and(|size| size != decoded.bytes.len() as u64)
-                {
-                    return Err(IngressError::Compression);
-                }
-                return Ok(decoded);
-            }
-            if input.pos == position && produced == 0 {
+        let produced = output.pos();
+        decoded.extend_from_slice(&chunk[..produced]);
+        if remaining == 0 {
+            if input.pos != compressed.len()
+                || declared.is_some_and(|size| size != decoded.len() as u64)
+            {
                 return Err(IngressError::Compression);
             }
+            return Ok(decoded);
+        }
+        if input.pos == position && produced == 0 {
+            return Err(IngressError::Compression);
         }
     }
-}
-
-fn vector_bytes<T>(count: usize) -> Result<usize, IngressError> {
-    count
-        .checked_mul(size_of::<T>())
-        .ok_or(IngressError::Capacity)
 }
 
 fn assignments(headers: &HeaderMap) -> impl Iterator<Item = Result<(&str, &str), IngressError>> {
@@ -346,47 +170,25 @@ pub(crate) fn header_sql(sql: &str) -> Result<std::borrow::Cow<'_, str>, &'stati
 }
 
 #[cfg(test)]
-pub(crate) fn test_ingress() -> (novarocks_memory::MemoryAuthority, PreparedStatementIngress) {
-    use novarocks_memory::{
-        AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TopUpPolicy,
-    };
-    let cap = 64 * 1024 * 1024;
-    let mut config = AuthorityConfig::new(cap, cap, 0);
-    config.top_up = TopUpPolicy::uniform(1);
-    let authority = MemoryAuthority::new(config).unwrap();
-    let account = authority
-        .create_account(AccountKind::Service, ExternalRef::NONE)
-        .unwrap();
-    (authority, PreparedStatementIngress::new(account))
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
     #[test]
-    fn trino_prepared_ingress_applies_process_capacity_to_parser_tokens() {
-        let (authority, ingress) = test_ingress();
-        let capacity = authority.snapshot().capacity_bytes;
-        let mut writer = authority.take_capacity_writer().unwrap();
-        let baseline = authority.root().committed_bytes();
-        let form = format!("SELECT+{}1", "1%2C+".repeat(32));
-        writer.set_capacity(1024).unwrap();
+    fn prepared_compression_requires_one_complete_frame() {
+        let sql = b"SELECT 1";
+        let mut buffer = vec![0; zstd_safe::compress_bound(sql.len())];
+        let written = zstd_safe::compress(&mut buffer[..], sql, 3).unwrap();
+        let frame = &buffer[..written];
+        assert_eq!(decompress(&BASE64.encode(frame)).unwrap().as_slice(), sql);
 
-        assert!(matches!(
-            ingress.decode_sql(&form),
-            Err(IngressError::Capacity)
-        ));
-        while !authority.maintain(64).complete {}
-        assert_eq!(authority.root().committed_bytes(), baseline);
-
-        writer.set_capacity(capacity).unwrap();
-        let definition = ingress.decode_sql(&form).unwrap();
-        assert_eq!(definition.sql().matches(',').count(), 32);
-        drop(definition);
-        while !authority.maintain(64).complete {}
-        assert_eq!(authority.root().committed_bytes(), baseline);
+        let concatenated = [frame, frame].concat();
+        for invalid in [&frame[..written - 1], concatenated.as_slice()] {
+            assert!(matches!(
+                decompress(&BASE64.encode(invalid)),
+                Err(IngressError::Compression)
+            ));
+        }
     }
 
     #[test]
@@ -395,10 +197,9 @@ mod tests {
         // SELECT length('<2048 a characters>'); its formatter adds LF twice.
         let upstream = "p=%24zstd%3AKLUv_WATB90AAKBTRUxFQ1QgbGVuZ3RoKCdhJykKCgEA-P_BEg%3D%3D";
         let text = format!("SELECT length('{}')", "a".repeat(2048));
-        let (_authority, ingress) = test_ingress();
         let mut headers = HeaderMap::new();
         headers.insert(HEADER, HeaderValue::from_static(upstream));
-        let snapshot = ingress.decode(&headers).unwrap();
+        let snapshot = decode(&headers).unwrap();
         assert_eq!(
             snapshot.get("p").unwrap().sql().as_ref(),
             format!("{text}\n\n")
@@ -419,7 +220,7 @@ mod tests {
                 .starts_with("%E4%B8%AD%2B%2C%3D=%24zstd%3A")
         );
         headers.insert(HEADER, added.clone());
-        let snapshot = ingress.decode(&headers).unwrap();
+        let snapshot = decode(&headers).unwrap();
         assert_eq!(snapshot.get(name).unwrap().sql().as_ref(), text);
         assert_eq!(header_sql("SELECT 1").unwrap(), "SELECT 1");
     }

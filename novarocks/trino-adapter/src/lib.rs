@@ -33,7 +33,6 @@ mod entry;
 mod envelope;
 mod paging;
 mod prepared;
-pub use prepared::PreparedStatementIngress;
 mod registry;
 mod request;
 mod routes;

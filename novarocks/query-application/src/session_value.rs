@@ -16,33 +16,21 @@
 // under the License.
 
 //! Immutable per-statement session input, without catalog existence checks.
-use std::{alloc::Layout, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use crate::session_error::QueryServiceError;
 use novarocks_result_contract::ClientPresentationFamily;
-use novarocks_type_contract::owned_resources::layout::arc_layout;
 use novarocks_types::naming::{DEFAULT_CATALOG, normalize_identifier};
 
-/// One validated definition together with the authority's original allocation facts.
-#[derive(Clone)]
+/// One validated definition, shared with the statement that uses its text.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedStatementDefinition {
     sql: Arc<str>,
-    _retention: Arc<dyn Send + Sync>,
 }
 
 impl PreparedStatementDefinition {
-    /// Requested backing for the retained text and its original allocation fact.
-    pub fn retained_content_bytes<Retention>(sql_bytes: usize) -> Option<usize> {
-        let sql = arc_layout(Layout::array::<u8>(sql_bytes).ok()?).ok()?;
-        let retention = arc_layout(Layout::new::<Retention>()).ok()?;
-        sql.size().checked_add(retention.size())
-    }
-
-    pub fn new(sql: Arc<str>, retention: impl Send + Sync + 'static) -> Self {
-        Self {
-            sql,
-            _retention: Arc::new(retention),
-        }
+    pub fn new(sql: Arc<str>) -> Self {
+        Self { sql }
     }
 
     pub fn sql(&self) -> &Arc<str> {
@@ -59,22 +47,13 @@ impl fmt::Debug for PreparedStatementDefinition {
     }
 }
 
-impl PartialEq for PreparedStatementDefinition {
-    fn eq(&self, other: &Self) -> bool {
-        self.sql == other.sql
-    }
-}
-
-impl Eq for PreparedStatementDefinition {}
-
-/// Names are compared exactly as received. The request map and each selected
-/// definition can release their original allocation facts at different times.
+/// Names are compared exactly as received. A statement can retain its chosen
+/// definition without keeping the request's other definitions alive.
 #[derive(Clone, Debug, Default)]
 pub struct PreparedStatementSnapshot(Option<Arc<PreparedStatementEntries>>);
 
 struct PreparedStatementEntries {
     definitions: Vec<(String, PreparedStatementDefinition)>,
-    _mapping_retention: Box<dyn Send + Sync>,
 }
 
 impl fmt::Debug for PreparedStatementEntries {
@@ -98,27 +77,15 @@ impl fmt::Display for DuplicatePreparedStatementName {
 impl std::error::Error for DuplicatePreparedStatementName {}
 
 impl PreparedStatementSnapshot {
-    /// Requested backing for the shared mapping and its boxed allocation fact.
-    /// The source of the vector and name buffers accounts for their capacities.
-    pub fn retained_metadata_bytes<Retention>() -> Option<usize> {
-        let entries = arc_layout(Layout::new::<PreparedStatementEntries>()).ok()?;
-        entries
-            .size()
-            .checked_add(Layout::new::<Retention>().size())
-    }
-
     pub fn new(
         mut definitions: Vec<(String, PreparedStatementDefinition)>,
-        mapping_retention: impl Send + Sync + 'static,
     ) -> Result<Self, DuplicatePreparedStatementName> {
         definitions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         if definitions.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            drop(definitions);
             return Err(DuplicatePreparedStatementName);
         }
         Ok(Self(Some(Arc::new(PreparedStatementEntries {
             definitions,
-            _mapping_retention: Box::new(mapping_retention),
         }))))
     }
 

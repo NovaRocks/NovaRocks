@@ -1661,28 +1661,24 @@ async fn malformed_or_overflowing_tokens_are_not_found_without_starting_the_stat
     use tower::ServiceExt;
     let fixture = Fixture::standard();
     let (entry, _) = fixture.register();
-    let (_authority, prepared_ingress) = crate::prepared::test_ingress();
     for token in ["-1", "not-a-token", "18446744073709551616"] {
         for method in ["GET", "HEAD", "DELETE"] {
             let uri = format!(
                 "/v1/statement/executing/{}/{}/{}",
                 entry.id, entry.slug, token
             );
-            let response = crate::routes::routes(
-                fixture.registry.clone(),
-                crate::QueryTextLimit::default(),
-                prepared_ingress.clone(),
-            )
-            .oneshot(
-                axum::http::Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("host", "localhost")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let response =
+                crate::routes::routes(fixture.registry.clone(), crate::QueryTextLimit::default())
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("host", "localhost")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {token}");
         }
     }

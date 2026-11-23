@@ -4450,7 +4450,6 @@ dependencies = [
  "hyper-util",
  "novarocks-execution-contract",
  "novarocks-failure-contract",
- "novarocks-memory",
  "novarocks-parser",
  "novarocks-query-application",
  "novarocks-result-contract",

@@ -1036,13 +1036,10 @@ fn prepared_diagnostics_project_their_original_named_immediate_and_using_sources
     // The protocol retains NovaRocks' UTF-16 indexing. The captured Trino
     // reference's ANTLR offsets differ by one for each supplementary scalar.
     let template = "SELECT '😀',\n  '😀', missing";
-    let snapshot = PreparedStatementSnapshot::new(
-        vec![(
-            "p".into(),
-            PreparedStatementDefinition::new(Arc::from(template), ()),
-        )],
-        (),
-    )
+    let snapshot = PreparedStatementSnapshot::new(vec![(
+        "p".into(),
+        PreparedStatementDefinition::new(Arc::from(template)),
+    )])
     .unwrap();
     let named = "EXECUTE p";
     let immediate = "-- 中文😀\nEXECUTE IMMEDIATE 'SELECT ''😀'', missing'";

@@ -18,7 +18,6 @@
 use crate::{
     body,
     host::base_uri,
-    prepared::PreparedStatementIngress,
     registry::TrinoQueryRegistry,
     request::{ParsedStatementRequest, QueryTextLimit, StatementBody},
 };
@@ -38,14 +37,9 @@ use tokio::sync::Notify;
 struct StatementState {
     registry: Arc<TrinoQueryRegistry>,
     limit: QueryTextLimit,
-    prepared_ingress: PreparedStatementIngress,
 }
 
-pub(crate) fn routes(
-    registry: Arc<TrinoQueryRegistry>,
-    limit: QueryTextLimit,
-    prepared_ingress: PreparedStatementIngress,
-) -> Router {
+pub(crate) fn routes(registry: Arc<TrinoQueryRegistry>, limit: QueryTextLimit) -> Router {
     Router::new()
         .route(
             "/v1/statement",
@@ -55,7 +49,6 @@ pub(crate) fn routes(
         .with_state(StatementState {
             registry: Arc::clone(&registry),
             limit,
-            prepared_ingress,
         })
         .merge(
             Router::new()
@@ -113,16 +106,11 @@ async fn submit(State(state): State<StatementState>, headers: HeaderMap, body: B
         Err(error) => return error.into_response(),
     };
     let registry = state.registry;
-    let request = match ParsedStatementRequest::parse_with_ingress(
-        &headers,
-        body,
-        &registry.user,
-        state.limit,
-        &state.prepared_ingress,
-    ) {
-        Ok(request) => request,
-        Err(error) => return (error.status, error.message).into_response(),
-    };
+    let request =
+        match ParsedStatementRequest::parse_body(&headers, body, &registry.user, state.limit) {
+            Ok(request) => request,
+            Err(error) => return (error.status, error.message).into_response(),
+        };
     // Global Host validation precedes this route, including UTF-8 and multiplicity checks.
     let Some(base) = headers
         .get(HOST)
@@ -322,9 +310,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
     }
-    fn committed(authority: &novarocks_memory::MemoryAuthority) -> u64 {
-        while !authority.maintain(64).complete {}
-        authority.root().committed_bytes()
+    fn queued_sql(entry: &crate::entry::QueryEntry, name: &str) -> std::sync::Weak<str> {
+        let request = entry.request.lock().unwrap();
+        Arc::downgrade(request.as_ref().unwrap().prepared_sql(name).unwrap())
     }
 
     async fn submit_prepared(state: &StatementState, prepared: &'static str) -> Response {
@@ -344,44 +332,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trino_prepared_ingress_refuses_overload_and_releases_a_cancelled_post() {
+    async fn prepared_post_rejects_bad_syntax_and_cancellation_releases_queued_sql() {
         let opened = Arc::new(AtomicUsize::new(0));
         let registry = registry(Arc::clone(&opened));
-        let (authority, prepared_ingress) = crate::prepared::test_ingress();
-        let capacity = authority.snapshot().capacity_bytes;
-        let mut writer = authority.take_capacity_writer().unwrap();
         let state = StatementState {
             registry: Arc::clone(&registry),
             limit: QueryTextLimit::default(),
-            prepared_ingress,
         };
-        let baseline = committed(&authority);
         let malformed = submit_prepared(&state, "p=SELECT+)").await;
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(committed(&authority), baseline);
 
         let queued = json(submit_prepared(&state, "p=SELECT+1").await).await;
-        let held = committed(&authority);
-        assert!(held > baseline);
+        let (id, slug, token) = endpoint(&queued);
+        let entry = registry.lookup(&id, &slug).unwrap();
+        let sql = queued_sql(&entry, "p");
+        assert_eq!(sql.upgrade().unwrap().as_ref(), "SELECT 1");
         assert_eq!(opened.load(Ordering::SeqCst), 0);
 
-        writer.set_capacity(held).unwrap();
-        let refused = submit_prepared(&state, "p=SELECT+2").await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(committed(&authority), held);
-        assert_eq!(opened.load(Ordering::SeqCst), 0);
-
-        let status = cancel(State(Arc::clone(&registry)), Path(endpoint(&queued))).await;
+        let status = cancel(State(Arc::clone(&registry)), Path((id, slug, token))).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(committed(&authority), baseline);
+        assert!(entry.request.lock().unwrap().is_none());
+        assert!(sql.upgrade().is_none());
         assert_eq!(opened.load(Ordering::SeqCst), 0);
-        writer.set_capacity(capacity).unwrap();
-        assert_eq!(
-            submit_prepared(&state, "p=SELECT+2").await.status(),
-            StatusCode::OK
-        );
         registry.finalize().await;
-        assert_eq!(committed(&authority), baseline);
     }
 
     #[derive(Default)]
@@ -408,47 +381,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trino_prepared_ingress_first_get_moves_original_capacity_to_the_last_alias() {
+    async fn prepared_first_get_preserves_the_original_sql_until_its_last_alias_drops() {
         let observer = Arc::new(ObservePreparedFactory::default());
         let registry = prepared_registry(observer.clone(), Duration::from_secs(60));
-        let (authority, prepared_ingress) = crate::prepared::test_ingress();
         let state = StatementState {
             registry: Arc::clone(&registry),
             limit: QueryTextLimit::default(),
-            prepared_ingress,
         };
-        let baseline = committed(&authority);
         let queued = json(submit_prepared(&state, "p=SELECT+1,other=SELECT+2").await).await;
-        let held = committed(&authority);
-        assert!(held > baseline);
+        let (id, slug, token) = endpoint(&queued);
+        let entry = registry.lookup(&id, &slug).unwrap();
+        let sql = queued_sql(&entry, "p");
+        let other_sql = queued_sql(&entry, "other");
         assert!(observer.0.lock().unwrap().is_none());
-        let failed = json(next(State(Arc::clone(&registry)), Path(endpoint(&queued))).await).await;
+        let failed = json(next(State(Arc::clone(&registry)), Path((id, slug, token))).await).await;
         assert!(failed.get("error").is_some());
         registry.finalize().await;
-        let residual = committed(&authority);
-        assert!(residual > baseline && residual < held);
+        assert!(entry.request.lock().unwrap().is_none());
+        assert!(other_sql.upgrade().is_none());
         let selected = observer.0.lock().unwrap().take().unwrap();
+        assert!(Arc::ptr_eq(&sql.upgrade().unwrap(), selected.sql()));
         assert_eq!(selected.sql().as_ref(), "SELECT 1");
         drop(selected);
-        assert_eq!(committed(&authority), baseline);
+        assert!(sql.upgrade().is_none());
     }
 
     #[tokio::test]
-    async fn trino_prepared_ingress_expiry_releases_the_snapshot_with_an_old_lookup() {
+    async fn prepared_post_expiry_releases_queued_sql_with_an_old_lookup() {
         let opened = Arc::new(AtomicUsize::new(0));
         let timeout = Duration::from_secs(60);
         let registry = prepared_registry(Arc::new(RefuseWorkFactory(Arc::clone(&opened))), timeout);
-        let (authority, prepared_ingress) = crate::prepared::test_ingress();
         let state = StatementState {
             registry: Arc::clone(&registry),
             limit: QueryTextLimit::default(),
-            prepared_ingress,
         };
-        let baseline = committed(&authority);
         let queued = json(submit_prepared(&state, "p=SELECT+1").await).await;
         let (id, slug, _) = endpoint(&queued);
         let entry = registry.lookup(&id, &slug).unwrap();
-        assert!(committed(&authority) > baseline);
+        let sql = queued_sql(&entry, "p");
         *entry.touched.lock().unwrap() = std::time::Instant::now() - 2 * timeout;
         entry.requests.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -458,7 +428,7 @@ mod tests {
         })
         .await
         .expect("the original registry timer has not expired its queued request");
-        assert_eq!(committed(&authority), baseline);
+        assert!(sql.upgrade().is_none());
         assert_eq!(
             registry.get(&entry, 0).await.err(),
             Some(StatusCode::NOT_FOUND)
@@ -476,7 +446,6 @@ mod tests {
         for (text, limit) in [("xx", 1), ("xxxx", 1), ("😀x", 2), ("x", 0)] {
             let opened = Arc::new(AtomicUsize::new(0));
             let registry = registry(Arc::clone(&opened));
-            let (_authority, prepared_ingress) = crate::prepared::test_ingress();
             let mut headers = HeaderMap::new();
             headers.insert("x-trino-user", HeaderValue::from_static("root"));
             headers.insert(HOST, HeaderValue::from_static("localhost:8080"));
@@ -485,7 +454,6 @@ mod tests {
                     State(StatementState {
                         registry: Arc::clone(&registry),
                         limit: QueryTextLimit::new(limit).unwrap(),
-                        prepared_ingress,
                     }),
                     headers,
                     Body::from(text),
