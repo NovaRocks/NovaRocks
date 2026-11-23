@@ -1,17 +1,17 @@
 -- query 3
--- legacy
+-- types	integer	boolean	integer
 id	parent_null	value_at_one
-1	1	NULL
-2	0	NULL
-3	0	NULL
-4	0	7
+1	true	NULL
+2	false	NULL
+3	false	NULL
+4	false	7
 
 -- query 4
--- legacy
+-- types	bigint	bigint	bigint
 rows_total	maps_present	values_present
 4	3	1
 
 -- query 5
--- legacy
+-- types	bigint
 maps_present
 3

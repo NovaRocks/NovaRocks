@@ -40,6 +40,9 @@ use super::completion::{
 use super::completion_catalog::CatalogCompletionState;
 use super::completion_predicate::{ProviderPredicateColumn, lower_provider_predicates};
 use super::mv_rewrite::{MvRewriteDefinitionIndex, SqlMvRewriteDefinitionFacts};
+use super::table_sequence::{
+    TableSequenceArgumentFact, TableSequenceOccurrence, TableSequencePass,
+};
 use super::{
     SqlAnalyzeOutput, SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCompileControl, SqlCompileError,
     SqlCompileIntent, SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot,
@@ -178,11 +181,10 @@ impl SqlFinalPlanCompileRequest {
                 .map_err(SqlCompileError::from)?;
             &query_semantics
         };
-        let query = crate::sql_mode::normalize_concat_query_with_semantics(query, effective);
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
         // Retain the producer's actual checked constants across discovery and
-        // catalog rounds. The loan is rebuilt against this normalized query;
+        // catalog rounds. The loan is rebuilt against the admitted query;
         // syntax transformations must validate the original structural sites.
         let statement_relation = match &statement.kind {
             super::SqlStatementInputKind::StatementSystemRelationQuery { source, .. } => {
@@ -190,6 +192,7 @@ impl SqlFinalPlanCompileRequest {
             }
             _ => None,
         };
+        let prepared_parameters = statement.prepared_parameters;
         let materialized_source = match statement.kind {
             super::SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
                 source.loan(&query, &control)?;
@@ -209,6 +212,7 @@ impl SqlFinalPlanCompileRequest {
             dop_domain,
             display_intent,
             materialized_source,
+            prepared_parameters,
             root_session_admitted,
             statement_relation,
             catalog_qualifications,
@@ -315,6 +319,7 @@ struct FinalPlanCommon {
     // for analysis preserves original pool/ordinal facts, not AST pointers.
     materialized_source: Option<super::materialized_values::MaterializedValues>,
     statement_relation: Option<super::StatementSystemRelationSource>,
+    prepared_parameters: Option<Arc<super::SqlPreparedParameters>>,
     root_session_admitted: bool,
     catalog_qualifications: super::CatalogQualifications,
 }
@@ -333,6 +338,12 @@ impl SqlCatalogCompletionState {
     pub(super) fn is_discovery_round(&self) -> bool {
         self.catalog.is_discovery_round()
     }
+}
+
+pub(crate) struct SqlTableSequenceCompletionState {
+    catalog: SqlCatalogCompletionState,
+    occurrences: Vec<TableSequenceOccurrence>,
+    next_need_ordinal: u32,
 }
 
 pub(crate) struct SqlStatisticsCompletionState {
@@ -516,20 +527,7 @@ pub(super) fn resume_catalog(
             CompilerContinuation::catalog(state),
         ));
     }
-    let fact_catalog = state.catalog.completed_catalog()?;
-    let analyzed = analyze_with_catalog(
-        &state.common,
-        state.catalog.query().clone(),
-        &fact_catalog,
-        state.mv_definitions.as_ref(),
-        control,
-    )?;
-    statistics_or_optimize_step(
-        state.common,
-        analyzed,
-        state.catalog.next_need_ordinal(),
-        control,
-    )
+    analyze_completed_catalog(state, control)
 }
 
 fn catalog_or_analyze_step(
@@ -551,15 +549,76 @@ fn catalog_or_analyze_step(
         ));
     }
 
-    let fact_catalog = catalog.completed_catalog()?;
-    let analyzed = analyze_with_catalog(
-        &common,
-        catalog.query().clone(),
-        &fact_catalog,
-        mv_definitions.as_ref(),
+    analyze_completed_catalog(
+        SqlCatalogCompletionState {
+            common,
+            catalog,
+            mv_definitions,
+        },
         control,
-    )?;
-    statistics_or_optimize_step(common, analyzed, catalog.next_need_ordinal(), control)
+    )
+}
+
+fn analyze_completed_catalog(
+    state: SqlCatalogCompletionState,
+    control: &SqlCompileControl,
+) -> Result<CompilerStep, SqlCompileError> {
+    let pass = TableSequencePass::request(
+        Arc::clone(&state.common.sealed_functions),
+        state.catalog.next_need_ordinal(),
+    );
+    let analyzed = analyze_with_completed_catalog(&state, &pass, control)?;
+    let (occurrences, next_need_ordinal) = pass.into_requests();
+    if occurrences.is_empty() {
+        let analyzed = analyzed.ok_or_else(|| {
+            SqlCompileError::InvalidRequest("Catalog analysis did not publish a plan".into())
+        })?;
+        return statistics_or_optimize_step(state.common, analyzed, next_need_ordinal, control);
+    }
+    let needs = TableSequencePass::needs(&occurrences);
+    Ok(CompilerStep::need(
+        SqlNeedBatch::TableSequenceArguments(needs),
+        CompilerContinuation::TableSequence(Box::new(SqlTableSequenceCompletionState {
+            catalog: state,
+            occurrences,
+            next_need_ordinal,
+        })),
+    ))
+}
+
+pub(super) fn resume_table_sequence(
+    state: SqlTableSequenceCompletionState,
+    facts: Box<[TableSequenceArgumentFact]>,
+    control: &SqlCompileControl,
+) -> Result<CompilerStep, SqlCompileError> {
+    let pass = TableSequencePass::resume(state.occurrences, facts, control)?;
+    let analyzed =
+        analyze_with_completed_catalog(&state.catalog, &pass, control)?.ok_or_else(|| {
+            SqlCompileError::InvalidRequest("Table sequence analysis still needs arguments".into())
+        })?;
+    pass.check_consumed()?;
+    statistics_or_optimize_step(
+        state.catalog.common,
+        analyzed,
+        state.next_need_ordinal,
+        control,
+    )
+}
+
+fn analyze_with_completed_catalog(
+    state: &SqlCatalogCompletionState,
+    pass: &TableSequencePass,
+    control: &SqlCompileControl,
+) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
+    let fact_catalog = state.catalog.completed_catalog()?;
+    analyze_with_catalog(
+        &state.common,
+        state.catalog.query().clone(),
+        &fact_catalog,
+        state.mv_definitions.as_ref(),
+        Some(pass),
+        control,
+    )
 }
 
 fn analyze_with_catalog(
@@ -567,16 +626,18 @@ fn analyze_with_catalog(
     query: novarocks_parser::ast::Query,
     catalog: &dyn crate::catalog::PlannerTableProvider,
     mv_definitions: Option<&MvRewriteDefinitionIndex>,
+    table_sequence: Option<&TableSequencePass>,
     control: &SqlCompileControl,
-) -> Result<SqlAnalyzedQuery, SqlCompileError> {
+) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
     let catalog = SqlPlannerTableSnapshot::new(catalog);
     let query = Box::new(query);
-    let statement = match (&common.statement_relation, &common.materialized_source) {
+    let mut statement = match (&common.statement_relation, &common.materialized_source) {
         (Some(source), _) => SqlStatementInput {
             kind: super::SqlStatementInputKind::StatementSystemRelationQuery {
                 query,
                 source: source.clone(),
             },
+            prepared_parameters: None,
         },
         (None, Some(source)) => {
             // Resolve a fresh loan only over the actual query entering this
@@ -588,6 +649,7 @@ fn analyze_with_catalog(
                     query,
                     source: source.clone(),
                 },
+                prepared_parameters: None,
             }
         }
         (None, None) if common.root_session_admitted => {
@@ -595,7 +657,8 @@ fn analyze_with_catalog(
         }
         (None, None) => SqlStatementInput::parsed_query(query),
     };
-    let request = SqlAnalyzeRequest::new(
+    statement.prepared_parameters = common.prepared_parameters.clone();
+    let mut request = SqlAnalyzeRequest::new(
         statement,
         common.intent.clone(),
         common.session.clone(),
@@ -607,11 +670,15 @@ fn analyze_with_catalog(
         common.constant_policy,
         control.clone(),
     );
-    let analyzed = SqlCompiler::analyze(request);
-    control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisFinished);
+    request.table_sequence = table_sequence;
+    let analyzed = SqlCompiler::analyze_with_table_sequence(request);
+    if !matches!(analyzed, Ok(None)) {
+        control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisFinished);
+    }
     match analyzed? {
-        SqlAnalyzeOutput::Pending(analyzed) => Ok(analyzed),
-        SqlAnalyzeOutput::Complete(_) => Err(SqlCompileError::InvalidRequest(
+        None => Ok(None),
+        Some(SqlAnalyzeOutput::Pending(analyzed)) => Ok(Some(analyzed)),
+        Some(SqlAnalyzeOutput::Complete(_)) => Err(SqlCompileError::InvalidRequest(
             "final physical-plan analysis terminated before optimization".to_string(),
         )),
     }
@@ -2337,6 +2404,9 @@ mod tests {
                         SqlNeedBatch::ProviderInputs { .. } => {
                             panic!("root intrinsic fixture has no system tables")
                         }
+                        SqlNeedBatch::TableSequenceArguments(_) => {
+                            panic!("root intrinsic fixture has no table arguments")
+                        }
                     };
                 }
             }
@@ -2623,6 +2693,9 @@ mod tests {
                 SqlNeedBatch::ProviderInputs { .. } => {
                     panic!("base query fixture has no system tables")
                 }
+                SqlNeedBatch::TableSequenceArguments(_) => {
+                    panic!("base query fixture has no table arguments")
+                }
             };
         }
     }
@@ -2631,18 +2704,18 @@ mod tests {
     fn unsupported_caller_never_discovers_optional_mv_definitions() {
         use crate::sql_mode::SqlMode;
         for (sql, connection_mode) in [
-            ("SELECT order_key FROM orders", "GROUP_CONCAT_LEGACY"),
+            ("SELECT order_key FROM orders", "ERROR_IF_OVERFLOW"),
             (
-                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
                 "32",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM (SELECT order_key FROM orders) d",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
@@ -2675,7 +2748,7 @@ mod tests {
         for (sql, connection_mode) in [
             (
                 "WITH SESSION sql_mode = 32 SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
@@ -2735,7 +2808,7 @@ mod tests {
             table: "orders".to_string(),
         };
         let query = novarocks_parser::parser::parse_query(
-            "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
         )
         .unwrap();
         let definition = SqlMvRewriteDefinitionFacts::try_new(
@@ -3266,12 +3339,6 @@ mod tests {
                 .disabled_rules
                 .push("PushDownTopNToPreAgg".into());
         }
-        // Original compressed_key query 132 admits this value before 137.
-        input.session.sql_semantics = input
-            .session
-            .sql_semantics
-            .clone()
-            .with_group_concat_max_len(65_535);
         input.dop_domain = PipelineDopDomain {
             min: 2,
             max: 2,
@@ -3528,8 +3595,8 @@ mod tests {
                 "SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100",
             ),
             (
-                "original-137",
-                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result",
+                "ordered-listagg",
+                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, LOWER(TO_HEX(MD5(TO_UTF8(LISTAGG(CAST(c1 AS VARCHAR), ':') WITHIN GROUP (ORDER BY c1, c2, c3))))) AS result_hash FROM result",
             ),
         ];
         let mut failures = Vec::new();
@@ -3537,8 +3604,10 @@ mod tests {
             match grouped_state_topn_sequence_fixture(sql) {
                 Ok(SqlCompileProgress::Complete(completed)) => {
                     let owner = completed.into_plan();
-                    {
+                    if label == "inner" {
                         assert_grouped_state_topn_sources(&owner);
+                    } else {
+                        assert_complete_group_topn_sources(&owner);
                     }
                 }
                 Ok(SqlCompileProgress::Incomplete(_)) => {
@@ -4086,11 +4155,11 @@ mod tests {
     fn source_free_ctes_do_not_fabricate_base_statistics_or_known_zero_rows() {
         let scenarios = [
             (
-                "WITH big_probe AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 1000000))), no_stats AS (SELECT k FROM (SELECT generate_series + 0 AS k FROM TABLE(generate_series(1, 100000000))) projected WHERE k > 0) SELECT COUNT(*) AS cnt FROM big_probe p JOIN no_stats b ON p.k = b.k",
+                "WITH big_probe AS (SELECT sequential_number AS k FROM TABLE(sequence(1, 1000000))), no_stats AS (SELECT k FROM (SELECT sequential_number + 0 AS k FROM TABLE(sequence(1, 100000000))) projected WHERE k > 0) SELECT COUNT(*) AS cnt FROM big_probe p JOIN no_stats b ON p.k = b.k",
                 false,
             ),
             (
-                "WITH p AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 1000))), b AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 10))) SELECT COUNT(*) AS cnt FROM p JOIN b ON p.k = b.k",
+                "WITH p AS (SELECT sequential_number AS k FROM TABLE(sequence(1, 1000))), b AS (SELECT sequential_number AS k FROM TABLE(sequence(1, 10))) SELECT COUNT(*) AS cnt FROM p JOIN b ON p.k = b.k",
                 true,
             ),
         ];

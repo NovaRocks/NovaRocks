@@ -21,9 +21,9 @@ USE ${case_db};
 CREATE TABLE probe_1m (k INT, v BIGINT);
 CREATE TABLE build_1000 (k INT);
 INSERT INTO probe_1m
-    SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000000));
+    SELECT generate_series, generate_series FROM TABLE(sequence(1, 1000000)) AS generate_series(generate_series);
 INSERT INTO build_1000
-    SELECT generate_series FROM TABLE(generate_series(1, 1000));
+    SELECT generate_series FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 ANALYZE probe_1m;
 ANALYZE build_1000;
 SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;
@@ -44,11 +44,11 @@ SELECT COUNT() AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
 EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH p AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 1000))
+    FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series)
 ),
 b AS (
     SELECT generate_series AS k
-    FROM TABLE(generate_series(1, 10))
+    FROM TABLE(sequence(1, 10)) AS generate_series(generate_series)
 )
 SELECT COUNT() AS cnt
 FROM p JOIN b ON p.k = b.k;

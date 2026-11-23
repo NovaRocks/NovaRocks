@@ -48,9 +48,9 @@ const DETAIL: &str = "Unexpected failure (reason 13:20)";
 // the inclusive 1MiB SQL string cap; the four-row tail totals 4MiB. Even when
 // wanted=2 carries consumed=1, this exceeds the two 1MiB Root Data positions,
 // keeping the real producer live behind that read without a timing workload.
-const TARGET: &str = "SELECT payload FROM (SELECT 0 AS ordinal, CAST('1' AS VARCHAR) AS payload UNION ALL SELECT 1 AS ordinal, REPEAT('x', 1048576) AS payload UNION ALL SELECT 2 AS ordinal, REPEAT('x', 1048576) AS payload UNION ALL SELECT 3 AS ordinal, REPEAT('x', 1048576) AS payload UNION ALL SELECT 4 AS ordinal, REPEAT('x', 1048576) AS payload) ordered_rows ORDER BY ordinal ASC";
+const TARGET: &str = "SELECT payload FROM (SELECT 0 AS ordinal, CAST('1' AS VARCHAR) AS payload UNION ALL SELECT 1 AS ordinal, rpad('', 1048576, 'x') AS payload UNION ALL SELECT 2 AS ordinal, rpad('', 1048576, 'x') AS payload UNION ALL SELECT 3 AS ordinal, rpad('', 1048576, 'x') AS payload UNION ALL SELECT 4 AS ordinal, rpad('', 1048576, 'x') AS payload) ordered_rows ORDER BY ordinal ASC";
 const HEALTHY: &str =
-    "SELECT CAST(SUM(generate_series) AS VARCHAR) AS payload FROM TABLE(generate_series(1, 100))";
+    "SELECT CAST(SUM(sequential_number) AS VARCHAR) AS payload FROM TABLE(sequence(1, 100))";
 
 pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![

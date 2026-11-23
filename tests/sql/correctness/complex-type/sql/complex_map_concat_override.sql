@@ -26,17 +26,17 @@
 -- 3. Assert element lookup and cardinality outputs.
 SELECT
     ELEMENT_AT(
-        MAP_CONCAT(MAP('a', 1, 'b', 2), MAP('b', 9, 'c', 3)),
+        MAP_CONCAT(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['b', 'c'], ARRAY[9, 3])),
         'a'
     ) AS a_v,
     ELEMENT_AT(
-        MAP_CONCAT(MAP('a', 1, 'b', 2), MAP('b', 9, 'c', 3)),
+        MAP_CONCAT(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['b', 'c'], ARRAY[9, 3])),
         'b'
     ) AS b_v,
     ELEMENT_AT(
-        MAP_CONCAT(MAP('a', 1, 'b', 2), MAP('b', 9, 'c', 3)),
+        MAP_CONCAT(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['b', 'c'], ARRAY[9, 3])),
         'c'
     ) AS c_v,
-    MAP_SIZE(
-        MAP_CONCAT(MAP('a', 1, 'b', 2), MAP('b', 9, 'c', 3))
+    cardinality(
+        MAP_CONCAT(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['b', 'c'], ARRAY[9, 3]))
     ) AS map_sz;

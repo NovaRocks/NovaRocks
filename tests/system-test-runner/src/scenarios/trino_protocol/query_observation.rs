@@ -351,7 +351,15 @@ fn running_cancel(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<
             "SELECT BIGINT '233' AS independent_probe",
             |independent| {
                 let message = "running cancellation receipt";
-                success(actor, &kill_sql(&query.id, Some(message)))?;
+                let runtime = actor
+                    .with_session(&[("x-trino-catalog", "system"), ("x-trino-schema", "runtime")]);
+                success(
+                    &runtime,
+                    &format!(
+                        "EXECUTE IMMEDIATE 'CALL kill_query(query_id => ?, message => ?)' USING '{}', '{message}'",
+                        query.id,
+                    ),
+                )?;
                 query.cancel(actor)?;
                 require_admin_result(actor, query, context.sql_user(), message)?;
                 let mut rows = Vec::new();

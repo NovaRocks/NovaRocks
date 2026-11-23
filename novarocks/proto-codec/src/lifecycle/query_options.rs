@@ -38,13 +38,12 @@ mod tests {
     fn preserves_the_exact_generated_query_options_message() {
         let raw = novarocks::QueryOptions {
             runtime_filter_wait_timeout_ms: Some(0),
-            group_concat_max_len: Some(0),
             ..Default::default()
         };
 
         let parsed = QueryOptions::from_proto(raw);
 
         assert_eq!(parsed.as_proto(), &raw);
-        assert_eq!(parsed.as_proto().encode_to_vec(), [64, 0, 80, 0]);
+        assert_eq!(parsed.as_proto().encode_to_vec(), [64, 0]);
     }
 }

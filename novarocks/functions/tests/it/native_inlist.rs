@@ -211,15 +211,19 @@ fn in_admission_checks_the_comparison_domain_and_exact_operand_carriers() {
     let json =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
-    let list = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+    let unsupported_list = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
         true,
     );
     let boolean = FunctionValueType::new(DataType::Boolean, true);
     for (input, candidate, failure) in [
         (&utf8, &json, ComparisonPrepareError::TypeMismatch),
         (&utf8, &boolean, ComparisonPrepareError::TypeMismatch),
-        (&list, &list, ComparisonPrepareError::Unsupported),
+        (
+            &unsupported_list,
+            &unsupported_list,
+            ComparisonPrepareError::Unsupported,
+        ),
     ] {
         assert_eq!(
             PreparedNativeInListRecipe::try_new(false, input, &[candidate], &boolean, &Active)

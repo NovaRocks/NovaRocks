@@ -349,6 +349,9 @@ fn prepare_completion_rows(
         ) => Ok(None),
         (StatementOutputShape::Rows, StatementCommandCompletion::Rows(_)) => {
             let count = completion.checked_row_value().map_err(str::to_string)?;
+            let field = shape
+                .command_row_field()
+                .ok_or("missing command row field")?;
             let window = owner
                 .result_window_alias()
                 .ok_or("command result has no original window")?;
@@ -357,13 +360,7 @@ fn prepare_completion_rows(
             producer
                 .produce(|| {
                     crate::api::build_arrow_query_result(
-                        vec![crate::api::ResultField::new(
-                            "rows",
-                            novarocks_type_contract::FunctionValueType::new(
-                                arrow::datatypes::DataType::Int64,
-                                true,
-                            ),
-                        )],
+                        vec![field],
                         vec![Arc::new(arrow::array::Int64Array::from(vec![count]))],
                     )
                 })

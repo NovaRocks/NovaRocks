@@ -29,10 +29,10 @@ CREATE TABLE ${case_db}.topn_compactness_left_src (id INT, score INT) WITH (stat
 CREATE TABLE ${case_db}.topn_compactness_right_src (id INT, score INT) WITH (statistics_collect_on_write = false);
 INSERT INTO ${case_db}.topn_compactness_left_src
     SELECT generate_series, generate_series
-    FROM TABLE(generate_series(1, 100000));
+    FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.topn_compactness_right_src
     SELECT generate_series + 100000, 200000 - generate_series
-    FROM TABLE(generate_series(1, 100000));
+    FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 
 -- @skip_result_check=true
 -- @result_contains=UNION ALL

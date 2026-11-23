@@ -43,8 +43,9 @@ pub use literal::{LiteralEmission, LiteralSyntax, TypedLiteral, supports_typed_s
 pub use route::{ScalarTypingRoute, scalar_typing_route};
 pub use syntax_constant::{LiteralValue, admit_syntax_constant};
 pub use temporal::{
-    TemporalSyntax, at_zone_syntax, bind_temporal_syntax, clock_syntax, declared_temporal_type,
-    qualified_datetime_difference, select_temporal_cast, temporal_function_value_type,
+    TemporalSyntax, at_zone_syntax, bind_extract, bind_temporal_syntax, clock_syntax,
+    declared_temporal_type, qualified_datetime_difference, select_temporal_cast,
+    temporal_function_value_type,
 };
 
 /// Project numeric and comparison syntax into the installed operator vocabulary.
@@ -179,6 +180,8 @@ pub enum NodeShape<'a> {
         name: &'a str,
         expected_result: Option<&'a FunctionValueType>,
     },
+    Row,
+    MapSubscript,
     Operator(OperatorFunction),
     Coalesce,
     UnaryPlus,
@@ -236,6 +239,7 @@ pub struct ValueDomainConversion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueConversionOrigin {
     ValueDomain,
+    ArrayCommonCoercion,
     OperatorDecimalFloat,
 }
 
@@ -270,6 +274,7 @@ pub enum NodeTyping {
 pub enum TypingError {
     TypeMismatch(String),
     InvalidLiteral(String),
+    NumericOutOfRange(String),
     Unsupported(String),
     InvalidShape(&'static str),
     Binding(FunctionBindingError),
@@ -325,6 +330,7 @@ impl fmt::Display for TypingError {
         match self {
             Self::TypeMismatch(message)
             | Self::InvalidLiteral(message)
+            | Self::NumericOutOfRange(message)
             | Self::Unsupported(message) => f.write_str(message),
             Self::InvalidShape(message) => f.write_str(message),
             Self::Binding(error) => error.fmt(f),
@@ -427,6 +433,50 @@ pub fn type_node(
                     )
                 })?;
             type_catalog_call(context, "coalesce", None, children, work)?
+        }
+        NodeShape::Row => {
+            let function = FunctionId::try_new("builtin.scalar/row/v1")
+                .expect("valid ROW constructor function identity");
+            let overload = FunctionOverloadId::try_new("builtin.scalar/row/dynamic-v1")
+                .expect("valid ROW constructor overload identity");
+            let arguments = arguments(children, work)?;
+            work.flush()?;
+            let binding = context.catalog.select_exact_scalar(
+                &function,
+                &overload,
+                request(&arguments, None),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, None, children, work)?
+        }
+        NodeShape::MapSubscript => {
+            let arguments = arguments(children, work)?;
+            let function = FunctionId::try_new("builtin.scalar/__map_subscript/v1")
+                .expect("valid MAP subscript function identity");
+            let Some(child) = children.first() else {
+                return Err(TypingError::InvalidShape(
+                    "MAP subscript needs its collection",
+                ));
+            };
+            // This candidate is selected by the actual uninhabited-key domain,
+            // not by the syntax or a reconstructed probe carrier.
+            let overload = if novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
+                &child.value_type,
+            ) {
+                "builtin.scalar/__map_subscript/(map-with-uninhabited-key<M,V>,any)->any<V>;strict;legacy"
+            } else {
+                "builtin.scalar/__map_subscript/(map<any<K>,any<V>>,any<K>)->any<V>;strict;legacy"
+            };
+            let overload = FunctionOverloadId::try_new(overload)
+                .expect("valid MAP subscript overload identity");
+            work.flush()?;
+            let binding = context.catalog.select_exact_scalar(
+                &function,
+                &overload,
+                request(&arguments, None),
+                work.control(),
+            )?;
+            type_selected_call(context, binding, None, children, work)?
         }
         NodeShape::Operator(operator) => {
             let unary = matches!(
@@ -595,11 +645,10 @@ fn type_catalog_call(
 ) -> Result<NodeTyping, TypingError> {
     let arguments = arguments(children, work)?;
     work.flush()?;
-    let binding = context.catalog.select_scalar(
-        name,
-        request(&arguments, expected_result),
-        work.control(),
-    )?;
+    let binding = context
+        .catalog
+        .select_scalar(name, request(&arguments, expected_result), work.control())
+        .map_err(|error| route::unavailable_string_binding(name, children, error))?;
     type_selected_call(context, binding, expected_result, children, work)
 }
 
@@ -613,6 +662,9 @@ fn type_selected_call(
     check_shape(&binding, children.len())?;
     let arithmetic = OperatorFunction::from_function_id(&binding.function_id)
         .is_some_and(|operator| operator.arithmetic().is_some());
+    let array_concat = binding.function_id.as_str() == "builtin.scalar/concat/v1"
+        && matches!(&binding.selected.result_type, FunctionResultType::Scalar(result)
+            if matches!(result.data_type(), DataType::List(_)));
     let conversions = binding
         .selected
         .argument_types
@@ -624,6 +676,9 @@ fn type_selected_call(
                     "selected scalar expects a lambda argument",
                 ));
             };
+            if array_concat && matches!(target.data_type(), DataType::List(_)) {
+                return conversion::array_common(context, child, target, work);
+            }
             if arithmetic
                 && matches!(child.value_type.data_type(), DataType::Decimal128(..))
                 && matches!(target.data_type(), DataType::Float32 | DataType::Float64)

@@ -25,9 +25,10 @@ use novarocks_failure_contract::{FailureReason, domain};
 use std::num::NonZeroU16;
 
 pub use novarocks_failure_contract::kernel_reason::{
-    DIVISION_BY_ZERO, INVALID_CAST_ARGUMENT, INVALID_FUNCTION_ARGUMENT, INVALID_JSON_LITERAL,
+    DATE_RESULT_OUT_OF_RANGE, DIVISION_BY_ZERO, EXCEEDED_FUNCTION_MEMORY_LIMIT,
+    INVALID_CAST_ARGUMENT, INVALID_FUNCTION_ARGUMENT, INVALID_JSON_LITERAL,
     JSON_INPUT_CONVERSION_ERROR, JSON_OUTPUT_CONVERSION_ERROR, JSON_VALUE_RESULT_ERROR,
-    NUMERIC_OUT_OF_RANGE, PATH_EVALUATION_ERROR,
+    NUMERIC_OUT_OF_RANGE, PATH_EVALUATION_ERROR, UNKNOWN_EPOCH_TIME_ZONE,
 };
 
 // These reasons belong to the actual pure-function preparation authors.
@@ -40,3 +41,5 @@ pub const UNSUPPORTED_ARITHMETIC: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(604).unwrap());
 pub const UNSUPPORTED_CAST: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(606).unwrap());
+pub const UNSUPPORTED_REGEXP_PATTERN: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(608).unwrap());

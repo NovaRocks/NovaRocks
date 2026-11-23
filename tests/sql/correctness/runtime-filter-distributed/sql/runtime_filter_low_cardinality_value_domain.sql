@@ -39,7 +39,7 @@ SELECT CASE i % 5
          ELSE NULL
        END AS status,
        i * 3 AS payload
-FROM TABLE(generate_series(1, 2000)) t(i);
+FROM TABLE(sequence(1, 2000)) t(i);
 
 INSERT INTO ${case_db}.rf_dist_lc_build VALUES
   ROW('PAID', 'Y'),

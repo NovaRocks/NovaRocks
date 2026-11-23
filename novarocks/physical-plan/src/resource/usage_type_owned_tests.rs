@@ -323,8 +323,6 @@ fn checked_scalar_unit() -> (
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::ReportError,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })

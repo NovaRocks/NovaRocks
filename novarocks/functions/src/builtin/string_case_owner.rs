@@ -40,11 +40,33 @@ use crate::{
 
 /// Only the two actually registered Utf8 profiles have owners.
 /// Legacy dispatch aliases without declarations gain no pure implementation.
-pub(super) fn operation(name: &str) -> Option<StringCaseOp> {
+#[derive(Clone, Copy, Debug)]
+pub(super) enum StringCaseKernel {
+    Case(StringCaseOp),
+    Normalize,
+}
+
+pub(super) fn operation(name: &str) -> Option<StringCaseKernel> {
     match name {
-        "lower" => Some(StringCaseOp::Lower),
-        "upper" => Some(StringCaseOp::Upper),
+        "lower" => Some(StringCaseKernel::Case(StringCaseOp::Lower)),
+        "upper" => Some(StringCaseKernel::Case(StringCaseOp::Upper)),
+        "normalize" => Some(StringCaseKernel::Normalize),
         _ => None,
+    }
+}
+
+pub(super) fn normalize_effects() -> FunctionEffectDeclaration {
+    let mut result = effects();
+    result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    result
+}
+
+impl StringCaseKernel {
+    fn effects(self) -> FunctionEffectDeclaration {
+        match self {
+            Self::Case(_) => effects(),
+            Self::Normalize => normalize_effects(),
+        }
     }
 }
 
@@ -78,7 +100,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct StringCaseOwner {
-    operation: StringCaseOp,
+    operation: StringCaseKernel,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -95,10 +117,12 @@ impl StringCaseOwner {
                 value: name.into(),
             })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let expected = operation.effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || !(1..=2).contains(&declaration.overloads().len())
+            || (matches!(operation, StringCaseKernel::Normalize)
+                && declaration.overloads().len() != 1)
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -128,7 +152,7 @@ impl StringCaseOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = self.operation.effects();
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -250,7 +274,7 @@ impl PureScalarImplementation for StringCaseOwner {
 
 #[derive(Debug)]
 struct PreparedStringCase {
-    operation: StringCaseOp,
+    operation: StringCaseKernel,
     contract: Arc<ScalarCallContract>,
 }
 impl PreparedScalarKernel for PreparedStringCase {
@@ -270,7 +294,7 @@ impl PreparedScalarKernel for PreparedStringCase {
 }
 
 struct StringCaseInstance {
-    operation: StringCaseOp,
+    operation: StringCaseKernel,
 }
 impl ScalarKernelInstance for StringCaseInstance {
     fn evaluate<'a>(
@@ -278,7 +302,12 @@ impl ScalarKernelInstance for StringCaseInstance {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::string_case::evaluate_string_case(self.operation, input, control)
+        match self.operation {
+            StringCaseKernel::Case(operation) => {
+                super::string_case::evaluate_string_case(operation, input, control)
+            }
+            StringCaseKernel::Normalize => super::string_case::evaluate_normalize(input, control),
+        }
     }
 
     fn retained_bytes(&self) -> usize {

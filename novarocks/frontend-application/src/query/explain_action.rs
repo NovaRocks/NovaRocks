@@ -67,6 +67,7 @@ struct ExplainPreparationInput {
     optimizer_limit: u64,
     sql: String,
     explain: ExplainInput,
+    parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     state: SessionSqlState,
     timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
     statement_time: novarocks_type_contract::StatementTimeEnvironment,
@@ -144,6 +145,7 @@ async fn make_explain_preparation(
             )
             .with_session_property_inputs(property_inputs),
         )
+        .with_prepared_parameters(input.parameters)
         .with_result_capacity(capacity.clone())
         .map_err(|e| internal_error(e.to_string()))?;
         #[cfg(novarocks_dev_controls)]
@@ -581,6 +583,7 @@ pub(super) fn build_explain_action(
         deadline,
         cancellation,
         window,
+        parameters,
         planning_cpu,
         timing,
         statement_time,
@@ -633,6 +636,7 @@ pub(super) fn build_explain_action(
         optimizer_limit: environment.optimizer_limit,
         sql,
         explain,
+        parameters,
         state,
         timing,
         statement_time,

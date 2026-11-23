@@ -45,9 +45,15 @@ impl Writer {
             }
             match &argument.value {
                 TableFunctionArgumentValue::Expression(expression) => {
-                    // Parentheses select the expression argument alternative,
-                    // even when its real head is DESCRIPTOR or COPARTITION.
-                    self.parenthesized_expression(expression)?;
+                    if matches!(expression, Expr::Subquery(_)) {
+                        // The subquery has its own parentheses. A second pair
+                        // would introduce a grouped query into the subquery.
+                        self.expression(expression)?;
+                    } else {
+                        // Parentheses select the expression argument alternative,
+                        // even when its real head is DESCRIPTOR or COPARTITION.
+                        self.parenthesized_expression(expression)?;
+                    }
                 }
                 TableFunctionArgumentValue::Descriptor(value) => match &value.descriptor {
                     None => self.text("CAST(NULL AS DESCRIPTOR)"),

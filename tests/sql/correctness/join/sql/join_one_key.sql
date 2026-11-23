@@ -37,7 +37,7 @@ CREATE TABLE ${case_db}.__row_util_base (
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(generate_series(0, 2500 - 1));
+INSERT INTO ${case_db}.__row_util_base SELECT generate_series FROM TABLE(sequence(0, 2500 - 1)) AS generate_series(generate_series);
 
 -- query 4
 -- @skip_result_check=true
@@ -132,10 +132,10 @@ SELECT
     if (idx % 25 = 0, idx, null),
     idx / CAST(2 AS DOUBLE),
     if (idx % 26 = 0, idx, null),
-    date_add('2023-01-01', idx / 2),
-    if (idx % 19 = 0, date_add('2023-01-01', idx), null),
-    date_add('2023-01-01 00:00:00', idx / 2),
-    if (idx % 20 = 0, date_add('2023-01-01 00:00:00', idx), null),
+    date_add('day', idx / 2, DATE '2023-01-01'),
+    if (idx % 19 = 0, date_add('day', idx, DATE '2023-01-01'), null),
+    date_add('day', idx / 2, TIMESTAMP '2023-01-01 00:00:00.000000'),
+    if (idx % 20 = 0, date_add('day', idx, TIMESTAMP '2023-01-01 00:00:00.000000'), null),
     concat('char_', idx / CAST(2 AS DOUBLE)),
     if (idx % 21 = 0, concat('char_', idx), null),
     concat('varchar_', idx / CAST(2 AS DOUBLE)),

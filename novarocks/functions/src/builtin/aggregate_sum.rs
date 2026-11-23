@@ -290,6 +290,9 @@ impl SumKernel {
 }
 
 impl PreparedAggregateKernel for SumKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

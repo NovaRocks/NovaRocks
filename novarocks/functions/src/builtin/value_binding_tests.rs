@@ -333,7 +333,7 @@ fn actual_ordinary_integer_widening_keeps_physical_targets() {
     ];
     let binding = builtin_engine_function_catalog()
         .resolve_bound_user(
-            "left",
+            "substring",
             FunctionKind::Scalar,
             request(&arguments),
             crate::binding_test_control(),
@@ -693,26 +693,6 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
             )
             .is_err()
     );
-    let list = physical(DataType::List(json_item(false)));
-    let arguments = [
-        value(list.clone()),
-        value(physical(DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        ))))),
-    ];
-    let sorted = resolve("array_sortby", FunctionKind::Scalar, &arguments);
-    assert_eq!(output(&sorted), &list);
-    let mut forged = sorted;
-    forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::List(Arc::new(
-        Field::new("item", DataType::Utf8, false),
-    ))));
-    assert!(
-        builtin_engine_function_catalog()
-            .validate_bound(&forged, request(&arguments), crate::binding_test_control())
-            .is_err()
-    );
 }
 
 #[test]
@@ -809,44 +789,41 @@ fn array_constructor_infers_independently_of_outer_expected_type_and_rejects_for
 }
 
 #[test]
-fn higher_order_array_result_carries_actual_lambda_result_domain() {
-    let source = physical(DataType::List(json_item(true)));
-    let arguments = [
-        FunctionArgument::Lambda {
-            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                vec![json()].into_boxed_slice(),
-            ),
-            result_type: json(),
-        },
-        value(source),
-    ];
-    let binding = resolve("array_map", FunctionKind::Scalar, &arguments);
-    assert!(
-        matches!(output(&binding).data_type(), DataType::List(item) if item.metadata().is_empty())
-    );
-    assert_eq!(
-        output(&binding).child_at(0).unwrap().logical_type(),
-        ValueLogicalType::Json
-    );
-    let wrong = [
-        FunctionArgument::Lambda {
-            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
-                vec![physical(DataType::Utf8)].into_boxed_slice(),
-            ),
-            result_type: json(),
-        },
-        arguments[1].clone(),
-    ];
-    assert!(
-        builtin_engine_function_catalog()
-            .resolve_bound_user(
-                "array_map",
-                FunctionKind::Scalar,
-                request(&wrong),
-                crate::binding_test_control()
-            )
-            .is_err()
-    );
+fn transform_keeps_typed_lambda_capability_and_arity_refusals_distinct() {
+    let catalog = builtin_engine_function_catalog();
+    let source = value(physical(DataType::List(json_item(true))));
+    let lambda = |parameters: Vec<FunctionValueType>| FunctionArgument::Lambda {
+        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            parameters.into_boxed_slice(),
+        ),
+        result_type: json(),
+    };
+    let arguments = [source.clone(), lambda(vec![json()])];
+    let control = crate::binding_test_control();
+    assert!(matches!(
+        catalog.resolve_bound_user("transform", FunctionKind::Scalar, request(&arguments), control),
+        Err(FunctionBindingError::UnavailableImplementation(overload))
+            if overload.as_str() == "builtin.scalar/transform/lambda-v1"
+    ));
+    assert!(matches!(
+        catalog.resolve_bound_user(
+            "array_map",
+            FunctionKind::Scalar,
+            request(&arguments),
+            control
+        ),
+        Err(FunctionBindingError::UnknownFunction)
+    ));
+    let wrong_arity = [source, lambda(vec![json(), json()])];
+    assert!(matches!(
+        catalog.resolve_bound_user(
+            "transform",
+            FunctionKind::Scalar,
+            request(&wrong_arity),
+            control
+        ),
+        Err(FunctionBindingError::NoMatchingOverload)
+    ));
 }
 
 fn variant_get_arguments(source: FunctionValueType, typed: bool) -> Vec<FunctionArgument> {

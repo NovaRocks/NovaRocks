@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use crate::session_error::QueryServiceError;
 use novarocks_parser::Span;
 use novarocks_parser::ast;
@@ -16,6 +18,12 @@ use super::{
     lower_object_name,
     property_evaluation::validate_create_authorization,
     session_admit::SessionAdmitError,
+};
+
+mod prepared;
+pub use prepared::{
+    AdmittedTrinoStatement, TrinoDescriptionAction, TrinoDescriptionKind, TrinoStatementSource,
+    admit_trino_statement_request, admit_trino_statement_request_in_namespace,
 };
 
 pub(super) const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
@@ -100,6 +108,9 @@ pub const TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     KillQuerySqlError::Missing.descriptor(),
     KillQuerySqlError::NotRunning.descriptor(),
     KillQuerySqlError::PermissionDenied.descriptor(),
+    prepared::PREPARED_STATEMENT_NOT_FOUND,
+    prepared::EXPRESSION_NOT_CONSTANT,
+    prepared::INVALID_PARAMETER_USAGE,
 ];
 
 pub fn procedure_not_registered(name: &ast::ObjectName) -> QueryServiceError {
@@ -165,6 +176,7 @@ pub enum TrinoStatementAction {
     Session(TrinoSessionAction),
     Product(ProductSqlCommand),
     Prepare(TrinoStatementPreparation),
+    Describe(TrinoDescriptionAction),
 }
 
 #[derive(Debug)]
@@ -201,6 +213,13 @@ pub enum TrinoSessionAction {
         span: Span,
     },
     SetTimeZone(ast::TrinoSetTimeZone),
+    Prepare {
+        name: String,
+        sql: Arc<str>,
+    },
+    DeallocatePrepare {
+        name: String,
+    },
 }
 
 /// Source-bearing requests to the owning preparation path. These values
@@ -281,38 +300,24 @@ pub fn admit_persisted_definition_semantics(
         }
         _ => return Ok(()),
     };
-    let (legacy, strict) = match definition {
-        Some(query) => {
-            let map_error = |error: novarocks_sql::analyze_error::AnalyzeError| {
-                QueryServiceError::from_user_error(error.to_user_error(Some(source)))
-            };
-            (
-                sql_mode::query_uses_group_concat_legacy(caller, query).map_err(map_error)?,
-                sql_mode::query_uses_error_if_overflow(caller, query).map_err(map_error)?,
-            )
-        }
-        None => (
-            caller.sql_mode().group_concat_legacy(),
-            caller.sql_mode().error_if_overflow(),
-        ),
+    let strict = match definition {
+        Some(query) => sql_mode::query_uses_error_if_overflow(caller, query).map_err(|error| {
+            QueryServiceError::from_user_error(error.to_user_error(Some(source)))
+        })?,
+        None => caller.sql_mode().error_if_overflow(),
     };
-    let setting = if legacy {
-        "GROUP_CONCAT_LEGACY"
-    } else if strict {
-        "ERROR_IF_OVERFLOW"
-    } else {
+    if !strict {
         return Ok(());
-    };
-    let message = format!(
-        "unsupported semantic setting: {setting} is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
-    );
+    }
+    let message = "unsupported semantic setting: ERROR_IF_OVERFLOW is not captured for persistent VIEW or MATERIALIZED VIEW definition replay";
     Err(QueryServiceError::from_user_error(
         SessionAdmitError::PersistedDefinitionSemanticsUnsupported
             .to_user_error(source, span, message),
     ))
 }
 
-/// Select the exact statement owner before any provider or session effects.
+/// Select an ordinary statement owner before any provider or session effects.
+/// Request dispatch uses `admit_trino_statement_request` to retain source and bindings.
 pub fn admit_trino_statement(
     source: &str,
     statement: ast::TrinoStatement,
@@ -321,6 +326,15 @@ pub fn admit_trino_statement(
 }
 
 pub fn admit_trino_statement_in_namespace(
+    source: &str,
+    statement: ast::TrinoStatement,
+    current_catalog: Option<&str>,
+    current_schema: Option<&str>,
+) -> Result<TrinoStatementAction, QueryServiceError> {
+    prepared::admit_ordinary_statement(source, statement, current_catalog, current_schema)
+}
+
+fn select_trino_statement_owner(
     source: &str,
     statement: ast::TrinoStatement,
     current_catalog: Option<&str>,
@@ -703,13 +717,45 @@ mod tests {
     }
 
     #[test]
+    fn execute_immediate_resolves_the_kill_procedure_in_the_request_namespace() {
+        use crate::session_value::PreparedStatementSnapshot;
+
+        let source = "EXECUTE IMMEDIATE 'CALL kill_query(?)' USING 'target'";
+        let snapshot = PreparedStatementSnapshot::default();
+        let admitted = admit_trino_statement_request_in_namespace(
+            source.into(),
+            parse_statement(source).unwrap(),
+            &snapshot,
+            Some("system"),
+            Some("runtime"),
+        )
+        .unwrap();
+        assert_eq!(admitted.source.sql().as_ref(), "CALL kill_query(?)");
+        assert!(admitted.parameters.is_some());
+        assert!(matches!(
+            admitted.action,
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::KillQuery(_))
+        ));
+
+        let admitted = admit_trino_statement_request_in_namespace(
+            source.into(),
+            parse_statement(source).unwrap(),
+            &snapshot,
+            Some("other"),
+            Some("runtime"),
+        )
+        .unwrap();
+        assert!(matches!(
+            admitted.action,
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::Call(_))
+        ));
+    }
+
+    #[test]
     fn persisted_definition_admission_keeps_the_frozen_caller_policy() {
         use novarocks_sql::sql_mode::SqlMode;
 
         let default = SqlSemanticSettings::default();
-        let legacy = default
-            .clone()
-            .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
         let strict = default
             .clone()
             .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
@@ -725,10 +771,7 @@ mod tests {
                 panic!("expected definition or replay preparation: {source}");
             };
             assert!(admit_persisted_definition_semantics(source, &preparation, &default).is_ok());
-            for (settings, feature) in [
-                (&legacy, "GROUP_CONCAT_LEGACY"),
-                (&strict, "ERROR_IF_OVERFLOW"),
-            ] {
+            for (settings, feature) in [(&strict, "ERROR_IF_OVERFLOW")] {
                 let error = admit_persisted_definition_semantics(source, &preparation, settings)
                     .unwrap_err();
                 let user = error.user_error().unwrap();

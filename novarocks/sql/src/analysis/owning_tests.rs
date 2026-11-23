@@ -629,6 +629,7 @@ fn recursive_typed_expression_owners_keep_every_child_slot_and_original_allocati
 
 fn output() -> AnalyzedOutputField {
     AnalyzedOutputField {
+        aliased: false,
         column_id: ColumnId(73),
         name: "internal".into(),
         field_name: Some("visible".into()),
@@ -697,6 +698,7 @@ fn wrap_query(slot: usize, inner: ResolvedQuery) -> ResolvedQuery {
             select.apply_specs = vec![ApplyScalarSpec {
                 mark_probe: None,
                 mark_key_bindings: None,
+                relation_mark: None,
                 subquery_id: 17,
                 clause: ApplyClause::Projection,
                 output_column: output(),

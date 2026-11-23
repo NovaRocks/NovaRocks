@@ -99,6 +99,7 @@ impl JoinOrientation {
                 NestedLoopJoinType::LeftSemi
                     | NestedLoopJoinType::LeftAnti
                     | NestedLoopJoinType::NullAwareLeftAnti
+                    | NestedLoopJoinType::LeftMark
             )
         )
     }
@@ -247,11 +248,7 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                 // The original complete predicate owns NAA guard/demand;
                 // the runtime never reconstructs C/E from its shape.
                 JoinKind::NullAwareLeftAnti => (0, NestedLoopJoinType::NullAwareLeftAnti),
-                JoinKind::LeftMark => {
-                    return Err(FragmentCompileError::Invalid(
-                        "left mark join requires hash execution",
-                    ));
-                }
+                JoinKind::LeftMark => (0, NestedLoopJoinType::LeftMark),
                 // Only a singleton placement may swap: a broadcast right side
                 // would become the preserved side and duplicate its rows.
                 JoinKind::RightSemi | JoinKind::RightAnti
@@ -500,7 +497,11 @@ pub(crate) fn shape_join_with_creation<H>(
             work,
         )?;
     }
-    let mark = if orientation.kind == LocalJoinKind::Hash(JoinType::LeftMark) {
+    let mark = if matches!(
+        orientation.kind,
+        LocalJoinKind::Hash(JoinType::LeftMark)
+            | LocalJoinKind::NestLoop(NestedLoopJoinType::LeftMark)
+    ) {
         let mark = node.output.columns.iter().copied().find(|value| values.get(value).is_some_and(|definition| matches!(definition.origin, ValueOrigin::JoinMark { node: owner } if owner == node.id)))
             .ok_or(FragmentCompileError::Invalid("left mark join has no original mark output"))?;
         canonical_types.push((mark, true));

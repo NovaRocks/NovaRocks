@@ -37,6 +37,7 @@ pub(super) enum ControlOperation {
     If,
     Coalesce,
     Try,
+    OrderedRegexp(super::regexp_count::f10::RegexpOperation),
 }
 
 /// Only registration interprets the installed names. Prepared contracts retain
@@ -46,20 +47,25 @@ pub(super) fn operation(name: &str) -> Option<ControlOperation> {
         "if" => Some(ControlOperation::If),
         "coalesce" | "ifnull" => Some(ControlOperation::Coalesce),
         "try" => Some(ControlOperation::Try),
-        _ => None,
+        name => super::regexp_count::f10::RegexpOperation::from_name(name)
+            .map(ControlOperation::OrderedRegexp),
     }
 }
 
 pub(super) fn effects(operation: ControlOperation) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        own_row_error: match operation {
+            ControlOperation::OrderedRegexp(_) => FunctionIntrinsicRowError::MayRaise,
+            _ => FunctionIntrinsicRowError::NoRowError,
+        },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::ControlDefined,
         argument_control: match operation {
             ControlOperation::If => ArgumentControl::If,
             ControlOperation::Coalesce => ArgumentControl::Coalesce,
             ControlOperation::Try => ArgumentControl::Try,
+            ControlOperation::OrderedRegexp(_) => ArgumentControl::OrderedRegexp,
         },
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
@@ -101,7 +107,8 @@ impl ControlOwner {
         let expected = effects(operation);
         if declaration.function_id().as_str() != format!("builtin.scalar/{name}/v1")
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || (!matches!(operation, ControlOperation::OrderedRegexp(_))
+                && declaration.overloads().len() != 1)
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -260,6 +267,7 @@ impl ControlOwner {
                     ControlOperation::If => arity != 3,
                     ControlOperation::Coalesce => arity == 0,
                     ControlOperation::Try => arity != 1,
+                    ControlOperation::OrderedRegexp(operation) => !operation.accepts_arity(arity),
                 }
             {
                 return Err(FunctionBindingError::NoMatchingOverload);

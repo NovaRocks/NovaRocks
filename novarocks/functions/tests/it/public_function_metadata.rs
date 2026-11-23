@@ -61,7 +61,8 @@ fn installed_public_function_metadata_borrows_each_original_overload() {
             ));
             assert_eq!(
                 found,
-                definition.visibility() == FunctionVisibility::Public,
+                definition.visibility() == FunctionVisibility::Public
+                    && !definition.is_declared_only_pure_overload(&overload.identity),
                 "{definition:?}"
             );
         }
@@ -104,13 +105,46 @@ fn public_aliases_resolve_to_the_overload_that_supplied_the_metadata() {
         assert!(!row.deterministic);
     }
 
-    let array_append = catalog
-        .public_function_overloads()
-        .find(|row| row.name == "array_append")
-        .unwrap();
-    assert_eq!(array_append.return_type, "array(T)");
-    assert_eq!(array_append.argument_types, "array(T), T");
-    assert!(array_append.deterministic);
+    assert!(catalog.public_function_overloads().any(|row| {
+        row.name == "concat"
+            && row.return_type == "array(T)"
+            && row.argument_types == "array(T), T"
+            && row.deterministic
+    }));
+}
+
+#[test]
+fn public_overloads_follow_the_trino_collection_string_and_aggregate_owners() {
+    let catalog = shared_installed_builtin_owner_catalogue();
+    for (name, arguments, result) in [
+        ("map", "", "map(unknown,unknown)"),
+        ("map", "array(K), array(V)", "map(K,V)"),
+        ("length", "char(x)", "bigint"),
+        ("length", "varchar(x)", "bigint"),
+        ("min", "T", "T"),
+        ("min", "T, bigint", "array(T)"),
+        (
+            "listagg",
+            "varchar, varchar, boolean, varchar, boolean",
+            "varchar",
+        ),
+        ("date_add", "varchar(x), bigint, date", "date"),
+        ("approx_distinct", "T", "bigint"),
+    ] {
+        assert!(
+            catalog
+                .public_function_overloads()
+                .any(|row| row.name == name
+                    && row.argument_types == arguments
+                    && row.return_type == result),
+            "missing public signature {name}({arguments}) -> {result}",
+        );
+    }
+    assert!(
+        !catalog
+            .public_function_overloads()
+            .any(|row| row.name == "approx_distinct" && row.argument_types.ends_with(", double"))
+    );
 }
 
 #[test]

@@ -218,7 +218,7 @@ impl Scenario for TrinoInterop {
                         "Requires the declared Trino reference image, Linux Docker host networking, original Spark/Iceberg REST fixture and native 1FE+3BE."
                     }
                     Mode::Jdbc => {
-                        "Requires the declared Trino reference image, its read-only JDBC driver, Linux Docker host networking and native 1FE+3BE."
+                        "Requires the declared Trino reference image, its read-only JDBC driver, Linux Docker host networking, the original Spark/Iceberg REST fixture and native 1FE+3BE."
                     }
                 },
             }),
@@ -239,10 +239,7 @@ impl Scenario for TrinoInterop {
             })?
             .canonicalize()?;
         let storage = RunStorageScope::from_publication(&publication, budget)?.to_json()?;
-        let launch = match self.mode {
-            Mode::Encoding | Mode::Cli => fixture_launch_config(&publication)?,
-            Mode::Jdbc => ScenarioLaunchConfig::default(),
-        };
+        let launch = fixture_launch_config(&publication)?;
         *self
             .prepared
             .lock()

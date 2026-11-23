@@ -673,17 +673,22 @@ fn row_and_map_builders_retain_original_owning_nodes_without_changing_tuple_cont
     let key_span = key.span();
     let val = expression("ROW(3)");
     let val_span = val.span();
-    let built = build::map(vec![(key, val)]);
+    let built = build::map(build::array(vec![key]), build::array(vec![val]));
     let Expr::FunctionCall(call) = &built else {
-        panic!("plain variadic map");
+        panic!("two-array map");
     };
-    let Expr::Subscript(moved) = &call.arguments[0].value else {
+    let (Expr::Array(keys), Expr::Array(values)) =
+        (&call.arguments[0].value, &call.arguments[1].value)
+    else {
+        panic!("key and value arrays");
+    };
+    let Expr::Subscript(moved) = &keys.values[0] else {
         panic!("original key subtree");
     };
     assert_eq!(moved.as_ref() as *const SubscriptExpr, original_pointer);
-    assert_eq!(call.arguments[0].span, key_span);
-    assert_eq!(call.arguments[1].span, val_span);
-    assert!(built.syntax_eq(&expression("map(items[2], ROW(3))")));
+    assert_eq!(keys.values[0].span(), key_span);
+    assert_eq!(values.values[0].span(), val_span);
+    assert!(built.syntax_eq(&expression("map(ARRAY[items[2]], ARRAY[ROW(3)])")));
     let mut top = built.clone();
     let Expr::FunctionCall(call) = &mut top else {
         unreachable!()

@@ -35,7 +35,7 @@ CREATE TABLE ${case_db}.trc_l7_measurements (
 CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_avg_star AS SELECT k, AVG(*) AS invalid_avg FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 3
--- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_avg_string AS SELECT k, AVG(s) FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 4
@@ -60,19 +60,29 @@ SELECT k, count(*) FILTER (WHERE v > 0) AS n
 FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 8
+-- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_unnamed_avg AS
+SELECT k, AVG(v) FROM ${case_db}.trc_l7_measurements GROUP BY k;
+
+-- query 9
+-- @expect_error=Iceberg IMV requires an installed persistent state author for overload builtin.aggregate/approx_distinct/default-hll-v1
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_approx_distinct AS
+SELECT k, approx_distinct(v) AS n FROM ${case_db}.trc_l7_measurements GROUP BY k;
+
+-- query 10
 SELECT table_name
 FROM iceberg_ivm_cat_${suite_uuid0}.information_schema.tables
 WHERE table_schema = '${case_db}'
-  AND table_name IN ('trc_l7_count_control', 'trc_l7_count_filtered');
+  AND table_name IN ('trc_l7_count_control', 'trc_l7_count_filtered', 'trc_l7_approx_distinct');
 
--- query 9
+-- query 11
 SELECT name
 FROM system.runtime.materialized_view_states
 WHERE catalog_name = 'iceberg_ivm_cat_${suite_uuid0}'
   AND schema_name = '${case_db}'
-  AND name IN ('trc_l7_count_control', 'trc_l7_count_filtered');
+  AND name IN ('trc_l7_count_control', 'trc_l7_count_filtered', 'trc_l7_approx_distinct');
 
--- query 10
+-- query 12
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_star;
@@ -81,4 +91,6 @@ DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_min_star;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_retired_call;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_filtered;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_control;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_unnamed_avg;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_approx_distinct;
 DROP TABLE IF EXISTS ${case_db}.trc_l7_measurements;

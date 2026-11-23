@@ -573,8 +573,6 @@ fn unit(owner: &Owner, control: ArgumentControl, hidden_call: bool) -> BoundExpr
                     effects: owner.frozen(u.context, &selected),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -922,8 +920,6 @@ fn intrinsic_controller_keeps_hand_checked_branch_guards_without_scalar_instance
                     effects: owner.frozen(u.context, &selected),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -1111,8 +1107,6 @@ fn seal_type_only_fixture(
                     effects: owner.frozen(u.context, &selected),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -1137,8 +1131,8 @@ fn compile_type_only_hidden_native_profile(
     let mut b = builder();
     let input_type = match kind {
         "in_float" => FunctionValueType::new(DataType::Float64, false),
-        "in_nested" => FunctionValueType::new(
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+        "in_text_array" => FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
             false,
         ),
         "like_json" | "between_json" => {
@@ -1170,7 +1164,7 @@ fn compile_type_only_hidden_native_profile(
                 negated: false,
             }
         }
-        "in_float" | "in_nested" => ExprKind::InList {
+        "in_float" | "in_text_array" => ExprKind::InList {
             expr: input,
             list: Box::from([input]),
             negated: false,
@@ -1260,8 +1254,8 @@ fn type_only_hidden_float_in_compiles_without_evaluating_arguments() {
     );
 }
 #[test]
-fn type_only_hidden_nested_in_keeps_the_profile_refusal() {
-    check_type_only_hidden_native_profile_refusal("in_nested");
+fn type_only_hidden_text_array_in_keeps_the_profile_refusal() {
+    check_type_only_hidden_native_profile_refusal("in_text_array");
 }
 #[test]
 fn type_only_hidden_json_between_keeps_the_original_profile_refusal() {

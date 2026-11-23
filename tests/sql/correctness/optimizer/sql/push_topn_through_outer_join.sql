@@ -38,10 +38,10 @@ CREATE TABLE ${case_db}.topn_outer_left (id INT, score INT);
 CREATE TABLE ${case_db}.topn_outer_right (id INT, payload INT);
 INSERT INTO ${case_db}.topn_outer_left
     SELECT generate_series, 100000 - generate_series
-    FROM TABLE(generate_series(1, 100000));
+    FROM TABLE(sequence(1, 100000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.topn_outer_right
     SELECT generate_series, generate_series * 10
-    FROM TABLE(generate_series(1, 1000));
+    FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 -- This case deliberately plans with persisted ANALYZE statistics. NDV is a
 -- deterministic Theta estimate, so cardinality text need not equal exact NDV.
 ANALYZE ${case_db}.topn_outer_left;

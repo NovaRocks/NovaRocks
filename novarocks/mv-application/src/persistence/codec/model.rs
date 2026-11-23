@@ -238,6 +238,7 @@ pub enum ApplyKeyKind {
 pub struct AggregateInterpretation {
     pub aggregate_id: AggregateIdentity,
     pub function_identity: String,
+    pub semantic_contract: Option<novarocks_functions::PersistentAggregateContract>,
     pub source_fields: Vec<SourceFieldReference>,
     /// Ordered algorithm state, e.g. AVG sum followed by count.
     pub state_slot_ids: Vec<StateSlotIdentity>,

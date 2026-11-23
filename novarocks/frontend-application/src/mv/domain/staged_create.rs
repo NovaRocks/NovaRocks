@@ -1555,6 +1555,7 @@ pub(crate) struct AdmittedMvPublication {
     versions: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
     entrance: ManagementEntrance,
     repartitioned: bool,
+    rebound_aggregate_contracts: bool,
     configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
 }
 
@@ -1724,6 +1725,21 @@ impl AdmittedMvPublication {
         Ok(())
     }
 
+    pub(crate) fn rebind_aggregate_contracts(
+        &mut self,
+        current: &novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
+    ) -> Result<(), String> {
+        if self.rebound_aggregate_contracts {
+            return Err("MV aggregate contracts were already rebound".into());
+        }
+        self.interpretation =
+            novarocks_mv_application::persistence::aggregate_bindings::rebind_aggregate_semantic_contracts(
+                &self.definition, &self.interpretation, current,
+            )?;
+        self.rebound_aggregate_contracts = true;
+        Ok(())
+    }
+
     /// Complete P from the pinned watermark and the target's post-write
     /// logical cardinality. A repartition publishes its new L in the same set.
     ///
@@ -1736,7 +1752,8 @@ impl AdmittedMvPublication {
         inputs: &MvPublicationInputs,
         logical_result_rows: Option<u64>,
     ) -> Result<novarocks_spi::connector::KeyedPublication, String> {
-        let versions = if self.repartitioned {
+        let changes_interpretation = self.repartitioned || self.rebound_aggregate_contracts;
+        let versions = if changes_interpretation {
             novarocks_mv_application::persistence::keyed_documents::build_keyed_versions(
                 &self.definition,
                 &self.interpretation,
@@ -1746,7 +1763,7 @@ impl AdmittedMvPublication {
         } else {
             self.versions.clone()
         };
-        if !self.repartitioned
+        if !changes_interpretation
             && (versions.definition_revision() != self.source_revision.definition_revision
                 || versions.interpretation_revision()
                     != self.source_revision.interpretation_revision)
@@ -1926,6 +1943,7 @@ impl MvPublicationAdmissionParts {
             versions: self.versions,
             entrance: self.entrance,
             repartitioned: false,
+            rebound_aggregate_contracts: false,
             configuration_slot_update: self.configuration_slot_update,
         }
     }

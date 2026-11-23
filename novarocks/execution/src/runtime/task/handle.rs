@@ -47,7 +47,7 @@ pub struct LocalTaskPrepareContext {
     #[cfg(novarocks_dev_controls)]
     exchange_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
     #[cfg(novarocks_dev_controls)]
-    position_shard_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
+    task_protocol_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
     #[cfg(novarocks_dev_controls)]
     join_build_control:
         Option<Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
@@ -2444,7 +2444,7 @@ impl Default for LocalTaskPrepareContext {
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
             #[cfg(novarocks_dev_controls)]
-            position_shard_test_observer: None,
+            task_protocol_test_observer: None,
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
             #[cfg(novarocks_dev_controls)]
@@ -2498,7 +2498,7 @@ impl LocalTaskPrepareContext {
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
             #[cfg(novarocks_dev_controls)]
-            position_shard_test_observer: None,
+            task_protocol_test_observer: None,
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
             #[cfg(novarocks_dev_controls)]
@@ -2588,11 +2588,11 @@ impl LocalTaskPrepareContext {
     }
 
     #[cfg(novarocks_dev_controls)]
-    pub fn with_position_shard_test_observer(
+    pub fn with_task_protocol_test_observer(
         mut self,
         observer: Arc<dyn crate::runtime::exchange::TestEventObserver>,
     ) -> Self {
-        self.position_shard_test_observer = Some(observer);
+        self.task_protocol_test_observer = Some(observer);
         self
     }
 

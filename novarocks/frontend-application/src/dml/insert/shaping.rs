@@ -585,13 +585,18 @@ fn constrain_literal_in(
                     }
                 }
                 ("map", DataType::Map(..)) => {
-                    if map_types(target.data_type()).is_some() {
-                        let key = target_child(target, 0)?;
-                        let value = target_child(target, 1)?;
-                        for pair in function.arguments.as_chunks_mut::<2>().0 {
-                            pair[0].value = constrain_literal(pair[0].value.clone(), &key)?;
-                            pair[1].value = constrain_literal(pair[1].value.clone(), &value)?;
-                        }
+                    if let [keys, values] = function.arguments.as_mut_slice()
+                        && matches!(keys.value, ast::Expr::Array(_))
+                        && matches!(values.value, ast::Expr::Array(_))
+                    {
+                        keys.value = constrain_literal(
+                            keys.value.clone(),
+                            &map_input_array_type(&target_child(target, 0)?)?,
+                        )?;
+                        values.value = constrain_literal(
+                            values.value.clone(),
+                            &map_input_array_type(&target_child(target, 1)?)?,
+                        )?;
                     }
                 }
                 ("parse_json", DataType::LargeBinary)
@@ -616,14 +621,14 @@ fn target_child(target: &FunctionValueType, index: usize) -> Result<FunctionValu
         .ok_or_else(|| "INSERT target lacks its declared semantic child".to_string())
 }
 
-fn map_types(target: &DataType) -> Option<(&DataType, &DataType)> {
-    let DataType::Map(field, _) = target else {
-        return None;
-    };
-    let DataType::Struct(fields) = field.data_type() else {
-        return None;
-    };
-    (fields.len() == 2).then(|| (fields[0].data_type(), fields[1].data_type()))
+fn map_input_array_type(item: &FunctionValueType) -> Result<FunctionValueType, String> {
+    novarocks_type_contract::list_value_type_with_construction::<std::convert::Infallible>(
+        item,
+        false,
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        None,
+    )
+    .map_err(|cause| format!("Invalid MAP argument array declaration: {cause:?}"))
 }
 
 fn constant_variant_in(
@@ -713,8 +718,21 @@ fn array(elements: Vec<ast::Expr>) -> ast::Expr {
 fn tuple(expressions: Vec<ast::Expr>) -> Result<ast::Expr, String> {
     build::tuple_value(expressions).map_err(|error| error.to_string())
 }
-fn map(entries: Vec<(ast::Expr, ast::Expr)>) -> ast::Expr {
-    build::map(entries)
+fn map_default_field_type(
+    field: &arrow::datatypes::Field,
+    declaration: Option<&SqlType>,
+) -> Result<FunctionValueType, String> {
+    let Some(declaration) = declaration else {
+        return FunctionValueType::try_from_field(field).map_err(|cause| cause.to_string());
+    };
+    let binding = novarocks_types::execution_value_type_from_declaration(
+        declaration,
+        field.data_type(),
+        field.is_nullable(),
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .map_err(|cause| cause.to_string())?;
+    FunctionValueType::try_from_typed_binding(binding).map_err(|cause| cause.to_string())
 }
 
 fn default_to_expr(
@@ -799,23 +817,31 @@ fn default_to_expr(
             if fields.len() != 2 {
                 return Err("MAP entries struct must contain key and value".to_string());
             }
-            let (key_type, value_type) = match logical {
+            let (key_declaration, value_declaration) = match logical {
                 Some(SqlType::Map(key, value)) => (Some(key.as_ref()), Some(value.as_ref())),
                 _ => (None, None),
             };
-            map(entries
+            let key_type = map_default_field_type(&fields[0], key_declaration)?;
+            let value_type = map_default_field_type(&fields[1], value_declaration)?;
+            let (keys, values) = entries
                 .iter()
                 .map(|(key, value)| {
                     Ok((
-                        default_to_expr(key, fields[0].data_type(), key_type)?,
+                        default_to_expr(key, fields[0].data_type(), key_declaration)?,
                         if matches!(value, ColumnDefault::Null) {
                             null_expr()
                         } else {
-                            default_to_expr(value, fields[1].data_type(), value_type)?
+                            default_to_expr(value, fields[1].data_type(), value_declaration)?
                         },
                     ))
                 })
-                .collect::<Result<Vec<_>, String>>()?)
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
+                .unzip();
+            build::map(
+                constrain_literal(array(keys), &map_input_array_type(&key_type)?)?,
+                constrain_literal(array(values), &map_input_array_type(&value_type)?)?,
+            )
         }
         (ColumnDefault::Struct(values), DataType::Struct(fields))
             if values.len() == fields.len() =>

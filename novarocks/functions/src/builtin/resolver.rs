@@ -607,6 +607,24 @@ fn value_signature_decision_with_creation<'a, H>(
         work.step()?;
         work.flush()?;
         let spec = signature_spec_at(signature, index);
+        if allow_coercion
+            && index == 1
+            && let (TypeSpec::Any(probe), TypeSpec::Map(key, _)) =
+                (spec, signature_spec_at(signature, 0))
+            && matches!(key.as_ref(), TypeSpec::Any(map_key) if map_key == probe)
+            && let Some(key) = bindings.lookup_value_borrowed(probe)
+        {
+            // A lookup coerces its probe to the existing key type. Widening
+            // the binding would demand a different MAP and change key identity.
+            if !novarocks_type_contract::trino_can_coerce(
+                actual.value_type(),
+                key.value_type(),
+                work,
+            )? {
+                return Ok(None);
+            }
+            continue;
+        }
         let matched = with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
             super::signature::unify_value_with_construction(
                 spec,
@@ -940,13 +958,182 @@ fn signature_spec_at(sig: &Signature, idx: usize) -> &super::signature::TypeSpec
 
 #[cfg(test)]
 mod tests {
+    use super::super::signature::CharacterWidth;
     use super::*;
+    use novarocks_type_contract::{
+        CharacterKind, CharacterType, ValueKind, ValueLayout, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
     use std::sync::Arc;
 
     use arrow_schema::{Field, TimeUnit};
 
     fn list_of(item: DataType) -> DataType {
         DataType::List(Arc::new(Field::new("item", item, true)))
+    }
+
+    fn character(kind: CharacterKind, width: u32, nullable: bool) -> FunctionValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        let value = ValueTypeRef::try_new(
+            ValueKind::BoundedCharacter(CharacterType::new(kind, width).unwrap()),
+            nullable,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = ValueLayout::try_new(&DataType::Utf8, storage).unwrap();
+        FunctionValueType::try_from_value(value, layout).unwrap()
+    }
+
+    #[test]
+    fn character_width_recipe_replays_the_exact_bounded_or_unbounded_result() {
+        let kind = CharacterKind::Varchar;
+        let signature = Signature::new(
+            vec![TypeSpec::Character(kind, CharacterWidth::Argument("x"))],
+            TypeSpec::Character(kind, CharacterWidth::UrlEncode("x")),
+        )
+        .with_argument_coercion();
+        let candidates = [
+            (
+                character(kind, 3, false),
+                character(kind, 36, true),
+                character(kind, 35, true),
+            ),
+            (
+                character(kind, CharacterType::MAX_VARCHAR_LENGTH, false),
+                FunctionValueType::new(DataType::Utf8, true),
+                character(kind, CharacterType::MAX_VARCHAR_LENGTH, true),
+            ),
+            (
+                FunctionValueType::new(DataType::Utf8, false),
+                FunctionValueType::new(DataType::Utf8, true),
+                character(kind, 36, true),
+            ),
+        ];
+        for (input, expected, wrong_width) in candidates.into_iter().chain([(
+            FunctionValueType::new(DataType::Null, true),
+            character(kind, 0, true),
+            FunctionValueType::new(DataType::Utf8, true),
+        )]) {
+            value_resolution_scope(crate::binding_test_control(), |work| {
+                let unknown = input.data_type() == &DataType::Null;
+                let argument = if unknown {
+                    character(kind, 0, true)
+                } else {
+                    input.clone()
+                };
+                let inputs = [input];
+                let decision = value_signature_decision_in_pass(
+                    &signature,
+                    ScalarTypes::from_values(&inputs),
+                    if unknown {
+                        MatchPass::Coercion
+                    } else {
+                        MatchPass::Generic
+                    },
+                    work,
+                )?
+                .expect("VARCHAR width is admitted");
+                assert_eq!(decision.argument_types, [argument]);
+                let recipe = decision.result_recipe(true);
+                assert_eq!(decision.diagnostic_return_type(), expected);
+                assert!(
+                    recipe
+                        .matches_value_observed(expected.typed_binding().borrowed(), work)
+                        .map_err(binding_to_resolution)?
+                );
+                assert!(
+                    !recipe
+                        .matches_value_observed(wrong_width.typed_binding().borrowed(), work)
+                        .map_err(binding_to_resolution)?
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn character_width_variables_follow_the_selected_kind_and_target() {
+        let varchar = |width| TypeSpec::Character(CharacterKind::Varchar, width);
+        let fixed = |width| TypeSpec::Character(CharacterKind::Char, width);
+        let x = CharacterWidth::Argument("x");
+        let y = CharacterWidth::Argument("y");
+        let substring = Signature::new(vec![fixed(x)], varchar(x)).with_argument_coercion();
+        let encode = Signature::new(vec![varchar(x)], varchar(x)).with_argument_coercion();
+        let codepoint = Signature::new(vec![varchar(CharacterWidth::Fixed(1))], TypeSpec::Int32)
+            .with_argument_coercion();
+        let concat = Signature::new(
+            vec![fixed(x), fixed(y)],
+            fixed(CharacterWidth::Sum("x", "y")),
+        )
+        .with_argument_coercion();
+        let replace = Signature::new(
+            vec![varchar(x), varchar(y)],
+            varchar(CharacterWidth::Replace {
+                source: "x",
+                replacement: "y",
+            }),
+        )
+        .with_argument_coercion();
+        let make_char = |width| character(CharacterKind::Char, width, false);
+        let make_varchar = |width| character(CharacterKind::Varchar, width, false);
+        value_resolution_scope(crate::binding_test_control(), |work| {
+            for (signature, inputs, pass, expected) in [
+                (
+                    &substring,
+                    vec![make_char(3)],
+                    MatchPass::Generic,
+                    Some((CharacterKind::Varchar, 3)),
+                ),
+                (&substring, vec![make_varchar(3)], MatchPass::Coercion, None),
+                (&encode, vec![make_char(3)], MatchPass::Generic, None),
+                (
+                    &encode,
+                    vec![make_char(3)],
+                    MatchPass::Coercion,
+                    Some((CharacterKind::Varchar, 3)),
+                ),
+                (
+                    &concat,
+                    vec![make_char(2), make_char(3)],
+                    MatchPass::Generic,
+                    Some((CharacterKind::Char, 5)),
+                ),
+                (
+                    &replace,
+                    vec![make_varchar(3), make_varchar(2)],
+                    MatchPass::Generic,
+                    Some((CharacterKind::Varchar, 11)),
+                ),
+            ] {
+                let decision = value_signature_decision_in_pass(
+                    signature,
+                    ScalarTypes::from_values(&inputs),
+                    pass,
+                    work,
+                )?;
+                assert_eq!(
+                    decision.map(|decision| decision.diagnostic_return_type()),
+                    expected.map(|(kind, width)| character(kind, width, true))
+                );
+            }
+            for (input, expected) in [
+                (make_varchar(0), true),
+                (make_varchar(2), false),
+                (FunctionValueType::new(DataType::Utf8, false), false),
+            ] {
+                let inputs = [input];
+                let decision = value_signature_decision_in_pass(
+                    &codepoint,
+                    ScalarTypes::from_values(&inputs),
+                    MatchPass::Coercion,
+                    work,
+                )?;
+                assert_eq!(decision.is_some(), expected);
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1031,10 +1218,11 @@ mod tests {
                 ],
             ),
             (
-                "array_slice",
+                "slice",
                 vec![
                     FunctionValueType::new(list_of(DataType::Int32), true),
                     FunctionValueType::new(DataType::Int32, false),
+                    FunctionValueType::new(DataType::Int64, true),
                 ],
             ),
             (
@@ -1112,16 +1300,14 @@ mod tests {
             ),
             true,
         );
-        let (_, promoted) = resolve_scalar_value_signature_with_overload(
-            "__map_element_at",
-            &[narrow_map, FunctionValueType::new(DataType::Int64, false)],
-            &Control,
-        )
-        .unwrap();
-        assert_eq!(
-            promoted.argument_types[0].child_at(0).unwrap().data_type(),
-            &DataType::Int64,
-            "both MAP key and probe bind the same covariant target",
+        assert!(
+            resolve_scalar_value_signature_with_overload(
+                "__map_element_at",
+                &[narrow_map, FunctionValueType::new(DataType::Int64, false)],
+                &Control,
+            )
+            .is_err(),
+            "a MAP lookup may coerce only its probe to the original key type",
         );
         let repeated = Signature::new(
             vec![TypeSpec::Any("T"), TypeSpec::Any("T"), TypeSpec::Int64],
@@ -1136,25 +1322,6 @@ mod tests {
                 "ordinary repeated T stays strict in both orders"
             );
         }
-        let list = FunctionValueType::new(list_of(DataType::Int64), false);
-        let item = FunctionValueType::new(DataType::Int32, false);
-        assert!(
-            resolve_scalar_function_signature_with_overload(
-                "array_append",
-                &[list.data_type().clone(), DataType::Int32]
-            )
-            .is_err(),
-            "List<T> does not grant the Map key role"
-        );
-        let (_, resolved) = resolve_scalar_value_signature_with_overload(
-            "array_append",
-            &[list.clone(), item],
-            &Control,
-        )
-        .unwrap();
-        assert_eq!(resolved.argument_types[0], list);
-        assert_eq!(resolved.argument_types[1].data_type(), &DataType::Int64);
-
         assert!(
             resolve_scalar_value_signature_with_overload(
                 "lead",
@@ -1234,8 +1401,17 @@ mod tests {
 
     #[test]
     fn resolve_upper_returns_utf8() {
-        let r = resolve_scalar_function("upper", &[DataType::Utf8]);
-        assert_eq!(r, Ok(DataType::Utf8));
+        let source = FunctionValueType::new(DataType::Utf8, false);
+        let (_, resolved) = resolve_scalar_value_signature_with_overload(
+            "upper",
+            std::slice::from_ref(&source),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.return_type,
+            FunctionValueType::new(DataType::Utf8, true)
+        );
     }
 
     #[test]
@@ -1249,8 +1425,8 @@ mod tests {
     #[test]
     fn resolve_concat_is_variadic() {
         assert!(resolve_scalar_function("concat", &[]).is_err());
-        // CONCAT requires one Utf8 argument before its repeated tail.
-        for n in 1..5 {
+        assert!(resolve_scalar_function("concat", &[DataType::Utf8]).is_err());
+        for n in 2..5 {
             let args = vec![DataType::Utf8; n];
             assert_eq!(
                 resolve_scalar_function("concat", &args),
@@ -1280,20 +1456,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_array_append_propagates_element_type() {
+    fn resolve_array_concat_propagates_element_type() {
         // `array_append(List<T>, T) -> List<T>` — polymorphic.
-        let r =
-            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Int64]);
+        let r = resolve_scalar_function("concat", &[list_of(DataType::Int64), DataType::Int64]);
         assert_eq!(r, Ok(list_of(DataType::Int64)));
-    }
-
-    #[test]
-    fn resolve_array_append_rejects_mismatched_element_type() {
-        // `array_append(List<Int64>, Utf8)` should not match — T is bound
-        // to Int64 by the first arg, second arg violates the binding.
-        let r =
-            resolve_scalar_function("array_append", &[list_of(DataType::Int64), DataType::Utf8]);
-        assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
     }
 
     #[test]
@@ -1392,96 +1558,76 @@ mod tests {
     }
 
     #[test]
-    fn resolve_substring_exposes_int32_argument_targets() {
-        let resolved = resolve_scalar_function_signature(
+    fn resolve_substring_exposes_bigint_argument_targets() {
+        let value = |data_type| FunctionValueType::new(data_type, false);
+        let text = value(DataType::Utf8);
+        let bigint = value(DataType::Int64);
+        let (_, resolved) = resolve_scalar_value_signature_with_overload(
             "substring",
-            &[DataType::Utf8, DataType::Int64, DataType::Int16],
+            &[text.clone(), bigint.clone(), value(DataType::Int16)],
+            crate::binding_test_control(),
         )
-        .expect("substring integer arguments should use the opt-in cast match");
-
-        assert_eq!(resolved.return_type, DataType::Utf8);
+        .unwrap();
         assert_eq!(
-            resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int32, DataType::Int32]
+            resolved.return_type,
+            FunctionValueType::new(DataType::Utf8, true)
         );
+        assert_eq!(resolved.argument_types, [text, bigint.clone(), bigint]);
         assert!(resolved.enforce_argument_binding);
     }
 
     #[test]
-    fn resolve_substring_null_offset_targets_int32() {
-        let resolved =
-            resolve_scalar_function_signature("substring", &[DataType::Utf8, DataType::Null])
-                .expect("NULL should coerce to the signature target");
-
+    fn resolve_substring_null_offset_targets_bigint() {
+        let text = FunctionValueType::new(DataType::Utf8, false);
+        let null = FunctionValueType::new(DataType::Null, true);
+        let (_, resolved) = resolve_scalar_value_signature_with_overload(
+            "substring",
+            &[text.clone(), null],
+            crate::binding_test_control(),
+        )
+        .unwrap();
         assert_eq!(
             resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int32]
+            [text, FunctionValueType::new(DataType::Int64, true)]
         );
     }
 
     #[test]
     fn resolve_substring_reports_enforced_no_match() {
-        let err = resolve_scalar_function_signature(
-            "substring",
-            &[DataType::Utf8, list_of(DataType::Int32)],
-        )
-        .expect_err("an offset that is not a number must not fall through to legacy inference");
-
-        assert!(matches!(
-            err,
-            ResolveError::NoMatchingSignature {
-                candidates: 2,
-                binding_enforced: true,
-            }
-        ));
+        let text = FunctionValueType::new(DataType::Utf8, false);
+        for invalid_offset in [DataType::Utf8, list_of(DataType::Int32)] {
+            let offset = FunctionValueType::new(invalid_offset, false);
+            let error = resolve_scalar_value_signature_with_overload(
+                "substring",
+                &[text.clone(), offset],
+                crate::binding_test_control(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ResolveError::NoMatchingSignature {
+                    candidates: 4,
+                    binding_enforced: true,
+                }
+            ));
+        }
     }
 
     #[test]
-    fn resolve_substring_offset_spelled_as_a_string_targets_int32() {
-        let resolved =
-            resolve_scalar_function_signature("substring", &[DataType::Utf8, DataType::Utf8])
-                .expect("an offset opted in to coercion reads a string as a number");
-
-        assert_eq!(
-            resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int32]
-        );
-    }
-
-    #[test]
-    fn resolve_date_add_interval_spelled_as_a_float_targets_int64() {
-        let resolved =
-            resolve_scalar_function_signature("date_add", &[DataType::Utf8, DataType::Float64])
-                .expect("an interval opted in to coercion reads a float as a number");
-
-        assert_eq!(
-            resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int64]
-        );
-        assert_eq!(
-            resolved.return_type,
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-    }
-
-    #[test]
-    fn resolve_date_add_keeps_a_datetime_first_argument_over_the_string_overload() {
-        let resolved = resolve_scalar_function_signature(
-            "date_add",
-            &[
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                DataType::Utf8,
-            ],
-        )
-        .expect("coercion applies to the interval, not to the shifted value");
-
-        assert_eq!(
-            resolved.argument_types,
+    fn legacy_resolver_does_not_bind_date_add() {
+        for arguments in [
+            vec![DataType::Utf8, DataType::Float64],
             vec![
+                DataType::Utf8,
+                DataType::Int64,
                 DataType::Timestamp(TimeUnit::Microsecond, None),
-                DataType::Int64
-            ]
-        );
+            ],
+        ] {
+            assert!(matches!(
+                resolve_scalar_function_signature("date_add", &arguments),
+                Err(ResolveError::UnknownFunction)
+            ));
+        }
     }
 
     #[test]
@@ -1492,7 +1638,7 @@ mod tests {
         assert!(matches!(
             err,
             ResolveError::NoMatchingSignature {
-                candidates: 2,
+                candidates: 4,
                 binding_enforced: true,
             }
         ));
@@ -1500,8 +1646,8 @@ mod tests {
 
     #[test]
     fn non_opt_in_signature_keeps_legacy_no_match_policy() {
-        let err = resolve_scalar_function_signature("upper", &[DataType::Int64])
-            .expect_err("upper(Int64) is normalized by the analyzer, not resolver cast match");
+        let err = resolve_scalar_function_signature("abs", &[DataType::Utf8])
+            .expect_err("abs requires a numeric source");
 
         assert!(matches!(
             err,

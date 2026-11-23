@@ -21,10 +21,10 @@ USE ${case_db};
 CREATE TABLE probe_5m_wide (k INT, pad1 VARCHAR(100), pad2 VARCHAR(100));
 CREATE TABLE build_500k (k INT);
 INSERT INTO probe_5m_wide
-    SELECT generate_series, repeat('x', 100), repeat('y', 100)
-    FROM TABLE(generate_series(1, 5000000));
+    SELECT generate_series, rpad('', 100, 'x'), rpad('', 100, 'y')
+    FROM TABLE(sequence(1, 5000000)) AS generate_series(generate_series);
 INSERT INTO build_500k
-    SELECT generate_series FROM TABLE(generate_series(1, 500000));
+    SELECT generate_series FROM TABLE(sequence(1, 500000)) AS generate_series(generate_series);
 ANALYZE build_500k;
 -- ANALYZE publishes before the following query is admitted.
 SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;

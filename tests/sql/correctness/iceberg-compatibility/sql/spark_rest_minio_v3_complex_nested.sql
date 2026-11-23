@@ -63,7 +63,7 @@ printf 'SPARK_SQL_OK\n'
 -- query 2
 SELECT id,
        profile.city AS city,
-       array_length(tags) AS tag_count,
+       cardinality(tags) AS tag_count,
        tags[1] AS first_tag,
        attrs['score'] AS score,
        events[1].weight AS first_event_weight

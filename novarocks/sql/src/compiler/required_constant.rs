@@ -33,9 +33,12 @@ pub enum RequiredConstantTarget {
     Boolean,
     Integer,
     Bigint,
+    PreparedRowCount,
+    PreparedTableSelection,
     Double,
     Varchar,
     ArrayVarchar,
+    MapVarcharVarchar,
     /// Accept an already typed Physical timestamp or an UNKNOWN NULL.
     /// Preserve its exact timestamp carrier, precision and zone annotation.
     Timestamp,
@@ -47,17 +50,52 @@ impl RequiredConstantTarget {
         match self {
             Self::Boolean => Some(DataType::Boolean),
             Self::Integer => Some(DataType::Int32),
-            Self::Bigint => Some(DataType::Int64),
+            Self::Bigint | Self::PreparedRowCount => Some(DataType::Int64),
             Self::Double => Some(DataType::Float64),
             Self::Varchar => Some(DataType::Utf8),
-            Self::ArrayVarchar | Self::Timestamp | Self::TimeZone => None,
+            Self::ArrayVarchar
+            | Self::MapVarcharVarchar
+            | Self::Timestamp
+            | Self::TimeZone
+            | Self::PreparedTableSelection => None,
         }
+    }
+
+    /// The required VARCHAR map target admits its exact semantic children and
+    /// UNKNOWN values. An UNKNOWN key has no resident values, so the property
+    /// projection must verify that such a map is empty after evaluation.
+    pub fn admits_map_source(self, source: &FunctionValueType) -> bool {
+        use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
+
+        let varchar = |kind: &ValueKind| match kind {
+            ValueKind::String => true,
+            ValueKind::BoundedCharacter(character) => character.kind() == CharacterKind::Varchar,
+            _ => false,
+        };
+        self == Self::MapVarcharVarchar
+            && source.logical_type() == ValueLogicalType::Physical
+            && match source.value_type().kind() {
+                ValueKind::Scalar(DataType::Null) => source.nullable(),
+                ValueKind::Map { key, value } => {
+                    !key.nullable()
+                        && (varchar(key.kind())
+                            || matches!(key.kind(), ValueKind::Scalar(DataType::Null)))
+                        && (varchar(value.kind())
+                            || matches!(value.kind(), ValueKind::Scalar(DataType::Null))
+                                && value.nullable())
+                }
+                _ => false,
+            }
     }
 }
 
 /// Materialized inputs keep their original checked pool and selected ordinal.
 pub enum RequiredConstantInput<'a> {
     Expression(&'a ast::Expr),
+    PreparedExpression {
+        expression: &'a ast::Expr,
+        parameters: &'a super::SqlPreparedParameters,
+    },
     Materialized(ConstantValue),
 }
 
@@ -139,6 +177,31 @@ impl SqlAuthoredScalarUnit {
     }
 }
 
+/// Context in which the original required expression can be evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredConstantEligibility {
+    Property,
+    TableArgument,
+}
+
+impl RequiredConstantEligibility {
+    pub fn allows_call(self, call: &novarocks_type_contract::CallEffects) -> bool {
+        use novarocks_type_contract::FunctionInstanceState;
+        let effects = call.observable_effects;
+        if self == Self::TableArgument && effects.rng_sampling {
+            return !effects.controlled_wait
+                && !effects.warnings
+                && matches!(
+                    call.instance_state,
+                    FunctionInstanceState::None | FunctionInstanceState::ScalarInstance
+                );
+        }
+        !call.value_stability.is_volatile()
+            && call.instance_state == FunctionInstanceState::None
+            && effects.is_empty()
+    }
+}
+
 /// SQL's exact one-cell computation. The application cannot rewrite its tree,
 /// replace a selected binding, or reconstruct an expression from display text.
 pub struct PreparedRequiredConstant {
@@ -148,6 +211,7 @@ pub struct PreparedRequiredConstant {
     pub(crate) policy: ConstantPolicy,
     pub(crate) control: SqlCompileControl,
     pub(crate) original_value: Option<ConstantValue>,
+    pub(crate) eligibility: RequiredConstantEligibility,
 }
 impl std::fmt::Debug for PreparedRequiredConstant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -169,6 +233,9 @@ impl PreparedRequiredConstant {
     }
     pub const fn constant_policy(&self) -> ConstantPolicy {
         self.policy
+    }
+    pub const fn eligibility(&self) -> RequiredConstantEligibility {
+        self.eligibility
     }
     pub const fn control(&self) -> &SqlCompileControl {
         &self.control

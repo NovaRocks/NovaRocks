@@ -42,6 +42,7 @@ use crate::{
 pub(super) fn operation(name: &str) -> Option<StringInitcapOp> {
     match name {
         "initcap" => Some(StringInitcapOp::Initcap),
+        "title_case" => Some(StringInitcapOp::TitleCase),
         _ => None,
     }
 }
@@ -96,7 +97,8 @@ impl StringInitcapOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || !(1..=2).contains(&declaration.overloads().len())
+            || (operation == StringInitcapOp::Initcap && declaration.overloads().len() != 1)
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })

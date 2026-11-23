@@ -18,6 +18,9 @@
 
 use std::collections::HashMap;
 
+mod controlled;
+pub(crate) use controlled::{ControlledPatternMemo, DeterministicPatternFailure};
+
 /// How many distinct patterns one evaluation keeps compiled.
 ///
 /// A regex that has searched holds roughly 10-120 KiB of program and search

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::parser::expression_for_diagnostic;
 use arrow::datatypes::DataType;
 use novarocks_parser::ast;
 
@@ -651,6 +650,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             .map_err(AnalyzeError::internal)?;
                         Ok(OutputColumn {
                             field_name: col.field_name.clone(),
+                            aliased: col.aliased,
                             column_id: new_id,
                             name: col.name,
                             value_type: col.value_type.clone(),
@@ -766,7 +766,9 @@ impl<'a> super::AnalyzerContext<'a> {
             &resolved_table.catalog.columns,
             self.control,
         )?;
+
         let crate::planner::table::ScanSource::Sql(source) = &table_def.source;
+        self.describe_table_origin(&column_ids, &resolved_table.catalog.identity);
         for field in &source.retired_read_fields {
             self.check_control()?;
             if let Some((ordinal, _)) = resolved_table
@@ -792,6 +794,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 &resolved_table.catalog.hidden_columns,
                 self.control,
             )?;
+            self.describe_table_origin(&meta_ids, &resolved_table.catalog.identity);
             column_ids.extend(meta_ids);
         }
 
@@ -813,6 +816,19 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok((relation, scope))
     }
 
+    pub(super) fn describe_table_origin(
+        &self,
+        columns: &[ColumnId],
+        origin: &novarocks_types::naming::TableIdentity,
+    ) {
+        if let Some(description) = &mut self.factory.borrow_mut().prepared_description {
+            let origin = std::sync::Arc::new(origin.clone());
+            for &column in columns {
+                description.set_origin(column, std::sync::Arc::clone(&origin));
+            }
+        }
+    }
+
     fn analyze_iceberg_metadata_scan(
         &self,
         database: String,
@@ -828,6 +844,15 @@ impl<'a> super::AnalyzerContext<'a> {
             .iter()
             .map(|column| scope.add_table_column(Some(qualifier), column, self.control))
             .collect::<Result<Vec<_>, AnalyzeError>>()?;
+        if self.factory.borrow().prepared_description.is_some() {
+            let crate::planner::table::ScanSource::Sql(source) = &table.source;
+            let origin = novarocks_types::naming::TableIdentity::new(
+                &source.table.catalog,
+                &database,
+                &table.name,
+            );
+            self.describe_table_origin(&column_ids, &origin);
+        }
         let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {
             database,
             table,
@@ -855,6 +880,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 continue;
             }
             output_columns.push(OutputColumn {
+                aliased: false,
                 column_id: self.alloc_column_id(
                     Some(alias_name.clone()),
                     column.name.clone(),
@@ -875,6 +901,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 alias.columns,
                 alias.span,
             )?;
+        }
+        if self.factory.borrow().prepared_description.is_some() {
+            let origin = novarocks_types::naming::TableIdentity::new(
+                declaration.binding.catalog_name(),
+                &declaration.schema,
+                &declaration.table,
+            );
+            let ids: Vec<_> = output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect();
+            self.describe_table_origin(&ids, &origin);
         }
         let mut scope = self.new_scope();
         self.add_system_table_scope_fields(
@@ -1072,6 +1110,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 value_type.clone(),
             );
             output_columns.push(OutputColumn {
+                aliased: false,
                 field_name: alias_columns.get(idx).cloned(),
                 column_id,
                 name,
@@ -1132,141 +1171,108 @@ impl<'a> super::AnalyzerContext<'a> {
         span: novarocks_parser::Span,
         alias: Option<RelationAlias<'_>>,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
-        let func_name = name
+        let names = name
             .parts
-            .last()
+            .iter()
             .map(|part| part.value.to_ascii_lowercase())
-            .unwrap_or_default();
-        if func_name == "__nr_ivm_delta" {
-            if arguments.iter().any(|argument| argument.name.is_some()) {
-                return Err(AnalyzeError::invalid_argument(
-                    "__nr_ivm_delta requires positional arguments",
-                    span,
-                ));
-            }
-            let expressions = arguments
-                .iter()
-                .map(|argument| argument.expression)
-                .collect::<Vec<_>>();
-            return self.analyze_iceberg_delta_table_function(&expressions, span, alias);
-        }
-        if func_name != "generate_series" {
-            return Err(AnalyzeError::unsupported_query_shape(
-                format!("unsupported table function: {func_name}"),
-                name.span,
-            ));
-        }
-        let any_named = arguments.iter().any(|argument| argument.name.is_some());
-        if any_named && let Some(arg) = arguments.iter().find(|arg| arg.name.is_none()) {
-            if matches!(arg.expression, ast::Expr::Lambda(_)) {
-                return Err(AnalyzeError::invalid_argument(
-                    "No viable statement for input",
-                    arg.span(),
-                ));
-            }
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "Unexpected input '{}'.",
-                    expression_for_diagnostic(arg.expression)
-                ),
-                arg.span(),
-            ));
-        }
-
-        let (start, end, step) = if any_named {
-            let mut start_v: Option<Option<i64>> = None;
-            let mut end_v: Option<Option<i64>> = None;
-            let mut step_v: Option<Option<i64>> = None;
-            for arg in arguments {
-                self.check_control()?;
-                let Some(name) = arg.name else {
+            .collect::<Vec<_>>();
+        match names.as_slice() {
+            [only] if only == "__nr_ivm_delta" => {
+                if arguments.iter().any(|argument| argument.name.is_some()) {
                     return Err(AnalyzeError::invalid_argument(
-                        "Unknown table function: generate_series",
-                        arg.span(),
-                    ));
-                };
-                let key = name.value.to_ascii_lowercase();
-                let expr = arg.expression;
-                let value = if is_null_literal(expr) {
-                    None
-                } else {
-                    Some(eval_const_i64(expr)?)
-                };
-                let slot = match key.as_str() {
-                    "start" => &mut start_v,
-                    "end" => &mut end_v,
-                    "step" => &mut step_v,
-                    _ => {
-                        return Err(AnalyzeError::invalid_argument(
-                            format!("Unknown table function: generate_series ({key})"),
-                            name.span,
-                        ));
-                    }
-                };
-                if slot.is_some() {
-                    return Err(AnalyzeError::invalid_argument(
-                        "Unknown table function: generate_series",
-                        name.span,
-                    ));
-                }
-                *slot = Some(value);
-            }
-            let start = start_v.ok_or_else(|| {
-                AnalyzeError::invalid_argument("Unknown table function: generate_series", span)
-            })?;
-            let end = end_v.ok_or_else(|| {
-                AnalyzeError::invalid_argument("Unknown table function: generate_series", span)
-            })?;
-            // Named args do not allow NULL values for any parameter.
-            if start.is_none() || end.is_none() || matches!(step_v, Some(None)) {
-                return Err(AnalyzeError::invalid_argument(
-                    "table function not support null parameter",
-                    span,
-                ));
-            }
-            let step = step_v.flatten().unwrap_or(1);
-            if step == 0 {
-                return Err(AnalyzeError::invalid_argument(
-                    "generate_series step must not be zero",
-                    span,
-                ));
-            }
-            (start.unwrap(), end.unwrap(), step)
-        } else {
-            let values: Vec<i64> = arguments
-                .iter()
-                .map(|argument| eval_const_i64(argument.expression))
-                .collect::<Result<_, _>>()?;
-            match values.as_slice() {
-                [s, e] => (*s, *e, 1i64),
-                [s, e, st] => {
-                    if *st == 0 {
-                        return Err(AnalyzeError::invalid_argument(
-                            "generate_series step must not be zero",
-                            span,
-                        ));
-                    }
-                    (*s, *e, *st)
-                }
-                _ => {
-                    return Err(AnalyzeError::invalid_argument(
-                        "Unknown table function: generate_series",
+                        "__nr_ivm_delta requires positional arguments",
                         span,
                     ));
                 }
+                let expressions = arguments
+                    .iter()
+                    .map(|argument| argument.expression)
+                    .collect::<Vec<_>>();
+                return self.analyze_iceberg_delta_table_function(&expressions, span, alias);
             }
-        };
+            [only] if only == "sequence" => {}
+            [catalog, schema, function]
+                if catalog == "system" && schema == "builtin" && function == "sequence" => {}
+            _ => {
+                return Err(AnalyzeError::unknown_function(
+                    format!("Table function '{}' not registered", names.join(".")),
+                    name.span,
+                ));
+            }
+        }
 
-        // Determine output column name from alias or default
+        let named = arguments
+            .iter()
+            .filter(|argument| argument.name.is_some())
+            .count();
+        if named != 0 && named != arguments.len() {
+            return Err(AnalyzeError::invalid_argument(
+                "Named and positional arguments cannot be mixed",
+                span,
+            ));
+        }
+        const PARAMETERS: [&str; 3] = ["START", "STOP", "STEP"];
+        let mut bound = [false; 3];
+        let mut supplied = Vec::with_capacity(3);
+        for (position, argument) in arguments.iter().enumerate() {
+            self.check_control()?;
+            let slot = if let Some(name) = argument.name {
+                let canonical = if name.quoted {
+                    name.value.clone()
+                } else {
+                    name.value.to_ascii_uppercase()
+                };
+                PARAMETERS
+                    .iter()
+                    .position(|parameter| *parameter == canonical)
+                    .ok_or_else(|| {
+                        AnalyzeError::invalid_function_argument(
+                            format!("Unexpected argument name: {}", name.value),
+                            name.span,
+                        )
+                    })?
+            } else {
+                if position >= PARAMETERS.len() {
+                    return Err(AnalyzeError::invalid_argument(
+                        "Too many arguments for sequence",
+                        span,
+                    ));
+                }
+                position
+            };
+            if std::mem::replace(&mut bound[slot], true) {
+                return Err(AnalyzeError::invalid_function_argument(
+                    format!("Duplicate argument: {}", PARAMETERS[slot]),
+                    argument.span(),
+                ));
+            }
+            supplied.push((slot, argument.expression));
+        }
+        if !bound[1] {
+            return Err(AnalyzeError::missing_argument(
+                "Missing required argument: STOP",
+                span,
+            ));
+        }
+
+        let [start, end, step] = self.bind_sequence_parameters(supplied, span)?;
+        if let Some(alias) = alias
+            && !alias.columns.is_empty()
+            && alias.columns.len() != 1
+        {
+            return Err(AnalyzeError::mismatched_column_aliases(
+                "Column alias count does not match the table function output",
+                alias.name.span,
+            ));
+        }
         let column_name = alias
-            .and_then(|a| a.columns.first().map(|c| c.value.clone()))
-            .unwrap_or_else(|| "generate_series".to_string());
-        let alias_name = alias.map(|a| a.name.value.clone());
-        let qualifier = alias_name.as_deref().unwrap_or("generate_series");
+            .and_then(|alias| alias.columns.first().map(|column| column.value.clone()))
+            .unwrap_or_else(|| "sequential_number".to_string());
+        let alias_name = alias.map(|alias| alias.name.value.clone());
 
         let mut scope = self.new_scope();
         let output_column_id = scope.add_column(
-            Some(qualifier),
+            alias_name.as_deref(),
             &column_name,
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
@@ -1460,16 +1466,6 @@ fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
             expr.span(),
         )),
     }
-}
-
-fn is_null_literal(expr: &ast::Expr) -> bool {
-    matches!(
-        expr,
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Null,
-            ..
-        })
-    )
 }
 
 fn derived_table_output_columns(

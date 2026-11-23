@@ -23,6 +23,7 @@ use crate::query_execution::completion_facts::{
     ReadEncodingPurpose,
 };
 use novarocks_query_application::api::StatementNativeHealthFailure;
+use novarocks_sql::compiler::SqlStatementInput;
 
 pub(crate) enum ReadCompilerInput {
     Query(Box<Query>),
@@ -161,7 +162,7 @@ impl FrontendQueryCompiler {
         }
         let (query, statement) = match query {
             ReadCompilerInput::Query(query) => {
-                let statement = SqlStatementInput::query_with_admitted_session(query.clone());
+                let statement = execution.sql_statement_input(query.clone(), true);
                 (query, statement)
             }
             ReadCompilerInput::Show(show) => {

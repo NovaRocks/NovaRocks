@@ -150,6 +150,7 @@ impl ViewEngine for SessionViewEngine {
         preparation
             .analyze_view_definition(
                 novarocks_sql::compiler::builtin_sql_function_catalog(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::application::test_constant_policy(),
             )
             .map(|columns| columns.into_vec())

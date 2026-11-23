@@ -1057,7 +1057,12 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         typed_connector_session()?,
         Arc::clone(execution.session_property_inputs()),
     )?;
-    let mut prepared = query.clone();
+    let mut prepared = match execution.prepared_parameters() {
+        Some(parameters) => parameters
+            .complete_query(query.clone())
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?,
+        None => query.clone(),
+    };
     if has_time_travel_refs(&prepared) {
         crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
             state,
@@ -1079,7 +1084,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         state.catalog_application().map(Arc::as_ref),
     )
     .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
-    let statement = match constants {
+    let mut statement = match constants {
         Some(constants) => {
             novarocks_sql::compiler::SqlStatementInput::query_with_expression_constants(
                 Box::new(prepared),
@@ -1090,6 +1095,9 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         }
         None => novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
     };
+    if let Some(parameters) = execution.prepared_parameters() {
+        statement = statement.with_prepared_parameters(parameters.clone());
+    }
     let assignments = sink
         .root_write_assignments(&compile_control)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
@@ -1121,13 +1129,14 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
             .continue_catalog(facts.into_boxed_slice())
             .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     }
-    let analyzed = preparation
-        .analyze(
-            &[],
+    let analyzed = provider_source
+        .analyze_dml_source(
+            preparation,
             DmlQueryExecutionKernel::function_catalog(state),
             Arc::clone(DmlQueryExecutionKernel::sealed_functions(state)),
             DmlQueryExecutionKernel::constant_policy(state),
         )
+        .await
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
         state, Arc::clone(&table_bindings), connector_context,

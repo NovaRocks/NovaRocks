@@ -1,5 +1,5 @@
 -- query 1
--- types	varchar	boolean
+-- types	varchar(1)	boolean
 lowercase	caught_parse
 a	true
 
@@ -19,6 +19,6 @@ negated	narrow_type
 -1	tinyint
 
 -- query 9
--- legacy
-sorted_empty	minimum_null	maximum_null	null_key_order
-[]	1	1	[[2],[1]]
+-- types	array(array(integer))
+null_key_order
+[[2],[1]]

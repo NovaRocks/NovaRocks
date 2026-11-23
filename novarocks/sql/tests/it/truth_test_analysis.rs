@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::fixtures::expression_sources;
+use crate::fixtures::{compile_table_free, expression_sources, session};
 use arrow::datatypes::{DataType, Field};
 use novarocks_expression_contract::{ExprKind, ExprNode, UnaryOperator};
 use novarocks_sql::{
@@ -166,4 +166,34 @@ fn truth_tests_reject_non_boolean_operands_during_analysis() {
         );
         assert!(error.span().is_some());
     }
+}
+
+#[test]
+fn composite_in_short_circuit_freezes_a_searched_case_and_nullable_mark() {
+    let sql = "SELECT guard OR (ARRAY[CAST(v AS INTEGER)] IN (SELECT ARRAY[1])) AS mark \
+        FROM (VALUES (TRUE, 'bad integer'), (FALSE, '1')) AS t(guard, v)";
+    let control = SqlCompileControl::unbounded();
+    let compiled = compile_table_free(sql, session(Default::default(), true), &control).unwrap();
+    assert!(compiled.plan().fragments().values().any(|fragment| {
+        fragment.nodes().values().any(|node| {
+            matches!(
+                node.kind,
+                novarocks_physical_plan::NodeKind::NestLoopJoin {
+                    kind: novarocks_physical_plan::JoinKind::LeftMark,
+                    predicate: Some(_),
+                    ..
+                }
+            )
+        })
+    }));
+    assert!(expression_sources(&compiled).any(|(_, _, node)| {
+        matches!(
+            node.kind,
+            ExprKind::Case {
+                operand: None,
+                ieee_float_equality: false,
+                ..
+            }
+        )
+    }));
 }

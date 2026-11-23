@@ -61,7 +61,7 @@ SELECT
   CAST(n AS BIGINT) AS order_id,
   CASE n % 3 WHEN 0 THEN 'Dairy' WHEN 1 THEN 'Snacks' ELSE 'Baby' END AS category_l1,
   CAST(n % 500 AS BIGINT) AS sales_amount
-FROM TABLE(generate_series(1, 2400)) t(n);
+FROM TABLE(sequence(1, 2400)) t(n);
 
 -- query 6
 -- @skip_result_check=true
@@ -95,7 +95,7 @@ SELECT
 
 -- query 11
 -- APPROX_COUNT_DISTINCT over the base with the candidate present
-SELECT APPROX_COUNT_DISTINCT(customer_id) AS acd FROM sales_data;
+SELECT approx_distinct(customer_id) AS acd FROM sales_data;
 
 -- query 12
 -- self-join: each branch may rewrite independently; result must be exact
@@ -145,7 +145,7 @@ SELECT
   CASE n % 3 WHEN 0 THEN 'east' WHEN 1 THEN 'west' ELSE 'north' END AS region,
   CASE WHEN n % 2 = 0 THEN 'd1' ELSE 'd2' END AS day,
   CAST(n % 100 AS BIGINT) AS amount
-FROM TABLE(generate_series(1, 2400)) t(n);
+FROM TABLE(sequence(1, 2400)) t(n);
 
 -- query 20
 -- @skip_result_check=true

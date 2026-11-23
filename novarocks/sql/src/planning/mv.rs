@@ -3561,7 +3561,7 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
         .iter()
         .map(|argument| &argument.value)
         .collect::<Vec<_>>();
-    if is_non_deterministic_function(&function_name, &argument_values) {
+    if is_non_deterministic_function(&function_name) {
         return Err(
             "incremental MV projection/filter query contains non-deterministic function"
                 .to_string(),
@@ -3595,7 +3595,7 @@ fn reject_unsupported_function_arguments(args: &[&Expr]) -> Result<(), String> {
     Ok(())
 }
 
-fn is_non_deterministic_function(name: &str, args: &[&Expr]) -> bool {
+fn is_non_deterministic_function(name: &str) -> bool {
     matches!(
         name,
         "now"
@@ -3603,30 +3603,18 @@ fn is_non_deterministic_function(name: &str, args: &[&Expr]) -> bool {
             | "localtime"
             | "localtimestamp"
             | "current_date"
-            | "curdate"
             | "current_time"
-            | "curtime"
             | "random"
             | "rand"
             | "uuid"
-    ) || (name == "unix_timestamp" && function_argument_count(args) == Some(0))
+    )
 }
 
 fn is_non_deterministic_bare_identifier(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "current_timestamp"
-            | "localtime"
-            | "localtimestamp"
-            | "current_date"
-            | "curdate"
-            | "current_time"
-            | "curtime"
+        "current_timestamp" | "localtime" | "localtimestamp" | "current_date" | "current_time"
     )
-}
-
-fn function_argument_count(args: &[&Expr]) -> Option<usize> {
-    Some(args.len())
 }
 
 fn is_window_only_function(name: &str) -> bool {
@@ -3678,6 +3666,7 @@ fn is_aggregate_function(name: &str) -> bool {
             | "percentile_approx"
             | "percentile_approx_weighted"
             | "approx_count_distinct"
+            | "approx_distinct"
             | "approx_top_k"
             | "hll_raw"
             | "ndv"
@@ -4756,13 +4745,15 @@ mod tests {
         for sql in [
             "select \"current_date\" from ice.ns.orders",
             "select \"current_time\" from ice.ns.orders",
-            "select curtime() from ice.ns.orders",
             "select \"localtime\" from ice.ns.orders",
             "select \"localtimestamp\" from ice.ns.orders",
-            "select unix_timestamp() from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "non-deterministic");
         }
+        assert_rejects_with(
+            "select CURRENT_DATE from ice.ns.orders",
+            "projection/filter",
+        );
     }
 
     #[test]
@@ -4778,8 +4769,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_unix_timestamp_with_argument() {
-        classify_sql("select unix_timestamp(k1) from ice.ns.orders")
+    fn accepts_to_unixtime_with_explicit_zoned_argument() {
+        classify_sql("select to_unixtime(TIMESTAMP '2024-03-01 00:00:00 UTC') from ice.ns.orders")
             .expect("query should be accepted");
     }
 }
@@ -5956,6 +5947,7 @@ fn count_aggregate_projection_outputs(
                 distinct,
                 order_by,
                 filter,
+                resolved,
                 ..
             } => {
                 if filter.is_some() {
@@ -5967,6 +5959,21 @@ fn count_aggregate_projection_outputs(
                     );
                 }
                 work.flush()?;
+                if resolved.function_id.as_str() == "builtin.aggregate/approx_distinct/v1" {
+                    let state = resolved
+                        .selected
+                        .aggregate
+                        .as_ref()
+                        .expect("resolved approx_distinct state signature");
+                    return Err(
+                        crate::analyze_error::AnalyzeError::unsupported_expression_without_span(
+                            format!(
+                                "Iceberg IMV requires an installed persistent state author for overload {} (ordinary state format {}). The approx_distinct IVM state contract is unavailable",
+                                resolved.selected.overload.as_str(), state.state_format.as_str(),
+                            ),
+                        ).into(),
+                    );
+                }
                 validate_supported_aggregate_call(name, args.len(), *distinct, order_by)?;
                 validate_aggregate_argument_exprs(args)?;
                 aggregate_count += 1;
@@ -6053,7 +6060,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
                     "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
                 ));
             }
-            if is_unsupported_contract_scalar_function(name, args.len()) {
+            if is_unsupported_contract_scalar_function(name) {
                 return Err(format!(
                     "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
                 ));
@@ -6216,7 +6223,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
                     "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
                 ));
             }
-            if is_unsupported_contract_scalar_function(name, args.len()) {
+            if is_unsupported_contract_scalar_function(name) {
                 return Err(format!(
                     "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
                 ));
@@ -6268,7 +6275,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
     }
 }
 
-fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool {
+fn is_unsupported_contract_scalar_function(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "now"
@@ -6276,9 +6283,7 @@ fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool
             | "localtime"
             | "localtimestamp"
             | "current_date"
-            | "curdate"
             | "current_time"
-            | "curtime"
             | "random"
             | "rand"
             | "uuid"
@@ -6288,7 +6293,7 @@ fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool
             | "current_user"
             | "user"
             | "grouping"
-    ) || (name.eq_ignore_ascii_case("unix_timestamp") && arg_count == 0)
+    )
 }
 
 fn relation_qualifiers(relation: &Relation) -> Result<Vec<String>, String> {

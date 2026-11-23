@@ -29,7 +29,7 @@ CREATE TABLE ${case_db}.strict_eq_b (b BIGINT, payload BIGINT);
 CREATE TABLE ${case_db}.strict_eq_c (c BIGINT, payload BIGINT);
 INSERT INTO ${case_db}.strict_eq_a
     SELECT generate_series, generate_series, generate_series * 10
-    FROM TABLE(generate_series(1, 10000));
+    FROM TABLE(sequence(1, 10000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.strict_eq_b VALUES ROW(1, 100), ROW(2, 200), ROW(NULL, 300);
 INSERT INTO ${case_db}.strict_eq_c VALUES ROW(1, 1000), ROW(2, 2000), ROW(NULL, 3000);
 ANALYZE ${case_db}.strict_eq_a;

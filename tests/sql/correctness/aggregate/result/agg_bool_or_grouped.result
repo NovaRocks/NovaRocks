@@ -3,4 +3,4 @@
 g	has_gt_15	has_null
 1	true	false
 2	false	true
-3	false	true
+3	NULL	true

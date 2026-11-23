@@ -21,6 +21,7 @@ use novarocks_type_contract::ValueLogicalType;
 const CONVERSION: &str =
     novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID;
 const ARRAY_LITERAL: &str = "builtin.scalar/__array_literal/v1";
+const CONCAT: &str = "builtin.scalar/concat/v1";
 
 fn calls<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
@@ -100,7 +101,10 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
             false,
         ),
         (
-            "SELECT CAST(array_sortby([json_object('k':1), json_object('k':2)], [2,1]) AS ARRAY<VARCHAR>) AS s FROM orders",
+            "SELECT CAST(concat(
+                ARRAY[json_object('k': order_key), json_object('m': order_key)],
+                ARRAY[json_object('n': order_key), json_object('p': order_key)]
+             ) AS ARRAY(VARCHAR)) AS s FROM orders",
             true,
         ),
     ] {
@@ -138,13 +142,11 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                             ValueLogicalType::Physical
                         );
                         assert_ne!(source.ty, expression.ty);
-                        let ContractExprKind::FunctionCall { function, .. } = &source.kind else {
-                            panic!("original array_sortby source");
+                        let ContractExprKind::FunctionCall { function, args } = &source.kind else {
+                            panic!("original array concat source");
                         };
-                        assert_eq!(
-                            function.function_id.as_str(),
-                            "builtin.scalar/array_sortby/v1"
-                        );
+                        assert_eq!(function.function_id.as_str(), CONCAT);
+                        assert_eq!(args.len(), 2);
                         assert_eq!(function.result_type, source.ty);
                         let receipt =
                             loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
@@ -152,15 +154,33 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                             receipt.canonical_selection().unwrap().result_type,
                             FunctionResultType::Scalar(source.ty.clone())
                         );
+                        let original = receipt.captured().request();
+                        assert_eq!(original.logical_argument_count, 2);
+                        assert_eq!(original.arguments.len(), 2);
+                        for argument in original.arguments.iter() {
+                            let FunctionArgument::Value {
+                                value_type,
+                                constant: None,
+                            } = argument
+                            else {
+                                panic!(
+                                    "original concat argument must remain a computed JSON array"
+                                );
+                            };
+                            let item = value_type.child_at(0).unwrap();
+                            assert_eq!(item.data_type(), &DataType::Utf8);
+                            assert_eq!(item.logical_type(), ValueLogicalType::Json);
+                        }
                         assert_loan_prefixes(&owner, fragment, unit_node, source);
                     }
                 }
             }
             assert!(cast_count >= 1);
             let arrays = calls(&owner, ARRAY_LITERAL);
-            assert!(!arrays.is_empty());
-            let mut json_values = 0;
-            let mut sort_keys = 0;
+            assert!(
+                arrays.len() >= 2,
+                "both original JSON array sources retained"
+            );
             for (fragment, unit_node, source) in arrays {
                 let receipt =
                     loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
@@ -171,17 +191,26 @@ fn explicit_json_text_casts_keep_their_target_and_original_scalar_sources() {
                 let DataType::List(item) = source.ty.data_type() else {
                     panic!("original array source");
                 };
-                let domain = source.ty.child_at(0).unwrap().logical_type();
-                match (item.data_type(), domain) {
-                    (DataType::Utf8, ValueLogicalType::Json) => json_values += 1,
-                    (DataType::Int32, ValueLogicalType::Physical) => sort_keys += 1,
-                    actual => panic!("unexpected array source {actual:?}"),
+                assert_eq!(item.data_type(), &DataType::Utf8);
+                assert_eq!(
+                    source.ty.child_at(0).unwrap().logical_type(),
+                    ValueLogicalType::Json
+                );
+                let original = receipt.captured().request();
+                assert_eq!(original.logical_argument_count, 2);
+                assert_eq!(original.arguments.len(), 2);
+                for argument in original.arguments.iter() {
+                    let FunctionArgument::Value {
+                        value_type,
+                        constant: None,
+                    } = argument
+                    else {
+                        panic!("original array element must remain computed JSON");
+                    };
+                    assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
                 }
-                assert_eq!(receipt.captured().request().logical_argument_count, 2);
                 assert_loan_prefixes(&owner, fragment, unit_node, source);
             }
-            assert!(json_values >= 1, "original JSON values source retained");
-            assert!(sort_keys >= 1, "original Int32 sort key source retained");
         } else {
             let mut casts = 0;
             for (fragment, node, unit) in owner.plan().fragments().values().flat_map(|fragment| {

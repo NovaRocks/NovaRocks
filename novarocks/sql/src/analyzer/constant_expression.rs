@@ -32,8 +32,8 @@ use novarocks_type_contract::{
 };
 
 use crate::compiler::{
-    PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
-    RequiredConstantTarget, SqlAuthoredScalarUnit, SqlCompileError,
+    PreparedRequiredConstant, RequiredConstantEligibility, RequiredConstantInput,
+    RequiredConstantRequest, RequiredConstantTarget, SqlAuthoredScalarUnit, SqlCompileError,
 };
 use crate::planner::distributed::build::lower_required_constant_unit;
 use crate::{
@@ -57,6 +57,8 @@ fn scalar_context<'a>(
         constant_policy,
         materialized_values: None,
         statement_relation: None,
+        prepared_parameters: None,
+        table_sequence: None,
         catalog: catalog.planner_table_provider(),
         current_database,
         function_catalog: functions,
@@ -65,7 +67,6 @@ fn scalar_context<'a>(
         ctes: HashMap::new(),
         pending_ctes: HashSet::new(),
         next_subquery_id: Cell::new(0),
-        next_lambda_slot_id: Cell::new(0),
         collected_subqueries: RefCell::new(Vec::new()),
         cte_registry: RefCell::new(crate::analysis::cte::CTERegistry::new()),
     }
@@ -154,7 +155,7 @@ pub(crate) fn prepare(
         control,
     } = request;
     control.check()?;
-    let context = scalar_context(
+    let mut context = scalar_context(
         catalog,
         current_database,
         functions.as_ref(),
@@ -163,7 +164,11 @@ pub(crate) fn prepare(
         control,
     );
     let (expression, span) = match input {
-        RequiredConstantInput::Expression(expression) => {
+        RequiredConstantInput::Expression(expression)
+        | RequiredConstantInput::PreparedExpression { expression, .. } => {
+            if let RequiredConstantInput::PreparedExpression { parameters, .. } = input {
+                context.prepared_parameters = Some(parameters);
+            }
             reject_subqueries(
                 expression,
                 control,
@@ -185,7 +190,153 @@ pub(crate) fn prepare(
             )
         }
     };
-    validate_scalar(&expression, span, control)?;
+    drop(context);
+    prepare_typed(
+        expression,
+        target,
+        span,
+        RequiredConstantEligibility::Property,
+        functions,
+        sealed_functions,
+        sql_semantics,
+        constant_policy,
+        control,
+    )
+}
+
+impl super::AnalyzerContext<'_> {
+    pub(super) fn bind_sequence_parameters(
+        &self,
+        arguments: Vec<(usize, &ast::Expr)>,
+        span: Span,
+    ) -> Result<[i64; 3], AnalyzeError> {
+        let typed: Vec<_> = arguments
+            .iter()
+            .map(|(_, syntax)| self.analyze_sequence_argument(syntax))
+            .collect::<Result<_, _>>()?;
+        let mut range = [0, 0, 1];
+        let mut needs_evaluation = false;
+        let mut null_argument = None;
+        for ((slot, syntax), expression) in arguments.iter().zip(&typed) {
+            if matches!(
+                expression.kind,
+                ExprKind::Literal(crate::common::LiteralValue::Null)
+            ) {
+                null_argument.get_or_insert(syntax.span());
+            } else if let Some(value) = super::resolve_expr::signed_int_literal_value(expression) {
+                range[*slot] = value;
+            } else {
+                needs_evaluation = true;
+            }
+        }
+        // The original literal author already proved the signed value and
+        // required BIGINT conversion. Other scalar computations still send
+        // their exact bound roots to the statement interpreter.
+        if !needs_evaluation {
+            if let Some(span) = null_argument {
+                return Err(AnalyzeError::invalid_function_argument(
+                    "Table function sequence arguments must not be NULL",
+                    span,
+                ));
+            }
+            return crate::compiler::table_sequence::validate_range(range, span);
+        }
+        let pass = self.table_sequence.ok_or_else(|| {
+            AnalyzeError::unsupported_expression(
+                "Table function sequence requires statement constant preparation",
+                span,
+            )
+        })?;
+        let mut typed = typed.into_iter();
+        pass.visit(arguments, span, |syntax, sealed_functions| {
+            let expression = typed.next().expect("one typed expression per argument");
+            let result = prepare_typed(
+                expression,
+                RequiredConstantTarget::Bigint,
+                syntax.span(),
+                RequiredConstantEligibility::TableArgument,
+                self.function_catalog.snapshot(),
+                sealed_functions,
+                &self.sql_semantics,
+                self.constant_policy,
+                self.control,
+            );
+            match result {
+                Ok(prepared) => Ok(prepared),
+                Err(SqlCompileError::Analyze(error)) => Err(error),
+                Err(SqlCompileError::Cancelled) => Err(AnalyzeError::control(
+                    novarocks_type_contract::CompileControlError::Cancelled,
+                )),
+                Err(SqlCompileError::DeadlineExceeded) => Err(AnalyzeError::control(
+                    novarocks_type_contract::CompileControlError::DeadlineExceeded,
+                )),
+                Err(SqlCompileError::ResourceExhausted) => Err(AnalyzeError::control(
+                    novarocks_type_contract::CompileControlError::ResourceExhausted,
+                )),
+                Err(SqlCompileError::CompilationSource(source)) => {
+                    Err(AnalyzeError::shared_domain_source(source))
+                }
+                Err(error) => Err(AnalyzeError::internal(error.to_string())),
+            }
+        })
+    }
+    fn analyze_sequence_argument(&self, syntax: &ast::Expr) -> Result<TypedExpr, AnalyzeError> {
+        reject_subqueries(
+            syntax,
+            self.control,
+            "Table function arguments cannot contain subqueries",
+        )
+        .map_err(|error| {
+            if error.control_error().is_some() {
+                error
+            } else {
+                AnalyzeError::expression_not_constant(error.message(), syntax.span())
+            }
+        })?;
+        let expression = self
+            .analyze_expr(syntax, &self.new_scope())
+            .map_err(|error| {
+                if error.kind() == crate::analyze_error::AnalyzeErrorKind::UnknownColumn {
+                    AnalyzeError::expression_not_constant(error.message(), syntax.span())
+                } else {
+                    error
+                }
+            })?;
+        let target = RequiredConstantTarget::Bigint;
+        let result = required_target_value_type(&expression.value_type, target, self.control)?;
+        validate_implicit_target(
+            &expression.value_type,
+            &result,
+            target,
+            syntax.span(),
+            self.control,
+        )
+        .map_err(|error| {
+            if error.control_error().is_some() {
+                error
+            } else {
+                AnalyzeError::type_mismatch(
+                    "Table function sequence argument must be BIGINT",
+                    syntax.span(),
+                )
+            }
+        })?;
+        Ok(expression)
+    }
+}
+
+fn prepare_typed(
+    expression: TypedExpr,
+    target: RequiredConstantTarget,
+    span: Span,
+    eligibility: RequiredConstantEligibility,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<PreparedRequiredConstant, SqlCompileError> {
+    validate_scalar(&expression, span, control, eligibility)?;
     // The target admits NULL until the application checks the actual result.
     // This does not erase a possible NULL produced by an ordinary CAST.
     let result_type = required_target_value_type(&expression.value_type, target, control)?;
@@ -203,7 +354,6 @@ pub(crate) fn prepare(
         ExprKind::Constant(value) => Some(value.clone()),
         _ => None,
     };
-    drop(context);
     let source = SqlAuthoredScalarUnit::from_emission(
         lower_required_constant_unit(
             &expression,
@@ -220,6 +370,18 @@ pub(crate) fn prepare(
     if let Some(observer) = control.fold_dependency_observer() {
         observer.observe_required_scalar_source_observed(&source, control)?;
     }
+    if eligibility == RequiredConstantEligibility::TableArgument {
+        for claim in source.unit().claims().values() {
+            control.checkpoint(CompilePhase::Validate, 1)?;
+            if !eligibility.allows_call(&claim.effects) {
+                return Err(AnalyzeError::unsupported_expression(
+                    "Function effect is unavailable while preparing table arguments",
+                    span,
+                )
+                .into());
+            }
+        }
+    }
     let value_type = source.value_type().clone();
     control.check()?;
     Ok(PreparedRequiredConstant {
@@ -229,6 +391,7 @@ pub(crate) fn prepare(
         policy: constant_policy,
         control: control.clone(),
         original_value,
+        eligibility,
     })
 }
 
@@ -343,6 +506,9 @@ fn validate_implicit_target(
     span: Span,
     control: &dyn PureCompileControl,
 ) -> Result<(), AnalyzeError> {
+    if target == RequiredConstantTarget::PreparedTableSelection {
+        return Ok(());
+    }
     if target == RequiredConstantTarget::TimeZone {
         let ty = source.value_type();
         if matches!(
@@ -368,6 +534,8 @@ fn validate_implicit_target(
                 }
                 _ => false,
             }
+    } else if target == RequiredConstantTarget::MapVarcharVarchar {
+        target.admits_map_source(source)
     } else {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
             .map_err(AnalyzeError::control)?;
@@ -382,6 +550,11 @@ fn validate_implicit_target(
     };
     if allowed {
         Ok(())
+    } else if target == RequiredConstantTarget::PreparedRowCount {
+        Err(AnalyzeError::type_mismatch(
+            "Prepared row count must be implicitly coercible to BIGINT",
+            span,
+        ))
     } else {
         let message = if target == RequiredConstantTarget::Timestamp {
             "required constant for an absolute time must have a Physical TIMESTAMP type"
@@ -405,6 +578,7 @@ fn required_target_value_type(
         RequiredConstantTarget::Boolean
         | RequiredConstantTarget::Integer
         | RequiredConstantTarget::Bigint
+        | RequiredConstantTarget::PreparedRowCount
         | RequiredConstantTarget::Double
         | RequiredConstantTarget::Varchar => {
             let data_type = target.scalar_data_type().ok_or_else(|| {
@@ -419,7 +593,12 @@ fn required_target_value_type(
                     ),
             ))
         }
-        RequiredConstantTarget::Timestamp | RequiredConstantTarget::TimeZone => source
+        // Keep the original complete MAP result. The property consumer
+        // performs the checked projection of any admitted UNKNOWN children.
+        RequiredConstantTarget::MapVarcharVarchar
+        | RequiredConstantTarget::Timestamp
+        | RequiredConstantTarget::TimeZone
+        | RequiredConstantTarget::PreparedTableSelection => source
             .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
             .map_err(AnalyzeError::control),
         RequiredConstantTarget::ArrayVarchar => {
@@ -515,6 +694,7 @@ fn validate_scalar(
     expression: &TypedExpr,
     span: Span,
     control: &crate::compiler::SqlCompileControl,
+    eligibility: RequiredConstantEligibility,
 ) -> Result<(), AnalyzeError> {
     let mut pending = vec![expression];
     while let Some(expression) = pending.pop() {
@@ -529,16 +709,22 @@ fn validate_scalar(
             | ExprKind::SubqueryPlaceholder { .. }
             | ExprKind::Lambda { .. }
             | ExprKind::LambdaFunction { .. } => {
-                return Err(AnalyzeError::unsupported_expression(
-                    "required constants cannot depend on columns, aggregates, windows or lambda inputs",
-                    span,
-                ));
+                let message = "required constants cannot depend on columns, aggregates, windows or lambda inputs";
+                return Err(
+                    if eligibility == RequiredConstantEligibility::TableArgument {
+                        AnalyzeError::expression_not_constant(message, span)
+                    } else {
+                        AnalyzeError::unsupported_expression(message, span)
+                    },
+                );
             }
             ExprKind::Literal(_) | ExprKind::Constant(_) => {}
             ExprKind::FunctionCall {
                 args, volatility, ..
             } => {
-                if *volatility == FunctionVolatility::Volatile {
+                if eligibility == RequiredConstantEligibility::Property
+                    && *volatility == FunctionVolatility::Volatile
+                {
                     return Err(AnalyzeError::unsupported_expression(
                         "volatile functions are not supported in required constants",
                         span,

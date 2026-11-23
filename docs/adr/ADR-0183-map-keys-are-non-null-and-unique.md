@@ -5,6 +5,8 @@ domain: [map-semantics]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - "ADR-0254: MAP construction key identity and failure author; key domain and merge policy remain"
 date: 2026-10-17
 provenance:
   - "discussion: 2026-10-17 accepted Map key domain, construction failure boundary and canonical key equivalence"

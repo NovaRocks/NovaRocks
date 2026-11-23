@@ -34,15 +34,23 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+mod prepared_description;
+pub(crate) use prepared_description::DescriptionAnalysis;
+pub use prepared_description::{SqlDescribedColumn, SqlPreparedDescription};
+mod prepared_parameters;
+pub use prepared_parameters::{PreparedContextNeed, PreparedParameterError, SqlPreparedParameters};
 mod required_constant;
+pub(crate) mod table_sequence;
 pub use required_constant::{
-    PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
-    RequiredConstantTarget, SqlAuthoredScalarUnit, prepare_required_constant,
+    PreparedRequiredConstant, RequiredConstantEligibility, RequiredConstantInput,
+    RequiredConstantRequest, RequiredConstantTarget, SqlAuthoredScalarUnit,
+    prepare_required_constant,
 };
 #[cfg(novarocks_dev_controls)]
 pub use required_constant::{
     SqlStandaloneScalarColumn, SqlStandaloneScalarRequest, author_standalone_scalar_for_test,
 };
+pub use table_sequence::{TableSequenceArgumentFact, TableSequenceArgumentNeed};
 
 mod captured_catalog;
 mod dml_catalog;
@@ -63,7 +71,9 @@ pub use crate::planner::distributed::build::{
 pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
-pub use dml_catalog::SqlDmlCatalogPreparation;
+pub use dml_catalog::{
+    SqlDmlAnalysisProgress, SqlDmlCatalogPreparation, SqlDmlTableSequenceAnalysis,
+};
 pub use logical_explain::SqlLogicalExplainCatalog;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
@@ -753,6 +763,7 @@ impl std::error::Error for SqlConstantEvaluationError {
 #[derive(Clone, Debug)]
 pub struct SqlStatementInput {
     kind: SqlStatementInputKind,
+    prepared_parameters: Option<Arc<SqlPreparedParameters>>,
 }
 
 #[derive(Clone, Debug)]
@@ -786,6 +797,7 @@ impl SqlStatementInput {
     pub fn parsed_query(query: Box<novarocks_parser::ast::Query>) -> Self {
         Self {
             kind: SqlStatementInputKind::ParsedQuery(query),
+            prepared_parameters: None,
         }
     }
 
@@ -794,7 +806,13 @@ impl SqlStatementInput {
     pub fn query_with_admitted_session(query: Box<novarocks_parser::ast::Query>) -> Self {
         Self {
             kind: SqlStatementInputKind::AdmittedSessionQuery(query),
+            prepared_parameters: None,
         }
+    }
+
+    pub fn with_prepared_parameters(mut self, parameters: Arc<SqlPreparedParameters>) -> Self {
+        self.prepared_parameters = Some(parameters);
+        self
     }
 
     fn root_session_admitted(&self) -> bool {
@@ -846,6 +864,7 @@ impl SqlStatementInput {
                 query,
                 source: StatementSystemRelationSource { kind, declaration },
             },
+            prepared_parameters: None,
         })
     }
 
@@ -861,6 +880,7 @@ impl SqlStatementInput {
         )?;
         Ok(Self {
             kind: SqlStatementInputKind::MaterializedValuesQuery { query, source },
+            prepared_parameters: None,
         })
     }
 
@@ -875,6 +895,7 @@ impl SqlStatementInput {
                 factory,
                 root_semantics,
             },
+            prepared_parameters: None,
         }
     }
 }
@@ -1065,6 +1086,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
+    pub(crate) table_sequence: Option<&'a table_sequence::TableSequencePass>,
     pub(crate) control: SqlCompileControl,
 }
 
@@ -1117,6 +1139,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             constant_policy,
             mv_rewrite,
             imv_rewrite: None,
+            table_sequence: None,
             control,
         }
     }
@@ -1154,6 +1177,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             constant_policy,
             mv_rewrite: None,
             imv_rewrite: None,
+            table_sequence: None,
             control,
         }
     }
@@ -1753,9 +1777,17 @@ use completion_driver::{
 pub(crate) use system_table_completion::install as install_system_table_snapshots;
 
 impl SqlCompiler {
-    pub fn analyze(
+    pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
+        Self::analyze_with_table_sequence(request)?.ok_or_else(|| {
+            SqlCompileError::InvalidRequest(
+                "Original table arguments are required before analysis can publish a plan".into(),
+            )
+        })
+    }
+
+    fn analyze_with_table_sequence(
         mut request: SqlAnalyzeRequest<'_>,
-    ) -> Result<SqlAnalyzeOutput, SqlCompileError> {
+    ) -> Result<Option<SqlAnalyzeOutput>, SqlCompileError> {
         request.check_control()?;
         request.freeze_scalar_presence_scope();
         let (
@@ -1776,12 +1808,7 @@ impl SqlCompiler {
                 factory.clone(),
                 root_semantics.clone(),
                 true,
-                (request
-                    .session
-                    .sql_semantics
-                    .sql_mode()
-                    .group_concat_legacy()
-                    || request.session.sql_semantics.sql_mode().error_if_overflow()),
+                (request.session.sql_semantics.sql_mode().error_if_overflow()),
                 request
                     .session
                     .sql_semantics
@@ -1831,10 +1858,18 @@ impl SqlCompiler {
                             } => Some(source),
                             _ => None,
                         },
+                        request.statement.prepared_parameters.as_deref(),
+                        request.table_sequence,
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
 
+                if request
+                    .table_sequence
+                    .is_some_and(table_sequence::TableSequencePass::has_requests)
+                {
+                    return Ok(None);
+                }
                 let analyzed_fields = resolved.output_columns.clone();
                 let logical_plan =
                     crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;
@@ -1871,23 +1906,23 @@ impl SqlCompiler {
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
-            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::analysis(
-                SqlAnalysisOutput {
+            return Ok(Some(SqlAnalyzeOutput::Complete(
+                SqlCompileOutput::analysis(SqlAnalysisOutput {
                     logical_plan,
                     factory,
                     root_semantics,
-                },
+                }),
             )));
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) && request.imv_rewrite.is_none()
         {
-            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
+            return Ok(Some(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
                 SqlAnalysisOutput {
                     logical_plan,
                     factory,
                     root_semantics,
                 },
-            )));
+            ))));
         }
         let settings = request.session.optimizer_settings.clone();
         if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
@@ -1961,13 +1996,13 @@ impl SqlCompiler {
             request.check_control()?;
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) {
-            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
+            return Ok(Some(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
                 SqlAnalysisOutput {
                     logical_plan,
                     factory,
                     root_semantics,
                 },
-            )));
+            ))));
         }
 
         let mv_rewrite = if let Some(definitions) = request.mv_rewrite {
@@ -2009,7 +2044,7 @@ impl SqlCompiler {
             })?
             .snapshot();
 
-        Ok(SqlAnalyzeOutput::Pending(SqlAnalyzedQuery {
+        Ok(Some(SqlAnalyzeOutput::Pending(SqlAnalyzedQuery {
             root_semantics,
             logical_plan,
             factory,
@@ -2023,7 +2058,7 @@ impl SqlCompiler {
             function_catalog,
             constant_policy: request.constant_policy,
             sealed_functions: request.sealed_functions,
-        }))
+        })))
     }
 
     pub fn optimize(request: SqlOptimizeRequest<'_>) -> Result<SqlCompileOutput, SqlCompileError> {
@@ -2137,7 +2172,11 @@ fn parse_query(
         | SqlStatementInputKind::AdmittedSessionQuery(query)
         | SqlStatementInputKind::MaterializedValuesQuery { query, .. }
         | SqlStatementInputKind::StatementSystemRelationQuery { query, .. } => {
-            Ok((**query).clone())
+            if let Some(parameters) = &statement.prepared_parameters {
+                parameters.complete_query((**query).clone())
+            } else {
+                Ok((**query).clone())
+            }
         }
         SqlStatementInputKind::LogicalPlan { .. } => Err(SqlCompileError::InvalidRequest(
             "logical SQL compiler input must bypass parsing".to_string(),
@@ -2985,7 +3024,7 @@ mod tests {
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
             constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query(
-                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT k FROM missing_table",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT k FROM missing_table",
             ),
             current_database: "db".to_string(),
             catalog: &catalog,
@@ -2994,7 +3033,7 @@ mod tests {
         })
         .expect_err("unsupported persisted semantics");
         assert!(error.to_string().starts_with("Unsupported:"));
-        assert!(error.to_string().contains("GROUP_CONCAT_LEGACY"));
+        assert!(error.to_string().contains("ERROR_IF_OVERFLOW"));
         assert!(
             !error.to_string().contains("missing_table"),
             "guard precedes analyzer table materialization"
@@ -3079,8 +3118,8 @@ mod tests {
         for sql in [
             "select array_agg(JSON_OBJECT('2': 3)) as j, array_agg(cast(JSON_OBJECT('2': 3) as varchar)) as s",
             "with q as (select cast(json_object('k':1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
-            "select array_sortby([json_object('k':1), json_object('k':2)],[2,1]) as j, array_sortby(cast([json_object('k':1), json_object('k':2)] as array<varchar>),[2,1]) as s",
-            "with q as (select [json_object('k':1),json_object('k':2)] as j) select array_sortby(j,[2,1]) as j, array_sortby(cast(j as array<varchar>),[2,1]) as s from q",
+            "select concat(ARRAY[json_object('k':1)], ARRAY[json_object('k':2)]) as j, concat(cast(ARRAY[json_object('k':1), json_object('k':2)] as ARRAY(VARCHAR)), ARRAY['plain']) as s",
+            "with q as (select [json_object('k':1),json_object('k':2)] as j) select concat(j, ARRAY[json_object('k':3)]) as j, concat(cast(j as ARRAY(VARCHAR)), ARRAY['plain']) as s from q",
         ] {
             let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
             let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
@@ -3793,7 +3832,8 @@ mod system_table_completion;
 pub use completion::*;
 pub use root_render_type::{
     ClientRenderSchemaError, RenderFamilyRequest, client_render_schema,
-    client_render_schema_from_port, validate_public_result_logical_identities,
+    client_render_schema_from_port, render_field_for_declaration,
+    validate_public_result_logical_identities,
 };
 pub(crate) mod mv_rewrite;
 

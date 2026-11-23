@@ -233,9 +233,9 @@ fn element_at_type_probe_keeps_original_ordinary_binding_error_without_rebinding
         assert_eq!(error, expected);
         assert_eq!(
             error.kind(),
-            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction
         );
-        assert_eq!(error.code().as_str(), "sql.analyze.type_mismatch");
+        assert_eq!(error.code().as_str(), "sql.analyze.unknown_function");
         assert_eq!(error.span(), Some(array_span));
         assert_eq!(error.message(), "no matching declared overload");
         assert!(error.control_error().is_none());
@@ -376,7 +376,8 @@ fn element_at_type_probe_preserves_selected_unavailable_without_rebinding() {
 #[test]
 fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_guessing() {
     let query = analyze(
-        "SELECT element_at([1,2],1), [1,2][1], element_at(map(1,2),1), map(1,2)[1]",
+        "SELECT element_at([1,2],1), [1,2][1], \
+         element_at(map(ARRAY[1], ARRAY[2]),1), map(ARRAY[1], ARRAY[2])[1]",
         crate::functions::builtin_sql_function_catalog(),
     )
     .unwrap();
@@ -384,24 +385,14 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
         panic!("select");
     };
     let expected = [
-        // Both spellings select the existing INTEGER index overload.
-        (
-            "__array_element_at",
-            DataType::Int32,
-            DataType::Int32,
-            false,
-        ),
-        (
-            "__array_element_at",
-            DataType::Int32,
-            DataType::Int32,
-            false,
-        ),
-        ("__map_element_at", DataType::Int32, DataType::Int32, false),
-        ("__map_element_at", DataType::Int32, DataType::Int32, false),
+        // Both ARRAY forms select BIGINT. MAP probes keep the original key width.
+        ("element_at", DataType::Int64),
+        ("__array_subscript", DataType::Int64),
+        ("element_at", DataType::Int32),
+        ("__map_subscript", DataType::Int32),
     ];
     assert_eq!(select.projection.len(), expected.len());
-    for (project, (name, result, index, index_nullable)) in select.projection.iter().zip(expected) {
+    for (project, (name, index)) in select.projection.iter().zip(expected) {
         let ExprKind::FunctionCall {
             name: actual,
             binding,
@@ -424,7 +415,10 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
                 &FunctionArgumentType::Value(argument.value_type.clone())
             );
         }
-        let result = FunctionValueType::new(result, true);
+        let nullable = name != "__array_subscript"
+            || args[0].value_type.nullable()
+            || args[0].value_type.child_at(0).unwrap().nullable();
+        let result = FunctionValueType::new(DataType::Int32, nullable);
         assert_eq!(project.expr.value_type, result);
         assert_eq!(
             binding.selected.result_type,
@@ -432,14 +426,29 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
         );
         assert_eq!(
             args[1].value_type,
-            FunctionValueType::new(index, index_nullable)
+            FunctionValueType::new(index.clone(), false)
         );
+        let original_index = if index == DataType::Int64 {
+            let ExprKind::Cast {
+                expr, cast_mode, ..
+            } = &args[1].kind
+            else {
+                panic!("ARRAY index requires an implicit BIGINT conversion");
+            };
+            assert_eq!(
+                *cast_mode,
+                Some(novarocks_type_contract::TrinoCastMode::Implicit)
+            );
+            expr.as_ref()
+        } else {
+            &args[1]
+        };
         assert!(
             matches!(
-                args[1].kind,
+                original_index.kind,
                 ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
             ),
-            "original INTEGER probe needs no narrowing"
+            "the selected width preserves the original literal value"
         );
         assert!(matches!(args[0].kind, ExprKind::FunctionCall { .. }));
     }

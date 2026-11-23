@@ -20,7 +20,7 @@ WITH t AS (SELECT 1 AS c) SELECT missing FROM t;
 SELECT sqlp7_not_a_function(1);
 
 -- query 4
--- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT substring('x', 1, 2, 3);
 
 -- query 5
@@ -138,7 +138,7 @@ SELECT sum(1) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CUR
 SELECT sum(1) OVER (ORDER BY 1 ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING PATTERN (A) DEFINE A AS TRUE);
 
 -- query 34
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT * FROM TABLE (p14_other_function());
 
 -- query 35
@@ -225,3 +225,39 @@ SELECT substring(a => 'x', b => 1);
 -- query 56
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SELECT FINAL count(*);
+
+-- query 57
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT format('%s', 7);
+
+-- query 58
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT format(7, 'x');
+
+-- query 59
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT overlay('abc' PLACING 'x' FROM '1');
+
+-- query 60
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT ltrim('abc', 1);
+
+-- query 61
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT char_length('abc');
+
+-- query 62
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT initcap('abc');
+
+-- query 63
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT lower(1);
+
+-- query 64
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT translate('abc', 'a');
+
+-- query 65
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT concat('abc', 1);

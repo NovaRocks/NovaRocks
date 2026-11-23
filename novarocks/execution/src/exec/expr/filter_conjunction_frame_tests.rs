@@ -26,7 +26,7 @@ use novarocks_physical_plan::NodeKind;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::sync::{Arc, Mutex};
 
-const NATIVE: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;";
+const NATIVE: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING approx_distinct(v) = 0 AND approx_distinct(CAST(v AS BIGINT)) = 0 ORDER BY k;";
 struct CompileStop {
     at: usize,
     cause: CompileControlError,

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable six-operator comparison for already-materialized flat value domains with explicit logical identity.
+//! Immutable six-operator comparison for already-materialized value domains with explicit logical identity.
 //! This primitive has no instance state, registry lookup, coercion or memory grant.
 
 use arrow_array::{types::*, *};
@@ -27,6 +27,7 @@ use novarocks_type_contract::{
 };
 use std::{cmp::Ordering, error::Error, fmt};
 
+use crate::arithmetic::SignedWidth;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, validate_type_observed};
 use crate::{EvaluatedArgument, KernelEvaluationControl, KernelFailure, ScopedExpressionEffects};
@@ -63,7 +64,7 @@ impl fmt::Display for ComparisonPrepareError {
             Self::Control(error) => error.fmt(f),
             Self::Kernel(error) => error.fmt(f),
             Self::Unsupported => {
-                f.write_str("comparison requires its exact supported flat logical domain")
+                f.write_str("comparison requires an installed recipe for its exact logical domains")
             }
             Self::TypeMismatch => {
                 f.write_str("comparison arguments differ in their frozen value domain")
@@ -94,8 +95,9 @@ impl From<novarocks_type_contract::ValueTypeError> for ComparisonPrepareError {
 /// Ordinary scalar Arrow comparison, including floating-point total ordering
 /// and bit equality. Authored UUID has the original unsigned 16-byte order;
 /// authored LARGEINT uses signed i128 order decoded from big-endian bytes. Neither
-/// identity is inferred from a carrier. Nested and null-safe comparison retain
-/// their separate existing algorithms and are not admitted.
+/// identity is inferred from a carrier. Array equality is installed for one
+/// layer of signed integer elements, including SQL UNKNOWN elements. Other
+/// nested comparisons require their own admitted recipes.
 /// The compiler retains this checked recipe against the actual expression use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedComparisonRecipe {
@@ -103,7 +105,63 @@ pub struct PreparedComparisonRecipe {
     ieee_float_equality: bool,
     left: FunctionValueType,
     right: FunctionValueType,
-    leaf: FlatLeaf,
+    algorithm: Algorithm,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Algorithm {
+    Flat(FlatLeaf),
+    IntegerArray {
+        left: IntegerItem,
+        right: IntegerItem,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntegerItem {
+    width: Option<SignedWidth>,
+    nullable: bool,
+}
+
+impl IntegerItem {
+    fn prepare(array: &FunctionValueType) -> Option<Self> {
+        let DataType::List(field) = array.data_type() else {
+            return None;
+        };
+        let child = array.value_type().child_type_at(0)?;
+        if array.logical_type() != ValueLogicalType::Physical
+            || !matches!(child.kind(), ValueKind::Scalar(_))
+        {
+            return None;
+        }
+        let width = match field.data_type() {
+            DataType::Null => None,
+            carrier => Some(SignedWidth::from_carrier(carrier)?),
+        };
+        Some(Self {
+            width,
+            nullable: child.nullable(),
+        })
+    }
+
+    fn read(self, array: &dyn Array, row: usize) -> Result<Option<i64>, KernelFailure> {
+        match self.width {
+            None => {
+                cast::<NullArray>(array)?;
+                Ok(None)
+            }
+            Some(_) if array.is_null(row) => {
+                if !self.nullable {
+                    return Err(invalid("non-null ARRAY item contains a reachable NULL"));
+                }
+                Ok(None)
+            }
+            Some(width) => width.read(array, row).map(Some),
+        }
+    }
+
+    fn nullable(self) -> bool {
+        self.nullable || self.width.is_none()
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FlatLeaf {
@@ -201,6 +259,11 @@ impl FlatLeaf {
     }
 }
 impl PreparedComparisonRecipe {
+    /// Whether this complete type can supply an operand to signed ARRAY equality.
+    pub fn supports_array_equality_operand(value: &FunctionValueType) -> bool {
+        IntegerItem::prepare(value).is_some()
+    }
+
     pub fn try_new(
         operator: ComparisonOperator,
         left: &FunctionValueType,
@@ -224,6 +287,26 @@ impl PreparedComparisonRecipe {
             };
             if !allowed {
                 return Err(ComparisonPrepareError::Unsupported);
+            }
+            if matches!(operator, ComparisonOperator::Eq | ComparisonOperator::Ne)
+                && matches!(left.data_type(), DataType::List(_))
+                && matches!(right.data_type(), DataType::List(_))
+            {
+                let left_item =
+                    IntegerItem::prepare(left).ok_or(ComparisonPrepareError::Unsupported)?;
+                let right_item =
+                    IntegerItem::prepare(right).ok_or(ComparisonPrepareError::Unsupported)?;
+                work.step()?;
+                return Ok(Self {
+                    operator,
+                    ieee_float_equality: false,
+                    left: left.clone(),
+                    right: right.clone(),
+                    algorithm: Algorithm::IntegerArray {
+                        left: left_item,
+                        right: right_item,
+                    },
+                });
             }
             let temporal = left.value_type().temporal();
             if temporal != right.value_type().temporal() {
@@ -260,7 +343,7 @@ impl PreparedComparisonRecipe {
                 ieee_float_equality: false,
                 left: left.clone(),
                 right: right.clone(),
-                leaf,
+                algorithm: Algorithm::Flat(leaf),
             };
             work.step()?;
             Ok(prepared)
@@ -282,7 +365,10 @@ impl PreparedComparisonRecipe {
     ) -> Result<Self, ComparisonPrepareError> {
         let mut recipe = Self::try_new(ComparisonOperator::Eq, left, right, control)?;
         if left.logical_type() != ValueLogicalType::Physical
-            || !matches!(recipe.leaf, FlatLeaf::Float32 | FlatLeaf::Float64)
+            || !matches!(
+                recipe.algorithm,
+                Algorithm::Flat(FlatLeaf::Float32 | FlatLeaf::Float64)
+            )
         {
             return Err(ComparisonPrepareError::Unsupported);
         }
@@ -300,7 +386,12 @@ impl PreparedComparisonRecipe {
         &self.right
     }
     pub fn nullable_result(&self) -> bool {
-        self.left.nullable() || self.right.nullable() || self.leaf == FlatLeaf::Null
+        self.left.nullable()
+            || self.right.nullable()
+            || match self.algorithm {
+                Algorithm::Flat(leaf) => leaf == FlatLeaf::Null,
+                Algorithm::IntegerArray { left, right } => left.nullable() || right.nullable(),
+            }
     }
     /// Only an admitted ordinary comparison recipe supplies its own pure summary.
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
@@ -334,7 +425,7 @@ impl PreparedComparisonRecipe {
             let la = left.array();
             let ra = right.array();
             // Check both operands before a successful SQL NULL can short-circuit.
-            if self.leaf != FlatLeaf::Null
+            if self.algorithm != Algorithm::Flat(FlatLeaf::Null)
                 && (la.is_null(l) && !self.left.nullable()
                     || ra.is_null(r) && !self.right.nullable())
             {
@@ -365,6 +456,40 @@ impl PreparedComparisonRecipe {
                 primitive::<$ty>(left, l, right, r, self.operator, work)
             };
         }
+        let leaf = match self.algorithm {
+            Algorithm::Flat(leaf) => leaf,
+            Algorithm::IntegerArray {
+                left: left_item,
+                right: right_item,
+            } => {
+                let left = cast::<ListArray>(left)?;
+                let right = cast::<ListArray>(right)?;
+                if left.is_null(l) || right.is_null(r) {
+                    return Ok(None);
+                }
+                let left_offsets = left.value_offsets();
+                let right_offsets = right.value_offsets();
+                let left_range = left_offsets[l] as usize..left_offsets[l + 1] as usize;
+                let right_range = right_offsets[r] as usize..right_offsets[r + 1] as usize;
+                let equal = self.operator == ComparisonOperator::Eq;
+                if left_range.len() != right_range.len() {
+                    return Ok(Some(!equal));
+                }
+                let mut unknown = false;
+                for (l, r) in left_range.zip(right_range) {
+                    work.step()?;
+                    match (
+                        left_item.read(left.values().as_ref(), l)?,
+                        right_item.read(right.values().as_ref(), r)?,
+                    ) {
+                        (Some(left), Some(right)) if left != right => return Ok(Some(!equal)),
+                        (Some(_), Some(_)) => {}
+                        _ => unknown = true,
+                    }
+                }
+                return Ok((!unknown).then_some(equal));
+            }
+        };
         macro_rules! b {
             ($ty:ty, $bytes:expr) => {{
                 let left = cast::<$ty>(left)?;
@@ -377,14 +502,14 @@ impl PreparedComparisonRecipe {
                         self.operator,
                         bytes(left, l),
                         bytes(right, r),
-                        self.leaf == FlatLeaf::Char,
+                        leaf == FlatLeaf::Char,
                         work,
                     )
                     .map(Some)
                 }
             }};
         }
-        match self.leaf {
+        match leaf {
             FlatLeaf::Temporal(declaration) => {
                 use novarocks_value_arrays::decode::PreparedTemporalArray;
                 let left = PreparedTemporalArray::bind(declaration, left, self.left.nullable())

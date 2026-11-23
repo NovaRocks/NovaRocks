@@ -191,6 +191,10 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     // observation L was validated against, never from a persisted contract.
     let runtime_bindings = validate_projection_target(&mv_definition, &target_schema_observation)
         .map_err(RefreshError::from)?;
+    if !stmt.full && mv_definition.facts.publication().is_some() {
+        novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(mv_definition.facts.interpretation())
+            .map_err(RefreshError::user)?;
+    }
     let caps = RefreshCapabilities::from_canonical_facts(
         mv_definition.facts.interpretation(),
         &runtime_bindings,
@@ -1191,6 +1195,10 @@ pub(crate) async fn captured_refresh_decision_original(
     full: bool,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ExecutableRefreshDecision, RefreshError> {
+    if !full && projection.facts.publication().is_some() {
+        novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(projection.facts.interpretation())
+            .map_err(RefreshError::user)?;
+    }
     let refs = definition_base_refs(projection)?;
     let bases = base_relation_occurrences(projection, &refs)?;
     let previous =

@@ -17,7 +17,9 @@
 
 //! Optional folding through ordinary SQL completion.
 
-use crate::fixtures::{compile_table_free, expression_sources, session, text};
+use crate::fixtures::{
+    compile_table_free, expression_sources, session, table_free_request_with_constant_policy, text,
+};
 use crate::fold_observation::FoldProbe;
 use arrow::array::Decimal128Array;
 use arrow::datatypes::DataType;
@@ -26,9 +28,7 @@ use novarocks_functions::ConstantValue;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlCompileControl};
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_sql_testkit::sql_fixture_constant_policy;
-use novarocks_type_contract::{
-    CompilePhase, OperatorFunction, RegexpCountPatternSource, ValueLogicalType,
-};
+use novarocks_type_contract::{ArgumentControl, CompilePhase, OperatorFunction, ValueLogicalType};
 use std::sync::Arc;
 
 fn compile(sql: &str, probe: &Arc<FoldProbe>) -> SqlAuthoredPhysicalPlan {
@@ -105,6 +105,55 @@ fn folds_date_format_and_utf8_to_date32_through_real_kernels() {
         })
         .unwrap();
     assert_eq!(text(formatted.result.as_ref().unwrap()), "2020-01-01");
+}
+
+#[test]
+fn date_format_keeps_a_successful_output_that_exceeds_the_optional_fold_limit() {
+    const FORMAT: &str = "builtin.scalar/date_format/v1";
+    let sql = format!(
+        "SELECT date_format(TIMESTAMP '2024-09-01 12:00:00.000', '{}')",
+        "%M".repeat(96)
+    );
+    let expected = "September".repeat(96);
+    let small_policy = novarocks_functions::ConstantPolicy {
+        max_retained_buffer_bytes: 512,
+        ..sql_fixture_constant_policy()
+    };
+
+    let fold = Arc::new(FoldProbe::default());
+    let control = fold.control();
+    let owner = table_free_request_with_constant_policy(
+        &sql,
+        session(Default::default(), true),
+        &control,
+        small_policy,
+    )
+    .try_into_completion()
+    .unwrap();
+    let owner = novarocks_sql::compiler::SqlCompiler::start(owner, &control)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .into_plan();
+    let receipts = fold.receipts.lock().unwrap();
+    let attempted = receipts
+        .iter()
+        .find(|receipt| receipt.is_call(FORMAT))
+        .unwrap();
+    assert!(attempted.result.is_none());
+    assert!(expression_sources(&owner).any(|(_, _, node)| {
+        matches!(&node.kind, ExprKind::FunctionCall { function, .. }
+            if function.function_id.as_str() == FORMAT)
+    }));
+
+    let normal = Arc::new(FoldProbe::default());
+    compile(&sql, &normal);
+    let receipts = normal.receipts.lock().unwrap();
+    let fully_folded = receipts
+        .iter()
+        .find(|receipt| receipt.is_call(FORMAT))
+        .unwrap();
+    assert_eq!(text(fully_folded.result.as_ref().unwrap()), expected);
 }
 
 fn decimal_coefficient(value: &ConstantValue) -> i128 {
@@ -233,7 +282,7 @@ fn standard_decimal_overflow_remains_an_unfolded_call_in_both_sql_modes() {
 }
 
 #[test]
-fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_error_decline() {
+fn regexp_count_fold_preserves_the_original_ordered_call_for_hosted_evaluation() {
     let probe = Arc::new(FoldProbe::default());
     let owner = compile("SELECT regexp_count('test string','[0-9')", &probe);
     let receipts = probe.receipts.lock().unwrap();
@@ -244,8 +293,10 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
     assert_eq!(calls.len(), 1);
     let receipt = calls[0];
     assert_eq!(
-        receipt.unit.claims()[&receipt.root_use()].regexp_count_pattern_source,
-        Some(RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent),
+        receipt.unit.claims()[&receipt.root_use()]
+            .effects
+            .argument_control,
+        ArgumentControl::OrderedRegexp,
     );
     assert!(receipt.result.is_none());
     assert!(
@@ -254,6 +305,23 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
                 if function.function_id.as_str() == "builtin.scalar/regexp_count/v1"
         ))
     );
+}
+
+#[test]
+fn ordered_regexp_folds_known_null_even_with_an_invalid_pattern_or_array_result() {
+    let probe = Arc::new(FoldProbe::default());
+    let owner = compile(
+        "SELECT regexp_replace('a', '[', CAST(NULL AS VARCHAR)), regexp_extract_all(CAST(NULL AS VARCHAR), '[')",
+        &probe,
+    );
+    assert!(!expression_sources(&owner).any(|(_, _, node)| {
+        matches!(&node.kind, ExprKind::FunctionCall { function, .. }
+            if function.function_id.as_str().starts_with("builtin.scalar/regexp_"))
+    }));
+    assert!(expression_sources(&owner).any(|(_, _, node)| {
+        matches!(node.ty.data_type(), DataType::List(_))
+            && matches!(node.kind, ExprKind::Constant(_))
+    }));
 }
 
 #[test]
@@ -352,12 +420,12 @@ fn e08s1_table_fold_original_source_keeps_real_child_evaluation() {
 }
 
 #[test]
-fn e08s1_fold_environment_exact_original_concat_raw_limits_keep_child_fold() {
-    for raw in [-1, 4096] {
-        let semantics = SqlSemanticSettings::default().with_group_concat_max_len(raw);
+fn listagg_original_arguments_keep_child_fold() {
+    {
+        let semantics = SqlSemanticSettings::default();
         let probe = Arc::new(FoldProbe::default());
         crate::fixtures::optimize_table_free(
-            "SELECT GROUP_CONCAT(REVERSE('abc'))",
+            "SELECT LISTAGG(REVERSE('abc')) WITHIN GROUP (ORDER BY 1)",
             session(semantics, true),
             novarocks_sql::compiler::builtin_sql_function_catalog(),
             &probe.control(),

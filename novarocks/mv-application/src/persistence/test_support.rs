@@ -180,6 +180,7 @@ fn sample_interpretation(definition: &DefinitionDocument) -> InterpretationDocum
         aggregates: vec![AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "avg".to_string(),
+            semantic_contract: None,
             source_fields: vec![SourceFieldReference {
                 occurrence_id: 7,
                 field_id: field_id(2),
@@ -272,6 +273,7 @@ fn retraction_count_interpretation(definition: &DefinitionDocument) -> Interpret
         AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "sum".to_string(),
+            semantic_contract: None,
             source_fields: vec![SourceFieldReference {
                 occurrence_id: 7,
                 field_id: field_id(2),
@@ -285,6 +287,7 @@ fn retraction_count_interpretation(definition: &DefinitionDocument) -> Interpret
         AggregateInterpretation {
             aggregate_id: internal_retraction_count_aggregate_identity(),
             function_identity: INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY.to_string(),
+            semantic_contract: None,
             source_fields: Vec::new(),
             state_slot_ids: vec![state_slot_id(42)],
             branch_id: None,

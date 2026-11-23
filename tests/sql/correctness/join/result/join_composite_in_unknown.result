@@ -1,30 +1,30 @@
 -- query 1
--- legacy
+-- types	boolean	boolean
 unknown_pair	definite_mismatch
-NULL	0
+NULL	false
 
 -- query 2
--- legacy
+-- types	boolean	boolean
 match_wins	not_match_wins
-1	0
+true	false
 
 -- query 3
--- legacy
+-- types	boolean
 outer_null
 NULL
 
 -- query 4
--- legacy
+-- types	boolean	boolean
 empty_in	empty_not_in
-0	1
+false	true
 
 -- query 5
--- legacy
+-- types	integer	boolean	boolean
 pk	member	nonmember
 1	NULL	NULL
 1	NULL	NULL
-2	0	1
-3	1	0
+2	false	true
+3	true	false
 4	NULL	NULL
 
 -- query 6

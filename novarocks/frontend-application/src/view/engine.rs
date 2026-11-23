@@ -292,7 +292,11 @@ impl ViewEngine for FrontendViewEngine {
             preparation = preparation.continue_catalog(facts.into_boxed_slice())?;
         }
         preparation
-            .analyze_view_definition(self.function_catalog(), self.kernel.constant_policy())
+            .analyze_view_definition(
+                self.function_catalog(),
+                Arc::clone(self.kernel.sealed_functions()),
+                self.kernel.constant_policy(),
+            )
             .map(|columns| columns.into_vec())
     }
 }

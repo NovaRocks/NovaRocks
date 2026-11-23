@@ -498,8 +498,6 @@ fn lambda_is_an_explicit_unsupported_compiler_shape() {
                     },
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -791,8 +789,6 @@ fn rand_unit() -> (BoundExprSet, PureEngineFunctionCatalog, SemanticParameters) 
                 effects: token.call_contract().effects().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 temporal_source: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
             },
         );
     }
@@ -2050,8 +2046,6 @@ fn original_no_arguments_invocation_keeps_full_static_request_without_input_uses
                     effects: token.call_contract().effects().clone(),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )]),
             &mut w,
@@ -2989,8 +2983,6 @@ fn sparse_non_dfs_nested_shared_calls_keep_actual_edges_claims_and_compile_prefi
                 effects: fresh.call_contract().effects().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 temporal_source: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
             },
         );
     }
@@ -3279,7 +3271,8 @@ fn zero_port_compiler_keeps_unsupported_primitive_capabilities() {
         Err(ExprCompileError::Cast(CastPrepareError::Unsupported))
     ));
 
-    let ty = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    // Signed integer ARRAY equality has an installed recipe. VARCHAR items do not.
+    let ty = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
     for op in [BinaryOperator::Eq, BinaryOperator::EqForNull] {
         let result = zero_port::primitive(
             [new_null_array(&ty, 1), new_null_array(&ty, 1)],

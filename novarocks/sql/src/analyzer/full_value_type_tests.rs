@@ -181,27 +181,27 @@ fn catalog_root_identity_survives_projection_alias_derived_cte_and_outer_padding
 }
 
 #[test]
-fn actual_field_domain_reaches_lambda_parameter_body_and_bound_result() {
-    let resolved = analyze("SELECT array_map(x -> x, ja) FROM source");
+fn actual_field_domain_reaches_concat_arguments_and_bound_result() {
+    let resolved = analyze("SELECT concat(ja, CAST(ARRAY[] AS ARRAY(JSON))) FROM source");
     let QueryBody::Select(select) = resolved.body else {
-        panic!("expected select");
+        panic!("expected select")
     };
     let expression = &select.projection[0].expr;
     let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
-        panic!("expected actual call");
+        panic!("expected actual call")
     };
-    let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
-        panic!("expected lambda");
-    };
-    assert_eq!(params[0].value_type.logical_type(), ValueLogicalType::Json);
-    assert_eq!(body.value_type, params[0].value_type);
+    assert_eq!(binding.function_id.as_str(), "builtin.scalar/concat/v1");
+    assert_eq!(
+        args[0].value_type.child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        panic!("expected scalar");
+        panic!("expected scalar")
     };
     assert_eq!(&expression.value_type, result);
     let DataType::List(item) = &result.data_type() else {
-        panic!("expected list");
+        panic!("expected list")
     };
     let expected =
         crate::test_value_types::string_list(item.is_nullable(), true, result.nullable());

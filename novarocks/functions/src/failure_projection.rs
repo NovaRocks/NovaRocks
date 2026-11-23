@@ -510,7 +510,7 @@ mod comparison_failure_tests {
     fn actual_comparison_recipe_authors_capability_and_mismatch_as_distinct_facts() {
         let nested = value(DataType::List(Arc::new(Field::new(
             "item",
-            DataType::Int32,
+            DataType::Float32,
             true,
         ))));
         let int32 = value(DataType::Int32);

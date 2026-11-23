@@ -42,7 +42,7 @@ CREATE TABLE ${case_db}.rf_dist_part_build (
 -- 2000 probe rows, key space 0..199 (10 probe rows per key).
 INSERT INTO ${case_db}.rf_dist_part_probe
 SELECT generate_series AS id, generate_series % 200 AS k
-FROM TABLE(generate_series(1, 2000));
+FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 
 -- 200 build rows, one per key; only even keys pass the flag = 'Y' predicate,
 -- so the runtime filter has real work to prune (~half the probe rows). Write
@@ -51,17 +51,17 @@ FROM TABLE(generate_series(1, 2000));
 INSERT INTO ${case_db}.rf_dist_part_build
 SELECT generate_series % 200 AS k,
        CASE WHEN (generate_series % 200) % 2 = 0 THEN 'Y' ELSE 'N' END AS flag
-FROM TABLE(generate_series(1, 67));
+FROM TABLE(sequence(1, 67)) AS generate_series(generate_series);
 
 INSERT INTO ${case_db}.rf_dist_part_build
 SELECT generate_series % 200 AS k,
        CASE WHEN (generate_series % 200) % 2 = 0 THEN 'Y' ELSE 'N' END AS flag
-FROM TABLE(generate_series(68, 134));
+FROM TABLE(sequence(68, 134)) AS generate_series(generate_series);
 
 INSERT INTO ${case_db}.rf_dist_part_build
 SELECT generate_series % 200 AS k,
        CASE WHEN (generate_series % 200) % 2 = 0 THEN 'Y' ELSE 'N' END AS flag
-FROM TABLE(generate_series(135, 200));
+FROM TABLE(sequence(135, 200)) AS generate_series(generate_series);
 
 ANALYZE ${case_db}.rf_dist_part_probe;
 ANALYZE ${case_db}.rf_dist_part_build;

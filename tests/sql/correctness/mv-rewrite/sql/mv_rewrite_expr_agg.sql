@@ -60,7 +60,7 @@ SELECT
   concat('2023-08-', CAST(10 + (n % 4) AS VARCHAR)) AS k1,
   CAST(n % 5 AS INT) AS k6,
   CAST(n % 100 AS BIGINT) AS k9
-FROM TABLE(generate_series(1, 2400)) t(n);
+FROM TABLE(sequence(1, 2400)) t(n);
 
 -- query 5
 -- @skip_result_check=true

@@ -525,7 +525,6 @@ impl ContractLoweringVisitor<'_> {
                 )
                 .map_err(PackageSemanticsError::from)?;
             let mut policies = BTreeMap::new();
-            let mut environments = BTreeMap::new();
             for &(site, _) in &occurrences.relational_contexts {
                 let node = fragment.nodes().get(&site.node()).ok_or(
                     PackageSemanticsError::InvalidSource("relation site has no actual node"),
@@ -592,20 +591,6 @@ impl ContractLoweringVisitor<'_> {
                 self.work.flush()?;
                 policies.insert(site, binding.decimal_overflow_policy());
                 self.work.step()?;
-                if let Some(source) = binding.group_concat_source() {
-                    let references = source.environment();
-                    for reference in references {
-                        parameters.require(reference).map_err(|_| {
-                            PackageSemanticsError::InvalidSource(
-                                "group_concat admitted parameter is absent",
-                            )
-                        })?;
-                        self.work.step()?;
-                    }
-                    self.work.flush()?;
-                    environments.insert(site, references);
-                    self.work.step()?;
-                }
             }
             let mut scopes = BTreeMap::new();
             for &(site, context) in &occurrences.relational_contexts {
@@ -625,9 +610,7 @@ impl ContractLoweringVisitor<'_> {
                     PhysicalRelationalCallSourceScope {
                         source: node,
                         decimal_overflow_policy: decimal,
-                        environment: environments
-                            .get(&site)
-                            .map_or(&[][..], |references| references.as_slice()),
+                        environment: &[],
                         proof_scope: novarocks_type_contract::CallProofScope::Relation(
                             context.identity,
                         ),

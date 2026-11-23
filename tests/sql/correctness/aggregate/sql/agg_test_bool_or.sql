@@ -35,16 +35,16 @@ CREATE TABLE "t1" (
 
 -- query 3
 USE ${case_db};
-select bool_or(c0), boolor_agg(c1), bool_or(c2), bool_or(c3), bool_or(null) from t1;
+select bool_or(c0 <> 0), bool_or(c1 <> 0), bool_or(c2 <> 0), bool_or(c3 <> 0), bool_or(null) from t1;
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 SELECT generate_series, generate_series, generate_series, null FROM TABLE(generate_series(1,  40960));
+insert into t1 SELECT generate_series, generate_series, generate_series, null FROM TABLE(sequence(1,  40960)) AS generate_series(generate_series);
 
 -- query 5
 USE ${case_db};
-select bool_or(c0), boolor_agg(c1), bool_or(c2), bool_or(c3), bool_or(null) from t1;
+select bool_or(c0 <> 0), bool_or(c1 <> 0), bool_or(c2 <> 0), bool_or(c3 <> 0), bool_or(null) from t1;
 
 -- query 6
 -- @skip_result_check=true
@@ -52,8 +52,8 @@ USE ${case_db};
 
 -- query 7
 USE ${case_db};
-select sum (a), sum(b), sum(c),sum(d), sum(e) from (select bool_or(c0) a, boolor_agg(c1) b, bool_or(c2) c, bool_or(c3) d, bool_or(null) e from t1 group by c0) t;
+select sum(CAST(a AS BIGINT)), sum(CAST(b AS BIGINT)), sum(CAST(c AS BIGINT)),sum(CAST(d AS BIGINT)), sum(CAST(e AS BIGINT)) from (select bool_or(c0 <> 0) a, bool_or(c1 <> 0) b, bool_or(c2 <> 0) c, bool_or(c3 <> 0) d, bool_or(null) e from t1 group by c0) t;
 
 -- query 8
 USE ${case_db};
-select sum(a) from ( select bool_or(c0) over (partition by c2 order by c3) a from t1) t;
+select sum(CAST(a AS BIGINT)) from ( select bool_or(c0 <> 0) over (partition by c2 order by c3) a from t1) t;

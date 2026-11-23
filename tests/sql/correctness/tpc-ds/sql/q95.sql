@@ -31,7 +31,7 @@ from
   ,web_site
 where
     d_date between '1999-2-01' and 
-           date_add(cast('1999-2-01' as date), 60)
+           date_add('day', 60, CAST('1999-2-01' AS DATE))
 and ws1.ws_ship_date_sk = d_date_sk
 and ws1.ws_ship_addr_sk = ca_address_sk
 and ca_state = 'IL'

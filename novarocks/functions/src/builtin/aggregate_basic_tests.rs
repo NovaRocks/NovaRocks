@@ -113,7 +113,7 @@ impl Fixture {
             })
             .collect::<Vec<_>>();
         let resolved = catalog
-            .resolve_bound_user(
+            .resolve_bound_trusted(
                 name,
                 FunctionKind::Aggregate,
                 FunctionBindingRequest {
@@ -275,7 +275,7 @@ fn basic_window_average_frames_have_independent_expected_values() {
     assert_eq!(output.as_ref(), &expected);
 }
 #[test]
-fn basic_window_boolean_frames_distinguish_no_rows_from_null_rows() {
+fn basic_window_boolean_frames_skip_null_inputs() {
     let values: ArrayRef = Arc::new(BooleanArray::from(vec![
         None,
         Some(true),
@@ -286,11 +286,11 @@ fn basic_window_boolean_frames_distinguish_no_rows_from_null_rows() {
     for (name, expected) in [
         (
             "bool_or",
-            BooleanArray::from(vec![None, Some(false), Some(true), Some(true)]),
+            BooleanArray::from(vec![None, None, Some(true), Some(true)]),
         ),
         (
             "bool_and",
-            BooleanArray::from(vec![None, Some(true), Some(true), Some(false)]),
+            BooleanArray::from(vec![None, None, Some(true), Some(false)]),
         ),
     ] {
         let fixture = Fixture::new(
@@ -694,12 +694,12 @@ fn basic_window_every_numeric_overload_and_alias_has_independent_values() {
     for input in &inputs {
         for (name, expected) in [
             ("avg", 2.0),
-            ("variance", 2.0 / 3.0),
+            ("variance", 1.0),
             ("variance_pop", 2.0 / 3.0),
             ("var_pop", 2.0 / 3.0),
             ("variance_samp", 1.0),
             ("var_samp", 1.0),
-            ("stddev", (2.0f64 / 3.0).sqrt()),
+            ("stddev", 1.0),
             ("std", (2.0f64 / 3.0).sqrt()),
             ("stddev_pop", (2.0f64 / 3.0).sqrt()),
             ("stddev_samp", 1.0),

@@ -439,7 +439,7 @@ CREATE TABLE ${case_db}.skew_t1 (
 -- @skip_result_check=true
 INSERT INTO ${case_db}.skew_t1(c_key, c_tinyint, c_smallint, c_int, c_bigint, c_largeint, c_float, c_double, c_decimal, c_date, c_datetime, c_string)
 SELECT t.c_key, t.c_key % 100 as c_tinyint, t.c_key % 1000 as c_smallint, t.c_key % 10000 as c_int, t.c_key % 100000 as c_bigint, t.c_key % 1000000 as c_largeint, t.c_key % 10000000 as c_float, t.c_key % 100000000 as c_double, t.c_key % 1000000000 as c_decimal, t.c_key % 10000000000 as c_date, TRY_CAST(CONCAT('2000-', LPAD(CAST(t.c_key / 100 AS VARCHAR), 2, '0'), '-', LPAD(CAST(t.c_key % 100 AS VARCHAR), 2, '0')) AS TIMESTAMP(6)) as c_datetime, t.c_key % 1000000000000 as c_string
-FROM TABLE(generate_series(1, 4095*2)) t(c_key);
+FROM TABLE(sequence(1, 4095*2)) t(c_key);
 
 -- query 83
 -- @skip_result_check=true
@@ -449,13 +449,13 @@ TRUNCATE TABLE ${case_db}.t2;
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t2(c_key, c_tinyint, c_smallint, c_int, c_bigint, c_largeint, c_float, c_double, c_decimal, c_date, c_datetime, c_string)
 SELECT t.c_key, t.c_key % 100 as c_tinyint, t.c_key % 1000 as c_smallint, t.c_key % 10000 as c_int, t.c_key % 100000 as c_bigint, t.c_key % 1000000 as c_largeint, t.c_key % 10000000 as c_float, t.c_key % 100000000 as c_double, t.c_key % 1000000000 as c_decimal, t.c_key % 10000000000 as c_date, TRY_CAST(CONCAT('2000-', LPAD(CAST(t.c_key / 100 AS VARCHAR), 2, '0'), '-', LPAD(CAST(t.c_key % 100 AS VARCHAR), 2, '0')) AS TIMESTAMP(6)) as c_datetime, t.c_key % 1000000000000 as c_string
-FROM TABLE(generate_series(1, 4095*2)) t(c_key);
+FROM TABLE(sequence(1, 4095*2)) t(c_key);
 
 -- query 85
 -- @skip_result_check=true
 INSERT INTO ${case_db}.skew_t1(c_key, c_tinyint, c_smallint, c_int, c_bigint, c_largeint, c_float, c_double, c_decimal, c_date, c_datetime, c_string)
 SELECT t.c_key % 1, t.c_key % 1 as c_tinyint, t.c_key % 1 as c_smallint, t.c_key % 1 as c_int, t.c_key % 1 as c_bigint, t.c_key % 1 as c_largeint, t.c_key % 1 as c_float, t.c_key % 1 as c_double, t.c_key % 1 as c_decimal, t.c_key % 1 as c_date, CAST(NULL AS TIMESTAMP(6)) as c_datetime, t.c_key % 1 as c_string
-FROM TABLE(generate_series(1, 4095*2)) t(c_key);
+FROM TABLE(sequence(1, 4095*2)) t(c_key);
 
 -- query 86
 SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int;
@@ -535,19 +535,19 @@ CREATE TABLE ${case_db}.t_mcv_r (
 
 -- query 107
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_l SELECT 1, 1 FROM TABLE(generate_series(1, 5000));
+INSERT INTO ${case_db}.t_mcv_l SELECT 1, 1 FROM TABLE(sequence(1, 5000)) AS generate_series(generate_series);
 
 -- query 108
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_l SELECT 2, 1 FROM TABLE(generate_series(1, 2500));
+INSERT INTO ${case_db}.t_mcv_l SELECT 2, 1 FROM TABLE(sequence(1, 2500)) AS generate_series(generate_series);
 
 -- query 109
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_l SELECT generate_series + 2, 1 FROM TABLE(generate_series(1, 2500));
+INSERT INTO ${case_db}.t_mcv_l SELECT generate_series + 2, 1 FROM TABLE(sequence(1, 2500)) AS generate_series(generate_series);
 
 -- query 110
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_r SELECT (generate_series % 2502) + 1, 1 FROM TABLE(generate_series(1, 20000));
+INSERT INTO ${case_db}.t_mcv_r SELECT (generate_series % 2502) + 1, 1 FROM TABLE(sequence(1, 20000)) AS generate_series(generate_series);
 
 -- query 111
 -- @skip_result_check=true
@@ -632,19 +632,19 @@ CREATE TABLE ${case_db}.t_mcv_r2 (
 
 -- query 130
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_l2 SELECT generate_series, 1 FROM TABLE(generate_series(1, 10000));
+INSERT INTO ${case_db}.t_mcv_l2 SELECT generate_series, 1 FROM TABLE(sequence(1, 10000)) AS generate_series(generate_series);
 
 -- query 131
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_r2 SELECT 1, 1 FROM TABLE(generate_series(1, 8000));
+INSERT INTO ${case_db}.t_mcv_r2 SELECT 1, 1 FROM TABLE(sequence(1, 8000)) AS generate_series(generate_series);
 
 -- query 132
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_r2 SELECT 2, 1 FROM TABLE(generate_series(1, 4000));
+INSERT INTO ${case_db}.t_mcv_r2 SELECT 2, 1 FROM TABLE(sequence(1, 4000)) AS generate_series(generate_series);
 
 -- query 133
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_mcv_r2 SELECT generate_series + 2, 1 FROM TABLE(generate_series(1, 8000));
+INSERT INTO ${case_db}.t_mcv_r2 SELECT generate_series + 2, 1 FROM TABLE(sequence(1, 8000)) AS generate_series(generate_series);
 
 -- query 134
 -- @skip_result_check=true
@@ -698,19 +698,19 @@ CREATE TABLE ${case_db}.t_null_r (
 
 -- query 145
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_null_l SELECT null, 1 FROM TABLE(generate_series(1, 7000));
+INSERT INTO ${case_db}.t_null_l SELECT null, 1 FROM TABLE(sequence(1, 7000)) AS generate_series(generate_series);
 
 -- query 146
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_null_l SELECT 1, 1 FROM TABLE(generate_series(1, 2000));
+INSERT INTO ${case_db}.t_null_l SELECT 1, 1 FROM TABLE(sequence(1, 2000)) AS generate_series(generate_series);
 
 -- query 147
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_null_l SELECT 2, 1 FROM TABLE(generate_series(1, 1000));
+INSERT INTO ${case_db}.t_null_l SELECT 2, 1 FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);
 
 -- query 148
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_null_r SELECT (generate_series % 2000) + 1, 1 FROM TABLE(generate_series(1, 10000));
+INSERT INTO ${case_db}.t_null_r SELECT (generate_series % 2000) + 1, 1 FROM TABLE(sequence(1, 10000)) AS generate_series(generate_series);
 
 -- query 149
 -- @skip_result_check=true

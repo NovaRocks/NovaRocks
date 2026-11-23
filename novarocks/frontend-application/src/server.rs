@@ -102,6 +102,7 @@ pub struct FrontendServingConfig {
     /// Upper bound for terminal resource cleanup after graceful/deadline drain.
     pub frontend_cleanup_timeout: Duration,
     pub trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
+    pub memory_authority: Arc<novarocks_memory::MemoryAuthority>,
     pub native_trust: Arc<NativeTrust>,
     pub native_transport: FrontendNativeTransport,
     pub native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
@@ -468,6 +469,7 @@ async fn build_frontend_role_products(
             view_service.clone(),
             system_relations.clone(),
             mv_readiness.clone(),
+            host.required_constant_interpreter(),
         ),
         execution: (
             host.connector_blocking_io_supervisor(),
@@ -491,6 +493,7 @@ async fn build_frontend_role_products(
                 view_service.clone(),
                 system_relations.clone(),
                 mv_readiness.clone(),
+                host.required_constant_interpreter(),
             ),
             (
                 host.connector_blocking_io_supervisor(),
@@ -540,6 +543,7 @@ async fn build_frontend_role_products(
             view_service.clone(),
             system_relations.clone(),
             mv_readiness.clone(),
+            host.required_constant_interpreter(),
         ),
         connector_control: typed_connector_control.clone(),
         blocking: host.connector_blocking_io_supervisor(),
@@ -650,6 +654,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&products.view_service),
             host.constant_policy(),
             products.system_relations.clone(),
+            host.required_constant_interpreter().sealed_functions(),
         ));
     let iceberg_ref_command_executor = core_capabilities::iceberg_ref_command_executor(
         core_capabilities::IcebergRefCommandPorts::new(
@@ -1446,6 +1451,65 @@ mod tests {
         QuerySession, QuerySessionFactory, QuerySessionStatement, StatementSessionRequest,
     };
     use novarocks_query_application::session_error::QueryServiceErrorKind;
+
+    #[tokio::test]
+    async fn trino_prepared_headers_validate_before_statement_execution() {
+        use novarocks_query_application::{
+            cancellation::QueryCancellationReason, serving_admission::FrontendServingAdmission,
+            session_control::QueryControlService, session_value::StatementSessionError,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NoExecution;
+        impl QuerySessionFactory for NoExecution {
+            fn open_statement_session(
+                &self,
+                _: StatementSessionRequest,
+            ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+                panic!("POST must not instantiate a session before the first GET")
+            }
+            fn cancel_all(&self, _: QueryCancellationReason) {}
+        }
+
+        async fn post(address: std::net::SocketAddr, definition: &str) -> String {
+            let request = format!(
+                "POST /v1/statement HTTP/1.1\r\nHost: localhost\r\nX-Trino-User: root\r\nX-Trino-Prepared-Statement: {definition}\r\nContent-Length: 9\r\nConnection: close\r\n\r\nEXECUTE p"
+            );
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        }
+
+        let control = QueryControlService::new(Arc::new(
+            novarocks_query_application::query_control::QueryApplicationControl::new(
+                novarocks_types::FrontendProcessId::new_v7(),
+            ),
+        ));
+        let mut listener = novarocks_trino_adapter::TrinoListener::bind(
+            &novarocks_trino_adapter::TrinoListenerSettings {
+                port: 0,
+                user: "root".into(),
+                ..Default::default()
+            },
+            "test".into(),
+            FrontendServingAdmission::new(),
+            Arc::new(NoExecution),
+            control,
+        )
+        .await
+        .unwrap();
+        let address = listener.bound_addr();
+        for invalid in ["missing-assignment", "p=SELECT+1%3BSELECT+2"] {
+            assert!(post(address, invalid).await.starts_with("HTTP/1.1 400"));
+        }
+        let queued = post(address, "p=SELECT+1").await;
+        assert!(queued.starts_with("HTTP/1.1 200"));
+        assert!(queued.contains("nextUri"));
+        listener.finalize();
+        listener.wait_stopped().await.unwrap();
+    }
 
     fn test_statement_request(
         control: &novarocks_query_application::session_control::QueryControlService,

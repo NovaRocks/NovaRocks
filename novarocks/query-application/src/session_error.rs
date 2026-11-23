@@ -22,6 +22,7 @@ use crate::execution_error::ExecutionFailurePresentation;
 use std::{borrow::Cow, fmt, sync::Arc};
 
 use crate::api::StatementExternalEffectDisposition;
+use crate::sql::trino_admission::TrinoStatementSource;
 use novarocks_spi::connector::{LakePublicationDisposition, LakePublicationTerminal};
 use novarocks_user_error::UserError;
 
@@ -77,6 +78,7 @@ struct DiagnosticFacts {
     external_effect_message_base: Option<String>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     compile_provenance: Option<novarocks_type_contract::CompileControlProvenance>,
+    trino_statement_source: Option<TrinoStatementSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +106,7 @@ impl QueryServiceError {
                 && facts.compile_control.is_none()
                 && facts.compile_provenance.is_none()
                 && facts.external_effect_message_base.is_none()
+                && facts.trino_statement_source.is_none()
         }) {
             self.diagnostics = None;
         }
@@ -223,6 +226,27 @@ impl QueryServiceError {
         };
         self.render_execution_message();
         self
+    }
+
+    /// Keep the text and origin of the first location author through wire projection.
+    pub fn with_trino_statement_source(mut self, source: TrinoStatementSource) -> Self {
+        self.attach_trino_statement_source(source);
+        self
+    }
+
+    pub(crate) fn attach_trino_statement_source(&mut self, source: TrinoStatementSource) {
+        if self
+            .user_error()
+            .is_some_and(|error| error.location().is_some())
+        {
+            self.diagnostic_facts_mut()
+                .trino_statement_source
+                .get_or_insert(source);
+        }
+    }
+
+    pub fn trino_statement_source(&self) -> Option<&TrinoStatementSource> {
+        self.diagnostics.as_deref()?.trino_statement_source.as_ref()
     }
 
     pub fn failure_cause(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {

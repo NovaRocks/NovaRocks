@@ -35,39 +35,61 @@ pub(crate) enum AggMergeability {
     SinglePhaseOnly,
 }
 
-/// Order-sensitive aggregates whose parallel-partition merge would change
-/// concatenation/array ordering. These stay single-phase.
-fn is_order_sensitive(name: &str) -> bool {
+// The executable selection owns decomposition. A second overload of an
+// existing SQL name does not inherit the selected singleton's state contract.
+fn has_two_phase_merge(binding: &crate::binding::SqlFunctionBinding) -> bool {
     matches!(
-        name,
-        "group_concat" | "string_agg" | "array_agg" | "array_agg_distinct"
+        (
+            binding.function_id.as_str(),
+            binding.selected.overload.as_str()
+        ),
+        (
+            "builtin.aggregate/sum/v1",
+            "builtin.aggregate/sum/derived-v1"
+        ) | (
+            "builtin.aggregate/min/v1",
+            "builtin.aggregate/min/derived-v1"
+        ) | (
+            "builtin.aggregate/max/v1",
+            "builtin.aggregate/max/derived-v1"
+        ) | (
+            "builtin.aggregate/count/v1",
+            "builtin.aggregate/count/derived-v1"
+        ) | (
+            "builtin.aggregate/avg/v1",
+            "builtin.aggregate/avg/derived-v1"
+        ) | (
+            "builtin.aggregate/approx_distinct/v1",
+            "builtin.aggregate/approx_distinct/default-hll-v1"
+                | "builtin.aggregate/approx_distinct/boolean-v1"
+                | "builtin.aggregate/approx_distinct/unknown-v1"
+        )
     )
-}
-
-/// Functions with an exact, deterministically-verifiable local-update +
-/// global-merge decomposition. Part 1 scope: the existing whitelist plus
-/// `avg`. Float/sketch families (stddev/variance/percentile/approx/bitmap/hll)
-/// are added in a follow-up round with tolerance/sketch-equality tests.
-fn has_two_phase_merge(name: &str) -> bool {
-    matches!(name, "sum" | "min" | "max" | "count" | "avg")
 }
 
 #[cfg(test)]
 pub(crate) fn aggregate_mergeability(call: &AggregateCall) -> AggMergeability {
-    aggregate_mergeability_from_parts(&call.name, call.distinct, call.source.order_by().is_empty())
+    aggregate_mergeability_from_parts(
+        call.source.binding(),
+        call.distinct,
+        call.source.order_by().is_empty(),
+    )
 }
 
 pub(crate) fn scalar_aggregate_mergeability(call: &ScalarAggregateSpec) -> AggMergeability {
-    aggregate_mergeability_from_parts(&call.name, call.distinct, call.source.order_by().is_empty())
+    aggregate_mergeability_from_parts(
+        call.source.binding(),
+        call.distinct,
+        call.source.order_by().is_empty(),
+    )
 }
 
 fn aggregate_mergeability_from_parts(
-    name: &str,
+    binding: &crate::binding::SqlFunctionBinding,
     distinct: bool,
     order_by_is_empty: bool,
 ) -> AggMergeability {
-    let name = name.to_ascii_lowercase();
-    if distinct || !order_by_is_empty || is_order_sensitive(&name) || !has_two_phase_merge(&name) {
+    if distinct || !order_by_is_empty || !has_two_phase_merge(binding) {
         AggMergeability::SinglePhaseOnly
     } else {
         AggMergeability::TwoPhase
@@ -93,8 +115,14 @@ mod tests {
     }
 
     fn call(name: &str, distinct: bool, ordered: bool) -> AggregateCall {
-        let args = if matches!(name, "group_concat" | "string_agg") {
-            vec![arg(DataType::Int64), arg(DataType::Utf8)]
+        let args = if name == "listagg" {
+            vec![
+                arg(DataType::Utf8),
+                arg(DataType::Utf8),
+                arg(DataType::Boolean),
+                arg(DataType::Utf8),
+                arg(DataType::Boolean),
+            ]
         } else {
             vec![arg(DataType::Int64)]
         };
@@ -124,6 +152,46 @@ mod tests {
     }
 
     #[test]
+    fn top_n_overloads_do_not_inherit_scalar_extrema_decomposition() {
+        for name in ["min", "max"] {
+            let mut call = call(name, false, false);
+            let types = [DataType::Int64, DataType::Int64];
+            call.source = crate::binding::AggregateArgumentSource::uncertified(
+                vec![arg(DataType::Int64), arg(DataType::Int64)],
+                vec![],
+                crate::functions::test_resolved_aggregate(name, &types, false),
+            );
+            assert_eq!(
+                aggregate_mergeability(&call),
+                AggMergeability::SinglePhaseOnly
+            );
+        }
+    }
+
+    #[test]
+    fn approx_distinct_default_overloads_split_only_without_distinct_or_order() {
+        for data_type in [DataType::Int64, DataType::Boolean, DataType::Null] {
+            for (distinct, expected) in [
+                (false, AggMergeability::TwoPhase),
+                (true, AggMergeability::SinglePhaseOnly),
+            ] {
+                let mut call = call("count", distinct, false);
+                call.name = "approx_distinct".into();
+                call.source = crate::binding::AggregateArgumentSource::uncertified(
+                    vec![arg(data_type.clone())],
+                    vec![],
+                    crate::functions::test_resolved_aggregate(
+                        "approx_distinct",
+                        &[data_type.clone()],
+                        distinct,
+                    ),
+                );
+                assert_eq!(aggregate_mergeability(&call), expected);
+            }
+        }
+    }
+
+    #[test]
     fn avg_and_existing_whitelist_are_two_phase() {
         for name in ["sum", "min", "max", "count", "avg"] {
             assert_eq!(
@@ -145,7 +213,7 @@ mod tests {
             AggMergeability::SinglePhaseOnly
         );
         assert_eq!(
-            aggregate_mergeability(&call("group_concat", false, false)),
+            aggregate_mergeability(&call("listagg", false, false)),
             AggMergeability::SinglePhaseOnly
         );
     }

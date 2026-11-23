@@ -41,13 +41,20 @@ use novarocks_sql::compiler::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType,
-    FunctionInstanceState, PureCompileControl, ValueSchemaCreationFactory,
-    ValueSchemaCreationScope,
+    PureCompileControl, ValueSchemaCreationFactory, ValueSchemaCreationScope,
 };
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 use std::{fmt, sync::Arc};
 
 mod resources;
+
+pub(super) fn work_error_to_compile(
+    error: novarocks_workload_control::WorkError,
+) -> novarocks_sql::compiler::SqlCompileError {
+    novarocks_sql::compiler::SqlCompileError::from(CompileControlError::Source(
+        novarocks_failure_contract::SharedFailureCause::new(error),
+    ))
+}
 use resources::RootResources;
 pub(crate) use resources::with_root_value_creation;
 
@@ -80,6 +87,15 @@ impl RequiredConstantInterpreter {
         root: &WorkScope,
         window: &ResultWindowAlias,
     ) -> Result<ConstantValue, SqlConstantEvaluationError> {
+        self.evaluate_prepared(&prepared, root, window)
+    }
+
+    pub(crate) fn evaluate_prepared(
+        &self,
+        prepared: &PreparedRequiredConstant,
+        root: &WorkScope,
+        window: &ResultWindowAlias,
+    ) -> Result<ConstantValue, SqlConstantEvaluationError> {
         let control = prepared.control();
         control.checkpoint(CompilePhase::Validate, 0)?;
         if prepared.constant_policy() != self.policy {
@@ -101,7 +117,7 @@ impl RequiredConstantInterpreter {
             return Ok(original.clone());
         }
         let mut resources = RootResources::new(root, window, control)?;
-        let result = self.evaluate_in(&prepared, &mut resources);
+        let result = self.evaluate_in(prepared, &mut resources);
         result.map_err(|error| resources.retain_error(error))
     }
 
@@ -117,10 +133,7 @@ impl RequiredConstantInterpreter {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         for claim in unit.claims().values() {
             work.step()?;
-            if claim.effects.value_stability.is_volatile()
-                || claim.effects.instance_state != FunctionInstanceState::None
-                || !claim.effects.observable_effects.is_empty()
-            {
+            if !prepared.eligibility().allows_call(&claim.effects) {
                 return Err(SqlConstantEvaluationError::from_domain(
                     RequiredConstantEligibilityFailure::new(),
                 ));
@@ -253,14 +266,18 @@ impl RequiredConstantInterpreter {
                 "required result differs from its complete frozen carrier",
             ));
         }
-        // ARRAY<VARCHAR> can share nested children. Arrow take can also slice
-        // an UNKNOWN result and retain its bufferless root owner. Both use the
-        // source-retaining path. Concrete scalars prove independent backing.
+        // Collection results can share nested children. Arrow take can also
+        // slice an UNKNOWN result and retain its bufferless root owner.
+        // Concrete scalars prove independent backing.
         let retains_source = *array.data_type() == DataType::Null
             || matches!(
                 prepared.value_type().value_type().kind(),
                 novarocks_type_contract::ValueKind::List(child)
                     if matches!(child.kind(), novarocks_type_contract::ValueKind::String)
+            )
+            || matches!(
+                prepared.value_type().value_type().kind(),
+                novarocks_type_contract::ValueKind::Map { .. }
             );
         let mut indices_scope = resources.factory.begin_scope()?;
         indices_scope.request_layout(
@@ -317,7 +334,6 @@ impl RequiredConstantInterpreter {
         let array = copied.map_err(copy_operation_error)?.into_values();
         drop(indices_scope);
         let mut storage = resources.factory.begin_scope()?;
-        // The required-target contract admits five flat physical carriers.
         // Fund the new field header and its owned name under the result scope.
         const OUTPUT_NAME: &str = "value";
         storage.request_layout(

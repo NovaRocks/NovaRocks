@@ -130,3 +130,21 @@ fn membership_completed_plan_requires_a_canonical_key_schema() {
     );
     assert_eq!(membership_filters(&rejected), 0);
 }
+
+#[test]
+fn collection_overloads_keep_independent_array_and_map_result_types() {
+    let sql = "SELECT concat(ARRAY[k], k) AS a, concat('a', 'b') AS s, \
+               cardinality(ARRAY[k]) AS list_count, cardinality(map(ARRAY[k], ARRAY[k])) AS map_count, \
+               element_at(ARRAY[k], CAST(-1 AS BIGINT)) AS element FROM fixture.source";
+    let source = sql_source(sql, DataType::Int64);
+    let result = source.original_public_result_declaration().unwrap();
+    let fields = result.fields();
+    let DataType::List(item) = fields[0].ty.data_type() else {
+        panic!("array concat must preserve its selected List output");
+    };
+    assert_eq!(item.data_type(), &DataType::Int64);
+    assert_eq!(fields[1].ty.data_type(), &DataType::Utf8);
+    for field in &fields[2..] {
+        assert_eq!(field.ty.data_type(), &DataType::Int64);
+    }
+}

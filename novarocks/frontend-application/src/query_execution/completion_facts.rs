@@ -55,14 +55,14 @@ use novarocks_catalog_application::{CatalogApplicationPort, ConnectorControlHost
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::preparation::{
     CatalogFactPort, MaterializedViewFactPort, ProviderReadFactPort, QueryCompletionFactSource,
-    StatisticsFactPort,
+    StatisticsFactPort, TableSequenceArgumentFactPort,
 };
 use novarocks_spi::connector::{
     ConnectorRequestContext, MvStorageObservationPort, read_stack::ConnectorSession,
 };
 use novarocks_sql::compiler::{
     CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact, MaterializedViewNeed,
-    StatisticsFact, StatisticsNeed,
+    StatisticsFact, StatisticsNeed, TableSequenceArgumentFact, TableSequenceArgumentNeed,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -99,6 +99,7 @@ pub(crate) struct CompletionFactOwners {
     state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     blocking: ConnectorBlockingIoSupervisor,
+    required_constants: Arc<crate::RequiredConstantInterpreter>,
 }
 
 impl CompletionFactOwners {
@@ -128,6 +129,10 @@ impl CompletionFactOwners {
     ) -> &Arc<novarocks_query_application::system_tables::SystemTableRegistry> {
         &self.system_relations
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Completion keeps each original fact owner and the required constant interpreter explicit."
+    )]
     pub(crate) const fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -139,6 +144,7 @@ impl CompletionFactOwners {
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
         system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+        required_constants: Arc<crate::RequiredConstantInterpreter>,
     ) -> Self {
         Self {
             view_service,
@@ -151,6 +157,7 @@ impl CompletionFactOwners {
             materialized_views,
             mv_readiness,
             state_store: None,
+            required_constants,
             mv_storage_observation,
             blocking,
         }
@@ -565,6 +572,44 @@ pub(crate) fn install_frontend_fact_source(
         })
 }
 
+struct FrontendTableSequenceFacts {
+    interpreter: Arc<crate::RequiredConstantInterpreter>,
+    scope: StatementFactScope,
+}
+
+#[async_trait]
+impl TableSequenceArgumentFactPort for FrontendTableSequenceFacts {
+    async fn resolve_table_sequence(
+        &self,
+        needs: &[TableSequenceArgumentNeed],
+    ) -> Result<Vec<TableSequenceArgumentFact>, novarocks_sql::compiler::SqlCompileError> {
+        use novarocks_sql::compiler::SqlCompileError;
+        let planning = self
+            .scope
+            .planning
+            .as_ref()
+            .and_then(|inputs| inputs.cpu.as_ref())
+            .ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "Table sequence arguments require the original planning CPU".into(),
+                )
+            })?;
+        planning
+            .table_sequence_arguments(
+                Arc::clone(&self.interpreter),
+                self.scope
+                    .capacity
+                    .try_clone()
+                    .map_err(super::required_constant_eval::work_error_to_compile)?,
+                needs.to_vec(),
+            )
+            .await
+            .map_err(|health| {
+                SqlCompileError::Compilation(format!("Table argument CPU failed: {health:?}"))
+            })?
+    }
+}
+
 /// The one fact source one statement's completion is driven with.
 ///
 /// Assembling it in a single place is what makes "each kind of question reaches
@@ -577,6 +622,10 @@ pub(crate) fn statement_fact_source<A>(
     provider_reads: Arc<dyn ProviderReadFactPort<Access = A>>,
     system_tables: Arc<dyn novarocks_query_application::preparation::SystemTableSnapshotFactPort>,
 ) -> QueryCompletionFactSource<A> {
+    let table_sequence = Arc::new(FrontendTableSequenceFacts {
+        interpreter: Arc::clone(&owners.required_constants),
+        scope: scope.clone(),
+    });
     QueryCompletionFactSource::new(
         Arc::new(FrontendCatalogFacts::new(owners.clone(), scope.clone())),
         Arc::new(FrontendStatisticsFacts::new(owners.clone(), scope.clone())),
@@ -584,6 +633,7 @@ pub(crate) fn statement_fact_source<A>(
         provider_reads,
         system_tables,
     )
+    .with_table_sequence(table_sequence)
 }
 
 #[cfg(test)]

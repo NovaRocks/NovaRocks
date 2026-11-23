@@ -178,6 +178,21 @@ impl ExecutionFailurePresentation for ExecutionFailureInput {
                 == novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
         {
             K::InvalidFunctionArgument
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
+                == novarocks_function_contract::kernel_failure::EXCEEDED_FUNCTION_MEMORY_LIMIT
+        {
+            K::ExceededFunctionMemoryLimit
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
+                == novarocks_function_contract::kernel_failure::DATE_RESULT_OUT_OF_RANGE
+        {
+            K::DateResultOutOfRange
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
+                == novarocks_function_contract::kernel_failure::UNKNOWN_EPOCH_TIME_ZONE
+        {
+            K::UnknownEpochTimeZone
         } else {
             match self.fact().class() {
                 FailureClass::Unsupported if is_compiled_capability(self) => {
@@ -273,6 +288,9 @@ pub enum SqlExecutionErrorKind {
     DivisionByZero,
     InvalidCastArgument,
     InvalidFunctionArgument,
+    ExceededFunctionMemoryLimit,
+    DateResultOutOfRange,
+    UnknownEpochTimeZone,
     Data,
     MergeTargetRowMultipleMatches,
     UpdateTargetRowMultipleMatches,
@@ -302,6 +320,13 @@ impl SqlExecutionErrorDescriptor {
             DivisionByZero => ("query.execution.division_by_zero", 1365, "22012"),
             InvalidCastArgument => ("query.execution.invalid_cast_argument", 1105, "HY000"),
             InvalidFunctionArgument => ("query.execution.invalid_function_argument", 1105, "HY000"),
+            ExceededFunctionMemoryLimit => (
+                "query.execution.exceeded_function_memory_limit",
+                1105,
+                "HY000",
+            ),
+            DateResultOutOfRange => ("query.execution.date_result_out_of_range", 1105, "HY000"),
+            UnknownEpochTimeZone => ("query.execution.unknown_epoch_time_zone", 1105, "HY000"),
             Data => ("query.execution.invalid_data", 1105, "HY000"),
             MergeTargetRowMultipleMatches => (
                 "query.execution.merge_target_row_multiple_matches",
@@ -349,6 +374,10 @@ pub const EXECUTION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::InvalidCastArgument).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::InvalidFunctionArgument)
         .descriptor,
+    SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::ExceededFunctionMemoryLimit)
+        .descriptor,
+    SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::DateResultOutOfRange).descriptor,
+    SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::UnknownEpochTimeZone).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Data).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::MergeTargetRowMultipleMatches)
         .descriptor,
@@ -373,6 +402,9 @@ pub fn execution_descriptor_for_code(code: ErrorCodeId) -> Option<SqlExecutionEr
         DivisionByZero,
         InvalidCastArgument,
         InvalidFunctionArgument,
+        ExceededFunctionMemoryLimit,
+        DateResultOutOfRange,
+        UnknownEpochTimeZone,
         Data,
         MergeTargetRowMultipleMatches,
         UpdateTargetRowMultipleMatches,
@@ -879,6 +911,49 @@ mod boundary_tests {
             );
             assert_eq!(input.fact(), fact);
             assert_eq!(input.descriptor().descriptor.code.as_str(), expected_code);
+        }
+    }
+
+    #[test]
+    fn temporal_value_errors_require_the_original_kernel_data_reason() {
+        use novarocks_function_contract::kernel_failure::{
+            DATE_RESULT_OUT_OF_RANGE, UNKNOWN_EPOCH_TIME_ZONE,
+        };
+
+        for (reason, kind) in [
+            (
+                DATE_RESULT_OUT_OF_RANGE,
+                SqlExecutionErrorKind::DateResultOutOfRange,
+            ),
+            (
+                UNKNOWN_EPOCH_TIME_ZONE,
+                SqlExecutionErrorKind::UnknownEpochTimeZone,
+            ),
+        ] {
+            let expected = SqlExecutionErrorDescriptor::for_kind(kind);
+            let fact = FailureFact::new(FailureClass::Data, reason);
+            let input = ExecutionFailureInput::new(
+                fact,
+                SafeDetail::truncating("temporal value failure"),
+                ExecutionFailureSite::Coordinator,
+            );
+            assert_eq!(input.fact(), fact);
+            assert_eq!(input.descriptor(), expected);
+            assert!(EXECUTION_ERROR_CODE_DESCRIPTORS.contains(&expected.descriptor));
+            assert_eq!(
+                execution_descriptor_for_code(expected.descriptor.code),
+                Some(expected)
+            );
+
+            let invariant = ExecutionFailureInput::new(
+                FailureFact::new(FailureClass::Invariant, reason),
+                SafeDetail::truncating("temporal value failure"),
+                ExecutionFailureSite::Coordinator,
+            );
+            assert_eq!(
+                invariant.descriptor(),
+                SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Invariant,)
+            );
         }
     }
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A List offset refuses one finite input before any repeated output copy.
+//! Array concat rejects a single output beyond the Utf8 child offset limit.
 
 use super::execution_failure::{INDEPENDENT_SQL, NEXT_SQL, run_rejection_policy};
 use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
@@ -27,10 +27,19 @@ use novarocks_execution_contract::failure::{
 };
 use std::{path::Path, time::Instant};
 
-// SLEEP is an installed volatile function. With one real input row it returns
-// true, converted to BIGINT 1; it cannot be folded on FE. ARRAY_REPEAT checks
-// its first count against the List i32 offset before reserving a copy segment.
-const REPRESENTATION_SQL: &str = "SELECT CAST(array_length(array_repeat(CAST(sleep(0) AS BIGINT), CAST(2147483648 AS BIGINT))) AS VARCHAR) AS payload FROM TABLE(generate_series(1, 1)) AS t(n)";
+// The volatile wait supplies one runtime value. The array copies its 1 MiB
+// string into 32 positions. Each concat argument references the same array,
+// yielding 2^31 child bytes for the format preflight.
+fn representation_sql() -> String {
+    let elements = ["cell"; 32].join(", ");
+    let inputs = ["items"; 64].join(", ");
+    format!(
+        "SELECT CAST(cardinality(concat({inputs})) AS VARCHAR) AS payload \
+         FROM (SELECT ARRAY[{elements}] AS items \
+               FROM (SELECT rpad('', 1048575 + CAST(sleep(0) AS BIGINT), 'x') AS cell \
+                     FROM TABLE(sequence(1, 1))) AS text_source) AS array_source"
+    )
+}
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(RepresentationRecoveryPolicy::default())]
@@ -64,7 +73,7 @@ impl Scenario for RepresentationRecoveryPolicy {
             "representation rejection requires native 1FE+3BE"
         );
         let rejected = StatementSpec {
-            sql: REPRESENTATION_SQL.into(),
+            sql: representation_sql(),
             faults: vec![],
             observations: (0..cluster_size)
                 .flat_map(|index| {
@@ -99,15 +108,15 @@ impl Scenario for RepresentationRecoveryPolicy {
             context,
             &self.intent,
             FailureClass::Representation,
-            assert_list_minimum_unit,
+            assert_utf8_concat_single_output,
         )
     }
 }
 
-fn assert_list_minimum_unit(terminal: &QueryLifecycleStructuredSnapshot) -> Result<()> {
+fn assert_utf8_concat_single_output(terminal: &QueryLifecycleStructuredSnapshot) -> Result<()> {
     ensure!(
         terminal.execution_id.is_some() && terminal.attempt_id == 1,
-        "List minimum-unit rejection replaced its original attempt"
+        "Utf8 concatenation rejection replaced its original attempt"
     );
     let fact = terminal
         .failure_fact
@@ -116,31 +125,30 @@ fn assert_list_minimum_unit(terminal: &QueryLifecycleStructuredSnapshot) -> Resu
         fact.class() == FailureClass::Representation
             && fact.evidence() == FailureEvidence::Originating
             && fact.reason().domain() == domain::KERNEL.get()
-            && fact.reason().code() == 320,
-        "List offset rejected with another original cause: {fact:?}"
+            && fact.reason().code() == 259,
+        "Utf8 concatenation rejected with another original cause: {fact:?}"
     );
     ensure!(
         fact.resource().is_none(),
-        "List extent acquired invented resource measurements"
+        "Utf8 concatenation extent acquired invented resource measurements"
     );
-    // ScalarOutputExtent is a true outer failure. This path never enters the
-    // RowData journal consumed by RequiredExpressionRowError, so no canonical
-    // selected/batch row is authored merely because the input has one row.
+    // CopyExtentFailure is projected directly by the kernel. The row-data
+    // journal has no row to attach to this complete-output extent failure.
     ensure!(
         fact.row_position().is_none(),
-        "outer List extent acquired an unauthored row position"
+        "outer Utf8 extent acquired an unauthored row position"
     );
     let representation = fact
         .representation()
-        .context("List extent lost its physical boundary facts")?;
+        .context("Utf8 concatenation extent lost its physical boundary facts")?;
     ensure!(
-        representation.boundary == RepresentationBoundary::MinimumUnit
+        representation.boundary == RepresentationBoundary::SingleOutput
             && representation.layout.domain == domain::KERNEL
-            && representation.layout.code.get() == 63
+            && representation.layout.code.get() == 44
             && representation.required == Some(2147483648)
             && representation.extent_limit == Some(2147483647)
             && representation.representable_prefix.is_none(),
-        "List extent changed its exact required/limit/layout or invented a usable input prefix: {representation:?}"
+        "Utf8 concatenation extent changed its required size, limit, layout, or prefix: {representation:?}"
     );
     ensure!(
         terminal.worker_participations_converged,

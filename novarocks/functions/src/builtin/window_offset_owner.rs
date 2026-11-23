@@ -291,7 +291,7 @@ fn canonical_call(
     input: CallEffectInput<'_>,
     options: WindowCallOptions,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<i64, KernelFailure> {
+) -> Result<Option<i64>, KernelFailure> {
     let count = input.request.arguments.len();
     let shape = (1..=3).contains(&count)
         && input.request.logical_argument_count == count
@@ -357,7 +357,7 @@ fn canonical_call(
         ));
     }
     if count == 1 {
-        return Ok(1);
+        return Ok(Some(1));
     }
     let FunctionArgument::Value { value_type, .. } = &input.request.arguments[1] else {
         return Err(invalid(
@@ -369,7 +369,7 @@ fn canonical_call(
     work.step().map_err(compile_failure)?;
     if !canonical {
         return Err(invalid(
-            "LEAD/LAG offset differs from its exact I64 constant domain",
+            "LEAD/LAG offset differs from its exact BIGINT domain",
         ));
     }
     // Reuse the original complete CV source/type and observed selected-row
@@ -379,21 +379,20 @@ fn canonical_call(
         _ => invalid("LEAD/LAG offset constant differs from its checked source"),
     };
     work.flush().map_err(compile_failure)?;
-    let value = super::catalogue::constant_source(input.request.arguments.get(1), work)
+    let Some(value) = super::catalogue::constant_source(input.request.arguments.get(1), work)
         .map_err(binding_failure)?
-        .ok_or_else(|| invalid("LEAD/LAG offset must be a checked integer constant"))?;
+    else {
+        return Ok(None);
+    };
     work.flush().map_err(compile_failure)?;
     let offset = value
         .int64_observed(CompilePhase::FunctionSpecialization, work.control())
         .map_err(FunctionBindingError::from)
-        .map_err(binding_failure)?
-        .ok_or_else(|| invalid("LEAD/LAG offset must be a non-NULL integer constant"))?;
-    let nonnegative = offset >= 0;
+        .map_err(binding_failure)?;
     work.step().map_err(compile_failure)?;
-    if !nonnegative {
-        return Err(invalid("LEAD/LAG offset must be non-negative"));
-    }
-    Ok(offset)
+    // Invalid offsets are row-data errors. The partition kernel must observe
+    // the original channel before reporting one, including for a constant.
+    Ok(offset.filter(|offset| *offset >= 0))
 }
 
 impl WindowOffsetOwner {

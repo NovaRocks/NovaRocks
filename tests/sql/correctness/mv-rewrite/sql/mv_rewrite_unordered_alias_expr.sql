@@ -64,7 +64,7 @@ SELECT
   CAST(n % 3 AS BIGINT) AS k3,
   concat('2024-0', CAST(7 + (n % 2) AS VARCHAR), '-15') AS k4,
   CAST(n % 10 AS BIGINT) AS v1
-FROM TABLE(generate_series(1, 2400)) t(n);
+FROM TABLE(sequence(1, 2400)) t(n);
 
 -- query 5
 -- @skip_result_check=true

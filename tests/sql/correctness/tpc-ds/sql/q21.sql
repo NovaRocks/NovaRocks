@@ -32,8 +32,8 @@ select  *
      and i_item_sk          = inv_item_sk
      and inv_warehouse_sk   = w_warehouse_sk
      and inv_date_sk    = d_date_sk
-     and d_date between date_add(cast ('2000-03-11' as date), -30)
-                    and date_add(cast ('2000-03-11' as date), 30)
+     and d_date between date_add('day', -30, CAST('2000-03-11' AS DATE))
+                    and date_add('day', 30, CAST('2000-03-11' AS DATE))
    group by w_warehouse_name, i_item_id) x
  where case when inv_before > 0
              then inv_after / inv_before 

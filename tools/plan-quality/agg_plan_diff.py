@@ -65,7 +65,7 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-from trino_query import run_text_column
+from trino_query import VERBOSE_EXPLAIN, run_text_column
 
 
 DEFAULT_CASES = (
@@ -97,9 +97,8 @@ def case_default_database(case_id: str) -> str | None:
     return DEFAULT_DATABASES.get(case_id.split("/", 1)[0])
 
 
-def explain_sql(raw_sql: str, *, trino: bool = False) -> str:
+def explain_sql(raw_sql: str, *, prefix: str = "EXPLAIN VERBOSE") -> str:
     stripped = raw_sql.strip().rstrip(";").strip()
-    prefix = "EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT)" if trino else "EXPLAIN VERBOSE"
     return f"{prefix} {stripped};"
 
 
@@ -120,7 +119,7 @@ def safe_file_name(case_id: str) -> str:
 
 def run_novarocks(endpoint: Endpoint, raw_sql: str, timeout: float, database: str | None = None, *,
                    artifact_receipt: str | None = None, nr_catalog: str | None = None) -> str:
-    return run_text_column(endpoint, explain_sql(raw_sql, trino=True), timeout, database,
+    return run_text_column(endpoint, explain_sql(raw_sql, prefix=VERBOSE_EXPLAIN), timeout, database,
                            receipt=artifact_receipt, catalog=nr_catalog)
 
 

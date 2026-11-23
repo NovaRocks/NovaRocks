@@ -19,7 +19,7 @@
 -- Test Objective:
 -- 1. Validate DATE_FORMAT with microsecond format specifier (%f) on varchar-stored datetime values.
 -- 2. Validate LENGTH of DATE_FORMAT output with long literal strings in format.
--- 3. Validate IFNULL wrapping of LENGTH(DATE_FORMAT(...)) for edge-case format strings.
+-- 3. Verify that long formatted outputs survive the original 128-byte boundary.
 
 -- query 1
 -- Setup: create table and insert test data
@@ -38,22 +38,22 @@ INSERT INTO test_order VALUES ROW('1','2023-10-11 00:00:01.030');
 -- query 3
 -- DATE_FORMAT with %f microsecond specifier
 USE ${case_db};
-SELECT DATE_FORMAT(reset_period_data, '%Y-%m-%d %H:%i:%s.%f') FROM test_order WHERE id='1';
+SELECT DATE_FORMAT(CAST(reset_period_data AS TIMESTAMP(3)), '%Y-%m-%d %H:%i:%s.%f') FROM test_order WHERE id='1';
 
 -- query 4
 -- LENGTH of DATE_FORMAT with long literal padding in format string
 USE ${case_db};
-SELECT LENGTH(DATE_FORMAT(reset_period_data, '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f'))
+SELECT LENGTH(DATE_FORMAT(CAST(reset_period_data AS TIMESTAMP(3)), '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f'))
 FROM test_order WHERE id='1';
 
 -- query 5
 -- IFNULL wrapping LENGTH of DATE_FORMAT with extra-long literal in format
 USE ${case_db};
-SELECT IFNULL(LENGTH(DATE_FORMAT(reset_period_data, '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f')),-1)
+SELECT IFNULL(LENGTH(DATE_FORMAT(CAST(reset_period_data AS TIMESTAMP(3)), '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f')),-1)
 FROM test_order WHERE id='1';
 
 -- query 6
 -- IFNULL wrapping LENGTH of DATE_FORMAT with even longer literal and trailing chars after %f
 USE ${case_db};
-SELECT IFNULL(LENGTH(DATE_FORMAT(reset_period_data, '%Y-%m-%d %H:%i:%s.ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%ftttttttt')),-1)
+SELECT IFNULL(LENGTH(DATE_FORMAT(CAST(reset_period_data AS TIMESTAMP(3)), '%Y-%m-%d %H:%i:%s.ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%ftttttttt')),-1)
 FROM test_order WHERE id='1';

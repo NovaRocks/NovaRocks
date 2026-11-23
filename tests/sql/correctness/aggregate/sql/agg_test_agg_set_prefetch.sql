@@ -36,7 +36,7 @@ create table t0 (
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(generate_series(1,  30000));
+insert into t0 SELECT CAST(generate_series AS VARCHAR), CAST(generate_series AS VARCHAR), generate_series, generate_series FROM TABLE(sequence(1,  30000)) AS generate_series(generate_series);
 
 -- query 4
 -- @skip_result_check=true

@@ -27,7 +27,8 @@ use crate::{
     query_execution::{
         completion_facts::FrontendPlanningCpuSource,
         dml::ctas::{
-            CtasCommand, CtasFailure, CtasTargetBinding, CtasTargetPreflightOutcome,
+            CtasCommand, CtasDescriptionInput, CtasDescriptionResult, CtasFailure,
+            CtasTargetBinding, CtasTargetPreflightOutcome, PreparedCtasDescription,
             PreparedCtasTargetPreflight, TrinoCtasInput,
         },
         kernels::DmlExecutionKernel,
@@ -37,7 +38,11 @@ use crate::{
         table_exists_source::TableExistsSource,
     },
 };
-use novarocks_parser::ast::{StatementSaveMode, TrinoCreateTableAsSelect};
+use novarocks_parser::{
+    Span,
+    ast::{StatementSaveMode, TrinoCreateTableAsSelect},
+    build,
+};
 use novarocks_query_application::{
     api::{CommandContext, StatementExternalEffectDisposition, StatementNativeHealthFailure},
     session_control::{
@@ -48,11 +53,18 @@ use novarocks_query_application::{
     sql::{
         dml_admission::DmlAdmissionError,
         lower_object_name,
-        property_evaluation::{DdlPropertyNamePolicy, table::prepare_trino_ctas},
+        property_evaluation::{
+            DdlPropertyNamePolicy,
+            table::{prepare_trino_ctas, validate_trino_ctas},
+        },
     },
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorStagedCreateSession};
-use novarocks_sql::compiler::SqlCompileControl;
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorRequestContext, ConnectorStagedCreateSession,
+    ConnectorStagedCtasProperties, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
+};
+use novarocks_sql::compiler::{SqlCompileControl, SqlDescribedColumn};
 use novarocks_workload_control::WorkScope;
 use std::{
     sync::Arc,
@@ -122,6 +134,189 @@ impl TrinoCtasPropertyInput {
             source: statement.query.into_inner(),
             storage,
         })
+    }
+}
+
+pub(crate) async fn describe(
+    kernel: &DmlExecutionKernel,
+    input: CtasDescriptionInput<'_>,
+) -> CtasDescriptionResult {
+    let cpu = input.cpu;
+    match prepare_description_properties(kernel, input).await {
+        Ok(Some(properties)) => {
+            let CtasDescriptionProperties {
+                input,
+                table,
+                context,
+            } = properties;
+            let staged = input.staged.clone();
+            Ok(cpu
+                .ctas_properties(input)
+                .await?
+                .map(|command| PreparedCtasDescription {
+                    query: command.source,
+                    target: Some(CtasDescriptionTarget {
+                        staged,
+                        table,
+                        storage: command.storage,
+                        context,
+                    }),
+                }))
+        }
+        Ok(None) => Ok(build::values(vec![vec![build::integer(1)]])
+            .map_err(|error| internal_error(error.to_string()))
+            .map(|body| PreparedCtasDescription {
+                query: build::query(body),
+                target: None,
+            })),
+        Err(error) => Ok(Err(error)),
+    }
+}
+
+struct CtasDescriptionProperties {
+    input: TrinoCtasPropertyInput,
+    table: ConnectorTableIdentity,
+    context: ConnectorRequestContext,
+}
+
+pub(crate) struct CtasDescriptionTarget {
+    staged: ConnectorStagedCreateSession,
+    table: ConnectorTableIdentity,
+    storage: Arc<ConnectorStagedCtasProperties>,
+    context: ConnectorRequestContext,
+}
+
+impl CtasDescriptionTarget {
+    pub(crate) fn validate_source(
+        &self,
+        columns: &[SqlDescribedColumn],
+    ) -> Result<(), QueryServiceError> {
+        if columns.is_empty() {
+            return Err(QueryServiceError::new(
+                novarocks_query_application::session_error::QueryServiceErrorKind::InvalidValue,
+                "CTAS source has no output columns",
+            ));
+        }
+        let declarations = columns
+            .iter()
+            .map(|column| {
+                let definition =
+                    crate::query_execution::dml::iceberg_ctas::source_column_to_table_column_def(
+                        &column.name,
+                        &column.value_type,
+                    )?;
+                crate::catalog_application::statement::connector_column(&definition)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        self.staged
+            .validate_ctas_definition(&self.table, &declarations, &self.storage, &self.context)
+            .map_err(connector)
+    }
+}
+
+async fn prepare_description_properties(
+    kernel: &DmlExecutionKernel,
+    input: CtasDescriptionInput<'_>,
+) -> Result<Option<CtasDescriptionProperties>, QueryServiceError> {
+    let session = input.request.session();
+    let binding = kernel
+        .retain_governed_ctas_target(
+            &lower_object_name(&input.statement.name),
+            session.current_catalog(),
+            session.current_database(),
+        )
+        .map_err(|error| service(error.into_governed_dml_error(&input.source)))?;
+    let target = binding
+        .read_binding()
+        .map_err(product_command_service_error)?;
+    let pin = target.planning();
+    let connector_context = crate::connector::context_for_planning_pin_typed(pin, input.connector)
+        .map_err(connector)?;
+    let exists = pin
+        .binding()
+        .metadata()
+        .table_exists_async(ConnectorTableRequest {
+            table: target.table().clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: connector_context.clone(),
+        })
+        .await
+        .map_err(connector)?;
+    if let Some(reason) = input.request.execution().cancellation().reason() {
+        return Err(cancellation_error(reason));
+    }
+    if !ctas_needs_source(
+        exists,
+        input.statement.save_mode,
+        &input.source,
+        input.statement.span,
+        || binding.qualified_name(),
+    )? {
+        return Ok(None);
+    }
+    validate_trino_ctas(&input.source, &input.statement, &input.control)?;
+    if let Some(span) = input.statement.properties.iter().find_map(|property| {
+        input
+            .parameters
+            .first_in_expression(property.value.as_ref()?)
+    }) {
+        return Err(QueryServiceError::from_user_error(
+            novarocks_sql::analyze_error::AnalyzeError::unsupported_query_shape(
+                "DESCRIBE requires a bound CTAS table property value",
+                span,
+            )
+            .to_user_error(Some(&input.source)),
+        ));
+    }
+    let CtasTargetPreflightOutcome::Ready(preflight) = kernel
+        .preflight_governed_ctas_binding(binding)
+        .map_err(|error| service(error.into_governed_dml_error(&input.source)))?;
+    let staged = preflight
+        .staged_session()
+        .map_err(|error| service(error.into_governed_dml_error(&input.source)))?;
+    let window = input
+        .command
+        .result_window_alias()
+        .ok_or_else(|| internal_error("CTAS description has no original command window"))?;
+    let context = input.compiler.property_cpu_context(
+        session.current_database().to_owned(),
+        input.request.execution().sql_semantics().clone(),
+        input.interpreter,
+        input.control,
+        input.command.scope().clone(),
+        window,
+    );
+    Ok(Some(CtasDescriptionProperties {
+        input: TrinoCtasPropertyInput {
+            source: input.source,
+            statement: input.statement,
+            staged,
+            command: input.command,
+            context,
+        },
+        table: target.table().clone(),
+        context: connector_context,
+    }))
+}
+
+fn ctas_needs_source(
+    exists: bool,
+    save_mode: StatementSaveMode,
+    source: &str,
+    span: Span,
+    qualified_name: impl FnOnce() -> String,
+) -> Result<bool, QueryServiceError> {
+    match (exists, save_mode) {
+        (true, StatementSaveMode::Ignore) => Ok(false),
+        (true, StatementSaveMode::Fail) => Err(QueryServiceError::from_user_error(
+            DmlAdmissionError::TableAlreadyExists.to_user_error(
+                source,
+                span,
+                format!("Destination table '{}' already exists", qualified_name()),
+            ),
+        )),
+        _ => Ok(true),
     }
 }
 
@@ -223,41 +418,25 @@ impl Action {
             .execution
             .as_ref()
             .expect("original CTAS execution context");
-        if exists {
-            match statement.save_mode {
-                StatementSaveMode::Ignore => {
-                    return selected_command_completion(Ok(()), Some(0)).map(Some);
-                }
-                StatementSaveMode::Fail => {
-                    return Err(QueryServiceError::from_user_error(
-                        DmlAdmissionError::TableAlreadyExists.to_user_error(
-                            &execution.sql,
-                            statement.span,
-                            format!(
-                                "Destination table '{}' already exists",
-                                self.binding
-                                    .as_ref()
-                                    .expect("exact retained CTAS target")
-                                    .qualified_name()
-                            ),
-                        ),
-                    ));
-                }
-                // The pinned analyzer permits REPLACE to continue on an
-                // existing target. Our existing CTAS profile refuses it in
-                // the original typed admission below, before source analysis.
-                StatementSaveMode::Replace => {}
-            }
+        if !ctas_needs_source(
+            exists,
+            statement.save_mode,
+            &execution.sql,
+            statement.span,
+            || {
+                self.binding
+                    .as_ref()
+                    .expect("exact retained CTAS target")
+                    .qualified_name()
+            },
+        )? {
+            return selected_command_completion(Ok(()), Some(0)).map(Some);
         }
         let control = SqlCompileControl::new(
             self.deadline,
             sql_cancellation_observation(self.cancellation.clone()),
         );
-        novarocks_query_application::sql::property_evaluation::table::validate_trino_ctas(
-            &execution.sql,
-            &statement,
-            &control,
-        )?;
+        validate_trino_ctas(&execution.sql, &statement, &control)?;
         let CtasTargetPreflightOutcome::Ready(preflight) = self
             .kernel
             .preflight_governed_ctas_binding(
@@ -404,4 +583,29 @@ impl GovernedStatementAction for Action {
 
 fn connector(error: ConnectorError) -> QueryServiceError {
     product_command_service_error(command_error_from_connector(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StatementSaveMode, ctas_needs_source};
+    use novarocks_parser::SYNTHETIC;
+
+    #[test]
+    fn prepared_statement_ctas_checks_original_target_before_source() {
+        let source = "CREATE TABLE iceberg.db.t AS SELECT * FROM missing_target";
+        let target = || "iceberg.db.t".to_owned();
+        assert!(
+            !ctas_needs_source(true, StatementSaveMode::Ignore, source, SYNTHETIC, target).unwrap()
+        );
+        assert!(
+            ctas_needs_source(false, StatementSaveMode::Ignore, source, SYNTHETIC, target).unwrap()
+        );
+        let error = ctas_needs_source(true, StatementSaveMode::Fail, source, SYNTHETIC, target)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Destination table 'iceberg.db.t' already exists")
+        );
+    }
 }

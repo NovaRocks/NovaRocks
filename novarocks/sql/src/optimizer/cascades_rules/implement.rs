@@ -762,7 +762,19 @@ impl Rule for JoinToNestLoop {
             return Ok(vec![]);
         };
         if matches!(op.join_type, JoinKind::LeftMark { .. }) {
-            return Ok(vec![]);
+            // Hash marks have an authored null-aware condition and physical
+            // key contract. Relation marks consume the complete predicate.
+            return Ok(if op.naa_author.is_some() || op.condition.is_none() {
+                vec![]
+            } else {
+                vec![NewExpr {
+                    op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                        join_type: op.join_type,
+                        condition: op.condition,
+                    }),
+                    children: expr.children.clone(),
+                }]
+            });
         }
         // NestLoop is used for cross joins or joins without equality
         // conditions. We must check feasibility after `orient_eq_pair`,

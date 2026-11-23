@@ -607,7 +607,7 @@ fn seed_files(
         let first = file * rows_per_file + 1;
         let last = first + rows_per_file - 1;
         control.execute(format!(
-            "INSERT INTO {table} SELECT generate_series FROM TABLE(generate_series({first},{last}))"
+            "INSERT INTO {table} SELECT sequential_number FROM TABLE(sequence({first},{last}))"
         ))?;
     }
     let (schema, relation) = table

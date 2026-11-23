@@ -35,7 +35,7 @@ use novarocks_query_application::{
     session_outcome::{cancellation_failure_input, governed_cancellation_failure_input},
     session_value::StatementSessionError,
 };
-use novarocks_user_error::UserError;
+use novarocks_user_error::{ErrorPhase, UserError};
 use novarocks_workload_control::CancellationReason as WorkCancellationReason;
 use serde::Serialize;
 use std::fmt;
@@ -114,6 +114,7 @@ enum Code {
     FunctionNotFound,
     AmbiguousFunctionCall,
     InvalidFunctionArgument,
+    ExceededFunctionMemoryLimit,
     DivisionByZero,
     InvalidCastArgument,
     InvalidView,
@@ -148,10 +149,15 @@ enum Code {
     TypeMismatch,
     FunctionNotAggregate,
     ExpressionNotScalar,
+    ExpressionNotInDistinct,
+    MissingOrderBy,
+    InvalidParameterUsage,
     TypeNotFound,
     InvalidLiteral,
     MismatchedColumnAliases,
     InvalidArguments,
+    ExpressionNotConstant,
+    MissingArgument,
     ProcedureNotFound,
     InvalidProcedureArgument,
     DuplicateProperty,
@@ -196,6 +202,7 @@ impl Code {
             FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
             AmbiguousFunctionCall => (32, "AMBIGUOUS_FUNCTION_CALL", "USER_ERROR"),
             InvalidFunctionArgument => (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
+            ExceededFunctionMemoryLimit => (37, "EXCEEDED_FUNCTION_MEMORY_LIMIT", "USER_ERROR"),
             DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
             InvalidCastArgument => (9, "INVALID_CAST_ARGUMENT", "USER_ERROR"),
             InvalidView => (11, "INVALID_VIEW", "USER_ERROR"),
@@ -231,13 +238,18 @@ impl Code {
             TypeMismatch => (58, "TYPE_MISMATCH", "USER_ERROR"),
             FunctionNotAggregate => (72, "FUNCTION_NOT_AGGREGATE", "USER_ERROR"),
             ExpressionNotScalar => (74, "EXPRESSION_NOT_SCALAR", "USER_ERROR"),
+            ExpressionNotInDistinct => (69, "EXPRESSION_NOT_IN_DISTINCT", "USER_ERROR"),
+            MissingOrderBy => (65, "MISSING_ORDER_BY", "USER_ERROR"),
             TypeNotFound => (43, "TYPE_NOT_FOUND", "USER_ERROR"),
             InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
             MismatchedColumnAliases => (61, "MISMATCHED_COLUMN_ALIASES", "USER_ERROR"),
+            ExpressionNotConstant => (75, "EXPRESSION_NOT_CONSTANT", "USER_ERROR"),
+            MissingArgument => (111, "MISSING_ARGUMENT", "USER_ERROR"),
             InvalidArguments => (76, "INVALID_ARGUMENTS", "USER_ERROR"),
             ProcedureNotFound => (29, "PROCEDURE_NOT_FOUND", "USER_ERROR"),
             InvalidProcedureArgument => (30, "INVALID_PROCEDURE_ARGUMENT", "USER_ERROR"),
             DuplicateProperty => (79, "DUPLICATE_PROPERTY", "USER_ERROR"),
+            InvalidParameterUsage => (80, "INVALID_PARAMETER_USAGE", "USER_ERROR"),
             TooManyArguments => (77, "TOO_MANY_ARGUMENTS", "USER_ERROR"),
             ViewIsStale => (81, "VIEW_IS_STALE", "USER_ERROR"),
             ViewIsRecursive => (82, "VIEW_IS_RECURSIVE", "USER_ERROR"),
@@ -578,7 +590,7 @@ fn service_error(
             query_id,
             code,
             PublicMessage::Borrowed(user.message()),
-            user_location(user, sql),
+            service_location(error, sql),
             StatementExternalEffectDisposition::combine(
                 error.external_effect_disposition(),
                 effect,
@@ -610,12 +622,7 @@ fn service_error(
         }
     }
     let public = error.diagnostic_with_external_effect(effect);
-    project_public_diagnostic(
-        query_id,
-        code,
-        &public,
-        error.user_error().and_then(|user| user_location(user, sql)),
-    )
+    project_public_diagnostic(query_id, code, &public, service_location(error, sql))
 }
 
 fn cancellation_code(reason: &QueryCancellationReason) -> Code {
@@ -809,7 +816,9 @@ fn user_code(code: &str) -> Option<Code> {
         | "sql.validate.invalid_structure" => Syntax,
         "sql.validate.duplicate_cte_name" => DuplicateNamedQuery,
         "sql.validate.duplicate_window_name" => DuplicateWindowName,
-        "sql.validate.invalid_window_frame_bounds" => InvalidWindowFrame,
+        "sql.validate.invalid_window_frame_bounds" | "sql.analyze.invalid_window_frame" => {
+            InvalidWindowFrame
+        }
         "sql.analyze.unknown_catalog" | "sql.admit.show_catalog_not_found" => CatalogNotFound,
         "sql.analyze.unknown_schema" | "sql.admit.show_schema_not_found" => SchemaNotFound,
         "sql.analyze.unknown_table" | "sql.admit.show_table_not_found" => TableNotFound,
@@ -832,10 +841,19 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.view_is_stale" => ViewIsStale,
         "sql.analyze.view_is_recursive" => ViewIsRecursive,
         "sql.analyze.type_mismatch" => TypeMismatch,
+        "sql.admit.prepared_statement_not_found" => NotFound,
+        "sql.admit.expression_not_constant" => ExpressionNotConstant,
+        "sql.admit.invalid_parameter_usage" => InvalidParameterUsage,
         "sql.analyze.function_not_aggregate" => FunctionNotAggregate,
         "sql.analyze.expression_not_scalar" => ExpressionNotScalar,
-        "sql.admit.unknown_type" => TypeNotFound,
+        "sql.analyze.expression_not_in_distinct" => ExpressionNotInDistinct,
+        "sql.analyze.missing_order_by" => MissingOrderBy,
+        "sql.admit.unknown_type" | "sql.analyze.unknown_type" => TypeNotFound,
         "sql.analyze.invalid_literal" => InvalidLiteral,
+        "sql.analyze.numeric_out_of_range" => NumericOutOfRange,
+        "sql.analyze.invalid_function_argument" => InvalidFunctionArgument,
+        "sql.analyze.missing_argument" => MissingArgument,
+        "sql.analyze.expression_not_constant" => ExpressionNotConstant,
         "sql.analyze.invalid_argument" => InvalidArguments,
         "sql.analyze.invalid_type_argument" => InvalidFunctionArgument,
         "sql.admit.invalid_table_procedure_arguments" => InvalidArguments,
@@ -875,17 +893,20 @@ fn user_code(code: &str) -> Option<Code> {
         | "sql.admit.insert_unsupported_form"
         | "sql.admit.create_table_unsupported_form"
         | "UnsupportedCompiledShape"
-        | "query.execution.unsupported" => NotSupported,
+        | "query.execution.unsupported"
+        | "query.execution.unknown_epoch_time_zone" => NotSupported,
         "sql.admit.kill_denied" => PermissionDenied,
         "sql.analyze.internal"
         | "query.execution.invariant"
         | "query.execution.unexpected"
         | "query.execution.control"
-        | "query.execution.commit_unknown" => GenericInternal,
+        | "query.execution.commit_unknown"
+        | "query.execution.date_result_out_of_range" => GenericInternal,
         "query.execution.numeric_out_of_range" => NumericOutOfRange,
         "query.execution.division_by_zero" => DivisionByZero,
         "query.execution.invalid_cast_argument" => InvalidCastArgument,
         "query.execution.invalid_function_argument" => InvalidFunctionArgument,
+        "query.execution.exceeded_function_memory_limit" => ExceededFunctionMemoryLimit,
         "sql.analyze.too_many_arguments" => TooManyArguments,
         "query.execution.cancelled" => UserCanceled,
         "query.execution.deadline_exceeded" => ExceededTimeLimit,
@@ -897,8 +918,43 @@ fn user_code(code: &str) -> Option<Code> {
     })
 }
 
+fn service_location(error: &QueryServiceError, sql: &str) -> Option<TrinoErrorLocation> {
+    let user = error.user_error()?;
+    let Some(source) = error.trino_statement_source() else {
+        return user_location(user, sql);
+    };
+    let mut location = user_location(user, source.sql())?;
+    if let Some(span) = source.immediate_literal_span() {
+        let anchor = utf16_location(
+            &span.to_user_error_location(source.request_sql()),
+            source.request_sql(),
+        )?;
+        let first_line = if matches!(user.phase(), ErrorPhase::Lex | ErrorPhase::Parse) {
+            // Trino's parser exceptions use the outer line of the literal.
+            anchor.line_number == 1
+        } else {
+            // Analyzed AST locations use the inner line of the reported node.
+            location.line_number == 1
+        };
+        if first_line {
+            location.column_number = location.column_number.checked_add(anchor.column_number)?;
+        }
+        location.line_number = anchor
+            .line_number
+            .checked_sub(1)?
+            .checked_add(location.line_number)?;
+    }
+    Some(location)
+}
+
 fn user_location(error: &UserError, sql: &str) -> Option<TrinoErrorLocation> {
-    let location = error.location()?;
+    utf16_location(error.location()?, sql)
+}
+
+fn utf16_location(
+    location: &novarocks_user_error::UserErrorLocation,
+    sql: &str,
+) -> Option<TrinoErrorLocation> {
     let line = usize::try_from(location.line().checked_sub(1)?).ok()?;
     let column = usize::try_from(location.column().checked_sub(1)?).ok()?;
     let text = sql.split('\n').nth(line)?;

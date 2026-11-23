@@ -15,20 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One real immutable owner for the installed group_concat/string_agg aggregate identity.
+//! One real immutable owner for the installed LISTAGG aggregate identity.
 //! Raw ordered state interpretation and aggregate OVER retain separate obligations.
 
-use super::{
-    aggregate_concat::{ConcatKernel, validate_contract},
-    catalogue::BuiltinAggregateResolver,
-};
+use super::{aggregate_concat::ListaggKernel, catalogue::BuiltinAggregateResolver};
 use crate::kernel_control::{compile_failure, invalid};
 use crate::*;
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompilePhase,
     FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
-    PureCompileControl, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    PureCompileControl,
 };
 use std::sync::Arc;
 
@@ -41,10 +38,7 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         argument_control: ArgumentControl::Aggregate,
         instance_state: FunctionInstanceState::AggregateInstance,
         observable_effects: ObservableEffects::NONE,
-        environment_dependencies: Box::new([
-            SemanticParameterKey::GroupConcatLegacy,
-            SemanticParameterKey::GroupConcatMaxLen,
-        ]),
+        environment_dependencies: Box::new([]),
     }
 }
 pub(super) fn definition(
@@ -55,7 +49,7 @@ pub(super) fn definition(
     let owner = Arc::new(ConcatOwner::new(name, declaration, resolver)?);
     FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
         |error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin group_concat/string_agg aggregate pure owner",
+            subject: "builtin LISTAGG aggregate pure owner",
             value: error.to_string().into(),
         },
     )
@@ -72,7 +66,7 @@ impl ConcatOwner {
         resolver: Arc<BuiltinAggregateResolver>,
     ) -> Result<Self, FunctionCatalogError> {
         let expected = effects();
-        let valid = matches!(name, "group_concat" | "string_agg")
+        let valid = name == "listagg"
             && declaration.function_id().as_str() == format!("builtin.aggregate/{name}/v1")
             && declaration.kind() == FunctionKind::Aggregate
             && declaration.overloads().len() == 1
@@ -85,7 +79,7 @@ impl ConcatOwner {
             });
         if !valid {
             return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "builtin group_concat/string_agg aggregate pure declaration",
+                subject: "builtin LISTAGG aggregate pure declaration",
                 value: declaration.function_id().as_str().into(),
             });
         }
@@ -106,11 +100,7 @@ impl ConcatOwner {
             implementations,
         })
     }
-    fn call_effects(
-        &self,
-        proof_scope: CallProofScope,
-        environment: &[SemanticParameterRef],
-    ) -> CallEffects {
+    fn call_effects(&self, proof_scope: CallProofScope) -> CallEffects {
         let base = effects();
         CallEffects {
             value_stability: base.value_stability,
@@ -120,7 +110,7 @@ impl ConcatOwner {
             argument_control: base.argument_control,
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
-            environment: environment.into(),
+            environment: Box::new([]),
             proof_scope,
         }
     }
@@ -199,18 +189,6 @@ impl PureFunctionMetadataOwner for ConcatOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
-    fn admit_frozen_environment_observed(
-        &self,
-        selected: &FunctionBindingSelection,
-        environment: &[novarocks_type_contract::SemanticParameterRef],
-        parameters: &novarocks_type_contract::SemanticParameters,
-        control: &dyn PureCompileControl,
-    ) -> Result<(), FunctionBindingError> {
-        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
-        valid_environment_references(environment, parameters)
-            .map(|_| ())
-            .map_err(|_| FunctionBindingError::UnavailableImplementation(selected.overload.clone()))
-    }
 }
 impl FunctionEffectOwner for ConcatOwner {
     type Error = FunctionBindingError;
@@ -247,13 +225,13 @@ impl FunctionEffectOwner for ConcatOwner {
     }
 }
 impl PureAggregateImplementation for ConcatOwner {
-    type Kernel = ConcatKernel;
+    type Kernel = ListaggKernel;
     fn prepare_aggregate(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
-    ) -> Result<Arc<ConcatKernel>, KernelFailure> {
+    ) -> Result<Arc<ListaggKernel>, KernelFailure> {
         self.prepare_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
         })
@@ -269,46 +247,6 @@ impl PureAggregateImplementation for ConcatOwner {
             checked.require_binding_author(self.resolver.as_ref(), input)
         })
         .map_err(crate::CheckedOwnerFailure::Original)
-    }
-}
-
-fn valid_environment(input: CallEffectInput<'_>) -> Result<(bool, i64), FunctionBindingError> {
-    valid_environment_references(input.environment, input.parameters)
-}
-fn valid_environment_references(
-    environment: &[novarocks_type_contract::SemanticParameterRef],
-    parameters: &novarocks_type_contract::SemanticParameters,
-) -> Result<(bool, i64), FunctionBindingError> {
-    if environment.len() != 2 {
-        return Err(FunctionBindingError::InvalidBinding(
-            "group_concat requires exactly its two semantic references".into(),
-        ));
-    }
-    let mut mode = None;
-    let mut max_len = None;
-    for reference in environment {
-        let value = parameters
-            .require(*reference)
-            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
-        match value {
-            SemanticParameterValue::GroupConcatLegacy(value) if mode.is_none() => {
-                mode = Some(*value)
-            }
-            SemanticParameterValue::GroupConcatMaxLen(value) if max_len.is_none() => {
-                max_len = Some((*value).max(4))
-            }
-            _ => {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "group_concat semantic reference is extra or duplicated".into(),
-                ));
-            }
-        }
-    }
-    match (mode, max_len) {
-        (Some(mode), Some(max_len)) => Ok((mode, max_len)),
-        _ => Err(FunctionBindingError::InvalidBinding(
-            "group_concat semantic references are incomplete".into(),
-        )),
     }
 }
 
@@ -328,13 +266,14 @@ impl ConcatOwner {
             if !exact {
                 return Err(FunctionBindingError::UnknownFunction.into());
             }
-            let scope = valid_environment(input).is_ok()
+            let scope = input.environment.is_empty()
                 && (input.proof_scope == CallProofScope::Unconditional
                     || input.proof_scope == input.context.proof_scope());
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !scope {
                 return Err(FunctionBindingError::InvalidBinding(
-                    "group_concat/string_agg aggregate requires its original scope and exact frozen environment".into(),
+                    "LISTAGG aggregate requires its original scope and exact frozen environment"
+                        .into(),
                 )
                 .into());
             }
@@ -343,7 +282,7 @@ impl ConcatOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            Ok(self.call_effects(input.proof_scope, input.environment))
+            Ok(self.call_effects(input.proof_scope))
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
             return result;
@@ -357,7 +296,7 @@ impl ConcatOwner {
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
         validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<Arc<ConcatKernel>, KernelFailure> {
+    ) -> Result<Arc<ListaggKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
         let result = (|| {
@@ -368,40 +307,18 @@ impl ConcatOwner {
                 && std::ptr::eq(call.selected(), input.selected)
                 && call.context() == input.context
                 && call.decimal_overflow_policy() == input.decimal_overflow_policy
-                && call.effects() == &self.call_effects(input.proof_scope, input.environment)
+                && call.effects() == &self.call_effects(input.proof_scope)
                 && call.logical_argument_count() == input.request.logical_argument_count;
             work.step().map_err(compile_failure)?;
             if !exact {
                 return Err(invalid(
-                    "group_concat/string_agg aggregate preparation differs from its exact checked call",
+                    "LISTAGG aggregate preparation differs from its exact checked call",
                 ));
             }
-            for reference in input.environment {
-                work.step().map_err(compile_failure)?;
-                if input
-                    .parameters
-                    .require(*reference)
-                    .map_err(|_| invalid("group_concat semantic reference is unresolved"))?
-                    != call.parameters().require(*reference).map_err(|_| {
-                        invalid("group_concat semantic reference is absent from its checked call")
-                    })?
-                {
-                    return Err(invalid(
-                        "group_concat semantic values differ from its checked call",
-                    ));
-                }
-            }
-            // Original state interpretation is distinct from merge execution flags.
-            // The same admitted semantic source is required in every phase.
-            let (_legacy, max_len) = valid_environment(input).map_err(|_| {
-                invalid("group_concat requires explicit frozen mode and max length")
-            })?;
             work.flush().map_err(compile_failure)?;
             validate().map_err(|error| match error {
                 FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid(
-                    "group_concat/string_agg aggregate preparation has a stale selected binding",
-                ),
+                _ => invalid("LISTAGG aggregate preparation has a stale selected binding"),
             })?;
             for (actual, selected) in input
                 .request
@@ -418,35 +335,39 @@ impl ConcatOwner {
                 else {
                     work.step().map_err(compile_failure)?;
                     return Err(invalid(
-                        "group_concat/string_agg aggregate requires canonical value arguments",
+                        "LISTAGG aggregate requires canonical value arguments",
                     ));
                 };
                 if !actual.exactly_equals_observed::<KernelFailure>(selected, || {
                     work.step().map_err(compile_failure)
                 })? {
                     return Err(invalid(
-                        "group_concat/string_agg aggregate request differs from its exact selected source",
+                        "LISTAGG aggregate request differs from its exact selected source",
                     ));
                 }
             }
-            validate_contract(&contract, &mut work)?;
+            if contract.phase() != AggregateKernelPhase::Single
+                || input.request.logical_argument_count != 5
+            {
+                return Err(invalid(
+                    "LISTAGG requires its five logical arguments in Single",
+                ));
+            }
+            let original_order = contract
+                .state_interpretation()
+                .ok_or_else(|| invalid("LISTAGG requires its original state interpretation"))?;
             work.flush().map_err(compile_failure)?;
-            let prepared = Arc::new(ConcatKernel {
-                ascending: contract
-                    .state_interpretation()
-                    .expect("validated GC state interpretation")
+            let prepared = Arc::new(ListaggKernel {
+                ascending: original_order
                     .order_keys
                     .iter()
                     .map(|key| key.ascending)
                     .collect(),
-                nulls_first: contract
-                    .state_interpretation()
-                    .expect("validated GC state interpretation")
+                nulls_first: original_order
                     .order_keys
                     .iter()
                     .map(|key| key.nulls_first)
                     .collect(),
-                max_len,
                 contract,
             });
             work.flush().map_err(compile_failure)?;

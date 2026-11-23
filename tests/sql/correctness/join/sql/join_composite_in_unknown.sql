@@ -48,8 +48,8 @@ SELECT row(1,CAST(NULL AS INT)) IN (SELECT row(1,2)) AS unknown_pair,
        row(9,CAST(NULL AS INT)) IN (SELECT row(1,2)) AS definite_mismatch;
 
 -- query 7
-SELECT map(1,CAST(NULL AS INT)) IN (SELECT map(1,2)) AS unknown_pair,
-       map(9,CAST(NULL AS INT)) IN (SELECT map(1,2)) AS definite_mismatch;
+SELECT MAP(ARRAY[1], ARRAY[CAST(NULL AS INT)]) IN (SELECT MAP(ARRAY[1], ARRAY[2])) AS unknown_pair,
+       MAP(ARRAY[9], ARRAY[CAST(NULL AS INT)]) IN (SELECT MAP(ARRAY[1], ARRAY[2])) AS definite_mismatch;
 
 -- query 8
 -- Compare decimal values after exact common precision/scale coercion.

@@ -34,7 +34,7 @@ CREATE TABLE ${case_db}.row_util_base (
   k1 BIGINT
 ) WITH (format_version = 3);
 
-INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 5000 - 1));
+INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(sequence(0, 5000 - 1)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 10000
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 20000
 
@@ -121,27 +121,27 @@ CREATE TABLE ${case_db}.t3 (
 
 -- Insert t2: small value interval (idx % N for bounded values)
 INSERT INTO ${case_db}.t2
-SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), (idx % 2147483648), (idx % 2147483648), idx, idx, CAST(days_add('2023-01-01', idx) AS date), CAST(days_add('2023-01-01', idx) AS date), idx, idx, concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC LIMIT 500;
+SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), (idx % 2147483648), (idx % 2147483648), idx, idx, CAST(date_add('day', idx, DATE '2023-01-01') AS date), CAST(date_add('day', idx, DATE '2023-01-01') AS date), idx, idx, concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP), CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC LIMIT 500;
 
 -- Insert t2 rows with some NULLs
 INSERT INTO ${case_db}.t2
-SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, (idx % 2147483648), NULL, idx, NULL, CAST(days_add('2023-01-01', idx) AS date), NULL, idx, NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 500 ROWS LIMIT 50;
+SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, (idx % 2147483648), NULL, idx, NULL, CAST(date_add('day', idx, DATE '2023-01-01') AS date), NULL, idx, NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 500 ROWS LIMIT 50;
 
 -- Insert t3: large value interval (idx * 370 for spread values)
 INSERT INTO ${case_db}.t3
-SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), ((idx * 370) % 2147483648), ((idx * 370) % 2147483648), (idx * 370), (idx * 370), CAST(days_add('2023-01-01', (idx * 370)) AS date), CAST(days_add('2023-01-01', (idx * 370)) AS date), (idx * 370), (idx * 370), concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC LIMIT 500;
+SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), ((idx * 370) % 2147483648), ((idx * 370) % 2147483648), (idx * 370), (idx * 370), CAST(date_add('day', (idx * 370), DATE '2023-01-01') AS date), CAST(date_add('day', (idx * 370), DATE '2023-01-01') AS date), (idx * 370), (idx * 370), concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP), CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC LIMIT 500;
 
 -- Insert t3 rows with some NULLs
 INSERT INTO ${case_db}.t3
-SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, ((idx * 370) % 2147483648), NULL, (idx * 370), NULL, CAST(days_add('2023-01-01', (idx * 370)) AS date), NULL, (idx * 370), NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 500 ROWS LIMIT 50;
+SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, ((idx * 370) % 2147483648), NULL, (idx * 370), NULL, CAST(date_add('day', (idx * 370), DATE '2023-01-01') AS date), NULL, (idx * 370), NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 500 ROWS LIMIT 50;
 
 -- Insert t1: all rows from row_util (1.28M rows non-null)
 INSERT INTO ${case_db}.t1
-SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), (idx % 2147483648), (idx % 2147483648), idx, idx, CAST(days_add('2023-01-01', idx) AS date), CAST(days_add('2023-01-01', idx) AS date), idx, idx, concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP), CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util;
+SELECT idx, ((idx % 2) = 0), ((idx % 2) = 0), (idx % 128), (idx % 128), (idx % 32768), (idx % 32768), (idx % 2147483648), (idx % 2147483648), idx, idx, CAST(date_add('day', idx, DATE '2023-01-01') AS date), CAST(date_add('day', idx, DATE '2023-01-01') AS date), idx, idx, concat('str-abc-', idx), concat('str-abc-', idx), concat('str-abc-', (idx % 256)), concat('str-abc-', (idx % 256)), CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP), CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP) FROM ${case_db}.row_util;
 
 -- Insert t1 rows with some NULLs
 INSERT INTO ${case_db}.t1
-SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, (idx % 2147483648), NULL, idx, NULL, CAST(days_add('2023-01-01', idx) AS date), NULL, idx, NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(seconds_add('2023-01-01', idx) AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 5000 ROWS LIMIT 500;
+SELECT idx, NULL, ((idx % 2) = 0), NULL, (idx % 128), NULL, (idx % 32768), NULL, (idx % 2147483648), NULL, idx, NULL, CAST(date_add('day', idx, DATE '2023-01-01') AS date), NULL, idx, NULL, concat('str-abc-', idx), NULL, concat('str-abc-', (idx % 256)), NULL, CAST(date_add('second', idx, TIMESTAMP '2023-01-01 00:00:00.000000') AS TIMESTAMP) FROM ${case_db}.row_util ORDER BY idx ASC OFFSET 5000 ROWS LIMIT 500;
 
 -- ===========================================================================
 -- Section 1: type coverage - broadcast join with small build side (limit 10)

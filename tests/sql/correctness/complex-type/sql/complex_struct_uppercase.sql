@@ -26,7 +26,7 @@ CREATE TABLE ${case_db}.struct_upper_case
     (c1 int,
     c2 ROW(c2_sub1 int, C2_SUB2 int)) WITH (format_version = 3);
 
-insert into ${case_db}.struct_upper_case values ROW(1, named_struct('c2_sub1', 1, 'c2_sub2', 1)), ROW(2, named_struct('C2_SUB1', 2, 'C2_SUB2', 2));
+insert into ${case_db}.struct_upper_case values ROW(1, CAST(ROW(1,1) AS ROW(c2_sub1 INTEGER,c2_sub2 INTEGER))), ROW(2, CAST(ROW(2,2) AS ROW("C2_SUB1" INTEGER,"C2_SUB2" INTEGER)));
 
 -- query 2
 -- Access uppercase field C2_SUB2 via uppercase alias C2

@@ -139,3 +139,16 @@ FROM (VALUES '1', '0') t(x);
 SELECT k, bool_or(CAST(x AS BOOLEAN)) OVER () AS any_true
 FROM (VALUES (1, BIGINT '1'), (2, NULL)) t(k, x)
 ORDER BY k;
+
+
+-- query 30
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT CURRENT_TIMESTAMP(13);
+
+-- query 31
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT EXTRACT(HOUR FROM DATE '2024-03-01');
+
+-- query 32
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT year(INTERVAL '25' MONTH);

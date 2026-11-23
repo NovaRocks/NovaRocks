@@ -539,7 +539,14 @@ pub(crate) fn parse_trino_date32_observed<E>(
         }
         end -= ch.len_utf8();
     }
-    let bytes = &text.as_bytes()[start..end];
+    parse_trino_date32_untrimmed_observed(&text[start..end], observe)
+}
+
+pub(crate) fn parse_trino_date32_untrimmed_observed<E>(
+    text: &str,
+    mut observe: impl FnMut(DateParseObservation) -> Result<(), E>,
+) -> Result<Option<i32>, E> {
+    let bytes = text.as_bytes();
     // ISODateTimeFormat.date is yearMonthDay. Its NumberFormatter accepts
     // 1..9 ASCII year digits plus optional sign, then unsigned 1..2 month/day
     // digits with the two required '-' literals and no trailing characters.

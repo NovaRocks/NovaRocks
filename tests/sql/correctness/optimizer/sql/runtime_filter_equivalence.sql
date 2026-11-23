@@ -23,7 +23,7 @@ CREATE TABLE ${case_db}.eq_b (k INT, v INT);
 CREATE TABLE ${case_db}.eq_p (k INT, v INT);
 INSERT INTO ${case_db}.eq_b VALUES ROW(1, 10), ROW(2, 20), ROW(5, 50);
 INSERT INTO ${case_db}.eq_p
-    SELECT generate_series % 7, generate_series FROM TABLE(generate_series(1, 5000));
+    SELECT generate_series % 7, generate_series FROM TABLE(sequence(1, 5000)) AS generate_series(generate_series);
 ANALYZE ${case_db}.eq_b;
 ANALYZE ${case_db}.eq_p;
 

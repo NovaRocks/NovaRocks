@@ -217,26 +217,47 @@ pub(super) fn plan_select_scoped_with_source(
         // roots in the ordinary aggregate extraction, then retain the rewritten
         // expression for the owning mark join instead of projecting it early.
         let projected_count = select.projection.len();
-        let mut mark_spec_indices = Vec::new();
+        let mut mark_projection_inputs = Vec::new();
         let mut aggregate_projection = select.projection.clone();
         for (index, spec) in apply_specs.iter().enumerate() {
-            if matches!(spec.clause, ApplyClause::Having | ApplyClause::Projection)
-                && let Some(probe) = &spec.mark_probe
+            if !matches!(spec.clause, ApplyClause::Having | ApplyClause::Projection) {
+                continue;
+            }
+            let Some(probe) = &spec.mark_probe else {
+                continue;
+            };
+            let demand = spec
+                .relation_mark
+                .as_ref()
+                .map_or(&[][..], |mark| mark.demand_projections.as_slice());
+            let demand_columns = demand
+                .iter()
+                .map(|project| project.output_column_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            for (project, source) in demand
+                .iter()
+                .map(|project| (Some(project), &project.expr))
+                .chain(std::iter::once((None, probe)))
             {
-                let id = factory.create(
-                    None,
-                    format!("__mark_aggregate_probe_{index}"),
-                    probe.value_type.clone(),
-                );
+                let (name, id) = if let Some(project) = project {
+                    (project.output_name.clone(), project.output_column_id)
+                } else {
+                    let name = format!("__mark_aggregate_probe_{index}");
+                    let id = factory.create(None, name.clone(), source.value_type.clone());
+                    (name, id)
+                };
                 aggregate_projection.push(ProjectItem {
-                    expr: probe.clone(),
-                    output_name: format!("__mark_aggregate_probe_{index}"),
+                    expr: source.clone(),
+                    output_name: name,
                     output_column_id: id,
                 });
-                mark_spec_indices.push(index);
+                mark_projection_inputs
+                    .push((index, project.map(|project| project.output_column_id)));
                 let mut extra = Vec::new();
-                collect_non_agg_column_refs(probe, &select.group_by, &mut extra, control)?;
-                select.group_by.extend(extra);
+                collect_non_agg_column_refs(source, &select.group_by, &mut extra, control)?;
+                select.group_by.extend(extra.into_iter().filter(|expr| {
+                    !matches!(&expr.kind, ExprKind::ColumnRef { column_id, .. } if demand_columns.contains(column_id))
+                }));
             }
         }
         let aggregate_group_by = dedup_group_by_exprs(&select.group_by, control)?;
@@ -249,11 +270,24 @@ pub(super) fn plan_select_scoped_with_source(
                 control,
             )?;
 
-        for (index, item) in mark_spec_indices
+        for ((index, demand), item) in mark_projection_inputs
             .into_iter()
             .zip(project_items.drain(projected_count..))
         {
-            apply_specs[index].mark_probe = Some(item.expr);
+            let spec = &mut apply_specs[index];
+            if let Some(demand) = demand {
+                let project = spec
+                    .relation_mark
+                    .as_mut()
+                    .expect("relation mark demand")
+                    .demand_projections
+                    .iter_mut()
+                    .find(|project| project.output_column_id == demand)
+                    .expect("original demand projection");
+                project.expr = item.expr;
+            } else {
+                spec.mark_probe = Some(item.expr);
+            }
         }
         current = project_aggregate_inputs(current, &mut agg_calls, repeat.as_ref(), factory)?;
         if let Some(repeat) = repeat {

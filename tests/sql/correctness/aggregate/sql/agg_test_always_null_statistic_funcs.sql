@@ -162,39 +162,39 @@ select round(var_samp(val1), 3) from t1;
 -- query 22
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
-select round(variance_samp(c1), 3) from w1 where c1 > 10;
+select round(var_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 23
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 24
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 25
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 26
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 27
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 28
 USE ${case_db};
 SELECT
     k,
     val1,
-    round(variance_samp(val1) over (
+    round(var_samp(val1) over (
         ORDER BY k ASC
         ROWS BETWEEN 2 PRECEDING and CURRENT ROW
     ), 3) AS variance_samp_val1
@@ -206,7 +206,7 @@ USE ${case_db};
 SELECT
     k,
     val1,
-    round(variance_samp(val1) over (
+    round(var_samp(val1) over (
         ORDER BY k ASC
         ROWS BETWEEN 2 PRECEDING and CURRENT ROW
     ), 3) AS variance_samp_val1
@@ -215,35 +215,35 @@ order by k;
 
 -- query 30
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k > 100;
+select round(var_samp(val1), 3) from t1 where k > 100;
 
 -- query 31
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1_nonnull where k > 100;
+select round(var_samp(val1), 3) from t1_nonnull where k > 100;
 
 -- query 32
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k = 2;
+select round(var_samp(val1), 3) from t1 where k = 2;
 
 -- query 33
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1_nonnull where k = 2;
+select round(var_samp(val1), 3) from t1_nonnull where k = 2;
 
 -- query 34
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k in (2, 5, 6);
+select round(var_samp(val1), 3) from t1 where k in (2, 5, 6);
 
 -- query 35
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k in (5, 6);
+select round(var_samp(val1), 3) from t1 where k in (5, 6);
 
 -- query 36
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1_nonnull;
+select round(var_samp(val1), 3) from t1_nonnull;
 
 -- query 37
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1;
+select round(var_samp(val1), 3) from t1;
 
 -- query 38
 USE ${case_db};
@@ -626,39 +626,39 @@ select round(var_samp(val1), 3) from t1;
 -- query 108
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
-select round(variance_samp(c1), 3) from w1 where c1 > 10;
+select round(var_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 109
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 110
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 111
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 112
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 113
 USE ${case_db};
 with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
-select round(variance_samp(c1), 3) from w1;
+select round(var_samp(c1), 3) from w1;
 
 -- query 114
 USE ${case_db};
 SELECT
     k,
     val1,
-    round(variance_samp(val1) over (
+    round(var_samp(val1) over (
         ORDER BY k ASC
         ROWS BETWEEN 2 PRECEDING and CURRENT ROW
     ), 3) AS variance_samp_val1
@@ -670,7 +670,7 @@ USE ${case_db};
 SELECT
     k,
     val1,
-    round(variance_samp(val1) over (
+    round(var_samp(val1) over (
         ORDER BY k ASC
         ROWS BETWEEN 2 PRECEDING and CURRENT ROW
     ), 3) AS variance_samp_val1
@@ -679,35 +679,35 @@ order by k;
 
 -- query 116
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k > 100;
+select round(var_samp(val1), 3) from t1 where k > 100;
 
 -- query 117
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1_nonnull where k > 100;
+select round(var_samp(val1), 3) from t1_nonnull where k > 100;
 
 -- query 118
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k = 2;
+select round(var_samp(val1), 3) from t1 where k = 2;
 
 -- query 119
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1_nonnull where k = 2;
+select round(var_samp(val1), 3) from t1_nonnull where k = 2;
 
 -- query 120
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k in (2, 5, 6);
+select round(var_samp(val1), 3) from t1 where k in (2, 5, 6);
 
 -- query 121
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1 where k in (5, 6);
+select round(var_samp(val1), 3) from t1 where k in (5, 6);
 
 -- query 122
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1_nonnull;
+select round(var_samp(val1), 3) from t1_nonnull;
 
 -- query 123
 USE ${case_db};
-select round(variance_samp(val1), 3) from t1;
+select round(var_samp(val1), 3) from t1;
 
 -- query 124
 USE ${case_db};

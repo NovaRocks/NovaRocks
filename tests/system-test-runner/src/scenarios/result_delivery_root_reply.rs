@@ -56,8 +56,8 @@ const ESTABLISH: &str = novarocks_failpoint::observation_marker::PARTICIPATION_E
 const PREPARED_ROOT: &str = novarocks_failpoint::observation_marker::TASK_PREPARED_CLIENT_ROOT;
 // Observation storage bound only; this does not change TaskGraph or admission caps.
 const MARKERS_PER_BACKEND: usize = 8;
-const SQL: &str = "SELECT REPEAT('x',64) AS payload";
-const HEALTH: &str = "SELECT SUM(generate_series) AS total FROM TABLE(generate_series(1, 100))";
+const SQL: &str = "SELECT rpad('', 64, 'x') AS payload";
+const HEALTH: &str = "SELECT SUM(sequential_number) AS total FROM TABLE(sequence(1, 100))";
 
 #[derive(Clone, Copy)]
 enum Case {

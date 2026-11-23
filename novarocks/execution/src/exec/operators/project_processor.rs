@@ -19,7 +19,7 @@
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::runtime::task::ExecutionResult;
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef, NullArray};
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
 use std::sync::Arc;
@@ -345,6 +345,7 @@ pub(crate) fn materialize_project_output(
 pub(crate) enum ProjectEncodingSource<'a> {
     Plain,
     OriginalField(&'a arrow::datatypes::Field),
+    FinalResultField(&'a arrow::datatypes::Field),
 }
 
 pub(crate) fn project_reserve<T>(
@@ -507,6 +508,44 @@ pub(crate) fn materialize_project_output_owned<'a>(
             column,
             |step| owner.observe(ordinal, &[], step),
         )?;
+        if column.data_type() == &DataType::Null
+            && declared.slots()[ordinal].data_type() == &DataType::Null
+            && matches!(
+                encoding_at(ordinal)?,
+                ProjectEncodingSource::Plain | ProjectEncodingSource::FinalResultField(_)
+            )
+        {
+            let value = column.as_any().downcast_ref::<NullArray>().ok_or_else(|| {
+                ConstructionFailure::InvalidSource(
+                    "project UNKNOWN result has no standard NullArray value".into(),
+                )
+            })?;
+            if value.len() != row_count || column.len() != row_count {
+                return Err(ConstructionFailure::InvalidSource(
+                    "project UNKNOWN result differs from the declared row count".into(),
+                )
+                .into());
+            }
+            let original = column.as_ref();
+            if std::ptr::from_ref(original).cast::<()>() != std::ptr::from_ref(value).cast::<()>()
+                || std::mem::size_of_val(original) != std::mem::size_of::<NullArray>()
+            {
+                // UNKNOWN has no payload or nested metadata. Materialize its
+                // length under this Project's construction owner before
+                // releasing the expression's bufferless custody wrapper.
+                use novarocks_type_contract::owned_resources::layout::arc_layout;
+                owner.request(
+                    arc_layout(std::alloc::Layout::new::<NullArray>())
+                        .map_err(ConstructionFailure::from)?,
+                )?;
+                *column = Arc::new(NullArray::new(row_count));
+                owner.observe(
+                    ordinal,
+                    &[],
+                    crate::exec::chunk::ArrayNormalizationStep::OpaqueOperationFinished,
+                )?;
+            }
+        }
         if column.data_type() != declared.slots()[ordinal].data_type()
             && matches!(encoding_at(ordinal)?, ProjectEncodingSource::Plain)
         {
@@ -536,7 +575,8 @@ pub(crate) fn materialize_project_output_owned<'a>(
                 continue;
             }
             let actor = match encoding_at(ordinal)? {
-                ProjectEncodingSource::OriginalField(field) => field,
+                ProjectEncodingSource::OriginalField(field)
+                | ProjectEncodingSource::FinalResultField(field) => field,
                 ProjectEncodingSource::Plain => {
                     return Err(ConstructionFailure::InvalidSource(
                         "project representation change has no explicit encoding producer".into(),
@@ -633,6 +673,80 @@ mod tests {
             .unwrap(),
         )
     }
+
+    #[test]
+    fn project_materializes_bufferless_unknown_as_a_standard_root_array() {
+        use crate::exec::{
+            chunk::{RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage},
+            operators::compiled_expression::RuntimeKernelControl,
+            pipeline::operator::input_construction::try_runtime_input_construction_factory,
+        };
+        use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
+        use novarocks_functions::{SourceBackingOwner, retain_source_backing};
+
+        for final_result in [false, true] {
+            let tracker = MemTracker::new_root("project bufferless UNKNOWN custody");
+            let errors = Arc::new(RuntimeErrorState::default());
+            let mut control = RuntimeKernelControl::new(Arc::clone(&errors));
+            control.bind_mem_tracker(Arc::clone(&tracker));
+            let drop_witness = Arc::new(());
+            let source = SourceBackingOwner::try_from_owned(
+                Arc::clone(&drop_witness),
+                control.allocator().unwrap(),
+                &control,
+            )
+            .unwrap();
+            let owned =
+                retain_source_backing(Arc::new(NullArray::new(3)), &source, &control).unwrap();
+            drop(source);
+            assert_eq!(Arc::strong_count(&drop_witness), 2);
+            let limits = RootArrayStorageLimits {
+                bytes: 1 << 20,
+                nodes: 4,
+                depth: 2,
+            };
+            assert_eq!(
+                borrowed_root_array_storage(owned.as_ref(), limits),
+                Err(RootArrayStorageError::CarrierOuterOwnerMismatch)
+            );
+
+            let declaration = novarocks_type_contract::FunctionValueType::new(DataType::Null, true);
+            let output_schema = typed_output(&declaration);
+            let factory = try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                Arc::clone(&tracker),
+                errors,
+            )
+            .unwrap();
+            let owner = factory.begin_typed_construction(&output_schema).unwrap();
+            let mut columns = project_reserve(1, owner.as_ref()).unwrap();
+            columns.push(owned);
+            let output = materialize_project_output_owned(
+                columns,
+                3,
+                output_schema.clone(),
+                |_| Ok(declaration.typed_binding()),
+                |_| {
+                    Ok(if final_result {
+                        ProjectEncodingSource::FinalResultField(output_schema.slots()[0].field())
+                    } else {
+                        ProjectEncodingSource::Plain
+                    })
+                },
+                owner.storage_lifetime(),
+                owner.as_ref(),
+            )
+            .unwrap();
+            assert_eq!(Arc::strong_count(&drop_witness), 1);
+            let array = &output.columns()[0];
+            assert_eq!(array.data_type(), &DataType::Null);
+            assert_eq!(array.logical_null_count(), 3);
+            assert!(borrowed_root_array_storage(array.as_ref(), limits).is_ok());
+            drop((output, owner, factory, control));
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+
     // The same two real owners used by CompiledProjectProcessor::apply.
     // This fixture supplies only data/ports and the actual construction factory.
     fn validate_and_materialize(output: &ChunkSchemaRef, input: Chunk) -> ExecutionResult<Chunk> {

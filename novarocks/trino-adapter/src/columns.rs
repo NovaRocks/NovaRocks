@@ -565,6 +565,15 @@ impl Write for ExactName {
         Ok(())
     }
 }
+/// DESCRIBE always uses exact datetime precision; interval text uses the client capability.
+pub fn described_type_name(
+    ty: &NativeRenderType,
+    mut facts: TrinoJsonFacts,
+) -> Result<String, String> {
+    facts.parametric_datetime = true;
+    exact_type_name(ty, facts).map_err(|error| error.to_string())
+}
+
 fn exact_type_name(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<String, ColumnsError> {
     let length = counted_type_name(ty, facts)?;
     let mut writer = ExactName {

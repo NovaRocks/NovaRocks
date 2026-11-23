@@ -140,7 +140,7 @@ impl Drop for SessionClose {
 pub(crate) async fn run(
     entry: Arc<QueryEntry>,
     sessions: Arc<dyn QuerySessionFactory>,
-    request: crate::request::ParsedStatementRequest,
+    mut request: crate::request::ParsedStatementRequest,
     claim: ClientQueryClaim,
 ) {
     let mut commands = entry.command.subscribe();

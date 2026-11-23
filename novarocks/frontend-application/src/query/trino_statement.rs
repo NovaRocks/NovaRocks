@@ -2,6 +2,8 @@
 
 //! Temporary typed statement entrance for Trino compatibility tests.
 
+pub(crate) mod prepared_description;
+
 use super::*;
 
 mod kill_query;
@@ -11,8 +13,8 @@ use novarocks_query_application::{
     session::{QuerySessionStatement, StatementAdmission, StatementOutputShape},
     session_control::{GovernedQueryStatementOwner, StatementCompletionProjection},
     sql::trino_admission::{
-        TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement,
-        admit_trino_statement_in_namespace,
+        AdmittedTrinoStatement, TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation,
+        admit_trino_statement_request_in_namespace,
     },
     statement_kind::StatementKind,
 };
@@ -84,65 +86,110 @@ impl FrontendQuerySession {
             .map_err(internal_error)?;
         let statement = novarocks_query_application::sql::parse_single_statement(&source)
             .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(&source)))?;
-        let admitted = if matches!(&statement, ast::TrinoStatement::Call(call) if call.name.parts.len() < 3)
-        {
+        let snapshots =
+            std::mem::take(&mut *self.prepared_statements.lock().map_err(poisoned_state)?);
+        let (catalog, schema) = {
             let state = self.state.lock().map_err(poisoned_state)?;
-            admit_trino_statement_in_namespace(
-                &source,
-                statement,
-                state.current_catalog(),
-                state.explicit_database(),
-            )?
-        } else {
-            admit_trino_statement(&source, statement)?
+            (
+                state.current_catalog().map(str::to_owned),
+                state.explicit_database().map(str::to_owned),
+            )
         };
-        match admitted {
-            TrinoStatementAction::Query(action) => {
-                let kind = match &action {
-                    TrinoQueryAction::Read(_) | TrinoQueryAction::Show(_) => StatementKind::Query,
-                    TrinoQueryAction::Explain(_) | TrinoQueryAction::ExplainAnalyze(_) => {
-                        StatementKind::Explain
-                    }
-                };
-                let result = self
-                    .execute_trino_query_family(source, action, statement_time)
-                    .await?;
-                Ok(QuerySessionStatement::output_owned(result, kind))
-            }
-            TrinoStatementAction::Session(action) => {
-                self.execute_trino_session_action(source, action, statement_time)
+        let AdmittedTrinoStatement {
+            source: statement_source,
+            parameters,
+            action,
+        } = admit_trino_statement_request_in_namespace(
+            source,
+            statement,
+            &snapshots,
+            catalog.as_deref(),
+            schema.as_deref(),
+        )?;
+        drop(snapshots);
+        let source = statement_source.sql().clone();
+        let result = async {
+            match action {
+                TrinoStatementAction::Query(action) => {
+                    let kind = match &action {
+                        TrinoQueryAction::Read(_) | TrinoQueryAction::Show(_) => {
+                            StatementKind::Query
+                        }
+                        TrinoQueryAction::Explain(_) | TrinoQueryAction::ExplainAnalyze(_) => {
+                            StatementKind::Explain
+                        }
+                    };
+                    let result = self
+                        .execute_trino_query_family(
+                            statement_source.clone(),
+                            parameters,
+                            action,
+                            statement_time,
+                        )
+                        .await?;
+                    Ok(QuerySessionStatement::output_owned(result, kind))
+                }
+                TrinoStatementAction::Session(action) => {
+                    self.execute_trino_session_action(source, action, parameters, statement_time)
+                        .await
+                }
+                TrinoStatementAction::Product(command) => {
+                    let plan = product_plan(&command)?;
+                    let kind = plan.admission.kind;
+                    let result = match self
+                        .start_trino_command(
+                            &source,
+                            plan,
+                            statement_started_at,
+                            statement_time,
+                            parameters,
+                        )
+                        .await?
+                    {
+                        CommandStart::Ready(entry) => {
+                            self.execute_trino_product(command, *entry).await?
+                        }
+                        CommandStart::Error(result) => *result,
+                    };
+                    Ok(QuerySessionStatement::output_owned(result, kind))
+                }
+                TrinoStatementAction::Prepare(preparation) => {
+                    let plan = preparation_plan(&preparation)?;
+                    let kind = plan.admission.kind;
+                    let result = match self
+                        .start_trino_command(
+                            &source,
+                            plan,
+                            statement_started_at,
+                            statement_time,
+                            parameters,
+                        )
+                        .await?
+                    {
+                        CommandStart::Ready(entry) => {
+                            self.execute_trino_preparation(source, preparation, *entry)
+                                .await?
+                        }
+                        CommandStart::Error(result) => *result,
+                    };
+                    Ok(QuerySessionStatement::output_owned(result, kind))
+                }
+                TrinoStatementAction::Describe(description) => {
+                    self.execute_trino_describe(
+                        statement_source.clone(),
+                        description,
+                        parameters,
+                        statement_started_at,
+                        statement_time,
+                    )
                     .await
-            }
-            TrinoStatementAction::Product(command) => {
-                let plan = product_plan(&command)?;
-                let kind = plan.admission.kind;
-                let result = match self
-                    .start_trino_command(&source, plan, statement_started_at, statement_time)
-                    .await?
-                {
-                    CommandStart::Ready(entry) => {
-                        self.execute_trino_product(command, *entry).await?
-                    }
-                    CommandStart::Error(result) => *result,
-                };
-                Ok(QuerySessionStatement::output_owned(result, kind))
-            }
-            TrinoStatementAction::Prepare(preparation) => {
-                let plan = preparation_plan(&preparation)?;
-                let kind = plan.admission.kind;
-                let result = match self
-                    .start_trino_command(&source, plan, statement_started_at, statement_time)
-                    .await?
-                {
-                    CommandStart::Ready(entry) => {
-                        self.execute_trino_preparation(source, preparation, *entry)
-                            .await?
-                    }
-                    CommandStart::Error(result) => *result,
-                };
-                Ok(QuerySessionStatement::output_owned(result, kind))
+                }
             }
         }
+        .await;
+        result
+            .map(|result| result.with_trino_statement_source(statement_source.clone()))
+            .map_err(|error| error.with_trino_statement_source(statement_source))
     }
 
     async fn start_trino_command(
@@ -151,6 +198,7 @@ impl FrontendQuerySession {
         plan: CommandPlan,
         statement_started_at: std::time::SystemTime,
         statement_time: novarocks_type_contract::StatementTimeEnvironment,
+        parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     ) -> Result<CommandStart, QueryServiceError> {
         self.admission.publish(plan.admission);
         *self.output_shape.lock().map_err(poisoned_state)? = Some(plan.admission.shape);
@@ -273,6 +321,7 @@ impl FrontendQuerySession {
                 )
                 .with_session_property_inputs(properties),
             )
+            .with_prepared_parameters(parameters)
             .with_result_capacity(capacity)
             .map_err(|error| internal_error(error.to_string()))?;
             let connector = crate::connector::connector_request_context_for_execution_on_runtime(
@@ -996,7 +1045,65 @@ impl FrontendQuerySession {
             delete::DeleteStatementInput, insert::InsertStatementInput,
             mutation::MutationStatementInput,
         };
-        let CommandEntry { statement, input } = entry;
+        let CommandEntry {
+            mut statement,
+            mut input,
+        } = entry;
+        if let TrinoWrite::Insert(node) = &command
+            && let Some(parameters) = input.request.execution().prepared_parameters().cloned()
+            && !parameters.contextual_needs(&node.query).is_empty()
+        {
+            let window = input
+                .command
+                .result_window_alias()
+                .ok_or_else(|| internal_error("Prepared INSERT has no original result window"))?;
+            let control = crate::query_execution::planning::sql_compile_control_from_execution(
+                input.request.execution(),
+            );
+            let state = self.state.lock().map_err(poisoned_state)?.clone();
+            let context = self.service.query_compiler.property_cpu_context(
+                input.request.session().current_database().to_owned(),
+                input.request.execution().sql_semantics().clone(),
+                self.service.required_constant_interpreter.clone(),
+                control,
+                input.command.scope().clone(),
+                window.clone(),
+            );
+            let query = (*node.query).clone();
+            let argument_source = source.clone();
+            let (completed, owner, _window) = execute_synchronous_stage(
+                self.service.query_blocking_executor.clone(),
+                input.cancellation.clone(),
+                statement
+                    .take_execution_owner()
+                    .expect("original INSERT preparation owner"),
+                Some(window),
+                None,
+                move || {
+                    super::session_property_computation::complete_prepared_context(
+                        parameters,
+                        &query,
+                        &state,
+                        &context,
+                        &argument_source,
+                    )
+                    .map_err(RoutedExecutionError::Application)
+                },
+            )
+            .await
+            .map_err(internal_error)?;
+            statement.restore_execution_owner(owner);
+            match completed {
+                Ok(parameters) => {
+                    input.request = input.request.with_prepared_parameters(Some(parameters));
+                }
+                Err(error) => {
+                    return Ok(
+                        self.governed_typed_error(routed_execution_service_error(error), statement)
+                    );
+                }
+            }
+        }
         let dml_error =
             |error| routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err());
         let action = (|| {
@@ -1564,6 +1671,7 @@ mod add_files_control_tests {
 #[cfg(test)]
 mod branch_delete_tests {
     use super::*;
+    use novarocks_query_application::sql::trino_admission::admit_trino_statement;
 
     #[test]
     fn whole_branch_delete_uses_the_same_target_with_delete_completion() {

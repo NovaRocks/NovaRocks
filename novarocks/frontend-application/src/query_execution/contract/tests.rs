@@ -489,7 +489,7 @@ fn reconstructed_runtime_options_preserve_protocol_scalars() {
         runtime_filter_scan_wait_time_ms: Some(250),
         runtime_filter_wait_timeout_ms: Some(5000),
         allow_throw_exception: true,
-        group_concat_max_len: Some(65_535),
+
         enable_join_runtime_bitset_filter: Some(false),
         global_runtime_filter_build_max_size: 1 << 19,
         orc_use_column_names: true,
@@ -518,7 +518,7 @@ fn reconstructed_runtime_options_preserve_protocol_scalars() {
     assert_eq!(runtime.runtime_filter_scan_wait_time_ms, Some(250));
     assert_eq!(runtime.runtime_filter_wait_timeout_ms, Some(5000));
     assert!(runtime.allow_throw_exception);
-    assert_eq!(runtime.group_concat_max_len, Some(65_535));
+
     assert_eq!(runtime.enable_join_runtime_bitset_filter, Some(false));
     assert_eq!(runtime.global_runtime_filter_build_max_size, Some(1 << 19));
     assert!(runtime.orc_use_column_names);

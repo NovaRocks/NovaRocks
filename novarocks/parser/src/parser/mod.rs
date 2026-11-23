@@ -43,6 +43,7 @@ mod statement;
 mod table_alter;
 mod table_statement;
 mod types;
+mod validation;
 mod view_statement;
 mod window;
 mod write_statement;
@@ -57,12 +58,14 @@ use failure::GrammarError;
 
 pub(crate) use literal::numeric_literal_kind;
 pub use script::{StatementFrame, frame_statements};
+pub use validation::validate_statement_syntax;
 
 struct Parser<'source> {
     source: &'source str,
     tokens: Vec<Token>,
     position: usize,
     next_parameter: usize,
+    track_parameter_events: bool,
     // Only committed parameter productions enter this construction ledger.
     // Pattern quantifiers and trivia question marks are not parameter events.
     parameter_events: Vec<Span>,
@@ -87,11 +90,24 @@ impl<'source> Parser<'source> {
             tokens,
             position: 0,
             next_parameter: 0,
+            track_parameter_events: true,
             parameter_events: Vec::new(),
             grammar_boundary: None,
             alias_follow: false,
             routine_started: false,
         }
+    }
+
+    fn for_syntax_validation(source: &'source str) -> Result<Self, GrammarError> {
+        let mut parser = Self::new(source)?;
+        parser.track_parameter_events = false;
+        Ok(parser)
+    }
+
+    fn parse_complete_statement(&mut self) -> Result<TrinoStatement, GrammarError> {
+        let statement = self.parse_statement()?;
+        self.finish()?;
+        Ok(statement)
     }
 
     fn finish(&self) -> Result<(), GrammarError> {
@@ -158,8 +174,7 @@ impl<'source> Parser<'source> {
 /// Parses one complete Trino statement. Script separators belong to its caller.
 pub fn parse_statement(source: &str) -> Result<TrinoStatement, ParserError> {
     let mut parser = Parser::new(source)?;
-    let statement = parser.parse_statement()?;
-    parser.finish()?;
+    let statement = parser.parse_complete_statement()?;
     Ok(parser.parameter_numbers().fold_trino_statement(statement))
 }
 

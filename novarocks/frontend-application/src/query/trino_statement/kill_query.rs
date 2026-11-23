@@ -48,6 +48,7 @@ impl FrontendQuerySession {
             .take_execution_owner()
             .expect("original kill_query command owns its Work");
         let control = self.service.query_control.clone();
+        let parameters = input.request.execution().prepared_parameters().cloned();
         let mut worker = Box::pin(execute_prepared_dml_statement(
             self.service.query_blocking_executor.clone(),
             input.cancellation.clone(),
@@ -55,8 +56,11 @@ impl FrontendQuerySession {
             Some(window),
             statement.take_control_timing(),
             move || {
-                call.evaluate(&source, &mut context.constant_port())
-                    .map_err(RoutedExecutionError::Application)
+                call.evaluate(
+                    &source,
+                    &mut context.constant_port_with_parameters(parameters.as_deref()),
+                )
+                .map_err(RoutedExecutionError::Application)
             },
             move |arguments| {
                 let (query_id, message) = arguments

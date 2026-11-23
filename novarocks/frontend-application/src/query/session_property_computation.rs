@@ -57,6 +57,7 @@ pub(crate) enum ScopedSessionMutation {
 
 pub(crate) struct SessionPropertyMutation {
     pub(crate) mutation: Box<ScopedSessionMutation>,
+    pub(crate) parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     pub(crate) catalogs: Arc<dyn SessionCatalogPropertyPort>,
 }
 
@@ -93,6 +94,7 @@ impl SessionPropertyCpuInput {
             catalog: &self.catalog,
             functions: &self.functions,
             policy: self.policy,
+            parameters: self.mutation.parameters.as_deref(),
         };
         let effects = self.prepare_scoped(
             &evaluator,
@@ -164,6 +166,7 @@ impl SessionPropertyCpuInput {
 }
 pub(crate) struct QuerySessionPropertyCpuInput {
     pub(crate) source: Arc<str>,
+    pub(super) parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     pub(super) statement: super::query_session_action::QueryFamily,
     pub(crate) original: SessionSqlState,
     pub(crate) registry: Arc<SessionPropertyRegistry>,
@@ -173,6 +176,7 @@ pub(crate) struct QuerySessionPropertyCpuInput {
 
 pub(crate) struct PreparedQuerySession {
     pub(super) statement: super::query_session_action::QueryFamily,
+    pub(super) parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     pub(crate) state: SessionSqlState,
 }
 
@@ -188,6 +192,7 @@ impl QuerySessionPropertyCpuInput {
             catalog: &self.context.catalog,
             functions: &self.context.functions,
             policy: self.context.policy,
+            parameters: self.parameters.as_deref(),
         };
         let state = self.registry.prepare_query_session(
             &self.source,
@@ -206,9 +211,98 @@ impl QuerySessionPropertyCpuInput {
         )?;
         Ok(PreparedQuerySession {
             statement: self.statement,
+            parameters: self.parameters,
             state,
         })
     }
+}
+
+pub(crate) struct QueryContextsCpuInput {
+    source: Arc<str>,
+    prepared: PreparedQuerySession,
+    context: PropertyCpuContext,
+}
+
+impl QueryContextsCpuInput {
+    pub(crate) fn run(mut self) -> Result<PreparedQuerySession, QueryServiceError> {
+        if let Some(parameters) = self.prepared.parameters.take() {
+            self.prepared.parameters = Some(complete_prepared_context(
+                parameters,
+                self.prepared.statement.query(),
+                &self.prepared.state,
+                &self.context,
+                &self.source,
+            )?);
+        }
+        Ok(self.prepared)
+    }
+}
+
+struct QueryContextsEnvironment {
+    source: Arc<str>,
+    compiler: super::compiler::FrontendQueryCompiler,
+    interpreter: Arc<crate::RequiredConstantInterpreter>,
+    statement_time: novarocks_type_contract::StatementTimeEnvironment,
+}
+
+pub(super) fn complete_prepared_context(
+    parameters: Arc<novarocks_sql::compiler::SqlPreparedParameters>,
+    query: &ast::Query,
+    state: &SessionSqlState,
+    context: &PropertyCpuContext,
+    source: &str,
+) -> Result<Arc<novarocks_sql::compiler::SqlPreparedParameters>, QueryServiceError> {
+    let needs = parameters.contextual_needs(query);
+    if needs.is_empty() || parameters.is_description() {
+        return Ok(parameters);
+    }
+    let compiler_error = |error| {
+        super::routed_execution_service_error(super::routed_compiler_failure(
+            super::compiler::FrontendQueryCompilerError::from_compile(error),
+            source,
+        ))
+    };
+    let semantic_settings = state.sql_semantics().clone();
+    let sql_semantics = match context.sql_semantics.statement_time() {
+        Some(time) => semantic_settings.with_statement_time(time),
+        None => semantic_settings,
+    };
+    let mut evaluated = Vec::with_capacity(needs.len());
+    for need in needs {
+        let prepared = {
+            let catalog = context.catalog.read().map_err(super::poisoned_state)?;
+            prepare_required_constant(RequiredConstantRequest {
+                input: need.input(),
+                target: need.target(),
+                catalog: &SqlPlannerTableSnapshot::new(&*catalog),
+                current_database: state.current_database(),
+                functions: context.functions.clone(),
+                sealed_functions: context.interpreter.sealed_functions(),
+                sql_semantics: &sql_semantics,
+                constant_policy: context.policy,
+                control: &context.control,
+            })
+            .map_err(compiler_error)?
+        };
+        let value = context
+            .interpreter
+            .evaluate(prepared, &context.scope, &context.window)
+            .map_err(|cause| match cause {
+                SqlConstantEvaluationError::Source(cause)
+                | SqlConstantEvaluationError::Outer(cause) => {
+                    QueryServiceError::from_failure_cause(cause)
+                }
+                SqlConstantEvaluationError::Control(control) => {
+                    QueryServiceError::from_compile_control(control)
+                }
+                other => super::internal_error(other.to_string()),
+            })?;
+        evaluated.push(value);
+    }
+    parameters
+        .with_contextual_values(query, evaluated, &context.control)
+        .map(Arc::new)
+        .map_err(compiler_error)
 }
 
 /// First phase of the registered Read/Explain Action. It moves the actual
@@ -217,6 +311,8 @@ pub(super) struct QuerySessionPreparation {
     source: Arc<crate::query_execution::completion_facts::FrontendPlanningCpuSource>,
     input: Option<QuerySessionPreparationInput>,
     computation: Option<QuerySessionComputation>,
+    contexts: Option<QueryContextsEnvironment>,
+    context_computation: Option<QuerySessionComputation>,
     effective: Option<PreparedQuerySession>,
     admission: Option<novarocks_query_application::session_control::SessionQueryAdmission>,
     grant: Option<novarocks_query_application::session_control::QueuedQueryGrant>,
@@ -225,6 +321,7 @@ pub(super) struct QuerySessionPreparation {
 
 pub(super) struct QuerySessionPreparationInput {
     pub(super) source: Arc<str>,
+    pub(super) parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     pub(super) statement: super::query_session_action::QueryFamily,
     pub(super) original: SessionSqlState,
     pub(super) statement_time: novarocks_type_contract::StatementTimeEnvironment,
@@ -254,6 +351,8 @@ impl QuerySessionPreparation {
             source,
             input: Some(input),
             computation: None,
+            contexts: None,
+            context_computation: None,
             effective: None,
             admission: None,
             grant: None,
@@ -282,6 +381,19 @@ impl QuerySessionPreparation {
             return Poll::Pending;
         }
         if let Some(input) = self.input.take() {
+            if input.parameters.as_ref().is_some_and(|parameters| {
+                !parameters.is_description()
+                    && !parameters
+                        .contextual_needs(input.statement.query())
+                        .is_empty()
+            }) {
+                self.contexts = Some(QueryContextsEnvironment {
+                    source: input.source.clone(),
+                    compiler: input.compiler.clone(),
+                    interpreter: input.interpreter.clone(),
+                    statement_time: input.statement_time,
+                });
+            }
             let cancellation =
                 QueryCancellationView::governed(owner.cancellation().clone(), owner.timeout_ms());
             if let Some(reason) = cancellation.reason() {
@@ -316,6 +428,7 @@ impl QuerySessionPreparation {
             );
             let cpu_input = QuerySessionPropertyCpuInput {
                 source: input.source,
+                parameters: input.parameters,
                 statement: input.statement,
                 original: input.original,
                 registry: input.registry,
@@ -362,6 +475,58 @@ impl QuerySessionPreparation {
                 },
             )?);
         }
+        if let Some(environment) = self.contexts.take() {
+            // queue_after_session_preparation has frozen the actual timeout.
+            // The original preparation retention is live until the grant is accepted.
+            let prepared = self
+                .effective
+                .take()
+                .expect("prepared session for bound contexts");
+            let window = owner.result_window_alias().ok_or_else(|| {
+                super::internal_error("Prepared context CPU lacks its original retention")
+            })?;
+            let cancellation =
+                QueryCancellationView::governed(owner.cancellation().clone(), owner.timeout_ms());
+            let control = SqlCompileControl::new(
+                owner
+                    .cancellation()
+                    .deadline()
+                    .map(tokio::time::Instant::into_std),
+                crate::query_execution::planning::sql_cancellation_observation(cancellation),
+            );
+            let context =
+                environment.compiler.property_cpu_context(
+                    prepared.state.current_database().to_owned(),
+                    prepared.state.sql_semantics().clone().with_statement_time(
+                        prepared.state.statement_time(environment.statement_time),
+                    ),
+                    environment.interpreter,
+                    control,
+                    owner.scope().clone(),
+                    window,
+                );
+            let input = QueryContextsCpuInput {
+                source: environment.source,
+                prepared,
+                context,
+            };
+            let source = self.source.clone();
+            self.context_computation =
+                Some(Box::pin(async move { source.query_contexts(input).await }));
+        }
+        if let Some(computation) = self.context_computation.as_mut() {
+            match computation.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(health)) => {
+                    self.health = Some(health);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(result)) => {
+                    drop(self.context_computation.take());
+                    self.effective = Some(result?);
+                }
+            }
+        }
         let grant = match self.admission.as_mut().unwrap().as_mut().poll(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(result) => result,
@@ -405,6 +570,7 @@ struct SessionPropertyEvaluation<'a> {
     catalog: &'a RwLock<novarocks_sql::planning::catalog::PlannerMemoryCatalog>,
     functions: &'a Arc<dyn SqlFunctionCatalog>,
     policy: novarocks_functions::ConstantPolicy,
+    parameters: Option<&'a novarocks_sql::compiler::SqlPreparedParameters>,
 }
 
 impl SessionPropertyEvaluation<'_> {
@@ -507,7 +673,13 @@ impl SessionPropertyEvaluation<'_> {
         let prepared = {
             let catalog = self.catalog.read().map_err(super::poisoned_state)?;
             prepare_required_constant(RequiredConstantRequest {
-                input: RequiredConstantInput::Expression(expression),
+                input: match self.parameters {
+                    Some(parameters) => RequiredConstantInput::PreparedExpression {
+                        expression,
+                        parameters,
+                    },
+                    None => RequiredConstantInput::Expression(expression),
+                },
                 target,
                 catalog: &SqlPlannerTableSnapshot::new(&*catalog),
                 current_database: original.current_database(),
@@ -669,6 +841,7 @@ mod tests {
                 source: Arc::from(sql),
                 mutation: SessionPropertyMutation {
                     mutation: Box::new(mutation),
+                    parameters: None,
                     catalogs: Arc::new(SystemOnly),
                 },
                 staged,
@@ -726,6 +899,7 @@ mod tests {
         );
         let prepared = QuerySessionPropertyCpuInput {
             source: Arc::from(source),
+            parameters: None,
             statement: super::super::query_session_action::QueryFamily::Read(Box::new(parsed.clone())),
             original: live.clone(),
             registry,

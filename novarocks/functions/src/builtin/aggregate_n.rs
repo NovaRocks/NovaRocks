@@ -53,6 +53,9 @@ impl NKernel {
     }
 }
 impl PreparedAggregateKernel for NKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,
@@ -299,7 +302,7 @@ impl NKernel {
                     return Err(KernelFailure::InstanceFailed);
                 }
                 work.step()?;
-                values.push(state.output(&mut work).map(Some)?);
+                values.push(state.output(&mut work)?);
             }
             if values.len() != expected {
                 return Err(internal("min_n/max_n state iterator shortened its extent"));

@@ -48,10 +48,10 @@ CREATE TABLE ${case_db}.small_table (
 
 CREATE TABLE ${case_db}.empty_t (LIKE ${case_db}.t0);
 
-INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 12000));
+INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(1, 12000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t0 VALUES ROW(null, null, null, null);
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
-INSERT INTO ${case_db}.small_table SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 100));
+INSERT INTO ${case_db}.small_table SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(sequence(1, 100)) AS generate_series(generate_series);
 
 -- query 2
 select count(*) from ${case_db}.t0;
@@ -143,9 +143,9 @@ with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*),
 
 -- TableFunction
 -- query 36
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(generate_series(1, 100)) r on l.c0 = r.generate_series;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(sequence(1, 100)) r(generate_series) on l.c0 = r.generate_series;
 -- query 37
-with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(generate_series(1, 100)) r on l.c0 = r.generate_series;
+with agged_table as (select distinct c0, c1 from ${case_db}.t0) select count(*), sum(l.c0), sum(l.c1) from agged_table l join  TABLE(sequence(1, 100)) r(generate_series) on l.c0 = r.generate_series;
 
 -- bucket shuffle with group by
 -- query 38

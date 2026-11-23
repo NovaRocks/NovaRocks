@@ -64,7 +64,10 @@ impl ArrayKernel {
     fn kind(&self) -> ArrayAggKind<'_> {
         match self.operation {
             Operation::Array => ArrayAggKind::Array {
-                distinct: false,
+                distinct: self
+                    .contract
+                    .state_interpretation()
+                    .map_or_else(|| self.contract.distinct(), |original| original.distinct),
                 ascending: &self.ascending,
                 nulls_first: &self.nulls_first,
             },
@@ -115,6 +118,9 @@ impl ArrayKernel {
     }
 }
 impl PreparedAggregateKernel for ArrayKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

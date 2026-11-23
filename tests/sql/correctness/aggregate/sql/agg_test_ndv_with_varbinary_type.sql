@@ -37,25 +37,25 @@ CREATE TABLE tbinary_ndv_test (
 USE ${case_db};
 INSERT INTO tbinary_ndv_test
 SELECT generate_series,
-       to_binary(CONCAT('value_', CAST(generate_series AS VARCHAR)), 'utf8'),
+       to_utf8(CONCAT('value_', CAST(generate_series AS VARCHAR))),
        (generate_series - 1) % 5 + 1
-FROM TABLE(GENERATE_SERIES(1, 100));
+FROM TABLE(sequence(1, 100)) AS generate_series(generate_series);
 
 -- query 4
 USE ${case_db};
-SELECT ndv(data) AS ndv_result FROM tbinary_ndv_test;
+SELECT approx_distinct(data) AS ndv_result FROM tbinary_ndv_test;
 
 -- query 5
 USE ${case_db};
-SELECT category, ndv(data) AS ndv_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
+SELECT category, approx_distinct(data) AS ndv_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
 
 -- query 6
 USE ${case_db};
-SELECT approx_count_distinct(data) AS approx_count_result FROM tbinary_ndv_test;
+SELECT approx_distinct(data) AS approx_count_result FROM tbinary_ndv_test;
 
 -- query 7
 USE ${case_db};
-SELECT category, approx_count_distinct(data) AS approx_count_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
+SELECT category, approx_distinct(data) AS approx_count_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
 
 -- query 8
 USE ${case_db};
@@ -78,23 +78,23 @@ CREATE TABLE tbinary_ndv_null_test (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO tbinary_ndv_null_test VALUES
-ROW(1, to_binary('aaa', 'utf8'), 1),
-ROW(2, to_binary('bbb', 'utf8'), 1),
+ROW(1, to_utf8('aaa'), 1),
+ROW(2, to_utf8('bbb'), 1),
 ROW(3, NULL, 1),
-ROW(4, to_binary('aaa', 'utf8'), 2),
-ROW(5, to_binary('ccc', 'utf8'), 2),
+ROW(4, to_utf8('aaa'), 2),
+ROW(5, to_utf8('ccc'), 2),
 ROW(6, NULL, 2),
-ROW(7, to_binary('ddd', 'utf8'), 3),
-ROW(8, to_binary('eee', 'utf8'), 3),
-ROW(9, to_binary('fff', 'utf8'), 3);
+ROW(7, to_utf8('ddd'), 3),
+ROW(8, to_utf8('eee'), 3),
+ROW(9, to_utf8('fff'), 3);
 
 -- query 12
 USE ${case_db};
-SELECT ndv(data) AS ndv_with_null FROM tbinary_ndv_null_test;
+SELECT approx_distinct(data) AS ndv_with_null FROM tbinary_ndv_null_test;
 
 -- query 13
 USE ${case_db};
-SELECT category, ndv(data) AS ndv_with_null FROM tbinary_ndv_null_test GROUP BY category ORDER BY category;
+SELECT category, approx_distinct(data) AS ndv_with_null FROM tbinary_ndv_null_test GROUP BY category ORDER BY category;
 
 -- query 14
 USE ${case_db};
@@ -116,17 +116,17 @@ CREATE TABLE tbinary_ndv_dup_test (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO tbinary_ndv_dup_test VALUES
-ROW(1, to_binary('same_value', 'utf8')),
-ROW(2, to_binary('same_value', 'utf8')),
-ROW(3, to_binary('same_value', 'utf8')),
-ROW(4, to_binary('different_value', 'utf8')),
-ROW(5, to_binary('different_value', 'utf8')),
+ROW(1, to_utf8('same_value')),
+ROW(2, to_utf8('same_value')),
+ROW(3, to_utf8('same_value')),
+ROW(4, to_utf8('different_value')),
+ROW(5, to_utf8('different_value')),
 ROW(6, NULL),
 ROW(7, NULL);
 
 -- query 18
 USE ${case_db};
-SELECT ndv(data) AS ndv_dup_result FROM tbinary_ndv_dup_test;
+SELECT approx_distinct(data) AS ndv_dup_result FROM tbinary_ndv_dup_test;
 
 -- query 19
 USE ${case_db};
@@ -147,15 +147,15 @@ CREATE TABLE tbinary_multi_distinct_test (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO tbinary_multi_distinct_test VALUES
-ROW(1, to_binary('value1', 'utf8'), to_binary('val1', 'utf8'), to_binary('v1', 'utf8'), 1),
-ROW(2, to_binary('value2', 'utf8'), to_binary('val1', 'utf8'), to_binary('v1', 'utf8'), 1),
-ROW(3, to_binary('value1', 'utf8'), to_binary('val2', 'utf8'), to_binary('v2', 'utf8'), 1),
-ROW(4, to_binary('value3', 'utf8'), to_binary('val2', 'utf8'), to_binary('v1', 'utf8'), 2),
-ROW(5, to_binary('value4', 'utf8'), to_binary('val3', 'utf8'), to_binary('v3', 'utf8'), 2),
-ROW(6, to_binary('value3', 'utf8'), to_binary('val3', 'utf8'), to_binary('v2', 'utf8'), 2),
-ROW(7, to_binary('value5', 'utf8'), to_binary('val4', 'utf8'), to_binary('v4', 'utf8'), 3),
-ROW(8, to_binary('value6', 'utf8'), to_binary('val4', 'utf8'), to_binary('v4', 'utf8'), 3),
-ROW(9, to_binary('value5', 'utf8'), to_binary('val5', 'utf8'), to_binary('v5', 'utf8'), 3);
+ROW(1, to_utf8('value1'), to_utf8('val1'), to_utf8('v1'), 1),
+ROW(2, to_utf8('value2'), to_utf8('val1'), to_utf8('v1'), 1),
+ROW(3, to_utf8('value1'), to_utf8('val2'), to_utf8('v2'), 1),
+ROW(4, to_utf8('value3'), to_utf8('val2'), to_utf8('v1'), 2),
+ROW(5, to_utf8('value4'), to_utf8('val3'), to_utf8('v3'), 2),
+ROW(6, to_utf8('value3'), to_utf8('val3'), to_utf8('v2'), 2),
+ROW(7, to_utf8('value5'), to_utf8('val4'), to_utf8('v4'), 3),
+ROW(8, to_utf8('value6'), to_utf8('val4'), to_utf8('v4'), 3),
+ROW(9, to_utf8('value5'), to_utf8('val5'), to_utf8('v5'), 3);
 
 -- query 22
 USE ${case_db};
@@ -176,15 +176,15 @@ ORDER BY category;
 
 -- query 24
 USE ${case_db};
-SELECT ndv(data1) AS ndv_data1,
-       approx_count_distinct(data2) AS approx_data2
+SELECT approx_distinct(data1) AS ndv_data1,
+       approx_distinct(data2) AS approx_data2
 FROM tbinary_multi_distinct_test;
 
 -- query 25
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT category,
-       ndv(data1) AS ndv_data1,
-       approx_count_distinct(data2) AS approx_data2,
+       approx_distinct(data1) AS ndv_data1,
+       approx_distinct(data2) AS approx_data2,
        ds_theta_count_distinct(data3) AS theta_data3
 FROM ${case_db}.tbinary_multi_distinct_test
 GROUP BY category
@@ -193,7 +193,7 @@ ORDER BY category;
 -- query 26
 USE ${case_db};
 SELECT COUNT(DISTINCT data1) AS exact_count1,
-       ndv(data2) AS approx_count2,
+       approx_distinct(data2) AS approx_count2,
        COUNT(DISTINCT data3) AS exact_count3
 FROM tbinary_multi_distinct_test;
 
@@ -201,8 +201,8 @@ FROM tbinary_multi_distinct_test;
 USE ${case_db};
 SELECT category,
        COUNT(DISTINCT data1) AS exact_count1,
-       ndv(data2) AS approx_count2,
-       approx_count_distinct(data3) AS approx_count3
+       approx_distinct(data2) AS approx_count2,
+       approx_distinct(data3) AS approx_count3
 FROM tbinary_multi_distinct_test
 GROUP BY category
 ORDER BY category;
@@ -232,7 +232,7 @@ USE ${case_db};
 SELECT category,
        COUNT(DISTINCT data1) AS distinct_data1,
        COUNT(DISTINCT data2) AS distinct_data2,
-       ndv(data3) AS ndv_data3,
+       approx_distinct(data3) AS ndv_data3,
        COUNT(*) AS total
 FROM tbinary_multi_distinct_test
 WHERE id > 2
@@ -254,13 +254,13 @@ CREATE TABLE tbinary_multi_null_test (
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO tbinary_multi_null_test VALUES
-ROW(1, to_binary('val1', 'utf8'), to_binary('valA', 'utf8'), 1),
-ROW(2, NULL, to_binary('valA', 'utf8'), 1),
-ROW(3, to_binary('val1', 'utf8'), NULL, 1),
+ROW(1, to_utf8('val1'), to_utf8('valA'), 1),
+ROW(2, NULL, to_utf8('valA'), 1),
+ROW(3, to_utf8('val1'), NULL, 1),
 ROW(4, NULL, NULL, 1),
-ROW(5, to_binary('val2', 'utf8'), to_binary('valB', 'utf8'), 2),
-ROW(6, to_binary('val2', 'utf8'), NULL, 2),
-ROW(7, NULL, to_binary('valB', 'utf8'), 2);
+ROW(5, to_utf8('val2'), to_utf8('valB'), 2),
+ROW(6, to_utf8('val2'), NULL, 2),
+ROW(7, NULL, to_utf8('valB'), 2);
 
 -- query 33
 USE ${case_db};
@@ -280,8 +280,8 @@ ORDER BY category;
 -- query 35
 USE ${case_db};
 SELECT COUNT(DISTINCT data1) AS exact1,
-       ndv(data2) AS approx2,
-       approx_count_distinct(data1) AS approx1,
+       approx_distinct(data2) AS approx2,
+       approx_distinct(data1) AS approx1,
        COUNT(DISTINCT data2) AS exact2
 FROM tbinary_multi_null_test;
 

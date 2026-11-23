@@ -6187,12 +6187,6 @@ impl<'a> ContractLoweringVisitor<'a> {
         plan: &PhysicalPlanNode,
         join: &crate::planner::physical::PhysicalNestLoopJoinNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
-        if matches!(join.join_type, crate::common::JoinKind::LeftMark { .. }) {
-            return Err(ContractLoweringError::InvalidJoin {
-                node: "NestLoopJoin",
-                detail: "left mark join requires hash execution",
-            });
-        }
         expect_children(plan, 2)?;
         require_output_shape("NestLoopJoin", &plan.output_columns, &join.output_columns)?;
         let left = self.lower_node(&plan.children[0])?;
@@ -6289,7 +6283,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         } = self.lower_join_outputs(
             node,
             JoinOutputRequest {
-                mark_column: None,
+                mark_column: join.join_type.mark_output().map(|column| column.column_id),
                 kind,
                 requested: &plan.output_columns,
                 left: &left,
@@ -7223,27 +7217,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             let original_binding = lower_aggregate_binding(call, phase, &mut self.work)?;
-            if let Some(facts) = call.source.binding().group_concat_source() {
-                let [(mode_id, mode), (max_id, value)] =
-                    facts
-                        .parameter_entries()
-                        .ok_or(ContractLoweringError::InvalidAggregate {
-                            detail: "group_concat has no admitted max length source",
-                        })?;
-                self.work.flush()?;
-                self.semantic_parameters.insert(mode_id, mode);
-                if self
-                    .semantic_parameters
-                    .get(&max_id)
-                    .is_some_and(|prior| prior != &value)
-                {
-                    return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "group_concat changes its admitted max length source",
-                    });
-                }
-                self.semantic_parameters.insert(max_id, value);
-                self.work.step()?;
-            }
             let logical_source = self.capture_aggregate_source(&call.source)?;
             let mut channels =
                 if phase.consumes_logical_arguments() && logical_source.captured().is_some() {

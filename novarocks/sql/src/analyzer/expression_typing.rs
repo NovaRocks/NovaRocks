@@ -90,13 +90,58 @@ impl ScalarBindingCatalog for StatementScalarCatalog<'_> {
 }
 
 impl AnalyzerContext<'_> {
+    pub(super) fn described_arguments(&self, args: &[TypedExpr]) -> Option<Vec<Option<usize>>> {
+        let factory = self.factory.borrow();
+        let description = factory.prepared_description.as_ref()?;
+        Some(
+            args.iter()
+                .map(|arg| description.parameter_ordinal(arg))
+                .collect(),
+        )
+    }
+
+    pub(super) fn observe_argument_types<'a>(
+        &self,
+        ordinals: Option<Vec<Option<usize>>>,
+        types: impl IntoIterator<Item = Option<&'a FunctionValueType>>,
+    ) -> Result<(), AnalyzeError> {
+        if let Some(ordinals) = ordinals {
+            let mut factory = self.factory.borrow_mut();
+            let description = factory
+                .prepared_description
+                .as_mut()
+                .expect("original description");
+            for (ordinal, target) in ordinals.into_iter().zip(types) {
+                self.check_control()?;
+                if let (Some(ordinal), Some(target)) = (ordinal, target) {
+                    description.coerce_parameter(ordinal, target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn observe_implicit_type(
+        &self,
+        source: &TypedExpr,
+        target: &FunctionValueType,
+    ) -> Result<(), AnalyzeError> {
+        if let Some(description) = &mut self.factory.borrow_mut().prepared_description
+            && let Some(ordinal) = description.parameter_ordinal(source)
+        {
+            description.coerce_parameter(ordinal, target)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn type_scalar_call(
         &self,
         shape: NodeShape<'_>,
         args: Vec<TypedExpr>,
         span: Span,
     ) -> Result<BoundScalarCall, AnalyzeError> {
-        type_scalar_call_with_environment(
+        let ordinals = self.described_arguments(&args);
+        let result = type_scalar_call_with_environment(
             self.function_catalog,
             shape,
             args,
@@ -106,7 +151,12 @@ impl AnalyzerContext<'_> {
             span,
             self.sql_semantics.statement_time(),
             self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
-        )
+        )?;
+        self.observe_argument_types(
+            ordinals,
+            result.args.iter().map(|arg| Some(&arg.value_type)),
+        )?;
+        Ok(result)
     }
 
     pub(super) fn type_value_node(
@@ -115,7 +165,8 @@ impl AnalyzerContext<'_> {
         args: Vec<TypedExpr>,
         span: Span,
     ) -> Result<(FunctionValueType, Vec<TypedExpr>), AnalyzeError> {
-        self.with_typing(span, |context, work| {
+        let ordinals = self.described_arguments(&args);
+        let (result, converted) = self.with_typing(span, |context, work| {
             let check_branch_constants = matches!(shape, NodeShape::SearchedCase { .. });
             let children = typed_children(context, &args, check_branch_constants, work)?;
             let NodeTyping::Value {
@@ -136,6 +187,34 @@ impl AnalyzerContext<'_> {
                     work,
                 )?,
             ))
+        })?;
+        self.observe_argument_types(ordinals, converted.iter().map(|arg| Some(&arg.value_type)))?;
+        Ok((result, converted))
+    }
+
+    pub(super) fn type_extract(
+        &self,
+        field: ast::ExtractField,
+        source: TypedExpr,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        self.with_typing(span, |context, work| {
+            work.flush()?;
+            let argument = function_argument(&source, context.constant_policy, work.control())?;
+            let selected = typing::bind_extract(context.catalog, field, &argument, work.control())?;
+            let FunctionResultType::Scalar(value_type) = &selected.selected.result_type else {
+                return Err(TypingError::InvalidShape("EXTRACT result is not scalar"));
+            };
+            Ok(TypedExpr {
+                value_type: value_type.clone(),
+                kind: ExprKind::FunctionCall {
+                    name: novarocks_parser::extract_call_name(field).into(),
+                    volatility: selected.semantics.volatility,
+                    binding: SqlFunctionBinding::new(selected, context.decimal_overflow_policy),
+                    args: vec![source].into(),
+                    distinct: false,
+                },
+            })
         })
     }
 
@@ -496,6 +575,9 @@ fn scalar_selection_error(
                 error,
                 FunctionBindingError::UnavailableImplementation(_)
                     | FunctionBindingError::VariantTargetType(_)
+                    | FunctionBindingError::ValueType(
+                        novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. }
+                    )
                     | FunctionBindingError::UnknownFunction
                     | FunctionBindingError::HiddenFunction
                     | FunctionBindingError::NoMatchingOverload
@@ -536,6 +618,11 @@ pub(super) fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeErr
     match error {
         TypingError::TypeMismatch(message) => AnalyzeError::type_mismatch(message, span),
         TypingError::InvalidLiteral(message) => AnalyzeError::invalid_literal(message, span),
+        TypingError::NumericOutOfRange(message) => AnalyzeError::at(
+            crate::analyze_error::AnalyzeErrorKind::NumericOutOfRange,
+            message,
+            span,
+        ),
         TypingError::Unsupported(message) => AnalyzeError::unsupported_expression(message, span),
         TypingError::Control(error) => AnalyzeError::control(error),
         TypingError::Binding(error @ FunctionBindingError::AmbiguousOverload) => {
@@ -643,6 +730,13 @@ fn apply_conversions(
                             context.decimal_overflow_policy,
                             conversion.expected_result,
                             conversion.target,
+                        )
+                    }
+                    typing::ValueConversionOrigin::ArrayCommonCoercion => {
+                        SqlFunctionBinding::new_with_array_common_constraint(
+                            conversion.binding,
+                            context.decimal_overflow_policy,
+                            conversion.expected_result,
                         )
                     }
                     typing::ValueConversionOrigin::OperatorDecimalFloat => {

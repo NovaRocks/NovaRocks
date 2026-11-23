@@ -1,49 +1,59 @@
+-- query 8
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	1	9	[0,1,2,3,4,5,6,7,8,9]
+
 -- query 9
--- types	boolean	boolean
-_col0	_col1
-true	true
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
+
+-- query 10
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
 
 -- query 11
--- types	boolean	boolean
-_col0	_col1
-true	true
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
+
+-- query 12
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
 
 -- query 13
--- types	boolean	boolean
-_col0	_col1
-true	true
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
+
+-- query 14
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
 
 -- query 15
--- types	boolean	boolean
-_col0	_col1
-true	true
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
+
+-- query 16
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
 
 -- query 17
--- types	boolean	boolean
-_col0	_col1
-true	true
+-- types	bigint	bigint	bigint	array(bigint)
+retained_rows	matched_rows	null_keys	retained_values
+10	0	9	[0,1,2,3,4,5,6,7,8,9]
 
--- query 19
--- types	boolean	boolean
-_col0	_col1
-true	true
+-- query 18
+-- types	bigint	bigint	bigint	array(bigint)
+fingerprints	negative_fingerprints	distinct_fingerprints	values_by_key
+10	10	10	[-4108050209,-2212294583,-450215437,-1842515611,-4088798008,-2226203566,-498629140,-1790921346,-4194326291,-2366072709]
 
--- query 21
--- types	boolean	boolean
-_col0	_col1
-true	true
-
--- query 23
--- types	boolean	boolean
-_col0	_col1
-true	true
-
--- query 25
--- types	boolean	boolean
-_col0	_col1
-true	true
-
--- query 27
--- types	boolean	boolean
-_col0	_col1
-true	true
+-- query 20
+-- types	bigint	bigint	bigint	bigint
+fingerprints	distinct_fingerprints	smallest_fingerprint	largest_fingerprint
+2	1	-4088798008	-4088798008

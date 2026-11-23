@@ -22,8 +22,8 @@ CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE json_mark_probe (id BIGINT, txt VARCHAR);
 CREATE TABLE json_mark_rhs (txt VARCHAR);
-INSERT INTO json_mark_probe SELECT generate_series, CONCAT('{"a":',CAST(generate_series AS VARCHAR),',"b":1}') FROM TABLE(generate_series(0,12));
-INSERT INTO json_mark_rhs SELECT CONCAT('{"b":1,"a":',CAST(generate_series AS VARCHAR),'}') FROM TABLE(generate_series(0,8));
+INSERT INTO json_mark_probe SELECT generate_series, CONCAT('{"a":',CAST(generate_series AS VARCHAR),',"b":1}') FROM TABLE(sequence(0,12)) AS generate_series(generate_series);
+INSERT INTO json_mark_rhs SELECT CONCAT('{"b":1,"a":',CAST(generate_series AS VARCHAR),'}') FROM TABLE(sequence(0,8)) AS generate_series(generate_series);
 INSERT INTO json_mark_rhs VALUES ROW(NULL),ROW('{"b":1,"a":0}');
 -- q16 oracle: 9 TRUE, 4 NULL, one output for each probe occurrence.
 SELECT id, parse_json(txt) IN (SELECT parse_json(txt) FROM json_mark_rhs) AS included FROM json_mark_probe ORDER BY id;

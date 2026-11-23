@@ -590,6 +590,14 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
             .map(|value| proto::AggregateInterpretation {
                 aggregate_id: Some(value.aggregate_id.as_bytes().to_vec()),
                 function_identity: Some(value.function_identity.clone()),
+                semantic_contract: value.semantic_contract.as_ref().map(|contract| {
+                    proto::PersistentAggregateContract {
+                        function_identity: Some(contract.function.as_str().to_owned()),
+                        overload_identity: Some(contract.overload.as_str().to_owned()),
+                        result_semantics: Some(contract.result_semantics.clone()),
+                        state_format: Some(contract.state_format.as_str().to_owned()),
+                    }
+                }),
                 source_fields: value
                     .source_fields
                     .iter()
@@ -780,6 +788,10 @@ fn interpretation_from_proto(
                         value.function_identity,
                         "interpretation.aggregate.function_identity",
                     )?,
+                    semantic_contract: value
+                        .semantic_contract
+                        .map(decode_persistent_aggregate)
+                        .transpose()?,
                     source_fields: value
                         .source_fields
                         .into_iter()
@@ -954,5 +966,42 @@ fn configuration_from_proto(
         paused: required(dto.paused, "configuration.paused")?,
         refresh_interval_ms: dto.refresh_interval_ms,
         max_staleness_ms: dto.max_staleness_ms,
+    })
+}
+
+fn decode_persistent_aggregate(
+    value: proto::PersistentAggregateContract,
+) -> Result<novarocks_functions::PersistentAggregateContract, PersistenceCodecError> {
+    use novarocks_functions::PersistentAggregateContract;
+    use novarocks_functions::{AggregateStateFormatIdentity, FunctionId, FunctionOverloadId};
+    let function = FunctionId::try_new(required(
+        value.function_identity,
+        "aggregate.semantic_contract.function",
+    )?)
+    .map_err(|error| PersistenceCodecError::MalformedWire(error.to_string()))?;
+    let overload = FunctionOverloadId::try_new(required(
+        value.overload_identity,
+        "aggregate.semantic_contract.overload",
+    )?)
+    .map_err(|error| PersistenceCodecError::MalformedWire(error.to_string()))?;
+    let state_format = AggregateStateFormatIdentity::try_new(required(
+        value.state_format,
+        "aggregate.semantic_contract.state_format",
+    )?)
+    .map_err(|error| PersistenceCodecError::MalformedWire(error.to_string()))?;
+    let result_semantics = required(
+        value.result_semantics,
+        "aggregate.semantic_contract.result_semantics",
+    )?;
+    if result_semantics.trim().is_empty() {
+        return Err(PersistenceCodecError::MalformedWire(
+            "aggregate semantic contract has an empty result identity".to_owned(),
+        ));
+    }
+    Ok(PersistentAggregateContract {
+        function,
+        overload,
+        state_format,
+        result_semantics,
     })
 }

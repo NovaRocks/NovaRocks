@@ -1549,8 +1549,6 @@ fn parameter_fragment_with_claims(
                     effects: parameter_fixture_effects(spec.reference),
                     decimal_overflow_policy: spec.decimal_overflow_policy,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -2552,7 +2550,9 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::GroupConcatLegacy(true),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
         ),
     ])
     .unwrap();

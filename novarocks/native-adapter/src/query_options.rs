@@ -37,7 +37,7 @@ pub fn decode_query_options(src: &novarocks::QueryOptions) -> QueryOptions {
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
         allow_throw_exception: src.allow_throw_exception,
-        group_concat_max_len: src.group_concat_max_len,
+
         enable_join_runtime_bitset_filter: src.enable_join_runtime_bitset_filter,
         global_runtime_filter_build_max_size: (src.global_runtime_filter_build_max_size > 0)
             .then_some(src.global_runtime_filter_build_max_size),
@@ -67,13 +67,13 @@ mod tests {
         let decoded = decode_query_options(&novarocks::QueryOptions {
             runtime_filter_scan_wait_time_ms: Some(0),
             runtime_filter_wait_timeout_ms: Some(0),
-            group_concat_max_len: Some(0),
+
             datacache_evict_probability: Some(0),
             ..Default::default()
         });
         assert_eq!(decoded.runtime_filter_scan_wait_time_ms(), Some(0));
         assert_eq!(decoded.runtime_filter_wait_timeout_ms(), Some(0));
-        assert_eq!(decoded.group_concat_max_len(), Some(0));
+
         assert_eq!(decoded.cache().datacache_evict_probability, Some(0));
         assert_eq!(decoded.enable_join_runtime_bitset_filter(), None);
     }

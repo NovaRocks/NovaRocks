@@ -19,8 +19,8 @@
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header::InvalidHeaderValue};
 use novarocks_query_application::{
     query_control::ClientQueryText,
-    session_effects::SessionEffects,
-    session_value::{SessionValue, StatementSessionError},
+    session_effects::{PreparedStatementEffect, SessionEffects},
+    session_value::{PreparedStatementSnapshot, SessionValue, StatementSessionError},
 };
 use novarocks_result_contract::{ClientPresentationFamily, TrinoJsonFacts};
 use serde::Serialize;
@@ -80,7 +80,7 @@ pub(crate) enum StatementBody {
     ByteLimitExceeded,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ParsedStatementRequest {
     sql: Option<ClientQueryText>,
     principal: std::sync::Arc<str>,
@@ -92,6 +92,7 @@ pub(crate) struct ParsedStatementRequest {
     query_text_too_large: Option<String>,
     unsupported: Option<String>,
     observation: RequestObservation,
+    prepared: PreparedStatementSnapshot,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -257,12 +258,7 @@ impl ParsedStatementRequest {
         let mut unsupported = transaction
             .filter(|value| !value.eq_ignore_ascii_case("NONE"))
             .map(|_| "Multi-statement transactions are not supported".into());
-        for name in [
-            "x-trino-prepared-statement",
-            "x-trino-role",
-            "x-trino-extra-credential",
-            "x-trino-path",
-        ] {
+        for name in ["x-trino-role", "x-trino-extra-credential", "x-trino-path"] {
             // These features have no semantic owner in TRC-1. They are retained
             // as a dispatch error without parsing or retaining credential data.
             for value in headers.get_all(name) {
@@ -289,7 +285,10 @@ impl ParsedStatementRequest {
         let client_info = singleton(headers, "x-trino-client-info")?.map(str::to_owned);
         let trace_token = trim_empty(singleton(headers, "x-trino-trace-token")?);
         let language = singleton(headers, "x-trino-language")?.map(str::to_owned);
+        let prepared = crate::prepared::decode(headers)
+            .map_err(|error| RequestRejection::malformed(error.to_string()))?;
         Ok(Self {
+            prepared,
             sql: sql.map(ClientQueryText::new),
             principal: configured_user.into(),
             catalog,
@@ -323,7 +322,13 @@ impl ParsedStatementRequest {
     pub fn observation(&self) -> &RequestObservation {
         &self.observation
     }
-    pub fn session_value(&self) -> Result<SessionValue, RequestSessionError> {
+    #[cfg(test)]
+    pub(crate) fn prepared_sql(&self, name: &str) -> Option<&std::sync::Arc<str>> {
+        self.prepared.get(name).map(|definition| definition.sql())
+    }
+    /// Transfer the admitted POST snapshot on first GET. The request keeps
+    /// only the original text and headers needed by the protocol driver.
+    pub fn session_value(&mut self) -> Result<SessionValue, RequestSessionError> {
         if let Some(message) = &self.query_text_too_large {
             return Err(RequestSessionError::QueryTextTooLarge(message.clone()));
         }
@@ -337,6 +342,7 @@ impl ParsedStatementRequest {
             self.time_zone.as_deref(),
             ClientPresentationFamily::TrinoJson(self.facts),
         )
+        .map(|value| value.with_prepared_statements(std::mem::take(&mut self.prepared)))
         .map_err(RequestSessionError::Session)
     }
 }
@@ -365,7 +371,7 @@ fn trim_empty(value: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
 }
-fn decode_form_value(value: &str) -> Option<String> {
+pub(crate) fn decode_form_value(value: &str) -> Option<String> {
     fn hex(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
@@ -390,6 +396,19 @@ fn decode_form_value(value: &str) -> Option<String> {
     }
     String::from_utf8(decoded).ok()
 }
+pub(crate) fn valid_form_value(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%'
+            && !(bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                && bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit()))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn encode_form_value(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::new();
@@ -409,10 +428,31 @@ fn encode_form_value(value: &str) -> String {
     encoded
 }
 
+#[derive(Debug)]
+pub(crate) enum SessionEffectHeaderError {
+    InvalidHeader(InvalidHeaderValue),
+    Compression(&'static str),
+}
+
+impl From<InvalidHeaderValue> for SessionEffectHeaderError {
+    fn from(error: InvalidHeaderValue) -> Self {
+        Self::InvalidHeader(error)
+    }
+}
+
+impl std::fmt::Display for SessionEffectHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidHeader(error) => error.fmt(f),
+            Self::Compression(error) => f.write_str(error),
+        }
+    }
+}
+
 /// Only the successful statement's explicit effects create response headers.
 pub(crate) fn session_effect_headers(
     effects: &SessionEffects,
-) -> Result<HeaderMap, InvalidHeaderValue> {
+) -> Result<HeaderMap, SessionEffectHeaderError> {
     let mut headers = HeaderMap::new();
     if let Some(names) = effects.catalog_schema() {
         headers.insert(
@@ -434,6 +474,28 @@ pub(crate) fn session_effect_headers(
     }
     for name in effects.reset_properties() {
         headers.append("x-trino-clear-session", HeaderValue::from_str(&name)?);
+    }
+    for effect in effects.prepared_statements() {
+        match effect {
+            PreparedStatementEffect::Added { name, sql } => {
+                let sql = crate::prepared::header_sql(sql)
+                    .map_err(SessionEffectHeaderError::Compression)?;
+                headers.append(
+                    "x-trino-added-prepare",
+                    HeaderValue::from_str(&format!(
+                        "{}={}",
+                        encode_form_value(name),
+                        encode_form_value(&sql),
+                    ))?,
+                );
+            }
+            PreparedStatementEffect::Removed { name } => {
+                headers.append(
+                    "x-trino-deallocated-prepare",
+                    HeaderValue::from_str(&encode_form_value(name))?,
+                );
+            }
+        }
     }
     Ok(headers)
 }
@@ -471,7 +533,7 @@ mod tests {
     #[test]
     fn query_length_accepts_the_exact_utf16_limit_and_rejects_one_more() {
         let limit = QueryTextLimit::new(8).unwrap();
-        let exact = ParsedStatementRequest::parse_body(
+        let mut exact = ParsedStatementRequest::parse_body(
             &headers(),
             StatementBody::Complete("SELECT 1".into()),
             "root",
@@ -480,7 +542,7 @@ mod tests {
         .unwrap();
         assert!(exact.session_value().is_ok());
         assert_eq!(exact.sql(), "SELECT 1");
-        let over = ParsedStatementRequest::parse_body(
+        let mut over = ParsedStatementRequest::parse_body(
             &headers(),
             StatementBody::Complete("SELECT 1 ".into()),
             "root",
@@ -499,7 +561,7 @@ mod tests {
     fn query_length_counts_supplementary_characters_as_two_units() {
         for (text, limit, accepted) in [("😀", 2, true), ("😀x", 2, false), ("\u{0800}", 1, true)]
         {
-            let request = ParsedStatementRequest::parse_body(
+            let mut request = ParsedStatementRequest::parse_body(
                 &headers(),
                 StatementBody::Complete(text.into()),
                 "root",
@@ -516,14 +578,14 @@ mod tests {
             StatementBody::Complete("x".into()),
             StatementBody::ByteLimitExceeded,
         ] {
-            let request =
+            let mut request =
                 ParsedStatementRequest::parse_body(&headers(), body, "root", limit).unwrap();
             assert!(matches!(
                 request.session_value(),
                 Err(RequestSessionError::QueryTextTooLarge(_))
             ));
         }
-        let stopped = ParsedStatementRequest::parse_body(
+        let mut stopped = ParsedStatementRequest::parse_body(
             &headers(),
             StatementBody::ByteLimitExceeded,
             "root",
@@ -666,17 +728,61 @@ mod tests {
         }
     }
     #[test]
+    fn prepared_headers_are_validated_before_registration_and_captured_by_exact_name() {
+        let mut input = headers();
+        input.append(
+            crate::prepared::HEADER,
+            HeaderValue::from_static("p=SELECT+),P=SELECT+2"),
+        );
+        input.append(
+            crate::prepared::HEADER,
+            HeaderValue::from_static("p=SELECT+3,%E4%B8%AD%2B%2C%3D=SELECT+4"),
+        );
+        let mut request = parse(&input).unwrap();
+        let value = request.session_value().unwrap();
+        for (name, sql) in [("p", "SELECT 3"), ("P", "SELECT 2"), ("中+,=", "SELECT 4")] {
+            assert_eq!(
+                value
+                    .prepared_statements()
+                    .get(name)
+                    .unwrap()
+                    .sql()
+                    .as_ref(),
+                sql
+            );
+        }
+
+        for invalid in [
+            "missing",
+            "p=SELECT+%zz",
+            "p=SELECT+%zz,p=SELECT+3",
+            "p=SELECT+%FF",
+            "p=SELECT+)",
+            "p=SELECT+1%3BSELECT+2",
+            "p=%24zstd%3Ainvalid",
+            "p=SELECT+1,%70=SELECT+2",
+        ] {
+            input.remove(crate::prepared::HEADER);
+            input.append(crate::prepared::HEADER, HeaderValue::from_static(invalid));
+            assert_eq!(
+                parse(&input).unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_features_and_invalid_zones_are_deferred_to_first_get() {
         for (name, value) in [
             ("x-trino-transaction-id", "123"),
-            ("x-trino-prepared-statement", "stmt=SELECT+1"),
             ("x-trino-role", "NONE"),
             ("x-trino-extra-credential", "secret=value"),
             ("x-trino-path", "lake.sales"),
         ] {
             let mut input = headers();
             input.insert(name, HeaderValue::from_static(value));
-            let request = parse(&input).unwrap();
+            let mut request = parse(&input).unwrap();
             assert!(
                 matches!(
                     request.session_value(),
@@ -771,7 +877,7 @@ mod tests {
         input.insert("x-trino-client-info", HeaderValue::from_static("tool info"));
         input.insert("x-trino-trace-token", HeaderValue::from_static(" trace-1 "));
         input.insert("x-trino-language", HeaderValue::from_static("en-US"));
-        let request = parse(&input).unwrap();
+        let mut request = parse(&input).unwrap();
         assert_eq!(request.sql(), "SELECT 1");
         assert_eq!(request.principal().as_ref(), "root");
         assert_eq!(

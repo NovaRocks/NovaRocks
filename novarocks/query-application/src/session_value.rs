@@ -16,9 +16,87 @@
 // under the License.
 
 //! Immutable per-statement session input, without catalog existence checks.
+use std::{fmt, sync::Arc};
+
 use crate::session_error::QueryServiceError;
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_types::naming::{DEFAULT_CATALOG, normalize_identifier};
+
+/// One validated definition, shared with the statement that uses its text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedStatementDefinition {
+    sql: Arc<str>,
+}
+
+impl PreparedStatementDefinition {
+    pub fn new(sql: Arc<str>) -> Self {
+        Self { sql }
+    }
+
+    pub fn sql(&self) -> &Arc<str> {
+        &self.sql
+    }
+}
+
+impl fmt::Debug for PreparedStatementDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedStatementDefinition")
+            .field("sql_bytes", &self.sql.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Names are compared exactly as received. A statement can retain its chosen
+/// definition without keeping the request's other definitions alive.
+#[derive(Clone, Debug, Default)]
+pub struct PreparedStatementSnapshot(Option<Arc<PreparedStatementEntries>>);
+
+struct PreparedStatementEntries {
+    definitions: Vec<(String, PreparedStatementDefinition)>,
+}
+
+impl fmt::Debug for PreparedStatementEntries {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedStatementEntries")
+            .field("count", &self.definitions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DuplicatePreparedStatementName;
+
+impl fmt::Display for DuplicatePreparedStatementName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Prepared statement names must be unique after decoding")
+    }
+}
+
+impl std::error::Error for DuplicatePreparedStatementName {}
+
+impl PreparedStatementSnapshot {
+    pub fn new(
+        mut definitions: Vec<(String, PreparedStatementDefinition)>,
+    ) -> Result<Self, DuplicatePreparedStatementName> {
+        definitions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if definitions.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(DuplicatePreparedStatementName);
+        }
+        Ok(Self(Some(Arc::new(PreparedStatementEntries {
+            definitions,
+        }))))
+    }
+
+    pub fn get(&self, name: &str) -> Option<&PreparedStatementDefinition> {
+        let definitions = &self.0.as_ref()?.definitions;
+        let index = definitions
+            .binary_search_by(|candidate| candidate.0.as_str().cmp(name))
+            .ok()?;
+        Some(&definitions[index].1)
+    }
+}
 
 pub type SessionTimeZone = novarocks_type_contract::TimeZoneKey;
 
@@ -34,6 +112,7 @@ pub struct SessionValue {
     pub(crate) properties: Vec<(String, String)>,
     pub(crate) time_zone: Option<SessionTimeZone>,
     pub(crate) presentation: ClientPresentationFamily,
+    prepared_statements: PreparedStatementSnapshot,
 }
 impl SessionValue {
     pub fn try_new(
@@ -63,8 +142,21 @@ impl SessionValue {
             properties,
             time_zone,
             presentation,
+            prepared_statements: PreparedStatementSnapshot::default(),
         })
     }
+    pub fn with_prepared_statements(
+        mut self,
+        prepared_statements: PreparedStatementSnapshot,
+    ) -> Self {
+        self.prepared_statements = prepared_statements;
+        self
+    }
+
+    pub fn prepared_statements(&self) -> &PreparedStatementSnapshot {
+        &self.prepared_statements
+    }
+
     pub fn presentation(&self) -> &ClientPresentationFamily {
         &self.presentation
     }
@@ -268,7 +360,7 @@ mod tests {
             state.sql_semantics().sql_mode().assignment(),
             "GROUP_CONCAT_LEGACY,32"
         );
-        assert!(state.sql_semantics().sql_mode().group_concat_legacy());
+        assert!(!state.sql_semantics().sql_mode().error_if_overflow());
     }
 
     #[test]

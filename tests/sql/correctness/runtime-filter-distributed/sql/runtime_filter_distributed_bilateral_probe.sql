@@ -69,18 +69,18 @@ CREATE TABLE ${case_db}.rf_dist_bi_t3 (
 -- side), so the join is non-trivial (t1 join t2 join t3 fans out per key).
 INSERT INTO ${case_db}.rf_dist_bi_t1
 SELECT generate_series % 100 AS k, generate_series AS v
-FROM TABLE(generate_series(1, 300));
+FROM TABLE(sequence(1, 300)) AS generate_series(generate_series);
 
 INSERT INTO ${case_db}.rf_dist_bi_t2
 SELECT generate_series % 100 AS k, generate_series AS v
-FROM TABLE(generate_series(1, 300));
+FROM TABLE(sequence(1, 300)) AS generate_series(generate_series);
 
 -- t3 is the build side of the TOP join: only even keys pass the flag-style
 -- predicate (v <= 150), so the runtime filter has real work to prune — via
 -- transitive equivalence — on BOTH t1's and t2's scans.
 INSERT INTO ${case_db}.rf_dist_bi_t3
 SELECT generate_series % 100 AS k, generate_series AS v
-FROM TABLE(generate_series(1, 300));
+FROM TABLE(sequence(1, 300)) AS generate_series(generate_series);
 
 ANALYZE ${case_db}.rf_dist_bi_t1;
 ANALYZE ${case_db}.rf_dist_bi_t2;

@@ -23,6 +23,8 @@ use arrow_array::{
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field};
+use novarocks_failure_contract::FailureProjection;
+use novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT;
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     ExpressionUseId, FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior,
@@ -723,7 +725,7 @@ fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metad
 }
 
 #[test]
-fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_publication() {
+fn dynamic_offsets_and_typed_parameter_refusals_follow_partition_addresses() {
     let source = FunctionValueType::new(DataType::Int32, true);
     for name in NAMES {
         let dynamic = Fixture::with_arguments(
@@ -740,27 +742,75 @@ fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_public
             ],
             DecimalOverflowPolicy::OutputNull,
         );
-        for fixture in [
-            dynamic,
-            Fixture::offset(
+        let prepared = dynamic
+            .prepare(options(false), &CompileControl::default())
+            .unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+        let offsets: ArrayRef = Arc::new(Int64Array::from(vec![0, 1, 2]));
+        let arguments = [
+            EvaluatedArgument::Column(&values),
+            EvaluatedArgument::Column(&offsets),
+        ];
+        let peers = [WindowRowRange { start: 0, end: 3 }];
+        let frames = whole_frames(3);
+        let mut partition = WindowEvaluationPartition::begin(
+            prepared.clone(),
+            geometry(&prepared, &arguments, &peers, &frames),
+            &Control::default(),
+        )
+        .unwrap();
+        let expected = if name == "lead" {
+            [Some(10), Some(30), None]
+        } else {
+            [Some(10); 3]
+        };
+        assert_eq!(
+            ints(
+                &partition
+                    .evaluate(Selection::all(3), 3, &Control::default())
+                    .unwrap()
+            ),
+            expected
+        );
+        for offset in [None, Some(-1)] {
+            let offsets: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), offset, Some(2)]));
+            let arguments = [
+                EvaluatedArgument::Column(&values),
+                EvaluatedArgument::Column(&offsets),
+            ];
+            let Err(error) = WindowEvaluationPartition::begin(
+                prepared.clone(),
+                geometry(&prepared, &arguments, &peers, &frames),
+                &Control::default(),
+            ) else {
+                panic!("invalid dynamic offset must fail");
+            };
+            assert_eq!(error.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
+        }
+
+        for offset in [None, Some(-1)] {
+            let fixture = Fixture::offset(
                 name,
                 source.clone(),
-                cv(None, true),
+                cv(offset, offset.is_none()),
                 DecimalOverflowPolicy::OutputNull,
-            ),
-            Fixture::offset(
-                name,
-                source.clone(),
-                cv(Some(-1), false),
-                DecimalOverflowPolicy::OutputNull,
-            ),
-        ] {
-            assert!(matches!(
-                fixture.prepare(options(false), &CompileControl::default()),
-                Err(FunctionSpecializationFailure::Kernel(
-                    KernelFailure::InvalidProgram(_)
-                ))
-            ));
+            );
+            let prepared = fixture
+                .prepare(options(false), &CompileControl::default())
+                .unwrap();
+            let offset = cv(offset, offset.is_none());
+            let arguments = [
+                EvaluatedArgument::Column(&values),
+                EvaluatedArgument::Constant(&offset),
+            ];
+            let Err(error) = WindowEvaluationPartition::begin(
+                prepared.clone(),
+                geometry(&prepared, &arguments, &peers, &frames),
+                &Control::default(),
+            ) else {
+                panic!("invalid constant offset must fail at its runtime row");
+            };
+            assert_eq!(error.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
         }
         for default in [
             FunctionValueType::new(DataType::Boolean, true),
@@ -797,7 +847,7 @@ fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_public
 }
 
 #[test]
-fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_offset_tails() {
+fn every_compile_callback_keeps_three_primary_causes_for_all_offset_constants() {
     for name in NAMES {
         let source = FunctionValueType::new(DataType::Int32, true);
         for offset in [Some(1), Some(-1), None] {
@@ -808,47 +858,10 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                 DecimalOverflowPolicy::OutputNull,
             );
             let baseline = CompileControl::default();
-            let original = fixture.prepare(options(true), &baseline);
-            assert_eq!(original.is_ok(), offset == Some(1));
+            fixture.prepare(options(true), &baseline).unwrap();
             let trace = baseline.trace.lock().unwrap().clone();
             assert!(trace.len() > 2);
-            if offset == Some(1) {
-                assert_eq!(trace.last().unwrap().1, 0, "successful catalogue exit");
-            } else {
-                // The leaf's own tail remains observable. The enclosing
-                // catalogue preserves its Err without a later zero footer.
-                assert_eq!(
-                    trace.last().unwrap().1,
-                    u32::from(offset == Some(-1)),
-                    "original leaf ordinary tail"
-                );
-                let FunctionSpecializationFailure::Kernel(expected) = original.unwrap_err() else {
-                    panic!("ordinary offset refusal must retain the original kernel author");
-                };
-                let message = if offset == Some(-1) {
-                    "LEAD/LAG offset must be non-negative"
-                } else {
-                    "LEAD/LAG offset must be a non-NULL integer constant"
-                };
-                assert_eq!(expected, crate::kernel_control::invalid(message));
-                for cause in [
-                    CompileControlError::Cancelled,
-                    CompileControlError::DeadlineExceeded,
-                    CompileControlError::ResourceExhausted,
-                ] {
-                    let control = CompileControl {
-                        trace: Mutex::default(),
-                        refusal: Some((trace.len(), cause)),
-                    };
-                    let FunctionSpecializationFailure::Kernel(actual) =
-                        fixture.prepare(options(true), &control).unwrap_err()
-                    else {
-                        panic!("a later optional callback replaced the ordinary offset refusal");
-                    };
-                    assert_eq!(actual, expected);
-                    assert_eq!(*control.trace.lock().unwrap(), trace);
-                }
-            }
+            assert_eq!(trace.last().unwrap().1, 0, "successful catalogue exit");
             for at in 0..trace.len() {
                 for cause in [
                     CompileControlError::Cancelled,

@@ -17,14 +17,15 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, StringArray};
+use arrow_array::{Array, Float64Array, Int64Array, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CompilePhase, FunctionArgumentTypes, FunctionEffectDeclaration,
     FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PICOS_PER_DAY,
     PICOS_PER_SECOND, PureCompileControl, SemanticParameterKey as Key, SemanticParameterRef,
-    SemanticParameterValue, SemanticParameters, StatementStartUtc, TemporalMicros, TemporalType,
-    TemporalValue, TimeZoneKey, ValueLogicalType,
+    SemanticParameterValue, SemanticParameters, StatementStartUtc, TemporalMicros,
+    TemporalPrecision, TemporalType, TemporalValue, TimeZoneKey, ValueKind, ValueLogicalType,
+    trino_can_coerce_scalar,
 };
 use novarocks_value_arrays::decode::PreparedTemporalArray;
 
@@ -32,7 +33,9 @@ use crate::kernel_control::invalid;
 use crate::kernel_input::{EvaluationCheckpoints, validate_argument_observed};
 use crate::temporal_cast::Type;
 use crate::temporal_value::{round_time, round_timestamp};
-use crate::temporal_zone_rules::{TemporalZoneSource, offset_seconds, utc_to_local};
+use crate::temporal_zone_rules::{
+    TemporalZoneSource, joda_local_to_utc, offset_seconds, utc_to_local,
+};
 use crate::{
     CallEffectInput, CheckedCallEffectInput, CheckedOwnerFailure, FunctionArgument,
     FunctionArgumentType, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
@@ -46,7 +49,11 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-use super::{binding_control, temporal_output::TemporalOutputBuilder};
+use super::{
+    binding_control,
+    date_shift_owner::{temporal_argument, varchar_argument},
+    temporal_output::TemporalOutputBuilder,
+};
 
 pub const FUNCTION_NAME: &str = "__temporal_statement_syntax";
 pub const FUNCTION_ID: &str = "builtin.scalar/temporal_statement_syntax/v1";
@@ -64,6 +71,15 @@ pub enum TemporalSyntax {
     AtTimeName,
     AtTimeInterval,
     AtTimeLocal,
+    Now,
+    QuotedCurrentDate,
+    AtTimezoneName,
+    AtTimezoneInterval,
+    WithTimezone,
+    FromUnixSession,
+    FromUnixName,
+    FromUnixOffset,
+    ToUnix,
 }
 
 const SYNTAX: [TemporalSyntax; 11] = {
@@ -80,6 +96,21 @@ const SYNTAX: [TemporalSyntax; 11] = {
         AtTimeName,
         AtTimeInterval,
         AtTimeLocal,
+    ]
+};
+
+const PUBLIC: &[(&str, &[TemporalSyntax])] = {
+    use TemporalSyntax::*;
+    &[
+        ("now", &[Now]),
+        ("current_date", &[QuotedCurrentDate]),
+        ("at_timezone", &[AtTimezoneName, AtTimezoneInterval]),
+        ("with_timezone", &[WithTimezone]),
+        (
+            "from_unixtime",
+            &[FromUnixSession, FromUnixName, FromUnixOffset],
+        ),
+        ("to_unixtime", &[ToUnix]),
     ]
 };
 
@@ -100,14 +131,24 @@ impl TemporalSyntax {
             AtTimeName => "builtin.scalar/temporal_statement_syntax/at_time_name/v1",
             AtTimeInterval => "builtin.scalar/temporal_statement_syntax/at_time_interval/v1",
             AtTimeLocal => "builtin.scalar/temporal_statement_syntax/at_time_local/v1",
+            Now => "builtin.scalar/now/clock-v1",
+            QuotedCurrentDate => "builtin.scalar/current_date/clock-v1",
+            AtTimezoneName => "builtin.scalar/at_timezone/timestamp_zone_name/v1",
+            AtTimezoneInterval => "builtin.scalar/at_timezone/timestamp_offset/v1",
+            WithTimezone => "builtin.scalar/with_timezone/timestamp_zone_name/v1",
+            FromUnixSession => "builtin.scalar/from_unixtime/session_zone/v1",
+            FromUnixName => "builtin.scalar/from_unixtime/zone_name/v1",
+            FromUnixOffset => "builtin.scalar/from_unixtime/zone_offset/v1",
+            ToUnix => "builtin.scalar/to_unixtime/timestamp_with_time_zone/v1",
         }
     }
 
     pub fn dependencies(self) -> &'static [Key] {
         use TemporalSyntax::*;
         match self {
-            AtTimestampName | AtTimestampInterval | AtTimeInterval => &[],
-            AtTimestampLocal => &[Key::TimeZone],
+            AtTimestampName | AtTimestampInterval | AtTimeInterval | AtTimezoneName
+            | AtTimezoneInterval | WithTimezone | FromUnixName | FromUnixOffset | ToUnix => &[],
+            AtTimestampLocal | FromUnixSession => &[Key::TimeZone],
             AtTimeName => &[Key::StatementStartUtc],
             _ => &[Key::StatementStartUtc, Key::TimeZone],
         }
@@ -127,14 +168,24 @@ impl TemporalSyntax {
             AtTimeName => "(TIME WITH TIME ZONE, VARCHAR)",
             AtTimeInterval => "(TIME WITH TIME ZONE, day-time INTERVAL)",
             AtTimeLocal => "(TIME WITH TIME ZONE) with effective session zone",
+            Now | QuotedCurrentDate => "()",
+            AtTimezoneName => "timestamp(p) with time zone,varchar(x)",
+            AtTimezoneInterval => "timestamp(p) with time zone,interval day-time(Q)",
+            WithTimezone => "timestamp(p),varchar(x)",
+            FromUnixSession => "double",
+            FromUnixName => "double,varchar(x)",
+            FromUnixOffset => "double,bigint,bigint",
+            ToUnix => "timestamp(p) with time zone",
         }
     }
 
     fn argument_count(self) -> usize {
         use TemporalSyntax::*;
         match self {
-            CurrentDate | CurrentTime | CurrentTimestamp | LocalTime | LocalTimestamp => 0,
-            AtTimestampLocal | AtTimeLocal => 1,
+            CurrentDate | CurrentTime | CurrentTimestamp | LocalTime | LocalTimestamp | Now
+            | QuotedCurrentDate => 0,
+            AtTimestampLocal | AtTimeLocal | FromUnixSession | ToUnix => 1,
+            FromUnixOffset => 3,
             _ => 2,
         }
     }
@@ -157,8 +208,132 @@ impl TemporalSyntax {
     fn from_overload(overload: &FunctionOverloadId) -> Result<Self, FunctionBindingError> {
         SYNTAX
             .into_iter()
+            .chain(
+                PUBLIC
+                    .iter()
+                    .flat_map(|(_, operations)| operations.iter().copied()),
+            )
             .find(|operation| operation.identity() == overload.as_str())
             .ok_or_else(|| FunctionBindingError::UnknownOverload(overload.clone()))
+    }
+
+    fn public_result_pattern(self) -> &'static str {
+        use TemporalSyntax::*;
+        match self {
+            QuotedCurrentDate => "date",
+            Now | FromUnixSession | FromUnixName | FromUnixOffset => "timestamp(3) with time zone",
+            ToUnix => "double",
+            _ => "timestamp(p) with time zone",
+        }
+    }
+
+    fn public_selection(
+        self,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        use TemporalSyntax::*;
+        if request.arguments.len() != self.argument_count()
+            || request.logical_argument_count != request.arguments.len()
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        let arguments = request
+            .arguments
+            .iter()
+            .map(|arg| match arg {
+                FunctionArgument::Value { value_type, .. } => Ok(value_type),
+                _ => Err(FunctionBindingError::NoMatchingOverload),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let nullable = arguments.iter().any(|arg| arg.nullable());
+        let zoned = |source: &FunctionValueType, interpret_local: bool| {
+            use TemporalType as T;
+            let precision = match source.value_type().kind() {
+                ValueKind::Temporal(T::Timestamp(p)) => *p,
+                ValueKind::Temporal(T::TimestampWithTimeZone(p)) if !interpret_local => *p,
+                ValueKind::Scalar(DataType::Date32 | DataType::Null) => {
+                    TemporalPrecision::WHOLE_SECONDS
+                }
+                _ => return Err(FunctionBindingError::NoMatchingOverload),
+            };
+            let argument_type = if interpret_local {
+                T::Timestamp(precision)
+            } else {
+                T::TimestampWithTimeZone(precision)
+            };
+            let target_type = T::TimestampWithTimeZone(precision);
+            let argument = temporal_argument(source, &ValueKind::Temporal(argument_type))?;
+            let result = temporal_argument(source, &ValueKind::Temporal(target_type))?
+                .with_nullable(nullable)
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+            Ok((argument, result))
+        };
+        let default_zoned = || {
+            let null = FunctionValueType::new(DataType::Null, nullable);
+            temporal_argument(
+                &null,
+                &ValueKind::Temporal(TemporalType::TimestampWithTimeZone(
+                    TemporalPrecision::DEFAULT,
+                )),
+            )
+        };
+        let coerce_numeric = |ty: &FunctionValueType, target: DataType| {
+            if !trino_can_coerce_scalar(ty.value_type().kind(), &ValueKind::Scalar(target.clone()))
+            {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            Ok(FunctionValueType::new(target, ty.nullable()))
+        };
+        let (arguments, result) = match self {
+            Now => (vec![], default_zoned()?),
+            QuotedCurrentDate => (vec![], FunctionValueType::new(DataType::Date32, false)),
+            AtTimezoneName | AtTimezoneInterval | WithTimezone => {
+                let (arg, result) = zoned(arguments[0], self == WithTimezone)?;
+                let zone = arguments[1];
+                let zone = if self == AtTimezoneInterval {
+                    if !matches!(zone.value_type().temporal(), Some(TemporalType::Interval(q)) if !q.is_year_month())
+                    {
+                        return Err(FunctionBindingError::NoMatchingOverload);
+                    }
+                    zone.clone()
+                } else {
+                    varchar_argument(zone)?
+                };
+                (vec![arg, zone], result)
+            }
+            ToUnix => {
+                let (arg, _) = zoned(arguments[0], false)?;
+                (
+                    vec![arg],
+                    FunctionValueType::new(DataType::Float64, nullable),
+                )
+            }
+            FromUnixSession | FromUnixName | FromUnixOffset => {
+                let mut selected = vec![coerce_numeric(arguments[0], DataType::Float64)?];
+                match self {
+                    FromUnixName => selected.push(varchar_argument(arguments[1])?),
+                    FromUnixOffset => {
+                        selected.push(coerce_numeric(arguments[1], DataType::Int64)?);
+                        selected.push(coerce_numeric(arguments[2], DataType::Int64)?);
+                    }
+                    _ => {}
+                }
+                (selected, default_zoned()?)
+            }
+            _ => return Err(FunctionBindingError::NoMatchingOverload),
+        };
+        Ok(FunctionBindingSelection {
+            overload: FunctionOverloadId::try_new(self.identity())
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
+            argument_types: FunctionArgumentTypes::from_pure_boxed(
+                arguments
+                    .into_iter()
+                    .map(FunctionArgumentType::Value)
+                    .collect(),
+            ),
+            result_type: FunctionResultType::Scalar(result),
+            aggregate: None,
+        })
     }
 
     fn accepts(self, arguments: &[FunctionArgument], result: &FunctionValueType) -> bool {
@@ -233,7 +408,27 @@ impl TemporalSyntax {
     }
 }
 
-pub(crate) fn definition() -> Result<FunctionDefinition, FunctionCatalogError> {
+pub(crate) fn register(
+    builder: &mut crate::EngineFunctionCatalogBuilder,
+) -> Result<(), FunctionCatalogError> {
+    builder.register(definition(FUNCTION_NAME, FUNCTION_ID, &SYNTAX, false)?)?;
+    for &(name, operations) in PUBLIC {
+        builder.register(definition(
+            name,
+            &format!("builtin.scalar/{name}/v1"),
+            operations,
+            true,
+        )?)?;
+    }
+    Ok(())
+}
+
+fn definition(
+    name: &str,
+    function: &str,
+    operations: &'static [TemporalSyntax],
+    public: bool,
+) -> Result<FunctionDefinition, FunctionCatalogError> {
     fn invalid_catalog(error: impl std::fmt::Display) -> FunctionCatalogError {
         FunctionCatalogError::InvalidStableIdentity {
             subject: "temporal statement syntax owner",
@@ -242,15 +437,37 @@ pub(crate) fn definition() -> Result<FunctionDefinition, FunctionCatalogError> {
     }
     let mut overloads = Vec::new();
     let mut implementations = Vec::new();
-    for syntax in SYNTAX {
+    let mut display = Vec::new();
+    for &syntax in operations {
         let overload = FunctionOverloadId::try_new(syntax.identity()).map_err(invalid_catalog)?;
         overloads.push(FunctionOverloadDeclaration::from_effects(
             overload.clone(),
             syntax.argument_pattern(),
-            "exact temporal result",
+            if public {
+                syntax.public_result_pattern()
+            } else {
+                "exact temporal result"
+            },
             None,
             syntax.effects(),
         ));
+        if public {
+            let arguments = match syntax {
+                TemporalSyntax::AtTimezoneInterval => {
+                    "timestamp(p) with time zone, interval day to second".to_owned()
+                }
+                TemporalSyntax::Now | TemporalSyntax::QuotedCurrentDate => String::new(),
+                _ => syntax.argument_pattern().replace(',', ", "),
+            };
+            display.push((
+                overload.clone(),
+                vec![crate::FunctionPublicSignature::new(
+                    arguments,
+                    syntax.public_result_pattern(),
+                    "",
+                )],
+            ));
+        }
         implementations.push(PureImplementationDeclaration {
             overload,
             implementation: PureImplementationId::try_new(syntax.identity())?,
@@ -258,33 +475,64 @@ pub(crate) fn definition() -> Result<FunctionDefinition, FunctionCatalogError> {
         });
     }
     let declaration = FunctionBindingDeclaration::try_new_complete(
-        FunctionId::try_new(FUNCTION_ID).map_err(invalid_catalog)?,
+        FunctionId::try_new(function).map_err(invalid_catalog)?,
         FunctionKind::Scalar,
         overloads,
     )
     .map_err(invalid_catalog)?;
+    let declaration = if public {
+        declaration
+            .with_public_signatures(display)
+            .map_err(super::catalogue::public_signature_error)?
+    } else {
+        declaration
+    };
     FunctionDefinition::try_new_pure_scalar(
-        FUNCTION_NAME,
-        FunctionVisibility::Hidden,
+        name,
+        if public {
+            FunctionVisibility::Public
+        } else {
+            FunctionVisibility::Hidden
+        },
         Arc::new(ContextOwner {
             declaration,
             implementations: implementations.into_boxed_slice(),
-            resolver: Arc::new(TemporalContextResolver),
+            resolver: Arc::new(TemporalContextResolver { operations, public }),
         }),
     )
     .map_err(invalid_catalog)
 }
 
-pub(crate) struct TemporalContextResolver;
+// Design: ADR-0256 (docs/adr/ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md)
+pub(crate) struct TemporalContextResolver {
+    operations: &'static [TemporalSyntax],
+    public: bool,
+}
 
 impl FunctionBindingResolver for TemporalContextResolver {
     fn resolve(
         &self,
-        _: FunctionBindingRequest<'_>,
+        request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
-        Err(FunctionBindingError::NoMatchingOverload)
+        binding_control::scope(control, |work| {
+            if !self.public {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            binding_control::request_types(request, work)?;
+            let mut selected = None;
+            for &syntax in self.operations {
+                match syntax.public_selection(request) {
+                    Ok(_) if selected.is_some() => {
+                        return Err(FunctionBindingError::AmbiguousOverload);
+                    }
+                    Ok(candidate) => selected = Some(candidate),
+                    Err(FunctionBindingError::NoMatchingOverload) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            selected.ok_or(FunctionBindingError::NoMatchingOverload)
+        })
     }
 
     fn select_at_overload_observed(
@@ -296,6 +544,12 @@ impl FunctionBindingResolver for TemporalContextResolver {
         binding_control::scope(control, |work| {
             binding_control::request_types(request, work)?;
             let syntax = TemporalSyntax::from_overload(overload)?;
+            if !self.operations.contains(&syntax) {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            if self.public {
+                return syntax.public_selection(request);
+            }
             let result = request
                 .expected_result_type
                 .ok_or(FunctionBindingError::NoMatchingOverload)?;
@@ -334,6 +588,23 @@ impl FunctionBindingResolver for TemporalContextResolver {
         binding_control::scope(control, |work| {
             binding_control::request_types(request, work)?;
             let syntax = TemporalSyntax::from_overload(&selection.overload)?;
+            if !self.operations.contains(&syntax) {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            if self.public {
+                if selection != &syntax.public_selection(request)?
+                    || !selection.argument_types.iter().zip(request.arguments).all(|(selected, argument)| {
+                        matches!(
+                            (selected, argument),
+                            (FunctionArgumentType::Value(selected), FunctionArgument::Value { value_type, .. })
+                                if selected == value_type
+                        )
+                    })
+                {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+                return Ok(());
+            }
             let FunctionResultType::Scalar(result) = &selection.result_type else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
@@ -639,6 +910,14 @@ impl ContextRecipe {
                 validate_argument_observed(*argument, selection, ty, control)?;
             }
         }
+        if matches!(
+            self.syntax,
+            TemporalSyntax::FromUnixSession
+                | TemporalSyntax::FromUnixName
+                | TemporalSyntax::FromUnixOffset
+        ) {
+            return self.evaluate_from_epoch(input, work);
+        }
         let source = input
             .arguments()
             .first()
@@ -684,10 +963,14 @@ impl ContextRecipe {
             .transpose()?;
         let current = source.is_none().then(|| self.current(declared));
         work.flush()?;
-        let mut output = TemporalOutputBuilder::new(
-            declared.map_or(Type::Date, Type::Temporal),
-            selection.len(),
-        )?;
+        let mut output = if self.syntax == TemporalSyntax::ToUnix {
+            TemporalOutputBuilder::double(selection.len())?
+        } else {
+            TemporalOutputBuilder::new(
+                declared.map_or(Type::Date, Type::Temporal),
+                selection.len(),
+            )?
+        };
         let mut errors = Vec::new();
         for (ordinal, logical) in selection.iter().enumerate() {
             work.step()?;
@@ -704,24 +987,39 @@ impl ContextRecipe {
                     output.null();
                     continue;
                 };
-                let zone = match &zone_argument {
-                    None => Ok(self.facts.zone),
-                    Some(argument) => {
-                        let row = input.arguments()[1].value_row(ordinal, logical);
-                        argument.zone(row, work)?
+                if self.syntax == TemporalSyntax::ToUnix {
+                    let TemporalValue::TimestampWithTimeZone { instant, .. } = value else {
+                        return Err(invalid("to_unixtime requires a frozen zoned timestamp"));
+                    };
+                    let precision = input
+                        .contract()
+                        .value_argument_types()
+                        .next()
+                        .and_then(|ty| ty.value_type().temporal())
+                        .ok_or_else(|| invalid("to_unixtime source precision is missing"))?
+                        .precision();
+                    Ok(ResultValue::Double(epoch_seconds(instant, precision)))
+                } else {
+                    let zone = match &zone_argument {
+                        None => Ok(self.facts.zone),
+                        Some(argument) => {
+                            let row = input.arguments()[1].value_row(ordinal, logical);
+                            argument.zone(row, work)?
+                        }
+                    };
+                    match zone {
+                        Ok(Some(zone)) => self.at_zone(value, zone),
+                        Ok(None) => {
+                            output.null();
+                            continue;
+                        }
+                        Err(cause) => Err(cause),
                     }
-                };
-                match zone {
-                    Ok(Some(zone)) => self.at_zone(value, zone),
-                    Ok(None) => {
-                        output.null();
-                        continue;
-                    }
-                    Err(cause) => Err(cause),
                 }
             };
             match result {
                 Ok(ResultValue::Date(value)) => output.date(value)?,
+                Ok(ResultValue::Double(value)) => output.append_double(value)?,
                 Ok(ResultValue::Temporal(value)) => {
                     let ty = declared
                         .ok_or_else(|| invalid("temporal syntax result type is missing"))?;
@@ -745,14 +1043,117 @@ impl ContextRecipe {
         )
     }
 
+    fn evaluate_from_epoch<'a>(
+        self,
+        input: ScalarCallInput<'_, 'a>,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<SelectedValues<'a>, KernelFailure> {
+        let [seconds_arg, zone_args @ ..] = input.arguments() else {
+            return Err(invalid("from_unixtime requires an epoch value"));
+        };
+        let seconds = seconds_arg
+            .array()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| invalid("from_unixtime epoch is not DOUBLE"))?;
+        let zones = match zone_args {
+            [] => EpochZone::Session(
+                self.facts
+                    .zone
+                    .ok_or_else(|| invalid("from_unixtime session zone is missing"))?,
+            ),
+            [arg] => EpochZone::Name(
+                arg.array()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| invalid("from_unixtime zone name is not VARCHAR"))?,
+            ),
+            [hours, minutes] => {
+                let hours = hours
+                    .array()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| invalid("from_unixtime zone hours are not BIGINT"))?;
+                let minutes = minutes
+                    .array()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| invalid("from_unixtime zone minutes are not BIGINT"))?;
+                EpochZone::Offset(hours, minutes)
+            }
+            _ => return Err(invalid("from_unixtime got a foreign selected profile")),
+        };
+        let target = input.contract().result_type();
+        let temporal = target
+            .value_type()
+            .temporal()
+            .ok_or_else(|| invalid("from_unixtime selected result is not temporal"))?;
+        let selection = input.selection();
+        let mut output = TemporalOutputBuilder::new(Type::Temporal(temporal), selection.len())?;
+        let mut errors = Vec::new();
+        for (ordinal, row) in selection.iter().enumerate() {
+            work.step()?;
+            let sec_row = seconds_arg.value_row(ordinal, row);
+            if seconds.is_null(sec_row) {
+                output.null();
+                continue;
+            }
+            let zone = match zones {
+                EpochZone::Session(zone) => Ok(zone),
+                EpochZone::Name(text) => {
+                    let i = zone_args[0].value_row(ordinal, row);
+                    if text.is_null(i) {
+                        output.null();
+                        continue;
+                    }
+                    let name = text.value(i);
+                    for _ in name.as_bytes().chunks(32) {
+                        work.step()?;
+                    }
+                    TimeZoneKey::parse(name).ok_or(RowFailure::UnknownEpochZone)
+                }
+                EpochZone::Offset(hours, minutes) => {
+                    let hour_row = zone_args[0].value_row(ordinal, row);
+                    let minute_row = zone_args[1].value_row(ordinal, row);
+                    if hours.is_null(hour_row) || minutes.is_null(minute_row) {
+                        output.null();
+                        continue;
+                    }
+                    let offset = hours
+                        .value(hour_row)
+                        .wrapping_mul(60)
+                        .wrapping_add(minutes.value(minute_row));
+                    i16::try_from(offset)
+                        .ok()
+                        .and_then(TimeZoneKey::from_offset_minutes)
+                        .ok_or(RowFailure::Zone)
+                }
+            };
+            match zone.and_then(|zone| zoned_epoch(seconds.value(sec_row), zone)) {
+                Ok(value) => output.temporal(temporal, value)?,
+                Err(cause) => append_error(&mut output, &mut errors, ordinal, cause, work)?,
+            }
+        }
+        work.flush()?;
+        SelectedValues::try_new_observed(
+            selection,
+            target.data_type(),
+            output.finish(),
+            errors.into_boxed_slice(),
+            || work.step(),
+        )
+    }
+
     fn current(self, target: Option<TemporalType>) -> Result<ResultValue, RowFailure> {
         use TemporalSyntax::*;
         let instant = self.facts.instant()?;
         let zone = self.facts.zone.ok_or(RowFailure::Zone)?;
         let local =
             || utc_to_local(zone, TemporalZoneSource::Jdk, instant).map_err(|_| RowFailure::Range);
-        if self.syntax == CurrentDate {
-            let days = local()?.micros().div_euclid(86_400 * 1_000_000);
+        if matches!(self.syntax, CurrentDate | QuotedCurrentDate) {
+            let local = utc_to_local(zone, TemporalZoneSource::Joda, instant)
+                .map_err(|_| RowFailure::Range)?;
+            let days = local.micros().div_euclid(86_400 * 1_000_000);
             return i32::try_from(days)
                 .map(ResultValue::Date)
                 .map_err(|_| RowFailure::Range);
@@ -767,7 +1168,7 @@ impl ContextRecipe {
                 picos: rounded_clock()?,
                 offset_minutes: offset_minutes(zone, instant)?,
             },
-            CurrentTimestamp => TemporalValue::TimestampWithTimeZone {
+            CurrentTimestamp | Now => TemporalValue::TimestampWithTimeZone {
                 instant: round_timestamp(instant, precision).map_err(|_| RowFailure::Range)?,
                 zone,
             },
@@ -782,6 +1183,11 @@ impl ContextRecipe {
 
     fn at_zone(self, value: TemporalValue, zone: TimeZoneKey) -> Result<ResultValue, RowFailure> {
         let value = match value {
+            TemporalValue::Timestamp(local) if self.syntax == TemporalSyntax::WithTimezone => {
+                let instant =
+                    joda_local_to_utc(zone, local, None).map_err(|_| RowFailure::Range)?;
+                TemporalValue::TimestampWithTimeZone { instant, zone }
+            }
             TemporalValue::TimestampWithTimeZone { instant, .. } => {
                 TemporalValue::TimestampWithTimeZone { instant, zone }
             }
@@ -814,8 +1220,15 @@ fn offset_minutes(zone: TimeZoneKey, instant: TemporalMicros) -> Result<i16, Row
 #[derive(Clone, Copy, Debug)]
 enum ResultValue {
     Date(i32),
+    Double(f64),
     Temporal(TemporalValue),
 }
+enum EpochZone<'a> {
+    Session(TimeZoneKey),
+    Name(&'a StringArray),
+    Offset(&'a Int64Array, &'a Int64Array),
+}
+
 enum ZoneArgument<'a> {
     Text(&'a StringArray),
     Interval(PreparedTemporalArray<'a>),
@@ -868,6 +1281,8 @@ enum RowFailure {
     Zone,
     Minute,
     Range,
+    EpochRange,
+    UnknownEpochZone,
 }
 impl std::fmt::Display for RowFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -875,6 +1290,8 @@ impl std::fmt::Display for RowFailure {
             Self::Zone => "Invalid time zone",
             Self::Minute => "Time zone offset must contain whole minutes",
             Self::Range => "Temporal value is outside the supported range",
+            Self::EpochRange => "Epoch value cannot be represented as a timestamp with time zone",
+            Self::UnknownEpochZone => "Time zone is not supported",
         })
     }
 }
@@ -883,13 +1300,14 @@ impl novarocks_failure_contract::FailureProjection for RowFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{FailureClass, FailureFact};
         use novarocks_function_contract::kernel_failure::{
-            INVALID_FUNCTION_ARGUMENT, NUMERIC_OUT_OF_RANGE,
+            INVALID_FUNCTION_ARGUMENT, NUMERIC_OUT_OF_RANGE, UNKNOWN_EPOCH_TIME_ZONE,
         };
         FailureFact::new(
             FailureClass::Data,
             match self {
-                Self::Zone | Self::Minute => INVALID_FUNCTION_ARGUMENT,
+                Self::Zone | Self::Minute | Self::EpochRange => INVALID_FUNCTION_ARGUMENT,
                 Self::Range => NUMERIC_OUT_OF_RANGE,
+                Self::UnknownEpochZone => UNKNOWN_EPOCH_TIME_ZONE,
             },
         )
     }
@@ -909,4 +1327,57 @@ fn append_error(
     errors.push(RowDataError::from_domain(ordinal, cause)?);
     output.null();
     work.flush()
+}
+
+fn epoch_millis(seconds: f64) -> i64 {
+    if seconds.is_nan() {
+        return 0;
+    }
+    let millis = seconds * 1_000.0;
+    if millis.abs() >= (1_u64 << 52) as f64 {
+        return millis as i64;
+    }
+    let floor = millis.floor();
+    let fraction = millis - floor;
+    let magnitude = millis.abs();
+    let ulp = magnitude.next_up() - magnitude;
+    if (fraction - 0.5).abs() > 2.0 * ulp {
+        return floor as i64 + i64::from(fraction >= 0.5);
+    }
+    // Compare with the canonical double nearest the decimal tie. The product
+    // alone can move an adjacent double onto the same half-millisecond.
+    let lower = floor as i64;
+    let midpoint = (lower * 2 + 1) as f64 / 2_000.0;
+    lower + i64::from(seconds > midpoint || seconds == midpoint && seconds > 0.0)
+}
+
+fn zoned_epoch(seconds: f64, zone: TimeZoneKey) -> Result<TemporalValue, RowFailure> {
+    use novarocks_type_contract::{MAX_ZONED_TIMESTAMP_MILLIS, MIN_ZONED_TIMESTAMP_MILLIS};
+
+    let millis = epoch_millis(seconds);
+    if !(MIN_ZONED_TIMESTAMP_MILLIS..=MAX_ZONED_TIMESTAMP_MILLIS).contains(&millis) {
+        return Err(RowFailure::EpochRange);
+    }
+    Ok(TemporalValue::TimestampWithTimeZone {
+        instant: TemporalMicros::whole_micros(millis * 1_000),
+        zone,
+    })
+}
+
+fn epoch_seconds(instant: TemporalMicros, precision: TemporalPrecision) -> f64 {
+    if precision <= TemporalPrecision::DEFAULT {
+        return instant.floor_millis() as f64 / 1_000.0;
+    }
+    let divisor = i128::from(novarocks_type_contract::PICOS_PER_SECOND);
+    let stamp = instant.as_picos();
+    let seconds = stamp.div_euclid(divisor) as f64;
+    let remainder = stamp.rem_euclid(divisor) as f64;
+    let divisor = divisor as f64;
+    let fraction = remainder / divisor;
+    // Carry the lost parts of both operations, including cancellation for
+    // a negative instant close to the epoch.
+    let fraction_error = (-fraction).mul_add(divisor, remainder) / divisor;
+    let sum = seconds + fraction;
+    let sum_error = fraction - (sum - seconds);
+    sum + (sum_error + fraction_error)
 }

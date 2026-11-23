@@ -145,6 +145,9 @@ struct ReadEncodedParts {
 }
 pub(crate) struct LogicalFinishInput {
     pub(crate) logical: SqlLogicalExplainCatalog,
+    pub(crate) table_argument_capacity:
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    pub(crate) required_constants: Arc<crate::RequiredConstantInterpreter>,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
     pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub(crate) policy: novarocks_functions::ConstantPolicy,
@@ -171,7 +174,48 @@ struct LogicalCatalogInput {
     session: SqlSessionContext,
     control: SqlCompileControl,
 }
+struct TableSequenceArgumentsInput {
+    interpreter: Arc<crate::RequiredConstantInterpreter>,
+    capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    needs: Vec<novarocks_sql::compiler::TableSequenceArgumentNeed>,
+}
+
+impl TableSequenceArgumentsInput {
+    fn evaluate(
+        self,
+    ) -> Result<Vec<novarocks_sql::compiler::TableSequenceArgumentFact>, SqlCompileError> {
+        use novarocks_sql::compiler::{SqlConstantEvaluationError, TableSequenceArgumentFact};
+        let window = self
+            .capacity
+            .try_window_alias()
+            .map_err(super::super::required_constant_eval::work_error_to_compile)?;
+        let scope = self.capacity.scope();
+        self.needs
+            .into_iter()
+            .map(|need| {
+                let value = self
+                    .interpreter
+                    .evaluate_prepared(need.prepared(), scope, &window)
+                    .map_err(|error| match error {
+                        SqlConstantEvaluationError::Control(error) => SqlCompileError::from(error),
+                        SqlConstantEvaluationError::Constant(error) => SqlCompileError::from(error),
+                        SqlConstantEvaluationError::Source(source)
+                        | SqlConstantEvaluationError::Outer(source) => {
+                            SqlCompileError::CompilationSource(source)
+                        }
+                    })?;
+                TableSequenceArgumentFact::from_evaluated(&need, value)
+            })
+            .collect()
+    }
+}
+
 enum PlanningCpuInput {
+    QueryContexts(Box<crate::query::session_property_computation::QueryContextsCpuInput>),
+    PreparedDescription(
+        Box<crate::query::trino_statement::prepared_description::DescriptionCpuInput>,
+    ),
+    TableSequenceArguments(Box<TableSequenceArgumentsInput>),
     SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
     QuerySessionProperties(
         Box<crate::query::session_property_computation::QuerySessionPropertyCpuInput>,
@@ -208,6 +252,17 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    PreparedDescription(
+        Box<
+            Result<
+                novarocks_query_application::api::OwnedLocalResult,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    TableSequenceArguments(
+        Result<Vec<novarocks_sql::compiler::TableSequenceArgumentFact>, SqlCompileError>,
+    ),
     AnalyzeColumns(
         Result<
             crate::statistics::application::StatisticsColumnIntent,
@@ -358,8 +413,17 @@ impl PlanningCpuOriginal {
         body.started = true;
         let input = body.input.take().expect("original planning input");
         let output = match input {
+            PlanningCpuInput::PreparedDescription(input) => {
+                PlanningCpuOutput::PreparedDescription(Box::new(input.run()))
+            }
+            PlanningCpuInput::TableSequenceArguments(input) => {
+                PlanningCpuOutput::TableSequenceArguments(input.evaluate())
+            }
             PlanningCpuInput::AnalyzeProperties(input) => {
                 PlanningCpuOutput::AnalyzeColumns(input.run())
+            }
+            PlanningCpuInput::QueryContexts(input) => {
+                PlanningCpuOutput::QuerySessionProperties(Box::new(input.run()))
             }
             PlanningCpuInput::QuerySessionProperties(input) => {
                 PlanningCpuOutput::QuerySessionProperties(Box::new(input.run()))
@@ -469,13 +533,22 @@ impl PlanningCpuOriginal {
             }
             PlanningCpuInput::LogicalFinish(input) => {
                 let input = *input;
-                PlanningCpuOutput::LogicalLines(input.logical.finish(
+                PlanningCpuOutput::LogicalLines(input.logical.finish_with_table_arguments(
                     &[],
                     input.functions.as_ref(),
                     input.sealed_functions,
                     input.policy,
                     input.environment,
                     input.level,
+                    |needs| {
+                        TableSequenceArgumentsInput {
+                            interpreter: input.required_constants,
+                            capacity: input.table_argument_capacity,
+                            needs: needs.into_vec(),
+                        }
+                        .evaluate()
+                        .map(Vec::into_boxed_slice)
+                    },
                 ))
             }
         };
@@ -1092,6 +1165,28 @@ impl FrontendPlanningCpuSource {
         };
         Ok(staging.stage_row(values))
     }
+    pub(super) async fn table_sequence_arguments(
+        &self,
+        interpreter: Arc<crate::RequiredConstantInterpreter>,
+        capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        needs: Vec<novarocks_sql::compiler::TableSequenceArgumentNeed>,
+    ) -> Result<
+        Result<Vec<novarocks_sql::compiler::TableSequenceArgumentFact>, SqlCompileError>,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::TableSequenceArguments(Box::new(
+            TableSequenceArgumentsInput {
+                interpreter,
+                capacity,
+                needs,
+            },
+        )));
+        let PlanningCpuOutput::TableSequenceArguments(result) = self.receive().await? else {
+            panic!("table sequence arguments returned another CPU phase");
+        };
+        Ok(result)
+    }
+
     pub(crate) async fn materialize_system_batch(
         &self,
     ) -> Result<
@@ -1251,6 +1346,40 @@ impl FrontendPlanningCpuSource {
         };
         Ok(*result)
     }
+    pub(crate) async fn describe_prepared(
+        &self,
+        input: crate::query::trino_statement::prepared_description::DescriptionCpuInput,
+    ) -> Result<
+        Result<
+            novarocks_query_application::api::OwnedLocalResult,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::PreparedDescription(Box::new(input)));
+        let PlanningCpuOutput::PreparedDescription(result) = self.receive().await? else {
+            panic!("Prepared description returned another CPU phase");
+        };
+        Ok(*result)
+    }
+
+    pub(crate) async fn query_contexts(
+        &self,
+        input: crate::query::session_property_computation::QueryContextsCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::session_property_computation::PreparedQuerySession,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::QueryContexts(Box::new(input)));
+        let PlanningCpuOutput::QuerySessionProperties(result) = self.receive().await? else {
+            panic!("Prepared query contexts returned another CPU phase");
+        };
+        Ok(*result)
+    }
+
     pub(crate) async fn query_session_properties(
         &self,
         input: crate::query::session_property_computation::QuerySessionPropertyCpuInput,

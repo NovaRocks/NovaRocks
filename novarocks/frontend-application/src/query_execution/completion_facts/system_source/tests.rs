@@ -93,6 +93,9 @@ async fn source_in_registry(
         Arc::new(novarocks_query_application::view::QueryViewService::new()),
         registry,
         readiness,
+        Arc::new(
+            crate::query_execution::required_constant_eval::test_required_constant_interpreter(),
+        ),
     );
     FrontendSystemTableFacts::new(owners, scope).unwrap()
 }

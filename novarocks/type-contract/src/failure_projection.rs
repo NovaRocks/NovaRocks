@@ -67,6 +67,7 @@ impl FailureProjection for ValueTypeError {
             Self::InvalidLogicalCarrier(_) => fact(FailureClass::Invariant, 22),
             Self::TooDeep => fact(FailureClass::Resource, 23),
             Self::TooManyNodes => fact(FailureClass::Resource, 24),
+            Self::InvalidCharacterWidth { .. } => fact(FailureClass::Data, 25),
         }
     }
 }

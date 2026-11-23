@@ -204,6 +204,7 @@ pub(super) struct NEmissionGeometry {
     pub(super) values: usize,
     utf8: usize,
     encoded: usize,
+    has_empty_state: bool,
 }
 impl NEmissionGeometry {
     pub(super) fn add_state(
@@ -215,6 +216,7 @@ impl NEmissionGeometry {
         self.rows = add(self.rows, 1)?;
         self.values = add(self.values, core.values.len())?;
         self.encoded = add(self.encoded, 8)?;
+        self.has_empty_state |= core.values.is_empty();
         for value in &core.values {
             work.step()?;
             let encoded = match value {
@@ -246,6 +248,11 @@ impl NEmissionGeometry {
         let (own_peak, payload, metadata, bodies, nodes, buffers) = if final_result {
             let offsets = bytes::<i32>(add(self.rows, 1)?)?;
             let values = bytes::<u8>(mul(16, self.values)?)?;
+            let validity = if self.has_empty_state {
+                mul(self.rows.div_ceil(8).div_ceil(64), 64)?
+            } else {
+                0
+            };
             let flat = if self.values == 0 {
                 0
             } else {
@@ -264,6 +271,7 @@ impl NEmissionGeometry {
                 bytes::<Option<i128>>(self.values)?,
                 offsets,
                 values,
+                validity,
                 arc_bytes::<ListArray>()?,
                 arc_bytes::<FixedSizeBinaryArray>()?,
             ] {
@@ -271,11 +279,11 @@ impl NEmissionGeometry {
             }
             (
                 own,
-                add(offsets, values)?,
-                add(node(1, false, 1)?, node(1, false, 0)?)?,
+                add(add(offsets, values)?, validity)?,
+                add(node(1, self.has_empty_state, 1)?, node(1, false, 0)?)?,
                 add(size_of::<ListArray>(), size_of::<FixedSizeBinaryArray>())?,
                 2,
-                2,
+                2 + usize::from(self.has_empty_state),
             )
         } else {
             let (data_peak, data_capacity) = default_vector::<u8>(1024, self.encoded, 8)?;

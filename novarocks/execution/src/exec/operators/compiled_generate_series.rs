@@ -14,18 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Closed compiled integer-series processor over its exact bounds Values port.
+//! Demand-driven generation over the exact, once-evaluated bounds Values port.
 //!
-//! The preceding Values source owns parameter evaluation through the original
-//! compiled Frame. This processor receives arrays only and calls the one
-//! original Functions computation. Whole-call original Data remains the
-//! function-domain cause; controls keep their typed first cause.
-//! Expansion/Arrow retained memory and opaque allocation are still OPEN.
+//! The processor retains a cursor. Each driver step constructs and hands off
+//! at most one batch using its actual construction scope.
 
 use super::compiled_expression::RuntimeKernelControl;
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
+use crate::exec::chunk::{ArrayNormalizationStep, Chunk, ChunkSchemaRef};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
+    Operator, OperatorLifecycle,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
     driver_step::DriverStep,
@@ -34,15 +33,25 @@ use crate::exec::pipeline::{
     step::{NextStep, StepResult},
 };
 use crate::runtime::runtime_state::RuntimeErrorState;
-use crate::runtime::task::{ExecutionFailure, ExecutionResult};
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
+use crate::runtime::task::ExecutionResult;
+use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, PrimitiveArray};
+use arrow::buffer::{Buffer, ScalarBuffer};
+use arrow::datatypes::{
+    ArrowNativeType, DataType, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
+};
 use novarocks_functions::{
-    KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
-    generate_series_core::{self, SeriesFailure, SeriesObservation},
+    EvaluationCheckpoints, KernelEvaluationControl, KernelFailure,
+    array_projection::ARROW_BUFFER_OWNER_METADATA_BOUND,
+    generate_series_core::{IntegerDiagnosticContext, SeriesError, integer_argument},
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
+use novarocks_type_contract::{
+    ValueTypeStorageLifetime,
+    owned_resources::layout::{LayoutResourceError, arc_layout},
+};
+use std::panic::RefUnwindSafe;
 use std::sync::Arc;
+use std::{alloc::Layout, mem};
 
 #[path = "compiled_series_failure.rs"]
 mod failure;
@@ -144,8 +153,7 @@ impl CompiledGenerateSeriesProcessorFactory {
             output: None,
             construction: None,
             control,
-            pending: None,
-            offset: 0,
+            cursor: None,
             accepted: false,
             batch_rows: self.batch_rows,
             failed: false,
@@ -163,34 +171,103 @@ impl OperatorFactory for CompiledGenerateSeriesProcessorFactory {
     }
 }
 
-struct Work<'a> {
-    control: &'a dyn KernelEvaluationControl,
-    pending: u32,
+#[derive(Clone, Copy)]
+// Design: ADR-0255 (docs/adr/ADR-0255-collection-calls-and-relational-sequence.md)
+struct SeriesCursor {
+    current: i128,
+    stop: i128,
+    step: i128,
 }
-impl<'a> Work<'a> {
-    fn begin(control: &'a dyn KernelEvaluationControl) -> Result<Self, KernelFailure> {
-        control.checkpoint(0)?;
-        Ok(Self {
-            control,
-            pending: 0,
-        })
+
+impl SeriesCursor {
+    fn new(start: i128, stop: i128, step: i128) -> Result<Option<Self>, SeriesError> {
+        if step == 0 {
+            return Err(SeriesError::ZeroStep);
+        }
+        if (step > 0 && start > stop) || (step < 0 && start < stop) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            current: start,
+            stop,
+            step,
+        }))
     }
-    fn flush(&mut self) -> Result<(), KernelFailure> {
-        let units = std::mem::take(&mut self.pending);
-        self.control.checkpoint(units)
+
+    fn batch(&self, max_rows: std::num::NonZeroU32) -> (usize, bool) {
+        // Count steps after the current value. Adding a row for the current
+        // value only after taking the batch bound also handles full i128 spans.
+        let steps = self.current.abs_diff(self.stop) / self.step.unsigned_abs();
+        let rows = steps.min(u128::from(max_rows.get() - 1)) + 1;
+        (rows as usize, steps >= rows)
     }
-    fn observe(&mut self, event: SeriesObservation) -> Result<(), KernelFailure> {
-        match event {
-            SeriesObservation::Step => {
-                self.pending += 1;
-                if self.pending == MAX_UNOBSERVED_KERNEL_WORK {
-                    self.flush()?;
-                }
+
+    fn fill(
+        &mut self,
+        rows: usize,
+        has_successor: bool,
+        work: &mut EvaluationCheckpoints<'_>,
+        mut emit: impl FnMut(i128) -> Result<(), SeriesError>,
+    ) -> ExecutionResult<()> {
+        for row in 0..rows {
+            work.step()?;
+            emit(self.current)?;
+            if row + 1 < rows || has_successor {
+                self.current =
+                    self.current
+                        .checked_add(self.step)
+                        .ok_or(SeriesError::ValueProgress {
+                            current: self.current,
+                            step: self.step,
+                        })?;
             }
-            SeriesObservation::OpaqueBoundary => self.flush()?,
-        };
+        }
         Ok(())
     }
+}
+
+/// The output payload and its admitted construction lifetime follow the last
+/// actual Arrow Buffer alias, including arrays detached from their Chunk.
+struct BatchValues<T> {
+    values: Vec<T>,
+    _storage: ValueTypeStorageLifetime,
+}
+
+// The array is immutable after publication. Drop only releases owned storage.
+impl<T: RefUnwindSafe> RefUnwindSafe for BatchValues<T> {}
+
+fn series_column<T: ArrowNativeType + RefUnwindSafe, A: Array + 'static>(
+    elements: usize,
+    owner: &dyn InputConstructionOwner,
+    work: &mut EvaluationCheckpoints<'_>,
+    fill: impl FnOnce(&mut Vec<T>, &mut EvaluationCheckpoints<'_>) -> ExecutionResult<()>,
+    wrap: impl FnOnce(Buffer) -> Result<A, CompiledSeriesFailure>,
+) -> ExecutionResult<ArrayRef> {
+    work.flush()?;
+    let layout = Layout::array::<T>(elements)
+        .map_err(|_| ConstructionFailure::Resource(LayoutResourceError::Arithmetic))?;
+    owner.request(layout)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(elements)
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    fill(&mut values, work)?;
+    work.flush()?;
+
+    owner
+        .request(arc_layout(Layout::new::<BatchValues<T>>()).map_err(ConstructionFailure::from)?)?;
+    owner.observe_opaque_upper_bound(ARROW_BUFFER_OWNER_METADATA_BOUND)?;
+    let backing = Arc::new(BatchValues {
+        values,
+        _storage: owner.storage_lifetime(),
+    });
+    let bytes = mem::size_of_val(backing.values.as_slice());
+    let pointer = std::ptr::NonNull::from(backing.values.as_slice()).cast();
+    // SAFETY: the initialized, correctly aligned Vec payload is immutable
+    // and is owned by the Buffer's custom allocation for its full lifetime.
+    let buffer = unsafe { Buffer::from_custom_allocation(pointer, bytes, backing) };
+    owner.request(arc_layout(Layout::new::<A>()).map_err(ConstructionFailure::from)?)?;
+    Ok(Arc::new(wrap(buffer)?))
 }
 
 struct CompiledGenerateSeriesProcessor {
@@ -199,86 +276,143 @@ struct CompiledGenerateSeriesProcessor {
     parameters: Arc<[usize]>,
     output_layout: novarocks_local_program::StaticLayout,
     output: Option<ChunkSchemaRef>,
-    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     control: Arc<dyn KernelEvaluationControl>,
-    pending: Option<Chunk>,
-    offset: usize,
+    cursor: Option<SeriesCursor>,
     accepted: bool,
     batch_rows: std::num::NonZeroU32,
     failed: bool,
 }
 impl CompiledGenerateSeriesProcessor {
     fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
-        self.output.as_ref().ok_or_else(|| {
-            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into()
-        })
+        self.output
+            .as_ref()
+            .ok_or_else(|| ConstructionFailure::MissingOwner.into())
     }
-    fn invoke(&self, chunk: &Chunk) -> ExecutionResult<Option<Chunk>> {
-        let output_schema = self.prepared_output()?;
-        let mut work = Work::begin(self.control.as_ref())?;
+
+    fn bind_bounds(&self, chunk: &Chunk) -> ExecutionResult<Option<SeriesCursor>> {
+        let mut work = EvaluationCheckpoints::new(self.control.as_ref());
+        work.flush()?;
         if chunk.len() != 1 || chunk.schema().as_ref() != self.input.as_ref() {
             return Err(CompiledSeriesFailure::InputPort.into());
         }
         let batch = chunk.record_batch();
-        let start = batch.column(self.parameters[0]);
-        let stop = batch.column(self.parameters[1]);
-        let step = self.parameters.get(2).map(|ordinal| batch.column(*ordinal));
-        let expanded =
-            generate_series_core::expand_observed(start, stop, step, 1, false, &mut |event| {
-                work.observe(event)
-            });
-        let expanded = match expanded {
-            Ok(value) => value,
-            Err(SeriesFailure::Control(cause)) => return Err(cause.into()),
-            Err(SeriesFailure::Cause(cause)) => return Err(ExecutionFailure::from_domain(cause)),
-        };
-        if expanded.total_rows == 0 {
-            work.flush()?;
-            return Ok(None);
-        }
-        let data_type = output_schema
-            .arrow_schema_ref()
-            .field(0)
-            .data_type()
-            .clone();
-        let column = generate_series_core::result_column_observed(
-            expanded.values,
-            &[data_type],
-            &mut |event| work.observe(event),
-        );
-        let column = match column {
-            Ok(column) => column,
-            Err(SeriesFailure::Control(cause)) => return Err(cause.into()),
-            Err(SeriesFailure::Cause(cause)) => return Err(ExecutionFailure::from_domain(cause)),
-        };
-        work.flush()?;
-        let output = if output_schema.is_typed() {
-            use crate::exec::pipeline::operator::ConstructionFailure;
-            let factory = self
-                .construction
-                .as_ref()
-                .ok_or(ConstructionFailure::MissingOwner)?;
-            let owner = factory.begin_typed_construction(output_schema)?;
-            owner.observe(
+        let mut argument = |index: usize| -> ExecutionResult<Option<i128>> {
+            work.step()?;
+            Ok(integer_argument(
+                batch.column(self.parameters[index]),
                 0,
-                &[],
-                crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns { channels: 1 },
-            )?;
-            Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
-                Arc::clone(output_schema),
-                vec![column],
-                expanded.total_rows,
-                owner.storage_lifetime(),
-                |step| owner.observe(0, &[], step),
-            )?
-        } else {
-            let batch = RecordBatch::try_new(output_schema.arrow_schema_ref(), vec![column])
-                .map_err(CompiledSeriesFailure::Arrow)?;
-            Chunk::try_new_with_chunk_schema(batch, Arc::clone(output_schema))?
+                index,
+                IntegerDiagnosticContext::GenerateSeries,
+            )?)
         };
-        work.flush()?;
-        Ok(Some(output))
+        let start = argument(0)?;
+        let stop = argument(1)?;
+        let step = if self.parameters.len() == 3 {
+            argument(2)?
+        } else {
+            Some(1)
+        };
+        let cursor = match (start, stop, step) {
+            (Some(start), Some(stop), Some(step)) => SeriesCursor::new(start, stop, step)?,
+            _ => None,
+        };
+        work.finish()?;
+        Ok(cursor)
     }
+
+    fn build_batch(
+        &self,
+        mut cursor: SeriesCursor,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> ExecutionResult<(Chunk, Option<SeriesCursor>)> {
+        let (rows, has_successor) = cursor.batch(self.batch_rows);
+        let output_schema = self.prepared_output()?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_typed_construction(output_schema)?;
+        let ty = output_schema.arrow_schema_ref();
+        let data_type = ty.field(0).data_type();
+        macro_rules! signed_column {
+            ($arrow:ty, $native:ty) => {
+                series_column(
+                    rows,
+                    owner.as_ref(),
+                    work,
+                    |values, work| {
+                        cursor.fill(rows, has_successor, work, |value| {
+                            let converted = <$native>::try_from(value).map_err(|_| {
+                                SeriesError::ValueOutOfRange {
+                                    value,
+                                    data_type: data_type.clone(),
+                                }
+                            })?;
+                            values.push(converted);
+                            Ok(())
+                        })
+                    },
+                    |buffer| {
+                        Ok(PrimitiveArray::<$arrow>::new(
+                            ScalarBuffer::new(buffer, 0, rows),
+                            None,
+                        ))
+                    },
+                )?
+            };
+        }
+        let column = match data_type {
+            DataType::Int8 => signed_column!(Int8Type, i8),
+            DataType::Int16 => signed_column!(Int16Type, i16),
+            DataType::Int32 => signed_column!(Int32Type, i32),
+            DataType::Int64 => signed_column!(Int64Type, i64),
+            DataType::FixedSizeBinary(width)
+                if *width == novarocks_functions::largeint::LARGEINT_BYTE_WIDTH =>
+            {
+                let bytes =
+                    rows.checked_mul(*width as usize)
+                        .ok_or(ConstructionFailure::Resource(
+                            LayoutResourceError::Arithmetic,
+                        ))?;
+                series_column(
+                    bytes,
+                    owner.as_ref(),
+                    work,
+                    |values, work| {
+                        cursor.fill(rows, has_successor, work, |value| {
+                            values.extend_from_slice(&value.to_be_bytes());
+                            Ok(())
+                        })
+                    },
+                    |buffer| {
+                        FixedSizeBinaryArray::try_new(*width, buffer, None)
+                            .map_err(CompiledSeriesFailure::Arrow)
+                    },
+                )?
+            }
+            other => {
+                return Err(SeriesError::ReturnType {
+                    data_type: other.clone(),
+                }
+                .into());
+            }
+        };
+        owner.observe(
+            0,
+            &[],
+            ArrayNormalizationStep::CreateChunkColumns { channels: 1 },
+        )?;
+        let output = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            Arc::clone(output_schema),
+            vec![column],
+            rows,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?;
+        Ok((output, has_successor.then_some(cursor)))
+    }
+
     fn alive(&self) -> ExecutionResult<()> {
         if self.failed {
             Err(CompiledSeriesFailure::AlreadyFailed.into())
@@ -291,10 +425,7 @@ impl OperatorLifecycle for CompiledGenerateSeriesProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
-    fn set_construction_factory(
-        &mut self,
-        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-    ) {
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
         self.construction = Some(factory);
     }
     fn prepare(&mut self) -> ExecutionResult<()> {
@@ -303,7 +434,6 @@ impl OperatorLifecycle for CompiledGenerateSeriesProcessor {
             return Ok(());
         }
         let result = (|| -> ExecutionResult<ChunkSchemaRef> {
-            use crate::exec::pipeline::operator::ConstructionFailure;
             let factory = self
                 .construction
                 .as_ref()
@@ -325,7 +455,7 @@ impl OperatorLifecycle for CompiledGenerateSeriesProcessor {
         &self.name
     }
     fn begin_exit(&mut self) -> ExecutionResult<()> {
-        self.pending = None;
+        self.cursor = None;
         Ok(())
     }
     fn close(&mut self) -> ExecutionResult<()> {
@@ -333,7 +463,7 @@ impl OperatorLifecycle for CompiledGenerateSeriesProcessor {
     }
     fn cancel(&mut self) {
         self.failed = true;
-        self.pending = None;
+        self.cursor = None;
     }
 }
 impl InputEncodingPolicy for CompiledGenerateSeriesProcessor {}
@@ -348,80 +478,62 @@ impl TransformKernel for CompiledGenerateSeriesProcessor {
         self.prepared_output()?;
         if self.accepted {
             self.failed = true;
+            self.cursor = None;
             return Err(CompiledSeriesFailure::DuplicateBounds.into());
         }
         self.accepted = true;
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
-        match self.invoke(&chunk) {
-            Ok(output) => {
-                let next = if output.is_some() {
+        match self.bind_bounds(&chunk) {
+            Ok(cursor) => {
+                let next = if cursor.is_some() {
                     NextStep::Runnable
                 } else {
                     NextStep::Finished
                 };
-                self.pending = output;
+                self.cursor = cursor;
                 Ok(StepResult::new(None, next, rows))
             }
             Err(error) => {
                 self.failed = true;
-                self.pending = None;
+                self.cursor = None;
                 Err(error)
             }
         }
     }
-    fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
+
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
-        if let Err(cause) = self.control.checkpoint(0) {
-            self.failed = true;
-            self.pending = None;
-            return Err(cause.into());
-        }
-        let Some(chunk) = &self.pending else {
+        let Some(cursor) = self.cursor else {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
         };
-        let total = chunk.len();
-        let rows = (self.batch_rows.get() as usize).min(total - self.offset);
-        let sliced = (|| -> ExecutionResult<Chunk> {
-            let output = if chunk.chunk_schema().is_typed() {
-                use crate::exec::pipeline::operator::ConstructionFailure;
-                let factory = self
-                    .construction
-                    .as_ref()
-                    .ok_or(ConstructionFailure::MissingOwner)?;
-                let owner = factory.begin_input_construction(chunk)?;
-                chunk.slice_typed_observed::<ConstructionFailure, _>(
-                    self.offset,
-                    rows,
-                    owner.storage_lifetime(),
-                    |step| owner.observe(0, &[], step),
-                )?
-            } else {
-                chunk.slice(self.offset, rows)
-            };
-            Ok(output)
-        })();
-        let output = match sliced {
-            Ok(output) => output,
-            Err(cause) => {
-                self.failed = true;
-                self.pending = None;
-                return Err(cause);
-            }
-        };
-        if let Err(cause) = self.control.checkpoint(0) {
-            self.failed = true;
-            self.pending = None;
-            return Err(cause.into());
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-        self.offset += rows;
-        let next = if self.offset == total {
-            self.pending = None;
-            NextStep::Finished
-        } else {
-            NextStep::Runnable
-        };
-        Ok(StepResult::new(Some(output), next, 0))
+        let result = (|| {
+            let mut work = EvaluationCheckpoints::new(self.control.as_ref());
+            work.flush()?;
+            let batch = self.build_batch(cursor, &mut work)?;
+            work.finish()?;
+            Ok(batch)
+        })();
+        match result {
+            Ok((output, cursor)) => {
+                self.cursor = cursor;
+                let next = if cursor.is_some() {
+                    NextStep::Runnable
+                } else {
+                    NextStep::Finished
+                };
+                Ok(StepResult::new(Some(output), next, 0))
+            }
+            Err(error) => {
+                self.failed = true;
+                self.cursor = None;
+                Err(error)
+            }
+        }
     }
+
     fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
         Ok(StepResult::new(None, NextStep::Finished, 0))

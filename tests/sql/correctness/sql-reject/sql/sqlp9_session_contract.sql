@@ -83,65 +83,81 @@ SET SESSION AUTHORIZATION 'example-user';
 RESET SESSION AUTHORIZATION;
 
 -- query 17
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-PREPARE rejected FROM SELECT 1;
-
--- query 18
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
 DEALLOCATE PREPARE rejected;
 
--- query 19
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- query 18
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
 EXECUTE rejected USING 1;
 
+-- query 19
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
+DESCRIBE INPUT rejected;
+
 -- query 20
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-EXECUTE IMMEDIATE 'SELECT 1';
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
+DESCRIBE OUTPUT rejected;
 
 -- query 21
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-DESCRIBE INPUT rejected;
-
--- query 22
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-DESCRIBE OUTPUT rejected;
-
--- query 23
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-DESCRIBE OUTPUT (SELECT 1 AS id);
-
--- query 24
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SET PATH reject_ice.reject_ns;
 
--- query 25
+-- query 22
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 SET SESSION no_such_property = 1;
 
--- query 26
+-- query 23
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 WITH SESSION no_such_property = 1 SELECT CAST(1 AS integer);
 
--- query 27
+-- query 24
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET LOCAL pipeline_dop = 1;
 
--- query 28
+-- query 25
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET pipeline_dop = 1;
 
--- query 29
+-- query 26
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY;
 
--- query 30
+-- query 27
 -- @expect_trino_error=NOT_IN_TRANSACTION,USER_ERROR
 COMMIT WORK;
 
--- query 31
+-- query 28
 -- @expect_trino_error=NOT_IN_TRANSACTION,USER_ERROR
 ROLLBACK WORK;
 
--- query 32
+-- query 29
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 RESET SESSION no_such_property;
+
+-- query 30
+-- @expect_trino_error=INVALID_PARAMETER_USAGE,USER_ERROR
+SELECT ?;
+
+-- query 31
+-- @expect_trino_error=INVALID_PARAMETER_USAGE,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT ?, ?' USING 1;
+
+-- query 32
+-- @expect_trino_error=EXPRESSION_NOT_CONSTANT,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT ?' USING unbound_column;
+
+-- query 33
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+PREPARE outer_prepare FROM PREPARE inner_prepare FROM SELECT 1;
+
+-- query 34
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT 1 LIMIT ?' USING DECIMAL '1.0';
+
+-- query 35
+-- @expect_trino_error=INVALID_ARGUMENTS,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT 1 LIMIT ?' USING CAST(NULL AS BIGINT);
+
+-- query 36
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+EXECUTE IMMEDIATE 'SELECT 1 OFFSET ?' USING -1;

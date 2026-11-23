@@ -376,9 +376,7 @@ fn prove_provider_comparison(
         && effects.instance_state == FunctionInstanceState::None
         && effects.observable_effects.is_empty()
         && effects.environment.is_empty()
-        && claim.temporal_source.is_none()
-        && claim.regexp_count_pattern_source.is_none()
-        && claim.to_base64_byte_source.is_none())
+        && claim.temporal_source.is_none())
 }
 
 fn enqueue(

@@ -74,10 +74,10 @@ select typeof([1, 2, 3]);
 select typeof(get_json_object('{"k1":1, "k2":"v2"}', '$.k1'));
 
 -- query 18
-select typeof(map(1,'apple', 2,'orange', 3,'pear'));
+select typeof(MAP(ARRAY[1, 2, 3], ARRAY['apple', 'orange', 'pear']));
 
 -- query 19
-select typeof(struct(1, 2, 3, 4));
+select typeof(CAST(ROW(1, 2, 3, 4) AS ROW(col1 INTEGER, col2 INTEGER, col3 INTEGER, col4 INTEGER)));
 
 -- query 20
 select typeof(parse_json('{"a": 1, "b": true}'));

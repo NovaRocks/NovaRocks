@@ -711,6 +711,7 @@ impl QueryResultCapacityBinding {
 #[derive(Clone)]
 pub struct QueryExecutionContext {
     session_properties: Arc<crate::sql::session::registry::SessionPropertyInputs>,
+    prepared_parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
@@ -767,6 +768,7 @@ impl QueryExecutionContext {
             test_statement_nomination: None,
             result_capacity: None,
             session_properties: Arc::default(),
+            prepared_parameters: None,
             role,
             topology,
             deadline,
@@ -847,6 +849,29 @@ impl QueryExecutionContext {
         let mut execution = self.clone();
         execution.result_capacity = Some(binding);
         Ok(execution)
+    }
+
+    pub fn prepared_parameters(
+        &self,
+    ) -> Option<&Arc<novarocks_sql::compiler::SqlPreparedParameters>> {
+        self.prepared_parameters.as_ref()
+    }
+
+    pub fn sql_statement_input(
+        &self,
+        query: Box<novarocks_parser::ast::Query>,
+        session_admitted: bool,
+    ) -> novarocks_sql::compiler::SqlStatementInput {
+        use novarocks_sql::compiler::SqlStatementInput;
+        let statement = if session_admitted {
+            SqlStatementInput::query_with_admitted_session(query)
+        } else {
+            SqlStatementInput::parsed_query(query)
+        };
+        match self.prepared_parameters() {
+            Some(parameters) => statement.with_prepared_parameters(parameters.clone()),
+            None => statement,
+        }
     }
 
     pub fn result_capacity(&self) -> Option<&QueryResultCapacityBinding> {
@@ -961,6 +986,14 @@ impl RequestContext {
     ) -> Result<Self, WorkError> {
         self.execution = self.execution.with_result_capacity(binding)?;
         Ok(self)
+    }
+
+    pub fn with_prepared_parameters(
+        mut self,
+        parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
+    ) -> Self {
+        self.execution.prepared_parameters = parameters;
+        self
     }
 
     pub fn session(&self) -> &RequestSessionContext {
@@ -1557,7 +1590,7 @@ mod tests {
     fn sql_mode_is_frozen_in_both_request_projections_and_topology_retries() {
         let mode = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
             novarocks_sql::sql_mode::SqlMode::from_assignment(
-                "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
             ),
         );
         let first = RequestContext::admit(RequestAdmission::new(

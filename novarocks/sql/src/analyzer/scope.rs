@@ -22,7 +22,6 @@ use std::rc::Rc;
 use arrow::datatypes::DataType;
 use novarocks_parser::Span;
 
-use crate::analysis::LambdaParam;
 use crate::analyze_error::AnalyzeError;
 use crate::column_id::{ColumnId, ColumnRefFactory};
 use novarocks_type_contract::{FunctionValueType, PureCompileControl};
@@ -50,8 +49,6 @@ pub(super) struct AnalyzerScope {
     /// Ordered columns for SELECT * expansion:
     /// (qualifier, internal label, value ID, complete type, optional SQL name)
     ordered: Vec<ScopedField>,
-    /// Lambda parameters visible in the current expression scope.
-    lambda_params: HashMap<String, LambdaParam>,
     /// For column names that have a canonical qualifier — e.g. a USING-join
     /// column whose unqualified reference must resolve to a specific side's
     /// physical binding — this map records that qualifier. Callers can use
@@ -73,7 +70,6 @@ impl AnalyzerScope {
             qualified: HashMap::new(),
             unqualified: HashMap::new(),
             ordered: Vec::new(),
-            lambda_params: HashMap::new(),
             canonical_qualifier: HashMap::new(),
             computed_columns: HashMap::new(),
         }
@@ -368,14 +364,6 @@ impl AnalyzerScope {
         self.ordered.iter().any(|(_, _, id, _, _)| *id == column_id)
             || self.qualified.values().any(|(id, _)| *id == column_id)
             || self.unqualified.values().any(|(id, _)| *id == column_id)
-    }
-
-    pub(super) fn resolve_lambda_param(&self, name: &str) -> Option<LambdaParam> {
-        self.lambda_params.get(&name.to_lowercase()).cloned()
-    }
-
-    pub(super) fn add_lambda_param(&mut self, param: LambdaParam) {
-        self.lambda_params.insert(param.name.to_lowercase(), param);
     }
 
     pub(super) fn resolve(

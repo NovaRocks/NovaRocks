@@ -15,29 +15,121 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::datatypes::{DataType, Field};
+
 #[test]
-fn actual_map_key_keeps_original_exact_binding_and_candidate_named_refusal() {
+fn approximate_aggregate_availability_uses_the_exact_selected_profile() {
     use novarocks_sql::{
         analyze_error::AnalyzeErrorKind,
         compiler::{SqlCompileError, SqlCompileProgressError},
     };
     use novarocks_sql_testkit::try_sql_source_with_declared_fields;
-    {
-        let result = try_sql_source_with_declared_fields(
-            "SELECT map(CAST(1 AS TINYINT),10,CAST(2 AS TINYINT),20)[k] AS picked FROM t",
-            &[Field::new("k", DataType::Int64, false)],
-        );
 
-        let failure = result.unwrap_err();
+    let fields = [Field::new("k", DataType::Int64, false)];
+    for (sql, overload) in [
+        (
+            "SELECT approx_distinct(k, 0.01) FROM t",
+            "explicit-error-hll-v1",
+        ),
+        (
+            "SELECT approx_percentile(k, 1, 0.5, 0.01) FROM t",
+            "bigint-accuracy-v1",
+        ),
+        ("SELECT approx_distinct(ARRAY[k]) FROM t", "default-hll-v1"),
+    ] {
+        let failure = try_sql_source_with_declared_fields(sql, &fields).unwrap_err();
         let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
-            panic!("actual FE named missing implementation refusal: {failure:?}");
+            panic!("expected typed aggregate profile refusal: {failure:?}");
         };
         assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-        assert_eq!(
-            error.message(),
-            "selected overload `builtin.scalar/map/dynamic-v1` has no installed implementation for the selected carrier"
-        );
+        assert!(error.message().contains(overload), "{error}");
     }
+}
+
+#[test]
+fn actual_map_key_keeps_original_exact_binding_and_names_uninstalled_key_domain() {
+    use novarocks_sql::{
+        analyze_error::AnalyzeErrorKind,
+        compiler::{SqlCompileError, SqlCompileProgressError},
+    };
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+
+    let fields = [Field::new("k", DataType::Int64, false)];
+    let source = try_sql_source_with_declared_fields(
+        "SELECT map(ARRAY[CAST(1 AS BIGINT), CAST(2 AS BIGINT)], ARRAY[10,20])[k] AS picked FROM t",
+        &fields,
+    )
+    .unwrap();
+    let output = source.original_public_result_declaration().unwrap();
+    assert_eq!(output.fields()[0].ty.data_type(), &DataType::Int32);
+
+    let failure = try_sql_source_with_declared_fields(
+        "SELECT map(ARRAY[ARRAY[k]], ARRAY[10]) AS candidate FROM t",
+        &fields,
+    )
+    .unwrap_err();
+    let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
+        panic!("expected an exact MAP key domain refusal: {failure:?}");
+    };
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+    assert!(
+        error
+            .message()
+            .contains("builtin.scalar/map/array-keys-array-values-v1")
+    );
+}
+
+#[test]
+fn concat_array_widening_preserves_the_original_common_conversion_in_the_package() {
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION;
+    use novarocks_sql_testkit::try_sql_source_with_declared_fields;
+
+    let fields = [
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Int64, true),
+    ];
+    let authored = try_sql_source_with_declared_fields(
+        "SELECT concat(ARRAY[k, NULL], ARRAY[v]) AS items FROM t",
+        &fields,
+    )
+    .unwrap();
+    let schema = authored.original_public_result_declaration().unwrap();
+    let result = &schema.fields()[0].ty;
+    let item = result.child_at(0).expect("concat ARRAY result");
+    assert_eq!(item.data_type(), &DataType::Int64);
+    assert!(item.nullable());
+
+    let mut found = false;
+    for fragment in authored.plan().fragments().values() {
+        for node in fragment.nodes().values() {
+            let Some(unit) = &node.expressions else {
+                continue;
+            };
+            for expression in unit.definitions() {
+                let ExprKind::FunctionCall { function, args } = &expression.kind else {
+                    continue;
+                };
+                if function.overload.as_str() != ARRAY_COMMON_COERCION {
+                    continue;
+                }
+                let source = unit.definition(args[0]).expect("original ARRAY operand");
+                let Some(source_item) = source.ty.child_at(0) else {
+                    continue;
+                };
+                if source_item.data_type() != &DataType::Int32 {
+                    continue;
+                }
+                let converted_item = expression.ty.child_at(0).expect("converted ARRAY item");
+                assert_eq!(converted_item.data_type(), &DataType::Int64);
+                assert_eq!(expression.ty.nullable(), source.ty.nullable());
+                found = true;
+            }
+        }
+    }
+    assert!(
+        found,
+        "the source ARRAY(INTEGER) uses the installed exact common coercion"
+    );
 }
 
 mod fold_frontiers {
@@ -82,6 +174,36 @@ mod fold_frontiers {
     }
 
     #[test]
+    fn collection_lambda_signatures_keep_their_own_unavailable_overloads() {
+        let probe = Arc::new(FoldProbe::default());
+        for (sql, overload) in [
+            (
+                "SELECT array_sort(ARRAY[3,1,2], (x,y) -> 0)",
+                "builtin.scalar/array_sort/lambda-v1",
+            ),
+            (
+                "SELECT transform(ARRAY[1,2], x -> x + 1)",
+                "builtin.scalar/transform/lambda-v1",
+            ),
+            (
+                "SELECT map_filter(map(), (k,v) -> true)",
+                "builtin.scalar/map_filter/lambda-v1",
+            ),
+        ] {
+            unavailable(analyze(sql, &probe).unwrap_err(), overload);
+        }
+    }
+    #[test]
+    fn reverse_keeps_installed_string_and_uninstalled_array_overloads_distinct() {
+        let probe = Arc::new(FoldProbe::default());
+        analyze("SELECT reverse('abc')", &probe).unwrap();
+        unavailable(
+            analyze("SELECT reverse(ARRAY[1,2])", &probe).unwrap_err(),
+            "builtin.scalar/reverse/(list",
+        );
+    }
+
+    #[test]
     fn distinct_aggregates_are_selected_only_from_supported_sql_calls() {
         let probe = Arc::new(FoldProbe::default());
         analyze(
@@ -117,7 +239,7 @@ mod fold_frontiers {
     }
 
     #[test]
-    fn retired_trc_6d1_names_are_unknown_to_sql_analysis() {
+    fn retired_trc_6d_names_are_unknown_to_sql_analysis() {
         use novarocks_functions::{
             FunctionKind, FunctionVisibility, builtin::catalogue::builtin_engine_function_catalog,
         };
@@ -143,6 +265,7 @@ mod fold_frontiers {
             "array_contains_all",
             "array_cum_sum",
             "array_difference",
+            "array_sortby",
             "array_sum",
             "array_top_n",
             "array_unique_agg",
@@ -278,13 +401,12 @@ mod fold_frontiers {
             );
         }
 
-        for sql in [
-            "SELECT sleep(0)",
-            "SELECT murmur_hash3_32('x')",
-            "SELECT array_sortby(ARRAY[2, 1], ARRAY[2, 1])",
-        ] {
-            analyze(sql, &probe).unwrap_or_else(|error| panic!("{sql}: {error}"));
-        }
+        analyze("SELECT sleep(0)", &probe).unwrap();
+        let error = analyze("SELECT murmur_hash3_32('x')", &probe).unwrap_err();
+        let SqlCompileError::Analyze(error) = error else {
+            panic!("retired Murmur call must fail analysis: {error:?}");
+        };
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
     }
 
     #[test]
@@ -302,16 +424,10 @@ mod fold_frontiers {
         }
     }
 
-    const UNAUTHORED_ENVIRONMENT: &[(&str, &str)] = &[
-        (
-            "SELECT GROUP_CONCAT(REVERSE('abc'))",
-            "builtin.aggregate/string_agg/",
-        ),
-        (
-            "SELECT FROM_UNIXTIME(-(BIGINT '-1'))",
-            "builtin.scalar/from_unixtime/",
-        ),
-    ];
+    const UNAUTHORED_ENVIRONMENT: &[(&str, &str)] = &[(
+        "SELECT FROM_UNIXTIME(-(BIGINT '-1'))",
+        "builtin.scalar/from_unixtime/",
+    )];
 
     #[test]
     fn e08s1_fold_environment_exact_missing_authors_refuse_parent_before_children() {
@@ -359,11 +475,11 @@ mod fold_frontiers {
 
     #[test]
     fn e08s1_logical_environment_exact_authored_raw_limit_keeps_original_logical_success() {
-        for raw in [-1, 4096] {
+        {
             let probe = Arc::new(FoldProbe::default());
-            let semantics = SqlSemanticSettings::default().with_group_concat_max_len(raw);
+            let semantics = SqlSemanticSettings::default();
             analyze_table_free(
-                "SELECT GROUP_CONCAT(REVERSE('abc'))",
+                "SELECT LISTAGG(REVERSE('abc')) WITHIN GROUP (ORDER BY 1)",
                 SqlCompileIntent::LogicalOnly,
                 session(semantics, true),
                 builtin_sql_function_catalog(),

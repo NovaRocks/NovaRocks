@@ -45,6 +45,8 @@ pub(super) fn operation(name: &str) -> Option<StringMeasureOp> {
         "ascii" => Some(StringMeasureOp::Ascii),
         "length" => Some(StringMeasureOp::Bytes),
         "char_length" => Some(StringMeasureOp::Characters),
+        "chr" => Some(StringMeasureOp::Chr),
+        "codepoint" => Some(StringMeasureOp::Codepoint),
         _ => None,
     }
 }
@@ -61,6 +63,21 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),
+    }
+}
+
+pub(super) fn codepoint_effects() -> FunctionEffectDeclaration {
+    let mut result = effects();
+    result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    result
+}
+
+impl StringMeasureOp {
+    fn effects(self) -> FunctionEffectDeclaration {
+        match self {
+            Self::Chr | Self::Codepoint => codepoint_effects(),
+            _ => effects(),
+        }
     }
 }
 
@@ -96,10 +113,14 @@ impl StringMeasureOwner {
                 value: name.into(),
             })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let expected = operation.effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || if name == "length" {
+                !(1..=3).contains(&declaration.overloads().len())
+            } else {
+                declaration.overloads().len() != 1
+            }
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -129,7 +150,7 @@ impl StringMeasureOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = self.operation.effects();
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -423,7 +444,7 @@ mod tests {
         SemanticParameterRef, SemanticParameters, ValueLogicalType,
     };
 
-    const NAMES: [&str; 3] = ["ascii", "char_length", "length"];
+    const NAMES: [&str; 1] = ["length"];
 
     fn owner(name: &str) -> StringMeasureOwner {
         let (_, signatures) = super::super::registry::builtin_scalar_declarations()
@@ -512,22 +533,20 @@ mod tests {
                 definition.binding_declaration().unwrap(),
                 owner.binding_declaration()
             );
-            let [implementation] = owner.implementation_declarations() else {
-                panic!("one actual measurement profile");
-            };
-            assert_eq!(
-                implementation.overload,
-                owner.declaration.overloads()[0].identity
-            );
-            assert_eq!(
-                implementation.implementation.as_str(),
-                format!("builtin.scalar/{name}/selected-v1")
-            );
-            assert_eq!(implementation.abi, PureKernelAbi::ScalarV1);
-            assert_eq!(
-                owner.declaration.overloads()[0].effects.as_ref(),
-                Some(&effects())
-            );
+            assert_eq!(owner.implementation_declarations().len(), 3);
+            for (implementation, overload) in owner
+                .implementation_declarations()
+                .iter()
+                .zip(owner.declaration.overloads())
+            {
+                assert_eq!(implementation.overload, overload.identity);
+                assert_eq!(
+                    implementation.implementation.as_str(),
+                    format!("builtin.scalar/{name}/selected-v1")
+                );
+                assert_eq!(implementation.abi, PureKernelAbi::ScalarV1);
+                assert_eq!(overload.effects.as_ref(), Some(&effects()));
+            }
         }
         for name in [
             "character_length",
@@ -565,10 +584,7 @@ mod tests {
                 );
                 assert_eq!(
                     selected.result_type,
-                    FunctionResultType::Scalar(FunctionValueType::new(
-                        DataType::Int32,
-                        name == "ascii" || nullable
-                    ))
+                    FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, nullable))
                 );
                 for policy in [
                     DecimalOverflowPolicy::OutputNull,
@@ -633,10 +649,8 @@ mod tests {
         let uses = [Some(ExpressionUseId::new(62))];
         for name in NAMES {
             let owner = owner(name);
-            for source in [
-                FunctionValueType::new(DataType::LargeUtf8, true),
-                FunctionValueType::new(DataType::Null, true),
-            ] {
+            {
+                let source = FunctionValueType::new(DataType::LargeUtf8, true);
                 let raw = [argument(source)];
                 let selected = Arc::new(
                     owner
@@ -664,8 +678,6 @@ mod tests {
                 assert!(prepared_for_test(name, &canonical_source).is_ok());
             }
             for source in [
-                FunctionValueType::new(DataType::Binary, true),
-                FunctionValueType::new(DataType::LargeBinary, true),
                 FunctionValueType::new(DataType::Int64, true),
                 FunctionValueType::try_with_logical_type(
                     DataType::Utf8,
@@ -717,7 +729,7 @@ mod tests {
             );
             for result in [
                 FunctionValueType::new(DataType::Int64, true),
-                FunctionValueType::new(DataType::Int32, name != "ascii"),
+                FunctionValueType::new(DataType::Int32, false),
             ] {
                 let mut wrong = (*selected).clone();
                 wrong.result_type = FunctionResultType::Scalar(result);
@@ -766,8 +778,8 @@ mod tests {
             ));
         }
     }
-    fn owner_for_foreign_name(name: &str) -> StringMeasureOwner {
-        owner(if name == "ascii" { "length" } else { "ascii" })
+    fn owner_for_foreign_name(_name: &str) -> StringMeasureOwner {
+        owner("chr")
     }
 
     #[test]
@@ -861,7 +873,7 @@ mod tests {
     }
     #[test]
     fn measurement_owner_preserves_three_typed_entry_and_actual_work_refusals() {
-        let owner = owner("ascii");
+        let owner = owner("length");
         let arguments = [argument(FunctionValueType::new(DataType::Utf8, false))];
         let selected = Arc::new(
             owner

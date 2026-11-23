@@ -101,7 +101,7 @@ impl FrontendQueryCompiler {
             );
             let mut logical = match planning_cpu
                 .logical_catalog_for_input(
-                    SqlStatementInput::query_with_admitted_session(Box::new(query)),
+                    execution.sql_statement_input(Box::new(query), true),
                     SqlSessionContext {
                         sql_semantics: execution.sql_semantics().clone(),
                         current_catalog: current_catalog.map(str::to_owned),
@@ -156,9 +156,19 @@ impl FrontendQueryCompiler {
             }
             let functions: Arc<dyn novarocks_sql::compiler::SqlFunctionCatalog> =
                 self.functions.clone();
+            let Some(table_argument_capacity) = execution.result_capacity().cloned() else {
+                return Ok(Err(FrontendQueryCompilerError::Engine(
+                    "logical EXPLAIN requires the admitted result capacity".into(),
+                )));
+            };
             return Ok(planning_cpu
                 .logical_finish(LogicalFinishInput {
                     logical,
+                    table_argument_capacity,
+                    required_constants: Arc::new(crate::RequiredConstantInterpreter::new(
+                        self.sealed_functions(),
+                        self.constant_policy(),
+                    )),
                     functions,
                     sealed_functions: self.sealed_functions(),
                     policy: self.constant_policy(),
@@ -242,7 +252,7 @@ impl FrontendQueryCompiler {
             .map_err(FrontendQueryCompilerError::Engine)?;
             Ok(novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                 crate::query_execution::physical_encoding::mint_plan_version(),
-                SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
+                execution.sql_statement_input(Box::new(query.clone()), true),
                 SqlCompileIntent::Explain {
                     level,
                     analyze: false,
@@ -358,7 +368,7 @@ impl FrontendQueryCompiler {
             Ok((
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                     version,
-                    SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
+                    execution.sql_statement_input(Box::new(query.clone()), true),
                     SqlCompileIntent::Explain {
                         level: ExplainLevel::Analyze,
                         analyze: true,

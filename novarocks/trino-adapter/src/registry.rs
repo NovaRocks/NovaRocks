@@ -228,6 +228,9 @@ impl TrinoQueryRegistry {
                             &entry,
                             QueryCancellationReason::ClientDisconnected,
                         );
+                        // The same entry-state lock excludes first GET while
+                        // settlement releases the original request, including
+                        // its prepared snapshot.
                         registered_terminal(&registry.control, &entry, &mut state, error);
                         state.phase = Phase::Expired;
                     }

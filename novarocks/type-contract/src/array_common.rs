@@ -20,8 +20,8 @@
 //! No outer target, AST, ConstantValue, SQL mode or runtime value enters this API.
 use crate::value_construction::ValueConstruction;
 use crate::{
-    FunctionValueType, ValueConstructionFailure, ValueConstructionRequest, ValueKind, ValueLayout,
-    ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+    CharacterKind, FunctionValueType, ValueConstructionFailure, ValueConstructionRequest,
+    ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
 };
 use arrow_schema::{DataType, Field};
 use std::{alloc::Layout, sync::Arc};
@@ -60,6 +60,14 @@ fn unknown(value: &FunctionValueType) -> bool {
     value.logical_type() == ValueLogicalType::Physical
         && matches!(value.value_type().kind(), ValueKind::Scalar(DataType::Null))
 }
+fn varchar_leaf(kind: &ValueKind) -> bool {
+    match kind {
+        ValueKind::String => true,
+        ValueKind::BoundedCharacter(character) => character.kind() == CharacterKind::Varchar,
+        _ => false,
+    }
+}
+
 fn check_unknown<E>(value: &FunctionValueType) -> Result<(), ArrayCommonTypeFailure<E>> {
     if unknown(value) && !value.nullable() {
         return Err(rule(ArrayCommonRuleFailure::NonnullableUnknown));
@@ -174,6 +182,21 @@ fn pair<E>(
     }
     if left.logical_type() != ValueLogicalType::Physical {
         return Err(rule(ArrayCommonRuleFailure::IncompatibleDomains));
+    }
+    if varchar_leaf(left.value_type().kind()) && varchar_leaf(right.value_type().kind()) {
+        return crate::trino_common_type_with_construction(
+            left,
+            right,
+            storage,
+            creation.observer(),
+        )?
+        .ok_or_else(|| rule(ArrayCommonRuleFailure::IncompatibleScalarTypes));
+    }
+    if !matches!(
+        (left.value_type().kind(), right.value_type().kind()),
+        (ValueKind::Scalar(_), ValueKind::Scalar(_))
+    ) {
+        return Err(rule(ArrayCommonRuleFailure::UnreviewedHeterogeneousFamily));
     }
     let carrier = numeric_common(left.data_type(), right.data_type()).map_err(rule::<E>)?;
     FunctionValueType::try_with_logical_type_with_construction(
@@ -325,6 +348,11 @@ pub fn array_common_coercion_types_valid_observed<E>(
             &mut *observe,
         )? {
             return Ok(true);
+        }
+        if varchar_leaf(source.kind()) && varchar_leaf(target.kind()) {
+            return Ok(source_layout == &DataType::Utf8
+                && target_layout == &DataType::Utf8
+                && crate::trino_can_coerce_scalar(source.kind(), target.kind()));
         }
         Ok(matches!(
             (source.kind(), target.kind()),

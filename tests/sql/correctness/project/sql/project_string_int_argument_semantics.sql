@@ -17,25 +17,46 @@
 
 -- @order_sensitive=true
 -- @tags=project,string,int_args
--- Test Objective:
--- 1. Validate string functions with integer arguments (INT literals).
--- 2. Prevent regressions where INT-typed arguments are rejected or produce wrong NULL/empty semantics.
--- Test Flow:
--- 1. Evaluate string scalar functions in a single deterministic SELECT.
--- 2. Cover negative/zero/positive integer argument behavior for split_part, substring_index, repeat, space, left/right, lpad/rpad.
--- 3. Compare one-row output against expected values.
-SELECT
-  split_part('a,b,c', ',', -1) AS sp_neg1,
-  split_part('a,b,c', ',', -2) AS sp_neg2,
-  split_part('abc', '', 1) AS sp_empty_d1,
-  split_part('abc', '', 4) AS sp_empty_d4,
-  repeat('ab', 2) AS rep2,
-  repeat('ab', -1) AS rep_neg,
-  strleft('abc', 2) AS left2,
-  strleft('abc', -1) AS left_neg,
-  strright('abc', 2) AS right2,
-  strright('abc', -1) AS right_neg,
-  lpad('ab', 1, '') AS lpad_empty_shrink,
-  lpad('ab', -1, 'x') AS lpad_neg,
-  rpad('ab', 1, '') AS rpad_empty_shrink,
-  rpad('ab', -1, 'x') AS rpad_neg;
+-- SQL integer arguments coerce to the BIGINT function profiles.
+-- query 1
+SELECT split_part('a,b,c', ',', 3) AS third_field,
+       split_part('abc', '', 1) AS empty_separator_first,
+       split_part('abc', '', 4) AS empty_separator_missing,
+       substr('abc', 1, 2) AS first_two,
+       substr('abc', -2, 2) AS last_two,
+       substr('abc', 1, 0) AS empty_substring,
+       lpad('ab', 1, 'x') AS lpad_shrink,
+       rpad('ab', 1, 'x') AS rpad_shrink,
+       split('a,b,', ',') AS trailing_empty_field;
+
+-- query 2
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT split_part('a,b,c', ',', -1);
+
+-- query 3
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT split_part('a,b,c', ',', 0);
+
+-- query 4
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT lpad('ab', 1, '');
+
+-- query 5
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT lpad('ab', -1, 'x');
+
+-- query 6
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT rpad('ab', 1, '');
+
+-- query 7
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT rpad('ab', -1, 'x');
+
+-- query 8
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT split('abc', '');
+
+-- query 9
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT split('a,b', ',', 0);

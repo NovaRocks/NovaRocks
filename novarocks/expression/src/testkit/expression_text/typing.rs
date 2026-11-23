@@ -95,14 +95,33 @@ impl<'a> TextTyping<'a> {
         }
         let span = expr.span();
         let next = depth + 1;
+        if let ast::Expr::Extract(extract) = expr {
+            let source = self.lower(&extract.expression, work, next)?;
+            work.flush()?;
+            let binding = crate::typing::bind_extract(
+                self.context.catalog,
+                extract.field,
+                &source.typing.argument(),
+                work.control(),
+            )
+            .map_err(|cause| typing_error(cause, span))?;
+            return Ok(TextNode::call(binding, None, vec![source]));
+        }
         if let Some(call) = canonical_call(expr).map_err(TextError::UnsupportedSyntax)? {
-            if matches!(expr, ast::Expr::Coalesce(_)) {
+            let shape = if call.name == "row" {
+                Some(NodeShape::Row)
+            } else if matches!(expr, ast::Expr::Coalesce(_)) {
+                Some(NodeShape::Coalesce)
+            } else {
+                None
+            };
+            if let Some(shape) = shape {
                 let children = call
                     .arguments
                     .into_iter()
                     .map(|arg| self.lower(arg, work, next))
                     .collect::<Result<Vec<_>, _>>()?;
-                return self.type_call(NodeShape::Coalesce, children, span, work);
+                return self.type_call(shape, children, span, work);
             }
             return self.lower_call(call.name, call.arguments, span, work, next);
         }
@@ -153,8 +172,14 @@ impl<'a> TextTyping<'a> {
                 {
                     return Err(legacy("function call modifiers", span));
                 }
+                // The hidden overlay name is only reachable through dedicated syntax.
+                let name = if name.value.eq_ignore_ascii_case("$overlay") {
+                    "\"$overlay\""
+                } else {
+                    &name.value
+                };
                 self.lower_call(
-                    &name.value,
+                    name,
                     call.arguments.iter().map(|arg| &arg.value),
                     span,
                     work,

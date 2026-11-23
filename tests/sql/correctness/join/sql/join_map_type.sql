@@ -19,7 +19,7 @@
 -- Test Objective:
 -- Validate JOIN correctness for MAP-typed columns across all join types.
 -- Covers: INNER, LEFT/RIGHT/FULL OUTER, EXISTS/NOT EXISTS, IN/NOT IN subqueries,
--- NULL-safe equal (<=>), and map_apply expressions in join predicates.
+-- NULL-safe equality and map transformations in join predicates.
 -- MAP value types include: simple (int→string), nested array, nested map, and struct.
 -- Also verifies FE rejects unsupported MAP comparisons (cross-type, JSON, non-equality).
 
@@ -42,13 +42,13 @@ CREATE TABLE ${case_db}.map_test (
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.map_test VALUES
-  (0, map(0,'ab'), map(0,'ab'), map(0,['1','2']), map('1',map(1,'abc')), map(1,json_object('name':'abc','age':23)), map(0, row(1,'a')));
+  (0, MAP(ARRAY[0], ARRAY['ab']), MAP(ARRAY[0], ARRAY['ab']), MAP(ARRAY[0], ARRAY[['1','2']]), MAP(ARRAY['1'], ARRAY[MAP(ARRAY[1], ARRAY['abc'])]), MAP(ARRAY[1], ARRAY[json_object('name':'abc','age':23)]), MAP(ARRAY[0], ARRAY[row(1,'a')]));
 
 -- query 4
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped null-key entries from map1/map4/map5 (int keys -> empty map)
 INSERT INTO ${case_db}.map_test VALUES
-  ROW(1, map(1, null), map(), map(1,[]), map('11',map(1,'abc'),'', map(2,null)), map(), map());
+  ROW(1, MAP(ARRAY[1], ARRAY[null]), map(), MAP(ARRAY[1], ARRAY[[]]), MAP(ARRAY['11', ''], ARRAY[MAP(ARRAY[1], ARRAY['abc']), MAP(ARRAY[2], ARRAY[null])]), map(), map());
 
 -- query 5
 -- @skip_result_check=true
@@ -60,7 +60,7 @@ INSERT INTO ${case_db}.map_test VALUES
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the trailing null-key entry from each map (kept the non-null entry)
 INSERT INTO ${case_db}.map_test VALUES
-  (3, map(3,''), map(3,''), map(3,['3',null]), map('3',map(3,'a33c')), map(1,json_object('name':'abc','age':23)), map(3, row(3,'a')));
+  (3, MAP(ARRAY[3], ARRAY['']), MAP(ARRAY[3], ARRAY['']), MAP(ARRAY[3], ARRAY[['3',null]]), MAP(ARRAY['3'], ARRAY[MAP(ARRAY[3], ARRAY['a33c'])]), MAP(ARRAY[1], ARRAY[json_object('name':'abc','age':23)]), MAP(ARRAY[3], ARRAY[row(3,'a')]));
 
 -- query 7
 -- @skip_result_check=true
@@ -213,18 +213,19 @@ SELECT pk, map1 NOT IN (SELECT map0 FROM ${case_db}.map_test s) AS membership FR
 -- query 29
 SELECT pk, map5 NOT IN (SELECT map5 FROM ${case_db}.map_test s) AS membership FROM ${case_db}.map_test ORDER BY pk;
 
--- ========== map_apply in join predicate ==========
+-- ========== Map transformations in join predicates ==========
 
 -- query 30
 SELECT t.map2, s.map2
 FROM ${case_db}.map_test t JOIN ${case_db}.map_test s
-  ON transform_values((k,v) -> array_length(v), transform_keys((k,v) -> k+1, s.map2)) = transform_values((k,v) -> array_length(v), transform_keys((k,v) -> k+1, t.map2))
+  ON transform_values(transform_keys(s.map2, (k, v) -> k + 1), (k, v) -> cardinality(v))
+     = transform_values(transform_keys(t.map2, (k, v) -> k + 1), (k, v) -> cardinality(v))
 ORDER BY t.pk;
 
 -- query 31
 SELECT t.map2, s.map2
 FROM ${case_db}.map_test t JOIN ${case_db}.map_test s
-  ON transform_keys((k,v) -> k+1, s.map2) = transform_keys((k,v) -> k+1, t.map2)
+  ON transform_keys(s.map2, (k, v) -> k + 1) = transform_keys(t.map2, (k, v) -> k + 1)
 ORDER BY t.pk;
 
 -- query 32

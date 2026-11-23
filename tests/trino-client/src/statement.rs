@@ -137,6 +137,9 @@ impl TrinoClient {
             .join("/v1/statement")
             .map_err(|e| StatementFailure::protocol(e.to_string()))?;
         let response = self.request(Method::POST, uri, &headers, Some(sql), deadline)?;
+        // Prepared definitions belong to this POST's request snapshot. Later
+        // GET and DELETE address the registered statement by its exact URI.
+        headers.remove("x-trino-prepared-statement");
         let page = parse_page(&response.body)?;
         *progress = TraceProgress {
             query_id: Some(page.id.clone()),

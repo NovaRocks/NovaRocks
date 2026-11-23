@@ -61,12 +61,22 @@ pub(super) fn definition(
     declaration: FunctionBindingDeclaration,
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
+    let ordinary = Arc::new(super::aggregate_n_owner::NOwner::for_extrema_overload(
+        name,
+        declaration.clone(),
+        resolver.clone(),
+    )?);
     let owner = Arc::new(ExtremaOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate_window(name, FunctionVisibility::Public, owner)
-        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin MIN/MAX pure owner",
-            value: error.to_string().into(),
-        })
+    FunctionDefinition::try_new_pure_aggregate_overloads(
+        name,
+        FunctionVisibility::Public,
+        owner,
+        ordinary,
+    )
+    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+        subject: "builtin MIN/MAX pure owner",
+        value: error.to_string().into(),
+    })
 }
 struct ExtremaOwner {
     resolver: Arc<BuiltinAggregateResolver>,
@@ -88,8 +98,8 @@ impl ExtremaOwner {
             })?;
         let valid = declaration.function_id().as_str() == format!("builtin.aggregate/{name}/v1")
             && declaration.kind() == FunctionKind::Aggregate
-            && declaration.overloads().len() == 1
-            && declaration.overloads().iter().all(|overload| {
+            && declaration.overloads().len() == 2
+            && declaration.overloads().iter().any(|overload| {
                 overload.identity.as_str() == format!("builtin.aggregate/{name}/derived-v1")
                     && overload.effects.as_ref() == Some(&expected)
                     && overload.aggregate.as_ref().is_some_and(|state| {
@@ -104,13 +114,27 @@ impl ExtremaOwner {
         }
         let implementation =
             PureImplementationId::try_new(format!("builtin.aggregate/{name}/selected-v1"))?;
+        let top_n_id = format!("builtin.aggregate/{name}/top-n-v1");
+        let top_n_implementation =
+            PureImplementationId::try_new(format!("builtin.aggregate/{name}/top-n-selected-v1"))?;
         let implementations = declaration
             .overloads()
             .iter()
-            .map(|overload| PureImplementationDeclaration {
-                overload: overload.identity.clone(),
-                implementation: implementation.clone(),
-                abi: PureKernelAbi::AggregateWindowV1,
+            .map(|overload| {
+                let top_n = overload.identity.as_str() == top_n_id;
+                PureImplementationDeclaration {
+                    overload: overload.identity.clone(),
+                    implementation: if top_n {
+                        top_n_implementation.clone()
+                    } else {
+                        implementation.clone()
+                    },
+                    abi: if top_n {
+                        PureKernelAbi::AggregateV1
+                    } else {
+                        PureKernelAbi::AggregateWindowV1
+                    },
+                }
             })
             .collect();
         Ok(Self {

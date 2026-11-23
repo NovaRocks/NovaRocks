@@ -150,7 +150,7 @@ SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test 
 -- ============================================================
 -- query 15
 -- @order_sensitive=true
-SELECT s.i_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 = t.i_1 AND array_length(s.i_1) > 3 ORDER BY 1, 2;
+SELECT s.i_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 = t.i_1 AND cardinality(s.i_1) > 3 ORDER BY 1, 2;
 
 -- ============================================================
 -- INNER JOIN: count with cross-type <=> and =
@@ -380,7 +380,7 @@ SELECT s.aad_1, t.aad_1 FROM ${case_db}.array_test s FULL JOIN ${case_db}.array_
 -- ============================================================
 -- query 52
 -- @order_sensitive=true
-SELECT s.i_1, t.d_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON array_map(x -> x*3, s.i_1) = array_map(x-> x*3 + 1, t.d_1) ORDER BY 1, 2;
+SELECT s.i_1, t.d_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON transform(s.i_1, x -> x*3) = transform(t.d_1, x-> x*3 + 1) ORDER BY 1, 2;
 
 -- query 53
 -- Internal and outer NULLs are UNKNOWN for =/!=, but equal under <=>.

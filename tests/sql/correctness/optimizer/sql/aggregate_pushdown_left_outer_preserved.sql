@@ -19,7 +19,7 @@
 -- Test Objective:
 -- LEFT OUTER JOIN with aggregate on the preserved (left) side: the
 -- rule must still push to the left side.
--- Data design: 20 000 rows on the left, NDV(k) = 100. ANALYZE TABLE
+-- Data design: 20 000 rows on the left, approx_distinct(k) = 100. ANALYZE TABLE
 -- ensures the cost gate fires.
 -- Golden derivation: contract_lowering::append_exchange retains the sender's
 -- frozen display name, so the old v3 import is b.k in the join and its sink.
@@ -30,9 +30,9 @@ DROP TABLE IF EXISTS ${case_db}.t_agg_pd_lo_b;
 CREATE TABLE ${case_db}.t_agg_pd_lo_a (k INT, v INT);
 CREATE TABLE ${case_db}.t_agg_pd_lo_b (k INT);
 INSERT INTO ${case_db}.t_agg_pd_lo_a
-    SELECT generate_series % 100, generate_series FROM TABLE(generate_series(1, 20000));
+    SELECT generate_series % 100, generate_series FROM TABLE(sequence(1, 20000)) AS generate_series(generate_series);
 INSERT INTO ${case_db}.t_agg_pd_lo_b
-    SELECT DISTINCT generate_series % 50 FROM TABLE(generate_series(1, 50));
+    SELECT DISTINCT generate_series % 50 FROM TABLE(sequence(1, 50)) AS generate_series(generate_series);
 ANALYZE ${case_db}.t_agg_pd_lo_a;
 ANALYZE ${case_db}.t_agg_pd_lo_b;
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'

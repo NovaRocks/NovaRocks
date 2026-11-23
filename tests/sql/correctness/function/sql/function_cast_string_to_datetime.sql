@@ -35,7 +35,7 @@ CREATE TABLE t1 (
 CREATE TABLE __row_util (
     k1 bigint
 ) WITH (format_version = 3);
-INSERT INTO __row_util SELECT generate_series FROM TABLE(generate_series(0, 10000 - 1));
+INSERT INTO __row_util SELECT generate_series FROM TABLE(sequence(0, 10000 - 1)) AS generate_series(generate_series);
 INSERT INTO __row_util SELECT k1 + 20000 FROM __row_util;
 INSERT INTO __row_util SELECT k1 + 40000 FROM __row_util;
 INSERT INTO __row_util SELECT k1 + 80000 FROM __row_util;
