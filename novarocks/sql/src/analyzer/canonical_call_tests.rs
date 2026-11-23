@@ -185,10 +185,10 @@ fn canonical_date_add_retains_the_precise_source_type() {
                 "date_add",
                 &[
                     args[0].value_type.clone(),
-                    FunctionValueType::new(DataType::Int64, true),
+                    FunctionValueType::new(DataType::Int64, false),
                     input.clone(),
                 ],
-                &input.with_nullable(true).unwrap(),
+                input,
             );
         }
     }

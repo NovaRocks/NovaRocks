@@ -505,7 +505,7 @@ impl novarocks_functions::FunctionBindingResolver for CustomYear {
 }
 
 #[test]
-fn extract_binding_custom_same_spelling_result_is_owned_by_actual_selected_declaration() {
+fn extract_binding_uses_the_exact_scalar_identity_even_when_a_custom_name_exists() {
     use novarocks_functions::{
         EngineFunctionCatalogBuilder, FunctionBindingDeclaration, FunctionDefinition,
         FunctionFailureBehavior, FunctionId, FunctionKind, FunctionOverloadDeclaration,
@@ -555,36 +555,36 @@ fn extract_binding_custom_same_spelling_result_is_owned_by_actual_selected_decla
         logical: None,
         nullable: false,
     };
-    let query = &novarocks_parser::parser::parse_query(
-        "SELECT EXTRACT(YEAR FROM x), year(x) FROM temporal_source",
-    )
-    .unwrap();
-    let query = super::analyze_with_function_catalog(
-        query,
-        &source,
-        "default",
-        &functions,
-        crate::constant::test_constant_policy(),
-        &crate::compiler::SqlCompileControl::unbounded(),
-    )
-    .unwrap()
-    .0;
-    for ordinal in [0, 1] {
-        let expression = project(&query, ordinal);
-        let (_, binding, args) = call(expression);
-        assert_eq!(binding.function_id, identity);
-        assert_eq!(
-            args[0].value_type,
-            FunctionValueType::new(DataType::Date32, false)
-        );
-        assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
-        let expected = FunctionValueType::new(DataType::Int64, false);
-        assert_eq!(expression.value_type, expected);
-        assert_eq!(
-            binding.selected.result_type,
-            FunctionResultType::Scalar(expected)
-        );
-    }
+    let analyze_sql = |sql| {
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        super::analyze_with_function_catalog(
+            &query,
+            &source,
+            "default",
+            &functions,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .map(|(query, _)| query)
+    };
+    let ordinary = analyze_sql("SELECT year(x) FROM temporal_source").unwrap();
+    let expression = project(&ordinary, 0);
+    let (_, binding, args) = call(expression);
+    assert_eq!(binding.function_id, identity);
+    assert_eq!(
+        args[0].value_type,
+        FunctionValueType::new(DataType::Date32, false)
+    );
+    assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
+    let expected = FunctionValueType::new(DataType::Int64, false);
+    assert_eq!(expression.value_type, expected);
+    assert_eq!(
+        binding.selected.result_type,
+        FunctionResultType::Scalar(expected)
+    );
+
+    let error = analyze_sql("SELECT EXTRACT(YEAR FROM x) FROM temporal_source").unwrap_err();
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
 }
 
 #[test]

@@ -561,7 +561,7 @@ fn constant_entry_temporal_format_and_epoch_match_the_local_program() {
         (
             "date_format(from_unixtime(-0.0005e0, 'UTC'), '%Y-%m-%d %H:%i:%s.%f')",
             "builtin.scalar/date_format/v1",
-            "1970-01-01 00:00:00.000000",
+            "1969-12-31 23:59:59.999000",
         ),
     ] {
         let fixture = Fixture::compile(expression, Family::Call(function), "32", &functions);

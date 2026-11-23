@@ -4746,10 +4746,13 @@ mod tests {
             "select \"current_time\" from ice.ns.orders",
             "select \"localtime\" from ice.ns.orders",
             "select \"localtimestamp\" from ice.ns.orders",
-            r#"select "current_date"() from ice.ns.orders"#,
         ] {
             assert_rejects_with(sql, "non-deterministic");
         }
+        assert_rejects_with(
+            "select CURRENT_DATE from ice.ns.orders",
+            "projection/filter",
+        );
     }
 
     #[test]
