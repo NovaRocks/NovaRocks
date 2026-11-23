@@ -3976,6 +3976,22 @@ fn coerce_selected_function_argument(
             control,
         );
     }
+    // An unchanged Arrow carrier can still require a semantic conversion,
+    // such as widening the declared VARCHAR width of an array element. Keep
+    // the original call and its exact result together below the conversion.
+    if expr.value_type.data_type() == value_type.data_type()
+        && matches!(&expr.kind, ExprKind::FunctionCall { .. })
+    {
+        return Ok(TypedExpr {
+            kind: ExprKind::Cast {
+                expr: novarocks_parser::ast::AstBox::new(expr),
+                target: value_type.data_type().clone(),
+                decimal_overflow_policy,
+                cast_mode: None,
+            },
+            value_type,
+        });
+    }
     // Ordinary carrier coercion retains its checked integer-literal
     // normalization and runtime narrowing policy. The selected owner still
     // supplies the complete target domain, including nested field facts.
