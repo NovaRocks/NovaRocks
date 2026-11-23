@@ -63,7 +63,7 @@ WITH concatenated AS (
            WITHIN GROUP (ORDER BY ord) AS value
     FROM (VALUES (1,rpad('é',524288,'é')), (2,'b'), (3,'c')) t(ord,v)
 )
-SELECT CAST(char_length(value) AS BIGINT) AS characters, substr(value, -5) AS suffix FROM concatenated;
+SELECT CAST(length(value) AS BIGINT) AS characters, substr(value, -5) AS suffix FROM concatenated;
 
 -- query 12
 -- @expect_trino_error=EXCEEDED_FUNCTION_MEMORY_LIMIT,USER_ERROR
