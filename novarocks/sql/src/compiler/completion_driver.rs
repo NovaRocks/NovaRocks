@@ -3544,7 +3544,18 @@ mod tests {
             ),
             (
                 "original-137",
-                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result",
+                "WITH result AS (
+                    SELECT c1, c2, c3, COUNT(*) AS cnt FROM all_t0
+                    GROUP BY c1, c2, c3 ORDER BY c1, c2, c3 LIMIT 100
+                )
+                SELECT 'Test Case 39' AS test_name,
+                       LOWER(TO_HEX(MD5(TO_UTF8(GROUP_CONCAT(
+                           CAST(CAST(c1 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR
+                           CAST(CAST(c2 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR
+                           CAST(CAST(c3 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR
+                           CAST(CAST(cnt AS VARCHAR) AS BOOLEAN)
+                       ))))) AS result_hash
+                FROM result",
             ),
         ];
         let mut failures = Vec::new();
