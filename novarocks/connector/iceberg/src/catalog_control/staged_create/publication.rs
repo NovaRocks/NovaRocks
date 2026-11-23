@@ -493,7 +493,8 @@ mod tests {
     use crate::resources::IcebergMetadataResources;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderId, ConnectorStopOwner,
-        LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        CreatePolicy, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
     use std::time::Duration;
 
@@ -513,11 +514,11 @@ mod tests {
                 .join("data.parquet")
         }
         fn new(with_data: bool) -> Self {
-            Self::build(with_data, None)
+            Self::build(with_data, None, None)
         }
 
         fn managed(metadata_path: Option<StagedMetadataPath>) -> Self {
-            let mut fixture = Self::build(false, metadata_path);
+            let mut fixture = Self::build(false, metadata_path, None);
             fixture.prepared.document_properties = Some(HashMap::from([(
                 "document.manifest".into(),
                 "exact-documents".into(),
@@ -525,7 +526,11 @@ mod tests {
             fixture
         }
 
-        fn build(with_data: bool, metadata_path: Option<StagedMetadataPath>) -> Self {
+        fn build(
+            with_data: bool,
+            metadata_path: Option<StagedMetadataPath>,
+            rest_url: Option<String>,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let publication_id = LakePublicationId::new_v7();
             let table_directory = directory.path().join("table");
@@ -539,14 +544,18 @@ mod tests {
                 novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
                 Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
             );
-            let configuration = crate::catalog_config::parse_catalog_configuration(
-                "ice",
-                &[(
-                    "iceberg.catalog.warehouse".to_string(),
-                    directory.path().display().to_string(),
-                )],
-            )
-            .unwrap();
+            let mut properties = vec![(
+                "iceberg.catalog.warehouse".to_string(),
+                directory.path().display().to_string(),
+            )];
+            if let Some(rest_url) = rest_url {
+                properties.extend([
+                    ("iceberg.catalog.type".into(), "rest".into()),
+                    ("uri".into(), rest_url),
+                ]);
+            }
+            let configuration =
+                crate::catalog_config::parse_catalog_configuration("ice", &properties).unwrap();
             let runtime = Arc::new(
                 IcebergMetadataContext::try_new(
                     IcebergCatalogControlState::new(configuration),
@@ -665,7 +674,6 @@ mod tests {
                     location_refusal: None,
                     final_metadata_path: metadata_path,
                 },
-                policy: CreatePolicy::FailIfExists,
                 planning: None,
                 write: Some(StagedWrite { write: proof, seal }),
                 document_properties: None,
@@ -971,7 +979,19 @@ mod tests {
         novarocks_spi::connector::ConnectorStagedCreateSession,
         ConnectorStagedCreatePublishRequest,
     ) {
-        let mut fixture = Fixture::new(true);
+        original_publication_with_fixture(Fixture::new(true), CreatePolicy::FailIfExists)
+    }
+
+    fn original_publication_with_fixture(
+        mut fixture: Fixture,
+        policy: CreatePolicy,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<OriginalFixtureCapability>,
+        novarocks_spi::connector::ConnectorStagedCreateSession,
+        ConnectorStagedCreatePublishRequest,
+    ) {
         let operation = fixture.prepared.operation_id();
         let handle = ConnectorStagedTableHandle::try_new(
             fixture.adapter.owner(),
@@ -1007,6 +1027,7 @@ mod tests {
         );
         prepare.operation_id = operation;
         prepare.publication_id = publication;
+        prepare.policy = policy;
         lease.prepare(prepare).unwrap();
         lease.bind_write(handle.clone(), write.clone()).unwrap();
         let request = ConnectorStagedCreatePublishRequest {
@@ -1017,6 +1038,75 @@ mod tests {
             context: fixture.context,
         };
         (fixture.directory, data, capability, lease, request)
+    }
+
+    #[tokio::test]
+    async fn staged_create_loser_rejects_both_policies_and_cleans_only_its_files() {
+        use crate::iceberg::TableRequirement;
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection,
+            connector_reason::ICEBERG_TABLE_ALREADY_EXISTS,
+        };
+
+        for policy in [CreatePolicy::FailIfExists, CreatePolicy::NoOpIfExists] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("POST", "/v1/namespaces/db/tables/t", Reply::status(409)),
+            );
+            let fixture = Fixture::build(true, None, Some(server.url()));
+            let (_directory, data, _capability, lease, request) =
+                original_publication_with_fixture(fixture, policy);
+            let winner = data.with_file_name("winner.parquet");
+            std::fs::write(&winner, b"winner file").unwrap();
+            assert!(data.exists());
+            let receiving =
+                novarocks_spi::connector::ConnectorStagedCreatePublicationReceiving::default();
+            let mut execution = lease.begin_publish_original(request, &receiving).unwrap();
+            let outcome = std::future::poll_fn(|cx| execution.poll_result(cx))
+                .await
+                .unwrap();
+            let ConnectorStagedCreatePublishOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            } = outcome
+            else {
+                panic!("a same-name loser must reject and complete its operation cleanup");
+            };
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists);
+            assert_eq!(
+                failure.failure_fact(),
+                FailureFact::new(FailureClass::Data, ICEBERG_TABLE_ALREADY_EXISTS)
+            );
+            assert_eq!(failure.message(), "Table db.t already exists");
+            std::future::poll_fn(|cx| execution.poll_closed(cx)).await;
+            assert!(receiving.observation().provider_exited());
+            let posts = server.requests_to("POST", "/v1/namespaces/db/tables/t");
+            let [post] = posts.as_slice() else {
+                panic!("one create publication attempt per loser");
+            };
+            let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            let requirements: Vec<TableRequirement> =
+                serde_json::from_value(body["requirements"].clone()).unwrap();
+            assert_eq!(requirements, [TableRequirement::NotExist]);
+            let manifest_list = body["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|update| update["snapshot"]["manifest-list"].as_str())
+                .expect("nonempty create publishes a manifest list");
+            let manifest_list = url::Url::parse(manifest_list)
+                .unwrap()
+                .to_file_path()
+                .unwrap();
+            assert!(
+                !manifest_list.exists(),
+                "loser's manifest list survives cleanup"
+            );
+            assert!(!data.exists(), "loser's data file survives cleanup");
+            assert_eq!(std::fs::read(winner).unwrap(), b"winner file");
+        }
     }
 
     #[tokio::test]

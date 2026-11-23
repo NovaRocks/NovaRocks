@@ -21,12 +21,15 @@ use novarocks_query_application::api::ExecutionFailurePresentation;
 use crate::diagnostics::{self, BoundedMessage};
 use novarocks_execution_contract::failure::connector_reason::{
     ICEBERG_COMMIT_ERROR, ICEBERG_FILESYSTEM_ERROR, ICEBERG_INVALID_METADATA,
+    ICEBERG_TABLE_ALREADY_EXISTS,
 };
-use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
+use novarocks_execution_contract::failure::{
+    FailureClass, FailureEvidence, FailureProjection, domain,
+};
 use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind, StatementExternalEffectDisposition},
     cancellation::QueryCancellationReason,
-    execution_error::{ExecutionFailureInput, QueryFailureReason},
+    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
     session_error::{QueryServiceError, QueryServiceErrorKind},
     session_value::StatementSessionError,
 };
@@ -390,6 +393,13 @@ fn project_message(
     if code == Code::MergeTargetRowMultipleMatches {
         return project(code, diagnostics::bound_display(&message), location);
     }
+    let effect = if code == Code::TableAlreadyExists {
+        // The provider's same-name rejection has a standard public message.
+        // Keep any stronger cumulative effect that forbids a statement retry.
+        effect.filter(|effect| effect.do_not_retry())
+    } else {
+        effect
+    };
     let public = StatementExternalEffectDisposition::diagnostic(&message, effect);
     project_public_diagnostic(query_id, code, &public, location)
 }
@@ -545,6 +555,7 @@ fn service_error(
             return project_public_diagnostic(query_id, code, &public, None);
         }
         if code == Code::IcebergTooManyOpenPartitions
+            || code == Code::TableAlreadyExists
             || code.uses_iceberg_maintenance_detail()
             || is_legacy_interval_key_collision(input)
         {
@@ -627,15 +638,10 @@ fn add_files_execution_code(input: &ExecutionFailureInput, registration: bool) -
 }
 
 fn commit_failure_code(input: &ExecutionFailureInput) -> Option<Code> {
-    use novarocks_execution_contract::failure::{
-        FailureEvidence,
-        connector_reason::{
-            COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_STATE_UNKNOWN,
-            ICEBERG_COMMIT_VALIDATION_CONFLICT,
-        },
+    use novarocks_execution_contract::failure::connector_reason::{
+        COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_STATE_UNKNOWN,
+        ICEBERG_COMMIT_VALIDATION_CONFLICT,
     };
-    use novarocks_query_application::execution_error::ExecutionFailureSite;
-
     let fact = input.fact();
     if fact.class() != FailureClass::Dependency
         || fact.evidence() != FailureEvidence::Originating
@@ -664,7 +670,10 @@ fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage
             "Interval map keys collide at millisecond precision; use a client supporting PARAMETRIC_INTERVAL",
         );
     }
-    if commit_failure_code(input).is_some() || code.uses_iceberg_maintenance_detail() {
+    if commit_failure_code(input).is_some()
+        || code.uses_iceberg_maintenance_detail()
+        || code == Code::TableAlreadyExists
+    {
         return PublicMessage::Borrowed(input.detail().as_str());
     }
     match open_partition_limit(input) {
@@ -688,6 +697,12 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
     }
     let fact = input.fact();
     match (fact.class(), fact.reason()) {
+        (FailureClass::Data, ICEBERG_TABLE_ALREADY_EXISTS)
+            if fact.evidence() == FailureEvidence::Originating
+                && matches!(input.site(), ExecutionFailureSite::Coordinator) =>
+        {
+            return Code::TableAlreadyExists;
+        }
         (FailureClass::Data, ICEBERG_INVALID_METADATA) => return Code::IcebergInvalidMetadata,
         (FailureClass::Dependency, ICEBERG_FILESYSTEM_ERROR) => {
             return Code::IcebergFilesystemError;

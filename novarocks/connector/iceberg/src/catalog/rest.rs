@@ -528,6 +528,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                     .into());
                 }
                 AttributionExpectation::ctas_final_commit(
+                    CatalogTableName::from_identifier(request.identifier()),
                     expected.staged_table_uuid,
                     snapshot,
                     expected.properties,

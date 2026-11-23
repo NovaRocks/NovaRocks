@@ -254,7 +254,6 @@ impl PublicationOriginal {
         let observation = self.observation.clone();
         let cleanup_receiving = self.receiver.clone();
         let current = self.request.context.clone();
-        let dispatch = self.request.operation_id;
         let stages = publication::CreateStages::new(&prepared, &operation);
         body.original = Some(OpaqueOriginal::new(Box::pin(async move {
             let preparers = stages.preparers();
@@ -287,9 +286,7 @@ impl PublicationOriginal {
                             receipt,
                             finalization,
                         } => committed(effect, receipt, finalization),
-                        RetainedPublicationProjection::Settled(outcome) => {
-                            project_outcome(&source.adapter, &prepared, dispatch, outcome)
-                        }
+                        RetainedPublicationProjection::Settled(outcome) => project_outcome(outcome),
                     };
                     observation.record_raw(outcome);
                     Poll::Ready(())
@@ -347,50 +344,12 @@ impl PublicationOriginal {
             .raw_outcome()
             .expect("same original staged outcome")
         {
-            Ok(ConnectorStagedCreatePublishOutcome::Applied { .. }) => {
-                self.adapter
-                    .record_published(self.request.handle.operation_id(), prepared);
-            }
-            Ok(ConnectorStagedCreatePublishOutcome::NoOp {
-                ref finalization, ..
-            }) => {
-                // NoOpIfExists is a definite non-publication. Its original
-                // cleanup report, never an empty slot, chooses retained state.
-                if prepared
-                    .final_publication
-                    .as_ref()
-                    .and_then(|journal| {
-                        journal
-                            .current_entry()
-                            .map(|entry| journal.catalog_entry_outcome(entry))
-                    })
-                    .is_some_and(|outcome| {
-                        matches!(
-                            outcome,
-                            ExternalMutationOutcome::KnownCommitted {
-                                effect: ExternalMutationEffect::NoOp,
-                                ..
-                            }
-                        )
-                    })
-                {
-                    self.adapter
-                        .record_published(self.request.handle.operation_id(), prepared);
-                    return;
-                }
-                let mut prepared = prepared;
-                prepared.publication_closed = true;
-                self.adapter.record_terminal(
-                    self.request.handle.operation_id(),
-                    if matches!(finalization, ExternalMutationFinalization::Complete) {
-                        OperationState::Published {
-                            handle_digest: prepared.handle_digest,
-                        }
-                    } else {
-                        OperationState::CleanupPending(prepared)
-                    },
-                );
-            }
+            Ok(
+                ConnectorStagedCreatePublishOutcome::Applied { .. }
+                | ConnectorStagedCreatePublishOutcome::NoOp { .. },
+            ) => self
+                .adapter
+                .record_published(self.request.handle.operation_id(), prepared),
             Ok(
                 ConnectorStagedCreatePublishOutcome::Conflict { ref cleanup, .. }
                 | ConnectorStagedCreatePublishOutcome::KnownUncommitted { ref cleanup, .. },
@@ -512,9 +471,6 @@ fn committed(
     })
 }
 fn project_outcome(
-    adapter: &IcebergStagedCreateAdapter,
-    prepared: &PreparedOperation,
-    dispatch: ConnectorStagedCreateOperationId,
     outcome: ExternalMutationOutcome<ConnectorStagedCreateReceipt>,
 ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
     match outcome {
@@ -524,20 +480,6 @@ fn project_outcome(
             finalization,
             ..
         } => committed(effect, receipt, finalization),
-        ExternalMutationOutcome::KnownUncommitted { failure, cleanup }
-            if failure.kind() == ConnectorMutationFailureKind::Conflict
-                && prepared.policy == CreatePolicy::NoOpIfExists =>
-        {
-            Ok(ConnectorStagedCreatePublishOutcome::NoOp {
-                receipt: adapter.receipt(
-                    dispatch,
-                    ConnectorStagedCreateReceiptPhase::Published,
-                    ExternalMutationEffect::NoOp,
-                    Bytes::new(),
-                )?,
-                finalization: cleanup,
-            })
-        }
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup }
             if failure.kind() == ConnectorMutationFailureKind::Conflict =>
         {

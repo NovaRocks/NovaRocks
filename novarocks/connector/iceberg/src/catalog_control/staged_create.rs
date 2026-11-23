@@ -39,9 +39,8 @@ use novarocks_spi::connector::{
     ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
     ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
-    ConnectorStagedWriteProof, ConnectorVendedS3CredentialLeaseRefresher, CreatePolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ProviderBindingEpoch,
+    ConnectorStagedWriteProof, ConnectorVendedS3CredentialLeaseRefresher, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -121,7 +120,7 @@ pub(crate) enum RestStagedPrepareFailure {
     /// once a request may have left this process, refusing it is no longer an
     /// option and the only honest answers are the two below.
     Unsupported(String),
-    Conflict(String),
+    Conflict(ConnectorMutationFailure),
     /// A local check refused before any request.
     KnownUncommitted(String),
     /// The stage itself was never dispatched or was rejected before
@@ -457,7 +456,7 @@ fn prepare_rest_staged_table(
         }
         crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
             if failure.kind() == ConnectorMutationFailureKind::AlreadyExists {
-                return Err(RestStagedPrepareFailure::Conflict(failure.message().into()));
+                return Err(RestStagedPrepareFailure::Conflict(failure));
             }
             return Err(RestStagedPrepareFailure::StageUncommitted(failure));
         }
@@ -681,7 +680,6 @@ struct PreparedOperation {
     publication_id: novarocks_spi::connector::LakePublicationId,
     handle_digest: [u8; 32],
     staged: RestStagedTableCreate,
-    policy: CreatePolicy,
     planning: Option<ConnectorStagedWritePlanningBinding>,
     write: Option<StagedWrite>,
     document_properties: Option<HashMap<String, String>>,
@@ -1180,7 +1178,7 @@ async fn prepare_rest_staged_table_async(
         }
         crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
             if failure.kind() == ConnectorMutationFailureKind::AlreadyExists {
-                return Err(RestStagedPrepareFailure::Conflict(failure.message().into()));
+                return Err(RestStagedPrepareFailure::Conflict(failure));
             }
             return Err(RestStagedPrepareFailure::StageUncommitted(failure));
         }
@@ -1546,7 +1544,6 @@ impl IcebergStagedCreateAdapter {
                         publication_id: request.publication_id,
                         handle_digest: handle.digest(),
                         staged,
-                        policy: request.policy,
                         planning: None,
                         write: None,
                         document_properties: None,
@@ -1578,17 +1575,12 @@ impl IcebergStagedCreateAdapter {
                     ),
                 })
             }
-            Err(RestStagedPrepareFailure::Conflict(message)) => {
+            Err(RestStagedPrepareFailure::Conflict(failure)) => {
                 self.operations
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&request.operation_id);
-                Ok(ConnectorStagedCreatePrepareOutcome::Conflict {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::AlreadyExists,
-                        message,
-                    ),
-                })
+                Ok(ConnectorStagedCreatePrepareOutcome::Conflict { failure })
             }
             Err(RestStagedPrepareFailure::KnownUncommitted(message)) => {
                 self.operations
@@ -1699,37 +1691,11 @@ impl IcebergStagedCreateAdapter {
                 failure,
                 cleanup,
             } => {
-                if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && prepared.policy == CreatePolicy::NoOpIfExists
-                {
-                    prepared.publication_closed = true;
-                    let state = if matches!(cleanup, ExternalMutationFinalization::Complete) {
-                        OperationState::Published {
-                            handle_digest: prepared.handle_digest,
-                        }
-                    } else {
-                        OperationState::CleanupPending(prepared)
-                    };
-                    self.record_terminal(operation_id, state);
-                    Ok(ConnectorStagedCreatePublishOutcome::NoOp {
-                        receipt: self.receipt(
-                            request.operation_id,
-                            ConnectorStagedCreateReceiptPhase::Published,
-                            ExternalMutationEffect::NoOp,
-                            Bytes::new(),
-                        )?,
-                        finalization: cleanup,
-                    })
+                self.record_cleanup_state(operation_id, prepared, &cleanup);
+                if failure.kind() == ConnectorMutationFailureKind::Conflict {
+                    Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup })
                 } else {
-                    self.record_cleanup_state(operation_id, prepared, &cleanup);
-                    if failure.kind() == ConnectorMutationFailureKind::Conflict {
-                        Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup })
-                    } else {
-                        Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
-                            failure,
-                            cleanup,
-                        })
-                    }
+                    Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup })
                 }
             }
             novarocks_spi::connector::ExternalMutationOutcome::CommitUnknown {
@@ -2320,7 +2286,6 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                         publication_id: request.publication_id,
                         handle_digest: handle.digest(),
                         staged,
-                        policy: request.policy,
                         planning: None,
                         write: None,
                         document_properties: None,
@@ -2352,17 +2317,12 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     ),
                 })
             }
-            Err(RestStagedPrepareFailure::Conflict(message)) => {
+            Err(RestStagedPrepareFailure::Conflict(failure)) => {
                 self.operations
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&request.operation_id);
-                Ok(ConnectorStagedCreatePrepareOutcome::Conflict {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::AlreadyExists,
-                        message,
-                    ),
-                })
+                Ok(ConnectorStagedCreatePrepareOutcome::Conflict { failure })
             }
             Err(RestStagedPrepareFailure::KnownUncommitted(message)) => {
                 self.operations
@@ -2577,37 +2537,11 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 failure,
                 cleanup,
             } => {
-                if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && prepared.policy == CreatePolicy::NoOpIfExists
-                {
-                    prepared.publication_closed = true;
-                    let state = if matches!(cleanup, ExternalMutationFinalization::Complete) {
-                        OperationState::Published {
-                            handle_digest: prepared.handle_digest,
-                        }
-                    } else {
-                        OperationState::CleanupPending(prepared)
-                    };
-                    self.record_terminal(operation_id, state);
-                    Ok(ConnectorStagedCreatePublishOutcome::NoOp {
-                        receipt: self.receipt(
-                            request.operation_id,
-                            ConnectorStagedCreateReceiptPhase::Published,
-                            ExternalMutationEffect::NoOp,
-                            Bytes::new(),
-                        )?,
-                        finalization: cleanup,
-                    })
+                self.record_cleanup_state(operation_id, prepared, &cleanup);
+                if failure.kind() == ConnectorMutationFailureKind::Conflict {
+                    Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup })
                 } else {
-                    self.record_cleanup_state(operation_id, prepared, &cleanup);
-                    if failure.kind() == ConnectorMutationFailureKind::Conflict {
-                        Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup })
-                    } else {
-                        Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
-                            failure,
-                            cleanup,
-                        })
-                    }
+                    Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup })
                 }
             }
             novarocks_spi::connector::ExternalMutationOutcome::CommitUnknown {

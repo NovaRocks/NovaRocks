@@ -23,7 +23,7 @@ use crate::catalog_control::IcebergCatalogControlState;
 use crate::resources::IcebergMetadataResources;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorMutationOperationId,
-    ConnectorProviderId, ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorProviderId, ConnectorTableIdentity, ConnectorTableObjectId, CreatePolicy,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
@@ -183,7 +183,6 @@ fn prepared_operation_at(runtime: &IcebergMetadataContext, location: &str) -> Pr
             location_refusal: None,
             final_metadata_path: None,
         },
-        policy: CreatePolicy::FailIfExists,
         planning: None,
         write: None,
         document_properties: None,
@@ -585,6 +584,59 @@ pub(super) fn stage_http_request(
             request_context,
         )
         .unwrap()
+}
+
+#[test]
+fn rest_stage_same_name_preserves_the_typed_failure_for_both_policies() {
+    use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection,
+        connector_reason::ICEBERG_TABLE_ALREADY_EXISTS,
+    };
+
+    let server = TestServer::start(
+        Script::new()
+            .on("GET", "/v1/config", Reply::config(&[], &[], None))
+            .on(
+                "GET",
+                "/v1/namespaces/db",
+                Reply::json(
+                    200,
+                    &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                ),
+            )
+            .on("POST", "/v1/namespaces/db/tables", Reply::status(409)),
+    );
+    let (executor, adapter) = stage_http_adapter(&server);
+    for (policy, scoped) in [
+        (CreatePolicy::FailIfExists, false),
+        (CreatePolicy::NoOpIfExists, true),
+    ] {
+        let mut request = stage_http_request(&adapter, context());
+        request.policy = policy;
+        let operation = request.operation_id;
+        let outcome = if scoped {
+            executor
+                .block_on(adapter.prepare_async_original(request))
+                .unwrap()
+        } else {
+            adapter.prepare(request).unwrap()
+        };
+        let ConnectorStagedCreatePrepareOutcome::Conflict { failure } = outcome else {
+            panic!("REST stage 409 must reject the create");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists);
+        assert_eq!(
+            failure.failure_fact(),
+            FailureFact::new(FailureClass::Data, ICEBERG_TABLE_ALREADY_EXISTS)
+        );
+        assert_eq!(failure.message(), "Table db.t already exists");
+        assert!(!adapter.operations.lock().unwrap().contains_key(&operation));
+    }
+    assert_eq!(
+        server.requests_to("POST", "/v1/namespaces/db/tables").len(),
+        2
+    );
 }
 
 #[test]
