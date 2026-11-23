@@ -2445,6 +2445,22 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
+        if matches!(name.as_str(), "min" | "max") && args_typed.len() == 2 {
+            let n = &args_typed[1].value_type;
+            if n.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && matches!(
+                    n.data_type(),
+                    DataType::Null | DataType::Int8 | DataType::Int16 | DataType::Int32
+                )
+            {
+                let bigint =
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, n.nullable());
+                let limit = self.coerce_common_value(args_typed.remove(1), &bigint, func.span)?;
+                args_typed.push(limit);
+                arg_types[1] = DataType::Int64;
+            }
+        }
+
         if name == "count_if" && is_distinct {
             return Err(AnalyzeError::invalid_query_shape(
                 "Unexpected input '(', the most similar input is {<EOF>, ';'}.",

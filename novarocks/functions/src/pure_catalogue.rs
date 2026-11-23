@@ -985,6 +985,72 @@ struct HigherOrderOwner<O>(Arc<RegisteredOwner<O>>);
 struct ScalarHigherOrderOwner<O>(Arc<RegisteredOwner<O>>);
 struct AggregateOwner<O>(Arc<RegisteredOwner<O>>);
 struct AggregateWindowOwner<O>(Arc<RegisteredOwner<O>>);
+
+struct AggregateOverloadOwners<W, A> {
+    window: AggregateWindowOwner<W>,
+    ordinary: AggregateOwner<A>,
+    implementations: Arc<[PureImplementationDeclaration]>,
+}
+
+impl<W, A> AggregateOverloadOwners<W, A>
+where
+    W: PureFunctionMetadataOwner + PureAggregateWindowImplementation,
+    A: PureFunctionMetadataOwner + PureAggregateImplementation,
+{
+    fn select(
+        &self,
+        overload: &FunctionOverloadId,
+    ) -> Result<&dyn InstalledPureOwner, FunctionSpecializationFailure> {
+        let implementation = self
+            .implementations
+            .binary_search_by(|item| item.overload.cmp(overload))
+            .map(|index| &self.implementations[index])
+            .map_err(|_| wrong_options())?;
+        match implementation.abi {
+            PureKernelAbi::AggregateV1 => Ok(&self.ordinary),
+            PureKernelAbi::AggregateWindowV1 => Ok(&self.window),
+            _ => Err(wrong_options()),
+        }
+    }
+}
+impl<W, A> InstalledPureOwner for AggregateOverloadOwners<W, A>
+where
+    W: PureFunctionMetadataOwner + PureAggregateWindowImplementation,
+    A: PureFunctionMetadataOwner + PureAggregateImplementation,
+{
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(
+            abi,
+            PureKernelAbi::AggregateV1 | PureKernelAbi::AggregateWindowV1
+        )
+    }
+
+    fn prepare(
+        &self,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
+        self.select(&selected.overload)?
+            .prepare(input, selected, frozen, options, control)
+    }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        self.select(&selected.overload)?
+            .prepare_checked(checked, input, selected, frozen, options, control)
+    }
+}
 struct WindowOwner<O>(Arc<RegisteredOwner<O>>);
 struct TableOwner<O>(Arc<RegisteredOwner<O>>);
 struct ControlOwner<O>(Arc<RegisteredOwner<O>>);
@@ -1848,6 +1914,58 @@ impl FunctionDefinition {
             Some(legacy),
         )
     }
+
+    /// One registered binding author can install distinct aggregate kernels
+    /// with different lifecycle support. Both kernels use the same checked
+    /// binding declaration and dispatch by the selected overload identity.
+    pub(crate) fn try_new_pure_aggregate_overloads<W, A>(
+        name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        window: Arc<W>,
+        ordinary: Arc<A>,
+    ) -> Result<Self, PureCatalogError>
+    where
+        W: PureFunctionMetadataOwner
+            + PureAggregateWindowImplementation
+            + AggregateSignatureResolver
+            + 'static,
+        A: PureFunctionMetadataOwner + PureAggregateImplementation + 'static,
+    {
+        let legacy = window.clone();
+        let (registered, implementations) = register_owner(
+            window,
+            &[PureKernelAbi::AggregateV1, PureKernelAbi::AggregateWindowV1],
+        )?;
+        let mut declared_ordinary = ordinary.implementation_declarations().to_vec();
+        declared_ordinary.sort_unstable();
+        if registered.declaration.as_ref() != ordinary.binding_declaration()
+            || !implementations
+                .iter()
+                .filter(|entry| entry.abi == PureKernelAbi::AggregateV1)
+                .eq(declared_ordinary.iter())
+        {
+            return Err(PureCatalogError::ImplementationCoverage(
+                registered.declaration.function_id().clone(),
+            ));
+        }
+        let owner = Arc::new(AggregateOverloadOwners {
+            window: AggregateWindowOwner(registered.clone()),
+            ordinary: AggregateOwner(Arc::new(RegisteredOwner {
+                declaration: registered.declaration.clone(),
+                owner: ordinary,
+            })),
+            implementations: implementations.clone(),
+        });
+        attach_definition(
+            name,
+            visibility,
+            registered,
+            implementations,
+            owner,
+            Some(legacy),
+        )
+    }
+
     pub fn try_new_pure_aggregate_window<
         O: PureFunctionMetadataOwner
             + PureAggregateWindowImplementation

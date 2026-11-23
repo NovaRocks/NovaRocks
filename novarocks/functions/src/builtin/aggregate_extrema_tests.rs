@@ -102,25 +102,48 @@ impl Fixture {
         // Independent inventory of the one actually installed MIN/MAX owner, not
         // an assertion that every builtin has a complete pure implementation.
         let catalog = builder
-            .seal_pure([InstalledPureKernel {
-                function: FunctionId::try_new(format!("builtin.aggregate/{name}/v1")).unwrap(),
-                kind: FunctionKind::Aggregate,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(format!(
-                        "builtin.aggregate/{name}/derived-v1"
-                    ))
-                    .unwrap(),
-                    implementation: PureImplementationId::try_new(format!(
-                        "builtin.aggregate/{name}/selected-v1"
-                    ))
-                    .unwrap(),
-                    abi: PureKernelAbi::AggregateWindowV1,
-                },
-                aggregate_state_format: Some(
-                    AggregateStateFormatIdentity::try_new(format!("novarocks/{name}/state-v1"))
+            .seal_pure([
+                InstalledPureKernel {
+                    function: FunctionId::try_new(format!("builtin.aggregate/{name}/v1")).unwrap(),
+                    kind: FunctionKind::Aggregate,
+                    implementation: PureImplementationDeclaration {
+                        overload: FunctionOverloadId::try_new(format!(
+                            "builtin.aggregate/{name}/derived-v1"
+                        ))
                         .unwrap(),
-                ),
-            }])
+                        implementation: PureImplementationId::try_new(format!(
+                            "builtin.aggregate/{name}/selected-v1"
+                        ))
+                        .unwrap(),
+                        abi: PureKernelAbi::AggregateWindowV1,
+                    },
+                    aggregate_state_format: Some(
+                        AggregateStateFormatIdentity::try_new(format!("novarocks/{name}/state-v1"))
+                            .unwrap(),
+                    ),
+                },
+                InstalledPureKernel {
+                    function: FunctionId::try_new(format!("builtin.aggregate/{name}/v1")).unwrap(),
+                    kind: FunctionKind::Aggregate,
+                    implementation: PureImplementationDeclaration {
+                        overload: FunctionOverloadId::try_new(format!(
+                            "builtin.aggregate/{name}/top-n-v1"
+                        ))
+                        .unwrap(),
+                        implementation: PureImplementationId::try_new(format!(
+                            "builtin.aggregate/{name}/top-n-selected-v1"
+                        ))
+                        .unwrap(),
+                        abi: PureKernelAbi::AggregateV1,
+                    },
+                    aggregate_state_format: Some(
+                        AggregateStateFormatIdentity::try_new(format!(
+                            "novarocks/{name}/top-n-state-v1"
+                        ))
+                        .unwrap(),
+                    ),
+                },
+            ])
             .unwrap();
         let args = types
             .iter()

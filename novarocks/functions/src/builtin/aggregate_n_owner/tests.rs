@@ -462,3 +462,40 @@ fn private_dispatch_rejects_mixed_states_frames_and_emission_without_skipping_ro
     }
     clean(&host);
 }
+
+#[test]
+fn min_and_max_install_top_n_under_the_same_function_with_a_distinct_state() {
+    for name in ["min", "max"] {
+        let value_type = FunctionValueType::new(DataType::Int64, false);
+        let result = prepare(
+            name,
+            value_type.clone(),
+            value_type,
+            AggregateKernelPhase::Single,
+        )
+        .unwrap();
+        let PreparedPureKernel::Aggregate(handle) = result.prepared() else {
+            panic!("expected the prepared Top N aggregate")
+        };
+        let contract = handle.contract();
+        assert_eq!(
+            contract.call().function_id().as_str(),
+            format!("builtin.aggregate/{name}/v1")
+        );
+        assert_eq!(
+            contract.call().selected().overload.as_str(),
+            format!("builtin.aggregate/{name}/top-n-v1")
+        );
+        assert_eq!(
+            contract
+                .call()
+                .selected()
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .state_format
+                .as_str(),
+            format!("novarocks/{name}/top-n-state-v1")
+        );
+    }
+}

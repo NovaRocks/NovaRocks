@@ -186,7 +186,16 @@ impl<A: ScalarStateAllocator> NState<A> {
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), crate::KernelFailure> {
-        if limits.is_null(limit_row) || values.is_null(value_row) {
+        if value_row >= values.len() || limit_row >= limits.len() {
+            return Err(source_failure::contract(
+                "min/max Top N input address is out of bounds",
+            ));
+        }
+        if limits.is_null(limit_row)
+            || values.is_null(value_row)
+            || limits.data_type() == &DataType::Null
+            || values.data_type() == &DataType::Null
+        {
             return Ok(());
         }
         if !self.initialized {
