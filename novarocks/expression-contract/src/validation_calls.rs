@@ -121,7 +121,7 @@ pub(crate) fn validate_core<'a, H>(
                 Ok::<_, ValidationFailure<'a, H>>(())
             })?;
         } else {
-            let ExprKind::FunctionCall { function, args } = &node.kind else {
+            let ExprKind::FunctionCall { args, .. } = &node.kind else {
                 return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
@@ -189,35 +189,6 @@ pub(crate) fn validate_core<'a, H>(
             declaration.validate(FunctionKind::Scalar)?;
             work.step()?;
             work.flush()?;
-            if function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
-                if invocation.control != ControlShape::Eager
-                    || claim.regexp_count_pattern_source
-                        != Some(crate::regexp_count_pattern_source_observed(
-                            &parts.definitions,
-                            args,
-                            work,
-                        )?)
-                {
-                    return Err(ValidationFailure::invalid(
-                        Some(node.id),
-                        None,
-                        "regexp_count source claim differs from actual emitted source",
-                    ));
-                }
-            } else if claim.regexp_count_pattern_source.is_some() {
-                return Err(ValidationFailure::invalid(
-                    Some(node.id),
-                    None,
-                    "unrelated call carries regexp_count source",
-                ));
-            }
-            if claim.to_base64_byte_source.is_some() {
-                return Err(ValidationFailure::invalid(
-                    Some(node.id),
-                    None,
-                    "retired to_base64 source claim",
-                ));
-            }
             match (invocation.control, &claim.temporal_source) {
                 (ControlShape::TemporalSource(shape), Some(plan)) => {
                     let actual = crate::temporal_source::temporal_source_definitions_for_unit(

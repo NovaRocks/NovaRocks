@@ -24,6 +24,8 @@ use super::*;
 use arrow::array::{Array, BooleanArray};
 use novarocks_type_contract::EvaluationDemand;
 
+mod regexp;
+
 pub(super) fn supports_result(ty: &DataType) -> bool {
     novarocks_functions::control_values::supports_indexed_result(ty)
 }
@@ -431,6 +433,12 @@ impl<K> Frame<K> {
         }
         let mut ordinals = Vec::new();
         match shape {
+            ControlShape::OrderedRegexp if self.next > 0 => {
+                if self.next > regexp::PATTERN_ORDINAL {
+                    return Ok(None);
+                }
+                return regexp::pattern_ordinals(self, work);
+            }
             ControlShape::Membership { .. } => {
                 if self.next > 0 && self.rows.is_empty() {
                     return Ok(None);
@@ -1587,9 +1595,7 @@ pub(super) fn evaluate_tree<'a, R>(
         }
         work.step()?;
     }
-    let mut source_captured = false;
-    let mut source_custody = None;
-    let mut frames = vec![Frame::new(
+    let first = Frame::new(
         root_use,
         root_invocation.control,
         root_type,
@@ -1599,251 +1605,323 @@ pub(super) fn evaluate_tree<'a, R>(
         activation,
         Vec::new(),
         work,
-    )?];
-    while let Some(mut frame) = frames.pop() {
-        work.step()?;
-        let invocation = &flow.uses()[&frame.occurrence];
-        let definition = definitions
-            .node(invocation.definition)
-            .ok_or_else(|| invalid("missing compiled definition"))?;
-        let FunctionArgumentType::Value(result_type) = program
-            .types()
-            .get(invocation.definition.index())
-            .ok_or_else(|| invalid("missing exact compiled definition type"))?
-        else {
-            return Err(invalid("ordinary root cannot materialize a lambda definition").into());
-        };
-        let original_domain = match definition.kind() {
-            StaticExprKind::BoundCall { .. } => {
-                matches!(program.calls()[&frame.occurrence].prepared(),
+    )?;
+    let mut driver = TreeDriver {
+        program,
+        root,
+        input,
+        input_scope,
+        allocator,
+        effects,
+        needs_original,
+        source_captured: false,
+        source_custody: None,
+    };
+    let value = driver.drive(first, instances, work)?;
+    let value = value.into_value(selection, work)?;
+    if let Some(custody) = &driver.source_custody {
+        let ty = value.argument().array().data_type().clone();
+        let value = value.materialize(selection, &ty, work)?;
+        let continuation = value.continuation.clone();
+        let (_, array, errors) = value.into_parts();
+        let array = custody.retain(array, work.control)?;
+        return SelectedValues::try_new_observed(selection, &ty, array, errors, || work.step())
+            .map(Value::Selected)
+            .and_then(|value| match continuation {
+                Some(owner) => value.retaining_continuation(owner, work),
+                None => Ok(value),
+            })
+            .map_err(ExprEvaluationFailure::Kernel);
+    }
+    Ok(value)
+}
+
+struct TreeDriver<'s, 'input> {
+    program: &'s CompiledExprSet,
+    root: RootOrdinal,
+    input: FrameInput<'input>,
+    input_scope: RootScope,
+    allocator: Option<&'s Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    effects: &'s BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    needs_original: BTreeSet<ExpressionUseId>,
+    source_captured: bool,
+    source_custody: Option<input_source::CapturedInputSource>,
+}
+
+impl TreeDriver<'_, '_> {
+    fn drive<R>(
+        &mut self,
+        first: Frame,
+        instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
+        work: &mut Work<'_, '_, R>,
+    ) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
+        let program = self.program;
+        let root = self.root;
+        let input = self.input;
+        let input_scope = self.input_scope;
+        let allocator = self.allocator;
+        let effects = self.effects;
+        let flow = program.control_flow();
+        let definitions = program.definitions();
+        let mut frames = vec![first];
+        while let Some(mut frame) = frames.pop() {
+            work.step()?;
+            let invocation = &flow.uses()[&frame.occurrence];
+            let definition = definitions
+                .node(invocation.definition)
+                .ok_or_else(|| invalid("missing compiled definition"))?;
+            let FunctionArgumentType::Value(result_type) = program
+                .types()
+                .get(invocation.definition.index())
+                .ok_or_else(|| invalid("missing exact compiled definition type"))?
+            else {
+                return Err(invalid("ordinary root cannot materialize a lambda definition").into());
+            };
+            let original_domain = match definition.kind() {
+                StaticExprKind::BoundCall { .. } => {
+                    matches!(program.calls()[&frame.occurrence].prepared(),
                     PreparedPureKernel::ScalarInvocation(prepared) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain)
+                }
+                _ => false,
+            };
+            // ValidateOnly with no demanded rows enters no children or leaf.
+            // Activated empty invocations retain their original arity behavior.
+            let next = if frame.rows.is_empty()
+                && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
+            {
+                None
+            } else {
+                let next_is_pure = invocation
+                    .arguments
+                    .get(frame.next)
+                    .map(|child| {
+                        let occurrence = *child;
+                        effects
+                            .get(&occurrence)
+                            .ok_or_else(|| invalid("missing exact operand effects"))?
+                            .for_use(flow.uses()[child].context)
+                            .map_err(|_| invalid("operand effect context differs"))
+                            .map(|summary| summary.permits_boolean_reordering())
+                    })
+                    .transpose()?
+                    .unwrap_or(true);
+                frame.next_ordinals(
+                    invocation.control,
+                    invocation.arguments.len(),
+                    next_is_pure,
+                    input.num_rows(),
+                    work,
+                )?
+            };
+            if let Some(ordinals) = next {
+                let child_use = invocation.arguments[frame.next];
+                frame.next += 1;
+                let (rows, child_domain, child_activation) =
+                    child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
+                let child_domain = if invocation.control == ControlShape::OrderedRegexp
+                    && self.needs_original.contains(&child_use)
+                {
+                    child_domain.filtered(&rows, work.control)?
+                } else {
+                    child_domain
+                };
+                let child = Frame::new(
+                    child_use,
+                    flow.uses()[&child_use].control,
+                    definitions
+                        .node(flow.uses()[&child_use].definition)
+                        .ok_or_else(|| invalid("missing actual child definition"))?
+                        .data_type(),
+                    rows,
+                    child_domain,
+                    self.needs_original.contains(&child_use),
+                    child_activation,
+                    ordinals,
+                    work,
+                )?;
+                frames.push(frame);
+                frames.push(child);
+                continue;
             }
-            _ => false,
-        };
-        // ValidateOnly with no demanded rows enters no children or leaf.
-        // Activated empty invocations retain their original arity behavior.
-        let next = if frame.rows.is_empty()
-            && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
-        {
-            None
-        } else {
-            let next_is_pure = invocation
-                .arguments
-                .get(frame.next)
-                .map(|child| {
-                    let occurrence = *child;
-                    effects
-                        .get(&occurrence)
-                        .ok_or_else(|| invalid("missing exact operand effects"))?
-                        .for_use(flow.uses()[child].context)
-                        .map_err(|_| invalid("operand effect context differs"))
-                        .map(|summary| summary.permits_boolean_reordering())
-                })
-                .transpose()?
-                .unwrap_or(true);
-            frame.next_ordinals(
-                invocation.control,
-                invocation.arguments.len(),
-                next_is_pure,
-                input.num_rows(),
-                work,
-            )?
-        };
-        if let Some(ordinals) = next {
-            let child_use = invocation.arguments[frame.next];
-            frame.next += 1;
-            let (rows, child_domain, child_activation) =
-                child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
-            let child = Frame::new(
-                child_use,
-                flow.uses()[&child_use].control,
-                definitions
-                    .node(flow.uses()[&child_use].definition)
-                    .ok_or_else(|| invalid("missing actual child definition"))?
-                    .data_type(),
-                rows,
-                child_domain,
-                needs_original.contains(&child_use),
-                child_activation,
-                ordinals,
-                work,
-            )?;
-            frames.push(frame);
-            frames.push(child);
-            continue;
-        }
-        // Row domains are immutable once traversal finishes this frame. Move
-        // their existing vectors out so completion can mutate the other state
-        // without cloning rows or adding observation callbacks.
-        let completion_rows = std::mem::take(&mut frame.rows);
-        let completion_output_rows = std::mem::take(&mut frame.output_rows);
-        let local_selection =
-            Selection::try_sparse_observed(input.num_rows(), &completion_rows, || work.step())?;
-        let output_selection =
-            Selection::try_sparse_observed(input.num_rows(), &completion_output_rows, || {
-                work.step()
-            })?;
-        // Clone only explicit finite continuations of actually evaluated
-        // children. No host request occurs before the original leaf outcome.
-        let child_sources = frame
-            .children
-            .iter()
-            .filter_map(|child| child.value.continuation())
-            .collect();
-        let value = if completion_rows.is_empty()
-            && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
-        {
-            complete_undemanded_leaf(result_type.data_type(), work)?
-        } else {
-            match definition.kind() {
-                StaticExprKind::Constant(constant) => {
-                    complete_constant_leaf(constant, result_type, local_selection, allocator, work)?
-                }
-                StaticExprKind::Input => {
-                    let source = program
-                        .input(frame.occurrence)
-                        .ok_or_else(|| invalid("input requires its actual compiled source"))?;
-                    if source.scope != input_scope {
-                        return Err(invalid("input source differs from actual root scope").into());
-                    }
-                    let ordinal = source.ordinal as usize;
-                    let column = input
-                        .checked_column(ordinal)
-                        .ok_or_else(|| invalid("slot source ordinal is absent"))?;
-                    // Obtain the source at the original checked Slot. Current
-                    // kernels still consume only the evaluated array; this
-                    // synchronous borrow neither captures nor wraps its owner.
-                    let (_original, _source) = column.into_parts();
-                    let array = frame.domain.column(ordinal).ok_or_else(|| {
-                        invalid("actual source domain has no checked Slot ordinal")
-                    })?;
-                    if !source_captured {
-                        source_custody = input.capture_source(allocator, work.control)?;
-                        source_captured = true;
-                    }
-                    let array = match &source_custody {
-                        Some(custody) => custody.retain(Arc::clone(array), work.control)?,
-                        None => Arc::clone(array),
-                    };
-                    let owner = source_custody
-                        .as_ref()
-                        .map(|custody| custody.continuation(&array, work.control))
-                        .transpose()?;
-                    OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
-                }
-                kind => {
-                    let recipes = UnitNodeRecipes {
-                        unit: program,
-                        occurrence: frame.occurrence,
-                    };
-                    complete_node::<R, _>(
-                        &CompletionKind::from_static(kind)
-                            .ok_or_else(|| invalid("unsupported compiled root definition"))?,
-                        &mut frame,
-                        &recipes,
-                        invocation.control,
-                        invocation.context.demand,
+            // Row domains are immutable once traversal finishes this frame. Move
+            // their existing vectors out so completion can mutate the other state
+            // without cloning rows or adding observation callbacks.
+            let completion_rows = std::mem::take(&mut frame.rows);
+            let completion_output_rows = std::mem::take(&mut frame.output_rows);
+            let local_selection =
+                Selection::try_sparse_observed(input.num_rows(), &completion_rows, || work.step())?;
+            let output_selection =
+                Selection::try_sparse_observed(input.num_rows(), &completion_output_rows, || {
+                    work.step()
+                })?;
+            // Clone only explicit finite continuations of actually evaluated
+            // children. No host request occurs before the original leaf outcome.
+            let child_sources = frame
+                .children
+                .iter()
+                .filter_map(|child| child.value.continuation())
+                .collect();
+            let value = if completion_rows.is_empty()
+                && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
+            {
+                complete_undemanded_leaf(result_type.data_type(), work)?
+            } else {
+                match definition.kind() {
+                    StaticExprKind::Constant(constant) => complete_constant_leaf(
+                        constant,
                         result_type,
                         local_selection,
-                        original_domain,
-                        instances,
                         allocator,
                         work,
+                    )?,
+                    StaticExprKind::Input => {
+                        let source = program
+                            .input(frame.occurrence)
+                            .ok_or_else(|| invalid("input requires its actual compiled source"))?;
+                        if source.scope != input_scope {
+                            return Err(
+                                invalid("input source differs from actual root scope").into()
+                            );
+                        }
+                        let ordinal = source.ordinal as usize;
+                        let column = input
+                            .checked_column(ordinal)
+                            .ok_or_else(|| invalid("slot source ordinal is absent"))?;
+                        // Obtain the source at the original checked Slot. Current
+                        // kernels still consume only the evaluated array; this
+                        // synchronous borrow neither captures nor wraps its owner.
+                        let (_original, _source) = column.into_parts();
+                        let array = frame.domain.column(ordinal).ok_or_else(|| {
+                            invalid("actual source domain has no checked Slot ordinal")
+                        })?;
+                        if !self.source_captured {
+                            self.source_custody = input.capture_source(allocator, work.control)?;
+                            self.source_captured = true;
+                        }
+                        let array = match &self.source_custody {
+                            Some(custody) => custody.retain(Arc::clone(array), work.control)?,
+                            None => Arc::clone(array),
+                        };
+                        let owner = self
+                            .source_custody
+                            .as_ref()
+                            .map(|custody| custody.continuation(&array, work.control))
+                            .transpose()?;
+                        OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
+                    }
+                    kind => {
+                        let recipes = UnitNodeRecipes {
+                            unit: program,
+                            occurrence: frame.occurrence,
+                        };
+                        if let Some(PreparedPureKernel::OrderedRegexp(prepared)) = program
+                            .calls()
+                            .get(&frame.occurrence)
+                            .map(|call| call.prepared())
+                        {
+                            self.evaluate_regexp(
+                                prepared,
+                                &invocation.arguments,
+                                &mut frame,
+                                &completion_rows,
+                                instances,
+                                work,
+                            )?
+                        } else {
+                            complete_node::<R, _>(
+                                &CompletionKind::from_static(kind).ok_or_else(|| {
+                                    invalid("unsupported compiled root definition")
+                                })?,
+                                &mut frame,
+                                &recipes,
+                                invocation.control,
+                                invocation.context.demand,
+                                result_type,
+                                local_selection,
+                                original_domain,
+                                instances,
+                                allocator,
+                                work,
+                            )?
+                        }
+                    }
+                }
+            };
+            let value = if completion_output_rows != completion_rows {
+                project_owned(
+                    value,
+                    &completion_rows,
+                    &completion_output_rows,
+                    input.num_rows(),
+                    work,
+                )?
+            } else {
+                value
+            };
+            // Required children become fatal at their original return boundary,
+            // before any new custody/type-holder allocation can replace the cause.
+            if let Some(parent) = frames.last() {
+                let parent_requires_original = matches!(
+                    program.calls().get(&parent.occurrence).map(|call|call.prepared()),
+                    Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
+                );
+                if parent_requires_original
+                    && let OwnedValue::Selected(_, errors) = value.uncontinued()
+                    && let Some(error) = errors.first()
+                {
+                    work.control
+                        .operation_aborted
+                        .store(true, Ordering::Relaxed);
+                    return Err(RequiredExpressionRowError::try_new(
+                        root,
+                        output_selection,
+                        error.clone(),
                     )?
+                    .into());
                 }
             }
-        };
-        let value = if completion_output_rows != completion_rows {
-            project_owned(
-                value,
-                &completion_rows,
-                &completion_output_rows,
-                input.num_rows(),
-                work,
-            )?
-        } else {
-            value
-        };
-        // Required children become fatal at their original return boundary,
-        // before any new custody/type-holder allocation can replace the cause.
-        if let Some(parent) = frames.last() {
-            let parent_requires_original = matches!(
-                program.calls().get(&parent.occurrence).map(|call|call.prepared()),
-                Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
-            );
-            if parent_requires_original
-                && let OwnedValue::Selected(_, errors) = value.uncontinued()
-                && let Some(error) = errors.first()
-            {
-                work.control
-                    .operation_aborted
-                    .store(true, Ordering::Relaxed);
-                return Err(RequiredExpressionRowError::try_new(
-                    root,
-                    output_selection,
-                    error.clone(),
-                )?
-                .into());
+            // Preserve the original leaf/required-child failure before any new
+            // custody request. Successful scalar aliases inherit their real inputs.
+            let value = value.retaining_children(child_sources, allocator, work.control)?;
+            let value = value.retaining_custody(self.source_custody.as_ref(), work.control)?;
+            let value = value.retaining_result_type(result_type, allocator, work.control)?;
+            if let Some(operand) = frame.operand.take() {
+                work.flush()?;
+                drop(operand);
+                work.flush()?;
             }
-        }
-        // Preserve the original leaf/required-child failure before any new
-        // custody request. Successful scalar aliases inherit their real inputs.
-        let value = value.retaining_children(child_sources, allocator, work.control)?;
-        let value = value.retaining_custody(source_custody.as_ref(), work.control)?;
-        let value = value.retaining_result_type(result_type, allocator, work.control)?;
-        if let Some(operand) = frame.operand.take() {
-            work.flush()?;
-            drop(operand);
-            work.flush()?;
-        }
-        if let Some(parent) = frames.last_mut() {
-            let parent_invocation = &flow.uses()[&parent.occurrence];
-            let shape = parent_invocation.control;
+            if let Some(parent) = frames.last_mut() {
+                let parent_invocation = &flow.uses()[&parent.occurrence];
+                let shape = parent_invocation.control;
 
-            let child_is_pure = effects
-                .get(&frame.occurrence)
-                .ok_or_else(|| invalid("missing actual child effects"))?
-                .for_use(invocation.context)
-                .map_err(|_| invalid("child effects differ from actual occurrence"))?
-                .permits_boolean_reordering();
-            parent.attach(
-                Child {
-                    ordinals: frame.parent_ordinals,
-                    value,
-                },
-                &UnitNodeRecipes {
-                    unit: program,
-                    occurrence: parent.occurrence,
-                },
-                shape,
-                parent_invocation.context.demand,
-                child_is_pure,
-                input.num_rows(),
-                work,
-                allocator,
-            )?;
-        } else {
-            let value = value.into_value(selection, work)?;
-            if let Some(custody) = &source_custody {
-                let ty = value.argument().array().data_type().clone();
-                let value = value.materialize(selection, &ty, work)?;
-                let continuation = value.continuation.clone();
-                let (_, array, errors) = value.into_parts();
-                let array = custody.retain(array, work.control)?;
-                return SelectedValues::try_new_observed(selection, &ty, array, errors, || {
-                    work.step()
-                })
-                .map(Value::Selected)
-                .and_then(|value| match continuation {
-                    Some(owner) => value.retaining_continuation(owner, work),
-                    None => Ok(value),
-                })
-                .map_err(ExprEvaluationFailure::Kernel);
+                let child_is_pure = effects
+                    .get(&frame.occurrence)
+                    .ok_or_else(|| invalid("missing actual child effects"))?
+                    .for_use(invocation.context)
+                    .map_err(|_| invalid("child effects differ from actual occurrence"))?
+                    .permits_boolean_reordering();
+                parent.attach(
+                    Child {
+                        ordinals: frame.parent_ordinals,
+                        value,
+                    },
+                    &UnitNodeRecipes {
+                        unit: program,
+                        occurrence: parent.occurrence,
+                    },
+                    shape,
+                    parent_invocation.context.demand,
+                    child_is_pure,
+                    input.num_rows(),
+                    work,
+                    allocator,
+                )?;
+            } else {
+                return Ok(value);
             }
-            return Ok(value);
         }
+        Err(internal("actual compiled root result is absent").into())
     }
-    Err(internal("actual compiled root result is absent").into())
 }
 
 /// Only the typed owner policy enters this path. Sources are already evaluated

@@ -15,38 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! The original v1 PARSE_URL computation. The key supplier is evaluated only for QUERY.
-//! The parser, uppercase conversion, query iterator and owned text are opaque library work.
-use url::Url;
-/// Outer None means the original two-argument call. Some(None) means its NULL query key.
-/// This supplier preserves the original conditional key access without depending on an arena.
-pub fn parse_value<'a>(
-    url_str: &str,
-    part_str: &str,
-    key_value: &mut dyn FnMut() -> Option<Option<&'a str>>,
-) -> Option<String> {
-    let part = part_str.to_uppercase();
-    let url = Url::parse(url_str).ok();
-    match (url, part.as_str()) {
-        (Some(u), "HOST") => u.host_str().map(|s| s.to_string()),
-        (Some(u), "PATH") => Some(u.path().to_string()),
-        (Some(u), "PROTOCOL") => Some(u.scheme().to_string()),
-        (Some(u), "REF") => u.fragment().map(|s| s.to_string()),
-        (Some(u), "QUERY") => {
-            if let Some(key) = key_value() {
-                if let Some(key) = key {
-                    u.query_pairs()
-                        .find(|(k, _)| k == key)
-                        .map(|(_, v)| v.to_string())
-                } else {
-                    None
-                }
-            } else {
-                u.query().map(|s| s.to_string())
-            }
-        }
-        _ => None,
-    }
-}
+//! Java-style URI structure and raw component access.
 
 use crate::{KernelFailure, kernel_input::EvaluationCheckpoints};
 

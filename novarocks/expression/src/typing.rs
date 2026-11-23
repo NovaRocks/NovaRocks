@@ -642,11 +642,10 @@ fn type_catalog_call(
 ) -> Result<NodeTyping, TypingError> {
     let arguments = arguments(children, work)?;
     work.flush()?;
-    let binding = context.catalog.select_scalar(
-        name,
-        request(&arguments, expected_result),
-        work.control(),
-    )?;
+    let binding = context
+        .catalog
+        .select_scalar(name, request(&arguments, expected_result), work.control())
+        .map_err(|error| route::unavailable_string_binding(name, children, error))?;
     type_selected_call(context, binding, expected_result, children, work)
 }
 

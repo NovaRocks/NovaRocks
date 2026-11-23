@@ -1435,8 +1435,6 @@ fn seal_units(
             claims.insert(
                 id,
                 ExpressionCallClaim {
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                     temporal_source: None,
                     context: invocation.context,
                     effects: token.call_contract().effects().clone(),

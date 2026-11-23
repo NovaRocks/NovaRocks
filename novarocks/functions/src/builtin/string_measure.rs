@@ -531,11 +531,11 @@ mod tests {
         ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionValueType,
         ScalarEvaluationInstance, Selection,
     };
-    use arrow_array::{Int32Array, Int64Array};
+    use arrow_array::Int64Array;
     use novarocks_type_contract::{CompilePhase, DecimalOverflowPolicy};
     use std::{sync::Mutex, time::Duration};
 
-    const FUNCTIONS: [&str; 3] = ["ascii", "length", "char_length"];
+    const FUNCTIONS: [&str; 1] = ["length"];
 
     #[test]
     fn string_measure_fixed_width_is_selected_by_character_kind() {
@@ -570,7 +570,7 @@ mod tests {
     }
     // Independent expected byte codes, UTF-8 byte lengths and scalar counts.
     // Combining marks and joiners count as scalars, not grapheme clusters.
-    const EXPECTED: [(&str, [i32; 3]); 9] = [
+    const EXPECTED: [(&str, [i64; 3]); 9] = [
         ("", [0, 0, 0]),
         ("A", [65, 1, 1]),
         ("你好", [228, 6, 2]),
@@ -627,11 +627,11 @@ mod tests {
     fn strings(values: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(values))
     }
-    fn output(array: &ArrayRef) -> Vec<Option<i32>> {
-        assert_eq!(array.data_type(), &DataType::Int32);
+    fn output(array: &ArrayRef) -> Vec<Option<i64>> {
+        assert_eq!(array.data_type(), &DataType::Int64);
         array
             .as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
             .iter()
             .collect()
@@ -662,10 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_three_functions_keep_independent_unicode_and_byte_oracles() {
+    fn varchar_length_keeps_independent_unicode_oracles() {
         let array = strings(EXPECTED.iter().map(|(text, _)| Some(*text)).collect());
         let args = [EvaluatedArgument::Column(&array)];
-        for (index, name) in FUNCTIONS.into_iter().enumerate() {
+        for name in FUNCTIONS {
             for nullable in [false, true] {
                 for policy in [
                     DecimalOverflowPolicy::OutputNull,
@@ -682,15 +682,15 @@ mod tests {
                     assert_eq!(kernel.contract().decimal_overflow_policy(), policy);
                     let ty = kernel.contract().result_type();
                     assert_eq!(ty.logical_type(), ValueLogicalType::Physical);
-                    assert_eq!(ty.data_type().clone(), DataType::Int32);
-                    assert_eq!(ty.nullable(), name == "ascii" || nullable);
+                    assert_eq!(ty.data_type().clone(), DataType::Int64);
+                    assert_eq!(ty.nullable(), nullable);
                     let result = kernel
                         .evaluate(Selection::all(EXPECTED.len()), &args, &Control::default())
                         .unwrap();
                     assert!(result.errors().is_empty());
                     assert_eq!(
                         output(result.values()),
-                        EXPECTED.map(|(_, values)| Some(values[index]))
+                        EXPECTED.map(|(_, values)| Some(values[2]))
                     );
                 }
             }
@@ -716,7 +716,7 @@ mod tests {
             Box::default(),
         )
         .unwrap();
-        for (index, name) in FUNCTIONS.into_iter().enumerate() {
+        for name in FUNCTIONS {
             for argument in [
                 EvaluatedArgument::Column(&sliced),
                 EvaluatedArgument::SelectedColumn(&compact),
@@ -729,7 +729,7 @@ mod tests {
                 assert_eq!(result.selection(), selection);
                 assert_eq!(
                     output(result.values()),
-                    [Some([228, 6, 2][index]), Some([240, 4, 1][index])]
+                    [Some([228, 6, 2][2]), Some([240, 4, 1][2])]
                 );
                 assert!(result.errors().is_empty());
             }
@@ -742,7 +742,7 @@ mod tests {
         let constants = pool(strings(vec![None, Some("unselected"), Some("e\u{301}")]));
         let constant = constants.value(2).unwrap();
         assert!(Arc::ptr_eq(constant.pool().array(), constants.array()));
-        for (index, name) in FUNCTIONS.into_iter().enumerate() {
+        for name in FUNCTIONS {
             for argument in [
                 EvaluatedArgument::Scalar(&scalar),
                 EvaluatedArgument::Constant(&constant),
@@ -752,7 +752,7 @@ mod tests {
                 let result = kernel
                     .evaluate(Selection::all(4), &args, &Control::default())
                     .unwrap();
-                assert_eq!(output(result.values()), vec![Some([101, 3, 2][index]); 4]);
+                assert_eq!(output(result.values()), vec![Some([101, 3, 2][2]); 4]);
             }
             let null = constants.value(0).unwrap();
             let args = [EvaluatedArgument::Constant(&null)];
@@ -774,10 +774,7 @@ mod tests {
             let result = nullable
                 .evaluate(Selection::all(3), &args, &Control::default())
                 .unwrap();
-            assert_eq!(
-                output(result.values()),
-                [None, Some(0), Some(1 + i32::from(name == "ascii") * 64)]
-            );
+            assert_eq!(output(result.values()), [None, Some(0), Some(1)]);
             assert!(result.errors().is_empty());
             let mut nonnull = instance(name, false);
             assert!(matches!(
@@ -802,7 +799,6 @@ mod tests {
         for name in FUNCTIONS {
             for bad in [
                 FunctionValueType::new(DataType::LargeUtf8, false),
-                FunctionValueType::new(DataType::Binary, false),
                 FunctionValueType::new(DataType::Int64, false),
                 FunctionValueType::try_with_logical_type(
                     DataType::Utf8,
@@ -867,7 +863,7 @@ mod tests {
         let array = strings(vec![Some(&text)]);
         let args = [EvaluatedArgument::Scalar(&array)];
         let trace = Control::default();
-        let mut kernel = instance("char_length", false);
+        let mut kernel = instance("length", false);
         assert_eq!(
             output(
                 kernel
@@ -888,7 +884,7 @@ mod tests {
         ] {
             for at in 0..calls.len() {
                 let control = Control::refusing(at, error.clone());
-                let mut kernel = instance("char_length", false);
+                let mut kernel = instance("length", false);
                 assert_eq!(
                     kernel
                         .evaluate(Selection::all(1), &args, &control)
@@ -909,25 +905,8 @@ mod tests {
     }
 
     #[test]
-    fn ascii_and_bytes_do_not_scan_text_and_unselected_text_is_not_visited() {
+    fn inactive_text_is_not_visited() {
         let long = "é".repeat(10_000);
-        let long_scalar = strings(vec![Some(&long)]);
-        let short_scalar = strings(vec![Some("é")]);
-        for (name, expected) in [("ascii", 195), ("length", 20_000)] {
-            let mut traces = Vec::new();
-            for array in [&long_scalar, &short_scalar] {
-                let mut kernel = instance(name, false);
-                let trace = Control::default();
-                let args = [EvaluatedArgument::Scalar(array)];
-                let result = kernel.evaluate(Selection::all(1), &args, &trace).unwrap();
-                if Arc::ptr_eq(array, &long_scalar) {
-                    assert_eq!(output(result.values()), [Some(expected)]);
-                }
-                traces.push(trace.calls());
-            }
-            assert_eq!(traces[0], traces[1]);
-            assert!(!traces[0].contains(&256));
-        }
         let wide = strings(vec![Some(&long), Some("A"), None]);
         let short = strings(vec![Some(""), Some("A"), Some("")]);
         let rows = [1];
@@ -939,10 +918,7 @@ mod tests {
                 let args = [EvaluatedArgument::Column(array)];
                 let trace = Control::default();
                 let result = kernel.evaluate(selection, &args, &trace).unwrap();
-                assert_eq!(
-                    output(result.values()),
-                    [Some(if name == "ascii" { 65 } else { 1 })]
-                );
+                assert_eq!(output(result.values()), [Some(1)]);
                 traces.push(trace.calls());
             }
             assert_eq!(traces[0], traces[1]);
@@ -1057,7 +1033,7 @@ mod source_properties {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
     #[test]
     fn direct_carrier_and_frozen_return_guards_do_not_retain_arrays_or_field_metadata() {
-        let source: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let weak = Arc::downgrade(&source);
         let failure = evaluate_required_ascii(&source).unwrap_err();
         drop(source);
@@ -1067,7 +1043,7 @@ mod source_properties {
         assert_eq!(failure.to_string(), "ascii expects string");
         let field = Arc::new(arrow_schema::Field::new(
             "ResourceExhausted",
-            DataType::Int32,
+            DataType::Int64,
             true,
         ));
         let weak_field = Arc::downgrade(&field);

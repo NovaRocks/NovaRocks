@@ -131,6 +131,8 @@ marker_registry! {
     PREPARED_FAILURE_EXIT_RELEASED => ("NOVAROCKS_PREPARED_FAILURE_EXIT_RELEASED", Task, FaultInjection, ["backend", "execution_id", "reason", "stage", "task", "token"]),
     POSITION_SHARD_DRIVER_FINISHED => ("NOVAROCKS_POSITION_SHARD_DRIVER_FINISHED", Task, Observation(TaskProtocol), ["driver_id", "emitted_rows", "execution_id", "task_key"]),
     POSITION_SHARD_DRIVER_OPENED => ("NOVAROCKS_POSITION_SHARD_DRIVER_OPENED", Task, Observation(TaskProtocol), ["driver_id", "execution_id", "task_key"]),
+    REGEXP_SEARCH_PROGRESS => ("NOVAROCKS_REGEXP_SEARCH_PROGRESS", Task, Observation(TaskProtocol), ["execution_id", "offset", "task_key"]),
+    REGEXP_SEARCH_STOPPED => ("NOVAROCKS_REGEXP_SEARCH_STOPPED", Task, Observation(TaskProtocol), ["execution_id", "offset", "task_key"]),
     QUERY_PROCESS_NAMESPACE => ("NOVAROCKS_QUERY_PROCESS_NAMESPACE", Frontend, Unconditional, ["query_process_namespace"]),
     READY => ("NOVAROCKS_READY", Process, Unconditional, ["advertise_host", "control_grpc_port", "grpc_port", "mysql_port", "pid", "role", "trino_port"]),
     RESULT_HANDOFF_TERMINAL_OBSERVED => ("NOVAROCKS_RESULT_HANDOFF_TERMINAL_OBSERVED", Frontend, Unconditional, ["statement", "token"]),

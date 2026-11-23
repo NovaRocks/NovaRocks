@@ -24,6 +24,7 @@ use crate::{AggregateStateAllocator, KernelFailure};
 use allocator_api2::vec::Vec as HostVec;
 use std::sync::Arc;
 
+mod batch;
 mod parse;
 mod program;
 mod rows;
@@ -34,6 +35,9 @@ mod tests;
 use parse::PatternRejection;
 use program::Program;
 use search::RegexpSearch;
+
+pub(crate) use batch::RegexpOperation;
+pub use batch::{PreparedRegexp, RegexpArgument, RegexpBatch, RegexpRow};
 
 struct PatternPrograms<'p> {
     host: Arc<dyn AggregateStateAllocator>,

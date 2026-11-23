@@ -1897,7 +1897,10 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                             }
                             (ControlShape::If, ArgumentControl::If)
                             | (ControlShape::Coalesce, ArgumentControl::Coalesce)
-                            | (ControlShape::Try, ArgumentControl::Try) => (false, true),
+                            | (ControlShape::Try, ArgumentControl::Try)
+                            | (ControlShape::OrderedRegexp, ArgumentControl::OrderedRegexp) => {
+                                (false, true)
+                            }
                             (
                                 ControlShape::TemporalSource(shape),
                                 ArgumentControl::TemporalSource(kind),
@@ -1986,43 +1989,6 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         }
                         work.step()?;
                     }
-                    let regexp_count_pattern_source = if function.function_id.as_str()
-                        == "builtin.scalar/regexp_count/v1"
-                    {
-                        let expected =
-                            novarocks_expression_contract::regexp_count_pattern_source_observed(
-                                unit.definitions(),
-                                args,
-                                work,
-                            )
-                            .map_err(|error| match error {
-                                novarocks_expression_contract::TemporalSourceProjectionError::Control(
-                                    cause,
-                                ) => ExprCompileError::Control(cause),
-                                novarocks_expression_contract::TemporalSourceProjectionError::Invalid(
-                                    message,
-                                ) => ExprCompileError::Invalid(message),
-                            })?;
-                        if frozen.regexp_count_pattern_source != Some(expected) {
-                            return Err(ExprCompileError::Invalid(
-                                "regexp_count frozen source differs from actual native-v1 projection",
-                            ).into());
-                        }
-                        Some(expected)
-                    } else {
-                        if frozen.regexp_count_pattern_source.is_some() {
-                            return Err(ExprCompileError::Invalid(
-                                "foreign regexp_count pattern source",
-                            )
-                            .into());
-                        }
-                        None
-                    };
-                    if frozen.to_base64_byte_source.is_some() {
-                        return Err(
-                            ExprCompileError::Invalid("retired to_base64 source claim").into()
-                        );
-                    }
                     let input = CallEffectInput {
                         context: frozen.context.into(),
                         argument_uses: match &frozen.temporal_source {
@@ -2032,17 +1998,9 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                                     channels: &source_channels,
                                 }
                             }
-                            None => match regexp_count_pattern_source {
-                                Some(source) => {
-                                    novarocks_functions::CallArgumentUses::RegexpCountPattern {
-                                        source,
-                                        channels: &argument_uses,
-                                    }
-                                }
-                                None => novarocks_functions::CallArgumentUses::SelectedChannels(
-                                    &argument_uses,
-                                ),
-                            },
+                            None => novarocks_functions::CallArgumentUses::SelectedChannels(
+                                &argument_uses,
+                            ),
                         },
                         function_id: &function.function_id,
                         kind: function.kind,
@@ -2235,6 +2193,7 @@ fn validate_prepared_call(
             PreparedPureKernel::Scalar(_)
                 | PreparedPureKernel::ScalarInvocation(_)
                 | PreparedPureKernel::ControlIntrinsic(_)
+                | PreparedPureKernel::OrderedRegexp(_)
         )
         || call.function_id() != &function.function_id
         || call.selected().overload != function.overload

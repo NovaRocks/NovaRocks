@@ -132,6 +132,7 @@ fn encode_argument_control(value: ArgumentControl) -> wire::ArgumentControl {
         ArgumentControl::If => Kind::Simple(W::If as i32),
         ArgumentControl::Coalesce => Kind::Simple(W::Coalesce as i32),
         ArgumentControl::Try => Kind::Simple(W::Try as i32),
+        ArgumentControl::OrderedRegexp => Kind::Simple(W::OrderedRegexp as i32),
         ArgumentControl::SimpleCase => Kind::Simple(W::SimpleCase as i32),
         ArgumentControl::SearchedCase => Kind::Simple(W::SearchedCase as i32),
         ArgumentControl::Aggregate => Kind::Simple(W::Aggregate as i32),
@@ -183,6 +184,7 @@ fn decode_argument_control(input: &wire::ArgumentControl) -> Result<ArgumentCont
                 Ok(W::If) => ArgumentControl::If,
                 Ok(W::Coalesce) => ArgumentControl::Coalesce,
                 Ok(W::Try) => ArgumentControl::Try,
+                Ok(W::OrderedRegexp) => ArgumentControl::OrderedRegexp,
                 Ok(W::SimpleCase) => ArgumentControl::SimpleCase,
                 Ok(W::SearchedCase) => ArgumentControl::SearchedCase,
                 Ok(W::Aggregate) => ArgumentControl::Aggregate,
@@ -573,14 +575,6 @@ fn encode_claim_core<P: CallProjection>(
         context: Some(encode_context(&call.context)),
         effects: Some(encode_effects(&call.effects, resources, work)?),
         decimal_overflow_policy: Some(encode_policy(call.decimal_overflow_policy)),
-        regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
-            novarocks_type_contract::RegexpCountPatternSource::Dynamic => 0,
-            novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent => 1,
-        }),
-        to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
-            novarocks_type_contract::ToBase64ByteSource::Ordinary => 0,
-            novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1 => 1,
-        }),
         temporal_source: call
             .temporal_source
             .as_ref()
@@ -598,38 +592,28 @@ fn decode_claim_core<P: CallProjection>(
         return Err(E::InvalidShape("scalar claim key differs from its context").into());
     }
     Ok(novarocks_expression_contract::ExpressionCallClaim {
-            context: decode_context(
-                call.context
-                    .as_ref()
-                    .ok_or(E::InvalidShape("missing call context"))?,
-            )?,
-            effects: decode_effects(
-                call.effects
-                    .as_ref()
-                    .ok_or(E::InvalidShape("missing call effects"))?,
-                resources,
-                work,
-            )?,
-            regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
-                0 => Ok(novarocks_type_contract::RegexpCountPatternSource::Dynamic),
-                1 => Ok(novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent),
-                _ => Err(E::InvalidShape("unknown regexp_count pattern source tag")),
-            }).transpose()?,
-            to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
-                0 => Ok(novarocks_type_contract::ToBase64ByteSource::Ordinary),
-                1 => Ok(novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1),
-                _ => Err(E::InvalidShape("unknown to_base64 byte source tag")),
-            }).transpose()?,
-            temporal_source: call
-                .temporal_source
+        context: decode_context(
+            call.context
                 .as_ref()
-                .map(|source| decode_temporal_source(source, resources, work))
-                .transpose()?,
-            decimal_overflow_policy: decode_policy(
-                call.decimal_overflow_policy
-                    .ok_or(E::InvalidShape("missing call decimal overflow policy"))?,
-            )?,
-        })
+                .ok_or(E::InvalidShape("missing call context"))?,
+        )?,
+        effects: decode_effects(
+            call.effects
+                .as_ref()
+                .ok_or(E::InvalidShape("missing call effects"))?,
+            resources,
+            work,
+        )?,
+        temporal_source: call
+            .temporal_source
+            .as_ref()
+            .map(|source| decode_temporal_source(source, resources, work))
+            .transpose()?,
+        decimal_overflow_policy: decode_policy(
+            call.decimal_overflow_policy
+                .ok_or(E::InvalidShape("missing call decimal overflow policy"))?,
+        )?,
+    })
 }
 pub(super) fn encode_calls(
     input: &FrozenFragmentCalls,

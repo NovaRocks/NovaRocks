@@ -37,7 +37,7 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// Only the installed Utf8, Utf8, Int32 profile has an owner.
+/// The public profile takes two character arguments and a BIGINT field index.
 pub(super) fn operation(name: &str) -> Option<()> {
     (name == "split_part").then_some(())
 }
@@ -60,6 +60,7 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
 pub(super) fn trino_effects() -> FunctionEffectDeclaration {
     let mut result = effects();
     result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    result.null_behavior = FunctionNullBehavior::Strict;
     result
 }
 

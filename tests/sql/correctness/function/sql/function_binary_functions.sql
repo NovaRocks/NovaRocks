@@ -15,125 +15,122 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Migrated from dev/test/sql/test_binary_functions
--- Test Objective:
--- 1. Validate to_binary() with HEX/ENCODE64/UTF8 format (case-insensitive).
--- 2. Validate from_binary() roundtrip conversions.
--- 3. Cover bad input cases (odd-length hex, invalid base64, empty strings).
--- 4. Validate to_binary/from_binary on varbinary column data.
+-- Hex, Base64, UTF-8 and digest operations consume the original byte carrier.
 
 -- query 1
--- to_binary with default (no explicit format); result format may vary, skip check
--- @skip_result_check=true
-select to_binary('ab');
+SELECT to_hex(from_hex('aB')) AS hex_bytes,
+       to_hex(from_base64('qw==')) AS base64_bytes,
+       to_hex(to_utf8('ab')) AS utf8_bytes,
+       to_hex(to_utf8('é')) AS multibyte_utf8;
 
 -- query 2
--- HEX format (uppercase)
-select to_binary('ab', 'HEX');
+SELECT from_utf8(to_utf8('ab')) AS utf8_roundtrip,
+       to_base64(from_hex('ab')) AS base64_roundtrip,
+       to_hex(from_base64('/wA=')) AS raw_bytes;
 
 -- query 3
--- HEX format (lowercase)
-select to_binary('ab', 'hex');
+SELECT length(from_hex('')) AS hex_bytes,
+       length(from_base64('')) AS base64_bytes,
+       length(to_utf8('')) AS utf8_bytes,
+       length(to_base64(X'')) AS base64_chars,
+       crc32(X'') AS empty_crc32,
+       crc32(CAST(NULL AS VARBINARY)) AS null_crc32;
 
 -- query 4
--- ENCODE64 format (uppercase)
-select to_binary('qw==', 'ENCODE64');
+-- Omitted Base64 padding and noncanonical unused bits are accepted by Trino.
+SELECT to_hex(from_base64('/w')) AS short_base64,
+       to_hex(from_base64('/x==')) AS unused_bits;
 
 -- query 5
--- ENCODE64 format (lowercase)
-select to_binary('qw==', 'encode64');
+SELECT to_hex(md5(X'FF00')) AS md5_hex,
+       to_hex(sha256(X'FF00')) AS sha256_hex,
+       to_hex(sha512(X'FF00')) AS sha512_hex,
+       typeof(md5(X'FF00')) AS md5_type,
+       typeof(sha256(X'FF00')) AS sha256_type,
+       typeof(sha512(X'FF00')) AS sha512_type,
+       crc32(X'FF00') AS crc;
 
 -- query 6
--- UTF8 format (lowercase)
-select to_binary('ab', 'utf8');
+SELECT from_utf8(X'41C0AFEDA080FF42') AS default_replacement,
+       from_utf8(X'41C0AFEDA080FF42', '') AS deleted,
+       from_utf8(X'41C0AFEDA080FF42', '中') AS text_replacement,
+       from_utf8(X'41C0AFEDA080FF42', BIGINT '128512') AS codepoint_replacement,
+       to_hex(to_utf8(CAST('é中' AS CHAR(4)))) AS padded_utf8;
 
 -- query 7
--- UTF8 format (uppercase)
-select to_binary('ab', 'UTF8');
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT from_hex('1');
 
 -- query 8
--- from_binary roundtrip: utf8 -> utf8
-select from_binary(to_binary('ab', 'utf8'), 'utf8');
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT from_hex('XY');
 
 -- query 9
--- from_binary roundtrip: hex -> hex (result is uppercase)
-select from_binary(to_binary('ab', 'hex'), 'hex');
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT from_base64('AA=');
 
 -- query 10
--- from_binary: decode hex-encoded binary to base64
-select from_binary(to_binary('ab', 'hex'), 'encode64');
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT from_utf8(X'FF', BIGINT '-1');
 
 -- query 11
--- Bad input: empty string with hex returns empty binary (non-NULL, but value can't be snapshot)
--- @skip_result_check=true
-select to_binary('', 'hex');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT crc32('é');
 
 -- query 12
--- Bad input: empty string with utf8 returns empty binary (non-NULL, but value can't be snapshot)
--- @skip_result_check=true
-select to_binary('', 'utf8');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT md5('é');
 
 -- query 13
--- Bad input: empty string with encode64 (invalid base64 -> NULL)
-select to_binary('', 'encode64');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT to_base64('é');
 
 -- query 14
--- Bad input: odd-length hex string
-select to_binary('1', 'hex');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT to_binary('ab', 'hex');
 
 -- query 15
--- Bad input: invalid hex characters XY
-select to_binary('XY', 'hex');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT from_binary(X'AB', 'hex');
 
 -- query 16
--- Bad input: invalid hex characters XYZ0
-select to_binary('XYZ0', 'hex');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT HEX(BIGINT '26');
 
 -- query 17
--- Bad input: invalid base64 padding
-select to_binary('1', 'encode64');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT UNHEX('ab');
 
 -- query 18
--- Bad input: from_binary on null-producing hex
-select from_binary(to_binary('X', 'hex'), 'hex');
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT sha2('ab', 256);
 
 -- query 19
-select from_binary(to_binary('0X', 'hex'), 'hex');
+-- @skip_result_check=true
+CREATE TABLE ${case_db}.t0(c0 INT, c1 VARBINARY, c2 VARCHAR(16)) WITH (format_version = 3);
 
 -- query 20
-select from_binary(to_binary('1', 'encode64'), 'hex');
+-- @skip_result_check=true
+INSERT INTO ${case_db}.t0 VALUES
+    ROW(1, X'AB01', 'ab01'),
+    ROW(2, X'ABAB', 'abab'),
+    ROW(3, X'FF00', '/wA='),
+    ROW(4, X'', ''),
+    ROW(5, NULL, NULL);
 
 -- query 21
--- Create table with varbinary column
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t0(c0 INT, c1 varbinary(16), c2 varchar(16)) WITH (format_version = 3);
+SELECT c0, length(c1) AS byte_count, to_hex(c1) AS raw_hex,
+       to_hex(to_utf8(from_utf8(c1))) AS decoded_hex,
+       to_base64(c1) AS base64, to_hex(from_base64(c2)) AS decoded_base64,
+       crc32(c1) AS crc
+FROM ${case_db}.t0
+ORDER BY c0;
 
 -- query 22
--- Insert one row (x'ab01' is binary literal)
--- @skip_result_check=true
-INSERT INTO ${case_db}.t0 VALUES ROW(1, X'ab01', 'ab01');
-
--- query 23
--- from_binary on varbinary column vs reconstructed binary
-SELECT from_binary(c1, 'hex'), from_binary(to_binary(c2, 'hex'), 'hex') FROM ${case_db}.t0;
-
--- query 24
--- Decode malformed UTF-8 with the Trino replacement character.
-SELECT hex(from_binary(c1, 'utf8')), from_binary(to_binary(c2, 'encode64'), 'hex') FROM ${case_db}.t0;
-
--- query 25
-SELECT from_binary(c1, 'encode64'), from_binary(to_binary(c2, 'utf8'), 'hex') FROM ${case_db}.t0;
-
--- query 26
--- Insert second row
--- @skip_result_check=true
-INSERT INTO ${case_db}.t0 VALUES ROW(2, X'abab', 'abab');
-
--- query 27
-SELECT from_binary(c1, 'hex'), from_binary(to_binary(c2, 'hex'), 'hex') FROM ${case_db}.t0 ORDER BY c0;
-
--- query 28
-SELECT hex(from_binary(c1, 'utf8')), from_binary(to_binary(c2, 'encode64'), 'hex') FROM ${case_db}.t0 ORDER BY c0;
-
--- query 29
-SELECT from_binary(c1, 'encode64'), from_binary(to_binary(c2, 'utf8'), 'hex') FROM ${case_db}.t0 ORDER BY c0;
+WITH prepared AS (
+    SELECT c0, from_base64(c2) AS decoded, c1 AS raw FROM ${case_db}.t0 WHERE c0 >= 3
+)
+SELECT c0, decoded = raw AS exact_bytes, crc32(decoded) AS crc,
+       to_hex(md5(decoded)) AS digest_hex
+FROM prepared
+ORDER BY c0;

@@ -41,6 +41,10 @@ pub enum CharacterWidth {
         source: &'static str,
         replacement: &'static str,
     },
+    RegexpReplace {
+        source: &'static str,
+        replacement: &'static str,
+    },
 }
 
 /// Structural type used in registered function signatures.
@@ -257,6 +261,15 @@ impl TypeSpec {
                         replacement,
                     } => {
                         write!(output, "({source}+{replacement}*({source}+1))")
+                    }
+                    CharacterWidth::RegexpReplace {
+                        source,
+                        replacement,
+                    } => {
+                        write!(
+                            output,
+                            "({source}+max({source}*{replacement}/2,{replacement})*({source}+1))"
+                        )
                     }
                 }
                 .expect("writing to a String cannot fail");
@@ -546,6 +559,12 @@ impl Bindings {
             } => lookup(source)?
                 .zip(lookup(replacement)?)
                 .map(|(x, z)| x + z * (x + 1)),
+            CharacterWidth::RegexpReplace {
+                source,
+                replacement,
+            } => lookup(source)?
+                .zip(lookup(replacement)?)
+                .map(|(x, y)| x.saturating_add((x * y / 2).max(y).saturating_mul(x + 1))),
         })
     }
 

@@ -120,8 +120,6 @@ pub mod collection_arrow;
 mod collection_cardinality;
 mod collection_cardinality_owner;
 mod control_owner;
-pub mod crc32;
-mod crc32_owner;
 mod date;
 mod date_owner;
 mod dround;
@@ -138,9 +136,6 @@ mod map_entries_selected;
 pub mod map_projection_core;
 mod map_projection_owner;
 mod map_projection_selected;
-mod md5_selected;
-pub mod md5_shared;
-mod murmur;
 mod negation;
 mod negation_owner;
 pub mod nullif;
@@ -176,20 +171,10 @@ mod string_concat;
 mod string_concat_owner;
 mod string_concat_ws;
 mod string_concat_ws_owner;
-pub mod string_extended;
-mod string_extended_owner;
-mod string_from_base64;
-mod string_from_base64_owner;
-mod string_hex;
-mod string_hex_owner;
 mod string_initcap;
 mod string_initcap_owner;
-mod string_left_right;
-mod string_left_right_owner;
 mod string_locate;
 mod string_locate_owner;
-mod string_md5;
-mod string_md5_owner;
 pub mod string_measure;
 mod string_measure_owner;
 mod string_pad;
@@ -198,8 +183,6 @@ mod string_replace;
 mod string_replace_owner;
 mod string_reverse;
 mod string_reverse_owner;
-mod string_sha2;
-mod string_sha2_owner;
 pub mod string_split;
 mod string_split_owner;
 mod string_split_part;
@@ -213,7 +196,6 @@ pub mod string_trim_core;
 mod string_trim_owner;
 mod string_url_decode;
 pub use string_url_decode::evaluate_required as evaluate_required_url_decode;
-mod string_url_decode_owner;
 mod string_url_encode;
 pub use string_url_encode::evaluate_required as evaluate_required_url_encode;
 mod string_url_encode_owner;
@@ -239,9 +221,6 @@ mod window_value_owner;
 mod window_value_tests;
 
 mod string_failure;
-pub use string_failure::required_regex_compile_failure;
-mod string_regexp_extract;
-mod string_regexp_replace;
 
 pub mod scalar_extrema;
 mod scalar_extrema_owner;
@@ -249,9 +228,6 @@ mod scalar_extrema_owner;
 pub mod calendar_time_text_shared;
 #[cfg(test)]
 mod calendar_time_text_shared_tests;
-
-pub mod regexp_position;
-mod regexp_position_owner;
 
 pub mod array_literal_core;
 mod array_literal_owner;
@@ -271,9 +247,6 @@ mod calendar_unixtime_owner;
 mod array_concat;
 
 pub mod regexp_count;
-pub(crate) mod regexp_count_owner;
-
-pub mod sha2_shared;
 
 mod string_parse_url;
 mod string_parse_url_owner;
@@ -282,13 +255,7 @@ pub mod string_parse_url_shared;
 pub mod collection_cardinality_core;
 pub mod collection_offset_count;
 
-mod string_to_base64;
-mod string_to_base64_owner;
-pub mod to_base64_shared;
-
 mod assert_true_owner;
-pub mod bytes_output;
-mod from_binary_owner;
 mod scalar_rows_owner;
 mod synopse_owner;
 mod uuid_owner;

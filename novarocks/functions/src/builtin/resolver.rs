@@ -1401,8 +1401,17 @@ mod tests {
 
     #[test]
     fn resolve_upper_returns_utf8() {
-        let r = resolve_scalar_function("upper", &[DataType::Utf8]);
-        assert_eq!(r, Ok(DataType::Utf8));
+        let source = FunctionValueType::new(DataType::Utf8, false);
+        let (_, resolved) = resolve_scalar_value_signature_with_overload(
+            "upper",
+            std::slice::from_ref(&source),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.return_type,
+            FunctionValueType::new(DataType::Utf8, true)
+        );
     }
 
     #[test]
@@ -1416,8 +1425,8 @@ mod tests {
     #[test]
     fn resolve_concat_is_variadic() {
         assert!(resolve_scalar_function("concat", &[]).is_err());
-        // CONCAT requires one Utf8 argument before its repeated tail.
-        for n in 1..5 {
+        assert!(resolve_scalar_function("concat", &[DataType::Utf8]).is_err());
+        for n in 2..5 {
             let args = vec![DataType::Utf8; n];
             assert_eq!(
                 resolve_scalar_function("concat", &args),
@@ -1549,60 +1558,59 @@ mod tests {
     }
 
     #[test]
-    fn resolve_substring_exposes_int32_argument_targets() {
-        let resolved = resolve_scalar_function_signature(
+    fn resolve_substring_exposes_bigint_argument_targets() {
+        let value = |data_type| FunctionValueType::new(data_type, false);
+        let text = value(DataType::Utf8);
+        let bigint = value(DataType::Int64);
+        let (_, resolved) = resolve_scalar_value_signature_with_overload(
             "substring",
-            &[DataType::Utf8, DataType::Int64, DataType::Int16],
+            &[text.clone(), bigint.clone(), value(DataType::Int16)],
+            crate::binding_test_control(),
         )
-        .expect("substring integer arguments should use the opt-in cast match");
-
-        assert_eq!(resolved.return_type, DataType::Utf8);
+        .unwrap();
         assert_eq!(
-            resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int32, DataType::Int32]
+            resolved.return_type,
+            FunctionValueType::new(DataType::Utf8, true)
         );
+        assert_eq!(resolved.argument_types, [text, bigint.clone(), bigint]);
         assert!(resolved.enforce_argument_binding);
     }
 
     #[test]
-    fn resolve_substring_null_offset_targets_int32() {
-        let resolved =
-            resolve_scalar_function_signature("substring", &[DataType::Utf8, DataType::Null])
-                .expect("NULL should coerce to the signature target");
-
+    fn resolve_substring_null_offset_targets_bigint() {
+        let text = FunctionValueType::new(DataType::Utf8, false);
+        let null = FunctionValueType::new(DataType::Null, true);
+        let (_, resolved) = resolve_scalar_value_signature_with_overload(
+            "substring",
+            &[text.clone(), null],
+            crate::binding_test_control(),
+        )
+        .unwrap();
         assert_eq!(
             resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int32]
+            [text, FunctionValueType::new(DataType::Int64, true)]
         );
     }
 
     #[test]
     fn resolve_substring_reports_enforced_no_match() {
-        let err = resolve_scalar_function_signature(
-            "substring",
-            &[DataType::Utf8, list_of(DataType::Int32)],
-        )
-        .expect_err("an offset that is not a number must not fall through to legacy inference");
-
-        assert!(matches!(
-            err,
-            ResolveError::NoMatchingSignature {
-                candidates: 2,
-                binding_enforced: true,
-            }
-        ));
-    }
-
-    #[test]
-    fn resolve_substring_offset_spelled_as_a_string_targets_int32() {
-        let resolved =
-            resolve_scalar_function_signature("substring", &[DataType::Utf8, DataType::Utf8])
-                .expect("an offset opted in to coercion reads a string as a number");
-
-        assert_eq!(
-            resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int32]
-        );
+        let text = FunctionValueType::new(DataType::Utf8, false);
+        for invalid_offset in [DataType::Utf8, list_of(DataType::Int32)] {
+            let offset = FunctionValueType::new(invalid_offset, false);
+            let error = resolve_scalar_value_signature_with_overload(
+                "substring",
+                &[text.clone(), offset],
+                crate::binding_test_control(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ResolveError::NoMatchingSignature {
+                    candidates: 4,
+                    binding_enforced: true,
+                }
+            ));
+        }
     }
 
     #[test]
@@ -1649,7 +1657,7 @@ mod tests {
         assert!(matches!(
             err,
             ResolveError::NoMatchingSignature {
-                candidates: 2,
+                candidates: 4,
                 binding_enforced: true,
             }
         ));
@@ -1657,8 +1665,8 @@ mod tests {
 
     #[test]
     fn non_opt_in_signature_keeps_legacy_no_match_policy() {
-        let err = resolve_scalar_function_signature("upper", &[DataType::Int64])
-            .expect_err("upper(Int64) is normalized by the analyzer, not resolver cast match");
+        let err = resolve_scalar_function_signature("abs", &[DataType::Utf8])
+            .expect_err("abs requires a numeric source");
 
         assert!(matches!(
             err,

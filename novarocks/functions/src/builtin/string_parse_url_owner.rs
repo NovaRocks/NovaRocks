@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Each installed parse_url shares its binding, effects and CPU preparation owner.
+//! The Trino URL functions share their binding, effects and preparation owner.
 
 use std::sync::Arc;
 
@@ -38,33 +38,20 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum UrlOperation {
-    Parse,
-    Trino(TrinoUrlPart),
+pub(super) fn operation(name: &str) -> Option<TrinoUrlPart> {
+    TrinoUrlPart::from_name(name)
 }
 
-pub(super) fn operation(name: &str) -> Option<UrlOperation> {
-    match name {
-        "parse_url" => Some(UrlOperation::Parse),
-        _ => TrinoUrlPart::from_name(name).map(UrlOperation::Trino),
-    }
-}
-
-/// URL and part NULL propagate; a NULL key masks only QUERY. Invalid URL/part returns NULL.
-/// Parsing has no environment dependency or instance state.
-pub(super) fn effects(operation: UrlOperation) -> FunctionEffectDeclaration {
+/// URL functions are strict. Form decoding can report invalid percent escapes.
+pub(super) fn effects(operation: TrinoUrlPart) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: match operation {
-            UrlOperation::Trino(TrinoUrlPart::Decode) => FunctionIntrinsicRowError::MayRaise,
+            TrinoUrlPart::Decode => FunctionIntrinsicRowError::MayRaise,
             _ => FunctionIntrinsicRowError::NoRowError,
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: match operation {
-            UrlOperation::Parse => FunctionNullBehavior::CalledOnNull,
-            UrlOperation::Trino(_) => FunctionNullBehavior::Strict,
-        },
+        null_behavior: FunctionNullBehavior::Strict,
         argument_control: ArgumentControl::Eager,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
@@ -80,14 +67,14 @@ pub(super) fn definition(
     let owner = Arc::new(StringParseUrlOwner::new(name, declaration, resolver)?);
     FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
         |error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin parse_url pure owner",
+            subject: "builtin URL pure owner",
             value: error.to_string().into(),
         },
     )
 }
 
 pub(super) struct StringParseUrlOwner {
-    operation: UrlOperation,
+    operation: TrinoUrlPart,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -100,24 +87,20 @@ impl StringParseUrlOwner {
     ) -> Result<Self, FunctionCatalogError> {
         let operation =
             operation(name).ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
-                subject: "uninstalled parse_url",
+                subject: "uninstalled URL function",
                 value: name.into(),
             })?;
         let function = format!("builtin.scalar/{name}/v1");
         let expected = effects(operation);
-        let overloads = match operation {
-            UrlOperation::Parse => 2,
-            UrlOperation::Trino(_) => 1,
-        };
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != overloads
+            || declaration.overloads().len() != 1
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "builtin parse_url pure declaration",
+                subject: "builtin URL pure declaration",
                 value: declaration.function_id().as_str().into(),
             });
         }
@@ -264,7 +247,7 @@ impl PureScalarImplementation for StringParseUrlOwner {
 #[derive(Debug)]
 struct PreparedStringParseUrl {
     contract: Arc<ScalarCallContract>,
-    operation: UrlOperation,
+    operation: TrinoUrlPart,
 }
 impl PreparedScalarKernel for PreparedStringParseUrl {
     fn contract(&self) -> &Arc<ScalarCallContract> {
@@ -280,21 +263,14 @@ impl PreparedScalarKernel for PreparedStringParseUrl {
     }
 }
 
-struct StringParseUrlInstance(UrlOperation);
+struct StringParseUrlInstance(TrinoUrlPart);
 impl ScalarKernelInstance for StringParseUrlInstance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        match self.0 {
-            UrlOperation::Parse => {
-                super::string_parse_url::evaluate_string_parse_url(input, control)
-            }
-            UrlOperation::Trino(part) => {
-                super::string_parse_url::evaluate_trino_url(part, input, control)
-            }
-        }
+        super::string_parse_url::evaluate_trino_url(self.0, input, control)
     }
 
     fn retained_bytes(&self) -> usize {
@@ -399,7 +375,7 @@ impl StringParseUrlOwner {
                     && input.proof_scope != input.context.proof_scope()
             {
                 return Err(FunctionBindingError::InvalidBinding(
-                    "parse_url has no environment dependencies and requires an exact proof scope"
+                    "URL function has no environment dependencies and requires an exact proof scope"
                         .into(),
                 )
                 .into());
@@ -439,13 +415,13 @@ impl StringParseUrlOwner {
                 || !input.environment.is_empty()
             {
                 return Err(invalid(
-                    "parse_url preparation differs from its exact checked call",
+                    "URL preparation differs from its exact checked call",
                 ));
             }
             work.flush().map_err(compile_failure)?;
             validate().map_err(|error| match error {
                 FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("parse_url preparation has a stale selected binding"),
+                _ => invalid("URL preparation has a stale selected binding"),
             })?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.

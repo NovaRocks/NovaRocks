@@ -27,9 +27,4 @@ pub struct ExpressionCallClaim {
     /// Exact original emitted source roles and independent use occurrences.
     /// Required only by nominal TemporalSource controls; absence is no fact.
     pub temporal_source: Option<novarocks_type_contract::TemporalSourcePlan<crate::ExprId>>,
-    /// Present only for the exact REGEXP_COUNT scalar; Dynamic is positive
-    /// authored evidence, never the default for an absent source receipt.
-    pub regexp_count_pattern_source: Option<novarocks_type_contract::RegexpCountPatternSource>,
-    /// Exact immediate emitted-source receipt; Ordinary must be positively authored.
-    pub to_base64_byte_source: Option<novarocks_type_contract::ToBase64ByteSource>,
 }

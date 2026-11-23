@@ -15,17 +15,9 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Migrated from dev/test/sql/test_bucket_shuffle_right_join
--- Test Objective:
--- 1. Validate that RIGHT OUTER JOIN [bucket] and RIGHT OUTER JOIN [shuffle] produce identical results.
--- 2. The right (build) table is a derived table where most join-key values are NULL
---    due to: if(murmur_hash3_32(c0)=0, c0, NULL). Most right rows are unmatched.
--- 3. A secondary LEFT JOIN [bucket/shuffle] t2 on the same (often-NULL) t1.c0 is also included.
--- 4. Results are compared via fingerprinting: count(distinct fp)=1 asserts equivalence.
--- 5. Tests 10 different left-table filter values (c0 in 0..9) to cover all bucket assignments.
---
--- Regression: COUNT(DISTINCT ...) was incorrectly returning 0 for negative fingerprint values
--- (multi_distinct_count was mapped to CountDistinctNonNegative, silently skipping negatives).
+-- A right outer join must retain each right-side row, including rows whose key is NULL.
+-- Repeat with each left-side filter to distinguish the one matching key from the other rounds.
+-- A separate pair of equal negative fingerprints tests DISTINCT independently of join placement.
 
 -- query 1
 -- @skip_result_check=true
@@ -58,91 +50,148 @@ INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.t2 SELECT * FROM ${case_db}.t0;
 
 -- query 8
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (0)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (0)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 0) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 9
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 1) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 10
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (1)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (1)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 2) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 11
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 3) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 12
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (2)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (2)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 4) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 13
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 5) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 14
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (3)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (3)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 6) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 15
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 7) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 16
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (4)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (4)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 8) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 17
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
+SELECT count(*) AS retained_rows,
+       count(l.c0) AS matched_rows,
+       count_if(r.join_key IS NULL) AS null_keys,
+       array_agg(r.c1 ORDER BY r.c1) AS retained_values
+FROM (SELECT c0 FROM ${case_db}.t1 WHERE c0 = 9) AS l
+RIGHT OUTER JOIN (
+    SELECT CASE WHEN c0 = 0 THEN c0 END AS join_key, c1
+    FROM ${case_db}.t0
+) AS r ON r.join_key = l.c0
+LEFT JOIN ${case_db}.t2 AS t ON t.c0 = l.c0;
 
 -- query 18
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (5)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (5)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
+WITH fingerprints AS (
+    SELECT c0, -crc32(to_utf8(CAST(c0 AS VARCHAR))) AS fp
+    FROM ${case_db}.t0
+)
+SELECT count(fp) AS fingerprints,
+       count_if(fp < 0) AS negative_fingerprints,
+       count(DISTINCT fp) AS distinct_fingerprints,
+       array_agg(fp ORDER BY c0) AS values_by_key
+FROM fingerprints;
 
 -- query 19
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
+-- @skip_result_check=true
+INSERT INTO ${case_db}.r (fp)
+SELECT -crc32(to_utf8(CAST(c0 AS VARCHAR)))
+FROM ${case_db}.t0 WHERE c0 = 4;
+INSERT INTO ${case_db}.r (fp)
+SELECT -crc32(to_utf8(CAST(c0 AS VARCHAR)))
+FROM ${case_db}.t0 WHERE c0 = 4;
 
 -- query 20
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (6)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (6)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-
--- query 21
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
-
--- query 22
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (7)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (7)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-
--- query 23
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
-
--- query 24
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (8)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (8)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-
--- query 25
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
-
--- query 26
--- @skip_result_check=true
-TRUNCATE TABLE ${case_db}.r;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (9)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-INSERT INTO ${case_db}.r (fp) SELECT (sum(CAST(murmur_hash3_32(ifnull(c0,0)) AS BIGINT)+murmur_hash3_32(ifnull(c1,0))+murmur_hash3_32(ifnull(c2,0))+murmur_hash3_32(ifnull(ab,0)))) FROM (SELECT t0.c0,t0.c1,t0.c2,t1.c2 AS ab FROM (SELECT * FROM ${case_db}.t1 WHERE c0 IN (9)) t1 RIGHT OUTER JOIN (SELECT if(murmur_hash3_32(c0)=0,c0,NULL) AS c0,c1,c2 FROM ${case_db}.t0) t0 ON t0.c0=t1.c0 LEFT JOIN ${case_db}.t2 ON t2.c0=t1.c0) AS t;
-
--- query 27
-SELECT assert_true(count(fp)=2), assert_true(count(distinct fp)=1) FROM ${case_db}.r;
+SELECT count(fp) AS fingerprints,
+       count(DISTINCT fp) AS distinct_fingerprints,
+       min(fp) AS smallest_fingerprint,
+       max(fp) AS largest_fingerprint
+FROM ${case_db}.r;

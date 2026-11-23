@@ -63,6 +63,7 @@ pub mod bit_array;
 pub mod bit_numeric;
 pub mod bitmap_value;
 pub mod builtin;
+pub use builtin::regexp_count::f10::{PreparedRegexp, RegexpArgument, RegexpBatch, RegexpRow};
 pub mod calendar_julian;
 pub mod calendar_numeric;
 pub mod calendar_period_numeric;
@@ -2842,8 +2843,6 @@ pub use invocation_scope::{
     EvaluatedSourceLoan, InvocationInputDomainPolicy, ScalarInvocationScope,
     ScalarInvocationSource, ScopedScalarCallInput,
 };
-
-pub mod string_left_right_core;
 
 pub mod string_split_part_core;
 

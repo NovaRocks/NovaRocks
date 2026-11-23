@@ -583,7 +583,7 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
             owner.binding_declaration().function_id().as_str(),
             "builtin.scalar/reverse/v1"
         );
-        assert_eq!(owner.implementation_declarations().len(), 1);
+        assert_eq!(owner.implementation_declarations().len(), 2);
         assert_eq!(
             owner.implementation_declarations()[0]
                 .implementation
@@ -644,7 +644,7 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
         );
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
-            FunctionValueType::new(DataType::Binary, true),
+            FunctionValueType::new(DataType::Int64, true),
             FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
@@ -666,7 +666,7 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
 
 #[test]
 fn string_reverse_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
-    for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
+    for ty in [source(true), FunctionValueType::new(DataType::Int64, true)] {
         let good = CompileControl::default();
         let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(

@@ -68,13 +68,6 @@ fn output_layout(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 
-pub(super) fn evaluate_string_url_encode<'a>(
-    input: ScalarCallInput<'_, 'a>,
-    control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
-    evaluate_encoding(input, control, Encoding::Legacy)
-}
-
 pub(super) fn evaluate_trino_url_encode<'a>(
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,

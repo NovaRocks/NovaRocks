@@ -38,8 +38,7 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// Only the actually registered one-argument Utf8 profile has an owner.
-/// The legacy List helper is not an installed reverse overload.
+/// Installed scalar profiles reverse Unicode code points or binary bytes.
 pub(super) fn operation(name: &str) -> Option<StringReverseOp> {
     match name {
         "reverse" => Some(StringReverseOp::Reverse),

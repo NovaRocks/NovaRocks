@@ -25,10 +25,10 @@ use arrow_schema::DataType;
 use md5::Md5;
 use sha2::{Sha256, Sha512};
 
-use super::super::{
+use super::{
     crc32::crc32_zlib_observed,
-    from_binary_owner::{Format, visit_utf8},
-    sha2_shared::{Observation, digest_bytes},
+    digest::{Observation, digest_bytes},
+    encoding::{Format, visit_utf8},
 };
 use crate::{
     EvaluatedArgument, KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallInput,
@@ -397,8 +397,8 @@ fn measure(
         (Op::Sha256, _) => 32,
         (Op::Sha512, _) => 64,
         (Op::ToUtf8, ByteRow::Bytes(bytes, _)) if char_width.is_none() => bytes.len(),
-        (Op::ToHex, ByteRow::Bytes(bytes, _)) => Format::Hex.output_len(bytes, work)?,
-        (Op::ToBase64, ByteRow::Bytes(bytes, _)) => Format::Base64.output_len(bytes, work)?,
+        (Op::ToHex, ByteRow::Bytes(bytes, _)) => Format::Hex.output_len(bytes)?,
+        (Op::ToBase64, ByteRow::Bytes(bytes, _)) => Format::Base64.output_len(bytes)?,
         _ => {
             let mut length = 0;
             if let Err(message) = visit(operation, row, char_width, work, |chunk| {

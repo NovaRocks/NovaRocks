@@ -65,6 +65,9 @@ pub(super) fn overload_kind(name: &str, signature: &str) -> Option<ConcatKind> {
         "concat" if signature.starts_with("(list<any<T>>,any<T>)") => Some(ConcatKind::Append),
         "concat" if signature.starts_with("(any<T>,list<any<T>>)") => Some(ConcatKind::Prepend),
         "concat" if signature.starts_with("(list<") => Some(ConcatKind::Array),
+        "concat" if signature.starts_with("(utf8,") && signature.ends_with(";coerce") => {
+            Some(ConcatKind::TrinoScalar)
+        }
         "concat"
             if ["(varchar(", "(char(", "(binary"]
                 .into_iter()

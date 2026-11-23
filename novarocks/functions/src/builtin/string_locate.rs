@@ -135,6 +135,16 @@ fn strpos(
     if instance > haystack.len() as u64 {
         return Ok(0);
     }
+    // Every nonempty match starts at a distinct code point, even when
+    // matches overlap. Observe the source while deriving that upper bound.
+    let mut characters = 0;
+    for character in haystack.chars() {
+        observe_char(character, work)?;
+        characters += 1;
+    }
+    if instance > characters {
+        return Ok(0);
+    }
     let mut range = 0..haystack.len();
     let mut matched = 0;
     while matched < instance {

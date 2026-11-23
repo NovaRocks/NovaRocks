@@ -124,6 +124,27 @@ impl<'g, 'p> RegexpSearch<'g, 'p> {
         start: usize,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Option<RegexpMatch<'_, 'p>>, KernelFailure> {
+        let mut boundary = start;
+        let found = match self.find_ordered(source, start, &mut boundary, work) {
+            Ok(found) => found,
+            Err(cause) => {
+                work.regexp_search_stopped(boundary);
+                return Err(cause);
+            }
+        };
+        Ok(found.then_some(RegexpMatch {
+            names: &self.program.names,
+            slots: &self.matched,
+        }))
+    }
+
+    fn find_ordered(
+        &mut self,
+        source: &str,
+        start: usize,
+        boundary: &mut usize,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<bool, KernelFailure> {
         let tail = source
             .get(start..)
             .ok_or_else(|| invalid("regexp search start must be a source character boundary"))?;
@@ -144,8 +165,14 @@ impl<'g, 'p> RegexpSearch<'g, 'p> {
         // Earlier starts and preferred branches enter the active list first.
         // After a match, only higher-priority threads may extend or replace
         // it. No new start or lower-priority branch can win.
+        let mut progress_reported = false;
         for (offset, ch) in positions {
+            *boundary = offset;
             work.step()?;
+            if !progress_reported && offset - start >= crate::MAX_UNOBSERVED_KERNEL_WORK as usize {
+                work.regexp_search_progress(offset)?;
+                progress_reported = true;
+            }
             if !matched {
                 follow(
                     self.program,
@@ -203,10 +230,7 @@ impl<'g, 'p> RegexpSearch<'g, 'p> {
                 break;
             }
         }
-        Ok(matched.then_some(RegexpMatch {
-            names: &self.program.names,
-            slots: &self.matched,
-        }))
+        Ok(matched)
     }
 }
 

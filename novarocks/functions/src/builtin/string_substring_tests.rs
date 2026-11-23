@@ -159,15 +159,15 @@ fn sources(arity: usize) -> Vec<FunctionValueType> {
                 if i == 0 {
                     DataType::Utf8
                 } else {
-                    DataType::Int32
+                    DataType::Int64
                 },
                 true,
             )
         })
         .collect()
 }
-fn integers(values: Vec<Option<i32>>) -> ArrayRef {
-    Arc::new(Int32Array::from(values))
+fn integers(values: Vec<Option<i64>>) -> ArrayRef {
+    Arc::new(Int64Array::from(values))
 }
 
 #[test]
@@ -185,9 +185,9 @@ fn string_substring_actual_profiles_preserve_independent_unicode_and_signed_boun
         ("abc", -1, Some(-1), ""),
         ("abc", 4, Some(1), ""),
         ("abc", -4, Some(1), ""),
-        ("abc", i32::MIN, None, ""),
-        ("abc", i32::MAX, None, ""),
-        ("abc", -3, Some(i32::MAX), "abc"),
+        ("abc", i64::MIN, None, ""),
+        ("abc", i64::MAX, None, ""),
+        ("abc", -3, Some(i64::MAX), "abc"),
         ("", -1, None, ""),
         ("x\0y", 2, Some(1), "\0"),
     ];
@@ -206,7 +206,7 @@ fn string_substring_actual_profiles_preserve_independent_unicode_and_signed_boun
                 let length = integers(
                     chosen
                         .iter()
-                        .map(|(_, _, length, _)| Some(length.unwrap_or(i32::MAX)))
+                        .map(|(_, _, length, _)| Some(length.unwrap_or(i64::MAX)))
                         .collect(),
                 );
                 let mut arguments = vec![
@@ -256,7 +256,7 @@ fn string_substring_each_argument_keeps_sparse_slice_compact_scalar_and_constant
     let selection = Selection::try_sparse(3, &rows).unwrap();
     let compact = SelectedValues::try_new(
         selection,
-        &DataType::Int32,
+        &DataType::Int64,
         integers(vec![Some(1), Some(1)]),
         Box::default(),
     )
@@ -351,7 +351,7 @@ fn string_substring_strict_null_and_inactive_payload_never_scan_hidden_text() {
 fn string_substring_empty_selection_and_wrong_selected_shape_preserve_failed_latch() {
     let text = strings(vec![Some("abc")]);
     let pos = integers(vec![Some(2)]);
-    let wrong = Arc::new(arrow_array::Int64Array::from(vec![2])) as ArrayRef;
+    let wrong = Arc::new(arrow_array::Int32Array::from(vec![2])) as ArrayRef;
     let empty = [];
     let selection = Selection::try_sparse(1, &empty).unwrap();
     for name in NAMES {
@@ -401,7 +401,7 @@ fn string_substring_required_child_error_cannot_become_successful_null() {
     let text = strings(vec![Some("abc")]);
     let failed = SelectedValues::try_new(
         selection,
-        &DataType::Int32,
+        &DataType::Int64,
         integers(vec![None]),
         Box::from([crate::RowDataError::new(0, "required position failed")]),
     )
@@ -439,7 +439,7 @@ fn string_substring_runtime_callback_prefix_keeps_all_three_causes_and_real_256(
         (strings(vec![Some("abc")]), false, true),
     ] {
         let pos = if wrong {
-            Arc::new(arrow_array::Int64Array::from(vec![-2; text.len()])) as ArrayRef
+            Arc::new(arrow_array::Int32Array::from(vec![-2; text.len()])) as ArrayRef
         } else {
             integers(vec![Some(-2); text.len()])
         };
@@ -596,7 +596,10 @@ fn string_substring_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
                 owner.binding_declaration().function_id().as_str(),
                 format!("builtin.scalar/{name}/v1")
             );
-            assert_eq!(owner.implementation_declarations().len(), 2);
+            assert_eq!(
+                owner.implementation_declarations().len(),
+                if name == "substr" { 6 } else { 4 }
+            );
             assert_eq!(
                 owner.implementation_declarations()[0]
                     .implementation
@@ -607,7 +610,10 @@ fn string_substring_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
                 owner.binding_declaration().overloads()[0].effects.as_ref(),
                 Some(&effects())
             );
-            assert_eq!(owner.binding_declaration().overloads().len(), 2);
+            assert_eq!(
+                owner.binding_declaration().overloads().len(),
+                if name == "substr" { 6 } else { 4 }
+            );
             for count in [0, 4] {
                 let bad_args: Vec<_> = (0..count)
                     .map(|i| arguments[i.min(arity - 1)].clone())
@@ -675,7 +681,7 @@ fn string_substring_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
             );
             for source in [
                 FunctionValueType::new(DataType::LargeUtf8, true),
-                FunctionValueType::new(DataType::Binary, true),
+                FunctionValueType::new(DataType::Boolean, true),
                 FunctionValueType::from_legacy_declared_projection(
                     DataType::List(Arc::new(arrow_schema::Field::new(
                         "item",
@@ -694,7 +700,7 @@ fn string_substring_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
                 assert!(
                     prepared_for_test_with_policy(
                         name,
-                        &[source, FunctionValueType::new(DataType::Int32, true)],
+                        &[source, FunctionValueType::new(DataType::Int64, true)],
                         DecimalOverflowPolicy::OutputNull
                     )
                     .is_err()
@@ -712,7 +718,7 @@ fn string_substring_compile_success_and_ordinary_tail_preserve_all_callback_caus
         assert_eq!(
             prepared_for_test_with_control(
                 "substring",
-                &[ty.clone(), FunctionValueType::new(DataType::Int32, true)],
+                &[ty.clone(), FunctionValueType::new(DataType::Int64, true)],
                 DecimalOverflowPolicy::OutputNull,
                 &good
             )
@@ -733,7 +739,7 @@ fn string_substring_compile_success_and_ordinary_tail_preserve_all_callback_caus
                 };
                 let actual = prepared_for_test_with_control(
                     "substring",
-                    &[ty.clone(), FunctionValueType::new(DataType::Int32, true)],
+                    &[ty.clone(), FunctionValueType::new(DataType::Int64, true)],
                     DecimalOverflowPolicy::OutputNull,
                     &control,
                 )

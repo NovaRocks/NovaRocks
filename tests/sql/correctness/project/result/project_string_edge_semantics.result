@@ -1,4 +1,9 @@
 -- query 1
--- types	varchar	varchar	varchar	boolean	varchar	boolean
-re_no_match	re_null_input	unhex_bad_hex	unhex_bad_is_null	unhex_odd_hex	unhex_odd_is_null
-""	NULL	""	false	""	false
+-- types	varchar(7)	varchar(0)
+re_no_match	re_null_input
+NULL	NULL
+
+-- query 4
+-- types	varchar	varchar	bigint	varchar
+nfc_bytes	chr_type	char_length_value	char_bytes
+C3A9	varchar(1)	3	612020

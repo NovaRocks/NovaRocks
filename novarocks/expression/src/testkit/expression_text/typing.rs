@@ -160,8 +160,14 @@ impl<'a> TextTyping<'a> {
                 {
                     return Err(legacy("function call modifiers", span));
                 }
+                // The hidden overlay name is only reachable through dedicated syntax.
+                let name = if name.value.eq_ignore_ascii_case("$overlay") {
+                    "\"$overlay\""
+                } else {
+                    &name.value
+                };
                 self.lower_call(
-                    &name.value,
+                    name,
                     call.arguments.iter().map(|arg| &arg.value),
                     span,
                     work,

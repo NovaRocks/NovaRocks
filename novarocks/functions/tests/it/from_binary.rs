@@ -18,7 +18,6 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray};
-use arrow_schema::DataType;
 use novarocks_functions::{
     CallArgumentUses, CallEffectInput, DataFailureReason, EvaluatedArgument, FunctionArgument,
     FunctionBindingRequest, FunctionKind, KernelEvaluationControl, KernelFailure,
@@ -47,17 +46,12 @@ impl KernelEvaluationControl for Control {
     }
 
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        panic!("FROM_BINARY must not wait");
+        panic!("Byte functions must not wait");
     }
 }
 
-fn evaluate(bytes: Vec<Option<&[u8]>>, formats: Option<Vec<Option<&str>>>) -> Vec<Option<String>> {
-    let mut arrays: Vec<ArrayRef> = vec![Arc::new(BinaryArray::from(bytes))];
-    if let Some(formats) = formats {
-        arrays.push(Arc::new(StringArray::from(formats)));
-    }
-    let (values, errors) = evaluate_call("from_binary", arrays);
-    assert_eq!(values.data_type(), &DataType::Utf8);
+fn evaluate_text(name: &str, arrays: Vec<ArrayRef>) -> Vec<Option<String>> {
+    let (values, errors) = evaluate_call(name, arrays);
     assert!(errors.is_empty());
     values
         .as_any()
@@ -188,38 +182,30 @@ fn trino_uri_overloads_decode_values_after_matching_raw_parameter_names() {
 }
 
 #[test]
-fn formats_are_per_row_and_legacy_null_and_empty_cases_hold() {
+fn from_utf8_replacement_is_per_row_and_keeps_empty_bytes_distinct_from_null() {
+    let bytes = Arc::new(BinaryArray::from(vec![
+        Some(&b"\xff"[..]),
+        Some(&b"\xff"[..]),
+        Some(&b"\xff"[..]),
+        Some(&b""[..]),
+        None,
+        Some("é😀".as_bytes()),
+    ]));
+    let replacements = Arc::new(StringArray::from(vec![
+        None,
+        Some(""),
+        Some("中"),
+        Some("�"),
+        Some("�"),
+        Some(""),
+    ]));
     assert_eq!(
-        evaluate(vec![Some(b"\xab\xcd"), Some(b""), None], None),
-        [Some("ABCD".into()), Some(String::new()), None]
-    );
-    assert_eq!(
-        evaluate(
-            vec![
-                Some(b"\xab"),
-                Some(b"\xcd"),
-                Some(b"ab"),
-                Some(b""),
-                Some(b""),
-                None,
-                Some("é😀".as_bytes())
-            ],
-            Some(vec![
-                None,
-                Some("unknown"),
-                Some("EnCoDe64"),
-                Some("encode64"),
-                Some("utf8"),
-                Some("utf8"),
-                Some("UTF8")
-            ]),
-        ),
+        evaluate_text("from_utf8", vec![bytes, replacements]),
         [
-            Some("AB".into()),
-            Some("CD".into()),
-            Some("YWI=".into()),
             None,
-            Some(String::new()),
+            Some("".into()),
+            Some("中".into()),
+            Some("".into()),
             None,
             Some("é😀".into())
         ]
@@ -241,21 +227,19 @@ fn utf8_replacement_groups_invalid_prefixes_like_trino_484() {
         (b"\xe2\x82\xac", "€"),
     ];
     assert_eq!(
-        evaluate(
-            vectors.iter().map(|&(input, _)| Some(input)).collect(),
-            Some(vec![Some("utf8"); vectors.len()]),
+        evaluate_text(
+            "from_utf8",
+            vec![Arc::new(BinaryArray::from(
+                vectors
+                    .iter()
+                    .map(|&(input, _)| Some(input))
+                    .collect::<Vec<_>>()
+            ))],
         ),
         vectors
             .iter()
             .map(|&(_, output)| Some(output.to_owned()))
             .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        evaluate(
-            vec![Some(b"\xe2\x82"), Some(b"\xe2\x82")],
-            Some(vec![Some("utf8"), Some("hex")]),
-        ),
-        [Some("\u{fffd}".into()), Some("E282".into())]
     );
 }
 
@@ -264,7 +248,10 @@ fn base64_padding_applies_only_at_the_end_of_the_value() {
     let input = b"abc".repeat(65);
     let input = [input.as_slice(), b"z"].concat();
     assert_eq!(
-        evaluate(vec![Some(&input)], Some(vec![Some("encode64")])),
+        evaluate_text(
+            "to_base64",
+            vec![Arc::new(BinaryArray::from(vec![Some(input.as_slice())]))]
+        ),
         [Some("YWJj".repeat(65) + "eg==")]
     );
 }

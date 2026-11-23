@@ -3691,7 +3691,6 @@ dependencies = [
  "num-traits",
  "rand 0.8.8",
  "regex",
- "regex-automata",
  "regex-syntax",
  "roaring 0.10.12",
  "ryu",

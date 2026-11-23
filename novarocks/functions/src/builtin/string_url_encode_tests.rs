@@ -47,8 +47,20 @@ const ORACLES: [(&str, &str); 10] = [
     ("!$'()*;,", "%21%24%27%28%29%2A%3B%2C"),
     ("Straße İΣ", "Stra%C3%9Fe%20%C4%B0%CE%A3"),
 ];
-fn expected(_op: usize, oracle: &(&str, &str)) -> String {
-    oracle.1.into()
+fn form_expected(input: &str) -> &str {
+    match input {
+        "" => "",
+        "AZaz09-_.~" => "AZaz09-_.%7E",
+        " /+%?&=:#[]@" => "+%2F%2B%25%3F%26%3D%3A%23%5B%5D%40",
+        "\0\t\n\r\u{7f}" => "%00%09%0A%0D%7F",
+        "é中" => "%C3%A9%E4%B8%AD",
+        "a\u{301}" => "a%CC%81",
+        "👩‍💻" => "%F0%9F%91%A9%E2%80%8D%F0%9F%92%BB",
+        "%2f" => "%252f",
+        "!$'()*;," => "%21%24%27%28%29*%3B%2C",
+        "Straße İΣ" => "Stra%C3%9Fe+%C4%B0%CE%A3",
+        _ => unreachable!(),
+    }
 }
 #[derive(Default)]
 struct Control {
@@ -151,7 +163,7 @@ fn pool(array: ArrayRef) -> ConstantPool {
 #[test]
 fn string_url_encode_actual_profiles_preserve_independent_byte_percent_case_and_allowed_set() {
     let array = strings(ORACLES.iter().map(|(text, _)| Some(*text)).collect());
-    for (op, name) in NAMES.into_iter().enumerate() {
+    for name in NAMES {
         for nullable in [false, true] {
             for policy in [
                 DecimalOverflowPolicy::OutputNull,
@@ -159,7 +171,7 @@ fn string_url_encode_actual_profiles_preserve_independent_byte_percent_case_and_
             ] {
                 let prepared =
                     prepared_for_test_with_policy(name, &source(nullable), policy).unwrap();
-                assert_eq!(prepared.contract().result_type(), &source(true));
+                assert_eq!(prepared.contract().result_type(), &source(nullable));
                 assert_eq!(prepared.contract().decimal_overflow_policy(), policy);
                 let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
                 let arguments = [EvaluatedArgument::Column(&array)];
@@ -170,7 +182,7 @@ fn string_url_encode_actual_profiles_preserve_independent_byte_percent_case_and_
                     output(&result),
                     ORACLES
                         .iter()
-                        .map(|oracle| Some(expected(op, oracle)))
+                        .map(|oracle| Some(form_expected(oracle.0).to_owned()))
                         .collect::<Vec<_>>()
                 );
             }
@@ -496,7 +508,7 @@ fn string_url_encode_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
         );
         assert_eq!(
             selected.result_type,
-            FunctionResultType::Scalar(source(true))
+            FunctionResultType::Scalar(source(false))
         );
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
@@ -596,7 +608,7 @@ fn string_url_encode_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
         );
         assert!(std::ptr::eq(canonical.selected(), selected.as_ref()));
         let mut forged = (*selected).clone();
-        forged.result_type = FunctionResultType::Scalar(source(false));
+        forged.result_type = FunctionResultType::Scalar(source(true));
         assert!(
             owner
                 .validate_selected(&forged, request, crate::binding_test_control())

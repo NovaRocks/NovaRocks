@@ -16,8 +16,7 @@
 // under the License.
 
 use super::super::string_concat_ws_owner::{
-    effects, operation, owner_for_test, prepared_for_test_with_control,
-    prepared_for_test_with_policy,
+    operation, owner_for_test, prepared_for_test_with_control, prepared_for_test_with_policy,
 };
 use super::*;
 use crate::{
@@ -251,7 +250,7 @@ fn string_concat_ws_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
         assert!(canonical.effects().observable_effects.is_empty());
         assert_eq!(
             canonical.effects().own_row_error,
-            crate::FunctionIntrinsicRowError::NoRowError
+            crate::FunctionIntrinsicRowError::MayRaise
         );
         assert_eq!(
             canonical.effects().argument_control,
@@ -266,7 +265,7 @@ fn string_concat_ws_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
             owner.binding_declaration().function_id().as_str(),
             format!("builtin.scalar/{name}/v1")
         );
-        assert_eq!(owner.implementation_declarations().len(), 1);
+        assert_eq!(owner.implementation_declarations().len(), 2);
         assert_eq!(
             owner.implementation_declarations()[0]
                 .implementation
@@ -275,9 +274,9 @@ fn string_concat_ws_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
         );
         assert_eq!(
             owner.binding_declaration().overloads()[0].effects.as_ref(),
-            Some(&effects())
+            Some(&super::super::string_concat_ws_owner::trino_effects())
         );
-        assert_eq!(owner.binding_declaration().overloads().len(), 1);
+        assert_eq!(owner.binding_declaration().overloads().len(), 2);
         for count in [0, 1] {
             let bad_args: Vec<_> = (0..count)
                 .map(|i| arguments[i.min(arity - 1)].clone())
@@ -683,7 +682,19 @@ fn string_concat_ws_original_one_mib_byte_limit_includes_only_used_separators() 
     let result = instance(&[source(true), source(true), source(true)])
         .evaluate(Selection::all(7), &arguments, &Control::default())
         .unwrap();
-    assert!(result.errors().is_empty());
+    assert_eq!(
+        result
+            .errors()
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.reason()))
+            .collect::<Vec<_>>(),
+        [2, 5].map(|row| (
+            row,
+            crate::DataFailureReason::Domain(
+                novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
+            )
+        )),
+    );
     let values = result
         .values()
         .as_any()
@@ -1028,7 +1039,14 @@ fn string_concat_ws_complete_success_traces_and_bounded_all_seven_causes() {
             let selection = Selection::all(arrays[0].len());
             let good = Control::default();
             let result = make().evaluate(selection, &arguments, &good).unwrap();
-            let actual = output(&result);
+            assert_eq!(result.errors().len(), usize::from(case == 4));
+            let actual = result
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>();
             let trace = good.trace.lock().unwrap().clone();
             println!(
                 "C12-P2 trace name=concat_ws policy={policy:?} case={case} output={actual:?} units={trace:?}"

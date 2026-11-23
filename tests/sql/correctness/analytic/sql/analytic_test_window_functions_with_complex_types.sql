@@ -290,13 +290,13 @@ SELECT FIRST_VALUE(c19) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CU
 SELECT FIRST_VALUE(c20) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 23
-with cte as( SELECT FIRST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT FIRST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 24
-with cte as( SELECT FIRST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT FIRST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 25
-with cte as( SELECT FIRST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT FIRST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 26
 SELECT FIRST_VALUE(c24) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
@@ -494,13 +494,13 @@ SELECT LAST_VALUE(c19) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CUR
 SELECT LAST_VALUE(c20) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
 
 -- query 88
-with cte as( SELECT LAST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LAST_VALUE(c21) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 89
-with cte as( SELECT LAST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LAST_VALUE(c22) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 90
-with cte as( SELECT LAST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LAST_VALUE(c23) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 91
 SELECT LAST_VALUE(c24) OVER(ORDER BY k1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) wv FROM ${case_db}.t1;
@@ -696,13 +696,13 @@ SELECT LEAD(c19) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 SELECT LEAD(c20) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 
 -- query 153
-with cte as( SELECT LEAD(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LEAD(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 154
-with cte as( SELECT LEAD(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LEAD(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 155
-with cte as( SELECT LEAD(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LEAD(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 156
 SELECT LEAD(c24) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
@@ -849,13 +849,13 @@ SELECT LAG(c19) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 SELECT LAG(c20) OVER(ORDER BY k1) wv FROM ${case_db}.t1;
 
 -- query 194
-with cte as( SELECT LAG(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LAG(c21) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 195
-with cte as( SELECT LAG(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LAG(c22) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 196
-with cte as( SELECT LAG(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(murmur_hash3_32(array_join(transform(wv, x->murmur_hash3_32(x)),','))) from cte;
+with cte as( SELECT LAG(c23) OVER(ORDER BY k1) wv FROM ${case_db}.t1) select sum(crc32(to_utf8(CAST(array_join(transform(wv, x->crc32(to_utf8(CAST(x AS VARCHAR)))),',') AS VARCHAR)))) from cte;
 
 -- query 197
 SELECT LAG(c24) OVER(ORDER BY k1) wv FROM ${case_db}.t1;

@@ -26,9 +26,7 @@ use novarocks_functions::ConstantValue;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlCompileControl};
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_sql_testkit::sql_fixture_constant_policy;
-use novarocks_type_contract::{
-    CompilePhase, OperatorFunction, RegexpCountPatternSource, ValueLogicalType,
-};
+use novarocks_type_contract::{ArgumentControl, CompilePhase, OperatorFunction, ValueLogicalType};
 use std::sync::Arc;
 
 fn compile(sql: &str, probe: &Arc<FoldProbe>) -> SqlAuthoredPhysicalPlan {
@@ -233,7 +231,7 @@ fn standard_decimal_overflow_remains_an_unfolded_call_in_both_sql_modes() {
 }
 
 #[test]
-fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_error_decline() {
+fn regexp_count_fold_preserves_the_original_ordered_call_for_hosted_evaluation() {
     let probe = Arc::new(FoldProbe::default());
     let owner = compile("SELECT regexp_count('test string','[0-9')", &probe);
     let receipts = probe.receipts.lock().unwrap();
@@ -244,8 +242,10 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
     assert_eq!(calls.len(), 1);
     let receipt = calls[0];
     assert_eq!(
-        receipt.unit.claims()[&receipt.root_use()].regexp_count_pattern_source,
-        Some(RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent),
+        receipt.unit.claims()[&receipt.root_use()]
+            .effects
+            .argument_control,
+        ArgumentControl::OrderedRegexp,
     );
     assert!(receipt.result.is_none());
     assert!(
@@ -254,6 +254,23 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
                 if function.function_id.as_str() == "builtin.scalar/regexp_count/v1"
         ))
     );
+}
+
+#[test]
+fn ordered_regexp_folds_known_null_even_with_an_invalid_pattern_or_array_result() {
+    let probe = Arc::new(FoldProbe::default());
+    let owner = compile(
+        "SELECT regexp_replace('a', '[', CAST(NULL AS VARCHAR)), regexp_extract_all(CAST(NULL AS VARCHAR), '[')",
+        &probe,
+    );
+    assert!(!expression_sources(&owner).any(|(_, _, node)| {
+        matches!(&node.kind, ExprKind::FunctionCall { function, .. }
+            if function.function_id.as_str().starts_with("builtin.scalar/regexp_"))
+    }));
+    assert!(expression_sources(&owner).any(|(_, _, node)| {
+        matches!(node.ty.data_type(), DataType::List(_))
+            && matches!(node.kind, ExprKind::Constant(_))
+    }));
 }
 
 #[test]

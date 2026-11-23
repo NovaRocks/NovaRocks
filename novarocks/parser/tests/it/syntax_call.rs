@@ -31,10 +31,33 @@ fn dedicated_syntax_maps_to_canonical_name_and_ordered_source_children() {
         ("IF(predicate, yes, no)", "if", &["predicate", "yes", "no"]),
         ("NULLIF(a, b)", "nullif", &["a", "b"]),
         ("COALESCE(a, b, c)", "coalesce", &["a", "b", "c"]),
+        ("FORMAT(pattern, a, b)", "format", &["pattern", "a", "b"]),
         ("TRIM(text_value)", "trim", &["text_value"]),
         ("TRIM(BOTH FROM text_value)", "trim", &["text_value"]),
         ("TRIM(LEADING FROM text_value)", "ltrim", &["text_value"]),
         ("TRIM(TRAILING FROM text_value)", "rtrim", &["text_value"]),
+        (
+            "TRIM(BOTH chars FROM text_value)",
+            "trim",
+            &["text_value", "chars"],
+        ),
+        (
+            "TRIM(LEADING chars FROM text_value)",
+            "ltrim",
+            &["text_value", "chars"],
+        ),
+        (
+            "TRIM(TRAILING chars FROM text_value)",
+            "rtrim",
+            &["text_value", "chars"],
+        ),
+        ("TRIM(text_value, chars)", "trim", &["text_value", "chars"]),
+        ("OVERLAY(s PLACING r FROM p)", "$overlay", &["s", "r", "p"]),
+        (
+            "OVERLAY(s PLACING r FROM p FOR n)",
+            "$overlay",
+            &["s", "r", "p", "n"],
+        ),
         ("EXTRACT(YEAR FROM x)", "year", &["x"]),
         ("EXTRACT(MONTH FROM x)", "month", &["x"]),
         ("EXTRACT(DAY FROM x)", "day", &["x"]),
@@ -71,11 +94,6 @@ fn canonical_call_borrows_original_nested_nodes() {
 #[test]
 fn syntax_without_a_canonical_call_preserves_the_rejection() {
     for (source, message) in [
-        (
-            "TRIM(BOTH 'x' FROM t)",
-            "explicit TRIM characters are not supported",
-        ),
-        ("TRIM(t, 'x')", "explicit TRIM characters are not supported"),
         (
             "ROW(a, b AS named_field)",
             "named ROW fields are not supported",

@@ -384,8 +384,6 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })

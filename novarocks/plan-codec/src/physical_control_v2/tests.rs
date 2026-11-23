@@ -210,7 +210,13 @@ fn shared_definition_fixture() -> (Definitions, ExpressionControlFlow<ExprId>) {
     (definitions, flow)
 }
 
-fn branch_fixture(is_case: bool) -> (Definitions, ExpressionControlFlow<ExprId>) {
+const SEARCHED_CASE: ControlShape = ControlShape::Case {
+    simple: false,
+    arms: 1,
+    has_else: true,
+};
+
+fn branch_fixture(shape: ControlShape) -> (Definitions, ExpressionControlFlow<ExprId>) {
     let mut builder = Definitions::default();
     let arguments = [
         builder.boolean(true),
@@ -218,7 +224,7 @@ fn branch_fixture(is_case: bool) -> (Definitions, ExpressionControlFlow<ExprId>)
         builder.boolean(false),
     ];
     let ty = ValueType::new(DataType::Boolean, false);
-    let kind = if is_case {
+    let kind = if shape == SEARCHED_CASE {
         ExprKind::Case {
             ieee_float_equality: false,
             operand: None,
@@ -250,16 +256,7 @@ fn branch_fixture(is_case: bool) -> (Definitions, ExpressionControlFlow<ExprId>)
     };
     let root = builder.add(kind);
     // The exact selected owner remains a compiler obligation. The fixture
-    // explicitly requests If; neither its name nor the legacy flag selects it.
-    let shape = if is_case {
-        ControlShape::Case {
-            simple: false,
-            arms: 1,
-            has_else: true,
-        }
-    } else {
-        ControlShape::If
-    };
+    // requests its control shape independently of its name or legacy flag.
     let region = EvaluationRegionId::new(u32::MAX);
     let mut regions = vec![ExpressionEvaluationRegion {
         id: region,
@@ -391,8 +388,8 @@ fn shared_definition_retains_independent_value_and_truth_only_occurrences() {
 
 #[test]
 fn actual_case_and_explicit_if_preserve_guard_owner_ordinal_and_demand() {
-    for is_case in [false, true] {
-        let (definitions, flow) = branch_fixture(is_case);
+    for shape in [ControlShape::If, SEARCHED_CASE] {
+        let (definitions, flow) = branch_fixture(shape);
         let encoded = encode_expression_control(&flow, &Control::default()).unwrap();
         for region in encoded
             .regions
@@ -419,6 +416,57 @@ fn actual_case_and_explicit_if_preserve_guard_owner_ordinal_and_demand() {
 }
 
 #[test]
+fn ordered_regexp_roundtrip_checks_predecessor_guards_and_value_demand() {
+    use wire::region_guard::Kind::OrderedRegexpAfterArgumentOrdinal;
+
+    let control = Control::default();
+    let (definitions, flow) = branch_fixture(ControlShape::OrderedRegexp);
+    let encoded = encode_expression_control(&flow, &control).unwrap();
+    for (region, predecessor) in encoded
+        .regions
+        .iter()
+        .filter(|region| region.guard.is_some())
+        .zip([0, 1])
+    {
+        assert_eq!(region.parent_region_id, Some(u32::MAX));
+        let guard = region.guard.as_ref().unwrap();
+        assert_eq!(guard.owner_use_id, Some(0));
+        assert_eq!(
+            guard.kind,
+            Some(OrderedRegexpAfterArgumentOrdinal(predecessor))
+        );
+    }
+    assert_eq!(
+        decode_expression_control(&definitions, &encoded, &control).unwrap(),
+        flow
+    );
+
+    let mut forged = encoded.clone();
+    forged
+        .regions
+        .iter_mut()
+        .find_map(|region| region.guard.as_mut())
+        .unwrap()
+        .kind = Some(OrderedRegexpAfterArgumentOrdinal(1));
+    assert_eq!(
+        decode_expression_control(&definitions, &forged, &control).unwrap_err(),
+        ControlCodecError::Flow(ExpressionControlFlowError::InvalidGuard)
+    );
+
+    let mut forged = encoded;
+    forged
+        .uses
+        .iter_mut()
+        .find(|use_| use_.id == 8)
+        .unwrap()
+        .demand = wire::EvaluationDemand::TruthOnly as i32;
+    assert_eq!(
+        decode_expression_control(&definitions, &forged, &control).unwrap_err(),
+        ControlCodecError::Flow(ExpressionControlFlowError::InvalidDemand)
+    );
+}
+
+#[test]
 fn every_control_and_guard_variant_roundtrips() {
     for shape in [
         ControlShape::Eager,
@@ -430,6 +478,7 @@ fn every_control_and_guard_variant_roundtrips() {
         ControlShape::If,
         ControlShape::Coalesce,
         ControlShape::Try,
+        ControlShape::OrderedRegexp,
         ControlShape::Between { negated: false },
         ControlShape::Between { negated: true },
         ControlShape::Membership { negated: false },
@@ -472,6 +521,7 @@ fn every_control_and_guard_variant_roundtrips() {
             GuardKind::TemporalAfterSource { ordinal: u32::MAX },
             GuardKind::BetweenAfterSource { ordinal: u32::MAX },
             GuardKind::MembershipAfterSource { ordinal: u32::MAX },
+            GuardKind::OrderedRegexpAfterArgument { ordinal: 0 },
             GuardKind::CoalesceAfterNull { ordinal: u32::MAX },
             GuardKind::CaseWhen { arm: 0 },
             GuardKind::CaseThen { arm: u32::MAX },
@@ -508,7 +558,7 @@ fn absent_mandatory_ids_and_oneofs_never_default_to_zero_or_eager() {
             ControlCodecError::InvalidShape(message)
         );
     }
-    let (definitions, flow) = branch_fixture(true);
+    let (definitions, flow) = branch_fixture(SEARCHED_CASE);
     let encoded = encode_expression_control(&flow, &Control::default()).unwrap();
     for (missing_owner, message) in [
         (true, "guard owner is missing"),

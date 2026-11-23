@@ -19,7 +19,7 @@
 -- Test Objective:
 -- 1. Validate BINARY(n) column type: padded storage, hex output.
 -- 2. Validate BINARY (no length), VARBINARY, VARCHAR(n) in same table.
--- 3. Validate INSERT and SELECT hex() across binary column types.
+-- 3. Validate INSERT and SELECT to_hex() across binary column types.
 -- 4. Validate INSERT INTO ... SELECT * across tables with matching binary schema.
 -- 5. Validate INSERT of hex literal into varbinary column (equivalent
 --    to the previous stream_load JSON path, which is not supported in
@@ -37,7 +37,7 @@ INSERT INTO ${case_db}.t0 VALUES ROW(1, X'ab01', X'abab', X'abac', 'ab01');
 
 -- query 3
 -- BINARY(16) pads to 16 bytes; BINARY pads to 1 byte; VARBINARY stores exact bytes
-SELECT hex(c1), hex(c2), hex(c3), hex(c4) FROM ${case_db}.t0 ORDER BY c0;
+SELECT to_hex(c1), to_hex(c2), to_hex(c3), to_hex(to_utf8(c4)) FROM ${case_db}.t0 ORDER BY c0;
 
 -- query 4
 -- Insert second row; both rows should appear
@@ -45,7 +45,7 @@ SELECT hex(c1), hex(c2), hex(c3), hex(c4) FROM ${case_db}.t0 ORDER BY c0;
 INSERT INTO ${case_db}.t0 VALUES ROW(2, X'ab01', X'abab', X'abac', 'ab01');
 
 -- query 5
-SELECT hex(c1), hex(c2), hex(c3), hex(c4) FROM ${case_db}.t0 ORDER BY c0;
+SELECT to_hex(c1), to_hex(c2), to_hex(c3), to_hex(to_utf8(c4)) FROM ${case_db}.t0 ORDER BY c0;
 
 -- query 6
 -- Create t1 with the same schema; insert via SELECT *
@@ -58,7 +58,7 @@ INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 
 -- query 8
 -- t1 should have same rows as t0
-SELECT hex(c1), hex(c2), hex(c3), hex(c4) FROM ${case_db}.t1 ORDER BY c0;
+SELECT to_hex(c1), to_hex(c2), to_hex(c3), to_hex(to_utf8(c4)) FROM ${case_db}.t1 ORDER BY c0;
 
 -- query 9
 -- Create t2 for binary-ingest test
@@ -75,3 +75,23 @@ INSERT INTO ${case_db}.t2 VALUES ROW(1, X'31323334');
 
 -- query 11
 SELECT * FROM ${case_db}.t2;
+
+-- query 12
+SELECT typeof(to_big_endian_64(BIGINT '26')) AS bytes_type,
+       length(to_big_endian_64(BIGINT '26')) AS byte_count,
+       to_hex(to_big_endian_64(BIGINT '26')) AS padded_hex;
+
+-- query 13
+SELECT ordinal, n, to_hex(to_big_endian_64(n)) AS padded_hex,
+       CASE WHEN n = 0 THEN '0'
+            ELSE regexp_replace(to_hex(to_big_endian_64(n)), '^0+', '')
+       END AS hex_display
+FROM (VALUES
+    (1, BIGINT '0'),
+    (2, BIGINT '26'),
+    (3, BIGINT '-1'),
+    (4, BIGINT '-9223372036854775808'),
+    (5, BIGINT '9223372036854775807'),
+    (6, CAST(NULL AS BIGINT))
+) AS t(ordinal, n)
+ORDER BY ordinal;

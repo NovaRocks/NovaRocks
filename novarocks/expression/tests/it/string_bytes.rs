@@ -14,822 +14,498 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Selected string and byte evaluation from the original checked source forms.
+//! Selected expression execution for the installed byte, URI and regexp functions.
 
 use arrow::{
-    array::{Array, ArrayRef, Int64Array, StringArray},
-    datatypes::{DataType, Field, Schema, SchemaRef},
-    record_batch::RecordBatch,
+    array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray},
+    datatypes::{DataType, Schema},
+    record_batch::{RecordBatch, RecordBatchOptions},
 };
-use novarocks_constant_contract::{ConstantPools, ConstantValue};
 use novarocks_expression::{
-    CompiledExprSet, CompiledExpressionInstance, EvaluationEnvironment, EvaluationInput,
-    ExprEvaluationFailure, ScopeLayouts,
+    CompiledExprSet, CompiledExpressionInstance, EvaluationInput, ExprEvaluationFailure,
+    ScopeLayouts, compile_expr_set_pure,
     testkit::{
-        CallbackControl, ClaimAuthor, HarnessControl, PassThroughCallHost, add_call,
-        callback_causes, checked_constants, compile_fixture_unit, declare_call_controls,
-        finish_unit, fixture_scope,
-        frame_fixtures::{Control, POLICY},
-        register_call_requests, register_constant,
+        CallbackControl, CountingAllocator, HarnessControl, PassThroughCallHost, callback_causes,
+        constant_policy,
+        expression_text::{TextColumn, TextContext, TextError, type_expression_text},
     },
 };
-use novarocks_expression_contract::{
-    BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
-};
+use novarocks_expression_contract::{RootOrdinal, ValueId};
+use novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT;
 use novarocks_functions::{
-    EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind, FunctionOverloadId,
-    InstalledPureKernel, KernelFailure, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScalarInvocationActivation, ScalarInvocationScope,
-    Selection,
+    DataFailureReason, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
+    ScalarInvocationScope, SelectedValues, Selection,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, ControlShape, EvaluationDemand, FunctionValueType,
-    SemanticParameterId, SemanticParameterValue, SemanticParameters, ToBase64ByteSource as Source,
+    CharacterKind, CharacterType, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy,
+    FunctionValueType, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+    SemanticParameters, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{convert::Infallible, sync::Arc};
 
-struct Program {
-    unit: Arc<CompiledExprSet>,
-    root: RootOrdinal,
-    schema: SchemaRef,
+const ROOT: RootOrdinal = RootOrdinal::new(0);
+
+fn varchar_kind(width: u32) -> ValueKind {
+    ValueKind::BoundedCharacter(CharacterType::new(CharacterKind::Varchar, width).unwrap())
 }
 
-fn program(
-    functions: &PureEngineFunctionCatalog,
-    columns: &[ValueId],
-    parameters: SemanticParameters,
-    build: impl FnOnce(
-        &mut BoundExprSetBuilder,
-        &mut ConstantPools,
-        &mut BTreeMap<ExprId, ClaimAuthor>,
-        &FunctionValueType,
-    ) -> ExprId,
-) -> Program {
-    let ty = FunctionValueType::new(DataType::Utf8, true);
-    let mut draft = BoundExprSetBuilder::new(UnitLimits {
-        expression_semantic_depth: 256,
-    });
-    let mut constants = ConstantPools::empty();
-    let mut authors = BTreeMap::new();
-    // These typed NULLs originally authored the producer Project's columns.
-    // Keep their ordered source addresses before consumer literal registration.
-    for _ in columns {
-        checked_constants::kind(&mut constants, checked_constants::null(&ty, POLICY));
-    }
-    let definition = build(&mut draft, &mut constants, &mut authors, &ty);
-    let root = draft
-        .root(definition, EvaluationDemand::Value, RootScope::Port(0))
-        .unwrap();
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .enumerate()
-            .map(|(i, _)| Field::new(format!("local_1_{i}"), DataType::Utf8, true))
-            .collect::<Vec<_>>(),
-    ));
-    let port = ExprPort {
-        values: columns.iter().map(|&value| (value, ty.clone())).collect(),
-    };
-    let scope = fixture_scope(&port, schema.clone());
-    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    register_call_requests(&mut draft, &authors, &mut constants);
-    declare_call_controls(
-        &mut draft,
-        functions,
-        &constants,
-        &parameters,
-        POLICY,
-        &mut work,
-    );
-    let sealed = draft.seal(vec![port], &mut work).unwrap();
-    let unit = finish_unit(
-        functions,
-        sealed,
-        &authors,
-        &constants,
-        &parameters,
-        POLICY,
-        &mut work,
-    );
-    work.finish().unwrap();
-    let unit = compile_fixture_unit(
-        &unit,
-        EvaluationEnvironment {
-            constants: &constants,
-            parameters: &parameters,
-        },
-        ScopeLayouts {
-            ports: std::slice::from_ref(&scope),
-            all_ports: Some(&scope),
-        },
-        POLICY,
-        functions,
-    );
-    Program { unit, root, schema }
-}
-
-fn instance(program: &Program) -> CompiledExpressionInstance {
-    CompiledExpressionInstance::try_new(program.unit.clone(), program.root, &Control).unwrap()
-}
-
-fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionArgument {
-    FunctionArgument::Value {
-        value_type: ty,
-        constant,
-    }
-}
-
-fn author(
-    functions: &PureEngineFunctionCatalog,
-    name: &str,
-    arguments: Vec<FunctionArgument>,
-) -> ClaimAuthor {
-    ClaimAuthor::with_legacy_binding(
-        functions,
-        name,
-        arguments,
-        ControlShape::Eager,
-        None,
-        POLICY,
-        &Control,
-    )
-}
-
-fn causes() -> [KernelFailure; 7] {
-    callback_causes([
-        "guarded-origin-invalid",
-        "guarded-origin-internal",
-        "guarded-origin-operational",
-    ])
-}
-
-fn parse_url_catalogue() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(
-            actual
-                .definition("parse_url", FunctionKind::Scalar)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-    builder
-        .seal_pure(
-            [
-                "builtin.scalar/parse_url/(utf8,utf8)->utf8;strict;legacy",
-                "builtin.scalar/parse_url/(utf8,utf8,utf8)->utf8;strict;legacy",
-            ]
-            .into_iter()
-            .map(|overload| InstalledPureKernel {
-                function: FunctionId::try_new("builtin.scalar/parse_url/v1").unwrap(),
-                kind: FunctionKind::Scalar,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(overload).unwrap(),
-                    implementation: PureImplementationId::try_new(
-                        "builtin.scalar/parse_url/selected-v1",
-                    )
-                    .unwrap(),
-                    abi: PureKernelAbi::ScalarV1,
-                },
-                aggregate_state_format: None,
-            }),
-        )
-        .unwrap()
-}
-
-fn parse_url_program(arity: usize, constant_part: Option<&str>) -> Program {
-    let functions = parse_url_catalogue();
-    let values = (0..arity)
-        .map(|i| ValueId::new(91 + u32::try_from(i).unwrap()))
-        .collect::<Vec<_>>();
-    program(
-        &functions,
-        &values,
-        SemanticParameters::try_new([]).unwrap(),
-        |draft, source_pools, authors, ty| {
-            let mut args = Vec::new();
-            let mut arguments = Vec::new();
-            for (i, value) in values.iter().enumerate() {
-                let cv = if i == 1 {
-                    constant_part.map(|text| {
-                        ConstantValue::from_utf8(
-                            Arc::new(ty.try_to_field("actual checked part").unwrap()),
-                            ty.clone(),
-                            text,
-                            POLICY,
-                            CompilePhase::Validate,
-                            &Control,
-                        )
-                        .unwrap()
-                    })
-                } else {
-                    None
-                };
-                let expr = draft
-                    .add(
-                        None,
-                        ty.clone(),
-                        if let Some(value) = &cv {
-                            ExprKind::Constant(register_constant(source_pools, value))
-                        } else {
-                            ExprKind::Value(*value)
-                        },
-                    )
-                    .unwrap();
-                args.push(expr);
-                arguments.push(argument(ty.clone(), cv));
-            }
-
-            let owner = author(&functions, "parse_url", arguments);
-            assert_eq!(&owner.result(), ty);
-            add_call(draft, authors, owner, args)
-        },
-    )
-}
-
-#[test]
-fn parse_url_actual_compiler_both_profiles_dynamic_and_native_constants_keep_key_null_semantics() {
-    for arity in [2, 3] {
-        for constant_part in [None, Some("HOST"), Some("QUERY")] {
-            let program = parse_url_program(arity, constant_part);
-            let text: ArrayRef = Arc::new(StringArray::from(vec![
-                Some("guard"),
-                Some("https://Example.com/a?q=a+b&q=second"),
-                Some("https://x/b?q=c"),
-                None,
-                Some("bad"),
-                Some("guard"),
-            ]));
-            let part: ArrayRef = Arc::new(StringArray::from(vec![
-                Some("guard"),
-                Some("QUERY"),
-                Some("HOST"),
-                Some("PATH"),
-                Some("HOST"),
-                Some("guard"),
-            ]));
-            let key: ArrayRef = Arc::new(StringArray::from(vec![
-                Some("guard"),
-                Some("q"),
-                None,
-                None,
-                Some("q"),
-                Some("guard"),
-            ]));
-            let arrays = [text.slice(1, 4), part.slice(1, 4), key.slice(1, 4)];
-            let batch =
-                RecordBatch::try_new(program.schema.clone(), arrays[..arity].to_vec()).unwrap();
-            let rows = [0, 1, 2, 3];
-            let selection = Selection::try_sparse(4, &rows).unwrap();
-            let mut evaluator = instance(&program);
-            let result = evaluator
-                .evaluate(
-                    EvaluationInput::Batch {
-                        batch: &batch,
-                        source: None,
-                    },
-                    ScalarInvocationScope::new(selection, selection),
-                    ScalarInvocationActivation::Activated,
-                    &Control,
-                    &mut PassThroughCallHost,
-                )
-                .unwrap();
-            let expected = match constant_part {
-                Some("HOST") => vec![Some("example.com"), Some("x"), None, None],
-                Some("QUERY") if arity == 2 => {
-                    vec![Some("q=a+b&q=second"), Some("q=c"), None, None]
-                }
-                Some("QUERY") => vec![Some("a b"), None, None, None],
-                None if arity == 2 => vec![Some("q=a+b&q=second"), Some("x"), None, None],
-                None => vec![Some("a b"), Some("x"), None, None],
-                _ => unreachable!(),
-            };
-            assert_eq!(
-                result
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>(),
-                expected
-            );
-            assert_eq!(result.selection(), selection);
-            assert!(result.errors().is_empty());
-            let empty = evaluator
-                .evaluate(
-                    EvaluationInput::Batch {
-                        batch: &batch,
-                        source: None,
-                    },
-                    {
-                        let selection = Selection::try_sparse(4, &[]).unwrap();
-                        ScalarInvocationScope::new(selection, selection)
-                    },
-                    ScalarInvocationActivation::Activated,
-                    &Control,
-                    &mut PassThroughCallHost,
-                )
-                .unwrap();
-            assert_eq!(empty.values().len(), 0);
-            assert_eq!(empty.values().data_type(), &DataType::Utf8);
-            assert!(empty.errors().is_empty());
-        }
-    }
-}
-#[test]
-fn parse_url_actual_compiler_all_seven_runtime_causes_keep_first_cause_and_instance_latch() {
-    let long = format!("https://x/{}", "a".repeat(700));
-    for arity in [2, 3] {
-        let program = parse_url_program(arity, None);
-        let text: ArrayRef = Arc::new(StringArray::from(vec![Some(long.as_str()), None]));
-        let part: ArrayRef = Arc::new(StringArray::from(vec![Some("PATH"), Some("HOST")]));
-        let key: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; 2]));
-        let arrays = [text, part, key];
-        let batch = RecordBatch::try_new(program.schema.clone(), arrays[..arity].to_vec()).unwrap();
-        let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-        instance(&program)
-            .evaluate(
-                EvaluationInput::Batch {
-                    batch: &batch,
-                    source: None,
-                },
-                ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
-                ScalarInvocationActivation::Activated,
-                &recorder,
-                &mut PassThroughCallHost,
-            )
+fn varchar(name: &str, ordinal: u32, width: u32) -> TextColumn {
+    let value =
+        ValueTypeRef::try_new(varchar_kind(width), true, ValueTypeStorageLifetime::pure()).unwrap();
+    let layout =
+        ValueLayout::try_from_normalized_arrow(DataType::Utf8, ValueTypeStorageLifetime::pure())
             .unwrap();
-        let trace = recorder.trace();
-        assert!(trace.contains(&256));
-        assert!(trace.iter().all(|units| *units <= 256));
-        for index in 1..=trace.len() {
-            for cause in causes() {
-                let mut evaluator = instance(&program);
-                let control = CallbackControl::new(cause.clone(), index);
-                assert!(
-                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(2), Selection::all(2)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
-                );
-                assert_eq!(control.trace(), trace[..index]);
-                let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-                assert!(matches!(
-                    evaluator.evaluate(
-                        EvaluationInput::Batch {
-                            batch: &batch,
-                            source: None
-                        },
-                        ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
-                        ScalarInvocationActivation::Activated,
-                        &after,
-                        &mut PassThroughCallHost
-                    ),
-                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
-                ));
-                assert!(after.trace().is_empty());
-            }
-        }
+    TextColumn {
+        name: name.to_owned(),
+        value: ValueId::new(ordinal),
+        value_type: FunctionValueType::try_from_value(value, layout).unwrap(),
     }
 }
 
-fn regexp_count_catalogue() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(
-            actual
-                .definition("regexp_count", FunctionKind::Scalar)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-    builder
-        .seal_pure([InstalledPureKernel {
-            function: FunctionId::try_new("builtin.scalar/regexp_count/v1").unwrap(),
-            kind: FunctionKind::Scalar,
-            implementation: PureImplementationDeclaration {
-                overload: FunctionOverloadId::try_new(
-                    "builtin.scalar/regexp_count/(utf8,utf8)->i64;strict;legacy",
-                )
-                .unwrap(),
-                implementation: PureImplementationId::try_new(
-                    "builtin.scalar/regexp_count/selected-v1",
-                )
-                .unwrap(),
-                abi: PureKernelAbi::ScalarV1,
-            },
-            aggregate_state_format: None,
-        }])
-        .unwrap()
+fn batch(columns: &[TextColumn], arrays: Vec<ArrayRef>) -> RecordBatch {
+    let fields = columns
+        .iter()
+        .map(|col| col.value_type.try_to_field(&col.name).unwrap())
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
 }
 
-fn regexp_count_program(constant: Option<&str>) -> Program {
-    let functions = regexp_count_catalogue();
-    let values = [ValueId::new(91), ValueId::new(7)];
-    program(
-        &functions,
-        &values,
-        SemanticParameters::try_new([]).unwrap(),
-        |draft, source_pools, authors, ty| {
-            let text = draft
-                .add(None, ty.clone(), ExprKind::Value(values[0]))
-                .unwrap();
-            let cv = constant.map(|text| {
-                ConstantValue::from_utf8(
-                    Arc::new(ty.try_to_field("actual checked constant").unwrap()),
-                    ty.clone(),
-                    text,
-                    POLICY,
-                    CompilePhase::Validate,
-                    &Control,
-                )
-                .unwrap()
-            });
-            let pattern = draft
-                .add(
-                    None,
-                    ty.clone(),
-                    if let Some(value) = &cv {
-                        ExprKind::Constant(register_constant(source_pools, value))
-                    } else {
-                        ExprKind::Value(values[1])
-                    },
-                )
-                .unwrap();
-
-            let owner = author(
-                &functions,
-                "regexp_count",
-                vec![argument(ty.clone(), None), argument(ty.clone(), cv)],
-            );
-            assert_eq!(
-                owner.result(),
-                FunctionValueType::new(DataType::Int64, true)
-            );
-            add_call(draft, authors, owner, vec![text, pattern])
+fn text_program(
+    sql: &str,
+    columns: &[TextColumn],
+) -> Result<(Arc<CompiledExprSet>, FunctionValueType), TextError> {
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let parameters = SemanticParameters::default();
+    let context = TextContext {
+        functions: &functions,
+        constant_policy: constant_policy(),
+        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        parameters: &parameters,
+        allow_throw_exception: SemanticParameterRef {
+            id: SemanticParameterId::new(0),
+            expected_key: SemanticParameterKey::AllowThrowException,
         },
+    };
+    let typed = type_expression_text(sql, columns, &context, &HarnessControl)?;
+    let unit = typed.unit();
+    let result = unit
+        .definition(unit.root(ROOT).unwrap().definition)
+        .unwrap()
+        .ty
+        .clone();
+    let mut work =
+        CompileCheckpoints::try_new(&HarnessControl, CompilePhase::LowerProgram).unwrap();
+    let program = compile_expr_set_pure(
+        unit,
+        typed.environment(),
+        ScopeLayouts {
+            ports: typed.layout().map_or(&[], std::slice::from_ref),
+            all_ports: None,
+        },
+        context.constant_policy,
+        &functions,
+        &mut work,
+    )
+    .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    work.finish().unwrap();
+    Ok((program, result))
+}
+
+fn instance(
+    program: &Arc<CompiledExprSet>,
+    allocation: &Arc<CountingAllocator>,
+) -> CompiledExpressionInstance {
+    CompiledExpressionInstance::try_new_with_allocator(
+        Arc::clone(program),
+        ROOT,
+        &HarnessControl,
+        Some(allocation.clone()),
+    )
+    .unwrap()
+}
+
+fn evaluate<'a>(
+    instance: &mut CompiledExpressionInstance,
+    batch: &RecordBatch,
+    selection: Selection<'a>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, ExprEvaluationFailure<Infallible>> {
+    instance.evaluate(
+        EvaluationInput::Batch {
+            batch,
+            source: None,
+        },
+        ScalarInvocationScope::new(selection, selection),
+        ScalarInvocationActivation::Activated,
+        control,
+        &mut PassThroughCallHost,
     )
 }
 
+fn strings(out: &SelectedValues<'_>) -> Vec<Option<String>> {
+    out.values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect()
+}
+
 #[test]
-fn regexp_count_actual_compiler_emitted_constant_and_dynamic_bytes_keep_original_error_policy() {
-    let text: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("guard"),
+fn base64_uses_the_original_binary_carrier_through_selected_calls() {
+    let columns = [TextColumn {
+        name: "b".to_owned(),
+        value: ValueId::new(11),
+        value_type: FunctionValueType::new(DataType::Binary, true),
+    }];
+    let array: ArrayRef = Arc::new(BinaryArray::from(vec![
+        Some(&b"guard"[..]),
+        Some(&[0xff, 0x00][..]),
+        Some(&b"unselected"[..]),
+        None,
+        Some(&b""[..]),
+    ]));
+    let batch = batch(&columns, vec![array.slice(1, 4)]);
+    let selected = Selection::try_sparse(4, &[0, 2, 3]).unwrap();
+    let allocation = Arc::new(CountingAllocator::new(usize::MAX));
+    let (encode, ty) = text_program("to_base64(b)", &columns).unwrap();
+    assert_eq!(ty.value_type().kind(), &ValueKind::String);
+    let encoded = evaluate(
+        &mut instance(&encode, &allocation),
+        &batch,
+        selected,
+        &HarnessControl,
+    )
+    .unwrap();
+    assert_eq!(encoded.selection(), selected);
+    assert_eq!(
+        strings(&encoded),
+        [Some("/wA=".into()), None, Some(String::new())]
+    );
+    assert!(encoded.errors().is_empty());
+
+    let (round_trip, ty) = text_program("from_base64(to_base64(b))", &columns).unwrap();
+    assert_eq!(ty.value_type().kind(), &ValueKind::Binary);
+    let decoded = evaluate(
+        &mut instance(&round_trip, &allocation),
+        &batch,
+        selected,
+        &HarnessControl,
+    )
+    .unwrap();
+    assert_eq!(
+        decoded
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(&[0xff, 0x00][..]), None, Some(&b""[..])]
+    );
+    assert!(decoded.errors().is_empty());
+    assert!(matches!(
+        text_program("to_base64('abc')", &[]),
+        Err(TextError::Typing { .. })
+    ));
+
+    let (literal, _) = text_program("to_base64(X'FF00')", &[]).unwrap();
+    let unit = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        vec![],
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .unwrap();
+    let actual = evaluate(
+        &mut instance(&literal, &allocation),
+        &unit,
+        Selection::all(1),
+        &HarnessControl,
+    )
+    .unwrap();
+    assert_eq!(strings(&actual), [Some("/wA=".into())]);
+}
+
+#[test]
+fn url_extraction_keeps_declared_width_and_compares_raw_parameter_keys() {
+    let source = varchar("uri", 11, 128);
+    let uri: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("/a?%71=first+name&q=second%26name"),
+        Some("unselected"),
+        Some("HTTP://ExAmPle.test:80/a/../b"),
+        Some("http://["),
+        None,
+    ]));
+    let key = varchar("key", 12, 16);
+    let keys: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("q"),
+        None,
+        Some("q"),
+        Some("q"),
+        Some("q"),
+    ]));
+    let selection = Selection::try_sparse(5, &[0, 2, 3, 4]).unwrap();
+    let allocation = Arc::new(CountingAllocator::new(usize::MAX));
+    for (sql, columns, arrays, expected) in [
+        (
+            "url_extract_host(uri)",
+            vec![source.clone()],
+            vec![uri.clone()],
+            [Some(""), Some("ExAmPle.test"), None, None],
+        ),
+        (
+            "url_extract_path(uri)",
+            vec![source.clone()],
+            vec![uri.clone()],
+            [Some("/a"), Some("/a/../b"), None, None],
+        ),
+        (
+            "url_extract_parameter(uri,key)",
+            vec![source.clone(), key],
+            vec![uri.clone(), keys],
+            [Some("second&name"), None, None, None],
+        ),
+        (
+            "url_extract_parameter(uri,'%71')",
+            vec![source],
+            vec![uri],
+            [Some("first name"), None, None, None],
+        ),
+    ] {
+        let (program, ty) = text_program(sql, &columns).unwrap();
+        assert_eq!(ty.value_type().kind(), &varchar_kind(128), "{sql}");
+        let actual = evaluate(
+            &mut instance(&program, &allocation),
+            &batch(&columns, arrays),
+            selection,
+            &HarnessControl,
+        )
+        .unwrap();
+        assert_eq!(actual.selection(), selection);
+        assert_eq!(
+            strings(&actual),
+            expected.map(|value| value.map(str::to_owned)),
+            "{sql}"
+        );
+        assert!(actual.errors().is_empty(), "{sql}");
+    }
+}
+
+#[test]
+fn regexp_literal_and_column_patterns_have_the_same_data_error_policy() {
+    let source = varchar("s", 11, 16);
+    let pattern = varchar("p", 12, 4);
+    let input: ArrayRef = Arc::new(StringArray::from(vec![
         None,
         Some("éé"),
         Some("ababa"),
-        Some("guard"),
+        Some("ignored"),
     ]));
     let patterns: ArrayRef = Arc::new(StringArray::from(vec![
-        Some("guard"),
         Some("["),
-        Some("."),
-        Some("aba"),
-        Some("guard"),
+        Some("["),
+        Some("["),
+        Some("["),
     ]));
-    let text = text.slice(1, 3);
-    let patterns = patterns.slice(1, 3);
-    for constant in [None, Some("["), Some("."), Some("a{,}"), Some("")] {
-        let p = regexp_count_program(constant);
-        let batch =
-            RecordBatch::try_new(p.schema.clone(), vec![text.clone(), patterns.clone()]).unwrap();
-        let selection = Selection::try_sparse(3, &[0, 1, 2]).unwrap();
-        let mut instance = instance(&p);
-        let out = instance
-            .evaluate(
-                EvaluationInput::Batch {
-                    batch: &batch,
-                    source: None,
-                },
-                ScalarInvocationScope::new(selection, selection),
-                ScalarInvocationActivation::Activated,
-                &Control,
-                &mut PassThroughCallHost,
-            )
-            .unwrap();
-        let expected = match constant {
-            None => vec![None, Some(2), Some(1)],
-            Some("[") => vec![None, None, None],
-            Some(".") => vec![None, Some(2), Some(5)],
-            Some("a{,}") => vec![None, Some(0), Some(0)],
-            Some("") => vec![None, Some(3), Some(6)],
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            out.values()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            expected
-        );
-        if constant == Some("[") {
-            assert_eq!(out.errors().len(), 2);
-            assert!(out.errors().iter().all(|e| {
-                e.message()
-                    .starts_with("Invalid regex expression: [. Detail message:")
-            }));
-        } else {
-            assert!(out.errors().is_empty());
-        }
-        assert!(
-            instance
-                .evaluate(
-                    EvaluationInput::Batch {
-                        batch: &batch,
-                        source: None
-                    },
-                    {
-                        let selection = Selection::try_sparse(3, &[]).unwrap();
-                        ScalarInvocationScope::new(selection, selection)
-                    },
-                    ScalarInvocationActivation::Activated,
-                    &Control,
-                    &mut PassThroughCallHost
-                )
-                .unwrap()
-                .errors()
-                .is_empty()
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Shape {
-    Slot,
-    Constant,
-    FromBase64,
-    CastFromBase64,
-    ConcatFromBase64,
-}
-fn base64_program(shape: Shape) -> Program {
-    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
-    let value = ValueId::new(91);
-    let parameters = if matches!(shape, Shape::CastFromBase64) {
-        SemanticParameters::try_new([(
-            SemanticParameterId::new(0),
-            SemanticParameterValue::AllowThrowException(false),
-        )])
-        .unwrap()
-    } else {
-        SemanticParameters::default()
-    };
-
-    program(
-        &functions,
-        &[value],
-        parameters,
-        |draft, source_pools, authors, ty| {
-            let cv = matches!(shape, Shape::Constant).then(|| {
-                ConstantValue::from_utf8(
-                    Arc::new(ty.try_to_field("actual checked source").unwrap()),
-                    ty.clone(),
-                    "ÿ",
-                    POLICY,
-                    CompilePhase::Validate,
-                    &Control,
-                )
-                .unwrap()
-            });
-            let leaf = draft
-                .add(
-                    None,
-                    ty.clone(),
-                    if let Some(value) = &cv {
-                        ExprKind::Constant(register_constant(source_pools, value))
-                    } else {
-                        ExprKind::Value(value)
-                    },
-                )
-                .unwrap();
-            let mut child = leaf;
-            if matches!(
-                shape,
-                Shape::FromBase64 | Shape::CastFromBase64 | Shape::ConcatFromBase64
-            ) {
-                let owner = author(&functions, "from_base64", vec![argument(ty.clone(), None)]);
-                child = add_call(draft, authors, owner, vec![child]);
-            }
-            if matches!(shape, Shape::CastFromBase64) {
-                child = draft
-                    .add(
-                        None,
-                        ty.clone(),
-                        ExprKind::Cast {
-                            cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
-                            expr: child,
-                            target: DataType::Utf8,
-                        },
-                    )
-                    .unwrap();
-            }
-            if matches!(shape, Shape::ConcatFromBase64) {
-                let owner = author(&functions, "concat", vec![argument(ty.clone(), None)]);
-                child = add_call(draft, authors, owner, vec![child]);
-            }
-
-            let owner = author(&functions, "to_base64", vec![argument(ty.clone(), cv)]);
-            assert_eq!(&owner.result(), ty);
-            add_call(draft, authors, owner, vec![child])
-        },
-    )
-}
-
-// RFC 4648 section 4 uses the standard alphabet and '=' padding. These
-// values are independent byte derivations, not output from either evaluator:
-// UTF-8 U+00FF = c3 bf -> w78=; U+0100 = c4 80 -> xIA=;
-// ff -> /w==; ff 00 -> /wA=; UTF-8 U+00FF + NUL = c3 bf 00 -> w78A.
-// The sealed NovaRocks TO_BASE64 contract maps empty bytes and SQL NULL to
-// successful NULL. That NULL rule is separate from RFC 4648's empty encoding.
-fn independent_expected(shape: Shape) -> Vec<Option<String>> {
-    let rows = match shape {
-        Shape::Slot => [Some("w78="), Some("xIA="), None, None],
-        Shape::Constant => [Some("w78="); 4],
-        Shape::FromBase64 => [Some("/w=="), Some("/wA="), None, None],
-        Shape::CastFromBase64 | Shape::ConcatFromBase64 => [Some("w78="), Some("w78A"), None, None],
-    };
-    rows.into_iter().map(|row| row.map(str::to_owned)).collect()
-}
-
-#[test]
-fn to_base64_actual_compiler_source_sensitive_full_profile_matches_rfc4648_vectors() {
-    for shape in [
-        Shape::Slot,
-        Shape::Constant,
-        Shape::FromBase64,
-        Shape::CastFromBase64,
-        Shape::ConcatFromBase64,
+    let selection = Selection::try_sparse(4, &[0, 1, 2]).unwrap();
+    let allocation = Arc::new(CountingAllocator::new(usize::MAX));
+    for (sql, columns, arrays) in [
+        (
+            "regexp_count(s,'[')",
+            vec![source.clone()],
+            vec![input.clone()],
+        ),
+        (
+            "regexp_count(s,p)",
+            vec![source.clone(), pattern],
+            vec![input.clone(), patterns],
+        ),
     ] {
-        let input: ArrayRef = Arc::new(StringArray::from(if matches!(shape, Shape::Slot) {
-            vec![
-                Some("guard"),
-                Some("ÿ"),
-                Some("Ā"),
-                Some(""),
-                None,
-                Some("guard"),
-            ]
-        } else if matches!(shape, Shape::Constant) {
-            vec![
-                Some("guard"),
-                Some("ÿ"),
-                Some("ÿ"),
-                Some("ÿ"),
-                Some("ÿ"),
-                Some("guard"),
-            ]
-        } else {
-            vec![
-                Some("guard"),
-                Some("/w=="),
-                Some("/wA="),
-                Some(""),
-                None,
-                Some("guard"),
-            ]
-        }));
-        let input = input.slice(1, 4);
-        let program = base64_program(shape);
-        let batch = RecordBatch::try_new(program.schema.clone(), vec![input.clone()]).unwrap();
-        let mut evaluator = instance(&program);
-        let selection = Selection::try_sparse(4, &[0, 1, 2, 3]).unwrap();
-        let out = evaluator
-            .evaluate(
-                EvaluationInput::Batch {
-                    batch: &batch,
-                    source: None,
-                },
-                ScalarInvocationScope::new(selection, selection),
-                ScalarInvocationActivation::Activated,
-                &Control,
-                &mut PassThroughCallHost,
-            )
-            .unwrap();
-        let expected = independent_expected(shape);
+        let (program, ty) = text_program(sql, &columns).unwrap();
+        assert_eq!(ty.data_type(), &DataType::Int64);
+        let mut evaluator = instance(&program, &allocation);
+        let batch = batch(&columns, arrays);
+        let result = evaluate(&mut evaluator, &batch, selection, &HarnessControl).unwrap();
+        assert_eq!(result.values().null_count(), 3);
         assert_eq!(
-            out.values()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
+            result
+                .errors()
                 .iter()
-                .map(|v| v.map(str::to_owned))
+                .map(|error| (error.selected_ordinal(), error.reason()))
                 .collect::<Vec<_>>(),
-            expected
+            [
+                (1, DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT)),
+                (2, DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT))
+            ]
         );
-        assert!(out.errors().is_empty());
-        let expected_source = if matches!(shape, Shape::FromBase64) {
-            Source::NativeV1EncryptionLatin1
-        } else {
-            Source::Ordinary
-        };
-        let records = program.unit.calls();
-        let own: Vec<_> = records
-            .values()
-            .filter(|record| {
-                record.call_contract().function_id().as_str() == "builtin.scalar/to_base64/v1"
-            })
-            .collect();
-        assert_eq!(own.len(), 1);
-        assert_eq!(
-            own[0].call_contract().to_base64_byte_source(),
-            Some(expected_source)
-        );
-        let sparse = Selection::try_sparse(4, &[0, 3]).unwrap();
-        let out = instance(&program)
-            .evaluate(
-                EvaluationInput::Batch {
-                    batch: &batch,
-                    source: None,
-                },
-                ScalarInvocationScope::new(sparse, sparse),
-                ScalarInvocationActivation::Activated,
-                &Control,
-                &mut PassThroughCallHost,
-            )
-            .unwrap();
-        assert_eq!(out.selection(), sparse);
-        assert_eq!(
-            out.values()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .iter()
-                .map(|v| v.map(str::to_owned))
-                .collect::<Vec<_>>(),
-            vec![expected[0].clone(), expected[3].clone()]
-        );
-        assert!(
-            instance(&program)
-                .evaluate(
-                    EvaluationInput::Batch {
-                        batch: &batch,
-                        source: None
-                    },
-                    {
-                        let selection = Selection::try_sparse(4, &[]).unwrap();
-                        ScalarInvocationScope::new(selection, selection)
-                    },
-                    ScalarInvocationActivation::Activated,
-                    &Control,
-                    &mut PassThroughCallHost
-                )
-                .unwrap()
-                .values()
-                .is_empty()
-        );
+        let empty = evaluate(
+            &mut evaluator,
+            &batch,
+            Selection::try_sparse(4, &[]).unwrap(),
+            &HarnessControl,
+        )
+        .unwrap();
+        assert_eq!(empty.values().len(), 0);
+        assert_eq!(empty.values().data_type(), &DataType::Int64);
+        assert!(empty.errors().is_empty());
     }
+    let (program, _) = text_program("regexp_count(s,'.')", &[source.clone()]).unwrap();
+    let actual = evaluate(
+        &mut instance(&program, &allocation),
+        &batch(&[source], vec![input]),
+        selection,
+        &HarnessControl,
+    )
+    .unwrap();
+    assert_eq!(
+        actual
+            .values()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        [None, Some(2), Some(5)]
+    );
 }
 
 #[test]
-fn to_base64_actual_compiler_runtime_seven_causes_keep_source_and_first_failure_latch() {
-    let long = "/w==";
-    for shape in [Shape::Slot, Shape::FromBase64, Shape::CastFromBase64] {
-        let program = base64_program(shape);
-        let input: ArrayRef = Arc::new(StringArray::from(vec![Some(long); 321]));
-        let batch = RecordBatch::try_new(program.schema.clone(), vec![input]).unwrap();
-        let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-        instance(&program)
-            .evaluate(
-                EvaluationInput::Batch {
-                    batch: &batch,
-                    source: None,
-                },
-                ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
-                ScalarInvocationActivation::Activated,
-                &recorder,
-                &mut PassThroughCallHost,
-            )
-            .unwrap();
-        let trace = recorder.trace();
-        assert!(trace.contains(&256));
-        assert!(trace.iter().all(|units| *units <= 256));
-        for index in 1..=trace.len() {
-            for cause in causes() {
-                let mut evaluator = instance(&program);
-                let control = CallbackControl::new(cause.clone(), index);
-                assert!(
-                    matches!(evaluator.evaluate(EvaluationInput::Batch { batch: &batch, source: None }, ScalarInvocationScope::new(Selection::all(321), Selection::all(321)), ScalarInvocationActivation::Activated, &control, &mut PassThroughCallHost), Err(ExprEvaluationFailure::Kernel(actual))if actual==cause)
-                );
-                assert_eq!(control.trace(), trace[..index]);
-                let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-                assert!(matches!(
-                    evaluator.evaluate(
-                        EvaluationInput::Batch {
-                            batch: &batch,
-                            source: None
-                        },
-                        ScalarInvocationScope::new(Selection::all(321), Selection::all(321)),
-                        ScalarInvocationActivation::Activated,
-                        &after,
-                        &mut PassThroughCallHost
-                    ),
-                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
-                ));
-                assert!(after.trace().is_empty());
-            }
+fn regexp_replace_preserves_selected_row_order_and_try_scope() {
+    let columns = [
+        varchar("s", 11, 16),
+        varchar("p", 12, 8),
+        varchar("r", 13, 8),
+    ];
+    let batch = batch(
+        &columns,
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("unselected"),
+                None,
+                Some("a"),
+                Some("abc"),
+                Some("a"),
+                Some("a"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("["),
+                Some("["),
+                Some("["),
+                Some("z"),
+                Some("(a)"),
+                Some("(a)"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("$2"),
+                Some("$2"),
+                None,
+                Some("$2"),
+                Some("$2"),
+                Some("$1x"),
+            ])),
+        ],
+    );
+    let selection = Selection::try_sparse(6, &[1, 2, 3, 4, 5]).unwrap();
+    let allocation = Arc::new(CountingAllocator::new(usize::MAX));
+    for (sql, error_ordinals) in [
+        ("regexp_replace(s,p,r)", &[1, 3][..]),
+        ("TRY(regexp_replace(s,p,r))", &[][..]),
+    ] {
+        let (program, _) = text_program(sql, &columns).unwrap();
+        let result = evaluate(
+            &mut instance(&program, &allocation),
+            &batch,
+            selection,
+            &HarnessControl,
+        )
+        .unwrap();
+        assert_eq!(result.selection(), selection);
+        assert_eq!(
+            strings(&result),
+            [None, None, Some("abc".into()), None, Some("ax".into())]
+        );
+        assert_eq!(
+            result
+                .errors()
+                .iter()
+                .map(|error| error.selected_ordinal())
+                .collect::<Vec<_>>(),
+            error_ordinals
+        );
+        assert!(result.errors().iter().all(|error| error.reason() == DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT)));
+    }
+    let (budget, _) = text_program("TRY(regexp_replace(s,p,r))", &columns).unwrap();
+    let allocation = Arc::new(CountingAllocator::new(0));
+    assert!(matches!(
+        evaluate(
+            &mut instance(&budget, &allocation),
+            &batch,
+            selection,
+            &HarnessControl
+        ),
+        Err(ExprEvaluationFailure::Kernel(
+            KernelFailure::ResourceExhausted
+        ))
+    ));
+    assert_eq!(allocation.outstanding(), 0);
+}
+
+#[test]
+fn ordered_regexp_keeps_the_first_checkpoint_failure_and_releases_its_allocations() {
+    let columns = [
+        varchar("s", 11, 1024),
+        varchar("p", 12, 8),
+        varchar("r", 13, 8),
+    ];
+    let source = "x".repeat(700);
+    let batch = batch(
+        &columns,
+        vec![
+            Arc::new(StringArray::from(vec![source.as_str()])),
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(StringArray::from(vec!["b"])),
+        ],
+    );
+    let (program, _) = text_program("regexp_replace(s,p,r)", &columns).unwrap();
+    let allocation = Arc::new(CountingAllocator::new(usize::MAX));
+    let trace_control = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
+    let all = Selection::all(1);
+    evaluate(
+        &mut instance(&program, &allocation),
+        &batch,
+        all,
+        &trace_control,
+    )
+    .unwrap();
+    assert_eq!(allocation.outstanding(), 0);
+    let trace = trace_control.trace();
+    assert!(trace.contains(&256));
+    assert!(trace.iter().all(|units| *units <= 256));
+    let causes = callback_causes([
+        "guarded-origin-invalid",
+        "guarded-origin-internal",
+        "guarded-origin-operational",
+    ]);
+    for index in 1..=trace.len() {
+        for cause in &causes {
+            let mut evaluator = instance(&program, &allocation);
+            let control = CallbackControl::new(cause.clone(), index);
+            assert!(matches!(
+                evaluate(&mut evaluator, &batch, all, &control),
+                Err(ExprEvaluationFailure::Kernel(actual)) if &actual == cause
+            ));
+            assert_eq!(control.trace(), trace[..index]);
+            assert_eq!(allocation.outstanding(), 0);
+            let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
+            assert!(matches!(
+                evaluate(&mut evaluator, &batch, all, &after),
+                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
+            ));
+            assert!(after.trace().is_empty());
         }
     }
+    let (reserved, refunded) = allocation.reservation_totals();
+    assert!(reserved > 0);
+    assert_eq!(reserved, refunded);
 }

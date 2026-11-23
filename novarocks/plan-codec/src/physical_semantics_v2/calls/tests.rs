@@ -273,8 +273,6 @@ fn scalar_fixture(count: usize, _retired_fragment_id: u32) -> Fixture {
                     ),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -343,8 +341,6 @@ fn scalar_fixture(count: usize, _retired_fragment_id: u32) -> Fixture {
                     ),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     temporal_source: None,
-                    regexp_count_pattern_source: None,
-                    to_base64_byte_source: None,
                 },
             )
         })
@@ -858,34 +854,6 @@ fn policy_absence_unspecified_and_unknown_are_never_defaulted() {
 }
 
 #[test]
-fn regexp_count_wire_source_unknown_and_foreign_tags_never_supply_a_default() {
-    let fixture = scalar_fixture(1, 0);
-    let dto = encode_checked(&fixture.checked().unwrap(), &TestControl::default()).unwrap();
-    assert_eq!(dto.entries[0].regexp_count_pattern_source, None);
-    for source in [-1, i32::MAX, 0, 1] {
-        let mut bad = dto.clone();
-        bad.entries[0].regexp_count_pattern_source = Some(source);
-        if source < 0 || source == i32::MAX {
-            assert!(matches!(
-                decode_checked(&fixture, &bad, &TestControl::default()),
-                Err(ClaimError::Codec(E::InvalidShape(_)))
-            ));
-        } else {
-            assert_unit_invalid(
-                decode_checked(&fixture, &bad, &TestControl::default()),
-                "unrelated call carries regexp_count source",
-            );
-        }
-    }
-    let out = decode_checked(&fixture, &dto, &TestControl::default()).unwrap();
-    assert!(
-        out.claims()
-            .values()
-            .all(|call| call.regexp_count_pattern_source.is_none())
-    );
-}
-
-#[test]
 fn all_six_sites_preserve_zero_max_ids_and_actual_call_ordinals() {
     for id in [0, u32::MAX] {
         for site in [
@@ -968,6 +936,7 @@ fn every_control_and_proof_variant_projects_exactly_including_higher_order() {
         ArgumentControl::If,
         ArgumentControl::Coalesce,
         ArgumentControl::Try,
+        ArgumentControl::OrderedRegexp,
         ArgumentControl::SimpleCase,
         ArgumentControl::SearchedCase,
         ArgumentControl::Aggregate,

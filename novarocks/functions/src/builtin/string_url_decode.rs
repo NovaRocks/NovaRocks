@@ -15,25 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Selected original uppercase-only percent decoding with required row errors.
-//! Output and error layouts are checked before reservations. Standard UTF-8
-//! checks inspect bounded borrowed blocks under opaque entry/exit observation;
-//! allocator/library internals and formal host memory grants remain open.
+//! URI and form decoding, plus the required byte-decoding API.
 
 use crate::{
-    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError,
-    ScalarCallInput, SelectedValues, Selection,
-    kernel_control::{internal, invalid},
+    EvaluatedArgument, KernelEvaluationControl, KernelFailure, Selection, kernel_control::internal,
     kernel_input::EvaluationCheckpoints,
 };
 use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
-use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
-use std::{
-    fmt::{self, Write},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 enum DecodeError {
@@ -175,65 +165,7 @@ fn inspect(
     })
 }
 
-// Static text and at most two byte-derived chars use fewer than 96 bytes.
-// A usize decimal index uses no more than usize::BITS digits. This fixed
-// stack bound avoids allocating a temporary diagnostic String.
-const DIAGNOSTIC_CAPACITY: usize = 96 + usize::BITS as usize;
-struct Diagnostic<'a, 'c> {
-    bytes: [u8; DIAGNOSTIC_CAPACITY],
-    length: usize,
-    work: &'a mut EvaluationCheckpoints<'c>,
-    refusal: Option<KernelFailure>,
-}
-impl Write for Diagnostic<'_, '_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        if text.len() > self.bytes.len() - self.length {
-            return Err(fmt::Error);
-        }
-        for byte in text.bytes() {
-            self.bytes[self.length] = byte;
-            self.length += 1;
-            if let Err(cause) = self.work.step() {
-                self.refusal = Some(cause);
-                return Err(fmt::Error);
-            }
-        }
-        Ok(())
-    }
-}
-fn row_error(
-    error: DecodeError,
-    ordinal: usize,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<RowDataError, KernelFailure> {
-    let mut diagnostic = Diagnostic {
-        bytes: [0; DIAGNOSTIC_CAPACITY],
-        length: 0,
-        work,
-        refusal: None,
-    };
-    let result = write!(diagnostic, "{error}");
-    if let Some(cause) = diagnostic.refusal {
-        return Err(cause);
-    }
-    result.map_err(|_| internal("url_decode diagnostic exceeds its source-derived stack bound"))?;
-    diagnostic.work.flush()?;
-    let text = std::str::from_utf8(&diagnostic.bytes[..diagnostic.length])
-        .map_err(|_| internal("url_decode diagnostic is not UTF-8"))?;
-    diagnostic.work.flush()?;
-    let error = RowDataError::with_reason(ordinal, crate::DataFailureReason::InvalidEncoding, text);
-    diagnostic.work.flush()?;
-    Ok(error)
-}
-fn output_layout(rows: usize, bytes: usize, errors: usize) -> Result<(), KernelFailure> {
-    let error_slots = super::string_failure::array_layout::<RowDataError>(errors)?.size();
-    let messages = errors
-        .checked_mul(crate::MAX_ROW_ERROR_MESSAGE_BYTES)
-        .ok_or(KernelFailure::ResourceExhausted)?;
-    super::string_failure::array_layout::<u8>(messages)?;
-    error_slots
-        .checked_add(messages)
-        .ok_or(KernelFailure::ResourceExhausted)?;
+fn output_layout(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     let offsets = rows
         .checked_add(1)
         .ok_or(KernelFailure::ResourceExhausted)?;
@@ -247,74 +179,21 @@ fn output_layout(rows: usize, bytes: usize, errors: usize) -> Result<(), KernelF
     bytes
         .checked_add(offsets)
         .and_then(|value| value.checked_add(bitmap))
-        .and_then(|value| value.checked_add(error_slots))
-        .and_then(|value| value.checked_add(messages))
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
 }
 
-pub(super) fn evaluate_string_url_decode<'a>(
-    input: ScalarCallInput<'_, 'a>,
-    control: &dyn KernelEvaluationControl,
-) -> Result<SelectedValues<'a>, KernelFailure> {
-    control.checkpoint(0)?;
-    let mut work = EvaluationCheckpoints::new(control);
-    let result = (|| {
-        let ([FunctionArgumentType::Value(source)], [argument]) = (
-            input.contract().selected().argument_types.as_ref(),
-            input.arguments(),
-        ) else {
-            return Err(invalid("URL decoding requires one checked value argument"));
-        };
-        let target = input.contract().result_type();
-        if source.logical_type() != ValueLogicalType::Physical
-            || source.data_type() != &DataType::Utf8
-            || target.logical_type() != ValueLogicalType::Physical
-            || target.data_type() != &DataType::Utf8
-            || !target.nullable()
-        {
-            return Err(invalid(
-                "URL decoding differs from its exact installed profile",
-            ));
-        }
-        let selection = input.selection();
-        let (array, errors) = build_decoded(
-            *argument,
-            selection,
-            source.nullable(),
-            DecodeDemand::Journal,
-            &mut work,
-        )?;
-        SelectedValues::try_new_observed::<KernelFailure>(
-            selection,
-            target.data_type(),
-            array,
-            errors,
-            || work.step(),
-        )
-    })();
-    work.finish_result(result)
-}
-
-#[derive(Clone, Copy)]
-enum DecodeDemand {
-    Journal,
-    Required,
-}
 fn build_decoded(
     argument: EvaluatedArgument<'_>,
     selection: Selection<'_>,
-    nullable: bool,
-    demand: DecodeDemand,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<(ArrayRef, Box<[RowDataError]>), KernelFailure> {
+) -> Result<ArrayRef, KernelFailure> {
     let values = argument
         .array()
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| internal("URL decoding selected carrier is not Utf8"))?;
-    output_layout(selection.len(), 0, 0)?;
-    let mut error_count = 0usize;
+    output_layout(selection.len(), 0)?;
     let mut output_offset = 0i32;
     for (ordinal, batch_row) in selection.iter().enumerate() {
         let row = argument.value_row(ordinal, batch_row);
@@ -323,11 +202,6 @@ fn build_decoded(
             return Err(internal("URL decoding selected row is outside its carrier"));
         }
         if values.is_null(row) {
-            if !nullable {
-                return Err(internal(
-                    "URL decoding non-null source contains selected SQL NULL",
-                ));
-            }
             continue;
         }
         let selected = values.value(row);
@@ -337,25 +211,15 @@ fn build_decoded(
                     crate::aggregate_scalar::checked_utf8_output_offset(output_offset, length)?;
             }
             Err(error) => {
-                if matches!(demand, DecodeDemand::Required) {
-                    return Err(KernelFailure::from_domain(RequiredDecodeFailure {
-                        _ordinal: ordinal,
-                        cause: error,
-                    }));
-                }
-                error_count = error_count
-                    .checked_add(1)
-                    .ok_or(KernelFailure::ResourceExhausted)?;
+                return Err(KernelFailure::from_domain(RequiredDecodeFailure {
+                    _ordinal: ordinal,
+                    cause: error,
+                }));
             }
         }
     }
     let output_bytes = output_offset as usize;
-    output_layout(selection.len(), output_bytes, error_count)?;
-    work.flush()?;
-    let mut errors = Vec::new();
-    errors.try_reserve_exact(error_count).map_err(|source| {
-        super::string_failure::reservation::<RowDataError>(error_count, source)
-    })?;
+    output_layout(selection.len(), output_bytes)?;
     work.flush()?;
     let mut bytes = Vec::new();
     bytes
@@ -379,11 +243,8 @@ fn build_decoded(
         } else {
             let selected = values.value(row);
             match inspect(selected, work)? {
-                Err(error) => {
-                    has_null = true;
-                    validity.append(false);
-                    errors.push(row_error(error, ordinal, work)?);
-                    work.step()?;
+                Err(_) => {
+                    return Err(internal("URL decoding changed after inspection"));
                 }
                 Ok(length) => {
                     if length > output_bytes - bytes.len() {
@@ -407,7 +268,7 @@ fn build_decoded(
         offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
         work.step()?;
     }
-    if bytes.len() != output_bytes || errors.len() != error_count {
+    if bytes.len() != output_bytes {
         return Err(internal(
             "URL decoding differs from its measured output extent",
         ));
@@ -419,13 +280,10 @@ fn build_decoded(
         has_null.then(|| NullBuffer::new(validity.finish())),
     )) as ArrayRef;
     work.flush()?;
-    let errors = errors.into_boxed_slice();
-    work.flush()?;
-    Ok((array, errors))
+    Ok(array)
 }
 
-/// Required consumers fail on their first selected invalid value. The bounded
-/// journal remains a selected-call product and never owns source arrays.
+/// Required consumers fail on their first invalid value.
 pub fn evaluate_required(input: &ArrayRef, batch_rows: usize) -> Result<ArrayRef, KernelFailure> {
     let values = input
         .as_any()
@@ -444,14 +302,7 @@ pub fn evaluate_required(input: &ArrayRef, batch_rows: usize) -> Result<ArrayRef
         EvaluatedArgument::Column(input)
     };
     let mut work = EvaluationCheckpoints::new(&DirectControl);
-    let result = build_decoded(
-        argument,
-        Selection::all(rows),
-        true,
-        DecodeDemand::Required,
-        &mut work,
-    )
-    .map(|(array, _)| array);
+    let result = build_decoded(argument, Selection::all(rows), &mut work);
     work.finish_result(result)
 }
 struct DirectControl;

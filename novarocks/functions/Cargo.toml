@@ -37,7 +37,6 @@ url.workspace = true
 arrow-arith = "60.1.0"
 arrow-ord = "60.1.0"
 regex.workspace = true
-regex-automata = { version = "=0.4.13", default-features = false, features = ["std", "syntax", "nfa-thompson", "unicode"] }
 regex-syntax = "=0.8.8"
 # Reuse the locked Unicode property author for Trino's BMP decimal digits.
 icu_properties = "=2.1.2"

@@ -108,7 +108,7 @@ pub(crate) fn prepared_for_test(
 }
 
 #[test]
-fn split_owner_one_actual_exact_signature_and_strict_eager_effects() {
+fn split_owner_exact_signature_and_strict_eager_effects() {
     for nullable in [false, true] {
         let ty = FunctionValueType::new(DataType::Utf8, nullable);
         let prepared = prepared_for_test("split", &[ty.clone(), ty.clone()]).unwrap();
@@ -137,7 +137,7 @@ fn split_owner_one_actual_exact_signature_and_strict_eager_effects() {
         );
         assert_eq!(
             prepared.contract().effects().own_row_error,
-            FunctionIntrinsicRowError::NoRowError
+            FunctionIntrinsicRowError::MayRaise
         );
     }
 }
