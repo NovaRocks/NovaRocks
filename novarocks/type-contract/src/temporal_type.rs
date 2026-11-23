@@ -17,6 +17,7 @@
 
 use arrow_schema::{DataType, TimeUnit};
 
+// Design: ADR-0253 (docs/adr/ADR-0253-exact-temporal-values-and-frozen-statement-time.md)
 /// Trino's fractional precision describes the smallest represented part of a second.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TemporalPrecision(u8);
