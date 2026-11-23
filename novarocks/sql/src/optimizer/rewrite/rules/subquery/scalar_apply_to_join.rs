@@ -455,8 +455,6 @@ fn build_output_project_items(
         .ok_or_else(|| {
             SqlCompileError::Compilation("missing scalar subquery output column".into())
         })?;
-    let inner_out_type = inner_value_type.data_type().clone();
-
     let inner_col_ref = arena.intern_observed(
         ScalarNode::ColumnRef(inner_output_column_id),
         inner_value_type,
@@ -465,13 +463,11 @@ fn build_output_project_items(
 
     let scalar_expr =
         if scalar_utils::is_count_aggregate_result(right, arena, inner_output_column_id) {
-            // ifnull(count_result, 0): count(1) with LEFT OUTER returns NULL when no
-            // match; normalize to 0 (SQL COUNT semantics).
-            scalar_utils::ifnull_zero(
+            // A missing outer-join match represents an empty COUNT group.
+            scalar_utils::coalesce_count_zero(
                 function_catalog,
                 arena,
                 inner_col_ref,
-                inner_out_type,
                 policy,
                 control,
             )?
@@ -1242,13 +1238,16 @@ mod tests {
         let assert_item = &proj.items[2];
         assert_eq!(assert_item.output_name, "__subquery_assertion");
         // Expression must be assert_true(...)
-        let ExprKind::FunctionCall { name, args, .. } = &assert_item.expr.kind else {
+        let ExprKind::FunctionCall { binding, args, .. } = &assert_item.expr.kind else {
             panic!(
                 "assertion item must be FunctionCall; got: {:?}",
                 assert_item.expr.kind
             );
         };
-        assert_eq!(name, "assert_true", "assertion must call assert_true");
+        assert_eq!(
+            binding.function_id.as_str(),
+            crate::functions::ASSERT_TRUE_ID
+        );
         assert_eq!(args.len(), 2, "assert_true must have 2 args");
 
         // First arg: cnt IS NULL OR cnt <= 1

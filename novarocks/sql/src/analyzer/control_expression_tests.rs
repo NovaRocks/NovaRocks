@@ -557,7 +557,7 @@ fn dedicated_controls_keep_original_bindings_display_and_direct_refusals() {
     for (sql, kind) in [
         (
             "SELECT if(TRUE, missing_value)",
-            AnalyzeErrorKind::UnsupportedExpression,
+            AnalyzeErrorKind::UnknownColumn,
         ),
         ("SELECT try(missing_value)", AnalyzeErrorKind::UnknownColumn),
         (

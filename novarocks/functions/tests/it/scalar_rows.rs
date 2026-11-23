@@ -60,7 +60,7 @@ pub(super) fn prepare(name: &str, arguments: &[FunctionArgument]) -> ScalarEvalu
     prepare_bound(&catalog, bound, request)
 }
 
-fn prepare_bound(
+pub(super) fn prepare_bound(
     catalog: &EngineFunctionCatalog,
     bound: ResolvedFunctionBinding,
     request: FunctionBindingRequest<'_>,

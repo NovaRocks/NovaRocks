@@ -87,3 +87,11 @@ SELECT array_generate(1, 2);
 -- query 18
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT map_from_arrays(ARRAY[1], ARRAY[2]);
+
+-- query 19
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT assert_true(TRUE);
+
+-- query 20
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT assert_true(FALSE, 'internal check');

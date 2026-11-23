@@ -298,7 +298,8 @@ fn collect_scalar_column_id_refs_inner(
 fn scalar_is_assert_true(arena: &ScalarArena, expr: ScalarId) -> bool {
     matches!(
         arena.node(expr),
-        ScalarNode::FunctionCall { name, .. } if name == "assert_true"
+        ScalarNode::FunctionCall { binding, .. }
+            if binding.function_id.as_str() == crate::functions::ASSERT_TRUE_ID
     )
 }
 

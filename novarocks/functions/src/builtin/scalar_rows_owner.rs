@@ -99,12 +99,17 @@ pub(super) fn definition(
     resolver: BuiltinScalarResolver,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(ScalarRowsOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    let visibility = if owner.operation == Operation::AssertTrue {
+        FunctionVisibility::Hidden
+    } else {
+        FunctionVisibility::Public
+    };
+    FunctionDefinition::try_new_pure_scalar(name, visibility, owner).map_err(|error| {
+        FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin scalar row pure owner",
             value: error.to_string().into(),
-        },
-    )
+        }
+    })
 }
 
 pub(super) struct ScalarRowsOwner {

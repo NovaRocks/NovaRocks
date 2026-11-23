@@ -1432,7 +1432,7 @@ mod intrinsic_error_consumer_tests {
             .collect::<Vec<_>>();
         let catalog = crate::functions::builtin_engine_function_catalog();
         let binding = catalog
-            .resolve_bound_user(
+            .resolve_bound_trusted(
                 name,
                 FunctionKind::Scalar,
                 FunctionBindingRequest {

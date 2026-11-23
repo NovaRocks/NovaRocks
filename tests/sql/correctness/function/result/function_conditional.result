@@ -170,3 +170,13 @@ i	mi	ms	mi_parent_null	ms_parent_null
 -- legacy
 rows_total	mi_present	ms_present	ms_nonnull_values
 4	2	2	1
+
+-- query 28
+-- types	smallint	smallint	smallint
+yes	no	unknown
+7	NULL	NULL
+
+-- query 29
+-- types	integer	integer
+skipped	skipped_null
+NULL	NULL

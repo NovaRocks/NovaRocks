@@ -699,33 +699,48 @@ pub(super) fn coalesce_false(
     )
 }
 
-pub(super) fn ifnull_zero(
+pub(super) fn coalesce_count_zero(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     value: ScalarId,
-    result_type: DataType,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    let zero = int_literal(arena, 0, control)?;
+    let zero_type = arena
+        .value_type(value)
+        .with_nullable(false)
+        .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))?;
+    let zero = arena.intern_observed(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
+        zero_type,
+        control,
+    )?;
     let args = vec![value, zero];
     let binding = crate::optimizer::scalar::resolve_function_binding(
         function_catalog,
         arena,
-        "ifnull",
+        "coalesce",
         &args,
         policy,
         control,
     )?;
+    let novarocks_functions::FunctionResultType::Scalar(result_type) =
+        &binding.selected.result_type
+    else {
+        return Err(crate::compiler::SqlCompileError::Compilation(
+            "COALESCE for a decorrelated count did not select a scalar result".into(),
+        ));
+    };
+    let result_type = result_type.clone();
     arena.intern_observed(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
-            name: "ifnull".to_string(),
+            name: "coalesce".to_string(),
             args,
             distinct: false,
             binding,
         },
-        novarocks_type_contract::FunctionValueType::new(result_type, false),
+        result_type,
         control,
     )
 }
@@ -740,14 +755,12 @@ pub(super) fn assert_true(
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let message = string_literal(arena, message, control)?;
     let args = vec![condition, message];
-    let binding = crate::optimizer::scalar::resolve_function_binding(
-        function_catalog,
-        arena,
-        "assert_true",
-        &args,
-        policy,
-        control,
-    )?;
+    let arguments = args
+        .iter()
+        .map(|id| crate::optimizer::scalar::function_argument(arena, *id, control))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = crate::functions::bind_assert_true(function_catalog, &arguments, control)?;
+    let binding = crate::binding::SqlFunctionBinding::new(selected, policy);
     arena.intern_observed(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,

@@ -370,7 +370,6 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     ));
     for (text, name) in [
         ("count(x)", "count"),
-        ("IF(TRUE, x, x)", "if"),
         ("x.y", "qualified name or field reference"),
     ] {
         assert!(
@@ -470,6 +469,35 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
             })
         ),
         "{mixed_coalesce:?}"
+    );
+}
+
+#[test]
+fn two_argument_if_preserves_the_selected_type_and_null_branch() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [
+        column("condition", 1, DataType::Boolean, true),
+        column("value", 2, DataType::Int32, false),
+    ];
+    let typed = compile("IF(condition, value)", &columns, &context);
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+            Arc::new(Int32Array::from(vec![7, 8, 9])),
+        ],
+    );
+    let result = evaluate(&typed, &input);
+    assert!(result.batch.errors.is_empty());
+    assert_eq!(
+        result.batch.result_type,
+        FunctionValueType::new(DataType::Int32, true)
+    );
+    assert_eq!(
+        result.batch.values.to_data(),
+        Int32Array::from(vec![Some(7), None, None]).to_data()
     );
 }
 

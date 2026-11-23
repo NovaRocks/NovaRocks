@@ -66,6 +66,33 @@ pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 /// the same decision.
 pub(crate) use novarocks_functions::FunctionVolatility;
 
+pub(crate) const ASSERT_TRUE_ID: &str = "builtin.scalar/assert_true/v1";
+
+pub(crate) fn bind_assert_true(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arguments: &[FunctionArgument],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    let function = novarocks_functions::FunctionId::try_new(ASSERT_TRUE_ID)
+        .expect("frozen assertion identity");
+    let overload = novarocks_functions::FunctionOverloadId::try_new(match arguments.len() {
+        1 => "builtin.scalar/assert_true/(bool)->bool;strict;legacy",
+        2 => "builtin.scalar/assert_true/(bool,utf8)->bool;strict;legacy",
+        _ => return Err(FunctionBindingError::NoMatchingOverload),
+    })
+    .expect("frozen assertion overload");
+    catalog.finish_scalar_binding(
+        &function,
+        &overload,
+        FunctionBindingRequest {
+            expected_result_type: None,
+            arguments,
+            logical_argument_count: arguments.len(),
+        },
+        control,
+    )
+}
+
 #[cfg(test)]
 fn declared_output_logical_type(
     result: &FunctionValueType,
@@ -1680,7 +1707,16 @@ mod tests {
                 Own::MayRaise,
             ),
         ] {
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            let bound = if name == "assert_true" {
+                bind_assert_true(
+                    &catalog,
+                    &arguments,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+            } else {
+                resolve_exact_scalar(&catalog, name, &arguments)
+            };
             assert_eq!(bound.semantics.intrinsic_row_error, expected, "{name}");
             catalog
                 .validate_bound(

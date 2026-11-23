@@ -7961,6 +7961,22 @@ mod tests {
     }
 
     #[test]
+    fn assert_true_is_hidden_from_sql() {
+        for sql in [
+            "SELECT assert_true(TRUE)",
+            "SELECT assert_true(FALSE, 'failure')",
+        ] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownFunction,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn hidden_aggregate_window_uses_user_visibility_error_before_capability_check() {
         let mut builder = novarocks_functions::EngineFunctionCatalogBuilder::new();
         let overload = novarocks_functions::AggregateOverloadMetadata::try_new(

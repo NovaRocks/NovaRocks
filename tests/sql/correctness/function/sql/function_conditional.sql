@@ -165,3 +165,12 @@ SELECT i, mi, ms, mi IS NULL AS mi_parent_null, ms IS NULL AS ms_parent_null FRO
 -- query 27
 USE ${case_db};
 SELECT COUNT(*) AS rows_total, COUNT(mi) AS mi_present, COUNT(ms) AS ms_present, COUNT(ms[1]) AS ms_nonnull_values FROM tc;
+
+-- query 28
+SELECT IF(TRUE, SMALLINT '7') AS yes,
+       IF(FALSE, SMALLINT '7') AS no,
+       IF(NULL, SMALLINT '7') AS unknown;
+
+-- query 29
+SELECT IF(FALSE, 1 / 0) AS skipped,
+       IF(NULL, 1 / 0) AS skipped_null;

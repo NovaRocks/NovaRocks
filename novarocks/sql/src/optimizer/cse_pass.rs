@@ -4003,7 +4003,7 @@ mod intrinsic_eligibility_tests {
                 constant: None,
             }];
             let binding = catalog
-                .resolve_bound_user(
+                .resolve_bound_trusted(
                     name,
                     FunctionKind::Scalar,
                     FunctionBindingRequest {

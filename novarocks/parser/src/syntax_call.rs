@@ -18,9 +18,16 @@
 use std::fmt;
 
 use crate::Span;
-use crate::ast::{Expr, ExtractField, TrimSpecification};
+use crate::ast::{Expr, ExtractField, Literal, LiteralKind, TrimSpecification};
 
-/// The canonical name and original children of a dedicated call syntax node.
+// The absent IF branch has no syntax location. Its type is fixed with the
+// other branch during call typing, just as for an explicit NULL.
+static IF_IMPLICIT_ELSE: Expr = Expr::Literal(Literal {
+    kind: LiteralKind::Null,
+    span: crate::SYNTHETIC,
+});
+
+/// The canonical name and operands of a dedicated call syntax node.
 #[derive(Debug)]
 pub struct CanonicalCall<'a> {
     pub name: &'static str,
@@ -70,12 +77,7 @@ pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, Unsuppor
             )
         }
         Expr::If(node) => {
-            let Some(false_value) = node.false_value.as_ref() else {
-                return Err(UnsupportedCallSyntax::new(
-                    "two-argument IF is not supported",
-                    span,
-                ));
-            };
+            let false_value = node.false_value.as_ref().unwrap_or(&IF_IMPLICIT_ELSE);
             ("if", vec![&node.condition, &node.true_value, false_value])
         }
         Expr::NullIf(node) => ("nullif", vec![&node.first, &node.second]),
