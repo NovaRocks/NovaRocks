@@ -465,12 +465,13 @@ fn recent_query_history_refunds_original_text_after_last_alias_and_expires_indep
 #[test]
 fn recent_query_history_pressure_uses_finish_order_and_drops_oversized_diagnostics() {
     let id = QueryApplicationControl::default().mint_client_query_id();
-    let backing = |value: &str| {
-        ClientQueryText::new(value.to_owned())
-            .retained_bytes()
-            .unwrap()
-    };
-    let max_bytes = size_of::<history::HistoricalQuery>() + backing(id.as_str()) + backing("root");
+    let backing = |value| ClientQueryText::new(value).retained_bytes().unwrap();
+    let principal: Arc<str> = "root".into();
+    // Registration stores the principal using its Arc<str> Display path,
+    // whose String backing can have spare capacity beyond its UTF-8 length.
+    let max_bytes = size_of::<history::HistoricalQuery>()
+        + backing(id.as_str().to_owned())
+        + backing(principal.to_string());
     let fixture = Fixture::new(Some(ClientQueryHistoryConfig {
         max_bytes,
         max_age: Duration::from_secs(1),

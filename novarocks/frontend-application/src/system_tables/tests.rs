@@ -976,7 +976,7 @@ fn state_extension_declares_real_types_and_creates_runtime_schema() {
     let registry = SystemTableRegistry::try_new([registration.clone()]).unwrap();
     assert_eq!(
         registry.schemas(&SystemTableBinding::System),
-        ["metadata", "runtime"]
+        ["jdbc", "metadata", "runtime"]
     );
     assert_eq!(registration.columns.len(), 12);
     assert_eq!(

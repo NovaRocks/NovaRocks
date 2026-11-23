@@ -26,11 +26,13 @@
 CREATE CATALOG trc_jdbc_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 CREATE SCHEMA trc_jdbc_${uuid0}.metadata_${uuid0};
 CREATE TABLE trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_base (
-    order_id bigint NOT NULL COMMENT 'id',
+    order_id bigint NOT NULL,
     total decimal(12,2) DEFAULT 12.34,
     code varchar,
     payload row(x bigint, ys array(decimal(9,2)))
 ) WITH (format_version = 3);
+USE trc_jdbc_${uuid0}.metadata_${uuid0};
+COMMENT ON COLUMN metadata_base.order_id IS 'id';
 CREATE VIEW trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_view
 AS SELECT order_id, total FROM trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_base;
 
@@ -52,12 +54,12 @@ FROM trc_jdbc_${uuid0}.information_schema.views
 WHERE table_schema = 'metadata_${uuid0}' AND table_name = 'metadata_view';
 
 -- query 5
-DESCRIBE trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_base;
+DESCRIBE metadata_base;
 
 -- query 6
 SELECT table_name, table_type, remarks
 FROM system.jdbc.tables
-WHERE table_cat = 'trc_jdbc_${uuid0}' AND table_schem LIKE 'metadata_${uuid0}' ESCAPE '\'
+WHERE table_cat = 'trc_jdbc_${uuid0}' AND table_schem = 'metadata_${uuid0}'
   AND table_name LIKE 'metadata\_%' ESCAPE '\' AND table_type IN ('TABLE', 'VIEW')
 ORDER BY table_type, table_name;
 
@@ -99,5 +101,6 @@ SELECT (SELECT count(*) FROM system.jdbc.attributes)
 -- @skip_result_check=true
 DROP VIEW IF EXISTS trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_view;
 DROP TABLE IF EXISTS trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_base;
+USE iceberg_ddl_cat_${suite_uuid0}.${case_db};
 DROP SCHEMA IF EXISTS trc_jdbc_${uuid0}.metadata_${uuid0};
 DROP CATALOG trc_jdbc_${uuid0};

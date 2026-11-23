@@ -3264,6 +3264,9 @@ pub(super) fn dynamic_definition_parts(
         _ => None,
     };
     let public_signatures: &[(&str, &str)] = match name {
+        "__array_literal" => &[("T...", "array(T)")],
+        // T is the selected field of the input row, named by the constant VARCHAR.
+        "__array_struct_subfield" => &[("array(row(...)), varchar", "array(T)")],
         "map_entries" => &[("map(K,V)", "array(row(K,V))")],
         "greatest" | "least" => &[("T...", "T")],
         "round" | "truncate" => super::rounding_binding::public_signatures(name),

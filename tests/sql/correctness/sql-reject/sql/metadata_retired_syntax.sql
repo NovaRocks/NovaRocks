@@ -53,26 +53,26 @@ SHOW TABLES FROM trc7_missing_catalog.reject_ns;
 -- @expect_trino_error=CATALOG_NOT_FOUND,USER_ERROR
 SHOW SCHEMAS FROM trc7_missing_catalog;
 
--- query 10
+-- query 9
 -- @expect_trino_error=CATALOG_NOT_FOUND,USER_ERROR
 SHOW COLUMNS FROM trc7_missing_catalog.reject_ns.t;
 
--- query 11
+-- query 10
 -- @expect_trino_error=CATALOG_NOT_FOUND,USER_ERROR
 DESCRIBE trc7_missing_catalog.reject_ns.t;
 
--- query 12
+-- query 11
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SHOW STATS FOR (SELECT 1 AS id);
 
--- query 13
+-- query 12
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SHOW CURRENT ROLES FROM reject_ice;
 
--- query 14
+-- query 13
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 SHOW ROLE GRANTS FROM reject_ice;
 
--- query 17
+-- query 14
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SHOW PROCESSLIST;

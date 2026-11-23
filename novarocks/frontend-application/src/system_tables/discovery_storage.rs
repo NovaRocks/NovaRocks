@@ -36,10 +36,19 @@ impl DiscoveryAllocation for DiscoveryStorage {
         let bytes = u64::try_from(layout.size()).map_err(|_| {
             CompileControlError::Source(SharedFailureCause::new(WorkError::ArithmeticOverflow))
         })?;
-        self.bytes
+        let mut held = self
+            .bytes
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .try_grow(bytes)
+            .unwrap_or_else(|poison| poison.into_inner());
+        held.try_grow(bytes)
+            .inspect_err(|error| {
+                tracing::debug!(
+                    requested_bytes = bytes,
+                    discovery_retained_bytes = held.bytes(),
+                    error = %error,
+                    "Provider metadata layout request refused"
+                );
+            })
             .map_err(|error| CompileControlError::Source(SharedFailureCause::new(error)))
     }
 

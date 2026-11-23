@@ -317,7 +317,17 @@ impl SystemTableCpuStaging {
         } else {
             0
         };
-        reserve(&mut self.input_bytes, extent_add(row_bytes, top_bytes)?)?;
+        let requested = extent_add(row_bytes, top_bytes)?;
+        reserve(&mut self.input_bytes, requested).inspect_err(|_| {
+            tracing::debug!(
+                schema = %self.declaration.schema,
+                table = %self.declaration.table,
+                requested_bytes = requested,
+                retained_bytes = self.window.retained_payload_bytes(),
+                capacity_bytes = self.window.payload_capacity_bytes(),
+                "System-table row staging refused by the original window"
+            );
+        })?;
         if grow {
             self.rows
                 .try_reserve_exact(next_capacity - self.rows.len())
@@ -373,6 +383,17 @@ impl SystemTableCpuStaging {
                     creation,
                     &self.control,
                 )
+                .inspect_err(|_| {
+                    tracing::debug!(
+                        schema = %self.declaration.schema,
+                        table = %self.declaration.table,
+                        rows = self.rows.len(),
+                        staged_row_bytes = self.live_row_bytes,
+                        retained_bytes = self.window.retained_payload_bytes(),
+                        capacity_bytes = self.window.payload_capacity_bytes(),
+                        "System-table Arrow batch construction refused"
+                    );
+                })
                 .map(|batch| MaterializedSystemTableBatch {
                     batch,
                     storage: creation.storage_lifetime(),
@@ -380,6 +401,15 @@ impl SystemTableCpuStaging {
             },
         )
         .map_err(control_error)??;
+        tracing::debug!(
+            schema = %self.declaration.schema,
+            table = %self.declaration.table,
+            rows = self.rows.len(),
+            staged_row_bytes = self.live_row_bytes,
+            retained_bytes = self.window.retained_payload_bytes(),
+            capacity_bytes = self.window.payload_capacity_bytes(),
+            "System-table batch and staged rows coexist in the original window"
+        );
         self.batches.push(batch);
         self.rows.clear();
         release(&mut self.input_bytes, self.live_row_bytes);

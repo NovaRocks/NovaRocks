@@ -922,16 +922,16 @@ impl QueryShape {
                 group_by: None,
                 having: None,
                 windows: Default::default(),
-                modifiers: ast::QueryModifiers::default(),
+                modifiers: ast::QueryModifiers {
+                    order_by: Some(ast::OrderBy {
+                        items: self.order.into(),
+                        span: self.span,
+                    }),
+                    ..Default::default()
+                },
                 span: self.span,
             }))),
-            modifiers: ast::QueryModifiers {
-                order_by: Some(ast::OrderBy {
-                    items: self.order.into(),
-                    span: self.span,
-                }),
-                ..Default::default()
-            },
+            modifiers: ast::QueryModifiers::default(),
             span: self.span,
         })
     }

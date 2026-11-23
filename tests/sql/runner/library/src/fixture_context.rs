@@ -1006,14 +1006,14 @@ pub(crate) fn render_expected(value: &str, variables: &HashMap<String, String>) 
     rendered
 }
 fn metadata_projection(sql: &str) -> Option<String> {
-    let re = Regex::new(r"(?is)\bSELECT\s+(.*?)\s+FROM\s+(?:(?:[A-Za-z0-9_`.$\{\}]+\.)?information_schema\.(?:schemata|tables|columns|task_runs)|system\.metadata\.materialized_views|system\.runtime\.materialized_view_states)\b").ok()?;
+    let re = Regex::new(r"(?is)\bSELECT\s+(.*?)\s+FROM\s+(?:(?:[A-Za-z0-9_`.$\{\}]+\.)?information_schema\.(?:schemata|tables|columns|views|task_runs)|system\.jdbc\.(?:schemas|tables|columns)|system\.metadata\.materialized_views|system\.runtime\.materialized_view_states)\b").ok()?;
     re.captures(sql).map(|c| c[1].to_string())
 }
 fn metadata_columns(sql: &str) -> BTreeSet<String> {
     let Some(projection) = metadata_projection(sql) else {
         return BTreeSet::new();
     };
-    let re = Regex::new(r"(?i)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?(schema_name|table_schema|storage_schema|database|db_name)`?(?:\s+(?:AS\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?\s*$").unwrap();
+    let re = Regex::new(r"(?i)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?(schema_name|table_schema|table_schem|storage_schema|database|db_name)`?(?:\s+(?:AS\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?\s*$").unwrap();
     projection
         .split(',')
         .filter_map(|part| {
@@ -1039,7 +1039,7 @@ pub(crate) fn rewrite_metadata_filters_observed(
         return sql.to_string();
     }
     let re = Regex::new(
-        r#"(?i)(\b(?:table_schema|schema_name|storage_schema|database|db_name)`?\s*=\s*)(['"])([^'"]+)(['"])"#,
+        r#"(?i)(\b(?:table_schema|table_schem|schema_name|storage_schema|database|db_name)`?\s*=\s*)(['"])([^'"]+)(['"])"#,
     )
     .unwrap();
     re.replace_all(sql, |c: &regex::Captures<'_>| {
