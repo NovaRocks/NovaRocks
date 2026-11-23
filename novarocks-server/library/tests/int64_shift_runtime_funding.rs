@@ -56,9 +56,9 @@ fn original_production_frame_values_keep_account_through_alias_last_free() {
         let output = frame.evaluate(&input).unwrap();
         let output_array = output.as_any().downcast_ref::<Int64Array>().unwrap();
         let expected = match name {
-            "bit_shift_left" => -14,
-            "bit_shift_right" => -4,
-            "bit_shift_right_logical" => ((-7i64) as u64 >> 1) as i64,
+            "bitwise_left_shift" => -14,
+            "bitwise_right_shift_arithmetic" => -4,
+            "bitwise_right_shift" => ((-7i64) as u64 >> 1) as i64,
             _ => unreachable!(),
         };
         assert_eq!(
@@ -76,15 +76,11 @@ fn original_production_frame_values_keep_account_through_alias_last_free() {
             binding.account().id().get()
         );
         for argument in input.columns() {
-            let source = argument
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .inner();
+            let source_data = argument.to_data();
+            let source = &source_data.buffers()[0];
             assert_ne!(source.data_ptr(), backing.data_ptr());
-            // SAFETY: this fixture's Int64Array came from its actual standard
-            // Vec producer under the same shipping GLOBAL, outside any grant.
+            // SAFETY: both integer inputs came from their standard Vec
+            // producers under the same shipping GLOBAL, outside any grant.
             let original = unsafe { original_shift_tag(source) };
             assert_ne!(
                 global_store().snapshot_ref(original).unwrap().origin,
@@ -140,9 +136,9 @@ fn original_complete_wrapper_nullable_buffers_keep_account_through_alias_last_fr
         assert!(errors.is_empty());
         let array = values.as_any().downcast_ref::<Int64Array>().unwrap();
         let expected = match name {
-            "bit_shift_left" => -14,
-            "bit_shift_right" => -4,
-            "bit_shift_right_logical" => ((-7i64) as u64 >> 1) as i64,
+            "bitwise_left_shift" => -14,
+            "bitwise_right_shift_arithmetic" => -4,
+            "bitwise_right_shift" => ((-7i64) as u64 >> 1) as i64,
             _ => unreachable!(),
         };
         assert_eq!(

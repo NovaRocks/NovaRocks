@@ -34,9 +34,8 @@ use novarocks_execution::runtime::{
 };
 use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::{
-    ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
-    InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi,
+    ConstantPolicy, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
+    PureEngineFunctionCatalog,
 };
 use novarocks_memory::{
     AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence, TopUpPolicy,
@@ -455,39 +454,30 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
     }
 }
 fn functions() -> PureEngineFunctionCatalog {
-    let actual = novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
-        .expect("builtin catalogue");
+    let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
+    let definition = actual
+        .definition("rand", FunctionKind::Scalar)
+        .expect("rand");
+    let binding = definition.binding_declaration().expect("rand binding");
+    let installed = binding.overloads().iter().map(|overload| {
+        let declaration = actual
+            .pure_overload_declaration_observed(
+                binding.function_id(),
+                definition.kind(),
+                &overload.identity,
+                &Control,
+            )
+            .expect("installed rand overload");
+        InstalledPureKernel {
+            function: binding.function_id().clone(),
+            kind: definition.kind(),
+            implementation: declaration.implementation().clone(),
+            aggregate_state_format: None,
+        }
+    });
     let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(
-            actual
-                .definition("rand", FunctionKind::Scalar)
-                .expect("rand")
-                .clone(),
-        )
-        .expect("register rand");
-    builder
-        .seal_pure(
-            [
-                "builtin.scalar/rand/()->f64;strict;legacy",
-                "builtin.scalar/rand/(i64)->f64;strict;legacy",
-            ]
-            .into_iter()
-            .map(|overload| InstalledPureKernel {
-                function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
-                kind: FunctionKind::Scalar,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(overload).unwrap(),
-                    implementation: PureImplementationId::try_new(
-                        "builtin.scalar/rand/selected-v1",
-                    )
-                    .unwrap(),
-                    abi: PureKernelAbi::ScalarV1,
-                },
-                aggregate_state_format: None,
-            }),
-        )
-        .expect("sealed rand subset")
+    builder.register(definition.clone()).expect("register rand");
+    builder.seal_pure(installed).expect("sealed rand subset")
 }
 
 #[test]

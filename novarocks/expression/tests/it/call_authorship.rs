@@ -378,7 +378,7 @@ fn shared_if_authors_exact_guarded_claims_for_value_and_truth_demands() {
 }
 
 #[test]
-fn guarded_parents_preserve_shared_definition_state_and_per_definition_decimal_effects() {
+fn guarded_parents_preserve_shared_definition_state_and_frozen_decimal_policies() {
     use arrow::array::Decimal128Array;
     use novarocks_type_contract::{FunctionIntrinsicRowError, FunctionVolatility};
     use std::sync::Arc;
@@ -395,12 +395,16 @@ fn guarded_parents_preserve_shared_definition_state_and_per_definition_decimal_e
         ),
         FunctionValueType::new(DataType::Decimal128(38, 3), true),
     );
+    let digits = fixture.constant(
+        Arc::new(arrow::array::Int32Array::from(vec![-1])),
+        FunctionValueType::new(DataType::Int32, false),
+    );
     let mut decimal_roots = Vec::new();
     for policy in [
         DecimalOverflowPolicy::ReportError,
         DecimalOverflowPolicy::OutputNull,
     ] {
-        let round = fixture.call("round", &[decimal], policy);
+        let round = fixture.call("round", &[decimal, digits], policy);
         let root = fixture.call(
             "coalesce",
             &[round, round],
@@ -440,10 +444,7 @@ fn guarded_parents_preserve_shared_definition_state_and_per_definition_decimal_e
     for (&id, (round, _, policy)) in sealed.root_use_ids()[1..].iter().zip(decimal_roots) {
         let invocation = &flow.uses()[&id];
         let summary = authored.summaries[&id].for_use(invocation.context).unwrap();
-        assert_eq!(
-            summary.may_raise_row_error,
-            policy == DecimalOverflowPolicy::ReportError
-        );
+        assert!(summary.may_raise_row_error);
         for child in &invocation.arguments {
             let child_use = &flow.uses()[child];
             assert_eq!(child_use.definition, round);

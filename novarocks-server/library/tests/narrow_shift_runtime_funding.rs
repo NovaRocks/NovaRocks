@@ -36,11 +36,16 @@ use novarocks_memory::lane::global_store;
 use shift_helpers::*;
 use shift_support::*;
 
-fn expected(name: &str) -> Option<i64> {
+fn expected(name: &str, ty: &DataType) -> i64 {
     match name {
-        "bit_shift_left" => Some(-14),
-        "bit_shift_right" => Some(-4),
-        "bit_shift_right_logical" => None,
+        "bitwise_left_shift" => -14,
+        "bitwise_right_shift_arithmetic" => -4,
+        "bitwise_right_shift" => match ty {
+            DataType::Int8 => 124,
+            DataType::Int16 => 32_764,
+            DataType::Int32 => 2_147_483_644,
+            _ => panic!("exact narrow shift source"),
+        },
         _ => panic!("installed exact shift name"),
     }
 }
@@ -64,7 +69,7 @@ fn original_nine_frames_keep_fresh_values_and_always_bitmap_through_alias_last_f
             .unwrap();
             let output = frame.evaluate(&input).unwrap();
             assert_eq!(output.data_type(), &ty);
-            assert_eq!(result_rows(&output), vec![expected(name); 4096]);
+            assert_eq!(result_rows(&output), vec![Some(expected(name, &ty)); 4096]);
             let (values, bitmap) = result_backings(&output);
             let bitmap = bitmap.expect("original safe unary_opt always creates validity");
             assert_ne!(values.data_ptr(), bitmap.data_ptr());
@@ -153,7 +158,11 @@ fn original_nine_complete_nullable_wrappers_keep_both_backings_and_zero_debt() {
             assert_eq!(
                 result_rows(&output),
                 (0..4096)
-                    .map(|row| if row % 3 == 0 { None } else { expected(name) })
+                    .map(|row| if row % 3 == 0 {
+                        None
+                    } else {
+                        Some(expected(name, &ty))
+                    })
                     .collect::<Vec<_>>()
             );
             let (values, bitmap) = result_backings(&output);
@@ -215,7 +224,7 @@ fn original_narrow_empty_small_and_rounding_bands_preserve_nominal_missing_polic
                 let (_, output, errors) = output.unwrap().into_parts();
                 assert!(errors.is_empty());
                 assert_eq!(output.data_type(), &ty);
-                assert_eq!(result_rows(&output), vec![expected(name); rows]);
+                assert_eq!(result_rows(&output), vec![Some(expected(name, &ty)); rows]);
                 let settlement = receipt.body.settlement.as_ref().unwrap();
                 assert_eq!(settlement.debt, 0);
                 assert_eq!(settlement.next_step, Ok(()));
@@ -307,7 +316,7 @@ fn original_sparse_and_broadcast_wrappers_fund_selected_rows_with_original_argum
                         .map(|row| if !scalar_source && row % 3 == 0 {
                             None
                         } else {
-                            expected(name)
+                            Some(expected(name, &ty))
                         })
                         .collect::<Vec<_>>()
                 );

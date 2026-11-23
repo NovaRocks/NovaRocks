@@ -4701,7 +4701,11 @@ mod tests {
         let error = ctx.analyze_expr(&column.expression, &scope).unwrap_err();
         assert_eq!(
             error.kind(),
-            crate::analyze_error::AnalyzeErrorKind::InvalidLiteral
+            crate::analyze_error::AnalyzeErrorKind::NumericOutOfRange
+        );
+        assert_eq!(
+            error.message(),
+            "Temporal clock precision must be in range [0, 12]: -17"
         );
     }
 
@@ -8493,26 +8497,21 @@ mod tests {
     }
 
     #[test]
-    fn abs_analysis_preserves_input_binding_and_freezes_promoted_result() {
-        for (input, output) in [
-            (DataType::Int8, DataType::Int16),
-            (DataType::Int16, DataType::Int32),
-            (DataType::Int32, DataType::Int64),
-            (DataType::Int64, DataType::FixedSizeBinary(16)),
-            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
-            (DataType::Float32, DataType::Float32),
-            (DataType::Float64, DataType::Float64),
-            (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
+    fn abs_analysis_preserves_input_binding_and_keeps_result_width() {
+        for input in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Decimal128(18, 3),
         ] {
             for nullable in [false, true] {
                 let catalog = UnaryInputCatalog {
                     key_type: input.clone(),
                     nullable,
-                    logical_type: if input == DataType::FixedSizeBinary(16) {
-                        Some(novarocks_types::schema::SqlType::LargeInt)
-                    } else {
-                        None
-                    },
+                    logical_type: None,
                 };
                 let expression = analyze_projection_expr_with_catalog(
                     "select abs(k) from unary_input",
@@ -8520,7 +8519,7 @@ mod tests {
                     crate::functions::builtin_sql_function_catalog(),
                 )
                 .unwrap();
-                assert_eq!(expression.value_type.data_type().clone(), output);
+                assert_eq!(expression.value_type.data_type(), &input);
                 assert_eq!(expression.value_type.nullable(), nullable);
                 let ExprKind::FunctionCall {
                     name,
@@ -8544,16 +8543,7 @@ mod tests {
                 assert_eq!(
                     binding.selected.argument_types.as_ref(),
                     &[novarocks_functions::FunctionArgumentType::Value(
-                        novarocks_functions::FunctionValueType::try_with_logical_type(
-                            input.clone(),
-                            nullable,
-                            if input == DataType::FixedSizeBinary(16) {
-                                novarocks_type_contract::ValueLogicalType::LargeInt
-                            } else {
-                                novarocks_type_contract::ValueLogicalType::Physical
-                            },
-                        )
-                        .unwrap()
+                        novarocks_functions::FunctionValueType::new(input.clone(), nullable)
                     )]
                 );
                 let novarocks_functions::FunctionResultType::Scalar(result) =
@@ -8561,23 +8551,23 @@ mod tests {
                 else {
                     panic!("ABS has a scalar result");
                 };
-                assert_eq!(result.data_type().clone(), output);
+                assert_eq!(result.data_type(), &input);
                 assert_eq!(result.nullable(), nullable);
             }
         }
     }
 
     #[test]
-    fn abs_typed_null_and_outer_decimal_cast_keep_the_promoted_child() {
-        for (spelling, input, output) in [
-            ("tinyint", DataType::Int8, DataType::Int16),
-            ("smallint", DataType::Int16, DataType::Int32),
-            ("int", DataType::Int32, DataType::Int64),
-            ("bigint", DataType::Int64, DataType::FixedSizeBinary(16)),
+    fn abs_typed_null_and_outer_decimal_cast_keep_the_original_width() {
+        for (spelling, input) in [
+            ("tinyint", DataType::Int8),
+            ("smallint", DataType::Int16),
+            ("int", DataType::Int32),
+            ("bigint", DataType::Int64),
         ] {
             let expression =
                 analyze_projection_expr(&format!("select abs(cast(null as {spelling}))")).unwrap();
-            assert_eq!(expression.value_type.data_type().clone(), output);
+            assert_eq!(expression.value_type.data_type(), &input);
             assert!(expression.value_type.nullable());
             let ExprKind::FunctionCall { args, .. } = expression.kind else {
                 panic!("expected ABS call");
@@ -8630,39 +8620,16 @@ mod tests {
             .unwrap();
         let mut context = logical_context(&control);
         context.materialized_values = Some(materialized.view());
-        let abs = context
+        let error = context
             .analyze_expr(&column.expression, &context.new_scope())
-            .unwrap();
-        assert_eq!(&abs.value_type, null.value_type());
-        let ExprKind::FunctionCall { binding, args, .. } = abs.kind else {
-            panic!("expected exact ABS call");
-        };
-        assert_eq!(binding.function_id.as_str(), "builtin.scalar/abs/v1");
+            .unwrap_err();
         assert_eq!(
-            binding.selected.argument_types.as_ref(),
-            &[novarocks_functions::FunctionArgumentType::Value(
-                null.value_type().clone()
-            )]
-        );
-        assert_eq!(
-            binding.selected.result_type,
-            novarocks_functions::FunctionResultType::Scalar(null.value_type().clone())
-        );
-        let [arg] = args.as_slice() else {
-            panic!("ABS must have one argument");
-        };
-        assert_eq!(&arg.value_type, null.value_type());
-        let ExprKind::Constant(witness) = &arg.kind else {
-            panic!("expected original typed NULL");
-        };
-        assert_eq!(witness.ordinal(), null.ordinal());
-        assert_eq!(
-            witness.pool().backing_identity(),
-            null.pool().backing_identity()
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction
         );
 
         let expression =
-            analyze_projection_expr("select cast(abs(cast(-128 as tinyint)) as decimal(38,15))")
+            analyze_projection_expr("select cast(abs(cast(-127 as tinyint)) as decimal(38,15))")
                 .unwrap();
         assert_eq!(
             expression.value_type.data_type().clone(),
@@ -8671,7 +8638,7 @@ mod tests {
         let ExprKind::Cast { expr, .. } = expression.kind else {
             panic!("expected outer Decimal CAST")
         };
-        assert_eq!(expr.value_type.data_type().clone(), DataType::Int16);
+        assert_eq!(expr.value_type.data_type(), &DataType::Int8);
         let ExprKind::FunctionCall { args, .. } = expr.into_inner().kind else {
             panic!("expected inner ABS")
         };
@@ -9229,13 +9196,17 @@ mod tests {
     fn unavailable_builtin_is_explicitly_rejected_before_false_filter_pruning() {
         let error = analyze_projection_expr("select reverse(ARRAY[1,2]) where false").unwrap_err();
         assert!(error.contains("builtin.scalar/reverse/(list"), "{error}");
-        for sql in ["select isnull(1) where false", "select cosh(1) where false"] {
-            let error = analyze_projection_expr(sql).unwrap_err();
-            assert!(
-                error.contains("no admitted selected scalar implementation"),
-                "{sql}: {error}"
-            );
-        }
+        let isnull = analyze_projection_expr("select isnull(1) where false").unwrap_err();
+        assert!(
+            isnull.contains("no admitted selected scalar implementation"),
+            "{isnull}"
+        );
+        let cosh = analyze_projection_expr("select cosh(1) where false").unwrap_err();
+        assert!(
+            cosh.contains("builtin.scalar/cosh/(f64)->f64;strict;coerce"),
+            "{cosh}"
+        );
+        assert!(cosh.contains("has no installed implementation"), "{cosh}");
         for sql in [
             "select array_reverse([1,2]) where false",
             "select array_to_string([1,2], ',') where false",

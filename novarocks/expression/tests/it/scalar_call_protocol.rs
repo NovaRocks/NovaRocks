@@ -16,9 +16,7 @@
 // under the License.
 
 use arrow::{
-    array::{
-        Array, ArrayRef, Date32Array, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray,
-    },
+    array::{Array, ArrayRef, Date32Array, Int32Array, Int64Array, StringArray},
     datatypes::Schema,
     record_batch::RecordBatch,
 };
@@ -336,9 +334,9 @@ fn unprofiled_scalar_only_observes_the_call_start() {
     let value = out
         .values()
         .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .expect("BIGINT ABS returns the LARGEINT carrier");
-    assert_eq!(value.value(0), 5_i128.to_be_bytes());
+        .downcast_ref::<Int64Array>()
+        .expect("BIGINT ABS retains the BIGINT carrier");
+    assert_eq!(value.value(0), 5);
     assert_eq!(host.events, vec![Event::Begin]);
 }
 

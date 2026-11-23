@@ -184,7 +184,21 @@ fn shared_call_keeps_port_order_and_repeated_references() {
             ],
         ),
     );
-    assert_compared(&result, 2, 3);
+    assert_eq!(
+        result.batch.shape,
+        EvaluationShape {
+            port_count: 1,
+            input_columns: 2,
+            input_rows: 3,
+        }
+    );
+    assert!(matches!(
+        result.consistency,
+        Consistency::NotApplicable(Inapplicability::Call {
+            function,
+            reason: CallInapplicability::WholeInvocation,
+        }) if function.as_str() == "builtin.scalar/nullif/v1"
+    ));
     assert!(result.batch.errors.is_empty());
     assert_eq!(
         result.batch.values.to_data(),
