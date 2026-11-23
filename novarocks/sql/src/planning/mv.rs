@@ -3561,7 +3561,7 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
         .iter()
         .map(|argument| &argument.value)
         .collect::<Vec<_>>();
-    if is_non_deterministic_function(&function_name, &argument_values) {
+    if is_non_deterministic_function(&function_name) {
         return Err(
             "incremental MV projection/filter query contains non-deterministic function"
                 .to_string(),
@@ -3595,7 +3595,7 @@ fn reject_unsupported_function_arguments(args: &[&Expr]) -> Result<(), String> {
     Ok(())
 }
 
-fn is_non_deterministic_function(name: &str, args: &[&Expr]) -> bool {
+fn is_non_deterministic_function(name: &str) -> bool {
     matches!(
         name,
         "now"
@@ -3603,30 +3603,18 @@ fn is_non_deterministic_function(name: &str, args: &[&Expr]) -> bool {
             | "localtime"
             | "localtimestamp"
             | "current_date"
-            | "curdate"
             | "current_time"
-            | "curtime"
             | "random"
             | "rand"
             | "uuid"
-    ) || (name == "unix_timestamp" && function_argument_count(args) == Some(0))
+    )
 }
 
 fn is_non_deterministic_bare_identifier(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "current_timestamp"
-            | "localtime"
-            | "localtimestamp"
-            | "current_date"
-            | "curdate"
-            | "current_time"
-            | "curtime"
+        "current_timestamp" | "localtime" | "localtimestamp" | "current_date" | "current_time"
     )
-}
-
-fn function_argument_count(args: &[&Expr]) -> Option<usize> {
-    Some(args.len())
 }
 
 fn is_window_only_function(name: &str) -> bool {
@@ -4756,10 +4744,9 @@ mod tests {
         for sql in [
             "select \"current_date\" from ice.ns.orders",
             "select \"current_time\" from ice.ns.orders",
-            "select curtime() from ice.ns.orders",
             "select \"localtime\" from ice.ns.orders",
             "select \"localtimestamp\" from ice.ns.orders",
-            "select unix_timestamp() from ice.ns.orders",
+            r#"select "current_date"() from ice.ns.orders"#,
         ] {
             assert_rejects_with(sql, "non-deterministic");
         }
@@ -4778,8 +4765,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_unix_timestamp_with_argument() {
-        classify_sql("select unix_timestamp(k1) from ice.ns.orders")
+    fn accepts_to_unixtime_with_explicit_zoned_argument() {
+        classify_sql("select to_unixtime(TIMESTAMP '2024-03-01 00:00:00 UTC') from ice.ns.orders")
             .expect("query should be accepted");
     }
 }
@@ -6053,7 +6040,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
                     "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
                 ));
             }
-            if is_unsupported_contract_scalar_function(name, args.len()) {
+            if is_unsupported_contract_scalar_function(name) {
                 return Err(format!(
                     "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
                 ));
@@ -6216,7 +6203,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
                     "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
                 ));
             }
-            if is_unsupported_contract_scalar_function(name, args.len()) {
+            if is_unsupported_contract_scalar_function(name) {
                 return Err(format!(
                     "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
                 ));
@@ -6268,7 +6255,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
     }
 }
 
-fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool {
+fn is_unsupported_contract_scalar_function(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "now"
@@ -6276,9 +6263,7 @@ fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool
             | "localtime"
             | "localtimestamp"
             | "current_date"
-            | "curdate"
             | "current_time"
-            | "curtime"
             | "random"
             | "rand"
             | "uuid"
@@ -6288,7 +6273,7 @@ fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool
             | "current_user"
             | "user"
             | "grouping"
-    ) || (name.eq_ignore_ascii_case("unix_timestamp") && arg_count == 0)
+    )
 }
 
 fn relation_qualifiers(relation: &Relation) -> Result<Vec<String>, String> {

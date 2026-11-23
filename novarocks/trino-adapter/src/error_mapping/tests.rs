@@ -237,7 +237,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "sql.admit.insert_unsupported_form"
         | "sql.admit.create_table_unsupported_form"
         | "UnsupportedCompiledShape"
-        | "query.execution.unsupported" => "NOT_SUPPORTED",
+        | "query.execution.unsupported"
+        | "query.execution.unknown_epoch_time_zone" => "NOT_SUPPORTED",
         "sql.admit.invalid_session_property" => "INVALID_SESSION_PROPERTY",
         "sql.admit.session_catalog_not_found" => "CATALOG_NOT_FOUND",
         "sql.admit.kill_denied" => "PERMISSION_DENIED",
@@ -245,7 +246,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "query.execution.invariant"
         | "query.execution.unexpected"
         | "query.execution.control"
-        | "query.execution.commit_unknown" => "GENERIC_INTERNAL_ERROR",
+        | "query.execution.commit_unknown"
+        | "query.execution.date_result_out_of_range" => "GENERIC_INTERNAL_ERROR",
         "query.execution.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
         "query.execution.division_by_zero" => "DIVISION_BY_ZERO",
         "query.execution.invalid_cast_argument" => "INVALID_CAST_ARGUMENT",

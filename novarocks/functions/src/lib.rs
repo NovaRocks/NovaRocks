@@ -65,7 +65,6 @@ pub mod bitmap_value;
 pub mod builtin;
 pub mod calendar_julian;
 pub mod calendar_numeric;
-pub mod calendar_period_numeric;
 mod call_contract;
 #[cfg(test)]
 mod carrier_map_tests;

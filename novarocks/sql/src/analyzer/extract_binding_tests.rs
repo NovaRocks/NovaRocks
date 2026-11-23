@@ -18,12 +18,12 @@
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
 use novarocks_functions::{ConstantPolicy, FunctionArgumentType, FunctionResultType};
 use novarocks_parser::ast;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
-    PureCompileControl, ValueLogicalType,
+    PureCompileControl, TemporalPrecision, TemporalType,
 };
 use novarocks_types::schema::{ColumnDef, SqlType};
 
@@ -133,7 +133,7 @@ fn assert_selected(expr: &TypedExpr, name: &str, expected: &FunctionValueType) {
         &[FunctionArgumentType::Value(expected.clone())]
     );
     assert_eq!(&args[0].value_type, expected);
-    let result = FunctionValueType::new(DataType::Int32, true);
+    let result = FunctionValueType::new(DataType::Int64, expected.nullable());
     assert_eq!(
         binding.selected.result_type,
         FunctionResultType::Scalar(result.clone())
@@ -142,24 +142,17 @@ fn assert_selected(expr: &TypedExpr, name: &str, expected: &FunctionValueType) {
 }
 
 #[test]
-fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog_sources() {
-    let mut sources = Vec::new();
-    for unit in [
-        TimeUnit::Second,
-        TimeUnit::Millisecond,
-        TimeUnit::Microsecond,
-        TimeUnit::Nanosecond,
-    ] {
-        for zone in [None, Some("UTC".into())] {
-            sources.push((DataType::Timestamp(unit, zone), None));
+fn extract_binding_retains_exact_temporal_types_and_matches_named_calls() {
+    let mut sources = vec![(DataType::Date32, None)];
+    for precision in [0, 3, 6, 9, 12] {
+        let precision = TemporalPrecision::new(precision).unwrap();
+        for temporal in [
+            TemporalType::Timestamp(precision),
+            TemporalType::TimestampWithTimeZone(precision),
+        ] {
+            sources.push((temporal.carrier(), Some(SqlType::Temporal(temporal))));
         }
     }
-    sources.extend([
-        (DataType::LargeUtf8, None),
-        (DataType::Utf8, None),
-        (DataType::Date32, None),
-        (DataType::FixedSizeBinary(16), Some(SqlType::LargeInt)),
-    ]);
     for (carrier, logical) in sources {
         for nullable in [false, true] {
             let catalog = TemporalCatalog {
@@ -167,72 +160,28 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
                 logical: logical.clone(),
                 nullable,
             };
-            let original = if logical == Some(SqlType::LargeInt) {
-                FunctionValueType::try_with_logical_type(
-                    carrier.clone(),
-                    nullable,
-                    ValueLogicalType::LargeInt,
-                )
-                .unwrap()
-            } else {
-                FunctionValueType::new(carrier.clone(), nullable)
-            };
-            let target_carrier = match &carrier {
-                DataType::Timestamp(_, _) => DataType::Timestamp(TimeUnit::Microsecond, None),
-                DataType::LargeUtf8 => DataType::Utf8,
-                other => other.clone(),
-            };
-            let target = if logical == Some(SqlType::LargeInt) {
-                FunctionValueType::try_with_logical_type(
-                    target_carrier,
-                    nullable,
-                    ValueLogicalType::LargeInt,
-                )
-                .unwrap()
-            } else {
-                FunctionValueType::new(
-                    target_carrier,
-                    nullable
-                        || matches!(
-                            carrier,
-                            // Arrow offset narrowing retains its conservative NULL declaration.
-                            DataType::LargeUtf8
-                                | DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, _)
-                        ),
-                )
-            };
-            for name in ["year", "month", "day", "hour", "minute", "second"] {
-                let sql = format!("SELECT EXTRACT({name} FROM x), {name}(x) FROM temporal_source");
+            for (field, name) in [
+                ("YEAR", "year"),
+                ("MONTH", "month"),
+                ("DAY", "day"),
+                ("QUARTER", "quarter"),
+                ("WEEK", "week"),
+                ("DAY_OF_WEEK", "day_of_week"),
+            ] {
+                let sql =
+                    format!("SELECT x, EXTRACT({field} FROM x), {name}(x) FROM temporal_source");
                 let query =
                     analyze(&sql, &catalog, crate::constant::test_constant_policy()).unwrap();
-                let special = project(&query, 0);
-                let ordinary = project(&query, 1);
-                assert_selected(special, name, &target);
-                assert_selected(ordinary, name, &target);
-                assert_eq!(call(special).1.selected, call(ordinary).1.selected);
-                for expression in [special, ordinary] {
-                    let argument = &call(expression).2[0];
-                    if original.data_type() != target.data_type() {
-                        let ExprKind::Cast {
-                            cast_mode: None,
-                            expr,
-                            target: cast_target,
-                            decimal_overflow_policy,
-                        } = &argument.kind
-                        else {
-                            panic!("source-preserving carrier cast: {sql}");
-                        };
-                        assert_eq!(&expr.value_type, &original);
-                        assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
-                        assert_eq!(cast_target, target.data_type());
-                        assert_eq!(
-                            *decimal_overflow_policy,
-                            call(expression).1.decimal_overflow_policy()
-                        );
-                    } else {
-                        assert!(matches!(argument.kind, ExprKind::ColumnRef { .. }));
-                        assert_eq!(argument.value_type, original);
-                    }
+                let original = &project(&query, 0).value_type;
+                assert_eq!(original.data_type(), &carrier);
+                assert_eq!(original.nullable(), nullable);
+                for ordinal in [1, 2] {
+                    let expression = project(&query, ordinal);
+                    assert_selected(expression, name, original);
+                    assert!(matches!(
+                        call(expression).2[0].kind,
+                        ExprKind::ColumnRef { .. }
+                    ));
                 }
             }
         }
@@ -240,7 +189,7 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
 }
 
 #[test]
-fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_original_span() {
+fn extract_binding_rejects_non_temporal_carriers_and_invalid_fields_at_original_span() {
     for logical in [None, Some(SqlType::Uuid)] {
         let catalog = TemporalCatalog {
             carrier: DataType::FixedSizeBinary(16),
@@ -253,7 +202,12 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
         ] {
             let error =
                 analyze(sql, &catalog, crate::constant::test_constant_policy()).unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
+            let expected = if sql.contains("EXTRACT") {
+                AnalyzeErrorKind::TypeMismatch
+            } else {
+                AnalyzeErrorKind::UnknownFunction
+            };
+            assert_eq!(error.kind(), expected);
             assert!(error.control_error().is_none());
         }
     }
@@ -262,7 +216,7 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
         logical: None,
         nullable: false,
     };
-    let sql = "SELECT EXTRACT(QUARTER FROM x) FROM temporal_source";
+    let sql = "SELECT EXTRACT(HOUR FROM x) FROM temporal_source";
     let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
@@ -275,17 +229,17 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
         panic!("extract");
     };
     let error = analyze(sql, &catalog, crate::constant::test_constant_policy()).unwrap_err();
-    assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+    assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
     assert_eq!(error.span(), Some(extract.span));
-    assert_eq!(error.message(), "unsupported EXTRACT field: quarter");
 }
 
 #[test]
 fn extract_binding_inherits_root_policy_null_sources_and_explicit_constant_admission() {
     use DecimalOverflowPolicy::{OutputNull, ReportError};
+    let temporal = TemporalType::TimestampWithTimeZone(TemporalPrecision::WHOLE_SECONDS);
     let catalog = TemporalCatalog {
-        carrier: DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
-        logical: None,
+        carrier: temporal.carrier(),
+        logical: Some(SqlType::Temporal(temporal)),
         nullable: false,
     };
     for (outer, outer_policy) in [("ERROR_IF_OVERFLOW", ReportError), ("32", OutputNull)] {
@@ -317,26 +271,16 @@ fn extract_binding_inherits_root_policy_null_sources_and_explicit_constant_admis
                 outer_policy
             );
         }
-        for (query, ordinals, policy) in [
-            (&query, [0, 1], outer_policy),
-            (inner_query.as_ref(), [1, 2], outer_policy),
-        ] {
+        for (query, ordinals) in [(&query, [0, 1]), (inner_query.as_ref(), [1, 2])] {
             for ordinal in ordinals {
-                let ExprKind::Cast {
-                    decimal_overflow_policy,
-                    expr,
-                    ..
-                } = &call(project(query, ordinal)).2[0].kind
-                else {
-                    panic!("canonical carrier cast");
-                };
-                assert_eq!(*decimal_overflow_policy, policy);
-                assert_eq!(expr.value_type.data_type().clone(), catalog.carrier);
+                let argument = &call(project(query, ordinal)).2[0];
+                assert!(matches!(argument.kind, ExprKind::ColumnRef { .. }));
+                assert_eq!(argument.value_type.data_type(), &catalog.carrier);
             }
         }
     }
     let query = analyze(
-        "SELECT EXTRACT(YEAR FROM NULL), year(NULL)",
+        "SELECT EXTRACT(YEAR FROM CAST(NULL AS DATE)), year(CAST(NULL AS DATE))",
         &catalog,
         crate::constant::test_constant_policy(),
     )
@@ -353,8 +297,8 @@ fn extract_binding_inherits_root_policy_null_sources_and_explicit_constant_admis
     let mut policy = crate::constant::test_constant_policy();
     policy.max_rows = 0;
     for sql in [
-        "SELECT EXTRACT(YEAR FROM '2024-02-29')",
-        "SELECT year('2024-02-29')",
+        "SELECT EXTRACT(YEAR FROM DATE '2024-02-29')",
+        "SELECT year(DATE '2024-02-29')",
     ] {
         let error = analyze(sql, &catalog, policy).unwrap_err();
         assert!(error.control_error().is_none());
@@ -405,7 +349,7 @@ impl PureCompileControl for Trace {
 fn extract_binding_sole_canonical_helper_preserves_every_original_control_prefix() {
     // The whole analyzer uses concrete deadline/cancellation control. This
     // trace tests its same production binder with actual analyzed source facts.
-    for carrier in [DataType::LargeUtf8, DataType::FixedSizeBinary(16)] {
+    for carrier in [DataType::Date32, DataType::FixedSizeBinary(16)] {
         let catalog = TemporalCatalog {
             carrier: carrier.clone(),
             logical: None,
@@ -427,7 +371,7 @@ fn extract_binding_sole_canonical_helper_preserves_every_original_control_prefix
             crate::constant::test_constant_policy(),
             &good,
         );
-        assert_eq!(result.is_ok(), carrier == DataType::LargeUtf8);
+        assert_eq!(result.is_ok(), carrier == DataType::Date32);
         let trace = good.callbacks.lock().unwrap().clone();
         assert!(!trace.is_empty());
         for at in 0..trace.len() {
@@ -644,14 +588,14 @@ fn extract_binding_custom_same_spelling_result_is_owned_by_actual_selected_decla
 }
 
 #[test]
-fn extract_unsupported_field_keeps_typeof_cast_hint_without_analyzing_input() {
+fn extract_keeps_typeof_cast_hint_without_analyzing_input() {
     let catalog = TemporalCatalog {
         carrier: DataType::Date32,
         logical: None,
         nullable: false,
     };
     let query = analyze(
-        "SELECT typeof(CAST(EXTRACT(QUARTER FROM must_not_resolve) AS INT))",
+        "SELECT typeof(CAST(EXTRACT(HOUR FROM must_not_resolve) AS INT))",
         &catalog,
         crate::constant::test_constant_policy(),
     )
