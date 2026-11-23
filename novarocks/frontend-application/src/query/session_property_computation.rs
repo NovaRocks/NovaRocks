@@ -441,7 +441,10 @@ impl SessionPropertyEvaluation<'_> {
         let constant_failure =
             |error| QueryServiceError::from_failure_cause(SharedFailureCause::new(error));
         let missing = || super::internal_error("SET TIME ZONE expression returned NULL");
-        if matches!(value.value_type().value_type().kind(), ValueKind::String) {
+        if matches!(
+            value.value_type().value_type().kind(),
+            ValueKind::String | ValueKind::BoundedCharacter(_)
+        ) {
             let name = value
                 .utf8_observed(CompilePhase::Validate, self.control)
                 .map_err(constant_failure)?
