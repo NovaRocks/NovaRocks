@@ -859,7 +859,7 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
         )),
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),
-        SqlType::String | SqlType::Json => Ok(DataType::Utf8),
+        SqlType::String | SqlType::BoundedCharacter(_) | SqlType::Json => Ok(DataType::Utf8),
         SqlType::Binary
         | SqlType::Bitmap
         | SqlType::Hll
@@ -1939,6 +1939,7 @@ mod source_failure_tests {
     fn generic_date_json_and_decoded_binary_keep_original_literal_producer_values() {
         for (source, expected) in [
             ("DATE '2024-01-02'", Literal::String("2024-01-02".into())),
+            ("INTEGER '1'", Literal::String("1".into())),
             ("JSON '{\"a\":1}'", Literal::String("{\"a\":1}".into())),
             (
                 "TIMESTAMP '2024-01-02 03:04:05.123456'",
@@ -1954,7 +1955,7 @@ mod source_failure_tests {
         }
         let unknown = ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Generic(ast::GenericLiteral {
-                type_name: "INTEGER".into(),
+                type_name: "NOT_A_SQL_TYPE".into(),
                 value: "1".into(),
             }),
             span: novarocks_parser::Span::new(0, 11),

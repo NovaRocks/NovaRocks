@@ -19,7 +19,7 @@
 //! an outward format projection and supply none of these semantic decisions.
 
 use crate::iceberg::spec::{PrimitiveType, Type};
-use crate::typed_read::runtime::IcebergReadLayout;
+use crate::typed_read::runtime::IcebergReadProjection;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_connector_contract::{ConnectorError, ConnectorErrorKind, PureProviderCompileError};
 use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
@@ -29,15 +29,62 @@ use novarocks_type_contract::{
 use std::sync::Arc;
 
 pub(crate) type Failure = PureProviderCompileError<ConnectorError>;
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 enum DeclarationPurpose {
-    Read(IcebergReadLayout),
+    Read(IcebergReadProjection),
+    Storage,
     CanonicalWriteInput,
 }
 
 pub(crate) struct DeclaredValue {
     pub(crate) source_layout: DataType,
     pub(crate) binding: FunctionValueType,
+}
+
+/// A raw Fixed value is projected only when the formal Iceberg type and its
+/// validated field-ID domain agree that it is plain storage.
+pub(crate) fn plain_fixed_width(
+    primitive: &PrimitiveType,
+    domain: ValueLogicalType,
+) -> Option<i32> {
+    match (primitive, domain) {
+        (PrimitiveType::Fixed(width), ValueLogicalType::Physical) => i32::try_from(*width).ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn contains_plain_fixed(
+    fields: &[Arc<crate::iceberg::spec::NestedField>],
+    nominals: &super::nominal_declaration::NominalSourceDeclarations,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<bool, Failure> {
+    for field in fields {
+        creation.work(1)?;
+        let contains = match field.field_type.as_ref() {
+            Type::Primitive(primitive) => {
+                matches!(primitive, PrimitiveType::Fixed(_)) && !nominals.contains_key(&field.id)
+            }
+            Type::Struct(fields) => contains_plain_fixed(fields.fields(), nominals, creation)?,
+            Type::List(list) => contains_plain_fixed(
+                std::slice::from_ref(&list.element_field),
+                nominals,
+                creation,
+            )?,
+            Type::Map(map) => {
+                contains_plain_fixed(std::slice::from_ref(&map.key_field), nominals, creation)?
+                    || contains_plain_fixed(
+                        std::slice::from_ref(&map.value_field),
+                        nominals,
+                        creation,
+                    )?
+            }
+            Type::Variant(_) => false,
+        };
+        if contains {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn invalid(message: &'static str) -> Failure {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message).into()
@@ -66,7 +113,7 @@ pub(crate) fn from_declaration(
         nominal,
         integer,
         &Default::default(),
-        DeclarationPurpose::Read(IcebergReadLayout::Offsets),
+        DeclarationPurpose::Storage,
         creation,
     )
 }
@@ -76,7 +123,7 @@ pub(crate) fn from_field(
     nullable: bool,
     nominals: &super::nominal_declaration::NominalSourceDeclarations,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
-    layout: IcebergReadLayout,
+    projection: IcebergReadProjection,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<DeclaredValue, Failure> {
     from_declaration_with_nominals(
@@ -85,7 +132,24 @@ pub(crate) fn from_field(
         nominals.get(&field.id).map(|domain| domain.logical_type()),
         integer,
         nominals,
-        DeclarationPurpose::Read(layout),
+        DeclarationPurpose::Read(projection),
+        creation,
+    )
+}
+
+pub(crate) fn from_storage_field(
+    field: &crate::iceberg::spec::NestedField,
+    nominals: &super::nominal_declaration::NominalSourceDeclarations,
+    integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<DeclaredValue, Failure> {
+    from_declaration_with_nominals(
+        &field.field_type,
+        !field.required,
+        nominals.get(&field.id).map(|domain| domain.logical_type()),
+        integer,
+        nominals,
+        DeclarationPurpose::Storage,
         creation,
     )
 }
@@ -168,7 +232,7 @@ fn author(
     let storage = creation.storage();
     let (source, layout, kind) = match declaration {
         Type::Primitive(_) | Type::Variant(_) => {
-            let (mut data_type, domain) = match declaration {
+            let (source, domain) = match declaration {
                 Type::Primitive(primitive) => (
                     primitive_layout(primitive, integer)?,
                     nominal.unwrap_or(match primitive {
@@ -191,15 +255,23 @@ fn author(
                 }
                 _ => unreachable!("scalar declaration arm"),
             };
-            if purpose == DeclarationPurpose::CanonicalWriteInput
-                && domain == ValueLogicalType::Physical
-                && matches!(declaration, Type::Primitive(PrimitiveType::Fixed(_)))
-            {
-                data_type = DataType::Binary;
-            }
-            domain.validate_carrier(&data_type).map_err(|_| {
+            domain.validate_carrier(&source).map_err(|_| {
                 invalid("Iceberg source domain conflicts with its declared primitive carrier")
             })?;
+            let raw_fixed = match declaration {
+                Type::Primitive(primitive) => plain_fixed_width(primitive, domain).is_some(),
+                _ => false,
+            };
+            let projects_fixed_as_binary = match purpose {
+                DeclarationPurpose::Read(projection) => projection.projects_fixed_as_binary(),
+                DeclarationPurpose::Storage => false,
+                DeclarationPurpose::CanonicalWriteInput => true,
+            };
+            let data_type = if raw_fixed && projects_fixed_as_binary {
+                DataType::Binary
+            } else {
+                source.clone()
+            };
             let kind = match domain {
                 ValueLogicalType::Physical => match data_type {
                     DataType::Utf8 => ValueKind::String,
@@ -209,10 +281,12 @@ fn author(
                 domain => ValueKind::Nominal(domain),
             };
             let layout = match purpose {
-                DeclarationPurpose::Read(layout) => layout.byte_carrier(&data_type, domain),
-                DeclarationPurpose::CanonicalWriteInput => data_type.clone(),
+                DeclarationPurpose::Read(projection) if !raw_fixed => {
+                    projection.byte_carrier(&data_type, domain)
+                }
+                _ => data_type.clone(),
             };
-            (data_type, layout, kind)
+            (source, layout, kind)
         }
         Type::Struct(fields) => {
             if nominal.is_some() || integer.is_some() {

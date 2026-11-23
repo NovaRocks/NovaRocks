@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
-use arrow::datatypes::{DataType, Field, Fields};
+#[cfg(test)]
+use arrow::datatypes::DataType;
 use novarocks_parser::ast;
 
 use crate::analyze_error::AnalyzeError;
@@ -138,497 +137,52 @@ pub(super) fn assignment_common_value_type(
     work.finish_result(result, AssignmentCommonTypeError::Control)
         .map_err(|error| match error {
             AssignmentCommonTypeError::Control(cause) => AnalyzeError::control(cause),
+            error @ AssignmentCommonTypeError::IncompatibleShape(_) => {
+                AnalyzeError::type_mismatch(error.to_string(), novarocks_parser::SYNTHETIC)
+            }
             error => AnalyzeError::internal(error.to_string()),
         })
 }
 
-/// A declared JSON cast does not validate ordinary non-NULL text. Transform
-/// explicit semantics recursively while retaining the declared exact layout.
-pub(super) fn declared_cast_value_type(
-    source: &crate::analysis::TypedExpr,
-    declared: novarocks_type_contract::FunctionValueType,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
-    if matches!(
-        source.kind,
-        crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Null)
-    ) {
-        return Ok(declared);
-    }
-    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-        control,
-        novarocks_type_contract::CompilePhase::Validate,
-    )
-    .map_err(AnalyzeError::control)?;
-    let semantics = cast_semantics(
-        declared.value_type(),
-        source.value_type.value_type(),
-        &mut work,
-    )?;
-    work.finish().map_err(AnalyzeError::control)?;
-    novarocks_type_contract::FunctionValueType::try_from_value(
-        semantics,
-        declared.typed_binding().layout().clone(),
-    )
-    .map_err(|e| AnalyzeError::internal(e.to_string()))
-}
-fn cast_semantics(
-    target: &novarocks_type_contract::ValueTypeRef,
-    source: &novarocks_type_contract::ValueTypeRef,
-    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-) -> Result<novarocks_type_contract::ValueTypeRef, AnalyzeError> {
-    use novarocks_type_contract::{
-        ValueField, ValueKind, ValueLogicalType, ValueTypeStorageLifetime,
-    };
-    work.step().map_err(AnalyzeError::control)?;
-    if matches!(source.kind(), ValueKind::Scalar(DataType::Null)) {
-        return Ok(target.clone());
-    }
-    if target.domain() == Some(ValueLogicalType::Json)
-        && source.domain() != Some(ValueLogicalType::Json)
-    {
-        return novarocks_type_contract::ValueTypeRef::try_new(
-            ValueKind::String,
-            target.nullable(),
-            ValueTypeStorageLifetime::pure(),
-        )
-        .map_err(|e| AnalyzeError::internal(e.to_string()));
-    }
-    let child = |index: usize,
-                 value: &novarocks_type_contract::ValueTypeRef,
-                 work: &mut novarocks_type_contract::CompileCheckpoints<'_>| {
-        match source.child_type_at(index) {
-            Some(source) => cast_semantics(value, source, work),
-            None => Ok(value.clone()),
-        }
-    };
-    let kind = match target.kind() {
-        ValueKind::List(item) => ValueKind::List(child(0, item, work)?),
-        ValueKind::FixedSizeList { item, length } => ValueKind::FixedSizeList {
-            item: child(0, item, work)?,
-            length: *length,
-        },
-        ValueKind::Map { key, value } => ValueKind::Map {
-            key: child(0, key, work)?,
-            value: child(1, value, work)?,
-        },
-        ValueKind::Struct(fields) => {
-            let mut output = Vec::with_capacity(fields.len());
-            for (index, field) in fields.iter().enumerate() {
-                let value = child(index, field.value_type(), work)?;
-                for _ in field.name().bytes() {
-                    work.step().map_err(AnalyzeError::control)?;
-                }
-                output.push(ValueField::new(
-                    field.name(),
-                    value,
-                    ValueTypeStorageLifetime::pure(),
-                ));
-            }
-            ValueKind::Struct(output.into())
-        }
-        _ => return Ok(target.clone()),
-    };
-    novarocks_type_contract::ValueTypeRef::try_new(
-        kind,
-        target.nullable(),
-        ValueTypeStorageLifetime::pure(),
-    )
-    .map_err(|e| AnalyzeError::internal(e.to_string()))
-}
-
-fn declared_root(sql_type: &ast::TypeName) -> novarocks_type_contract::ValueLogicalType {
-    use novarocks_type_contract::ValueLogicalType as V;
-    let ast::TypeKind::Generic(generic) = &sql_type.kind else {
-        return V::Physical;
-    };
-    match generic.name.value.to_ascii_lowercase().as_str() {
-        "json" | "jsonb" => V::Json,
-        "variant" => V::Variant,
-        "largeint" => V::LargeInt,
-        "hll" => V::Hll,
-        "bitmap" => V::Bitmap,
-        _ => V::Physical,
-    }
-}
-
-fn generic_type_arguments(
-    sql_type: &ast::TypeName,
-) -> Result<&[ast::DataTypeParameter], AnalyzeError> {
-    match &sql_type.kind {
-        ast::TypeKind::Generic(generic) => Ok(&generic.arguments),
-        _ => Err(AnalyzeError::internal(
-            "container layout lost its generic SQL type author",
-        )),
-    }
-}
-
-/// The AST declaration establishes identity; its carrier alone never does.
+/// Resolve a CAST or typed source declaration under the original analysis control.
 pub(super) fn sql_type_to_value_type(
     sql_type: &ast::TypeName,
     nullable: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_type_contract::FunctionValueType, AnalyzeError> {
-    use novarocks_type_contract::{
-        CompileCheckpoints, CompilePhase, ValueLayout, ValueTypeStorageLifetime,
-    };
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
-        .map_err(AnalyzeError::control)?;
-    validate_ast_type(sql_type, 1, &mut 0, &mut work)?;
-    work.flush().map_err(AnalyzeError::control)?;
-    let carrier = sql_type_to_arrow(sql_type)?;
-    work.flush().map_err(AnalyzeError::control)?;
-    let layout = ValueLayout::try_from_normalized_arrow(carrier, ValueTypeStorageLifetime::pure())
-        .map_err(|e| AnalyzeError::invalid_argument(e.to_string(), sql_type.span))?;
-    let value = author_ast_type(sql_type, layout.data_type(), nullable, &mut work)?;
-    work.finish().map_err(AnalyzeError::control)?;
-    novarocks_type_contract::FunctionValueType::try_from_value(value, layout)
-        .map_err(|e| AnalyzeError::invalid_argument(e.to_string(), sql_type.span))
-}
-fn validate_ast_type(
-    sql_type: &ast::TypeName,
-    depth: usize,
-    nodes: &mut usize,
-    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-) -> Result<(), AnalyzeError> {
-    work.step().map_err(AnalyzeError::control)?;
-    *nodes += 1;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-        || *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES
-    {
-        return Err(AnalyzeError::invalid_argument(
-            "SQL type exceeds the recursive type profile",
-            sql_type.span,
-        ));
-    }
-    match &sql_type.kind {
-        ast::TypeKind::Generic(generic) => {
-            for parameter in &generic.arguments {
-                match parameter {
-                    ast::DataTypeParameter::Type(child) => {
-                        validate_ast_type(&child.data_type, depth + 1, nodes, work)?
-                    }
-                    ast::DataTypeParameter::Numeric(_) => {
-                        work.step().map_err(AnalyzeError::control)?
-                    }
-                }
-            }
-        }
-        ast::TypeKind::Row(row) => {
-            for field in &row.fields {
-                validate_ast_type(&field.data_type, depth + 1, nodes, work)?;
-            }
-        }
-        ast::TypeKind::DateTime(_) => {}
-        ast::TypeKind::Interval(_) => {
-            return Err(AnalyzeError::unsupported_expression(
-                "INTERVAL data types are not supported",
-                sql_type.span,
-            ));
-        }
-        ast::TypeKind::ExplicitArray(_) => {
-            return Err(AnalyzeError::unsupported_expression(
-                "explicit ARRAY lengths are not supported",
-                sql_type.span,
-            ));
-        }
-    }
-    Ok(())
-}
-fn author_ast_type(
-    sql_type: &ast::TypeName,
-    layout: &DataType,
-    nullable: bool,
-    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-) -> Result<novarocks_type_contract::ValueTypeRef, AnalyzeError> {
-    use novarocks_type_contract::{
-        ValueField, ValueKind, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
-    };
-    work.step().map_err(AnalyzeError::control)?;
-    let storage = ValueTypeStorageLifetime::pure();
-    let domain = declared_root(sql_type);
-    let kind = if domain != ValueLogicalType::Physical {
-        ValueKind::Nominal(domain)
-    } else {
-        match layout {
-            DataType::List(item) => ValueKind::List(author_ast_type(
-                type_type_argument(generic_type_arguments(sql_type)?, 0, "ARRAY", sql_type.span)?,
-                item.data_type(),
-                item.is_nullable(),
-                work,
-            )?),
-            DataType::Map(entries, _) => {
-                let DataType::Struct(fields) = entries.data_type() else {
-                    return Err(AnalyzeError::internal(
-                        "authored Map entries are not Struct",
-                    ));
-                };
-                ValueKind::Map {
-                    key: author_ast_type(
-                        type_type_argument(
-                            generic_type_arguments(sql_type)?,
-                            0,
-                            "MAP",
-                            sql_type.span,
-                        )?,
-                        fields[0].data_type(),
-                        false,
-                        work,
-                    )?,
-                    value: author_ast_type(
-                        type_type_argument(
-                            generic_type_arguments(sql_type)?,
-                            1,
-                            "MAP",
-                            sql_type.span,
-                        )?,
-                        fields[1].data_type(),
-                        fields[1].is_nullable(),
-                        work,
-                    )?,
-                }
-            }
-            DataType::Struct(fields) => {
-                let mut values = Vec::with_capacity(fields.len());
-                let ast::TypeKind::Row(row) = &sql_type.kind else {
-                    return Err(AnalyzeError::internal(
-                        "Struct layout lost its ROW syntax author",
-                    ));
-                };
-                for (field, argument) in fields.iter().zip(&row.fields) {
-                    let child = &argument.data_type;
-                    let value =
-                        author_ast_type(child, field.data_type(), field.is_nullable(), work)?;
-                    for _ in field.name().bytes() {
-                        work.step().map_err(AnalyzeError::control)?;
-                    }
-                    values.push(ValueField::new(
-                        field.name().as_str(),
-                        value,
-                        storage.clone(),
-                    ));
-                }
-                ValueKind::Struct(values.into())
-            }
-            DataType::Utf8 | DataType::LargeUtf8 => ValueKind::String,
-            DataType::Binary | DataType::LargeBinary => ValueKind::Binary,
-            scalar => ValueKind::Scalar(scalar.clone()),
-        }
-    };
-    ValueTypeRef::try_new(kind, nullable, storage)
-        .map_err(|e| AnalyzeError::invalid_argument(e.to_string(), sql_type.span))
+    novarocks_expression::typing::declaration::resolve_trino_type(sql_type, nullable, control)
+        .map_err(type_declaration_error)
 }
 
-// SQL layout projection contains no semantic annotation. Its caller retains
-// the separately authored complete type for each node.
-fn nested_field_with_logical_type(
-    name: &str,
-    sql_type: &ast::TypeName,
-    nullable: bool,
-) -> Result<Field, AnalyzeError> {
-    Ok(Field::new(name, sql_type_to_arrow(sql_type)?, nullable))
-}
+pub(super) fn type_declaration_error(
+    error: novarocks_expression::typing::declaration::TypeDeclarationError,
+) -> AnalyzeError {
+    use novarocks_expression::typing::declaration::TypeDeclarationProblem;
 
-pub(super) fn sql_type_to_arrow(
-    sql_type: &novarocks_parser::ast::TypeName,
-) -> Result<DataType, AnalyzeError> {
-    let generic = match &sql_type.kind {
-        ast::TypeKind::Generic(generic) => generic,
-        ast::TypeKind::Row(row) => {
-            let fields = row
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    let name = field
-                        .name
-                        .as_ref()
-                        .map(|name| name.value.clone())
-                        .unwrap_or_else(|| format!("f{}", index + 1));
-                    nested_field_with_logical_type(&name, &field.data_type, true).map(Arc::new)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(DataType::Struct(Fields::from(fields)));
+    match error.problem {
+        TypeDeclarationProblem::UnknownType | TypeDeclarationProblem::InvalidParameters => {
+            AnalyzeError::type_mismatch(error.to_string(), error.span)
         }
-        ast::TypeKind::DateTime(datetime) => {
-            if datetime.with_time_zone || datetime.precision.as_deref().is_some_and(|parameter| !matches!(parameter, ast::DataTypeParameter::Numeric(value) if value.parsed_value == 6)) {
-                return Err(AnalyzeError::unsupported_expression("TIME/TIMESTAMP only support microsecond precision without time zone", sql_type.span));
-            }
-            return Ok(match datetime.kind {
-                ast::DateTimeType::Time => {
-                    DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
-                }
-                ast::DateTimeType::Timestamp => {
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-                }
-            });
+        TypeDeclarationProblem::InvalidDecimalParameters => {
+            AnalyzeError::invalid_type_argument(error.to_string(), error.span)
         }
-        ast::TypeKind::Interval(_) => {
-            return Err(AnalyzeError::unsupported_expression(
-                "INTERVAL data types are not supported",
-                sql_type.span,
-            ));
+        TypeDeclarationProblem::Unsupported => {
+            AnalyzeError::unsupported_expression(error.to_string(), error.span)
         }
-        ast::TypeKind::ExplicitArray(_) => {
-            return Err(AnalyzeError::unsupported_expression(
-                "explicit ARRAY lengths are not supported",
-                sql_type.span,
-            ));
+        TypeDeclarationProblem::Control => {
+            AnalyzeError::control(error.control.expect("original type declaration control"))
         }
-    };
-    let type_name = generic.name.value.to_ascii_lowercase();
-    let type_args = &generic.arguments;
-    match type_name.as_str() {
-        "tinyint" => Ok(DataType::Int8),
-        "smallint" => Ok(DataType::Int16),
-        "int" | "integer" => Ok(DataType::Int32),
-        "bigint" => Ok(DataType::Int64),
-        "float" | "real" => Ok(DataType::Float32),
-        "double" | "double precision" => Ok(DataType::Float64),
-        "boolean" | "bool" => Ok(DataType::Boolean),
-        "varchar" | "char" | "character" | "string" | "text" => Ok(DataType::Utf8),
-        "json" | "jsonb" => Ok(DataType::Utf8),
-        "varbinary" | "binary" | "bitmap" | "hll" => Ok(DataType::Binary),
-        "date" => Ok(DataType::Date32),
-        "datetime" | "timestamp" | "timestamptz" => Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        )),
-        "time" => Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)),
-        "largeint" => Ok(DataType::FixedSizeBinary(
-            novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
-        )),
-        "variant" => Ok(DataType::LargeBinary),
-        "datetime_ns" | "timestamp_ns" | "timestamptz_ns" => Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Nanosecond,
-            None,
-        )),
-        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            if type_args.len() > 2 {
-                return Err(AnalyzeError::invalid_argument(
-                    "DECIMAL type accepts at most precision and scale",
-                    sql_type.span,
-                ));
-            }
-            // Generic SQL DECIMAL chooses its carrier by precision. Explicit
-            // width aliases keep their declared domain; small decimals retain
-            // the engine's existing Decimal128 representation.
-            let (max_precision, default_precision) = match type_name.as_str() {
-                "decimal32" => (9_u64, 9_u64),
-                "decimal64" => (18, 18),
-                "decimal128" => (38, 38),
-                _ => (76, 38),
-            };
-            let precision = type_numeric_argument(type_args, 0)?.unwrap_or(default_precision);
-            let scale = type_numeric_argument(type_args, 1)?.unwrap_or(0);
-            if precision == 0 || precision > max_precision {
-                return Err(AnalyzeError::invalid_argument(
-                    format!(
-                        "{type_name} precision {precision} must be between 1 and {max_precision}"
-                    ),
-                    sql_type.span,
-                ));
-            }
-            if scale > precision {
-                return Err(AnalyzeError::invalid_argument(
-                    format!(
-                        "{type_name} scale {scale} must be between 0 and precision {precision}"
-                    ),
-                    sql_type.span,
-                ));
-            }
-            let precision = u8::try_from(precision).map_err(|_| {
-                AnalyzeError::invalid_argument(
-                    "DECIMAL precision exceeds its metadata domain",
-                    sql_type.span,
-                )
-            })?;
-            let scale = i8::try_from(scale).map_err(|_| {
-                AnalyzeError::invalid_argument(
-                    "DECIMAL scale exceeds its metadata domain",
-                    sql_type.span,
-                )
-            })?;
-            if precision > 38 {
-                Ok(DataType::Decimal256(precision, scale))
-            } else {
-                Ok(DataType::Decimal128(precision, scale))
-            }
-        }
-        "array" => {
-            let element = type_type_argument(type_args, 0, "ARRAY", sql_type.span)?;
-            Ok(DataType::List(Arc::new(nested_field_with_logical_type(
-                "item", element, true,
-            )?)))
-        }
-        "map" => {
-            let key = type_type_argument(type_args, 0, "MAP", sql_type.span)?;
-            let value = type_type_argument(type_args, 1, "MAP", sql_type.span)?;
-            let key = nested_field_with_logical_type("key", key, false)?;
-            let value = nested_field_with_logical_type("value", value, true)?;
-            Ok(DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(Fields::from(vec![Arc::new(key), Arc::new(value)])),
-                    false,
-                )),
-                false,
-            ))
-        }
-        _ => Err(AnalyzeError::unsupported_query_shape(
-            format!("unsupported SQL type: {type_name}"),
-            sql_type.span,
-        )),
     }
 }
 
-fn type_numeric_argument(
-    arguments: &[ast::DataTypeParameter],
-    index: usize,
-) -> Result<Option<u64>, AnalyzeError> {
-    let Some(argument) = arguments.get(index) else {
-        return Ok(None);
-    };
-    let ast::DataTypeParameter::Numeric(value) = argument else {
-        return Err(AnalyzeError::invalid_literal(
-            "numeric type parameter must be an integer",
-            type_name_argument_span(argument),
-        ));
-    };
-    u64::try_from(value.parsed_value).map(Some).map_err(|_| {
-        AnalyzeError::invalid_literal(
-            format!(
-                "numeric type parameter must be nonnegative: {}",
-                value.spelling
-            ),
-            value.span,
-        )
-    })
-}
-
-fn type_type_argument<'a>(
-    arguments: &'a [ast::DataTypeParameter],
-    index: usize,
-    kind: &str,
-    type_span: novarocks_parser::Span,
-) -> Result<&'a ast::TypeName, AnalyzeError> {
-    let Some(ast::DataTypeParameter::Type(value)) = arguments.get(index) else {
-        return Err(AnalyzeError::invalid_argument(
-            format!("{kind} type requires a type parameter"),
-            arguments
-                .get(index)
-                .map(type_name_argument_span)
-                .unwrap_or(type_span),
-        ));
-    };
-    Ok(&value.data_type)
-}
-
-fn type_name_argument_span(argument: &ast::DataTypeParameter) -> novarocks_parser::Span {
-    match argument {
-        ast::DataTypeParameter::Type(value) => value.data_type.span,
-        ast::DataTypeParameter::Numeric(value) => value.span,
-    }
+#[cfg(test)]
+pub(super) fn sql_type_to_arrow(sql_type: &ast::TypeName) -> Result<DataType, AnalyzeError> {
+    sql_type_to_value_type(
+        sql_type,
+        true,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .map(|value| value.data_type().clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,29 +1220,30 @@ mod tests {
     }
 
     #[test]
-    fn sql_type_to_arrow_accepts_datetime_ns_alias() {
-        let data_type = parse_native_cast_type("SELECT CAST(NULL AS DATETIME_NS)");
-
+    fn sql_type_to_arrow_requires_the_supported_timestamp_declaration() {
+        let standard = parse_native_cast_type("SELECT CAST(NULL AS TIMESTAMP(6))");
         assert_eq!(
-            sql_type_to_arrow(&data_type).expect("type"),
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
+            sql_type_to_arrow(&standard).expect("type"),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
         );
+        let retired = parse_native_cast_type("SELECT CAST(NULL AS DATETIME_NS)");
+        let error = sql_type_to_arrow(&retired).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+        );
+        assert_eq!(error.span(), Some(retired.span));
     }
 
     #[test]
-    fn sql_decimal_type_producer_preserves_width_precision_scale_and_alias_domains() {
+    fn sql_decimal_type_producer_preserves_supported_precision_and_scale() {
         for (type_name, expected) in [
             ("DECIMAL", DataType::Decimal128(38, 0)),
-            ("DECIMAL32", DataType::Decimal128(9, 0)),
-            ("DECIMAL64", DataType::Decimal128(18, 0)),
-            ("DECIMAL128", DataType::Decimal128(38, 0)),
+            ("DECIMAL(9,0)", DataType::Decimal128(9, 0)),
+            ("DECIMAL(18,0)", DataType::Decimal128(18, 0)),
             ("DECIMAL(38,38)", DataType::Decimal128(38, 38)),
-            ("DECIMAL(39,0)", DataType::Decimal256(39, 0)),
-            ("DEC(60,2)", DataType::Decimal256(60, 2)),
-            ("NUMERIC(76,76)", DataType::Decimal256(76, 76)),
-            ("DECIMAL32(9,9)", DataType::Decimal128(9, 9)),
-            ("DECIMAL64(18,18)", DataType::Decimal128(18, 18)),
-            ("DECIMAL128(38,38)", DataType::Decimal128(38, 38)),
+            ("DECIMAL(9,9)", DataType::Decimal128(9, 9)),
+            ("DECIMAL(18,18)", DataType::Decimal128(18, 18)),
         ] {
             let target = parse_native_cast_type(&format!("SELECT CAST(NULL AS {type_name})"));
             assert_eq!(sql_type_to_arrow(&target).unwrap(), expected, "{type_name}");
@@ -1699,13 +1254,19 @@ mod tests {
     fn sql_decimal_type_producer_rejects_invalid_and_wrapping_parameters_at_type_span() {
         for type_name in [
             "DECIMAL(0,0)",
+            "DECIMAL(39,0)",
             "DECIMAL(77,0)",
             "DECIMAL(10,11)",
             "DECIMAL(294,0)",
             "DECIMAL(38,256)",
+            "DECIMAL32(9,0)",
             "DECIMAL32(10,0)",
+            "DECIMAL64(18,0)",
             "DECIMAL64(19,0)",
+            "DECIMAL128(38,0)",
             "DECIMAL128(39,0)",
+            "DEC(60,2)",
+            "NUMERIC(76,76)",
             "DECIMAL(10,2,3)",
         ] {
             let target = parse_native_cast_type(&format!("SELECT CAST(NULL AS {type_name})"));
@@ -1741,7 +1302,7 @@ mod tests {
     #[test]
     fn sql_decimal_type_producer_preserves_nested_cast_carriers() {
         let target = parse_native_cast_type(
-            "SELECT CAST(NULL AS ROW(a ARRAY<DECIMAL(60,2)>,m MAP<INT,DECIMAL(76,4)>))",
+            "SELECT CAST(NULL AS ROW(a ARRAY(DECIMAL(38,2)),m MAP(INTEGER,DECIMAL(38,4))))",
         );
         let DataType::Struct(fields) = sql_type_to_arrow(&target).unwrap() else {
             panic!("expected STRUCT");
@@ -1749,7 +1310,7 @@ mod tests {
         let DataType::List(item) = fields[0].data_type() else {
             panic!("expected ARRAY");
         };
-        assert_eq!(item.data_type(), &DataType::Decimal256(60, 2));
+        assert_eq!(item.data_type(), &DataType::Decimal128(38, 2));
         let DataType::Map(entries, _) = fields[1].data_type() else {
             panic!("expected MAP");
         };
@@ -1757,17 +1318,18 @@ mod tests {
             panic!("expected MAP key/value fields");
         };
         assert_eq!(entries[0].data_type(), &DataType::Int32);
-        assert_eq!(entries[1].data_type(), &DataType::Decimal256(76, 4));
+        assert_eq!(entries[1].data_type(), &DataType::Decimal128(38, 4));
     }
 
     #[test]
-    fn sql_type_to_arrow_accepts_variant_alias() {
+    fn sql_type_to_arrow_reports_unavailable_variant_capability() {
         let data_type = parse_native_cast_type("SELECT CAST(NULL AS VARIANT)");
-
+        let error = sql_type_to_arrow(&data_type).unwrap_err();
         assert_eq!(
-            sql_type_to_arrow(&data_type).expect("type"),
-            DataType::LargeBinary
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
         );
+        assert_eq!(error.span(), Some(data_type.span));
     }
 
     #[test]
@@ -2018,7 +1580,7 @@ mod tests {
             .into_iter()
             .map(|ty| build::cast(build::null(), ty))
             .collect::<Vec<_>>();
-        for type_name in ["INTEGER", "\"DATE\""] {
+        for type_name in ["LARGEINT", "\"DATE\""] {
             expressions.push(ast::Expr::Literal(ast::Literal {
                 kind: ast::LiteralKind::Generic(ast::GenericLiteral {
                     type_name: type_name.into(),
@@ -2042,9 +1604,16 @@ mod tests {
             let ast::SetExpr::Select(select) = query.body.as_mut() else {
                 panic!("select")
             };
+            let expected = match &expression {
+                ast::Expr::Literal(ast::Literal {
+                    kind: ast::LiteralKind::Generic(_),
+                    ..
+                }) => AnalyzeErrorKind::TypeMismatch,
+                _ => AnalyzeErrorKind::UnsupportedExpression,
+            };
             select.projection[0] = novarocks_parser::build::item(expression, None);
             let error = crate::analyzer::analyze(query, &NoLookup, "default").unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+            assert_eq!(error.kind(), expected);
             assert_eq!(error.span(), Some(span));
         }
     }

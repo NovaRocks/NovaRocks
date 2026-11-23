@@ -178,6 +178,7 @@ pub fn sql_type_from_execution_value_observed<E: From<ExecutionColumnTypeError>>
         observe(1)?;
         Ok(match value.kind() {
             ValueKind::String => SqlType::String,
+            ValueKind::BoundedCharacter(character) => SqlType::BoundedCharacter(*character),
             ValueKind::Binary => SqlType::Binary,
             ValueKind::Nominal(domain) => match domain {
                 ValueLogicalType::Json => SqlType::Json,
@@ -348,6 +349,10 @@ fn author(
         (SqlType::String, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
             ValueKind::String
         }
+        (
+            SqlType::BoundedCharacter(character),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+        ) => ValueKind::BoundedCharacter(*character),
         (SqlType::Binary, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) => {
             ValueKind::Binary
         }

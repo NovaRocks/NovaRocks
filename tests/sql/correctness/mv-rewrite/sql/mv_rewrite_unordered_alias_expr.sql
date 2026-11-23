@@ -49,9 +49,9 @@ CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.t1 (
-  k2 STRING,
+  k2 VARCHAR,
   k3 BIGINT,
-  k4 STRING,
+  k4 VARCHAR,
   v1 BIGINT
 ) WITH (format_version = 3);
 
@@ -62,7 +62,7 @@ INSERT INTO mvrw_${uuid0}.ns_${uuid0}.t1
 SELECT
   CASE WHEN n % 3 = 0 THEN 'a' WHEN n % 3 = 1 THEN 'b' ELSE NULL END AS k2,
   CAST(n % 3 AS BIGINT) AS k3,
-  concat('2024-0', CAST(7 + (n % 2) AS STRING), '-15') AS k4,
+  concat('2024-0', CAST(7 + (n % 2) AS VARCHAR), '-15') AS k4,
   CAST(n % 10 AS BIGINT) AS v1
 FROM TABLE(generate_series(1, 2400)) t(n);
 

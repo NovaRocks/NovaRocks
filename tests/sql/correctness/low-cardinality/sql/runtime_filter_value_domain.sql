@@ -21,13 +21,13 @@
 
 CREATE TABLE ${case_db}.dict_rf_probe_t (
   id INT,
-  status STRING,
+  status VARCHAR,
   payload INT
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.dict_rf_build_t (
-  status STRING,
-  flag STRING
+  status VARCHAR,
+  flag VARCHAR
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.dict_rf_probe_t VALUES

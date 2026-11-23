@@ -298,6 +298,7 @@ pub struct SqlScanSource {
     pub(crate) kind: SqlScanKind,
     pub(crate) mv_occurrence: Option<crate::compiler::SqlMvRelationOccurrenceId>,
     ukfk_facts: SqlUkFkTableFacts,
+    pub(crate) retired_read_fields: Vec<novarocks_spi::connector::ConnectorRetiredReadField>,
 }
 
 impl SqlScanSource {
@@ -312,6 +313,7 @@ impl SqlScanSource {
             kind,
             mv_occurrence: None,
             ukfk_facts: SqlUkFkTableFacts::default(),
+            retired_read_fields: Vec::new(),
         }
     }
 
@@ -589,6 +591,12 @@ impl TableCompletionRetainedBytes {
         self.add_string(&source.table.namespace);
         self.add_string(&source.table.table);
         self.add_scan_kind(&source.kind);
+        self.add_allocation::<novarocks_spi::connector::ConnectorRetiredReadField>(
+            source.retired_read_fields.capacity(),
+        );
+        for field in &source.retired_read_fields {
+            self.add_string_vec(&field.field_path);
+        }
         self.add_allocation::<Vec<String>>(source.ukfk_facts.unique_constraints.capacity());
         for constraint in &source.ukfk_facts.unique_constraints {
             self.add_string_vec(constraint);
@@ -774,6 +782,7 @@ impl TableCompletionRetainedBytes {
             | SqlType::Double
             | SqlType::Decimal { .. }
             | SqlType::String
+            | SqlType::BoundedCharacter(_)
             | SqlType::Json
             | SqlType::Binary
             | SqlType::Bitmap

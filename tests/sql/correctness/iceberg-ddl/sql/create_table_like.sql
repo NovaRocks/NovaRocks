@@ -26,7 +26,7 @@ DROP TABLE IF EXISTS ${case_db}.src;
 DROP TABLE IF EXISTS ${case_db}.dst;
 CREATE TABLE ${case_db}.src (
   id INT,
-  name STRING,
+  name VARCHAR,
   v BIGINT
 ) COMMENT 'source-table';
 CREATE TABLE ${case_db}.dst (LIKE ${case_db}.src);

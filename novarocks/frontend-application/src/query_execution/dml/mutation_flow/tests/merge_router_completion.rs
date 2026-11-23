@@ -44,7 +44,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
     // locator and v3 lineage columns consumed by the production SQL builder.
     let query = merge_query_fixture(
         "(SELECT CAST(2 AS BIGINT) AS id, CAST(2 AS BIGINT) AS v, \
-         'fixture.parquet' AS _file, CAST(0 AS BIGINT) AS _pos, \
+         CAST('fixture.parquet' AS VARCHAR) AS _file, CAST(0 AS BIGINT) AS _pos, \
          CAST(20 AS BIGINT) AS _row_id, \
          CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INTEGER) AS _spec_id, \
          CAST(NULL AS ROW(bucket INTEGER)) AS _partition) AS t",

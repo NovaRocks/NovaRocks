@@ -31,6 +31,7 @@ use crate::admitted_query_context::RequestContext;
 use crate::api::{
     CatalogCommandConsumer, CommandContext, CommandFuture, StatisticsCommandConsumer,
 };
+use crate::session_error::QueryServiceError;
 
 /// Connection-local execution settings after SQL and session validation.
 pub mod session;
@@ -206,111 +207,123 @@ pub fn connector_partition_transform(
     }
 }
 
-fn lower_sql_type(type_name: &novarocks_parser::ast::TypeName) -> Result<SqlType, String> {
-    use novarocks_parser::ast::{DataTypeParameter, DateTimeType, TypeKind};
+fn lower_sql_type(
+    type_name: &novarocks_parser::ast::TypeName,
+    source: &str,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<SqlType, QueryServiceError> {
+    use novarocks_sql::{TypeDeclarationProblem, resolve_trino_type};
 
-    let generic = match &type_name.kind {
-        TypeKind::Generic(generic) => generic,
+    let value =
+        resolve_trino_type(type_name, true, control).map_err(|error| match error.problem {
+            TypeDeclarationProblem::Control => QueryServiceError::from_compile_control(
+                error.control.expect("original type declaration control"),
+            ),
+            TypeDeclarationProblem::InvalidDecimalParameters => QueryServiceError::from_user_error(
+                novarocks_sql::analyze_error::AnalyzeError::invalid_type_argument(
+                    error.to_string(),
+                    error.span,
+                )
+                .to_user_error(Some(source)),
+            ),
+            TypeDeclarationProblem::Unsupported => {
+                trino_admission::unsupported_statement_detail(source, error.span, error.to_string())
+            }
+            TypeDeclarationProblem::UnknownType | TypeDeclarationProblem::InvalidParameters => {
+                let written = novarocks_parser::printer::print_type(type_name)
+                    .map(|name| format!("Unknown type '{name}'"))
+                    .unwrap_or_else(|_| error.to_string());
+                trino_admission::type_not_found(source, error.span, written)
+            }
+        })?;
+    check_named_schema_rows(type_name, source, control)?;
+    novarocks_types::sql_type_from_execution_value(value.typed_binding()).map_err(|error| {
+        trino_admission::unsupported_statement_detail(source, type_name.span, error.to_string())
+    })
+}
+
+fn check_named_schema_rows(
+    type_name: &novarocks_parser::ast::TypeName,
+    source: &str,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), QueryServiceError> {
+    use novarocks_parser::ast::{DataTypeParameter, TypeKind};
+    use novarocks_type_contract::CompilePhase;
+
+    control
+        .checkpoint(CompilePhase::Validate, 1)
+        .map_err(QueryServiceError::from_compile_control)?;
+    match &type_name.kind {
         TypeKind::Row(row) => {
-            return Ok(SqlType::Struct(
-                row.fields
-                    .iter()
-                    .map(|field| {
-                        let name = field
-                            .name
-                            .as_ref()
-                            .ok_or("ROW schema type requires named fields")?;
-                        Ok((name.value.clone(), lower_sql_type(&field.data_type)?))
-                    })
-                    .collect::<Result<_, String>>()?,
-            ));
-        }
-        TypeKind::DateTime(value) => {
-            let supported_precision = value.precision.as_ref().is_none_or(|parameter| {
-                matches!(parameter.as_ref(), DataTypeParameter::Numeric(number) if number.parsed_value == 6)
-            });
-            if value.with_time_zone || !supported_precision {
-                return Err("Iceberg schema supports only TIME/TIMESTAMP without time zone at microsecond precision".into());
+            for field in &row.fields {
+                if field.name.is_none() {
+                    return Err(trino_admission::unsupported_statement_detail(
+                        source,
+                        field.span,
+                        "ROW schema type requires named fields".into(),
+                    ));
+                }
+                check_named_schema_rows(&field.data_type, source, control)?;
             }
-            return Ok(match value.kind {
-                DateTimeType::Time => SqlType::Time,
-                DateTimeType::Timestamp => SqlType::DateTime,
-            });
         }
-        TypeKind::Interval(_) => return Err("INTERVAL schema types are not supported".into()),
-        TypeKind::ExplicitArray(_) => {
-            return Err("explicit ARRAY schema lengths are not supported".into());
-        }
-    };
-    let name = generic.name.value.to_ascii_lowercase();
-    match name.as_str() {
-        "array" => {
-            let [DataTypeParameter::Type(element)] = generic.arguments.as_slice() else {
-                return Err("ARRAY type requires one element type".to_string());
-            };
-            Ok(SqlType::Array(Box::new(lower_sql_type(
-                &element.data_type,
-            )?)))
-        }
-        "map" => {
-            let [DataTypeParameter::Type(key), DataTypeParameter::Type(value)] =
-                generic.arguments.as_slice()
-            else {
-                return Err("MAP type requires key and value types".to_string());
-            };
-            Ok(SqlType::Map(
-                Box::new(lower_sql_type(&key.data_type)?),
-                Box::new(lower_sql_type(&value.data_type)?),
-            ))
-        }
-        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let values = generic
-                .arguments
-                .iter()
-                .map(|argument| match argument {
-                    DataTypeParameter::Numeric(value) => Ok(value.parsed_value),
-                    _ => Err("DECIMAL precision and scale must be numeric literals".to_string()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if values.len() > 2 {
-                return Err("DECIMAL type accepts at most precision and scale".to_string());
+        TypeKind::Generic(generic) => {
+            for parameter in &generic.arguments {
+                if let DataTypeParameter::Type(nested) = parameter {
+                    check_named_schema_rows(&nested.data_type, source, control)?;
+                }
             }
-            let precision = values
-                .first()
-                .map(|value| {
-                    u8::try_from(*value).map_err(|_| "DECIMAL precision must fit u8".to_string())
-                })
-                .transpose()?
-                .unwrap_or(38);
-            let scale = values
-                .get(1)
-                .map(|value| {
-                    i8::try_from(*value).map_err(|_| "DECIMAL scale must fit i8".to_string())
-                })
-                .transpose()?
-                .unwrap_or(0);
-            Ok(SqlType::Decimal { precision, scale })
         }
-        "tinyint" | "int8" => Ok(SqlType::TinyInt),
-        "smallint" | "int16" => Ok(SqlType::SmallInt),
-        "int" | "integer" | "int32" => Ok(SqlType::Int),
-        "bigint" | "int64" => Ok(SqlType::BigInt),
-        "largeint" | "int128" => Ok(SqlType::LargeInt),
-        "float" | "float32" => Ok(SqlType::Float),
-        "double" | "float64" | "double precision" => Ok(SqlType::Double),
-        "boolean" | "bool" => Ok(SqlType::Boolean),
-        "string" | "varchar" | "char" | "character" | "text" => Ok(SqlType::String),
-        "date" => Ok(SqlType::Date),
-        "datetime" | "timestamp" => Ok(SqlType::DateTime),
-        "timestamp_ns" | "timestamptz_ns" | "datetime_ns" => Ok(SqlType::DateTimeNs),
-        "time" => Ok(SqlType::Time),
-        "binary" | "varbinary" => Ok(SqlType::Binary),
-        "json" | "jsonb" => Ok(SqlType::Json),
-        "bitmap" => Ok(SqlType::Bitmap),
-        "hll" => Ok(SqlType::Hll),
-        "variant" => Ok(SqlType::Variant),
-        _ => Err(format!("unsupported Iceberg schema type `{name}`")),
+        _ => {}
     }
+    Ok(())
+}
+
+fn validate_bounded_varchar_default(
+    source: &str,
+    literal: &novarocks_parser::ast::Literal,
+    data_type: &SqlType,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), QueryServiceError> {
+    use dml_admission::DmlAdmissionError;
+    use novarocks_parser::ast::LiteralKind;
+    use novarocks_type_contract::{CharacterKind, CompileCheckpoints, CompilePhase};
+
+    let SqlType::BoundedCharacter(character) = data_type else {
+        return Ok(());
+    };
+    if character.kind() != CharacterKind::Varchar {
+        return Ok(());
+    }
+    let width = character.length();
+    match &literal.kind {
+        LiteralKind::Null => return Ok(()),
+        LiteralKind::String(value) => {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+                .map_err(QueryServiceError::from_compile_control)?;
+            let mut fits = true;
+            for (index, _) in value.chars().enumerate() {
+                work.step()
+                    .map_err(QueryServiceError::from_compile_control)?;
+                if index == width as usize {
+                    fits = false;
+                    break;
+                }
+            }
+            work.finish()
+                .map_err(QueryServiceError::from_compile_control)?;
+            if fits {
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+    Err(QueryServiceError::from_user_error(
+        DmlAdmissionError::InvalidDefaultColumnValue.to_user_error(
+            source,
+            literal.span,
+            format!("DEFAULT value is not a valid VARCHAR({width}) literal"),
+        ),
+    ))
 }
 
 fn lower_command_literal(
@@ -352,6 +365,15 @@ pub fn parse_single_statement(source: &str) -> Result<TrinoStatement, ParserErro
 mod tests {
     use super::{CommandLiteral, ParserError, TrinoStatement, parse_single_statement};
 
+    fn schema_type(type_name: &novarocks_parser::ast::TypeName) -> Result<super::SqlType, String> {
+        super::lower_sql_type(
+            type_name,
+            "",
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
     #[test]
     fn schema_type_lowering_uses_structured_children_and_named_rows() {
         use novarocks_parser::{SYNTHETIC, ast, build};
@@ -365,7 +387,7 @@ mod tests {
             span: SYNTHETIC,
         }]);
         assert_eq!(
-            super::lower_sql_type(&row).unwrap(),
+            schema_type(&row).unwrap(),
             SqlType::Struct(vec![(
                 "payload".into(),
                 SqlType::Array(Box::new(SqlType::Int))
@@ -377,7 +399,7 @@ mod tests {
             span: SYNTHETIC,
         }]);
         assert!(
-            super::lower_sql_type(&anonymous)
+            schema_type(&anonymous)
                 .unwrap_err()
                 .contains("named fields")
         );
@@ -386,7 +408,7 @@ mod tests {
             vec![build::numeric_parameter(38), build::numeric_parameter(9)],
         );
         assert_eq!(
-            super::lower_sql_type(&decimal).unwrap(),
+            schema_type(&decimal).unwrap(),
             SqlType::Decimal {
                 precision: 38,
                 scale: 9
@@ -397,9 +419,9 @@ mod tests {
             vec![build::numeric_parameter(256)],
         );
         assert!(
-            super::lower_sql_type(&overflow)
+            schema_type(&overflow)
                 .unwrap_err()
-                .contains("fit u8")
+                .contains("DECIMAL precision must be in range [1, 38]: 256")
         );
     }
 
@@ -419,7 +441,7 @@ mod tests {
                         span: SYNTHETIC,
                     };
                     assert_eq!(
-                        super::lower_sql_type(&ty).is_ok(),
+                        schema_type(&ty).is_ok(),
                         !with_time_zone && precision.is_none_or(|value| value == 6)
                     );
                 }
@@ -435,11 +457,7 @@ mod tests {
             }),
             span: SYNTHETIC,
         };
-        assert!(
-            super::lower_sql_type(&ty)
-                .unwrap_err()
-                .contains("explicit ARRAY")
-        );
+        assert!(schema_type(&ty).unwrap_err().contains("explicit ARRAY"));
     }
 
     #[test]

@@ -23,7 +23,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.sc3 (
-  "v1" bigint(20),
+  "v1" BIGINT,
   "a1" ARRAY<INT> ,
   "a2" ARRAY<ROW(a INT, b INT)> ,
   "m1" MAP<INT, INT> ,
@@ -32,10 +32,10 @@ CREATE TABLE ${case_db}.sc3 (
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t0 (
-  "v1" bigint(20),
-  "v2" bigint(20) NOT NULL,
-  "v3" string,
-  "v4" string NOT NULL
+  "v1" BIGINT,
+  "v2" BIGINT NOT NULL,
+  "v3" VARCHAR,
+  "v4" VARCHAR NOT NULL
 ) WITH (format_version = 3);
 
 insert into ${case_db}.sc3 values ROW(1, [1,2,3],[row(1,11),row(2,21),row(3,31)], map(1,11, 2,21), map(1,row(11, [111, 221, 331]), 2,row(22, [221, 221, 331])), row(1, [row(1,1), row(2,1)], map(1,11, 2,21), row(1,1)));

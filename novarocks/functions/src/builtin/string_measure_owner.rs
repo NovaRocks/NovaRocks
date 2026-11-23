@@ -636,12 +636,6 @@ mod tests {
             for source in [
                 FunctionValueType::new(DataType::LargeUtf8, true),
                 FunctionValueType::new(DataType::Null, true),
-                FunctionValueType::try_with_logical_type(
-                    DataType::Utf8,
-                    true,
-                    ValueLogicalType::Json,
-                )
-                .unwrap(),
             ] {
                 let raw = [argument(source)];
                 let selected = Arc::new(
@@ -673,6 +667,12 @@ mod tests {
                 FunctionValueType::new(DataType::Binary, true),
                 FunctionValueType::new(DataType::LargeBinary, true),
                 FunctionValueType::new(DataType::Int64, true),
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    true,
+                    ValueLogicalType::Json,
+                )
+                .unwrap(),
                 FunctionValueType::try_with_logical_type(
                     DataType::FixedSizeBinary(16),
                     true,

@@ -33,7 +33,7 @@ CREATE CATALOG ice_ivm_dep_${uuid0} USING iceberg WITH ("iceberg.catalog.type" =
 CREATE SCHEMA ice_ivm_dep_${uuid0}.dep_${uuid0};
 CREATE TABLE ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} VALUES
@@ -70,7 +70,7 @@ GROUP BY region;
 -- @result_rows_where=name=mv_region_${uuid0}
 -- @result_rows_count=1
 -- @result_rows_expect=upstream_identity_matches=true
-SELECT name, upstream_materialized_views[1] = concat(catalog_name, '.', schema_name, '.mv_orders_${uuid0}') AS upstream_identity_matches FROM system.runtime.materialized_view_states WHERE catalog_name = 'ice_ivm_dep_${uuid0}';
+SELECT name, TRY(upstream_materialized_views[1]) = concat(catalog_name, '.', schema_name, '.mv_orders_${uuid0}') AS upstream_identity_matches FROM system.runtime.materialized_view_states WHERE catalog_name = 'ice_ivm_dep_${uuid0}';
 
 -- query 7
 -- @skip_result_check=true

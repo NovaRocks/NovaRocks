@@ -337,8 +337,18 @@ fn negation_rejects_hidden_names_unsupported_types_and_exact_overload_changes() 
         Err(FunctionBindingError::NoMatchingOverload)
     ));
 
+    let unknown = [value_argument(FunctionValueType::new(DataType::Null, true))];
+    assert!(matches!(
+        metadata.resolve_bound_trusted_by_id(
+            &id,
+            FunctionKind::Scalar,
+            request(&unknown),
+            &Control
+        ),
+        Err(FunctionBindingError::AmbiguousOverload)
+    ));
+
     for carrier in [
-        DataType::Null,
         DataType::Boolean,
         DataType::Utf8,
         DataType::UInt8,

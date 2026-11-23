@@ -28,8 +28,8 @@ USE ${case_db};
 USE ${case_db};
 CREATE TABLE "t1" (
   "v1" varchar(65533),
-  "v2" bigint(20),
-  "v3" bigint(20)
+  "v2" BIGINT,
+  "v3" BIGINT
 ) WITH (format_version = 3);
 
 -- query 3

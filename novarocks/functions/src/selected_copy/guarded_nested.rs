@@ -31,7 +31,8 @@ pub fn supports_guarded_result(ty: &DataType) -> bool {
             .iter()
             .all(|field| supports_guarded_result(field.data_type())),
         DataType::FixedSizeBinary(width) => *width > 0,
-        DataType::Boolean
+        DataType::Null
+        | DataType::Boolean
         | DataType::Utf8
         | DataType::Binary
         | DataType::LargeUtf8
@@ -43,26 +44,19 @@ pub fn supports_guarded_result(ty: &DataType) -> bool {
 /// counts are checked by the exact physical range author after choices exist.
 /// Keep the old flat-only Values-construction gate independent of this port.
 pub fn guarded_result_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
-    if *ty == DataType::Null {
-        // The root Null carrier has neither an Arrow values buffer nor a
-        // validity bitmap. Actual source ordinals still require preflight.
-        return Ok(());
-    }
-    guarded_payload_extent(ty, rows)
-}
-
-fn guarded_payload_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
     match ty {
+        // NullArray carries a length without a payload buffer or bitmap.
+        DataType::Null => Ok(()),
         DataType::List(field) => {
             buffer_extent(add(rows, 1)?, size_of::<i32>())?;
             interleave_bitmap_extent(rows)?;
-            guarded_payload_extent(field.data_type(), 0)
+            guarded_result_extent(field.data_type(), 0)
         }
         DataType::Struct(fields) => {
             interleave_bitmap_extent(rows)?;
             buffer_extent(fields.len(), size_of::<ArrayRef>())?;
             for field in fields {
-                guarded_payload_extent(field.data_type(), rows)?;
+                guarded_result_extent(field.data_type(), rows)?;
             }
             Ok(())
         }
@@ -147,6 +141,7 @@ fn visit_interleave(
     }
     buffer_extent(sources.len(), size_of::<&dyn Array>())?;
     match ty {
+        DataType::Null => Ok(()),
         DataType::Struct(fields) => {
             for field in 0..fields.len() {
                 work.step()?;

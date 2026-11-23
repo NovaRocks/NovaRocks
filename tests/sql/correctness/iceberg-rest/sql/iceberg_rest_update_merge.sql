@@ -28,14 +28,14 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0} (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.s_update_merge_${uuid0} (
   id BIGINT,
-  v STRING
+  v VARCHAR
 ) WITH (format_version = 3);
 
 -- query 4

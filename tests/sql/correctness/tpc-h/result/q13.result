@@ -1,5 +1,5 @@
 -- query 1
--- legacy
+-- types	bigint	bigint
 c_count	custdist
 0	50004
 10	6637

@@ -17,7 +17,7 @@
 
 use super::{
     OutputPrefix, OutputRows, allocate, arithmetic,
-    column::{Column, Shape},
+    column::{ByteInput, Column, Shape},
 };
 use crate::{
     ByteLayout, ValueError, ValueFailure, ValueViolation, arrow_raw,
@@ -145,12 +145,15 @@ fn build_column<E>(
 fn build_bytes<E>(
     column: &Column,
     rows: Rows<'_>,
-    source: ByteLayout,
+    source: ByteInput,
     target: ByteLayout,
     growth: &mut Growth<'_, E>,
     work: &mut Work<'_, E>,
 ) -> Result<ArrayRef, ValueFailure<E>> {
-    let source = column.byte_source(source)?;
+    let variable = match source {
+        ByteInput::Variable(layout) => Some(column.byte_source(layout)?),
+        ByteInput::Fixed => None,
+    };
     let facts = column.committed;
     let payload = if target.is_view() {
         facts.inline_bytes
@@ -161,13 +164,19 @@ fn build_bytes<E>(
     builder.reserve_planned_observed(rows.len(), payload, facts.adopted, growth, work)?;
     for ordinal in 0..rows.len() {
         work(1).map_err(ValueFailure::Caller)?;
-        let mapped = match rows.at(ordinal)? {
-            Some(row) => source.mapped_row(row)?,
-            None => None,
-        };
-        let result = match mapped {
-            Some(row) => builder.append_array_value(source.values().as_ref(), row, growth, work),
-            None => builder.append_null(growth, work),
+        let row = rows.at(ordinal)?;
+        let result = match (variable, row) {
+            (Some(source), Some(row)) => match source.mapped_row(row)? {
+                Some(row) => {
+                    builder.append_array_value(source.values().as_ref(), row, growth, work)
+                }
+                None => builder.append_null(growth, work),
+            },
+            (None, Some(row)) => match arrow_raw::fixed_binary_span(column.source.as_ref(), row)? {
+                Some(span) => builder.append_bytes(span.bytes(), growth, work),
+                None => builder.append_null(growth, work),
+            },
+            (_, None) => builder.append_null(growth, work),
         };
         match result {
             Ok(()) => (),

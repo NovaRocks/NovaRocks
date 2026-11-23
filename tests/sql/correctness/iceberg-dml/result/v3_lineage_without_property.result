@@ -1,11 +1,11 @@
 -- query 2
--- types	varchar	bigint	bigint	bigint
+-- types	varchar(6)	bigint	bigint	bigint
 property_value	total_rows	assigned_ids	assigned_sequences
 absent	2	2	2
 false	2	2	2
 
 -- query 4
--- types	varchar	bigint	varchar
+-- types	varchar(6)	bigint	varchar
 property_value	id	v
 absent	1	aa
 absent	2	bb
@@ -15,7 +15,7 @@ false	2	bb
 false	3	c
 
 -- query 5
--- types	varchar	bigint	bigint	bigint	bigint
+-- types	varchar(6)	bigint	bigint	bigint	bigint
 property_value	total_rows	assigned_ids	unique_ids	assigned_sequences
 absent	3	3	3	3
 false	3	3	3	3

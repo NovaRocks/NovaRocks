@@ -24,7 +24,7 @@ USE iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};
 DROP TABLE IF EXISTS orders_eq_evo;
 CREATE TABLE orders_eq_evo (
   id INT,
-  amount FLOAT
+  amount REAL
 ) WITH (format_version = 2);
 INSERT INTO orders_eq_evo VALUES
   ROW(1, 10.5),

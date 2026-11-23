@@ -469,7 +469,7 @@ fn rand_operand_fixture(
         rand_request: Some(request),
         rand_definitions: vec![call],
         constant_policy: options().constants,
-        carrier_cast: false,
+        parameters: SemanticParameters::default(),
     }
 }
 

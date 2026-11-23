@@ -31,6 +31,13 @@ pub(super) enum Body {
     ArrowScalar,
     Structure,
     ByteViewProjection,
+    TrinoCharBinary(u32),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StructureOrder {
+    MatchNames,
+    Position,
 }
 
 fn bytes(ty: &DataType) -> bool {
@@ -159,6 +166,8 @@ pub(super) fn prepare(
         source.data_type(),
         result.value_type(),
         result.data_type(),
+        StructureOrder::MatchNames,
+        true,
         work,
     )? {
         if source.nullable() && !result.nullable() {
@@ -168,38 +177,83 @@ pub(super) fn prepare(
     }
     Ok(None)
 }
+
+/// Match a SQL ROW by ordinal and leave root nullability to the CAST recipe.
+pub(super) fn can_project_positional_structure(
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, CastPrepareError> {
+    structural(
+        source.value_type(),
+        source.data_type(),
+        result.value_type(),
+        result.data_type(),
+        StructureOrder::Position,
+        false,
+        work,
+    )
+}
+
+fn match_struct_fields_by_name<E>(
+    from: &arrow_schema::Fields,
+    to: &arrow_schema::Fields,
+    order: StructureOrder,
+    mut step: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    if order == StructureOrder::Position {
+        return Ok(false);
+    }
+    let mut by_name = true;
+    for field in to {
+        let mut found = false;
+        for candidate in from {
+            step()?;
+            found |= candidate.name() == field.name();
+        }
+        by_name &= found;
+    }
+    Ok(by_name)
+}
+
+fn struct_field_index<E>(
+    from: &arrow_schema::Fields,
+    name: &str,
+    ordinal: usize,
+    by_name: bool,
+    mut step: impl FnMut() -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut selected = ordinal;
+    if by_name {
+        for (i, candidate) in from.iter().enumerate() {
+            step()?;
+            if candidate.name() == name {
+                selected = i;
+            }
+        }
+    }
+    Ok(selected)
+}
+
 fn structural(
     source_value: &ValueTypeRef,
     source: &DataType,
     result_value: &ValueTypeRef,
     result: &DataType,
+    order: StructureOrder,
+    check_nullability: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, CastPrepareError> {
     work.step()?;
-    if source_value.nullable() && !result_value.nullable() {
+    if check_nullability && source_value.nullable() && !result_value.nullable() {
         return Ok(false);
     }
     match (source, result) {
         (DataType::Struct(from), DataType::Struct(to)) if from.len() == to.len() => {
-            let mut by_name = true;
-            for field in to {
-                let mut found = false;
-                for candidate in from {
-                    work.step()?;
-                    found |= candidate.name() == field.name();
-                }
-                by_name &= found;
-            }
+            let by_name = match_struct_fields_by_name(from, to, order, || work.step())?;
             for (ordinal, field) in to.iter().enumerate() {
-                let mut selected = ordinal;
-                if by_name {
-                    for (i, candidate) in from.iter().enumerate() {
-                        work.step()?;
-                        if candidate.name() == field.name() {
-                            selected = i;
-                        }
-                    }
-                }
+                let selected =
+                    struct_field_index(from, field.name(), ordinal, by_name, || work.step())?;
                 if !structural(
                     source_value
                         .child_type_at(selected)
@@ -209,6 +263,8 @@ fn structural(
                         .child_type_at(ordinal)
                         .expect("validated target field"),
                     field.data_type(),
+                    order,
+                    true,
                     work,
                 )? {
                     return Ok(false);
@@ -222,6 +278,8 @@ fn structural(
             from.data_type(),
             result_value.child_type_at(0).expect("validated list child"),
             to.data_type(),
+            order,
+            true,
             work,
         ),
         (DataType::Struct(_) | DataType::List(_) | DataType::LargeList(_), _)
@@ -259,6 +317,48 @@ fn reserve<T>(
     work.borrow_mut().flush()?;
     Ok(out)
 }
+fn char_to_binary(
+    selected: &ArrayRef,
+    length: u32,
+    work: &RefCell<EvaluationCheckpoints<'_>>,
+) -> Result<ArrayRef, KernelFailure> {
+    let text = selected
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .ok_or_else(|| invalid("CHAR binary cast lost its checked UTF-8 carrier"))?;
+    if text.is_null(0) {
+        return Ok(new_null_array(&DataType::Binary, 1));
+    }
+    let value = text.value(0);
+    let mut codepoints = 0;
+    for _ in value.chars() {
+        work.borrow_mut().step()?;
+        codepoints += 1;
+    }
+    let padding = usize::try_from(length)
+        .ok()
+        .and_then(|length| length.checked_sub(codepoints))
+        .ok_or_else(|| invalid("CHAR value exceeds its authored width"))?;
+    let byte_count = value
+        .len()
+        .checked_add(padding)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    let offset = i32::try_from(byte_count).map_err(|_| KernelFailure::ResourceExhausted)?;
+    work.borrow_mut().flush()?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_count)
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.resize(byte_count, b' ');
+    let offsets = arrow_buffer::OffsetBuffer::new(vec![0, offset].into());
+    Ok(Arc::new(arrow_array::BinaryArray::new(
+        offsets,
+        bytes.into(),
+        None,
+    )))
+}
+
 pub(super) fn evaluate<'a>(
     body: Body,
     recipe: &PreparedCastRecipe,
@@ -361,7 +461,14 @@ pub(super) fn evaluate<'a>(
             work.borrow_mut().flush()?;
             let out = match body {
                 Body::ByteViewProjection => project_byte_views(&compact, &recipe.result, &work)?,
-                _ => retag(&compact, recipe.result.data_type(), &work)?,
+                _ => {
+                    let order = if recipe.trino_mode.is_some() {
+                        StructureOrder::Position
+                    } else {
+                        StructureOrder::MatchNames
+                    };
+                    retag(&compact, recipe.result.data_type(), order, &work)?
+                }
             };
             let mut errors = reserve::<RowDataError>(inherited.len(), &work)?;
             for error in inherited {
@@ -404,11 +511,15 @@ pub(super) fn evaluate<'a>(
                 work.borrow_mut().flush()?;
                 let selected = argument.array().slice(row, 1);
                 work.borrow_mut().flush()?;
-                let converted = cast_one(
-                    &selected,
-                    recipe.result.data_type(),
-                    recipe.allow_throw_exception,
-                );
+                let converted = if let Body::TrinoCharBinary(length) = body {
+                    Ok(char_to_binary(&selected, length, &work)?)
+                } else {
+                    cast_one(
+                        &selected,
+                        recipe.result.data_type(),
+                        recipe.allow_throw_exception,
+                    )
+                };
                 match converted {
                     Ok(out) => {
                         work.borrow_mut().flush()?;
@@ -1024,6 +1135,7 @@ fn fixed_decimal(value: Option<i128>, result: &DataType) -> Result<ArrayRef, Arr
 fn retag(
     source: &ArrayRef,
     result: &DataType,
+    order: StructureOrder,
     work: &RefCell<EvaluationCheckpoints<'_>>,
 ) -> Result<ArrayRef, KernelFailure> {
     work.borrow_mut().step()?;
@@ -1036,27 +1148,19 @@ fn retag(
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| invalid("retag source is not a StructArray"))?;
-            let mut by_name = true;
-            for field in to {
-                let mut found = false;
-                for candidate in from {
-                    work.borrow_mut().step()?;
-                    found |= candidate.name() == field.name();
-                }
-                by_name &= found;
-            }
+            let by_name =
+                match_struct_fields_by_name(from, to, order, || work.borrow_mut().step())?;
             let mut columns = reserve::<ArrayRef>(to.len(), work)?;
             for (ordinal, field) in to.iter().enumerate() {
-                let mut selected = ordinal;
-                if by_name {
-                    for (i, candidate) in from.iter().enumerate() {
-                        work.borrow_mut().step()?;
-                        if candidate.name() == field.name() {
-                            selected = i;
-                        }
-                    }
-                }
-                columns.push(retag(source.column(selected), field.data_type(), work)?);
+                let selected = struct_field_index(from, field.name(), ordinal, by_name, || {
+                    work.borrow_mut().step()
+                })?;
+                columns.push(retag(
+                    source.column(selected),
+                    field.data_type(),
+                    order,
+                    work,
+                )?);
             }
             work.borrow_mut().flush()?;
             let array = StructArray::try_new(to.clone(), columns, source.nulls().cloned())
@@ -1072,7 +1176,7 @@ fn retag(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| invalid("retag source is not a ListArray"))?;
-            let child = retag(source.values(), field.data_type(), work)?;
+            let child = retag(source.values(), field.data_type(), order, work)?;
             work.borrow_mut().flush()?;
             let array = ListArray::try_new(
                 Arc::clone(field),
@@ -1091,7 +1195,7 @@ fn retag(
                 .as_any()
                 .downcast_ref::<LargeListArray>()
                 .ok_or_else(|| invalid("retag source is not a LargeListArray"))?;
-            let child = retag(source.values(), field.data_type(), work)?;
+            let child = retag(source.values(), field.data_type(), order, work)?;
             work.borrow_mut().flush()?;
             let array = LargeListArray::try_new(
                 Arc::clone(field),

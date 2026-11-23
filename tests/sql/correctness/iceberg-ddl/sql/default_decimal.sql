@@ -23,7 +23,7 @@
 --    DECIMAL(10, 2) example in v3_default_primitive_types.sql).
 
 DROP TABLE IF EXISTS ${case_db}.t;
-CREATE TABLE ${case_db}.t (id INT, name STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t (id INT, name VARCHAR) WITH (format_version = 3);
 INSERT INTO ${case_db}.t VALUES ROW(1, 'alice'), ROW(2, 'bob');
 
 ALTER TABLE ${case_db}.t ADD COLUMN price DECIMAL(10, 2) DEFAULT 9.99;

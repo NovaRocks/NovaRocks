@@ -39,9 +39,8 @@ use novarocks_functions::{
     Selection, testkit::installed_builtin_owner_catalogue,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters,
+    CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, SemanticParameterId,
+    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -181,11 +180,9 @@ fn signed_in_callback_root() -> (Arc<CompiledExprSet>, RootOrdinal) {
                     None,
                     widen_to.clone(),
                     ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                         expr: literal,
                         target: DataType::Int64,
-                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception: allow_throw,
                     },
                 )
                 .unwrap();

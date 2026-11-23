@@ -28,11 +28,11 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_outer_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_right_outer_r;
 CREATE TABLE ${case_db}.t_join_right_outer_l (
   id INT,
-  lv STRING
+  lv VARCHAR
 ) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_right_outer_r (
   id INT,
-  rv STRING
+  rv VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_right_outer_l VALUES
   ROW(2, 'L2'),

@@ -178,6 +178,7 @@ pub(crate) fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataTy
             scale: *scale,
         },
         SqlType::String => ConnectorDataType::String,
+        SqlType::BoundedCharacter(character) => ConnectorDataType::BoundedCharacter(*character),
         SqlType::Json => ConnectorDataType::Json,
         SqlType::Binary => ConnectorDataType::Binary,
         SqlType::Bitmap => ConnectorDataType::Bitmap,
@@ -1038,7 +1039,9 @@ fn lower_typed_numeric_default(text: &str, data_type: &SqlType) -> Result<Defaul
 
 fn lower_typed_string_default(value: &str, data_type: &SqlType) -> Result<DefaultLiteral, String> {
     match data_type {
-        SqlType::String => Ok(DefaultLiteral::String(value.to_string())),
+        SqlType::String | SqlType::BoundedCharacter(_) => {
+            Ok(DefaultLiteral::String(value.to_string()))
+        }
         SqlType::TinyInt
         | SqlType::SmallInt
         | SqlType::Int
@@ -1140,7 +1143,10 @@ fn validate_typed_default_literal(
         (DefaultLiteral::Bool(_), SqlType::Boolean)
         | (DefaultLiteral::Int(_), SqlType::BigInt)
         | (DefaultLiteral::Float(_), SqlType::Float | SqlType::Double)
-        | (DefaultLiteral::String(_), SqlType::String | SqlType::Json)
+        | (
+            DefaultLiteral::String(_),
+            SqlType::String | SqlType::BoundedCharacter(_) | SqlType::Json,
+        )
         | (DefaultLiteral::Binary(_), SqlType::Binary | SqlType::Bitmap | SqlType::Hll)
         | (DefaultLiteral::Date(_), SqlType::Date)
         | (DefaultLiteral::DateTime(_), SqlType::DateTime | SqlType::DateTimeNs) => {}
@@ -1750,7 +1756,9 @@ mod tests {
         };
         let command =
             novarocks_query_application::sql::trino_table_command::lower_trino_add_column(
-                sql, &statement,
+                sql,
+                &statement,
+                &novarocks_sql::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
         let novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(statement) = command

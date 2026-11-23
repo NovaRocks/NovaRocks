@@ -19,7 +19,7 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE murmur_numeric_text (id INT, f FLOAT, d DOUBLE, n BIGINT) WITH (format_version = 3);
+CREATE TABLE murmur_numeric_text (id INT, f REAL, d DOUBLE, n BIGINT) WITH (format_version = 3);
 INSERT INTO murmur_numeric_text VALUES ROW(1,0,7,-9223372036854775808),ROW(2,1.25,1.25,0),ROW(3,NULL,NULL,NULL);
 
 -- query 2
@@ -32,11 +32,11 @@ FROM murmur_numeric_text ORDER BY id;
 
 -- query 3
 USE ${case_db};
-SELECT murmur_hash3_32(CAST(0 AS FLOAT)) AS float_zero,
+SELECT murmur_hash3_32(CAST(0 AS REAL)) AS float_zero,
        murmur_hash3_32(CAST(7 AS DOUBLE)) AS double_integral,
        murmur_hash3_32(CAST(NULL AS DOUBLE)) AS null_hash,
        murmur_hash3_32(CAST('-170141183460469231731687303715884105728' AS LARGEINT)) AS largeint_min,
-       murmur_hash3_32(CAST(0 AS FLOAT), CAST(7 AS DOUBLE), CAST('-9223372036854775808' AS BIGINT)) AS mixed_variadic;
+       murmur_hash3_32(CAST(0 AS REAL), CAST(7 AS DOUBLE), CAST('-9223372036854775808' AS BIGINT)) AS mixed_variadic;
 
 -- query 4
 USE ${case_db};

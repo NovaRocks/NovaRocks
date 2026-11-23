@@ -26,8 +26,8 @@ CREATE TABLE ${case_db}.trc_l7_measurements (
   k INT,
   v BIGINT,
   d DECIMAL(20, 4),
-  s STRING,
-  ts DATETIME
+  s VARCHAR,
+  ts TIMESTAMP(6)
 ) WITH (format_version = 3);
 
 -- query 2
@@ -81,4 +81,4 @@ DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_min_star;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_retired_call;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_filtered;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_control;
-DROP TABLE ${case_db}.trc_l7_measurements;
+DROP TABLE IF EXISTS ${case_db}.trc_l7_measurements;

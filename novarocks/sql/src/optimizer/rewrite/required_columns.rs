@@ -658,7 +658,7 @@ fn tag_union(
 
     // Resolve which positions in the output schema are needed.
     let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
-    let needed_positions: Vec<usize> = match &parent_needed {
+    let mut needed_positions: Vec<usize> = match &parent_needed {
         None => (0..outputs.len()).collect(),
         Some(n) => outputs
             .iter()
@@ -666,6 +666,11 @@ fn tag_union(
             .filter_map(|(i, id)| n.contains(id).then_some(i))
             .collect(),
     };
+    // UNION ALL pruning retains its first output when the parent only needs
+    // row counts. Keep that position's original value in each branch as well.
+    if needed_positions.is_empty() && !outputs.is_empty() {
+        needed_positions.push(0);
+    }
 
     expr.required_output_columns = parent_needed.clone();
     let children = expr.children;
@@ -2875,7 +2880,7 @@ mod tests {
         );
         let order = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: key,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,

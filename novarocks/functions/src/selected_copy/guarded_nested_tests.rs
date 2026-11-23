@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::control_values::{AssemblyPlan, assemble_values};
-use arrow_array::{BooleanArray, Int64Array, ListArray, StringArray};
+use arrow_array::{BooleanArray, Int64Array, ListArray, NullArray, StringArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::Field;
 use std::sync::Arc;
@@ -31,6 +31,61 @@ impl crate::KernelEvaluationControl for Control {
         panic!("interleave must not wait")
     }
 }
+
+#[test]
+fn indexed_array_of_unknown_keeps_empty_array_null_array_and_null_element_distinct() {
+    let item = Arc::new(Field::new("item", DataType::Null, true));
+    let source: ArrayRef = Arc::new(ListArray::new(
+        item,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0, 1])),
+        Arc::new(NullArray::new(1)),
+        None,
+    ));
+    let output = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: source.data_type(),
+            sources: &[Some(&source)],
+            choices: &[Some((0, 0)), None, Some((0, 1))],
+        },
+        &Control,
+    )
+    .unwrap();
+
+    assert_eq!(output.data_type(), source.data_type());
+    let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(output.value_offsets(), &[0, 0, 0, 1]);
+    assert!(output.is_valid(0));
+    assert!(output.is_null(1));
+    assert!(output.is_valid(2));
+    assert_eq!(output.values().data_type(), &DataType::Null);
+    assert_eq!(output.values().logical_null_count(), 1);
+}
+
+#[test]
+fn indexed_struct_of_unknown_keeps_parent_validity_separate_from_the_field() {
+    let fields = vec![Arc::new(Field::new("unknown", DataType::Null, true))].into();
+    let source: ArrayRef = Arc::new(StructArray::new(
+        fields,
+        vec![Arc::new(NullArray::new(1))],
+        None,
+    ));
+    let output = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: source.data_type(),
+            sources: &[Some(&source)],
+            choices: &[None, Some((0, 0))],
+        },
+        &Control,
+    )
+    .unwrap();
+
+    assert_eq!(output.data_type(), source.data_type());
+    let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(output.is_null(0));
+    assert!(output.is_valid(1));
+    assert_eq!(output.column(0).logical_null_count(), 2);
+}
+
 fn list_struct_sources() -> Vec<ArrayRef> {
     let fields: arrow_schema::Fields = vec![
         Arc::new(Field::new("user_field", DataType::Utf8, true)),
@@ -277,8 +332,6 @@ fn nested_interleave_rejects_exact_type_source_choice_and_static_extent_failures
 #[test]
 fn nested_guarded_carriers_do_not_admit_other_encoding_or_child_protocols() {
     for ty in [
-        DataType::List(Arc::new(Field::new("item", DataType::Null, true))),
-        DataType::Struct(vec![Arc::new(Field::new("item", DataType::Null, true))].into()),
         DataType::FixedSizeBinary(0),
         DataType::FixedSizeBinary(-1),
         DataType::Union(

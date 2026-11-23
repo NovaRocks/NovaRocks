@@ -38,7 +38,7 @@ create table t0 (
     c3 array<bigint>,
     c4 array<DECIMAL(38, 0)>,
     c5 array<double>,
-    c6 array<float>
+    c6 array<REAL>
 ) WITH (format_version = 3);
 
 -- query 4
@@ -186,8 +186,8 @@ USE ${case_db};
 DROP TABLE IF EXISTS t0;
 create table t0 (
     k0 int,
-    c0 array<string>,
-    c1 array<string>
+    c0 array<VARCHAR>,
+    c1 array<VARCHAR>
 ) WITH (format_version = 3);
 
 -- query 32

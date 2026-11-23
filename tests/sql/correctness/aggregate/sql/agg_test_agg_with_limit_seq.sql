@@ -29,14 +29,14 @@ USE ${case_db};
 create table base_table (
     c0 int,
     c1 int,
-    c2 string,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into base_table SELECT generate_series % 4, generate_series % 9, generate_series % 9, generate_series %9 FROM TABLE(generate_series(1,  10000));
+insert into base_table SELECT generate_series % 4, generate_series % 9, CAST(generate_series % 9 AS VARCHAR), generate_series % 9 FROM TABLE(generate_series(1,  10000));
 
 -- query 4
 -- @skip_result_check=true
@@ -44,7 +44,7 @@ USE ${case_db};
 create table agg_with_limit_seq (
     c0 int,
     c1 int,
-    c2 string,
+    c2 VARCHAR,
     c3 int
 ) WITH (format_version = 3);
 

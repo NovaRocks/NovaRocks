@@ -296,6 +296,88 @@ pub(crate) fn validate_frozen_schema(
     Ok(())
 }
 
+/// Inspect only the selected occurrence and its descendants. The enclosing
+/// relation has already validated its frozen nominal declarations and source
+/// schema before this SQL admission check.
+pub(crate) fn retired_largeint_field<'a, E>(
+    field: &'a crate::iceberg::spec::NestedField,
+    declarations: &NominalSourceDeclarations,
+    work: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Option<&'a crate::iceberg::spec::NestedField>, E> {
+    if declarations.is_empty() {
+        return Ok(None);
+    }
+    work()?;
+    if declarations.get(&field.id) == Some(&NominalSourceDomain::LargeInt) {
+        return Ok(Some(field));
+    }
+    match field.field_type.as_ref() {
+        Type::Struct(children) => {
+            for child in children.fields() {
+                if let Some(retired) = retired_largeint_field(child, declarations, work)? {
+                    return Ok(Some(retired));
+                }
+            }
+        }
+        Type::List(list) => return retired_largeint_field(&list.element_field, declarations, work),
+        Type::Map(map) => {
+            if let Some(key) = retired_largeint_field(&map.key_field, declarations, work)? {
+                return Ok(Some(key));
+            }
+            return retired_largeint_field(&map.value_field, declarations, work);
+        }
+        Type::Primitive(_) | Type::Variant(_) => {}
+    }
+    Ok(None)
+}
+
+pub(crate) fn visit_retired_read_fields<'a, E>(
+    field: &'a crate::iceberg::spec::NestedField,
+    declarations: &NominalSourceDeclarations,
+    path: &mut Vec<&'a str>,
+    visit: &mut impl FnMut(&[&'a str], &'a crate::iceberg::spec::NestedField),
+    work: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    work()?;
+    path.push(field.name.as_str());
+    if declarations.get(&field.id) == Some(&NominalSourceDomain::LargeInt) {
+        visit(path, field);
+    }
+    match field.field_type.as_ref() {
+        Type::Struct(children) => {
+            for child in children.fields() {
+                visit_retired_read_fields(child, declarations, path, visit, work)?;
+            }
+        }
+        Type::List(list) => {
+            visit_retired_read_fields(&list.element_field, declarations, path, visit, work)?;
+        }
+        Type::Map(map) => {
+            visit_retired_read_fields(&map.key_field, declarations, path, visit, work)?;
+            visit_retired_read_fields(&map.value_field, declarations, path, visit, work)?;
+        }
+        Type::Primitive(_) | Type::Variant(_) => {}
+    }
+    path.pop();
+    Ok(())
+}
+
+pub(crate) fn retired_largeint_error(
+    table: &novarocks_spi::connector::read_stack::SchemaTableName,
+    field: &crate::iceberg::spec::NestedField,
+) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        format!(
+            "Iceberg table {}.{} field {} (ID {}) uses retired SQL type LARGEINT; migrate the field to a supported type",
+            table.schema_name(),
+            table.table_name(),
+            field.name,
+            field.id,
+        ),
+    )
+}
+
 /// This versioned provider namespace cannot be set by property mutations.
 pub(crate) fn reserved_property(key: &str) -> bool {
     key.starts_with(VERSIONED_PREFIX)

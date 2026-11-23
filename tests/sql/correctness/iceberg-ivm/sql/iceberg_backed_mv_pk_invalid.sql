@@ -33,9 +33,9 @@ CREATE CATALOG mv_ivm_pk_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = '
 CREATE SCHEMA mv_ivm_pk_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders (
   order_id BIGINT NOT NULL,
-  customer STRING,
+  customer VARCHAR,
   amount DOUBLE,
-  tags ARRAY<STRING>
+  tags ARRAY<VARCHAR>
 ) WITH (format_version = 3);
 INSERT INTO mv_ivm_pk_${uuid0}.ns_${uuid0}.orders VALUES
   ROW(1, 'A', 100.0, ['x']),

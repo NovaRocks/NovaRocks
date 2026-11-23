@@ -195,12 +195,12 @@ fn rewrite_children(
             }
         }
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child: mapped!(rewrite(arena, child)),
             target,
             decimal_overflow_policy,
@@ -924,7 +924,7 @@ mod tests {
                     true,
                 ),
                 kind: ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     expr: novarocks_parser::ast::AstBox::new(col_ref(a)),
                     target: DataType::Decimal128(3, 0),
                     decimal_overflow_policy: policy,

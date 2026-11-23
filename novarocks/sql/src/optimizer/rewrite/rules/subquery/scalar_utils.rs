@@ -486,12 +486,12 @@ where
             resolved,
         },
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child: candidate_or_none!(rewrite(arena, child)?),
             target,
             decimal_overflow_policy,

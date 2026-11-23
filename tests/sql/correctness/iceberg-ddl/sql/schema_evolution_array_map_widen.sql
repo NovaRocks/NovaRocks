@@ -29,7 +29,7 @@ DROP TABLE IF EXISTS samples;
 CREATE TABLE samples (
   id INT,
   scores ARRAY<INT>,
-  attrs MAP<STRING, INT>
+  attrs MAP<VARCHAR, INT>
 ) WITH (format_version = 2);
 
 -- query 2

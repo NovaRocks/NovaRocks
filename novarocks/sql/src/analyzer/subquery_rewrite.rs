@@ -1623,7 +1623,7 @@ impl<'a> AnalyzerContext<'a> {
                                 .expect("valid value root nullability transform"),
 
                             kind: ExprKind::Cast {
-                                array_failure_mode: None,
+                                cast_mode: None,
                                 expr: novarocks_parser::ast::AstBox::new(outer_expr),
                                 target: pred.inner_col.value_type.data_type().clone(),
                                 decimal_overflow_policy:
@@ -2437,7 +2437,7 @@ impl<'a> AnalyzerContext<'a> {
         sq_id: usize,
         negated: bool,
     ) -> Result<(), AnalyzeError> {
-        use super::resolve_expr::{cast_null_preserving_target_type, resolved_scalar_call_at};
+        use super::resolve_expr::resolved_scalar_call_at;
         use novarocks_functions::FunctionResultType;
         use novarocks_type_contract::DecimalOverflowPolicy;
 
@@ -2515,18 +2515,9 @@ impl<'a> AnalyzerContext<'a> {
             },
             value_type: param.value_type.clone(),
         };
-        let (probe, item) = match novarocks_types::comparison_common_type(
-            probe.value_type.data_type(),
-            item.value_type.data_type(),
-        )
-        .map_err(|message| AnalyzeError::type_mismatch_source(message, span))?
-        {
-            Some(common) => (
-                cast_null_preserving_target_type(probe, &common, DecimalOverflowPolicy::OutputNull),
-                cast_null_preserving_target_type(item, &common, DecimalOverflowPolicy::OutputNull),
-            ),
-            None => (probe, item),
-        };
+        let common = self.require_common_trino_type(&probe.value_type, &item.value_type, span)?;
+        let probe = self.coerce_common_value(probe, &common, span)?;
+        let item = self.coerce_common_value(item, &common, span)?;
         let comparison = TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: novarocks_parser::ast::AstBox::new(probe),
@@ -3198,7 +3189,11 @@ impl<'a> AnalyzerContext<'a> {
         // --- WHERE clause ---
         let filter = match &select.selection {
             Some(expr) => Some(qualify_inner_shadowing_column_refs(
-                coerce_where_to_bool(self.analyze_expr(expr, &merged_scope)?),
+                self.require_boolean_predicate(
+                    self.analyze_expr(expr, &merged_scope)?,
+                    "WHERE clause",
+                    expr.span(),
+                )?,
                 &inner_scope,
                 outer_scope,
             )),
@@ -3289,7 +3284,7 @@ impl<'a> AnalyzerContext<'a> {
                 let analyzed = self.analyze_expr(expr, &merged_scope);
                 match analyzed {
                     Ok(h) => Some(qualify_inner_shadowing_column_refs(
-                        h,
+                        self.require_boolean_predicate(h, "HAVING clause", expr.span())?,
                         &inner_scope,
                         outer_scope,
                     )),
@@ -3310,7 +3305,11 @@ impl<'a> AnalyzerContext<'a> {
                         }
                         let h = self.analyze_expr(expr, &alias_scope)?;
                         Some(qualify_inner_shadowing_column_refs(
-                            self.substitute_select_aliases(h, &projection),
+                            self.require_boolean_predicate(
+                                self.substitute_select_aliases(h, &projection),
+                                "HAVING clause",
+                                expr.span(),
+                            )?,
                             &inner_scope,
                             outer_scope,
                         ))
@@ -3553,50 +3552,6 @@ pub(super) struct CorrelationPred {
 /// A correlation predicate is an equality (or comparison) where one side
 /// references an outer-scope column (resolves in outer_scope but NOT in inner_scope)
 /// and the other side references an inner-scope column.
-/// Coerce a WHERE / ON / HAVING expression to BOOLEAN when its analysed
-/// type is not already boolean. MySQL/StarRocks accept `WHERE int_col`
-/// (truthy when non-zero, FALSE when zero, NULL when NULL); our analyzer
-/// hands such an expression off to downstream AND-conjuncts that
-/// require boolean operands ("AND right operand must be boolean"). Wrap
-/// numeric truthy filters as `expr != 0`; Utf8 truthy filters need an explicit
-/// boolean cast so values like `"true"` keep their predicate meaning.
-pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
-    use arrow::datatypes::DataType;
-    if matches!(expr.value_type.data_type(), DataType::Boolean) {
-        return expr;
-    }
-    let nullable = expr.value_type.nullable();
-    if matches!(expr.value_type.data_type(), DataType::Utf8) {
-        return TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                nullable,
-            ),
-
-            kind: ExprKind::Cast {
-                array_failure_mode: None,
-                expr: novarocks_parser::ast::AstBox::new(expr),
-                target: DataType::Boolean,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        };
-    }
-    let zero = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Int(0)),
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-    };
-    TypedExpr {
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-
-        kind: ExprKind::BinaryOp {
-            left: novarocks_parser::ast::AstBox::new(expr),
-            op: BinOp::Ne,
-            right: novarocks_parser::ast::AstBox::new(zero),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-    }
-}
-
 fn qualify_inner_shadowing_column_refs(
     expr: TypedExpr,
     inner_scope: &AnalyzerScope,
@@ -3727,7 +3682,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -3735,7 +3690,7 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::Cast {
-                array_failure_mode,
+                cast_mode,
                 expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
                     inner.into_inner(),
                     inner_scope,
@@ -5426,7 +5381,7 @@ fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
     if expr.value_type.data_type() != target && *expr.value_type.data_type() != DataType::Null {
         TypedExpr {
             kind: ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -5548,7 +5503,7 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -5556,7 +5511,7 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::Cast {
-                array_failure_mode: *array_failure_mode,
+                cast_mode: *cast_mode,
                 expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
@@ -5987,15 +5942,15 @@ fn correlation_factor_is_total(expression: &TypedExpr) -> bool {
         } => correlation_factor_is_total(left) && correlation_factor_is_total(right),
         ExprKind::Cast {
             expr,
-            target,
             decimal_overflow_policy,
-            array_failure_mode,
+            cast_mode,
+            ..
         } => {
             !crate::optimizer::scalar_expr::scalar_cast_can_fail(
-                expr.value_type.data_type(),
-                target,
+                &expr.value_type,
+                &expression.value_type,
                 *decimal_overflow_policy,
-                *array_failure_mode,
+                *cast_mode,
             ) && correlation_factor_is_total(expr)
         }
         ExprKind::UnaryOp {
@@ -6096,9 +6051,7 @@ mod tests {
     #[test]
     fn shadowing_qualification_preserves_explicit_array_cast_modes_and_complete_sources() {
         use crate::column_id::ColumnId;
-        use novarocks_type_contract::{
-            ArrayCastFailureMode, DecimalOverflowPolicy, FunctionValueType,
-        };
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
         use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
         let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
         let mut inner = AnalyzerScope::new(Rc::clone(&factory));
@@ -6123,10 +6076,7 @@ mod tests {
         outer.add_column_with_id(Some("outer_source"), "values", outer_id, source.clone());
         assert_eq!(inner.resolve(None, "values").unwrap().0, inner_id);
         assert_eq!(outer.resolve(None, "values").unwrap().0, outer_id);
-        for mode in [
-            ArrayCastFailureMode::ReportError,
-            ArrayCastFailureMode::OutputNull,
-        ] {
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
             let original = TypedExpr {
                 kind: ExprKind::Cast {
                     expr: novarocks_parser::ast::AstBox::new(TypedExpr {
@@ -6139,7 +6089,7 @@ mod tests {
                     }),
                     target: target.data_type().clone(),
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    array_failure_mode: Some(mode),
+                    cast_mode: Some(mode),
                 },
                 value_type: target.clone(),
             };
@@ -6153,12 +6103,12 @@ mod tests {
                 expr,
                 target: actual_target,
                 decimal_overflow_policy,
-                array_failure_mode,
+                cast_mode,
             } = actual.kind
             else {
                 panic!("original CAST boundary")
             };
-            assert_eq!(array_failure_mode, Some(mode));
+            assert_eq!(cast_mode, Some(mode));
             assert_eq!(decimal_overflow_policy, DecimalOverflowPolicy::ReportError);
             assert_eq!(&actual_target, target.data_type());
             assert_eq!(expr.value_type, source);
@@ -6268,51 +6218,6 @@ mod tests {
             );
             assert!(select.has_aggregation);
         }
-    }
-
-    #[test]
-    fn coerce_where_to_bool_keeps_numeric_truthiness_as_ne_zero() {
-        let expr = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: crate::column_id::ColumnId(1),
-                qualifier: None,
-                column: "flag".to_string(),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
-        };
-
-        let coerced = coerce_where_to_bool(expr);
-
-        assert!(matches!(
-            coerced.kind,
-            ExprKind::BinaryOp { op: BinOp::Ne, .. }
-        ));
-        assert_eq!(coerced.value_type.data_type().clone(), DataType::Boolean);
-        assert!(coerced.value_type.nullable());
-    }
-
-    #[test]
-    fn coerce_where_to_bool_casts_string_truthiness_to_boolean() {
-        let expr = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: crate::column_id::ColumnId(1),
-                qualifier: None,
-                column: "flag".to_string(),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
-        };
-
-        let coerced = coerce_where_to_bool(expr);
-
-        assert!(matches!(
-            coerced.kind,
-            ExprKind::Cast {
-                target: DataType::Boolean,
-                ..
-            }
-        ));
-        assert_eq!(coerced.value_type.data_type().clone(), DataType::Boolean);
-        assert!(coerced.value_type.nullable());
     }
 
     #[test]

@@ -335,7 +335,7 @@ fn pass_through_input(current: &LogicalPlanNode) -> Result<Vec<ProjectItem>, Sql
         .collect())
 }
 
-// Design: ADR-0252 (docs/adr/ADR-0252-aggregate-filters-select-original-rows-per-call.md)
+// Design: ADR-0253 (docs/adr/ADR-0253-aggregate-filters-select-original-rows-per-call.md)
 /// Each update has its own row-domain values. Repeat may duplicate these
 /// outputs, while the binding continues to refer to the original channels.
 pub(super) fn project_aggregate_inputs(
@@ -991,12 +991,12 @@ fn rewrite_expr_children_with<E>(
             body: novarocks_parser::ast::AstBox::new(rewrite_child(body)?),
         },
         ExprKind::Cast {
-            array_failure_mode,
+            cast_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
         } => ExprKind::Cast {
-            array_failure_mode: *array_failure_mode,
+            cast_mode: *cast_mode,
             expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
             target: target.clone(),
             decimal_overflow_policy: *decimal_overflow_policy,

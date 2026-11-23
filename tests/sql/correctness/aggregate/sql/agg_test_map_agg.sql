@@ -33,13 +33,13 @@ CREATE TABLE t1 (
     c4 int,
     c5 bigint,
     c6 largeint,
-    c7 string,
+    c7 VARCHAR,
     c8 double,
     c9 date,
-    c10 datetime,
+    c10 TIMESTAMP(6),
     c11 array<int>,
     c12 map<varchar(5), double>,
-    c13 ROW(a bigint, b string)
+    c13 ROW(a bigint, b VARCHAR)
     ) WITH (format_version = 3);
 
 -- query 3

@@ -42,7 +42,7 @@ fn native_decimal_array_and_temporal_literal_compile_sources_remain_valid() {
             double_items.clone(),
         ),
         (
-            "SELECT d = '2020-01-01' FROM (SELECT CAST('2020-01-01' AS DATE) AS d) t",
+            "SELECT d = DATE '2020-01-01' FROM (SELECT CAST('2020-01-01' AS DATE) AS d) t",
             DataType::Boolean,
         ),
         (
@@ -116,7 +116,7 @@ fn assert_real_null_list_cast(
             let value_type = FunctionValueType::try_from_value(
                 ValueTypeRef::try_new(
                     ValueKind::List(item.value_type().clone()),
-                    true,
+                    false,
                     ValueTypeStorageLifetime::pure(),
                 )
                 .unwrap(),

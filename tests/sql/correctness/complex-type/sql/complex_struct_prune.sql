@@ -23,16 +23,16 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.sc2 (
-  "v1" bigint(20),
+  "v1" BIGINT,
   "map1" MAP<int,MAP<int,MAP<int,int>>>,
   "st1" ROW(s1 int, sm2 MAP<int,int>, sm3 MAP<int,MAP<int,int>>),
   "st2" ROW(s1 int, sa2 ARRAY<int>, ss3 ROW(sss1 int, sss2 ROW(ssss1 int, ssss2 int)))
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t1 (
-  "v1" bigint(20),
-  "v2" bigint(20),
-  "v3" bigint(20)
+  "v1" BIGINT,
+  "v2" BIGINT,
+  "v3" BIGINT
 ) WITH (format_version = 3);
 
 insert into ${case_db}.t1 values ROW(1, 2, 3);
@@ -110,10 +110,10 @@ select named_struct('a', st1, 'b', st2)[1].sm2 from ${case_db}.sc2;
 
 -- query 21
 -- Cast struct to different field types
-select cast(row(1,2,3) as ROW(a double, b string, c BIGINT));
+select cast(row(1,2,3) as ROW(a double, b VARCHAR, c BIGINT));
 
 -- query 22
-select cast(named_struct('1', 1, '2', 2, '3', 3) as ROW(a double, b string, c BIGINT));
+select cast(named_struct('1', 1, '2', 2, '3', 3) as ROW(a double, b VARCHAR, c BIGINT));
 
 -- query 23
 with input as (select struct([1, 2, 3], [4, 5, 6]) as s union all select struct([5, 6, 7], [6, 7]) as s) select s, s.col1 from input;

@@ -23,7 +23,7 @@ CREATE SCHEMA iceberg_paimon_${suite_uuid0}.cross_${uuid0};
 -- @skip_result_check=true
 CREATE TABLE iceberg_paimon_${suite_uuid0}.cross_${uuid0}.dim_${uuid0} (
     id BIGINT,
-    label STRING
+    label VARCHAR
 );
 
 -- query 3

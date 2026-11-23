@@ -56,6 +56,7 @@ pub enum ArgumentControl {
     TypeOnly,
     If,
     Coalesce,
+    Try,
     /// The exact installed owner demands original emitted source occurrences.
     TemporalSource(crate::TemporalSourceKind),
     SimpleCase,
@@ -86,6 +87,7 @@ impl ArgumentControl {
             | (Self::NoArguments, ControlShape::NoArguments)
             | (Self::If, ControlShape::If)
             | (Self::Coalesce, ControlShape::Coalesce)
+            | (Self::Try, ControlShape::Try)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
             | (Self::SearchedCase, ControlShape::Case { simple: false, .. }) => true,
             (
@@ -205,6 +207,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::TypeOnly
                         | ArgumentControl::If
                         | ArgumentControl::Coalesce
+                        | ArgumentControl::Try
                         | ArgumentControl::TemporalSource(_)
                         | ArgumentControl::SimpleCase
                         | ArgumentControl::SearchedCase
@@ -234,6 +237,7 @@ impl FunctionEffectDeclaration {
             self.argument_control,
             ArgumentControl::If
                 | ArgumentControl::Coalesce
+                | ArgumentControl::Try
                 | ArgumentControl::TemporalSource(_)
                 | ArgumentControl::SimpleCase
                 | ArgumentControl::SearchedCase
@@ -587,6 +591,7 @@ mod tests {
             ArgumentControl::TypeOnly,
             ArgumentControl::If,
             ArgumentControl::Coalesce,
+            ArgumentControl::Try,
             ArgumentControl::SimpleCase,
             ArgumentControl::SearchedCase,
             ArgumentControl::HigherOrder {
@@ -606,6 +611,7 @@ mod tests {
             ControlShape::TypeOnly,
             ControlShape::If,
             ControlShape::Coalesce,
+            ControlShape::Try,
             ControlShape::Case {
                 simple: true,
                 arms: 1,

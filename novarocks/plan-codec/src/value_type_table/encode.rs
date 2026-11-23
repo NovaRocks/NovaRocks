@@ -140,9 +140,10 @@ impl Encoder<'_> {
     ) -> Result<(), Failure<H>> {
         context.step()?;
         let kind = match value.kind() {
-            ValueKind::Scalar(_) | ValueKind::String | ValueKind::Binary => {
-                Kind::Scalar(scalars::encode(value.kind(), context)?)
-            }
+            ValueKind::Scalar(_)
+            | ValueKind::String
+            | ValueKind::BoundedCharacter(_)
+            | ValueKind::Binary => Kind::Scalar(scalars::encode(value.kind(), context)?),
             ValueKind::Nominal(domain) => Kind::Nominal(scalars::encode_nominal(*domain)?),
             ValueKind::List(item) => Kind::ListItemTypeId(self.child(item, output, context)?),
             ValueKind::FixedSizeList { item, length } => {

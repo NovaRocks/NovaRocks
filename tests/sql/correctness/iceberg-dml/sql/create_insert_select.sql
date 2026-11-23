@@ -23,7 +23,7 @@
 DROP TABLE IF EXISTS ${case_db}.t_basic;
 CREATE TABLE ${case_db}.t_basic (
   id BIGINT,
-  name STRING,
+  name VARCHAR,
   qty BIGINT
 );
 INSERT INTO ${case_db}.t_basic VALUES

@@ -54,7 +54,7 @@ pub(crate) enum NormExpr {
         args: Vec<NormExpr>,
         binding: Option<crate::binding::SqlFunctionBinding>,
         decimal_overflow_policy: Option<novarocks_type_contract::DecimalOverflowPolicy>,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
         order_by: Vec<NormSortKey>,
         argument_order: NormArgumentOrder,
     },
@@ -159,7 +159,7 @@ fn normalize_inner(
         args,
         binding: None,
         decimal_overflow_policy: None,
-        array_failure_mode: None,
+        cast_mode: None,
         order_by: vec![],
     };
     Ok(Some(match arena.node(expr) {
@@ -236,7 +236,7 @@ fn normalize_inner(
                 args,
                 binding: None,
                 decimal_overflow_policy: Some(*decimal_overflow_policy),
-                array_failure_mode: None,
+                cast_mode: None,
                 order_by: vec![],
             }
         }
@@ -272,7 +272,7 @@ fn normalize_inner(
             distinct: *distinct || volatility.is_volatile(),
             binding: Some(binding.clone()),
             decimal_overflow_policy: None,
-            array_failure_mode: None,
+            cast_mode: None,
             order_by: vec![],
             args: required!(normalize_args(arena, args, base_names, control, work)?),
         },
@@ -291,13 +291,13 @@ fn normalize_inner(
             distinct: *distinct,
             binding: Some(resolved.clone()),
             decimal_overflow_policy: None,
-            array_failure_mode: None,
+            cast_mode: None,
             order_by: required!(normalize_order(arena, order_by, base_names, control, work)?),
             args: required!(normalize_args(arena, args, base_names, control, work)?),
         },
         ScalarNode::AggregateCall { .. } => return Ok(None),
         ScalarNode::Cast {
-            array_failure_mode,
+            cast_mode,
             child,
             target,
             decimal_overflow_policy,
@@ -322,7 +322,7 @@ fn normalize_inner(
                 )?)],
                 binding: None,
                 decimal_overflow_policy: Some(*decimal_overflow_policy),
-                array_failure_mode: *array_failure_mode,
+                cast_mode: *cast_mode,
                 order_by: vec![],
             }
         }
@@ -500,7 +500,7 @@ fn fingerprint(
             args,
             binding,
             decimal_overflow_policy,
-            array_failure_mode,
+            cast_mode,
             order_by,
             argument_order,
             ..
@@ -513,10 +513,12 @@ fn fingerprint(
             hash.write_u8(u8::from(*distinct));
             hash.write_u8(*argument_order as u8);
             hash.write_u8(decimal_overflow_policy.map_or(0, |p| 1 + p as u8));
-            hash.write_u8(match array_failure_mode {
+            hash.write_u8(match cast_mode {
                 None => 0,
-                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError) => 1,
-                Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull) => 2,
+                Some(novarocks_type_contract::TrinoCastMode::Explicit) => 1,
+                Some(novarocks_type_contract::TrinoCastMode::Try) => 2,
+                Some(novarocks_type_contract::TrinoCastMode::Implicit) => 3,
+                Some(novarocks_type_contract::TrinoCastMode::StoreAssignment) => 4,
             });
             hash.write_usize(args.len());
             hash.write_u8(u8::from(binding.is_some()));
@@ -597,7 +599,7 @@ fn equal(
                 args: aa,
                 binding: ab,
                 decimal_overflow_policy: ap,
-                array_failure_mode: am,
+                cast_mode: am,
                 order_by: ao,
                 argument_order: ar,
                 ..
@@ -608,7 +610,7 @@ fn equal(
                 args: ba,
                 binding: bb,
                 decimal_overflow_policy: bp,
-                array_failure_mode: bm,
+                cast_mode: bm,
                 order_by: bo,
                 argument_order: br,
                 ..

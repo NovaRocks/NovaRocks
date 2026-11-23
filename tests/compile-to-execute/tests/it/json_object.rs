@@ -33,7 +33,9 @@ use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
     Selection,
 };
-use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+use novarocks_type_contract::{
+    FunctionValueType, OperatorFunction, TrinoCastMode, ValueLogicalType,
+};
 
 use novarocks_sql_testkit::sql_source_with_declared_fields;
 
@@ -119,7 +121,9 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         let ExprKind::FunctionCall { function, args } = &expression.kind else {
                             continue;
                         };
-                        if function.function_id.as_str() != "builtin.scalar/__array_element_at/v1" {
+                        if function.function_id.as_str()
+                            != OperatorFunction::ArraySubscript.function_id_text()
+                        {
                             continue;
                         }
                         accesses += 1;
@@ -130,11 +134,19 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         );
                         assert!(expression.ty.nullable());
                         let index = unit.definition(args[1]).unwrap();
-                        assert_eq!(index.ty.data_type(), &DataType::Int32);
+                        assert_eq!(index.ty.data_type(), &DataType::Int64);
                         assert!(index.ty.nullable());
-                        // The literal IF index now has its native INTEGER
-                        // type; no BIGINT-to-INTEGER cast is needed or forged.
-                        let conditional = index;
+                        let ExprKind::Cast {
+                            expr,
+                            target,
+                            cast_mode,
+                        } = &index.kind
+                        else {
+                            panic!("expected widening of the original IF index");
+                        };
+                        assert_eq!(target, &DataType::Int64);
+                        assert_eq!(*cast_mode, TrinoCastMode::Implicit);
+                        let conditional = unit.definition(*expr).unwrap();
                         assert_eq!(conditional.ty.data_type(), &DataType::Int32);
                         assert!(conditional.ty.nullable());
                         let ExprKind::FunctionCall { function, args } = &conditional.kind else {

@@ -80,11 +80,11 @@ CREATE TABLE ${case_db}.t_mixed (
     id int NOT NULL,
     int_val int,
     str_val varchar(50),
-    float_val float,
+    float_val REAL,
     double_val double,
     decimal_val decimal(10,2),
     date_val date,
-    datetime_val datetime,
+    datetime_val TIMESTAMP(6),
     bool_val boolean
 ) WITH (format_version = 3);
 
@@ -253,7 +253,7 @@ SELECT id, varchar_col FROM ${case_db}.t_string WHERE upper(varchar_col) IN ('AP
 
 -- query 28
 -- @order_sensitive=true
-SELECT id, int_col FROM ${case_db}.t_int WHERE cast(int_col AS string) IN ('1000', '2000', '3000', '4000') ORDER BY id;
+SELECT id, int_col FROM ${case_db}.t_int WHERE cast(int_col AS VARCHAR) IN ('1000', '2000', '3000', '4000') ORDER BY id;
 
 -- query 29
 -- @order_sensitive=true

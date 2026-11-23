@@ -703,14 +703,32 @@ impl FrontendQuerySession {
                 return self.run_trino_action(statement, action).await;
             }
             Prep::RenameTable(node) => table::lower_trino_rename_table(&source, &node).map(catalog),
-            Prep::AddColumn(node) => table::lower_trino_add_column(&source, &node).map(catalog),
+            Prep::AddColumn(node) => table::lower_trino_add_column(
+                &source,
+                &node,
+                &novarocks_sql::compiler::SqlCompileControl::new(
+                    input.deadline,
+                    crate::query_execution::planning::sql_cancellation_observation(
+                        input.cancellation.clone(),
+                    ),
+                ),
+            )
+            .map(catalog),
             Prep::RenameColumn(node) => {
                 table::lower_trino_rename_column(&source, &node).map(catalog)
             }
             Prep::DropColumn(node) => table::lower_trino_drop_column(&source, &node).map(catalog),
-            Prep::SetColumnType(node) => {
-                table::lower_trino_set_column_type(&source, &node).map(catalog)
-            }
+            Prep::SetColumnType(node) => table::lower_trino_set_column_type(
+                &source,
+                &node,
+                &novarocks_sql::compiler::SqlCompileControl::new(
+                    input.deadline,
+                    crate::query_execution::planning::sql_cancellation_observation(
+                        input.cancellation.clone(),
+                    ),
+                ),
+            )
+            .map(catalog),
             Prep::DropNotNullConstraint(node) => {
                 table::lower_trino_drop_not_null(&source, &node).map(catalog)
             }

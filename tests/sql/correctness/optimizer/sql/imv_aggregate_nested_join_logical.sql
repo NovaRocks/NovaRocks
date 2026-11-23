@@ -40,7 +40,7 @@ CREATE TABLE imv_anj_cut_${uuid0}.ns_${uuid0}.dim (
 ) WITH (format_version = 3);
 CREATE TABLE imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 (
   id BIGINT NOT NULL,
-  region STRING
+  region VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 VALUES
   ROW(100, 'east'),

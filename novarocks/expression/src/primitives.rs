@@ -582,9 +582,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                 let StaticExprKind::PreparedCast {
                     operation,
                     child,
-                    decimal_overflow_policy,
-                    allow_throw_exception,
-                    array_failure_mode,
+                    cast_mode,
                 } = kind
                 else {
                     continue;
@@ -603,9 +601,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                     *operation,
                     value(*child)?,
                     value(invocation.definition)?,
-                    *decimal_overflow_policy,
-                    *allow_throw_exception,
-                    *array_failure_mode,
+                    *cast_mode,
                     control,
                 )?;
                 before_recipe_insert(&recipes, &mut retained, &mut work)?;
@@ -953,22 +949,14 @@ pub fn prepare_null_safe_comparison_node(
     Ok(novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(left, right, control)?)
 }
 pub fn prepare_cast_node(
-    operation: novarocks_functions::CastOperation,
+    _operation: novarocks_functions::CastOperation,
     source: &FunctionValueType,
     result: &FunctionValueType,
-    policy: novarocks_type_contract::DecimalOverflowPolicy,
-    allow_throw_exception: bool,
-    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+    cast_mode: novarocks_type_contract::TrinoCastMode,
     control: &dyn PureCompileControl,
 ) -> Result<novarocks_functions::PreparedCastRecipe, ProgramPrimitiveError> {
-    Ok(novarocks_functions::PreparedCastRecipe::try_new(
-        operation,
-        source,
-        result,
-        policy,
-        allow_throw_exception,
-        array_failure_mode,
-        control,
+    Ok(novarocks_functions::PreparedCastRecipe::try_new_trino(
+        source, result, cast_mode, control,
     )?)
 }
 pub fn prepare_arithmetic_node(

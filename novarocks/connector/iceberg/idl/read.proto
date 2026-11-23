@@ -163,6 +163,13 @@ message IcebergReadViewPayload {
 
 message IcebergPinnedDataFileSet {
   repeated string paths = 1;
+  IcebergPinnedDataReadPurpose purpose = 2;
+}
+
+enum IcebergPinnedDataReadPurpose {
+  ICEBERG_PINNED_DATA_READ_PURPOSE_UNSPECIFIED = 0;
+  ICEBERG_PINNED_DATA_READ_PURPOSE_QUERY = 1;
+  ICEBERG_PINNED_DATA_READ_PURPOSE_DATA_REWRITE = 2;
 }
 
 message IcebergReadDomain {

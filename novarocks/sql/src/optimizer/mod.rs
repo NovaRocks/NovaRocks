@@ -1372,7 +1372,7 @@ mod is_known_rule_name_tests {
     ) -> crate::optimizer::scalar::ScalarId {
         arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

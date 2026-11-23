@@ -28,7 +28,7 @@
 -- query 1
 -- Create table with BINARY(16), BINARY, VARBINARY, VARCHAR columns
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t0(c0 INT, c1 binary(16), c2 binary, c3 varbinary, c4 varchar(16)) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t0(c0 INT, c1 binary(16), c2 VARBINARY, c3 varbinary, c4 varchar(16)) WITH (format_version = 3);
 
 -- query 2
 -- Insert one row using hex literals
@@ -50,7 +50,7 @@ SELECT hex(c1), hex(c2), hex(c3), hex(c4) FROM ${case_db}.t0 ORDER BY c0;
 -- query 6
 -- Create t1 with the same schema; insert via SELECT *
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1(c0 INT, c1 binary(16), c2 binary, c3 varbinary, c4 varchar(16)) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t1(c0 INT, c1 binary(16), c2 VARBINARY, c3 varbinary, c4 varchar(16)) WITH (format_version = 3);
 
 -- query 7
 -- @skip_result_check=true

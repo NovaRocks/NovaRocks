@@ -29,27 +29,27 @@ USE ${case_db};
 
 -- query 3
 USE ${case_db};
-with input as (SELECT array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1)) AS a UNION ALL SELECT ['A', 'B', 'C'] AS a)
+with input as (SELECT array_map(x -> CAST(x AS VARCHAR), array_generate(1, 2000000, 1)) AS a UNION ALL SELECT ['A', 'B', 'C'] AS a)
 SELECT count(*) from (select a from input group by 1) AS t;
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t1" (
-  "id" int(11),
+  "id" INTEGER,
   "array_varchar" array<varchar(100)>
 ) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 select generate_series, array_map(x -> cast(x as string), array_generate(1, generate_series % 100, 1)) from table(generate_series(1, 10000));
+insert into t1 select generate_series, array_map(x -> cast(x as VARCHAR), array_generate(1, generate_series % 100, 1)) from table(generate_series(1, 10000));
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 values ROW(0, array_map(x -> CAST(x AS STRING), array_generate(1, 100000, 1))),
-ROW(10001, array_map(x -> CAST(x AS STRING), array_generate(1, 100000, 1)));
+insert into t1 values ROW(0, array_map(x -> CAST(x AS VARCHAR), array_generate(1, 100000, 1))),
+ROW(10001, array_map(x -> CAST(x AS VARCHAR), array_generate(1, 100000, 1)));
 
 -- query 7
 USE ${case_db};

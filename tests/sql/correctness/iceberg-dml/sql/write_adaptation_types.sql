@@ -21,8 +21,8 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.write_adaptation_types (
-  id INT,s ROW(raw BINARY,code INT,label STRING),a ARRAY<BINARY>,m MAP<STRING,BINARY>,
-  strings ARRAY<STRING>,d1 DECIMAL(1,0),d9 DECIMAL(9,2),d18 DECIMAL(18,2),d38 DECIMAL(38,2)
+  id INT,s ROW(raw VARBINARY,code INT,label VARCHAR),a ARRAY<VARBINARY>,m MAP<VARCHAR,VARBINARY>,
+  strings ARRAY<VARCHAR>,d1 DECIMAL(1,0),d9 DECIMAL(9,2),d18 DECIMAL(18,2),d38 DECIMAL(38,2)
 );
 INSERT INTO ${case_db}.write_adaptation_types VALUES
   ROW(1,named_struct('raw',X'FF00','code',7,'label','東京'),[X'00FF',NULL],map('alpha',X'FF00'),

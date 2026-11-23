@@ -160,12 +160,9 @@ fn invocation_program_with(
                 None,
                 source_type.clone(),
                 ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                     expr: data,
                     target: source_type.data_type().clone(),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                    allow_throw_exception: allow_ref,
                 },
             )
             .unwrap();
@@ -213,12 +210,9 @@ fn invocation_program_with(
                 None,
                 bool_ty.clone(),
                 ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
                     expr: remainder,
                     target: DataType::Boolean,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                    allow_throw_exception: allow_ref,
                 },
             )
             .unwrap();
@@ -264,12 +258,9 @@ fn invocation_program_with(
                     None,
                     flag_type.clone(),
                     ExprKind::Cast {
-                        array_failure_mode: None,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
                         expr: tail,
                         target: DataType::Boolean,
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                        allow_throw_exception: allow_ref,
                     },
                 )
                 .unwrap();

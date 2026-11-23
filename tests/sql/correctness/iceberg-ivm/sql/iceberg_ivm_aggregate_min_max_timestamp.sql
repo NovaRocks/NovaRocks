@@ -31,8 +31,8 @@ CREATE CATALOG ice_ivm_minmax_ts_db_${uuid0} USING iceberg WITH ("iceberg.catalo
 CREATE SCHEMA ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events (
   id BIGINT,
-  region STRING,
-  event_ts TIMESTAMP
+  region VARCHAR,
+  event_ts TIMESTAMP(6)
 ) WITH (format_version = 3);
 USE ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0};
 
@@ -42,11 +42,11 @@ USE ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0};
 -- microsecond precision survives the Iceberg parquet round-trip via the
 -- Map<Timestamp, Int64> detail-state column.
 INSERT INTO ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events VALUES
-  ROW(1, 'east', '2026-01-15 08:30:00.123456'),
-  ROW(2, 'east', '2026-03-22 14:45:30.654321'),
-  ROW(3, 'east', '2026-06-30 12:00:00'),
-  ROW(4, 'east', '2026-09-10 23:59:59.999999'),
-  ROW(5, 'east', '2026-12-25 00:00:01.000001');
+  ROW(1, 'east', TIMESTAMP '2026-01-15 08:30:00.123456'),
+  ROW(2, 'east', TIMESTAMP '2026-03-22 14:45:30.654321'),
+  ROW(3, 'east', TIMESTAMP '2026-06-30 12:00:00'),
+  ROW(4, 'east', TIMESTAMP '2026-09-10 23:59:59.999999'),
+  ROW(5, 'east', TIMESTAMP '2026-12-25 00:00:01.000001');
 CREATE MATERIALIZED VIEW ts_mv_${uuid0} AS SELECT region,
        MIN(event_ts) AS mn,
        MAX(event_ts) AS mx,
@@ -117,7 +117,7 @@ ORDER BY region;
 -- query 11
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW ts_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ts_mv_${uuid0};
 DROP TABLE ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events ;
 DROP SCHEMA ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_minmax_ts_db_${uuid0};

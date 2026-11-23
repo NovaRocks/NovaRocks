@@ -695,6 +695,12 @@ fn literal(kind: ast::LiteralKind) -> ast::Expr {
 fn null_expr() -> ast::Expr {
     build::null()
 }
+fn typed_string(type_name: &str, value: String) -> ast::Expr {
+    literal(ast::LiteralKind::Generic(ast::GenericLiteral {
+        type_name: type_name.to_string(),
+        value,
+    }))
+}
 fn string(value: String) -> ast::Expr {
     build::string(value)
 }
@@ -742,13 +748,13 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
         }
         (ColumnDefault::Binary(value), DataType::Binary | DataType::LargeBinary) => binary(value),
         (ColumnDefault::Date { days_since_epoch }, DataType::Date32) => {
-            string(format_date(*days_since_epoch)?)
+            typed_string("DATE", format_date(*days_since_epoch)?)
         }
         (
             ColumnDefault::TimestampMicros { micros_since_epoch },
-            DataType::Timestamp(TimeUnit::Microsecond, _),
-        )
-        | (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ) => typed_string("TIMESTAMP", format_timestamp_micros(*micros_since_epoch)?),
+        (
             ColumnDefault::TimestamptzMicros { micros_since_epoch },
             DataType::Timestamp(TimeUnit::Microsecond, _),
         ) => string(format_timestamp_micros(*micros_since_epoch)?),
@@ -851,7 +857,12 @@ fn format_date(days_since_epoch: i32) -> Result<String, String> {
 
 fn format_timestamp_micros(value: i64) -> Result<String, String> {
     chrono::DateTime::from_timestamp_micros(value)
-        .map(|datetime| datetime.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|datetime| {
+            datetime
+                .naive_utc()
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string()
+        })
         .ok_or_else(|| format!("write-default datetime value {value} is out of range"))
 }
 
@@ -913,147 +924,6 @@ fn typed_write_literal_source(
     Ok(expression)
 }
 
-/// Attach context only along the exact projection/derived-alias geometry
-/// authored by the INSERT wrapper above the complete source query.
-pub(crate) fn attach_write_literal_contexts(
-    query: &ast::Query,
-    assignments: std::sync::Arc<novarocks_sql::compiler::SqlWriteAssignments>,
-    control: &novarocks_sql::compiler::SqlCompileControl,
-) -> Result<
-    std::sync::Arc<novarocks_sql::compiler::SqlWriteAssignments>,
-    novarocks_sql::compiler::SqlCompileError,
-> {
-    use novarocks_sql::compiler::{SqlCompileError, SqlConstantQueryStep};
-    use novarocks_type_contract::PureCompileControl;
-    if source_assignment_before_common_type(query) {
-        let mut contexts = Vec::new();
-        for site in assignments.sites() {
-            append_write_literal_sites(
-                &query.body,
-                site.output_ordinal(),
-                site.output_ordinal(),
-                &mut Vec::new(),
-                &mut contexts,
-                control,
-                true,
-            )?;
-        }
-        let assignments = std::sync::Arc::try_unwrap(assignments).map_err(|_| {
-            SqlCompileError::InvalidRequest(
-                "INSERT source assignments require their original declaration owner".into(),
-            )
-        })?;
-        return Ok(std::sync::Arc::new(
-            assignments.with_literal_contexts(contexts.into_boxed_slice()),
-        ));
-    }
-    let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(assignments);
-    };
-    let assignments = if select
-        .projection
-        .iter()
-        .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
-    {
-        let mut sites = Vec::new();
-        sites
-            .try_reserve_exact(assignments.sites().len())
-            .map_err(|cause| {
-                SqlCompileError::CompilationSource(
-                    novarocks_failure_contract::SharedFailureCause::new(
-                        novarocks_functions::allocation_failure::AllocationRefusal::new(
-                            "INSERT source assignment sites",
-                            cause,
-                        ),
-                    ),
-                )
-            })?;
-        for site in assignments.sites() {
-            control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
-            let site = match select.projection.get(site.output_ordinal()) {
-                Some(ast::SelectItem::SingleColumn(column)) => {
-                    site.clone().with_source_span(column.expression.span())
-                }
-                _ => site.clone(),
-            };
-            sites.push(site);
-        }
-        std::sync::Arc::new(novarocks_sql::compiler::SqlWriteAssignments::try_new(
-            sites.into_boxed_slice(),
-            control,
-        )?)
-    } else {
-        assignments
-    };
-
-    let Some((subquery, alias, relation_path)) = select.from.as_ref().and_then(derived_source)
-    else {
-        return Ok(assignments);
-    };
-    if alias.alias.value != "__nr_insert_src" {
-        return Ok(assignments);
-    }
-    let mut contexts = Vec::new();
-    for site in assignments.sites() {
-        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
-        let Some(ast::SelectItem::SingleColumn(column)) =
-            select.projection.get(site.output_ordinal())
-        else {
-            continue;
-        };
-        let expr = &column.expression;
-        let Some(chain) = ast::identifier_chain_observed(expr, |_| {
-            control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
-        })?
-        else {
-            continue;
-        };
-        if chain.len() != 2 {
-            continue;
-        }
-        let qualifier = chain.first();
-        let name = chain.last();
-        if qualifier.value != alias.alias.value {
-            continue;
-        }
-        let ordinal = alias
-            .column_names
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .position(|column| column.value == name.value)
-            .ok_or_else(|| {
-                SqlCompileError::InvalidRequest(
-                    "INSERT source reference lost its original alias ordinal".into(),
-                )
-            })?;
-        let mut path = vec![SqlConstantQueryStep::SelectFromDerived {
-            relation_path: relation_path.clone(),
-        }];
-        append_write_literal_sites(
-            &subquery.body,
-            ordinal,
-            site.output_ordinal(),
-            &mut path,
-            &mut contexts,
-            control,
-            source_assignment_before_common_type(subquery),
-        )?;
-    }
-    if contexts.is_empty() {
-        return Ok(assignments);
-    }
-    let assignments = std::sync::Arc::try_unwrap(assignments).map_err(|_| {
-        SqlCompileError::InvalidRequest(
-            "INSERT literal contexts require their newly projected declaration owner".into(),
-        )
-    })?;
-    Ok(std::sync::Arc::new(
-        assignments.with_literal_contexts(contexts.into_boxed_slice()),
-    ))
-}
-/// Keep early assignment within the original literal INSERT sources. Source
-/// controls retain their independent inference above this boundary.
 /// Observe only the original single derived-source profile and its actual wrapper path.
 fn derived_source(
     relation: &ast::Relation,
@@ -1075,149 +945,6 @@ fn derived_source(
         alias,
         vec![novarocks_sql::compiler::SqlRelationStep::Aliased],
     ))
-}
-
-fn source_assignment_before_common_type(query: &ast::Query) -> bool {
-    if !query.functions.is_empty()
-        || query.with.is_some()
-        || query.modifiers.order_by.is_some()
-        || query.modifiers.limit.is_some()
-        || query.modifiers.offset.is_some()
-    {
-        return false;
-    }
-    fn eligible(body: &ast::SetExpr) -> bool {
-        match body {
-            ast::SetExpr::Table(_) => false,
-            ast::SetExpr::Values(_) => true,
-            ast::SetExpr::Select(select) => {
-                select.modifiers.is_empty()
-                    && select.from.is_none()
-                    && !select.distinct
-                    && select.selection.is_none()
-                    && select.group_by.is_none()
-                    && select.having.is_none()
-                    && select.windows.is_empty()
-                    && select.projection.iter().all(|item| match item {
-                        ast::SelectItem::SingleColumn(column) => {
-                            super::command::is_literal_expr(&column.expression)
-                        }
-                        _ => false,
-                    })
-            }
-            ast::SetExpr::Query(subquery) => {
-                let query = &subquery.query;
-                source_assignment_before_common_type(query)
-            }
-            ast::SetExpr::SetOperation(operation) => {
-                matches!(operation.operator, ast::SetOperator::Union)
-                    && !operation.distinct
-                    && operation.corresponding.is_none()
-                    && operation.inputs.iter().all(eligible)
-            }
-        }
-    }
-    eligible(&query.body)
-}
-
-fn append_write_literal_sites(
-    body: &ast::SetExpr,
-    source_ordinal: usize,
-    output_ordinal: usize,
-    path: &mut Vec<novarocks_sql::compiler::SqlConstantQueryStep>,
-    contexts: &mut Vec<novarocks_sql::compiler::SqlWriteLiteralContext>,
-    control: &novarocks_sql::compiler::SqlCompileControl,
-    assignment_before_common_type: bool,
-) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
-    use novarocks_sql::compiler::{
-        SqlConstantExpressionSite as Site, SqlConstantQueryStep as Step, SqlWriteLiteralContext,
-    };
-    use novarocks_type_contract::PureCompileControl;
-    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
-    match body {
-        ast::SetExpr::Table(_) => {
-            return Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(
-                "TABLE query bodies are not literal write sources".into(),
-            ));
-        }
-        ast::SetExpr::Values(values) => {
-            for (row, value) in values.rows.iter().enumerate() {
-                let cells = ast::ValuesRowCells::new(value);
-                if cells.has_named_fields() {
-                    return Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(
-                        "VALUES write context does not support named row fields".into(),
-                    ));
-                }
-                if source_ordinal >= cells.len() {
-                    continue;
-                }
-                let context = SqlWriteLiteralContext::new(
-                    path.clone(),
-                    Site::ValuesCell {
-                        row,
-                        column: source_ordinal,
-                    },
-                    output_ordinal,
-                );
-                contexts.push(if assignment_before_common_type {
-                    context.with_source_assignment()
-                } else {
-                    context
-                });
-            }
-        }
-        ast::SetExpr::Select(select) => {
-            if select
-                .projection
-                .iter()
-                .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
-                && source_ordinal < select.projection.len()
-            {
-                let context = SqlWriteLiteralContext::new(
-                    path.clone(),
-                    Site::SelectProjection {
-                        column: source_ordinal,
-                    },
-                    output_ordinal,
-                );
-                contexts.push(if assignment_before_common_type {
-                    context.with_source_assignment()
-                } else {
-                    context
-                });
-            }
-        }
-        ast::SetExpr::Query(subquery) => {
-            let query = &subquery.query;
-            path.push(Step::NestedQuery);
-            append_write_literal_sites(
-                &query.body,
-                source_ordinal,
-                output_ordinal,
-                path,
-                contexts,
-                control,
-                assignment_before_common_type,
-            )?;
-            path.pop();
-        }
-        ast::SetExpr::SetOperation(operation) => {
-            for (index, child) in operation.inputs.iter().enumerate() {
-                path.push(Step::SetOperand { index });
-                append_write_literal_sites(
-                    child,
-                    source_ordinal,
-                    output_ordinal,
-                    path,
-                    contexts,
-                    control,
-                    assignment_before_common_type,
-                )?;
-                path.pop();
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Keep original explicit VARIANT constants in the existing holder even when
@@ -1435,7 +1162,6 @@ mod typed_write_source_tests {
             "SELECT '1' AS p UNION SELECT '01' AS p",
         ] {
             let source = query(sql);
-            assert!(!source_assignment_before_common_type(&source), "{sql}");
             assert!(
                 shape_typed_write_source(&source, &[], &columns, &columns, None)
                     .unwrap()
@@ -1455,7 +1181,6 @@ mod typed_write_source_tests {
             columns: Vec::new(),
             span: operation.span,
         });
-        assert!(!source_assignment_before_common_type(&source));
         assert!(body_has_distinct_set(&source.body));
         assert!(
             shape_typed_write_source(&source, &[], &columns, &columns, None)

@@ -81,7 +81,7 @@ fn call(args: Vec<NormExpr>) -> NormExpr {
         args,
         binding: None,
         decimal_overflow_policy: None,
-        array_failure_mode: None,
+        cast_mode: None,
         order_by: vec![],
         argument_order: NormArgumentOrder::Ordered,
     }
@@ -591,7 +591,7 @@ fn typed_map64_mv_normalization_fingerprint_and_cast_keep_complete_identity() {
     let cast = intern(
         &mut arena,
         ScalarNode::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             child: value,
             target: ty.data_type().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -615,7 +615,7 @@ fn typed_map64_mv_normalization_fingerprint_and_cast_keep_complete_identity() {
 
 #[test]
 fn array_cast_mode_is_part_of_mv_normalized_fingerprint_and_exact_equality() {
-    use novarocks_type_contract::ArrayCastFailureMode;
+    use novarocks_type_contract::TrinoCastMode;
     let ty = FunctionValueType::new(
         DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
@@ -630,8 +630,8 @@ fn array_cast_mode_is_part_of_mv_normalized_fingerprint_and_exact_equality() {
     let mut expressions = Vec::new();
     for mode in [
         None,
-        Some(ArrayCastFailureMode::ReportError),
-        Some(ArrayCastFailureMode::OutputNull),
+        Some(TrinoCastMode::Explicit),
+        Some(TrinoCastMode::Try),
     ] {
         let id = intern(
             &mut arena,
@@ -639,7 +639,7 @@ fn array_cast_mode_is_part_of_mv_normalized_fingerprint_and_exact_equality() {
                 child,
                 target: ty.data_type().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                array_failure_mode: mode,
+                cast_mode: mode,
             },
             ty.clone(),
         );

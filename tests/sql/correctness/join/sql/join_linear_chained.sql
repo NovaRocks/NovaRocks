@@ -70,7 +70,7 @@ CREATE TABLE ${case_db}.t1 (
     k1 bigint ,
     c_int int ,
     c_bigint bigint ,
-    c_string STRING
+    c_string VARCHAR
 ) WITH (format_version = 3);
 
 -- query 10

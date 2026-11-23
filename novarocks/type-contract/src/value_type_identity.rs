@@ -195,6 +195,14 @@ fn node<E>(value: &ValueTypeRef, write: &mut impl FnMut(&[u8]) -> Result<(), E>)
             scalar(ty, write)?;
         }
         ValueKind::String => write(&[1])?,
+        ValueKind::BoundedCharacter(character) => {
+            let kind = match character.kind() {
+                crate::CharacterKind::Char => 0,
+                crate::CharacterKind::Varchar => 1,
+            };
+            write(&[9, kind])?;
+            write(&character.length().to_le_bytes())?;
+        }
         ValueKind::Binary => write(&[2])?,
         ValueKind::Nominal(domain) => write(&[
             3,

@@ -46,6 +46,7 @@ pub(crate) fn typed_expr_semantically_eq(
 pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
     use super::{BinOp, UnOp};
     let share = expression_can_share_evaluation;
+    let result_type = &expr.value_type;
     match &expr.kind {
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
@@ -83,15 +84,15 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
         | ExprKind::Lambda { body: expr, .. } => share(expr),
         ExprKind::Cast {
             expr,
-            target,
             decimal_overflow_policy,
-            array_failure_mode,
+            cast_mode,
+            ..
         } => {
             !crate::optimizer::scalar_expr::scalar_cast_can_fail(
-                expr.value_type.data_type(),
-                target,
+                &expr.value_type,
+                result_type,
                 *decimal_overflow_policy,
-                *array_failure_mode,
+                *cast_mode,
             ) && share(expr)
         }
         ExprKind::AggregateCall {
@@ -304,13 +305,13 @@ fn typed_expr_semantically_eq_with(
         }
         (
             ExprKind::Cast {
-                array_failure_mode: left_array_mode,
+                cast_mode: left_array_mode,
                 expr: left_expr,
                 target: left_target,
                 decimal_overflow_policy: left_policy,
             },
             ExprKind::Cast {
-                array_failure_mode: right_array_mode,
+                cast_mode: right_array_mode,
                 expr: right_expr,
                 target: right_target,
                 decimal_overflow_policy: right_policy,

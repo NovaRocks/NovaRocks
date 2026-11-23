@@ -35,7 +35,7 @@ CREATE TABLE iceberg_cat_${suite_uuid0}.runtime_prune_db_${uuid0}.build_${uuid0}
 -- @skip_result_check=true
 CREATE TABLE iceberg_cat_${suite_uuid0}.runtime_prune_db_${uuid0}.probe_${uuid0} (
   k1 INT,
-  payload STRING
+  payload VARCHAR
 );
 
 -- query 4

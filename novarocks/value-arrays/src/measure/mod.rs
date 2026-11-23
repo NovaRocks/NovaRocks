@@ -80,6 +80,7 @@ pub struct OutputColumn<'a> {
     source: &'a ArrayRef,
     target: &'a DataType,
     constant: bool,
+    project_fixed_binary: bool,
 }
 
 impl<'a> OutputColumn<'a> {
@@ -88,6 +89,7 @@ impl<'a> OutputColumn<'a> {
             source,
             target,
             constant: false,
+            project_fixed_binary: false,
         }
     }
 
@@ -96,7 +98,15 @@ impl<'a> OutputColumn<'a> {
             source,
             target,
             constant: true,
+            project_fixed_binary: false,
         }
+    }
+
+    /// The provider's binding has verified the selected Fixed storage
+    /// occurrences and has authored Binary at the corresponding output leaves.
+    pub const fn with_fixed_binary_projection(mut self) -> Self {
+        self.project_fixed_binary = true;
+        self
     }
 }
 
@@ -137,8 +147,11 @@ impl<'a> PrefixPlanner<'a> {
             planned.push(Column::new(
                 source,
                 column.target,
-                column.constant,
-                borrow,
+                column::SourcePolicy {
+                    constant: column.constant,
+                    borrow,
+                    project_fixed_binary: column.project_fixed_binary,
+                },
                 growth,
                 work,
                 0,

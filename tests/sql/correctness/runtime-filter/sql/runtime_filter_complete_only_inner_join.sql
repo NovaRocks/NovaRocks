@@ -26,7 +26,7 @@ DROP TABLE IF EXISTS ${case_db}.rf_co_customers;
 
 CREATE TABLE ${case_db}.rf_co_customers (
     id INT,
-    name STRING
+    name VARCHAR
 ) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_co_orders (

@@ -201,6 +201,20 @@ impl Signature {
 }
 
 impl TypeSpec {
+    pub(super) fn is_generic(&self) -> bool {
+        match self {
+            Self::Any(_)
+            | Self::AnyType
+            | Self::Decimal128Of(_)
+            | Self::Decimal256Of(_)
+            | Self::AnyDecimal128
+            | Self::MapWithUninhabitedKey { .. } => true,
+            Self::List(item) => item.is_generic(),
+            Self::Map(key, value) => key.is_generic() || value.is_generic(),
+            _ => false,
+        }
+    }
+
     fn write_canonical(&self, output: &mut String) {
         match self {
             Self::Boolean => output.push_str("bool"),
@@ -437,6 +451,7 @@ use super::scalar_construction::{
 pub(crate) enum BindMode {
     Strict,
     Widening,
+    TrinoCoercion,
 }
 
 /// Type-variable bindings produced by polymorphic matching.
@@ -468,13 +483,16 @@ impl Bindings {
         creation: &mut ScalarConstruction<'_, E>,
     ) -> Result<bool, ConstructionFailure<E>> {
         if let Some(existing) = self.lookup_value(name) {
-            let Some(merged) = merge_value_types_with_construction(
-                &existing,
-                ty,
-                matches!(mode, BindMode::Widening),
-                creation,
-            )?
-            else {
+            let merged = match mode {
+                BindMode::TrinoCoercion => creation.trino_common(&existing, ty)?,
+                BindMode::Strict | BindMode::Widening => merge_value_types_with_construction(
+                    &existing,
+                    ty,
+                    matches!(mode, BindMode::Widening),
+                    creation,
+                )?,
+            };
+            let Some(merged) = merged else {
                 return Ok(false);
             };
             if let Some(entry) = self.entries.iter_mut().find(|(n, _)| *n == name) {
@@ -728,6 +746,7 @@ pub(super) fn unify_with_construction<E>(
         TypeSpec::Any(name) => match mode {
             BindMode::Strict => bindings.bind_with_construction(name, dt, creation)?,
             BindMode::Widening => bindings.bind_widening_with_construction(name, dt, creation)?,
+            BindMode::TrinoCoercion => unreachable!("Trino signatures consume full value types"),
         },
         // A named decimal binds like a type variable but only over decimals,
         // so the exact precision and scale travel to the return type.
@@ -743,6 +762,9 @@ pub(super) fn unify_with_construction<E>(
                     BindMode::Strict => bindings.bind_with_construction(name, dt, creation)?,
                     BindMode::Widening => {
                         bindings.bind_widening_with_construction(name, dt, creation)?
+                    }
+                    BindMode::TrinoCoercion => {
+                        unreachable!("Trino signatures consume full value types")
                     }
                 }
             }
@@ -1077,6 +1099,27 @@ pub(super) fn unify_value_with_construction<E>(
                     None => false,
                 }
             }
+        }
+        TypeSpec::Decimal128Of(name)
+            if matches!(mode, BindMode::TrinoCoercion)
+                && matches!(
+                    ty.data_type(),
+                    DataType::Null
+                        | DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                ) =>
+        {
+            use novarocks_type_contract::ValueKind::Scalar;
+            let base = Scalar(DataType::Decimal128(1, 0));
+            let Some(Scalar(decimal)) =
+                novarocks_type_contract::trino_common_scalar_kind(ty.value_type().kind(), &base)
+            else {
+                return Ok(false);
+            };
+            let decimal = creation.value(decimal, ty.nullable(), ValueLogicalType::Physical)?;
+            bindings.bind_value_with_construction(name, &decimal, mode, creation)?
         }
         TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => {
             ty.logical_type() == ValueLogicalType::Physical

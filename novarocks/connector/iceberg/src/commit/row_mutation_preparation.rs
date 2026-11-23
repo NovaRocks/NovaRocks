@@ -28,8 +28,7 @@ use novarocks_spi::connector::{
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
     ConnectorProviderBindingKey, ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken,
+    ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteFieldToken,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -38,8 +37,7 @@ use super::model::IsolationLevel;
 
 use crate::commit::validation::row_mutation_strategy_from_metadata;
 use crate::commit::write_shared::{
-    exact_requested_write_fields_from_declaration, snapshot_token, write_target_snapshot_id,
-    writer_value_with_nullable,
+    snapshot_token, write_target_snapshot_id, writer_value_with_nullable,
 };
 use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
@@ -303,19 +301,7 @@ pub(crate) fn prepare_row_mutation(
     // source identities precede target before/after values and the logical
     // effect field is last.  The source/target ordinals are the sole cross
     // layer binding; these familiar Iceberg names never become a Core rule.
-    let requested_target_fields = target_iceberg_schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| {
-            ConnectorWriteFieldRequest::new(Field::new(
-                &field.name,
-                DataType::Null,
-                !field.required,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let (target_fields, canonical_fields, identity_fields) =
+    let (canonical_fields, identity_fields) =
         crate::metadata::with_pure_schema_creation(&request.context, |creation| {
             creation
                 .work(0)
@@ -332,13 +318,6 @@ pub(crate) fn prepare_row_mutation(
                 creation,
             )
             .map_err(crate::metadata::metadata_creation_error)?;
-            let targets = exact_requested_write_fields_from_declaration(
-                &document,
-                &target_iceberg_schema,
-                &requested_target_fields,
-                &execution,
-                creation,
-            )?;
             let offset = target_iceberg_schema.as_struct().fields().len();
             let mut identity = creation
                 .reserve(identity_source_fields.len())
@@ -363,7 +342,7 @@ pub(crate) fn prepare_row_mutation(
                     &execution,
                     creation,
                 )?;
-            Ok((targets, canonical, identity))
+            Ok((canonical, identity))
         })?;
     // The match query must scan the exact target ref/base chosen above. The
     // ordinary admitted table handle names the provider's default/current ref,
@@ -401,7 +380,7 @@ pub(crate) fn prepare_row_mutation(
             "Iceberg row-mutation identity layout exceeds u32 ordinals",
         )
     })?;
-    let target_width = u32::try_from(target_fields.len()).map_err(|_| {
+    let target_width = u32::try_from(canonical_fields.len()).map_err(|_| {
         ConnectorError::new(
             ConnectorErrorKind::ResourceExhausted,
             "Iceberg row-mutation target layout exceeds u32 ordinals",
@@ -410,13 +389,13 @@ pub(crate) fn prepare_row_mutation(
     let (before_fields, after_fields) =
         crate::metadata::with_pure_schema_creation(&request.context, |creation| {
             let mut before = creation
-                .reserve(target_fields.len())
+                .reserve(canonical_fields.len())
                 .map_err(crate::metadata::metadata_creation_error)?;
             let mut after = creation
-                .reserve(target_fields.len())
+                .reserve(canonical_fields.len())
                 .map_err(crate::metadata::metadata_creation_error)?;
-            for (ordinal, field) in target_fields.iter().enumerate() {
-                let value = field.execution_type().ok_or_else(|| {
+            for (ordinal, canonical) in canonical_fields.iter().enumerate() {
+                let value = canonical.execution_type().ok_or_else(|| {
                     ConnectorError::new(
                         ConnectorErrorKind::Internal,
                         "provider target declaration is absent",
@@ -429,21 +408,20 @@ pub(crate) fn prepare_row_mutation(
                 )?;
                 before.push(ConnectorMutationTargetField::try_new_typed(
                     row_mutation_field_token(owner, &request.table, b"before", ordinal),
-                    field.field().clone().with_nullable(before_value.nullable()),
+                    canonical
+                        .field()
+                        .clone()
+                        .with_nullable(before_value.nullable()),
                     target_start + u32::try_from(ordinal).expect("target ordinal fits u32"),
                     before_value,
                 )?);
-                let canonical = &canonical_fields[ordinal];
                 let after_field = ConnectorMutationTargetField::try_new_typed(
                     row_mutation_field_token(owner, &request.table, b"after", ordinal),
                     canonical.field().clone(),
                     target_start
                         + target_width
                         + u32::try_from(ordinal).expect("target ordinal fits u32"),
-                    canonical
-                        .execution_type()
-                        .expect("canonical provider after declaration")
-                        .clone(),
+                    value.clone(),
                 )?;
                 after.push(match canonical.storage_type() {
                     Some(storage) => after_field.with_storage_type(storage.clone())?,
@@ -920,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn mor_before_keeps_storage_and_after_signs_required_canonical_input() {
+    fn mor_before_uses_the_fixed_read_projection_and_after_keeps_storage() {
         let schema = IcebergSchema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -947,7 +925,7 @@ mod tests {
             );
             let contract = preparation.match_contract();
             let before = &contract.before_fields()[0];
-            assert_eq!(before.field().data_type(), &DataType::FixedSizeBinary(4));
+            assert_eq!(before.field().data_type(), &DataType::Binary);
             assert_eq!(before.field().is_nullable(), accepts_insert);
             assert!(before.storage_type().is_none());
             let after = &contract.after_fields()[0];

@@ -40,9 +40,9 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.employees;
 CREATE TABLE ${case_db}.employees (
-  "employee_id" int(11),
+  "employee_id" INTEGER,
   "name" varchar(100),
-  "manager_id" int(11),
+  "manager_id" INTEGER,
   "title" varchar(50)
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.employees VALUES

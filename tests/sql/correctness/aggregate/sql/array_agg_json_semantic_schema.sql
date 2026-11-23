@@ -15,20 +15,23 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- JSON and STRING have the same Utf8 text and different frozen child domains.
-SELECT array_agg(JSON '{"2:3": null}') AS json_values,
-       array_agg(CAST(JSON '{"2:3": null}' AS VARCHAR)) AS string_values;
+-- JSON and VARCHAR retain equal bytes and distinct frozen child domains.
+WITH q AS (SELECT JSON '{"2:3": null}' AS j, '{"2:3": null}' AS s)
+SELECT array_agg(j) AS json_values,
+       array_agg(CAST(s AS VARCHAR)) AS string_values FROM q;
 
-WITH q AS (SELECT JSON '{"k": 1}' AS j)
-SELECT array_agg(j) AS json_values, array_agg(CAST(j AS VARCHAR)) AS string_values FROM q;
+WITH q AS (SELECT JSON '{"k": 1}' AS j, '{"k": 1}' AS s)
+SELECT array_agg(j) AS json_values,
+       array_agg(CAST(s AS VARCHAR)) AS string_values FROM q;
 
 WITH q AS (
-  SELECT 1 AS n, JSON '{"k": 1}' AS j
-  UNION ALL SELECT 2, JSON '{"k": 2}'
-  UNION ALL SELECT 3, NULL
+  SELECT 1 AS n, JSON '{"k": 1}' AS j, '{"k": 1}' AS s
+  UNION ALL SELECT 2, JSON '{"k": 2}', '{"k": 2}'
+  UNION ALL SELECT 3, NULL, NULL
 )
 SELECT array_agg(j ORDER BY n) AS json_values,
-       array_agg(CAST(j AS VARCHAR) ORDER BY n) AS string_values FROM q;
+       array_agg(CAST(s AS VARCHAR) ORDER BY n) AS string_values FROM q;
 
-SELECT array_agg(JSON '{"k": "a''b"}') AS json_values,
-       array_agg(CAST(JSON '{"k": "a''b"}' AS VARCHAR)) AS string_values;
+WITH q AS (SELECT JSON '{"k": "a''b"}' AS j, '{"k": "a''b"}' AS s)
+SELECT array_agg(j) AS json_values,
+       array_agg(CAST(s AS VARCHAR)) AS string_values FROM q;

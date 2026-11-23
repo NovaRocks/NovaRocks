@@ -419,20 +419,10 @@ pub(crate) fn validate_expression_types<'a, H>(
         ExprKind::Cast {
             expr,
             target,
-            decimal_overflow_policy,
-            allow_throw_exception,
-            array_failure_mode,
+            cast_mode,
         } => {
-            if allow_throw_exception.expected_key
-                != novarocks_type_contract::SemanticParameterKey::AllowThrowException
-            {
-                errors.push(TypeIssue::new(
-                    path,
-                    "CAST requires an ALLOW_THROW_EXCEPTION semantic reference",
-                ));
-            }
             if let Some(input) = definitions.get((*expr).get() as usize)
-                && array_failure_mode.is_none()
+                && *cast_mode == novarocks_type_contract::TrinoCastMode::Implicit
                 && !novarocks_type_contract::is_null_list_to_json_cast(&input.ty, &expression.ty)
                 && !novarocks_type_contract::is_default_json_structure_cast(
                     &input.ty,
@@ -452,36 +442,6 @@ pub(crate) fn validate_expression_types<'a, H>(
                 errors.push(TypeIssue::new(
                     path,
                     "carrier CAST cannot establish or erase a logical identity",
-                ));
-            }
-            if let Some(input) = definitions.get((*expr).get() as usize)
-                && let Some(mode) = array_failure_mode
-                && !novarocks_type_contract::array_cast_mode_types_valid_observed(
-                    &input.ty,
-                    &expression.ty,
-                    *mode,
-                    || work.step().map_err(ValidationFailure::from),
-                )?
-            {
-                errors.push(TypeIssue::new(
-                    path,
-                    "explicit array CAST mode differs from its source and result declarations",
-                ));
-            }
-            if let Some(input) = definitions.get((*expr).get() as usize)
-                && array_failure_mode.is_none()
-                && !original_type_predicate(
-                    novarocks_type_contract::decimal_error_policy_cast_supported_observed(
-                        input.ty.data_type(),
-                        target,
-                        *decimal_overflow_policy,
-                        || work.step().map_err(ValidationFailure::from),
-                    ),
-                )?
-            {
-                errors.push(TypeIssue::new(
-                    path,
-                    "ReportError decimal CAST does not support nested type conversion",
                 ));
             }
             // A cast names the type it produces, and may admit null where its

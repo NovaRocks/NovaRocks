@@ -216,6 +216,7 @@ impl FunctionSemantics {
         let argument_evaluation = match effects.argument_control {
             ArgumentControl::If
             | ArgumentControl::Coalesce
+            | ArgumentControl::Try
             | ArgumentControl::SimpleCase
             | ArgumentControl::SearchedCase => FunctionArgumentEvaluation::ShortCircuit,
             ArgumentControl::Eager

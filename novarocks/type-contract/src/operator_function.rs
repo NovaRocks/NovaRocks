@@ -21,6 +21,7 @@ use crate::{ArithmeticOperator, ComparisonOperator, FunctionId};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum OperatorFunction {
     Negation,
+    ArraySubscript,
     Add,
     Subtract,
     Multiply,
@@ -37,7 +38,7 @@ pub enum OperatorFunction {
 }
 
 impl OperatorFunction {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Negation,
         Self::Add,
         Self::Subtract,
@@ -52,11 +53,13 @@ impl OperatorFunction {
         Self::GreaterThanOrEqual,
         Self::Identical,
         Self::Distinct,
+        Self::ArraySubscript,
     ];
 
     pub const fn catalog_name(self) -> &'static str {
         match self {
             Self::Negation => "__negate",
+            Self::ArraySubscript => "__array_subscript",
             Self::Add => "__operator_add",
             Self::Subtract => "__operator_subtract",
             Self::Multiply => "__operator_multiply",
@@ -76,6 +79,7 @@ impl OperatorFunction {
     pub const fn function_id_text(self) -> &'static str {
         match self {
             Self::Negation => "builtin.scalar/__negate/v1",
+            Self::ArraySubscript => "builtin.scalar/__array_subscript/v1",
             Self::Add => "builtin.scalar/__operator_add/v1",
             Self::Subtract => "builtin.scalar/__operator_subtract/v1",
             Self::Multiply => "builtin.scalar/__operator_multiply/v1",
@@ -136,6 +140,10 @@ impl OperatorFunction {
         matches!(self, Self::Identical | Self::Distinct)
     }
 
+    pub const fn is_infix(self) -> bool {
+        !matches!(self, Self::Negation | Self::ArraySubscript)
+    }
+
     pub const fn sql(self) -> &'static str {
         match self {
             Self::Negation => "-",
@@ -152,6 +160,7 @@ impl OperatorFunction {
             Self::GreaterThanOrEqual => ">=",
             Self::Identical => "IS NOT DISTINCT FROM",
             Self::Distinct => "IS DISTINCT FROM",
+            Self::ArraySubscript => "[]",
         }
     }
 

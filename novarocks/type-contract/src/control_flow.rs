@@ -61,6 +61,8 @@ pub enum ControlShape {
     Disjunction,
     If,
     Coalesce,
+    /// Evaluate one value expression in its own row-error catch scope.
+    Try,
     /// Four ordered source occurrences and two intervening comparisons.
     Between {
         negated: bool,
@@ -95,6 +97,7 @@ pub enum GuardKind {
         arm: u32,
     },
     CaseElse,
+    TryBody,
     LambdaInvocation,
     /// The previous source phase completed successfully for this row.
     TemporalAfterSource {
@@ -774,6 +777,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::Conjunction | ControlShape::Disjunction => count > 0,
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
+        ControlShape::Try => count == 1,
         ControlShape::Between { .. } => count == 4,
         ControlShape::Membership { .. } => count > 0,
         ControlShape::TemporalSource(shape) => count == shape.source_count(),
@@ -811,6 +815,7 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
         ControlShape::Coalesce => (ordinal > 0).then_some(GuardKind::CoalesceAfterNull {
             ordinal: ordinal as u32,
         }),
+        ControlShape::Try => Some(GuardKind::TryBody),
         ControlShape::Between { .. } => (ordinal > 0).then(|| GuardKind::BetweenAfterSource {
             ordinal: (ordinal - 1) as u32,
         }),
@@ -865,6 +870,7 @@ fn control_argument_demand(
         | ControlShape::TypeOnly
         | ControlShape::NoArguments
         | ControlShape::Coalesce
+        | ControlShape::Try
         | ControlShape::TemporalSource(_)
         | ControlShape::Between { .. }
         | ControlShape::Membership { .. } => Value,

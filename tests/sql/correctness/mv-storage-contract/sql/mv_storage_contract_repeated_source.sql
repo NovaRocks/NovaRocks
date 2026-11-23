@@ -43,8 +43,8 @@ CREATE SCHEMA mvsc_${uuid0}.ns_${uuid0};
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.moves (
-  account STRING,
-  peer STRING,
+  account VARCHAR,
+  peer VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 

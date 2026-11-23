@@ -18,12 +18,13 @@
 //! D33 conversion of authored raw JSON text and ordinary VARCHAR values.
 //! This is a value author inside the existing prepared CAST recipe. It owns
 //! no row selection, Arrow result assembly, inherited errors or allocation grant.
-use crate::KernelFailure;
-use crate::kernel_control::internal;
 use crate::kernel_input::EvaluationCheckpoints;
+use crate::{CompileKernelControl, KernelFailure};
 use arrow_schema::DataType;
-use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-use std::{cmp::Ordering, error::Error, fmt, ops::Range};
+use novarocks_type_contract::{
+    CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
+};
+use std::{error::Error, fmt, ops::Range};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operation {
@@ -407,6 +408,27 @@ fn push_frame(
     work.flush()?;
     Ok(())
 }
+/// Check a SQL JSON literal before it can reach a runtime conversion or TRY.
+/// The same JSON reader checks containers, scalar values and number ranges.
+pub fn validate_trino_json_literal(
+    raw: &str,
+    control: &dyn PureCompileControl,
+) -> Result<bool, KernelFailure> {
+    let control = CompileKernelControl::new(control, CompilePhase::Validate);
+    let mut work = EvaluationCheckpoints::new(&control);
+    match validate(raw, &mut work) {
+        Ok(_) => {
+            work.finish()?;
+            Ok(true)
+        }
+        Err(LeafError::Parse(_)) => Ok(false),
+        Err(LeafError::Outer(error)) => Err(error),
+        Err(LeafError::Conversion(_)) => Err(crate::kernel_control::internal(
+            "JSON literal validation attempted a value conversion",
+        )),
+    }
+}
+
 fn validate(raw: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<Scalar, LeafError> {
     let mut reader = Reader { raw, at: 0, work };
     let mut stack = Vec::<Frame>::new();
@@ -839,389 +861,11 @@ fn parse_double(
     }
 }
 
-// Fixed mathematical scratch for finite IEEE binary64 decimal development.
-// A value/midpoint needs at most 1076 binary denominator bits; decimal
-// normalization contributes at most 324*ceil(log2(10)) bits and the 53-bit
-// significand. Nineteen digit iterations need fewer than 64 additional bits.
-// 80 words cover that loose sum (2489 < 2560); this is no input text quota.
-#[derive(Clone)]
-struct Wide {
-    words: [u32; 80],
-    used: usize,
-}
-impl Wide {
-    fn from_u64(value: u64) -> Self {
-        let mut out = Self {
-            words: [0; 80],
-            used: 0,
-        };
-        if value != 0 {
-            out.words[0] = value as u32;
-            out.used = 1;
-            if value >> 32 != 0 {
-                out.words[1] = (value >> 32) as u32;
-                out.used = 2;
-            }
-        }
-        out
-    }
-    fn compare(
-        &self,
-        other: &Self,
-        work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<Ordering, LeafError> {
-        Ok(match self.used.cmp(&other.used) {
-            Ordering::Equal => {
-                for i in (0..self.used).rev() {
-                    work.step()?;
-                    let order = self.words[i].cmp(&other.words[i]);
-                    if order != Ordering::Equal {
-                        return Ok(order);
-                    }
-                }
-                Ordering::Equal
-            }
-            order => order,
-        })
-    }
-    fn multiply(
-        &mut self,
-        factor: u32,
-        work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<(), LeafError> {
-        let mut carry = 0_u64;
-        for word in &mut self.words[..self.used] {
-            work.step()?;
-            let value = u64::from(*word) * u64::from(factor) + carry;
-            *word = value as u32;
-            carry = value >> 32;
-        }
-        if carry != 0 {
-            if self.used == self.words.len() {
-                return Err(internal(
-                    "finite float decimal scratch exceeded its mathematical bound",
-                )
-                .into());
-            }
-            self.words[self.used] = carry as u32;
-            self.used += 1;
-        }
-        Ok(())
-    }
-    fn shift(
-        &mut self,
-        bits: usize,
-        work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<(), LeafError> {
-        if self.used == 0 {
-            return Ok(());
-        }
-        let whole = bits / 32;
-        let part = bits % 32;
-        if self.used + whole + usize::from(part != 0) > self.words.len() {
-            return Err(internal("finite float shift exceeded its mathematical bound").into());
-        }
-        if whole != 0 {
-            for i in (0..self.used).rev() {
-                work.step()?;
-                self.words[i + whole] = self.words[i];
-            }
-            for word in &mut self.words[..whole] {
-                work.step()?;
-                *word = 0;
-            }
-            self.used += whole;
-        }
-        if part != 0 {
-            let mut carry = 0_u64;
-            for word in &mut self.words[..self.used] {
-                work.step()?;
-                let value = (u64::from(*word) << part) | carry;
-                *word = value as u32;
-                carry = value >> 32;
-            }
-            if carry != 0 {
-                self.words[self.used] = carry as u32;
-                self.used += 1;
-            }
-        }
-        Ok(())
-    }
-    fn subtract(
-        &mut self,
-        other: &Self,
-        work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<(), LeafError> {
-        let mut borrow = 0_u64;
-        for i in 0..self.used {
-            work.step()?;
-            let sub = u64::from(if i < other.used { other.words[i] } else { 0 }) + borrow;
-            let value = u64::from(self.words[i]);
-            self.words[i] = value.wrapping_sub(sub) as u32;
-            borrow = u64::from(value < sub);
-        }
-        if borrow != 0 {
-            return Err(internal("float decimal subtraction violated its ordering").into());
-        }
-        while self.used != 0 && self.words[self.used - 1] == 0 {
-            work.step()?;
-            self.used -= 1;
-        }
-        Ok(())
-    }
-    fn add(&self, other: &Self, work: &mut EvaluationCheckpoints<'_>) -> Result<Self, LeafError> {
-        let mut out = self.clone();
-        let count = self.used.max(other.used);
-        let mut carry = 0_u64;
-        for i in 0..count {
-            work.step()?;
-            let value = u64::from(out.words[i]) + u64::from(other.words[i]) + carry;
-            out.words[i] = value as u32;
-            carry = value >> 32;
-        }
-        out.used = count;
-        if carry != 0 {
-            if count == out.words.len() {
-                return Err(
-                    internal("finite float addition exceeded its mathematical bound").into(),
-                );
-            }
-            out.words[count] = carry as u32;
-            out.used += 1;
-        }
-        Ok(out)
-    }
-    fn power10(
-        &mut self,
-        power: usize,
-        work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<(), LeafError> {
-        for _ in 0..power {
-            self.multiply(10, work)?;
-        }
-        Ok(())
-    }
-    fn quotient_digit(
-        &mut self,
-        denominator: &Self,
-        work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<u8, LeafError> {
-        let mut digit = 0;
-        while self.compare(denominator, work)? != Ordering::Less {
-            work.step()?;
-            self.subtract(denominator, work)?;
-            digit += 1;
-            if digit > 9 {
-                return Err(internal("float decimal quotient exceeded one digit").into());
-            }
-        }
-        Ok(digit)
-    }
-}
-
-fn five_bits(power: i32) -> i32 {
-    if power == 0 {
-        0
-    } else if power < 27 {
-        let value = 5_u128.pow(power as u32);
-        128 - value.leading_zeros() as i32
-    } else {
-        power * 3
-    }
-}
-fn small_decimal_comparison(
-    binary_exp: i32,
-    fraction_bits: i32,
-    significant: i32,
-    decimal_exp: i32,
-) -> bool {
-    let tiny = (fraction_bits - binary_exp - 1).max(0);
-    let b5 = (-decimal_exp).max(0);
-    let s5 = decimal_exp.max(0);
-    let mut b2 = b5 + tiny + binary_exp - fraction_bits + 1;
-    let mut s2 = s5 + tiny;
-    let mut m2 = b5 + tiny + binary_exp - significant;
-    let common = b2.min(s2);
-    b2 -= common;
-    s2 -= common;
-    m2 -= common;
-    if fraction_bits == 1 {
-        m2 -= 1;
-    }
-    if m2 < 0 {
-        b2 -= m2;
-        s2 -= m2;
-    }
-    fraction_bits + b2 + five_bits(b5) < 64 && s2 + 1 + five_bits(s5 + 1) < 64
-}
-
 fn double_text(value: f64, work: &mut EvaluationCheckpoints<'_>) -> Result<String, LeafError> {
     if !value.is_finite() {
         return bad_number();
     }
-    if value == 0.0 {
-        return copy_text(
-            if value.is_sign_negative() {
-                "-0E0"
-            } else {
-                "0E0"
-            },
-            work,
-        );
-    }
-    let bits = value.abs().to_bits();
-    let encoded_exp = ((bits >> 52) & 0x7ff) as i32;
-    let mut fraction = bits & ((1_u64 << 52) - 1);
-    let (binary_exp, significant) = if encoded_exp == 0 {
-        let width = 64 - fraction.leading_zeros() as i32;
-        let shift = 53 - width;
-        fraction <<= shift;
-        (-1022 - shift, width)
-    } else {
-        fraction |= 1_u64 << 52;
-        (encoded_exp - 1023, 53)
-    };
-    let fraction_bits = 53 - fraction.trailing_zeros() as i32;
-    let tiny = (fraction_bits - binary_exp - 1).max(0);
-    let mut digits = [0_u8; 32];
-    let mut count = 0_usize;
-    let mut decimal_exp;
-    if (-21..=62).contains(&binary_exp) && tiny == 0 {
-        let integer = if binary_exp >= 52 {
-            fraction << (binary_exp - 52)
-        } else {
-            fraction >> (52 - binary_exp)
-        };
-        let insignificant = if binary_exp > significant {
-            let n = 1_u64 << (binary_exp - significant - 1);
-            n.ilog10()
-        } else {
-            0
-        };
-        let unit = 10_u64.pow(insignificant);
-        let rounded = integer / unit + u64::from(integer % unit >= unit / 2 && unit > 1);
-        let text = rounded.to_string();
-        decimal_exp = text.len() as i32 - 1 + insignificant as i32;
-        for b in text.bytes() {
-            work.step()?;
-            digits[count] = b - b'0';
-            count += 1;
-        }
-    } else {
-        // The legacy converter's upper logarithm estimate affects the two
-        // smallest decimal decades: a leading zero can round into the next
-        // exponent. Replacing it with exact floor(log10) changes those values.
-        #[expect(
-            clippy::approx_constant,
-            reason = "The legacy converter uses this rounded coefficient for its exponent estimate"
-        )]
-        const LEGACY_LOG10_2: f64 = 0.301029995663981;
-        let normalized = f64::from_bits((1023_u64 << 52) | (fraction & ((1_u64 << 52) - 1)));
-        decimal_exp = ((normalized - 1.5) * 0.289529654
-            + 0.176091259
-            + f64::from(binary_exp) * LEGACY_LOG10_2)
-            .floor() as i32;
-        // An exact value ratio and the legacy converter's symmetric margin.
-        // At powers of two the legacy margin halves again; that behavior and
-        // its integral fast path are part of DecimalFormat's observed output.
-        let number = fraction >> fraction.trailing_zeros();
-        let exponent = binary_exp - fraction_bits + 1;
-        let margin_exp = binary_exp - significant - i32::from(fraction_bits == 1);
-        let common = (-exponent).max(-margin_exp).max(0);
-        let mut numerator = Wide::from_u64(number);
-        numerator.shift((exponent + common) as usize, work)?;
-        let mut margin = Wide::from_u64(1);
-        margin.shift((margin_exp + common) as usize, work)?;
-        let mut denominator = Wide::from_u64(1);
-        denominator.shift(common as usize, work)?;
-        if decimal_exp >= 0 {
-            denominator.power10(decimal_exp as usize, work)?;
-        } else {
-            numerator.power10((-decimal_exp) as usize, work)?;
-            margin.power10((-decimal_exp) as usize, work)?;
-        }
-        let mut ten = denominator.clone();
-        ten.multiply(10, work)?;
-        let strict = small_decimal_comparison(binary_exp, fraction_bits, significant, decimal_exp);
-        let mut first = true;
-        loop {
-            work.step()?;
-            let q = numerator.quotient_digit(&denominator, work)?;
-            numerator.multiply(10, work)?;
-            margin.multiply(10, work)?;
-            let low = numerator.compare(&margin, work)? == Ordering::Less;
-            let high = match numerator.add(&margin, work)?.compare(&ten, work)? {
-                Ordering::Greater => true,
-                Ordering::Equal => !strict,
-                Ordering::Less => false,
-            };
-            if first && q == 0 && !high {
-                decimal_exp -= 1;
-            } else {
-                digits[count] = q;
-                count += 1;
-            }
-            let force_second = first && !(-3..8).contains(&decimal_exp);
-            first = false;
-            if !force_second && (low || high) {
-                let round_up = if high && low {
-                    let mut twice = numerator.clone();
-                    twice.multiply(2, work)?;
-                    match twice.compare(&ten, work)? {
-                        Ordering::Greater => true,
-                        Ordering::Equal => digits[count - 1] & 1 != 0,
-                        Ordering::Less => false,
-                    }
-                } else {
-                    high
-                };
-                if round_up {
-                    let mut at = count;
-                    loop {
-                        if at == 0 {
-                            digits[0] = 1;
-                            decimal_exp += 1;
-                            break;
-                        }
-                        at -= 1;
-                        if digits[at] != 9 {
-                            digits[at] += 1;
-                            break;
-                        }
-                        digits[at] = 0;
-                    }
-                }
-                break;
-            }
-            if count == digits.len() {
-                return Err(internal("finite float decimal digit bound was violated").into());
-            }
-        }
-    }
-    while count > 1 && digits[count - 1] == 0 {
-        count -= 1;
-    }
-    let exp = decimal_exp.to_string();
-    let mut out = string_with_capacity(
-        count + exp.len() + usize::from(value.is_sign_negative()) + 3,
-        work,
-    )?;
-    if value.is_sign_negative() {
-        out.push('-');
-    }
-    out.push(char::from(b'0' + digits[0]));
-    out.push('.');
-    if count == 1 {
-        out.push('0');
-    } else {
-        for &digit in &digits[1..count] {
-            work.step()?;
-            out.push(char::from(b'0' + digit));
-        }
-    }
-    out.push('E');
-    out.push_str(&exp);
-    Ok(out)
+    Ok(super::trino_float_text::format_double(value, work)?)
 }
 
 #[cfg(test)]

@@ -478,8 +478,24 @@ fn assert_bound_binary_operator(
         panic!("expected two ordered operands for {operator:?}");
     };
     assert_eq!(binding.function_id, operator.function_id());
+    let original_right = match &right.kind {
+        ExprKind::Cast {
+            expr,
+            target,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            ..
+        } => {
+            assert_eq!(target, right.value_type.data_type());
+            assert!(crate::optimizer::scalar_expr::lossless_signed_widening(
+                &expr.value_type,
+                &right.value_type
+            ));
+            expr.as_ref()
+        }
+        _ => right,
+    };
     assert!(matches!(
-        right.kind,
+        original_right.kind,
         ExprKind::Literal(LiteralValue::Int(value)) if value == right_literal
     ));
     let [
@@ -1101,7 +1117,7 @@ fn p2_computed_group_key_rewrites_to_group_output_id() {
         "computed group key projection must reference the Aggregate output id"
     );
     assert_eq!(
-        column, "a + 1",
+        column, "a + (cast(1 as Int64))",
         "computed group key ColumnRef must preserve the group expression display name"
     );
 }
@@ -1176,7 +1192,7 @@ fn order_by_only_aggregates_are_added_to_aggregate_outputs() {
 #[test]
 fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
     let plan =
-        plan_test_query("SELECT abs(a) AS k, sum(b) AS s FROM t GROUP BY abs(a) HAVING abs(a) > 1");
+        plan_test_query("SELECT a % 3 AS k, sum(b) AS s FROM t GROUP BY a % 3 HAVING a % 3 > 1");
     let (project, filter, aggregate) = root_project_filter_aggregate(&plan);
     assert_eq!(
         aggregate.group_by.len(),
@@ -1208,16 +1224,11 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
         "computed group key projection must reference the Aggregate output id"
     );
     assert_eq!(
-        column, "abs(a)",
+        column, "a % (cast(3 as Int64))",
         "computed group key ColumnRef must preserve the group expression display name"
     );
 
-    let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
-        panic!(
-            "expected HAVING abs(a)>1 to remain a BinaryOp over the group key output, got {:?}",
-            filter.predicate.kind
-        );
-    };
+    let left = assert_bound_binary_operator(&filter.predicate, OperatorFunction::GreaterThan, 1);
     let ExprKind::ColumnRef {
         column_id, column, ..
     } = &left.kind
@@ -1232,7 +1243,7 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
         "HAVING computed group key must reference the Aggregate output id"
     );
     assert_eq!(
-        column, "abs(a)",
+        column, "a % (cast(3 as Int64))",
         "HAVING computed group key ColumnRef must preserve the group expression display name"
     );
 }
@@ -1270,12 +1281,12 @@ fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
         grouping.value_type.data_type(),
         &arrow::datatypes::DataType::Int32
     );
-    assert!(
-        grouping.value_type.nullable(),
-        "original narrowing CAST NULL law"
-    );
+    assert!(!grouping.value_type.nullable());
     let ExprKind::Cast {
-        expr: mask, target, ..
+        expr: mask,
+        target,
+        cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+        ..
     } = &grouping.kind
     else {
         panic!("public GROUPING needs a real typed INTEGER projection");
@@ -1608,7 +1619,9 @@ fn group_by_alias_expression_projects_aggregate_group_key() {
         panic!("expected Project under Sort");
     };
     let ExprKind::ColumnRef {
-        qualifier, column, ..
+        qualifier,
+        column,
+        column_id,
     } = &project.items[0].expr.kind
     else {
         panic!(
@@ -1617,7 +1630,11 @@ fn group_by_alias_expression_projects_aggregate_group_key() {
         );
     };
     assert!(qualifier.is_none());
-    assert_eq!(column, "o_orderkey % 2");
+    let (_, aggregate) = root_project_over_aggregate(plan.unary_input());
+    let key_output = &aggregate.output_columns[0];
+    assert_eq!(*column_id, key_output.column_id);
+    assert_eq!(key_output.name, "g");
+    assert_eq!(column, "o_orderkey % (cast(2 as Int64))");
 }
 
 #[test]
@@ -3424,35 +3441,32 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
 fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
     use novarocks_types::schema::SqlType as S;
     for (sql, domain) in [
-        ("select any_value(CAST(NULL AS HLL)) from orders", S::Hll),
-        (
-            "select any_value(CAST(NULL AS BITMAP)) from orders",
-            S::Bitmap,
-        ),
+        ("select any_value(CAST(NULL AS UUID)) from orders", S::Uuid),
+        ("select any_value(CAST(NULL AS JSON)) from orders", S::Json),
         ("select any_value(parse_json('{}')) from orders", S::Json),
     ] {
         assert_m07_planned_domains(sql, vec![Some(domain)]);
     }
     assert_m07_planned_domains(
-        "select o_custkey,any_value(CAST(NULL AS HLL)) as h,any_value(CAST(NULL AS BITMAP)) as b,any_value(parse_json('{}')) as p from orders group by o_custkey",
-        vec![None, Some(S::Hll), Some(S::Bitmap), Some(S::Json)],
+        "select o_custkey,any_value(CAST(NULL AS UUID)) as u,any_value(CAST(NULL AS JSON)) as j,any_value(parse_json('{}')) as p from orders group by o_custkey",
+        vec![None, Some(S::Uuid), Some(S::Json), Some(S::Json)],
     );
     assert_m07_planned_domains(
-        "select any_value(CAST(NULL AS HLL)) as x,any_value(CAST(NULL AS HLL)) as y from orders",
-        vec![Some(S::Hll); 2],
+        "select any_value(CAST(NULL AS JSON)) as x,any_value(CAST(NULL AS JSON)) as y from orders",
+        vec![Some(S::Json); 2],
     );
     assert_m07_planned_domains(
-        "select count(*),sum(o_orderkey),cast(any_value(CAST(NULL AS HLL)) as varbinary) from orders",
+        "select count(*),sum(o_orderkey),cast(any_value(CAST(NULL AS JSON)) as varchar) from orders",
         vec![None; 3],
     );
     for (sql, expected) in [
         (
-            "select any_value(CAST(NULL AS HLL)) as h,cast(any_value(CAST(NULL AS HLL)) as varbinary) as raw from orders",
-            vec![Some(S::Hll), None],
+            "select any_value(CAST(NULL AS JSON)) as j,cast(any_value(CAST(NULL AS JSON)) as varchar) as raw from orders",
+            vec![Some(S::Json), None],
         ),
         (
-            "select cast(any_value(CAST(NULL AS HLL)) as varbinary) as raw,any_value(CAST(NULL AS HLL)) as h from orders",
-            vec![None, Some(S::Hll)],
+            "select cast(any_value(CAST(NULL AS JSON)) as varchar) as raw,any_value(CAST(NULL AS JSON)) as j from orders",
+            vec![None, Some(S::Json)],
         ),
     ] {
         assert_m07_planned_domains(sql, expected);
@@ -3528,29 +3542,25 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
 
 #[test]
 fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
-    use novarocks_types::schema::SqlType;
     let sql =
-        "select any_value(CAST(NULL AS HLL)) as x,any_value(CAST(NULL AS HLL)) as y from orders";
-    for conflict in [None, Some(SqlType::Bitmap)] {
+        "select any_value(CAST(NULL AS JSON)) as x,any_value(CAST(NULL AS JSON)) as y from orders";
+    let incompatible = [
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            novarocks_type_contract::ValueLogicalType::Uuid,
+        )
+        .unwrap(),
+    ];
+    for conflict in incompatible {
         for ordinal in [0, 1] {
             let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
             let mut resolved = resolved;
             let QueryBody::Select(select) = &mut resolved.body else {
                 unreachable!()
             };
-            select.projection[ordinal].expr.value_type = if conflict.is_some() {
-                novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                    arrow::datatypes::DataType::Binary,
-                    true,
-                    novarocks_type_contract::ValueLogicalType::Bitmap,
-                )
-                .unwrap()
-            } else {
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Binary,
-                    true,
-                )
-            };
+            select.projection[ordinal].expr.value_type = conflict.clone();
             let error = plan_query(
                 resolved,
                 registry,

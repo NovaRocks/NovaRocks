@@ -16,7 +16,7 @@
 // under the License.
 //! Actual non-NULL Connector SQL source -> owned transaction -> LocalCompiler -> Frame.
 //! SQL-authored decimal casts and their exact evaluator results.
-use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Float32Array};
+use arrow::array::{Array, ArrayRef, Decimal128Array, Float32Array};
 use arrow::datatypes::DataType;
 use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::EvaluationInput;
@@ -24,10 +24,12 @@ use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
-    Selection,
+    Selection, testkit::shared_installed_builtin_owner_catalogue,
 };
 use novarocks_sql_testkit::sql_source;
-use novarocks_test_compile_to_execute::programs::{batch, producer_root, programs};
+use novarocks_test_compile_to_execute::programs::{
+    batch, producer_root, programs, programs_with_catalogue,
+};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{sync::Arc, time::Duration};
 
@@ -48,47 +50,21 @@ impl KernelEvaluationControl for Control {
     }
 }
 
-// Pure carrier construction, with no conversion or evaluator call.
-fn input(wide: bool, precision: u8, scale: i8, raw: Vec<Option<i128>>) -> ArrayRef {
-    if wide {
-        Arc::new(
-            Decimal256Array::from(
-                raw.into_iter()
-                    .map(|value| value.map(arrow::datatypes::i256::from_i128))
-                    .collect::<Vec<_>>(),
-            )
-            .with_precision_and_scale(precision, scale)
-            .unwrap(),
-        )
-    } else {
-        Arc::new(
-            Decimal128Array::from(raw)
-                .with_precision_and_scale(precision, scale)
-                .unwrap(),
-        )
-    }
-}
-
-// Corpus coefficients are [0, 4, -4, 1]. Their decimal values are r*10^-s.
-// IEEE-754 round-to-nearest-even gives 1e38 -> 0x7e967699;
-// |4e38| exceeds binary32's finite range. The preserved Decimal128 author
-// projects its non-finite results to SQL NULL, whereas Decimal256 retains
-// infinities. Neither NULL below is an i128 intermediate scaling overflow.
-// The independent exact-rational midpoint worksheet lives with this draft.
-fn expected_bits(wide: bool, scale: i8) -> [Option<u32>; 4] {
-    match (wide, scale) {
-        (false, 0) | (true, 0) => [
-            Some(0x00000000),
+// The exact rational values of coefficients [0, 4, -4, 1] at each
+// declared scale have these nearest-even binary32 representations.
+fn expected_bits(scale: i8) -> [Option<u32>; 4] {
+    match scale {
+        0 => [
+            Some(0),
             Some(0x40800000),
             Some(0xc0800000),
             Some(0x3f800000),
         ],
-        (false, -38) => [Some(0x00000000), None, None, Some(0x7e967699)],
-        (true, -38) => [
-            Some(0x00000000),
-            Some(0x7f800000),
-            Some(0xff800000),
-            Some(0x7e967699),
+        2 => [
+            Some(0),
+            Some(0x3d23d70a),
+            Some(0xbd23d70a),
+            Some(0x3c23d70a),
         ],
         _ => panic!("SQL corpus needs an explicit independent IEEE table"),
     }
@@ -104,13 +80,9 @@ fn assert_bits(array: &ArrayRef, expected: &[Option<u32>]) {
     assert_eq!(actual, expected);
 }
 
-fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
-    let dtype = if wide {
-        DataType::Decimal256(76, scale)
-    } else {
-        DataType::Decimal128(38, scale)
-    };
-    let sql = "SELECT CAST(k AS FLOAT) AS original_cast FROM fixture";
+fn same_source_case(scale: i8) {
+    let dtype = DataType::Decimal128(38, scale);
+    let sql = "SELECT CAST(k AS REAL) AS original_cast FROM fixture";
     // ColumnDef and Arrow Field are authored false by the existing real connector seam.
     let source = sql_source(sql, dtype.clone());
     let mut casts = 0;
@@ -125,7 +97,7 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
                     if *operand.ty.data_type() == dtype && target == &DataType::Float32 {
                         casts += 1;
                         assert!(!operand.ty.nullable());
-                        assert!(node.ty.nullable());
+                        assert!(!node.ty.nullable());
                         assert_eq!(&node.ty.data_type().clone(), target);
                     }
                 }
@@ -134,17 +106,16 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
     }
     assert!(
         casts > 0,
-        "actual SQL must retain the real Decimal-to-FLOAT Cast"
+        "actual SQL must retain the real DECIMAL-to-REAL cast"
     );
     let programs = programs(&source);
     let (program, root) = producer_root(&programs);
-    let values = input(
-        wide,
-        if wide { 76 } else { 38 },
-        scale,
-        vec![Some(0), Some(4), Some(-4), Some(1)],
+    let values = Arc::new(
+        Decimal128Array::from(vec![0_i128, 4, -4, 1])
+            .with_precision_and_scale(38, scale)
+            .unwrap(),
     );
-    let data = batch(&program, root, values.clone());
+    let data = batch(&program, root, values);
     let mut frame = CompiledExpressionInstance::try_new(
         program.unit(root.unit).unwrap().clone(),
         root.root,
@@ -164,23 +135,9 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
         )
         .unwrap();
     assert!(selected.errors().is_empty());
-    let expected = expected_bits(wide, scale);
+    let expected = expected_bits(scale);
     assert_eq!(selected.selection(), Selection::all(4));
     assert_bits(selected.values(), &expected);
-    let floats = selected
-        .values()
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .unwrap();
-    assert_eq!(floats.value(0).to_bits(), 0f32.to_bits());
-    if expected_null_values {
-        assert!(floats.is_null(1));
-        assert!(floats.is_null(2));
-    } else if wide && scale == -38 {
-        assert_eq!(floats.value(1), f32::INFINITY);
-        assert_eq!(floats.value(2), f32::NEG_INFINITY);
-        assert_eq!(floats.null_count(), 0);
-    }
     let rows = [0, 1, 3];
     let sparse = frame
         .evaluate(
@@ -219,34 +176,28 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
 }
 
 #[test]
-fn decimal_float32_sql_explicit_cast_nonnull_decimal128_negative_scale_preserves_original_public_true()
- {
-    same_source_case(false, -38, true);
-}
-#[test]
-fn decimal_float32_sql_explicit_cast_nonnegative_decimal128_and_decimal256_preserve_original_projection()
- {
-    same_source_case(false, 0, false);
-    // Wide Decimal has no genuine ConnectorValueType assignment. Its entire
-    // Float32 recipe/Frame domain stays in the existing direct compiler oracles.
+fn decimal_real_sql_explicit_cast_preserves_nonnull_scan_and_fractional_values() {
+    for scale in [0, 2] {
+        same_source_case(scale);
+    }
 }
 
 #[test]
-fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_preserve_infinity() {
+fn decimal_real_sql_explicit_cast_uses_standard_precision_boundary_and_unary_frame() {
     use arrow::datatypes::Schema;
     use arrow::record_batch::{RecordBatch, RecordBatchOptions};
     use novarocks_local_program::ProgramNodeKind;
     use std::sync::Arc;
-    // The point makes this a genuine decimal token; >38 digits is authored
-    // Decimal256 by the original analyzer, not a retagged scan or guessed CV.
-    let literal = "4000000000000000000000000000000000000000.0";
+    // Use the largest supported DECIMAL precision in the original SQL literal.
+    let literal = "DECIMAL '40000000000000000000000000000000000000'";
+    let functions = shared_installed_builtin_owner_catalogue();
     for negative in [false, true] {
         let sql = format!(
-            "SELECT CAST({}{literal} AS FLOAT) AS wide_literal",
+            "SELECT CAST({}{literal} AS REAL) AS boundary_literal",
             if negative { "-" } else { "" }
         );
         let source = sql_source(&sql, DataType::Int8);
-        let mut actual_wide = 0;
+        let mut actual_decimal = 0;
         for fragment in source.plan().fragments().values() {
             for node in fragment.nodes().values() {
                 assert!(!matches!(
@@ -260,17 +211,16 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
                 .filter_map(|node| fragment.unit(node.id))
                 .flat_map(|unit| unit.definitions())
             {
-                if matches!(expression.ty.data_type(), DataType::Decimal256(p, s) if *p > 38 && *s == 1)
-                {
-                    actual_wide += 1;
+                if expression.ty.data_type() == &DataType::Decimal128(38, 0) {
+                    actual_decimal += 1;
                 }
             }
         }
         assert!(
-            actual_wide > 0,
-            "the actual SQL literal author must retain Decimal256"
+            actual_decimal > 0,
+            "the actual SQL literal author must retain DECIMAL(38,0)"
         );
-        let lowered = programs(&source);
+        let lowered = programs_with_catalogue(&source, &functions);
         // Borrow actual compiled root bindings. Project is preferred when the
         // original optimizer retained it; a dynamic Values cell has the same
         // documented empty one-row port. No alternate graph is constructed.
@@ -360,12 +310,8 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
             .unwrap();
         assert_eq!(value.null_count(), 0);
         assert_eq!(
-            value.value(0),
-            if negative {
-                f32::NEG_INFINITY
-            } else {
-                f32::INFINITY
-            }
+            value.value(0).to_bits(),
+            if negative { 0xfdf0bdc2 } else { 0x7df0bdc2 }
         );
         assert_eq!(
             frame

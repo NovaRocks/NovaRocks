@@ -15,100 +15,107 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Test Objective:
--- 1. Validate CAST from integer types (tinyint/int/bigint/largeint) to DECIMAL(9,0), DECIMAL(9,1).
--- 2. Validate CAST to DECIMAL(27,0), DECIMAL(27,1), DECIMAL(38,0), DECIMAL(38,1).
--- 3. Validate integer multiplication by 0/1 produces correct results.
--- 4. Validate CAST of multiplication result to DECIMAL(38,0).
--- Migrated from dev/test/sql/test_decimal/T/test_decimal_cast
+-- Integer conversions preserve typed extrema and nulls.
+-- @order_sensitive=true
 
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint ,
-    c_tinyint tinyint ,
-    c_int int ,
-    c_bigint bigint ,
-    c_largeint largeint
+    k1 BIGINT,
+    c_tinyint TINYINT,
+    c_int INTEGER,
+    c_bigint BIGINT,
+    c_wide DECIMAL(38,0)
 ) WITH (format_version = 3);
-insert into ${case_db}.t1 values
-    ROW(1, 127, 2147483647, 9223372036854775807, CAST('170141183460469231731687303715884105727' AS LARGEINT)),
-    ROW(2, -128, -2147483648, -9223372036854775808, CAST('-170141183460469231731687303715884105728' AS LARGEINT)),
-    ROW(3, null, null, null, null),
-    ROW(4, 0, 0, 0, 0),
-    ROW(5, 1, 1, 1, 1),
-    ROW(6, -1, -1, -1, -1),
-    ROW(7, 12, 214748364, 922337203685477580, CAST('17014118346046923173168730371588410572' AS LARGEINT)),
-    ROW(8, -12, -214748364, -922337203685477580, CAST('-17014118346046923173168730371588410572' AS LARGEINT));
+INSERT INTO ${case_db}.t1 VALUES
+    ROW(BIGINT '1', TINYINT '127', INTEGER '2147483647', BIGINT '9223372036854775807', DECIMAL '99999999999999999999999999999999999999'),
+    ROW(BIGINT '2', TINYINT '-128', INTEGER '-2147483648', BIGINT '-9223372036854775808', DECIMAL '-99999999999999999999999999999999999999'),
+    ROW(BIGINT '3', NULL, NULL, NULL, NULL),
+    ROW(BIGINT '4', TINYINT '0', INTEGER '0', BIGINT '0', DECIMAL '0'),
+    ROW(BIGINT '5', TINYINT '1', INTEGER '1', BIGINT '1', DECIMAL '1'),
+    ROW(BIGINT '6', TINYINT '-1', INTEGER '-1', BIGINT '-1', DECIMAL '-1'),
+    ROW(BIGINT '7', TINYINT '12', INTEGER '214748364', BIGINT '922337203685477580', DECIMAL '17014118346046923173168730371588410572'),
+    ROW(BIGINT '8', TINYINT '-12', INTEGER '-214748364', BIGINT '-922337203685477580', DECIMAL '-17014118346046923173168730371588410572');
 
 -- query 2
-select
-    k1,
-    cast(c_tinyint as DECIMAL(9,0)),
-    cast(c_int as DECIMAL(9,0)),
-    cast(c_bigint as DECIMAL(9,0)),
-    cast(c_largeint as DECIMAL(9,0))
-from ${case_db}.t1
-order by k1;
+SELECT k1,
+       TRY_CAST(c_tinyint AS DECIMAL(9,0)),
+       TRY_CAST(c_int AS DECIMAL(9,0)),
+       TRY_CAST(c_bigint AS DECIMAL(9,0)),
+       TRY_CAST(c_wide AS DECIMAL(9,0))
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 3
-select
-    k1,
-    cast(c_tinyint as DECIMAL(9,1)),
-    cast(c_int as DECIMAL(9,1)),
-    cast(c_bigint as DECIMAL(9,1)),
-    cast(c_largeint as DECIMAL(9,1))
-from ${case_db}.t1
-order by k1;
+SELECT k1,
+       TRY_CAST(c_tinyint AS DECIMAL(9,1)),
+       TRY_CAST(c_int AS DECIMAL(9,1)),
+       TRY_CAST(c_bigint AS DECIMAL(9,1)),
+       TRY_CAST(c_wide AS DECIMAL(9,1))
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 4
-select
-    k1,
-    cast(c_tinyint as DECIMAL(27,0)),
-    cast(c_int as DECIMAL(27,0)),
-    cast(c_bigint as DECIMAL(27,0)),
-    cast(c_largeint as DECIMAL(27,0))
-from ${case_db}.t1
-order by k1;
+SELECT k1,
+       TRY_CAST(c_tinyint AS DECIMAL(27,0)),
+       TRY_CAST(c_int AS DECIMAL(27,0)),
+       TRY_CAST(c_bigint AS DECIMAL(27,0)),
+       TRY_CAST(c_wide AS DECIMAL(27,0))
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 5
-select
-    k1,
-    cast(c_tinyint as DECIMAL(27,1)),
-    cast(c_int as DECIMAL(27,1)),
-    cast(c_bigint as DECIMAL(27,1)),
-    cast(c_largeint as DECIMAL(27,1))
-from ${case_db}.t1
-order by k1;
+SELECT k1,
+       TRY_CAST(c_tinyint AS DECIMAL(27,1)),
+       TRY_CAST(c_int AS DECIMAL(27,1)),
+       TRY_CAST(c_bigint AS DECIMAL(27,1)),
+       TRY_CAST(c_wide AS DECIMAL(27,1))
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 6
-select
-    k1,
-    cast(c_tinyint as DECIMAL(38,0)),
-    cast(c_int as DECIMAL(38,0)),
-    cast(c_bigint as DECIMAL(38,0)),
-    cast(c_largeint as DECIMAL(38,0))
-from ${case_db}.t1
-order by k1;
+SELECT k1,
+       CAST(c_tinyint AS DECIMAL(38,0)),
+       CAST(c_int AS DECIMAL(38,0)),
+       CAST(c_bigint AS DECIMAL(38,0)),
+       CAST(c_wide AS DECIMAL(38,0))
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 7
-select
-    k1,
-    cast(c_tinyint as DECIMAL(38,1)),
-    cast(c_int as DECIMAL(38,1)),
-    cast(c_bigint as DECIMAL(38,1)),
-    cast(c_largeint as DECIMAL(38,1))
-from ${case_db}.t1
-order by k1;
+SELECT k1,
+       TRY_CAST(c_tinyint AS DECIMAL(38,1)),
+       TRY_CAST(c_int AS DECIMAL(38,1)),
+       TRY_CAST(c_bigint AS DECIMAL(38,1)),
+       TRY_CAST(c_wide AS DECIMAL(38,1))
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 8
-select k1, c_tinyint * 0, c_int * 0, c_bigint * 0, CAST(c_largeint * 0 AS VARCHAR) AS "c_largeint * 0" from ${case_db}.t1 order by k1;
+SELECT k1, c_tinyint * 0, c_int * 0, c_bigint * 0
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 9
-select k1, c_tinyint * 1, c_int * 1, c_bigint * 1, CAST(c_largeint * 1 AS VARCHAR) AS "c_largeint * 1" from ${case_db}.t1 order by k1;
+SELECT k1, c_tinyint * 1, c_int * 1, c_bigint * 1
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 10
-select k1, cast(c_tinyint * 0 as decimal(38, 0)), cast(c_int * 0 as decimal(38, 0)), cast(c_bigint * 0 as decimal(38, 0)), cast(c_largeint * 0 as decimal(38, 0)) from ${case_db}.t1 order by k1;
+SELECT k1, CAST(c_tinyint * 0 AS DECIMAL(38,0)), CAST(c_int * 0 AS DECIMAL(38,0)), CAST(c_bigint * 0 AS DECIMAL(38,0))
+FROM ${case_db}.t1 ORDER BY k1;
 
 -- query 11
-select k1, cast(c_tinyint * 1 as decimal(38, 0)), cast(c_int * 1 as decimal(38, 0)), cast(c_bigint * 1 as decimal(38, 0)), cast(c_largeint * 1 as decimal(38, 0)) from ${case_db}.t1 order by k1;
+SELECT k1, CAST(c_tinyint * 1 AS DECIMAL(38,0)), CAST(c_int * 1 AS DECIMAL(38,0)), CAST(c_bigint * 1 AS DECIMAL(38,0))
+FROM ${case_db}.t1 ORDER BY k1;
+
+-- query 12
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT CAST(c_int AS DECIMAL(9,0)) FROM ${case_db}.t1 WHERE k1 = 1;
+
+-- query 13
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(NULL AS LARGEINT);
+
+-- query 14
+-- Trino 484 admits this coefficient through an overflowing absolute value.
+-- A successful DECIMAL result must fit its declared precision.
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
+SELECT CAST(c_bigint AS DECIMAL(9,0)) FROM ${case_db}.t1 WHERE k1 = 2;
+
+-- query 15
+-- @cleanup=true
+-- @skip_result_check=true
+DROP TABLE IF EXISTS ${case_db}.t1;

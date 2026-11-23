@@ -1092,12 +1092,6 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
     let assignments = sink
         .root_write_assignments(&compile_control)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
-    let assignments = assignments
-        .map(|assignments| {
-            crate::dml::insert::attach_write_literal_contexts(query, assignments, &compile_control)
-        })
-        .transpose()
-        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let mut preparation =
         novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
             statement,

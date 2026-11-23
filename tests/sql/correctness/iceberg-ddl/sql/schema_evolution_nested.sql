@@ -29,7 +29,7 @@ USE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
 DROP TABLE IF EXISTS people;
 CREATE TABLE people (
   id INT,
-  address ROW(street STRING, city STRING)
+  address ROW(street VARCHAR, city VARCHAR)
 ) WITH (format_version = 2);
 
 -- query 2

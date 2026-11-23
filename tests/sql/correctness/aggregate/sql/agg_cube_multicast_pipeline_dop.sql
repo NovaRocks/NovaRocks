@@ -36,6 +36,6 @@ WITH t AS (
 SELECT a, b
 FROM t
 GROUP BY CUBE(a, b)
-ORDER BY a, b;
+ORDER BY a NULLS FIRST, b NULLS FIRST;
 
 SET SESSION pipeline_dop = 0;

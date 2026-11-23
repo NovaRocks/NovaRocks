@@ -24,10 +24,10 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-  "v1" int(11) ,
-  "v2" int(11) ,
-  "v3" int(11) NOT NULL,
-  "v4" int(11)
+  "v1" INTEGER ,
+  "v2" INTEGER ,
+  "v3" INTEGER NOT NULL,
+  "v4" INTEGER
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t1 (v1, v2, v3, v4) values
@@ -137,7 +137,7 @@ SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT sum(v3) OVER (PARTITION 
 SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT avg(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
 
 -- query 16
-SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(cume_dist() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
+SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(cume_dist() OVER (PARTITION BY v2 ORDER BY v1) AS DECIMAL(18,5)) AS wv FROM ${case_db}.t1)a;
 
 -- query 17
-SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(percent_rank() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
+SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(percent_rank() OVER (PARTITION BY v2 ORDER BY v1) AS DECIMAL(18,5)) AS wv FROM ${case_db}.t1)a;

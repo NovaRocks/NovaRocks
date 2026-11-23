@@ -1473,13 +1473,13 @@ mod tests {
 
         let sql = r#"
             SELECT p.id, parse_json(p.txt) IN (
-                SELECT parse_json(CONCAT('{"key":', CAST(generate_series AS STRING), '}'))
+                SELECT parse_json(CONCAT('{"key":', CAST(generate_series AS VARCHAR), '}'))
                 FROM TABLE(generate_series(0, 1))
             ) AS present
             FROM (
                 SELECT generate_series AS id,
                     CASE WHEN generate_series=2 THEN NULL
-                         ELSE CONCAT('{"key":', CAST(generate_series AS STRING), '}') END AS txt
+                         ELSE CONCAT('{"key":', CAST(generate_series AS VARCHAR), '}') END AS txt
                 FROM TABLE(generate_series(1, 2))
             ) p
             ORDER BY p.id
@@ -3120,7 +3120,7 @@ mod tests {
             .unwrap();
         let (_root, scope) = query_scope();
         let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete_for_test(
-            request_for("SELECT CAST(NULL AS HLL) AS h, CAST(NULL AS BITMAP) AS b, parse_json('{}') AS j, CAST(NULL AS VARBINARY) AS raw"), &scope,
+            request_for("SELECT CAST(NULL AS UUID) AS u, CAST(JSON '7' AS VARCHAR(8)) AS text_value, parse_json('{}') AS j, CAST(NULL AS VARBINARY) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();
@@ -3133,14 +3133,14 @@ mod tests {
                 .iter()
                 .map(|column| column.logical_type())
                 .collect::<Vec<_>>(),
-            vec![D::Hll, D::Bitmap, D::Json, D::Physical]
+            vec![D::Uuid, D::Physical, D::Json, D::Physical]
         );
         assert_eq!(
             outputs
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["h", "b", "j", "raw"]
+            vec!["u", "text_value", "j", "raw"]
         );
         for (output, original) in outputs.iter().zip(result.fields.iter()) {
             assert_eq!(output.ty, original.ty);

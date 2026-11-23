@@ -39,8 +39,9 @@ use novarocks_expression::{
 use novarocks_expression_contract::{ExprKind, ValueId};
 use novarocks_functions::{DataFailureReason, largeint};
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, FunctionValueType, SemanticParameterId, SemanticParameterKey,
-    SemanticParameterRef, SemanticParameterValue, SemanticParameters, ValueLogicalType,
+    AssignmentCommonTypeError, DecimalOverflowPolicy, FunctionValueType, SemanticParameterId,
+    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    ValueLogicalType,
 };
 use std::sync::Arc;
 
@@ -304,42 +305,42 @@ fn literal_types_and_cast_parameters_follow_the_checked_unit() {
             "{source}"
         );
     }
-    let temporal: &[(&str, ArrayRef)] = &[
+    let temporal: &[(&str, u32, ArrayRef)] = &[
         (
             "TIME '01:02:03'",
+            8,
             Arc::new(Time64MicrosecondArray::from(vec![3_723_000_000])),
         ),
         (
             "TIMESTAMP '1970-01-02 00:00:00'",
+            19,
             Arc::new(TimestampMicrosecondArray::from(vec![86_400_000_000])),
         ),
     ];
-    for (source, expected) in temporal {
+    for (source, expected_width, expected) in temporal {
         let typed = compile(source, &[], &context);
         let unit = typed.unit();
         let root = unit.definition(unit.roots()[0].definition).unwrap();
-        let expected_type = FunctionValueType::new(expected.data_type().clone(), true);
+        let expected_type = FunctionValueType::new(expected.data_type().clone(), false);
         assert_eq!(root.ty, expected_type, "{source}");
         let ExprKind::Cast {
             expr,
             target,
-            allow_throw_exception,
-            decimal_overflow_policy,
-            array_failure_mode: None,
+            cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
         } = &root.kind
         else {
             panic!("{source}: expected the original text CAST");
         };
         assert_eq!(target, expected.data_type(), "{source}");
-        assert_eq!(*decimal_overflow_policy, context.decimal_overflow_policy);
-        assert_eq!(*allow_throw_exception, ALLOW_THROW);
-        assert_eq!(
-            typed.environment().parameters.require(ALLOW_THROW).unwrap(),
-            &SemanticParameterValue::AllowThrowException(true)
-        );
         let child = unit.definition(*expr).unwrap();
         assert!(matches!(child.kind, ExprKind::Constant(_)));
-        assert_eq!(child.ty, FunctionValueType::new(DataType::Utf8, false));
+        assert!(!child.ty.nullable());
+        assert!(matches!(
+            child.ty.value_type().kind(),
+            novarocks_type_contract::ValueKind::BoundedCharacter(character)
+                if character.kind() == novarocks_type_contract::CharacterKind::Varchar
+                    && character.length() == *expected_width
+        ));
 
         let result = evaluate(&typed, &batch(&[], vec![]));
         assert_eq!(result.batch.shape, CONSTANT_SHAPE, "{source}");
@@ -355,12 +356,12 @@ fn literal_types_and_cast_parameters_follow_the_checked_unit() {
     let typed = compile(source, &[], &context);
     assert!(typed.unit().definitions().iter().any(|definition| matches!(
         definition.kind,
-        ExprKind::Cast { allow_throw_exception, .. } if allow_throw_exception == ALLOW_THROW
+        ExprKind::Cast {
+            cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
+            ..
+        }
     )));
-    assert_eq!(
-        typed.environment().parameters.require(ALLOW_THROW).unwrap(),
-        &SemanticParameterValue::AllowThrowException(true)
-    );
+    assert!(typed.environment().parameters.require(ALLOW_THROW).is_err());
     assert_eq!(
         constant(source, &context).batch.values.to_data(),
         Int64Array::from(vec![2_147_483_648]).to_data(),
@@ -381,10 +382,8 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     ));
     for (text, name) in [
         ("TRIM(x)", "trim"),
-        ("IF(TRUE, x, x)", "if"),
         ("count(x)", "count"),
         ("x.y", "qualified name or field reference"),
-        ("CAST(x AS BIGINT)", "CAST"),
     ] {
         assert!(
             matches!(
@@ -394,6 +393,25 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
             "{text}"
         );
     }
+    let conditional = type_text("IF(TRUE, x, x)").unwrap();
+    let values = Arc::new(StringArray::from(vec!["original value"]));
+    let result = evaluate(&conditional, &batch(&columns, vec![values.clone()]));
+    assert_eq!(result.batch.result_type, columns[0].value_type);
+    assert_eq!(result.batch.values.to_data(), values.to_data());
+
+    let cast = type_text("CAST(x AS BIGINT)").unwrap();
+    let root = cast
+        .unit()
+        .definition(cast.unit().roots()[0].definition)
+        .unwrap();
+    assert_eq!(root.ty, FunctionValueType::new(DataType::Int64, false));
+    assert!(matches!(
+        type_text("CAST(x AS LARGEINT)"),
+        Err(TextError::Typing {
+            cause: TypingError::TypeMismatch(_),
+            ..
+        })
+    ));
     assert!(matches!(
         type_text("TRIM('a' FROM x)"),
         Err(TextError::UnsupportedSyntax(cause)) if cause.message == "explicit TRIM characters are not supported"
@@ -434,6 +452,48 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
             "{text}"
         );
     }
+    let mixed_coalesce = type_text("COALESCE(1, 'text')").err();
+    assert!(
+        matches!(
+            mixed_coalesce,
+            Some(TextError::Typing {
+                cause: TypingError::CommonType(AssignmentCommonTypeError::IncompatibleShape(
+                    "expressions do not have a common Trino type"
+                )),
+                ..
+            })
+        ),
+        "{mixed_coalesce:?}"
+    );
+}
+
+#[test]
+fn trino_json_literal_validation_precedes_try_conversion() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for text in [
+        "TRY_CAST(JSON '[1' AS VARCHAR)",
+        "TRY(CAST(JSON '1e309' AS VARCHAR))",
+    ] {
+        assert!(
+            matches!(
+                type_expression_text(text, &[], &context, &HarnessControl),
+                Err(TextError::Typing {
+                    cause: TypingError::InvalidLiteral(_),
+                    ..
+                })
+            ),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        constant("TRY_CAST(JSON '1e2' AS VARCHAR)", &context)
+            .batch
+            .values
+            .to_data(),
+        StringArray::from(vec!["1.0E2"]).to_data(),
+    );
 }
 
 #[test]
@@ -491,6 +551,88 @@ fn negation_compares_nullable_integer_minima_at_the_original_row() {
             .to_data()
     );
     assert_overflow(&result, "largeint", i128::MIN);
+}
+
+#[test]
+fn try_recovers_only_failed_rows_from_its_original_body() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [column("x", 4, DataType::Int32, false)];
+    let input = batch(
+        &columns,
+        vec![Arc::new(Int32Array::from(vec![7, i32::MIN, -5]))],
+    );
+    let typed = compile("TRY(TRY(-x))", &columns, &context);
+    let result = evaluate(&typed, &input);
+    assert_compared(&result, 1, 3);
+    assert!(result.batch.result_type.nullable());
+    assert!(result.batch.errors.is_empty());
+    assert_eq!(
+        result.batch.values.to_data(),
+        Int32Array::from(vec![Some(-7), None, Some(5)]).to_data(),
+    );
+    let result = constant("TRY(TRY(7))", &context);
+    assert_eq!(
+        result.batch.values.to_data(),
+        Int32Array::from(vec![7]).to_data()
+    );
+}
+
+#[test]
+fn try_keeps_successes_and_nulls_around_invalid_array_subscripts() {
+    use arrow::{array::ListArray, datatypes::Int32Type};
+    use novarocks_failure_contract::kernel_reason::INVALID_FUNCTION_ARGUMENT;
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let arrays = ListArray::from_iter_primitive::<Int32Type, _, _>([
+        Some(vec![Some(11)]),
+        Some(vec![Some(12)]),
+        None,
+        Some(vec![Some(14)]),
+        Some(vec![Some(15)]),
+        Some(vec![None]),
+        Some(vec![Some(17)]),
+    ]);
+    let columns = [
+        column("a", 1, arrays.data_type().clone(), true),
+        column("i", 2, DataType::Int64, false),
+    ];
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(arrays),
+            Arc::new(Int64Array::from(vec![1, 0, 1, 2, -1, 1, 1])),
+        ],
+    );
+    let bare = evaluate(&compile("a[i]", &columns, &context), &input);
+    assert_eq!(
+        bare.batch
+            .errors
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.reason()))
+            .collect::<Vec<_>>(),
+        [1, 3, 4].map(|ordinal| (
+            ordinal,
+            DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT)
+        )),
+    );
+    let try_cast = evaluate(
+        &compile("TRY_CAST(a[i] AS BIGINT)", &columns, &context),
+        &input,
+    );
+    assert_eq!(try_cast.batch.errors, bare.batch.errors);
+    assert_eq!(
+        try_cast.batch.values.to_data(),
+        Int64Array::from(vec![Some(11), None, None, None, None, None, Some(17)]).to_data(),
+    );
+    let caught = evaluate(&compile("TRY(a[i])", &columns, &context), &input);
+    assert!(caught.batch.errors.is_empty());
+    assert_eq!(
+        caught.batch.values.to_data(),
+        Int32Array::from(vec![Some(11), None, None, None, None, None, Some(17)]).to_data(),
+    );
 }
 
 fn assert_overflow(result: &CheckedRows, label: &str, minimum: impl std::fmt::Display) {

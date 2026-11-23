@@ -27,8 +27,8 @@
 DROP TABLE IF EXISTS ${case_db}.t_project_string_functions;
 CREATE TABLE ${case_db}.t_project_string_functions (
   id INT,
-  first_name STRING,
-  last_name STRING
+  first_name VARCHAR,
+  last_name VARCHAR
 ) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_project_string_functions VALUES
   ROW(1, 'alice', 'smith'),

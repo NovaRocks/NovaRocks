@@ -86,9 +86,17 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
         SqlType::Int => "INT",
         SqlType::BigInt => "BIGINT",
         SqlType::LargeInt => "LARGEINT",
-        SqlType::Float => "FLOAT",
+        SqlType::Float => "REAL",
         SqlType::Double => "DOUBLE",
-        SqlType::String => "STRING",
+        SqlType::String => "VARCHAR",
+        SqlType::BoundedCharacter(character) => {
+            use novarocks_type_contract::CharacterKind;
+            let name = match character.kind() {
+                CharacterKind::Char => "CHAR",
+                CharacterKind::Varchar => "VARCHAR",
+            };
+            return parameterized_type(name, vec![number_argument(character.length())]);
+        }
         SqlType::Json => "JSON",
         SqlType::Binary => "VARBINARY",
         SqlType::Bitmap => "BITMAP",
@@ -113,7 +121,10 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
             }
             return parameterized_type(
                 "DECIMAL",
-                vec![number_argument(*precision), number_argument(*scale as u8)],
+                vec![
+                    number_argument(u32::from(*precision)),
+                    number_argument(*scale as u32),
+                ],
             );
         }
         SqlType::Array(item) => {
@@ -151,7 +162,7 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
     Ok(build::simple_type(scalar))
 }
 
-fn number_argument(value: u8) -> ast::DataTypeParameter {
+fn number_argument(value: u32) -> ast::DataTypeParameter {
     build::numeric_parameter(i64::from(value))
 }
 
@@ -213,13 +224,13 @@ mod tests {
             (DataType::Int16, "SMALLINT"),
             (DataType::Int32, "INT"),
             (DataType::Int64, "BIGINT"),
-            (DataType::Float32, "FLOAT"),
+            (DataType::Float32, "REAL"),
             (DataType::Float64, "DOUBLE"),
             (DataType::Decimal128(18, 2), "DECIMAL(18, 2)"),
             (DataType::Decimal256(76, 20), "DECIMAL(76, 20)"),
-            (DataType::Utf8, "STRING"),
-            (DataType::LargeUtf8, "STRING"),
-            (DataType::Utf8View, "STRING"),
+            (DataType::Utf8, "VARCHAR"),
+            (DataType::LargeUtf8, "VARCHAR"),
+            (DataType::Utf8View, "VARCHAR"),
             (DataType::Binary, "VARBINARY"),
             (DataType::LargeBinary, "VARBINARY"),
             (DataType::BinaryView, "VARBINARY"),
@@ -297,7 +308,7 @@ mod tests {
         }
         assert_spelling(
             FunctionValueType::new(map_type(DataType::Int64, DataType::Utf8), true),
-            "MAP<BIGINT, STRING>",
+            "MAP<BIGINT, VARCHAR>",
         );
         let list = DataType::List(Arc::new(Field::new("item", DataType::Boolean, true)));
         let structure = DataType::Struct(
@@ -309,7 +320,7 @@ mod tests {
         );
         assert_spelling(
             FunctionValueType::new(structure, true),
-            r#"ROW("a`b" INT, "space name" MAP<STRING, ARRAY<BOOLEAN>>)"#,
+            r#"ROW("a`b" INT, "space name" MAP<VARCHAR, ARRAY<BOOLEAN>>)"#,
         );
     }
 
@@ -347,7 +358,7 @@ mod tests {
         );
         assert_spelling(
             declared(declaration, carrier),
-            r#"ROW("documents" ARRAY<JSON>, "lookup" MAP<STRING, ROW("value" VARIANT)>)"#,
+            r#"ROW("documents" ARRAY<JSON>, "lookup" MAP<VARCHAR, ROW("value" VARIANT)>)"#,
         );
     }
 

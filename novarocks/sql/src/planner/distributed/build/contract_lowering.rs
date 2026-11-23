@@ -1655,10 +1655,6 @@ impl<'a> ContractLoweringVisitor<'a> {
 
     /// One admitted statement authors this source for every arithmetic/cast
     /// occurrence, independently of the occurrence's decimal overflow policy.
-    fn root_allow_throw_reference(&mut self) -> SemanticParameterRef {
-        scalar_emission::root_allow_throw_reference(&mut self.root_allow_throw_exception_used)
-    }
-
     fn fragment_mut(&mut self) -> &mut FragmentBuilder {
         self.fragments
             .get_mut(&self.current_fragment)
@@ -3519,17 +3515,13 @@ impl<'a> ContractLoweringVisitor<'a> {
             let mut expression =
                 self.add_unscoped_expression(node, ty, ContractExprKind::Value(input))?;
             if let Some(target) = projections.get(&input) {
-                let allow_throw_exception = self.root_allow_throw_reference();
                 expression = self.add_unscoped_expression(
                     node,
                     target.clone(),
                     ContractExprKind::Cast {
                         expr: expression,
                         target: target.data_type().clone(),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception,
-                        array_failure_mode: None,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
                     },
                 )?;
             }
@@ -10294,10 +10286,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         )
     }
 
-    /// Retain the existing per-position assignment contract before deciding
+    /// Validate each cell against the common source declaration before deciding
     /// whether this exact syntax occurrence can enter a first-created run.
     fn values_literal_type(
-        &self,
+        &mut self,
         expression: &TypedExpr,
         target: &ValueType,
         row_ordinal: usize,
@@ -10305,8 +10297,11 @@ impl<'a> ContractLoweringVisitor<'a> {
     ) -> Result<Option<ValueType>, ContractLoweringError> {
         let source = expression_type(expression);
         if source.nullable() && !target.nullable()
-            || novarocks_types::wider_type(source.data_type(), target.data_type())
-                != *target.data_type()
+            || !novarocks_type_contract::trino_can_coerce(
+                source.value_type(),
+                target.value_type(),
+                &mut self.work,
+            )?
         {
             return Err(ContractLoweringError::ExpressionTypeMismatch {
                 context: format!("Values row {row_ordinal} column {column_ordinal}"),
@@ -10953,15 +10948,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission(owner).lower_expression_as(
-            expression,
-            visible,
-            target,
-            policy,
-            array_failure_mode,
-        )
+        self.scalar_emission(owner)
+            .lower_expression_as(expression, visible, target, policy, cast_mode)
     }
 
     /// The type a NULL constant is lowered in, or `None` for any other
@@ -10990,14 +10980,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission(owner).convert_expression_to(
-            expression,
-            target,
-            policy,
-            array_failure_mode,
-        )
+        self.scalar_emission(owner)
+            .convert_expression_to(expression, target, policy, cast_mode)
     }
 
     fn convert_expression_to_inner(
@@ -11006,14 +10992,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
-        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
+        cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission(owner).convert_expression_to_inner(
-            expression,
-            target,
-            policy,
-            array_failure_mode,
-        )
+        self.scalar_emission(owner)
+            .convert_expression_to_inner(expression, target, policy, cast_mode)
     }
 
     fn common_comparison_value_type(
@@ -18255,7 +18237,7 @@ mod tests {
             };
             join.condition.keys_mut()[0].right = TypedExpr {
                 kind: ExprKind::Cast {
-                    array_failure_mode: None,
+                    cast_mode: None,
                     expr: novarocks_parser::ast::AstBox::new(column_ref(&right)),
                     target: DataType::Int64,
                     decimal_overflow_policy:
@@ -18694,7 +18676,7 @@ mod tests {
                 else_expr: Some(novarocks_parser::ast::AstBox::new(literal_int(0))),
             },
             ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(column_ref(&right)),
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -20419,50 +20401,59 @@ mod tests {
     }
 
     #[test]
-    fn signed_literal_assignment_to_largeint_retains_exact_conversion_binding() {
-        let mut output = column(1, "large_number", DataType::FixedSizeBinary(16), false);
-        output.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-            output.value_type.data_type().clone(),
-            output.value_type.nullable(),
-            novarocks_type_contract::ValueLogicalType::LargeInt,
-        )
-        .unwrap();
-        let final_plan =
-            finish_for_test(&values(vec![output], vec![vec![literal_int(7)]])).unwrap();
+    fn signed_literal_assignment_retains_its_cast_without_inventing_a_largeint_binding() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, TrinoCastMode};
+
+        let output = column(1, "number", DataType::Int32, false);
+        let source = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: novarocks_parser::ast::AstBox::new(literal_int(7)),
+                target: DataType::Int32,
+                cast_mode: Some(TrinoCastMode::StoreAssignment),
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            },
+            value_type: output.value_type.clone(),
+        };
+        let final_plan = finish_for_test(&values(vec![output], vec![vec![source]])).unwrap();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let root = fragment.nodes().get(&fragment.root()).unwrap();
         let NodeKind::Values { rows } = &root.kind else {
-            panic!("expected Values root")
+            panic!("expected Values root");
         };
         let expression = fragment
             .root_expression(fragment.root(), rows[0][0])
             .unwrap();
-        let ContractExprKind::FunctionCall { function, args } = &expression.kind else {
-            panic!("signed assignment must have a real conversion owner");
+        let ContractExprKind::Cast {
+            expr,
+            target: DataType::Int32,
+            cast_mode: TrinoCastMode::StoreAssignment,
+        } = &expression.kind
+        else {
+            panic!("expected the exact assignment CAST");
         };
+        assert_eq!(expression.ty, ValueType::new(DataType::Int32, false));
+        let original = fragment.unit(root.id).unwrap().definition(*expr).unwrap();
+        assert_eq!(original.ty, ValueType::new(DataType::Int64, false));
         assert_eq!(
-            function.function_id.as_str(),
-            "builtin.scalar/value_domain_conversion/v1"
+            checked_constant_for_test(&final_plan, original)
+                .try_i64()
+                .unwrap(),
+            Some(7)
         );
-        assert!(
-            function
-                .overload
-                .as_str()
-                .ends_with("signed_to_largeint/v1")
-        );
-        assert_eq!(
-            expression.ty.logical_type(),
-            novarocks_type_contract::ValueLogicalType::LargeInt
-        );
-        assert_eq!(
-            fragment
-                .unit(root.id)
-                .unwrap()
-                .definition(args[0])
-                .unwrap()
-                .ty,
-            ValueType::new(DataType::Int64, false)
-        );
+
+        let mut retired = column(1, "large_number", DataType::FixedSizeBinary(16), false);
+        retired.value_type = ValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        let expected_retired = retired.value_type.clone();
+        assert!(matches!(
+            finish_for_test(&values(vec![retired], vec![vec![literal_int(7)]])),
+            Err(ContractLoweringError::ExpressionTypeMismatch { expected, actual, .. })
+                if expected == expected_retired && actual == ValueType::new(DataType::Int64, false)
+        ));
     }
 
     #[test]

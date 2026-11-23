@@ -261,7 +261,7 @@ fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
 #[test]
 fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latches() {
     let f = fixture(
-        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS DATE) IS NOT NULL AND ndv(v)=0",
+        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NOT NULL AND ndv(v)=0",
     );
     let input = batch(
         &f,
@@ -326,7 +326,7 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
 #[test]
 fn filter_conjunction_actual_nested_not_is_null_keeps_value_demand() {
     let f = fixture(
-        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING NOT (CAST(MAX(CAST(v AS DOUBLE)) AS DATE) IS NULL) AND ndv(v)=0",
+        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING NOT (CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NULL) AND ndv(v)=0",
     );
     let input = batch(&f, &[0, 1, 0], &[None, Some(f64::NAN), Some(20200101.)]);
     assert_eq!(

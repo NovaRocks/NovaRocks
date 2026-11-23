@@ -145,6 +145,7 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
         ControlShape::Disjunction => Some(wire::SimpleControl::Disjunction),
         ControlShape::If => Some(wire::SimpleControl::If),
         ControlShape::Coalesce => Some(wire::SimpleControl::Coalesce),
+        ControlShape::Try => Some(wire::SimpleControl::Try),
         ControlShape::Case { .. }
         | ControlShape::HigherOrder { .. }
         | ControlShape::TemporalSource(_)
@@ -200,6 +201,7 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
             Ok(wire::SimpleControl::Disjunction) => Ok(ControlShape::Disjunction),
             Ok(wire::SimpleControl::If) => Ok(ControlShape::If),
             Ok(wire::SimpleControl::Coalesce) => Ok(ControlShape::Coalesce),
+            Ok(wire::SimpleControl::Try) => Ok(ControlShape::Try),
             _ => Err(ControlCodecError::InvalidShape(
                 "unknown or unspecified control shape",
             )),
@@ -226,6 +228,7 @@ fn encode_guard(guard: RegionGuard) -> wire::RegionGuard {
         GuardKind::IfThen => Kind::Simple(wire::SimpleGuard::IfThen as i32),
         GuardKind::IfElse => Kind::Simple(wire::SimpleGuard::IfElse as i32),
         GuardKind::CaseElse => Kind::Simple(wire::SimpleGuard::CaseElse as i32),
+        GuardKind::TryBody => Kind::Simple(wire::SimpleGuard::TryBody as i32),
         GuardKind::LambdaInvocation => Kind::Simple(wire::SimpleGuard::LambdaInvocation as i32),
         GuardKind::CoalesceAfterNull { ordinal } => Kind::CoalesceAfterNullOrdinal(ordinal),
         GuardKind::CaseWhen { arm } => Kind::CaseWhenArm(arm),
@@ -254,6 +257,7 @@ fn decode_guard(guard: &wire::RegionGuard) -> Result<RegionGuard, ControlCodecEr
             Ok(wire::SimpleGuard::IfThen) => GuardKind::IfThen,
             Ok(wire::SimpleGuard::IfElse) => GuardKind::IfElse,
             Ok(wire::SimpleGuard::CaseElse) => GuardKind::CaseElse,
+            Ok(wire::SimpleGuard::TryBody) => GuardKind::TryBody,
             Ok(wire::SimpleGuard::LambdaInvocation) => GuardKind::LambdaInvocation,
             Ok(wire::SimpleGuard::TemporalInvocationNull) => GuardKind::TemporalInvocationNull,
             _ => {

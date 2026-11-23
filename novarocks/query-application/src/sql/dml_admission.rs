@@ -56,6 +56,11 @@ const CREATE_TABLE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Admit,
     status: ErrorCodeStatus::Active,
 };
+const INVALID_DEFAULT_COLUMN_VALUE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.invalid_default_column_value"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
 
 const TABLE_ALREADY_EXISTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.table_already_exists"),
@@ -77,6 +82,7 @@ pub const DML_ADMISSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     MERGE_UNSUPPORTED_FORM,
     INSERT_UNSUPPORTED_FORM,
     CREATE_TABLE_UNSUPPORTED_FORM,
+    INVALID_DEFAULT_COLUMN_VALUE,
     TABLE_ALREADY_EXISTS,
     SCHEMA_ALREADY_EXISTS,
 ];
@@ -89,6 +95,7 @@ pub enum DmlAdmissionError {
     MergeUnsupportedForm,
     InsertUnsupportedForm,
     CreateTableUnsupportedForm,
+    InvalidDefaultColumnValue,
     TableAlreadyExists,
     SchemaAlreadyExists,
 }
@@ -102,6 +109,7 @@ impl DmlAdmissionError {
             Self::MergeUnsupportedForm => MERGE_UNSUPPORTED_FORM,
             Self::InsertUnsupportedForm => INSERT_UNSUPPORTED_FORM,
             Self::CreateTableUnsupportedForm => CREATE_TABLE_UNSUPPORTED_FORM,
+            Self::InvalidDefaultColumnValue => INVALID_DEFAULT_COLUMN_VALUE,
             Self::TableAlreadyExists => TABLE_ALREADY_EXISTS,
             Self::SchemaAlreadyExists => SCHEMA_ALREADY_EXISTS,
         }
@@ -123,7 +131,7 @@ mod tests {
 
     #[test]
     fn manifest_contains_every_dml_statement_shape_code() {
-        assert_eq!(DML_ADMISSION_ERROR_CODE_DESCRIPTORS.len(), 8);
+        assert_eq!(DML_ADMISSION_ERROR_CODE_DESCRIPTORS.len(), 9);
         assert!(
             DML_ADMISSION_ERROR_CODE_DESCRIPTORS
                 .iter()

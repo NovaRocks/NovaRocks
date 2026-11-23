@@ -484,7 +484,7 @@ fn selected_equality_column_operand(arena: &ScalarArena, mut expr: ScalarId) -> 
             ScalarNode::ColumnRef(_) => return Some(expr),
             ScalarNode::Nested(child) if arena.value_type(*child) == result => *child,
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None | Some(novarocks_type_contract::TrinoCastMode::Implicit),
                 child,
                 target,
                 ..
@@ -545,7 +545,7 @@ fn classify_column_ref(
         }
         ScalarNode::Cast {
             child,
-            array_failure_mode: None,
+            cast_mode: None,
             ..
         }
         | ScalarNode::Nested(child) => {
@@ -1016,7 +1016,7 @@ mod tests {
         );
         let cast_right = arena.intern(
             ScalarNode::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 child: right_key,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1106,7 +1106,7 @@ mod tests {
             } else {
                 arena.intern(
                     ScalarNode::Cast {
-                        array_failure_mode: None,
+                        cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
                         child: left,
                         target: selected.clone(),
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -1175,9 +1175,7 @@ mod tests {
 
     #[test]
     fn join_equality_pairs_keep_explicit_array_cast_boundaries_out_of_ukfk_proofs() {
-        use novarocks_type_contract::{
-            ArrayCastFailureMode, DecimalOverflowPolicy, FunctionValueType,
-        };
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
         let list_type = |item| {
             FunctionValueType::new(
                 DataType::List(Arc::new(Field::new("item", item, true))),
@@ -1207,16 +1205,13 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId::new_for_test(2)),
             source.clone(),
         );
-        for mode in [
-            ArrayCastFailureMode::ReportError,
-            ArrayCastFailureMode::OutputNull,
-        ] {
+        for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
             let cast = arena.intern(
                 ScalarNode::Cast {
                     child: right_key,
                     target: target.data_type().clone(),
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    array_failure_mode: Some(mode),
+                    cast_mode: Some(mode),
                 },
                 target.clone(),
             );
@@ -1241,15 +1236,13 @@ mod tests {
                 "an explicit conversion cannot become a bare-key uniqueness proof"
             );
             let ScalarNode::Cast {
-                child,
-                array_failure_mode,
-                ..
+                child, cast_mode, ..
             } = arena.node(cast)
             else {
                 panic!("original CAST remains in the condition")
             };
             assert_eq!(*child, right_key);
-            assert_eq!(*array_failure_mode, Some(mode));
+            assert_eq!(*cast_mode, Some(mode));
             assert_eq!(arena.value_type(cast), &target);
             assert_eq!(arena.value_type(right_key), &source);
         }

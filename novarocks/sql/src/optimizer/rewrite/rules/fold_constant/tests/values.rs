@@ -95,10 +95,10 @@ fn folds_immutable_function_call() {
 }
 
 #[test]
-fn throwing_fold_request_retains_original_node_and_policy_and_nullable_sibling_folds() {
+fn throwing_fold_request_retains_original_node_and_try_cast_sibling_folds() {
     use novarocks_type_contract::{
         DecimalOverflowPolicy::{OutputNull, ReportError},
-        FunctionValueType,
+        FunctionValueType, TrinoCastMode,
     };
     let mut fixture = Fixture::new();
     let wide = DataType::Decimal128(38, 0);
@@ -110,10 +110,10 @@ fn throwing_fold_request_retains_original_node_and_policy_and_nullable_sibling_f
         FunctionValueType::new(wide.clone(), false),
     );
     for cast in [false, true] {
-        let node = |decimal_overflow_policy| {
+        let node = |decimal_overflow_policy, cast_mode| {
             if cast {
                 ScalarNode::Cast {
-                    array_failure_mode: None,
+                    cast_mode: Some(cast_mode),
                     child,
                     target: narrow.clone(),
                     decimal_overflow_policy,
@@ -127,9 +127,15 @@ fn throwing_fold_request_retains_original_node_and_policy_and_nullable_sibling_f
                 }
             }
         };
-        let ty = FunctionValueType::new(if cast { narrow.clone() } else { wide.clone() }, true);
-        let throwing = fixture.intern(node(ReportError), ty.clone());
-        let nullable = fixture.intern(node(OutputNull), ty);
+        let carrier = if cast { narrow.clone() } else { wide.clone() };
+        let throwing = fixture.intern(
+            node(ReportError, TrinoCastMode::Explicit),
+            FunctionValueType::new(carrier.clone(), !cast),
+        );
+        let nullable = fixture.intern(
+            node(OutputNull, TrinoCastMode::Try),
+            FunctionValueType::new(carrier, true),
+        );
         let original = fixture.node(throwing);
         assert!(matches!(
             fixture.apply(project(throwing)),
@@ -206,7 +212,7 @@ fn real_fold_author_preserves_root_domains_and_nested_field_identity() {
     );
     let identity = fixture.intern(
         ScalarNode::Cast {
-            array_failure_mode: None,
+            cast_mode: None,
             child: literal,
             target: ty.data_type().clone(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

@@ -141,7 +141,7 @@ fn aggregate_vector<T>(
     })?;
     Ok(values)
 }
-// Design: ADR-0252 (docs/adr/ADR-0252-aggregate-filters-select-original-rows-per-call.md)
+// Design: ADR-0253 (docs/adr/ADR-0253-aggregate-filters-select-original-rows-per-call.md)
 #[derive(Default)]
 struct AggregateFilterScratch {
     rows: Vec<usize>,

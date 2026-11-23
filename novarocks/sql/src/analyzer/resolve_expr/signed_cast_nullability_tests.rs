@@ -61,7 +61,7 @@ fn implicit_signed_cast_nullability_preserves_complete_source_and_policy() {
                         assert_eq!(format!("{output:?}"), format!("{input:?}"));
                     } else {
                         let ExprKind::Cast {
-                            array_failure_mode: None,
+                            cast_mode: None,
                             expr,
                             target: actual_target,
                             decimal_overflow_policy,
@@ -178,7 +178,7 @@ fn implicit_decimal_function_coercion_uses_the_original_cast_null_contract() {
                 policy == DecimalOverflowPolicy::OutputNull
             );
             let ExprKind::Cast {
-                array_failure_mode: None,
+                cast_mode: None,
                 expr,
                 target: actual_target,
                 decimal_overflow_policy,
@@ -210,48 +210,29 @@ fn implicit_decimal_function_coercion_uses_the_original_cast_null_contract() {
 }
 
 #[test]
-fn implicit_temporal_comparison_coercion_preserves_possible_null_and_real_source() {
+fn comparisons_refuse_implicit_varchar_to_date_or_timestamp() {
     let control = crate::compiler::SqlCompileControl::unbounded();
+    let source = FunctionValueType::new(DataType::Utf8, false);
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .unwrap();
     for target in [
         DataType::Date32,
         DataType::Timestamp(TimeUnit::Microsecond, None),
     ] {
-        let input = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::String("2024-02-01".into())),
-            value_type: FunctionValueType::new(DataType::Utf8, false),
-        };
-        let output = coerce_to_target_type(input.clone(), &target);
-        assert_eq!(
-            output.value_type,
-            FunctionValueType::new(target.clone(), true)
-        );
-        let ExprKind::Cast {
-            array_failure_mode: None,
-            expr,
-            target: actual_target,
-            decimal_overflow_policy,
-        } = &output.kind
-        else {
-            panic!("temporal comparison must preserve its runtime CAST")
-        };
-        assert_eq!(format!("{expr:?}"), format!("{input:?}"));
-        assert_eq!(actual_target, &target);
-        assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
-        for allow in [false, true] {
-            novarocks_functions::PreparedCastRecipe::try_new(
-                novarocks_functions::CastOperation::Carrier,
-                &input.value_type,
-                &output.value_type,
-                DecimalOverflowPolicy::OutputNull,
-                allow,
-                None,
-                &control,
+        let target = FunctionValueType::new(target, false);
+        assert!(
+            !novarocks_type_contract::trino_can_coerce(
+                source.value_type(),
+                target.value_type(),
+                &mut work
             )
-            .expect("implicit temporal declaration remains valid under the actual ALLOW fact");
-        }
-        let non_temporal = coerce_to_target_type(input.clone(), &DataType::Boolean);
-        assert_eq!(format!("{non_temporal:?}"), format!("{input:?}"));
+            .unwrap()
+        );
     }
+    work.finish().unwrap();
 }
 
 #[test]

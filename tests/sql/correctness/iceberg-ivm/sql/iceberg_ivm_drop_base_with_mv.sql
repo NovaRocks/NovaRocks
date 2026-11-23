@@ -31,7 +31,7 @@ CREATE CATALOG ice_ivm_dropbase_${uuid0} USING iceberg WITH ("iceberg.catalog.ty
 CREATE SCHEMA ice_ivm_dropbase_${uuid0}.dropbase_${uuid0};
 CREATE TABLE ice_ivm_dropbase_${uuid0}.dropbase_${uuid0}.orders_${uuid0} (
   id BIGINT,
-  region STRING,
+  region VARCHAR,
   amount BIGINT
 ) WITH (format_version = 3);
 INSERT INTO ice_ivm_dropbase_${uuid0}.dropbase_${uuid0}.orders_${uuid0} VALUES

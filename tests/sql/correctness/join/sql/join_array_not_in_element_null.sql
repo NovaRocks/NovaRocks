@@ -30,14 +30,14 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.arr_lhs (
-  "pk" int(11) NOT NULL,
+  "pk" INTEGER NOT NULL,
   "d_1" Array<DECIMAL(26, 2)>
 ) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.arr_rhs (
-  "pk" int(11) NOT NULL,
+  "pk" INTEGER NOT NULL,
   "i_0" Array<INT> NOT NULL
 ) WITH (format_version = 3);
 
