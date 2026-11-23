@@ -895,7 +895,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         }
         require_refresh_paused(context, &mut conn, "orders_mv", true)?;
         require_refresh_paused(context, &mut conn, "parallel_mv", true)?;
-        require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 3)?;
+        require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 4)?;
         require_rest_snapshot_count(context, &rest_uri, "ns", "parallel_mv", 1)?;
         let metadata =
             super::mv_uea7_documents::load_metadata(context, &rest_uri, "ns", "orders_mv")?;
@@ -1814,7 +1814,7 @@ impl Scenario for MvLegacyInterpretationRebuild {
             create,
         )?;
         refresh(context, &mut conn, "orders_mv")?;
-        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 1)?;
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 2)?;
         assert_rows(
             context,
             &mut conn,

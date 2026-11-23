@@ -41,7 +41,7 @@ CREATE MATERIALIZED VIEW mv_conflict WITH (refresh_policy = 'MANUAL') AS SELECT 
 
 -- query 5
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_conflict,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_conflict,publications=1,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_conflict;
 
 -- query 6
@@ -72,7 +72,7 @@ import scala.jdk.CollectionConverters._
 import org.apache.iceberg.spark.Spark3Util
 
 val table = Spark3Util.loadIcebergTable(spark, "ice_rest.ns_${uuid0}.mv_conflict")
-require(table.snapshots().asScala.size == 2, "stale MV publication committed after the external DELETE")
+require(table.snapshots().asScala.size == 3, "stale MV publication committed after the external DELETE")
 println("MV_PHYSICAL_CONFLICT_OK")
 SPARK_SCALA
 spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)"

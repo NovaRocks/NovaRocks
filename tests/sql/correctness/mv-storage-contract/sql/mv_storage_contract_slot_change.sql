@@ -59,7 +59,7 @@ ALTER MATERIALIZED VIEW first_slot_mv SET PROPERTIES refresh_paused = false;
 
 -- query 11
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.first_slot_mv,publications=1,slot-changes=3
+-- @mv_rest_document_graph=ns_${uuid0}.first_slot_mv,publications=1,slot-changes=3,full-refreshes=1
 REFRESH MATERIALIZED VIEW first_slot_mv;
 
 -- query 12
@@ -84,7 +84,7 @@ ALTER MATERIALIZED VIEW conflict_slot_mv SET PROPERTIES refresh_paused = true;
 -- query 15
 -- @result_contains=SLOT_CONFLICT_UNCHANGED
 shell: set -eu
-curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/conflict_slot_mv' | python3 -c 'import json,sys; m=json.load(sys.stdin)["metadata"]; old=json.load(open(sys.argv[1])); key="novarocks.doc.v2.slot.novarocks.mv~configuration"; assert m["properties"][key]==old["slot"],"rejected ALTER changed C bytes/writer"; assert m["current-snapshot-id"]!=old["main"],"external writer did not advance main"; assert len(m["snapshots"])==2,"ALTER rebased or retried"; print("SLOT_CONFLICT_UNCHANGED")' "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
+curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/conflict_slot_mv' | python3 -c 'import json,sys; m=json.load(sys.stdin)["metadata"]; old=json.load(open(sys.argv[1])); key="novarocks.doc.v2.slot.novarocks.mv~configuration"; assert m["properties"][key]==old["slot"],"rejected ALTER changed C bytes/writer"; assert m["current-snapshot-id"]!=old["main"],"external writer did not advance main"; assert len(m["snapshots"])==3,"ALTER rebased or retried"; print("SLOT_CONFLICT_UNCHANGED")' "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
 rm -f "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
 
 -- query 16
@@ -102,7 +102,7 @@ ALTER MATERIALIZED VIEW unknown_slot_mv SET PROPERTIES refresh_policy = 'MANUAL'
 
 -- query 18
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.unknown_slot_mv,publications=2,slot-changes=1,table-commits=4
+-- @mv_rest_document_graph=ns_${uuid0}.unknown_slot_mv,publications=2,slot-changes=1,table-commits=4,full-refreshes=1
 REFRESH MATERIALIZED VIEW unknown_slot_mv;
 
 -- query 19

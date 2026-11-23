@@ -169,7 +169,7 @@ SELECT 1;
 -- query 20
 -- @skip_result_check=true
 -- @result_contains=MANAGEABLE
--- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=1,slot-changes=1,table-commits=3
+-- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=1,slot-changes=1,table-commits=3,full-refreshes=1
 SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 21
@@ -178,7 +178,7 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ROW('east', 'online', 1000),
 
 -- query 22
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=2,slot-changes=1,table-commits=4,full-overwrite-last=true
+-- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=2,slot-changes=1,table-commits=4,full-refreshes=2,full-refresh-last=true
 USE mvsc_${uuid0}.ns_${uuid0};
 SET SESSION "mvsc_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW orders_rollup;

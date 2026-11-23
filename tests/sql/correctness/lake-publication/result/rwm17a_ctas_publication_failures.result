@@ -1,0 +1,12 @@
+-- query 6
+-- types	integer	integer
+case_id	id
+1	91
+2	92
+
+-- query 7
+-- types	integer
+id
+1
+2
+3

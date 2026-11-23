@@ -45,7 +45,7 @@ CREATE MATERIALIZED VIEW mv_filtered WITH (refresh_policy = 'MANUAL') AS SELECT 
 
 -- query 6
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=1,slot-changes=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_filtered;
 
 -- query 7
@@ -54,7 +54,7 @@ INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact VALUES ROW('west', -1);
 
 -- query 8
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=2,slot-changes=0,metadata-only-last=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=2,slot-changes=0,metadata-only-last=true,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_filtered;
 
 -- query 9

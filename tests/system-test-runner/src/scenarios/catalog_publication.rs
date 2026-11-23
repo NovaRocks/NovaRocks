@@ -1239,17 +1239,48 @@ fn seed(
             &format!("INSERT INTO publication_setup.ns.{table} VALUES ROW({value})"),
         )?;
     }
-    // The final overwrite makes the first snapshot's data unreachable from
-    // main. Its later source read cannot pass merely through main protection.
+    // Truncate makes the first snapshot's data unreachable from main.
+    // The independent source read must depend on that snapshot's own files.
     sql(
         context,
-        &format!("INSERT OVERWRITE publication_setup.ns.{table} VALUES ROW(4)"),
+        &format!("TRUNCATE TABLE publication_setup.ns.{table}"),
+    )?;
+    sql(
+        context,
+        &format!("INSERT INTO publication_setup.ns.{table} VALUES ROW(4)"),
     )?;
     ensure!(
         rows(context, table, None)? == vec![4],
-        "seed overwrite did not replace main data"
+        "seed truncate and append did not replace main data"
     );
-    table_metadata(fixture, table)
+    let metadata = table_metadata(fixture, table)?;
+    let mut snapshots = metadata["snapshots"]
+        .as_array()
+        .context("complete seed snapshots missing")?
+        .iter()
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|snapshot| snapshot["sequence-number"].as_i64());
+    ensure!(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot["summary"]["operation"].as_str())
+            .eq([
+                Some("append"),
+                Some("append"),
+                Some("append"),
+                Some("delete"),
+                Some("append"),
+            ]),
+        "seed must retain three original appends followed by truncate and append"
+    );
+    ensure!(
+        snapshots
+            .windows(2)
+            .all(|pair| pair[1]["parent-snapshot-id"] == pair[0]["snapshot-id"])
+            && metadata["current-snapshot-id"] == snapshots[4]["snapshot-id"],
+        "seed replacement lost its exact main snapshot lineage"
+    );
+    Ok(metadata)
 }
 fn snapshot_list(metadata: &Value, snapshot: i64) -> Result<String> {
     Ok(metadata["snapshots"]

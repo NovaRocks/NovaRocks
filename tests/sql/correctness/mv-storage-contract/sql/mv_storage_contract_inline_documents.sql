@@ -173,7 +173,7 @@ FROM fact;
 
 -- query 6
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=1,slot-changes=0,full-refreshes=1
 SET SESSION "mvside_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW mv_wide;
 RESET SESSION "mvside_${uuid0}".incremental_refresh_enabled;
@@ -184,7 +184,7 @@ INSERT INTO fact VALUES ROW('west');
 
 -- query 8
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=2,slot-changes=0,full-overwrite-last=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=2,slot-changes=0,full-refreshes=2,full-refresh-last=true
 SET SESSION "mvside_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW mv_wide;
 RESET SESSION "mvside_${uuid0}".incremental_refresh_enabled;
@@ -215,7 +215,7 @@ printf '%s\n' OVERSIZED_MV_VISIBLE
 
 -- query 12
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.oversized_mv,publications=1,slot-changes=0
+-- @mv_rest_document_graph=ns_${uuid0}.oversized_mv,publications=1,slot-changes=0,full-refreshes=1
 SET SESSION "mvside_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW oversized_mv;
 RESET SESSION "mvside_${uuid0}".incremental_refresh_enabled;

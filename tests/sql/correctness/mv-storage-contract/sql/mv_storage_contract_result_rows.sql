@@ -37,7 +37,7 @@ DELETE FROM fact WHERE k = 'east';
 -- The MV delta deletes one logical row. SHOW and P must report the one
 -- visible row for either legal file layout. Query 21 checks the actual files.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=2,slot-changes=0,logical-rows=1
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=2,slot-changes=0,logical-rows=1,full-refreshes=1
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 8
@@ -57,7 +57,7 @@ INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact VALUES ROW('north', 30);
 -- query 11
 -- This refresh accepts one new row, while the complete target contains two.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=3,slot-changes=0,logical-rows=2
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=3,slot-changes=0,logical-rows=2,full-refreshes=1
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 12
@@ -74,7 +74,7 @@ SELECT k, v FROM rows_mv ORDER BY k;
 -- An unchanged source produces a metadata-only publication. Its zero accepted
 -- rows must preserve the complete target's logical row count and physical files.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=4,slot-changes=0,logical-rows=2,metadata-only-last=true
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=4,slot-changes=0,logical-rows=2,metadata-only-last=true,full-refreshes=1
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 15
@@ -94,7 +94,7 @@ DELETE FROM fact WHERE k IN ('west', 'north');
 -- query 18
 -- Deleting both remaining rows accepts two changes, but leaves zero target rows.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=5,slot-changes=0,logical-rows=0
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=5,slot-changes=0,logical-rows=0,full-refreshes=1
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 19
