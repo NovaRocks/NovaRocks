@@ -27,13 +27,23 @@ use crate::{LexError, ParseError, ParserError, Span};
 /// Unicode escape clauses, binary contents, literal conversion, and identifier
 /// use. This scanner only rejects identifier forms forbidden by the language.
 pub fn lex(source: &str) -> Result<Vec<Token>, ParserError> {
-    let mut lexer = Lexer::new(source);
     let mut tokens = Vec::new();
-    while lexer.position < source.len() {
-        tokens.push(lexer.token()?);
-    }
-    tokens.push(lexer.end_token());
+    visit_tokens(source, |token| {
+        tokens.push(token);
+        Ok::<(), ParserError>(())
+    })?;
     Ok(tokens)
+}
+
+pub(crate) fn visit_tokens<E: From<ParserError>>(
+    source: &str,
+    mut collect: impl FnMut(Token) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut lexer = Lexer::new(source);
+    while lexer.position < source.len() {
+        collect(lexer.token()?)?;
+    }
+    collect(lexer.end_token())
 }
 
 /// A lexer-owned rejection within a provable source range.

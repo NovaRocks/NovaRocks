@@ -207,10 +207,15 @@ impl PreparedStatementIngress {
         } else {
             &form
         };
-        // The parser owns its transient AST and allocator observations. There
-        // is no retained AST, and the full decoded input remains charged until
-        // syntax checking and its separate retained-string allocation finish.
-        novarocks_parser::parser::parse_statement(sql).map_err(|_| IngressError::Syntax)?;
+        // The decoded source and the parser's token storage overlap until the
+        // original grammar has validated the statement.
+        use novarocks_parser::parser::{StatementValidationError, validate_statement_syntax};
+        validate_statement_syntax(sql, |bytes| self.reserve(bytes).ok()).map_err(|error| {
+            match error {
+                StatementValidationError::Syntax(_) => IngressError::Syntax,
+                StatementValidationError::TokenCapacity => IngressError::Capacity,
+            }
+        })?;
         let retained_bytes =
             PreparedStatementDefinition::retained_content_bytes::<Allocation>(sql.len())
                 .ok_or(IngressError::Capacity)?;
@@ -359,6 +364,30 @@ pub(crate) fn test_ingress() -> (novarocks_memory::MemoryAuthority, PreparedStat
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn trino_prepared_ingress_applies_process_capacity_to_parser_tokens() {
+        let (authority, ingress) = test_ingress();
+        let capacity = authority.snapshot().capacity_bytes;
+        let mut writer = authority.take_capacity_writer().unwrap();
+        let baseline = authority.root().committed_bytes();
+        let form = format!("SELECT+{}1", "1%2C+".repeat(32));
+        writer.set_capacity(1024).unwrap();
+
+        assert!(matches!(
+            ingress.decode_sql(&form),
+            Err(IngressError::Capacity)
+        ));
+        while !authority.maintain(64).complete {}
+        assert_eq!(authority.root().committed_bytes(), baseline);
+
+        writer.set_capacity(capacity).unwrap();
+        let definition = ingress.decode_sql(&form).unwrap();
+        assert_eq!(definition.sql().matches(',').count(), 32);
+        drop(definition);
+        while !authority.maintain(64).complete {}
+        assert_eq!(authority.root().committed_bytes(), baseline);
+    }
 
     #[test]
     fn upstream_and_local_prepared_compression_decode_the_exact_sql() {

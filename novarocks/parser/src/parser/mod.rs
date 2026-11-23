@@ -43,6 +43,7 @@ mod statement;
 mod table_alter;
 mod table_statement;
 mod types;
+mod validation;
 mod view_statement;
 mod window;
 mod write_statement;
@@ -57,6 +58,7 @@ use failure::GrammarError;
 
 pub(crate) use literal::numeric_literal_kind;
 pub use script::{StatementFrame, frame_statements};
+pub use validation::{StatementValidationError, validate_statement_syntax};
 
 struct Parser<'source> {
     source: &'source str,
@@ -92,6 +94,12 @@ impl<'source> Parser<'source> {
             alias_follow: false,
             routine_started: false,
         }
+    }
+
+    fn parse_complete_statement(&mut self) -> Result<TrinoStatement, GrammarError> {
+        let statement = self.parse_statement()?;
+        self.finish()?;
+        Ok(statement)
     }
 
     fn finish(&self) -> Result<(), GrammarError> {
@@ -158,8 +166,7 @@ impl<'source> Parser<'source> {
 /// Parses one complete Trino statement. Script separators belong to its caller.
 pub fn parse_statement(source: &str) -> Result<TrinoStatement, ParserError> {
     let mut parser = Parser::new(source)?;
-    let statement = parser.parse_statement()?;
-    parser.finish()?;
+    let statement = parser.parse_complete_statement()?;
     Ok(parser.parameter_numbers().fold_trino_statement(statement))
 }
 
