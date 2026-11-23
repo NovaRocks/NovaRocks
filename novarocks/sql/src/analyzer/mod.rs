@@ -8113,6 +8113,7 @@ mod tests {
             );
         };
         assert_eq!(name, "substring");
+        assert_eq!(args.len(), 3);
         let ExprKind::Cast {
             target,
             expr,
@@ -8131,7 +8132,7 @@ mod tests {
             expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64
         );
-        for (position, expected) in args[1..].iter().zip([1, 6]) {
+        for (position, expected) in args[1..].iter().zip(["1", "6"]) {
             assert_eq!(
                 position.value_type.data_type(),
                 &arrow::datatypes::DataType::Int64
@@ -8148,9 +8149,17 @@ mod tests {
                 expr.value_type.data_type(),
                 &arrow::datatypes::DataType::Int32
             );
-            assert_eq!(
-                super::resolve_expr::signed_int_literal_value(expr),
-                Some(expected)
+            let ExprKind::Cast {
+                expr: literal,
+                target: arrow::datatypes::DataType::Int32,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                ..
+            } = &expr.kind
+            else {
+                panic!("expected the original INTEGER typed string cast");
+            };
+            assert!(
+                matches!(&literal.kind, ExprKind::Literal(LiteralValue::String(value)) if value == expected)
             );
         }
     }

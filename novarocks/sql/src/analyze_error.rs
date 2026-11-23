@@ -981,6 +981,7 @@ mod tests {
                 "sql.analyze.unknown_schema",
                 "sql.analyze.unknown_column",
                 "sql.analyze.unknown_function",
+                "sql.analyze.unknown_type",
                 "sql.analyze.ambiguous_function_call",
                 "sql.analyze.type_mismatch",
                 "sql.analyze.function_not_aggregate",
