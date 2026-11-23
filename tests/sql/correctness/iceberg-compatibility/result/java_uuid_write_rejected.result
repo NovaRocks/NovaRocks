@@ -3,8 +3,15 @@
 id	key_is_null	uuid_key
 1	false	f24f9b64-81fa-49d1-b74e-8c09a6e31c56
 2	true	NULL
+3	false	f24f9b64-81fa-49d1-b74e-8c09a6e31c56
 
--- query 8
+-- query 7
+-- types	uuid	bigint
+uuid_key	key_rows
+f24f9b64-81fa-49d1-b74e-8c09a6e31c56	2
+NULL	1
+
+-- query 9
 -- types	bigint
 remaining_rows
 0

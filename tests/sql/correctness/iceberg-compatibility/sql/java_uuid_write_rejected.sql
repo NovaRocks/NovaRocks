@@ -32,7 +32,7 @@ SELECT id,k IS NULL AS key_is_null,k AS uuid_key FROM iceberg_compat_${suite_uui
 
 -- query 3
 -- @expect_error=Iceberg uuid writes are not supported
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} VALUES ROW(3,NULL);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} VALUES ROW(4,NULL);
 
 -- query 4
 -- @expect_error=Iceberg uuid writes are not supported
@@ -51,13 +51,19 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace ${case_db} --table java_uuid_rejected_${uuid0} --output "$receipt_dir"
 
 -- query 7
--- @skip_result_check=true
-DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} WHERE id=1;
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(2)]);
+-- The same UUID is stored in both files and must form a single group.
+SELECT k AS uuid_key, COUNT(*) AS key_rows
+FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0}
+GROUP BY k ORDER BY key_rows DESC;
 
 -- query 8
-SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0};
+-- @skip_result_check=true
+DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} WHERE id IN (1,3);
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(2)]);
 
 -- query 9
+SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0};
+
+-- query 10
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ;
