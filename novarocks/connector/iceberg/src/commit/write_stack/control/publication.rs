@@ -688,9 +688,9 @@ impl Preparer for KeyedPublicationPreparer {
     }
 }
 
-struct WriteStatisticsPreparer {
-    op_kind: CommitOpKind,
-    drafts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+pub(crate) struct WriteStatisticsPreparer {
+    pub(crate) op_kind: CommitOpKind,
+    pub(crate) drafts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
 }
 
 #[async_trait]
@@ -1308,11 +1308,6 @@ impl IcebergWriteSessionControl {
         ) {
             return Err(invalid(
                 "received write cleanup requires a proven uncommitted session",
-            ));
-        }
-        if handle.flavor() == IcebergWriteFlavor::StagedCreate {
-            return Err(invalid(
-                "staged target publication retains its own sealed object cleanup authority",
             ));
         }
         // This is the original confirmed receiver won by the release or

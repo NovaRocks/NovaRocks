@@ -36,6 +36,7 @@
 //!   non-commit, so an unresolved session stays unknown.
 
 mod logical_rows;
+pub(crate) use publication::WriteStatisticsPreparer;
 pub(in crate::commit) mod publication;
 #[cfg(test)]
 pub(crate) use publication::observed_materialized_staging_fixture;
@@ -427,6 +428,14 @@ fn validate_statistics_artifacts(
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn written_file_from_fragment(
+    fragment: &IcebergCommitFragment,
+    metadata: &TableMetadata,
+) -> Result<WrittenFile, ConnectorError> {
+    publication::written_file_with_historical_partition(fragment, metadata, None)
+}
+
 fn validate_theta_properties(
     properties: &BTreeMap<String, String>,
     estimate: f64,
@@ -606,14 +615,6 @@ async fn artifacts_for_staged_metadata(
         )?);
     }
     Ok(merged)
-}
-
-/// Turn one validated fragment into the provider's physical commit input.
-fn written_file_from_fragment(
-    fragment: &IcebergCommitFragment,
-    metadata: &TableMetadata,
-) -> Result<WrittenFile, ConnectorError> {
-    publication::written_file_with_historical_partition(fragment, metadata, None)
 }
 
 /// Immutable inputs that survive an eager OCC conflict.
@@ -1061,45 +1062,24 @@ impl IcebergWriteSessionControl {
     fn seal_staged_received_set(
         &self,
         handle: &IcebergWriteCommitSession,
-        received: &IcebergReceiving,
-        context: &ConnectorRequestContext,
+        received: &mut IcebergReceiving,
+        statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+        request: &ConnectorWriteFinishRequestRef<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        validate_context(context)?;
+        validate_context(request.context)?;
         let metadata = handle.staged_metadata().ok_or_else(|| {
             internal("Iceberg staged write session lost its frozen target metadata")
         })?;
-        let validated = validate_received_set(handle, &self.adapter, received)?;
-        let sealed = validated
-            .iter()
-            .map(|entry| written_file_from_fragment(entry.fragment, metadata))
-            .collect::<Result<Vec<_>, ConnectorError>>();
-        let sealed = match sealed {
-            Ok(sealed) => sealed,
-            Err(error) => {
-                handle.settle(IcebergWriteSessionState::KnownUncommitted {
-                    message: error.message().to_string(),
-                })?;
-                return Err(error);
-            }
-        };
-        let receipt = match crate::write_codec::seal_staged_files(
-            sealed,
+        let receipt = crate::write_codec::seal_compact_staged_files(
+            received,
+            statistics,
             metadata,
             handle.session_id().to_bytes(),
+            request.row_count,
+            super::codec::CompactFragmentCodec::for_adapter(&self.adapter),
             self.binding_key(),
-        ) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                handle.settle(IcebergWriteSessionState::KnownUncommitted {
-                    message: error.message().to_string(),
-                })?;
-                return Err(error);
-            }
-        };
+        )?;
         handle.settle(IcebergWriteSessionState::Sealed)?;
-        // `NoOp` is the honest effect: this session applied nothing externally,
-        // and it is `KnownCommitted` only in the sense the caller needs -- the
-        // sealing is finished and its result is not in doubt.
         Ok(ExternalMutationOutcome::KnownCommitted {
             cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::NoOp,
@@ -1868,16 +1848,11 @@ pub(crate) fn session_plan_from_targets(
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let statistics_enabled = !handle.flavor().is_distributed_rewrite()
         && statistics_metadata.is_some_and(collect_on_write_enabled);
-    // Statistics describe the rows a write produced, so a session with no
-    // writers seals no expectation to produce them. A staged CREATE is one
-    // such session; a metadata-only publication is the other, and for the same
-    // reason -- its inputs did not move, so it runs no query and appends
-    // nothing, and the target's existing statistics stay exactly as they are.
-    let writes_rows = handle.flavor() != IcebergWriteFlavor::StagedCreate
-        && handle.document_publication().is_none_or(|publication| {
-            publication.technique()
-                != novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly
-        });
+    // An empty or metadata-only publication launches no statistics writer.
+    let writes_rows = handle.document_publication().is_none_or(|publication| {
+        publication.technique()
+            != novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly
+    });
     let statistics_eligible = matches!(
         handle.commit_op_kind(),
         CommitOpKind::FastAppend | CommitOpKind::Overwrite
@@ -5713,14 +5688,19 @@ impl IcebergWriteSessionControl {
                 return Err(error);
             }
             let document_publication = Self::bind_finish_documents(handle, request.publication)?;
-            let statistics = validate_statistics_artifacts(handle, request.statistics)?;
             // Staged create only seals its received outputs. The staged target's
             // publication owns the single external effect.
             if handle.flavor() == IcebergWriteFlavor::StagedCreate {
+                let statistics = if request.row_count == 0 && request.statistics.is_empty() {
+                    Vec::new()
+                } else {
+                    validate_statistics_artifacts(handle, request.statistics)?
+                };
                 return self
-                    .seal_staged_received_set(handle, &received, request.context)
+                    .seal_staged_received_set(handle, &mut received, statistics, &request)
                     .map(ConnectorWritePublicationCompletion::from_outcome);
             }
+            let statistics = validate_statistics_artifacts(handle, request.statistics)?;
             self.commit_received_set_async(
                 handle,
                 &mut received,

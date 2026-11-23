@@ -255,14 +255,9 @@ impl PublicationOriginal {
         let cleanup_receiving = self.receiver.clone();
         let current = self.request.context.clone();
         let dispatch = self.request.operation_id;
+        let stages = publication::CreateStages::new(&prepared, &operation);
         body.original = Some(OpaqueOriginal::new(Box::pin(async move {
-            let append = crate::commit::FastAppendPreparer;
-            let preparers: Vec<&dyn crate::commit::staging::Preparer> =
-                if intent.changes().added.is_empty() {
-                    vec![]
-                } else {
-                    vec![&append]
-                };
+            let preparers = stages.preparers();
             let mut child = Box::pin(attempt::run_to_committed_frontier(
                 &operation, &intent, &prefix, &preparers, &publisher, policy,
             ));

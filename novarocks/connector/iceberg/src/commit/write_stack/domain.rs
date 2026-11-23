@@ -2589,8 +2589,10 @@ impl IcebergWriteCommitSession {
                 flavor.as_str()
             )));
         }
-        let compact_receiving = flavor == IcebergWriteFlavor::Append
-            || flavor.is_distributed_rewrite()
+        let compact_receiving = matches!(
+            flavor,
+            IcebergWriteFlavor::Append | IcebergWriteFlavor::StagedCreate
+        ) || flavor.is_distributed_rewrite()
             || (repartition.is_none()
                 && document_publication.as_ref().is_some_and(|publication| {
                     matches!(

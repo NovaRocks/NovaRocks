@@ -808,7 +808,7 @@ async fn standard_preparation_rewrites_a_retired_manifest_without_dropping_its_r
         )
         .unwrap();
         engine
-            .stage(&crate::commit::FastAppendPreparer)
+            .stage(&crate::commit::fast_append::FastAppendPreparer)
             .await
             .unwrap();
         let result = engine.metadata().clone();

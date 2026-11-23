@@ -136,6 +136,127 @@ pub(crate) fn paid_fragments_counted(
     (paid, author, live)
 }
 
+pub(crate) fn seal_staged_files(
+    files: Vec<crate::commit::WrittenFile>,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    session_id: [u8; 16],
+    owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
+) -> Result<novarocks_spi::connector::ConnectorWriteReceipt, ConnectorError> {
+    seal_staged_files_with_statistics(files, Vec::new(), metadata, session_id, owner)
+}
+
+pub(crate) fn seal_staged_files_with_statistics(
+    files: Vec<crate::commit::WrittenFile>,
+    statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    session_id: [u8; 16],
+    owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
+) -> Result<novarocks_spi::connector::ConnectorWriteReceipt, ConnectorError> {
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorProviderId,
+    };
+
+    use super::codec::CompactFragmentCodec;
+    use super::domain::{IcebergCommitFragment, IcebergDataFileArtifact};
+    use super::receiving::{IcebergReceiving, ReceivedCompactFiles, compact::CompactEntry};
+
+    let adapter = super::runtime::build_write_adapter(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: owner.instance_id.clone(),
+        },
+        CatalogHandle::new(
+            owner.instance_id.clone(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+    );
+    let fragments = files
+        .into_iter()
+        .map(|file| {
+            let report =
+                crate::commit::report::writer_report_from_written_file(&file, metadata).unwrap();
+            assert_eq!(
+                report.file.content,
+                crate::delete_file::IcebergFileContent::Data
+            );
+            let partition = IcebergArtifactPartition::try_new(
+                report.file.partition.partition_path,
+                report.file.partition.null_fingerprint,
+                file.partition_spec_id,
+                crate::write_descriptor::encode_partition_descriptor(
+                    &file.partition_values,
+                    file.partition_spec_id,
+                    metadata,
+                )
+                .unwrap(),
+            )?;
+            let metrics = IcebergArtifactMetrics::try_new(
+                file.record_count,
+                file.file_size_in_bytes,
+                report.file.split_offsets.unwrap_or_default(),
+                report.file.column_stats,
+            )?;
+            let artifact = IcebergDataFileArtifact::try_new(
+                file.path,
+                IcebergFileFormat::Parquet,
+                partition,
+                metrics,
+                file.first_row_id,
+            )?;
+            Ok(adapter.wrap_commit_fragment(IcebergCommitFragment::data_file(artifact)))
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    let (fragments, author) = paid_fragments(&adapter, fragments);
+    let mut files = ReceivedCompactFiles::default();
+    for fragment in fragments {
+        let entry = CompactEntry::prepare(&adapter, &fragment, 0, &author, None)?
+            .finish(&adapter, &mut Some(fragment))?;
+        files.counts = files.counts.checked_add(entry.counts)?;
+        files.push(entry);
+    }
+    files.author = Some(author);
+    let rows = files.counts.data.rows;
+    crate::write_codec::seal_compact_staged_files(
+        &mut IcebergReceiving::from_compact_files(files),
+        statistics,
+        metadata,
+        session_id,
+        rows,
+        CompactFragmentCodec::for_adapter(&adapter),
+        owner,
+    )
+}
+
+pub(crate) fn open_staged_files(
+    receipt: &novarocks_spi::connector::ConnectorWriteReceipt,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
+) -> Result<Arc<Vec<crate::commit::WrittenFile>>, ConnectorError> {
+    let seal = crate::write_codec::open_compact_staged_files(
+        receipt,
+        metadata,
+        crate::write_codec::StagedSeal::row_count_in_receipt(receipt),
+        owner,
+    )?;
+    seal.with_inventory(|inventory| {
+        inventory
+            .files
+            .entries()
+            .map(|entry| {
+                let (fragment, _receipt) = inventory
+                    .codec
+                    .decode(
+                        &entry.addition.as_ref().unwrap().payload,
+                        inventory.files.author.as_ref().unwrap(),
+                    )
+                    .unwrap();
+                super::control::written_file_from_fragment(&fragment, metadata)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Arc::new)
+    })
+}
+
 pub(crate) fn receive_write_query(
     control: &dyn ConnectorWriteControl,
     commit: &ConnectorWriteCommitSession,

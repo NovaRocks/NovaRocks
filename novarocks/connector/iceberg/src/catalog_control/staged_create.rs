@@ -46,6 +46,7 @@ use novarocks_spi::connector::{
 use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog::staged_metadata_path::{StagedMetadataPath, WRITE_METADATA_PATH};
+#[cfg(test)]
 use crate::commit::WrittenFile;
 use crate::iceberg::{
     TableCreation, TableUpdate,
@@ -63,17 +64,12 @@ use crate::metadata_context::IcebergMetadataContext;
 const EVIDENCE_VERSION: u16 = 2;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
 const CTAS_STAGING_NAMESPACE: &str = "_novarocks/ctas-staging/v1";
-#[cfg(test)]
-const CTAS_PROVENANCE_TABLE_UUID: &str = "novarocks.ctas.table-uuid";
-#[cfg(test)]
-const CTAS_UNANCHORED_PROVENANCE_FILE: &str = "_novarocks.ctas.provenance.v1.json";
 #[derive(Clone)]
 pub(crate) struct RestStagedTableCreate {
     pub(crate) table: crate::iceberg::table::Table,
     pub(crate) initialization_updates: Vec<TableUpdate>,
     /// Changes layered over the exact REST initialization by canonical staging.
     publication_updates: Vec<TableUpdate>,
-    final_table_location: Option<Arc<str>>,
     location_refusal: Option<ConnectorError>,
     final_metadata_path: Option<StagedMetadataPath>,
 }
@@ -246,6 +242,11 @@ fn prepare_mv_staged_table(
         storage_facts
             .raw_properties
             .insert(key.to_string(), value.to_string());
+    }
+    if let Some(path) = &final_metadata_path {
+        storage_facts
+            .raw_properties
+            .insert(WRITE_METADATA_PATH.to_string(), path.as_str().to_string());
     }
     let mut visible_sources = HashSet::new();
     for name in storage.visible_partition_sources() {
@@ -599,14 +600,16 @@ fn prepare_rest_staged_table(
     } else {
         None
     };
-    if final_metadata_path.is_some()
+    if let Some(expected) = &final_metadata_path
         && table
             .metadata()
             .properties()
-            .contains_key(WRITE_METADATA_PATH)
+            .get(WRITE_METADATA_PATH)
+            .map(String::as_str)
+            != Some(expected.as_str())
     {
         return Err(RestStagedPrepareFailure::AppliedButUnusable(
-            "REST stage returned write.metadata.path before the final MV publication".into(),
+            "REST stage returned a different write.metadata.path".into(),
         ));
     }
     let mut publication_updates = Vec::new();
@@ -621,32 +624,9 @@ fn prepare_rest_staged_table(
         table,
         initialization_updates,
         publication_updates,
-        final_table_location: None,
         location_refusal,
         final_metadata_path,
     })
-}
-
-// The publication tests still exercise exact ownership for an existing artifact.
-#[cfg(test)]
-fn ctas_staging_location(
-    warehouse: &str,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<String, RestStagedPrepareFailure> {
-    Ok(format!(
-        "{}/{CTAS_STAGING_NAMESPACE}/{publication_id}/table",
-        warehouse.trim_end_matches('/')
-    ))
-}
-
-#[cfg(test)]
-pub(crate) fn unanchored_ctas_provenance_location(
-    table_location: &str,
-) -> Result<String, ConnectorError> {
-    let root = table_location
-        .strip_suffix("/table")
-        .ok_or_else(|| invalid("CTAS staging location does not end in /table"))?;
-    Ok(format!("{root}/{CTAS_UNANCHORED_PROVENANCE_FILE}"))
 }
 
 /// Exact-generation REST staged-create capability.
@@ -706,14 +686,13 @@ struct PreparedOperation {
     write: Option<StagedWrite>,
     document_properties: Option<HashMap<String, String>>,
     publication: Option<crate::commit::operation::IcebergCommitOperation>,
-    provenance_path: Option<String>,
     publication_closed: bool,
 }
 
 #[derive(Clone)]
 struct StagedWrite {
     write: ConnectorStagedWriteProof,
-    files: Arc<[WrittenFile]>,
+    seal: Arc<crate::write_codec::StagedSeal>,
 }
 
 impl PreparedOperation {
@@ -723,16 +702,6 @@ impl PreparedOperation {
     fn operation_id(&self) -> ConnectorStagedCreateOperationId {
         ConnectorStagedCreateOperationId::from_bytes(self.publication_id.to_bytes())
     }
-}
-
-/// Open the original immutable files after validating the bounded receipt facts
-/// and the complete provider generation. Wire-only receipts lack this attachment.
-fn sealed_artifacts(
-    write: &ConnectorStagedWriteProof,
-    metadata: &crate::iceberg::spec::TableMetadata,
-    owner: &ConnectorProviderBindingKey,
-) -> Result<Arc<[WrittenFile]>, ConnectorError> {
-    crate::write_codec::open_staged_files(write.receipt(), metadata, owner)
 }
 
 #[derive(Clone)]
@@ -747,8 +716,6 @@ struct PublishEvidenceV2 {
     operation_marker: String,
     table_uuid: String,
     expected_snapshot_id: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    final_table_location: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_metadata_path: Option<String>,
     handle_digest: [u8; 32],
@@ -1030,60 +997,6 @@ impl IcebergStagedCreateAdapter {
             receipt: stage.receipt.clone(),
             finalization,
         })
-    }
-
-    /// Decode full immutable output facts without creating a transaction.
-    fn staged_write_files(
-        &self,
-        prepared: &PreparedOperation,
-        write: &ConnectorStagedWriteProof,
-    ) -> Result<Arc<[WrittenFile]>, ConnectorError> {
-        let metadata = prepared.staged.table.metadata().clone();
-        let files = sealed_artifacts(write, &metadata, &self.owner())?;
-        let mut rebound: Option<Vec<WrittenFile>> = None;
-        for (index, file) in files.iter().enumerate() {
-            // Keep the original target-schema author, including typed bound decoding
-            // and normalization of retired field statistics, without a JSON round trip.
-            let mut report =
-                crate::commit::report::writer_report_from_written_file(file, &metadata)
-                    .map_err(corrupt)?;
-            let partition = crate::write_descriptor::encode_partition_descriptor(
-                &report.file.partition.partition_values,
-                report.file.partition.partition_spec_id,
-                &metadata,
-            )
-            .map_err(|error| corrupt(error.to_string()))?;
-            report.file.partition.partition_values =
-                crate::write_descriptor::decode_partition_descriptor(
-                    Some(partition),
-                    report.file.partition.partition_spec_id,
-                    &metadata,
-                )
-                .map_err(|error| corrupt(error.to_string()))?;
-            let normalized = crate::commit::report::written_file_from_report(
-                report,
-                metadata.current_schema().as_ref(),
-            )
-            .map_err(corrupt)?;
-            if normalized.content != crate::iceberg::spec::DataContentType::Data
-                || metadata
-                    .partition_spec_by_id(normalized.partition_spec_id)
-                    .is_none()
-            {
-                return Err(corrupt(
-                    "Staged create output requires Data content and an authoritative partition spec",
-                ));
-            }
-            if let Some(rebound) = &mut rebound {
-                rebound.push(normalized);
-            } else if normalized != *file {
-                let mut prefix = Vec::with_capacity(files.len());
-                prefix.extend(files[..index].iter().cloned());
-                prefix.push(normalized);
-                rebound = Some(prefix);
-            }
-        }
-        Ok(rebound.map_or(files, Arc::from))
     }
 
     fn abort_prepared(
@@ -1408,14 +1321,16 @@ async fn prepare_rest_staged_table_async(
     } else {
         None
     };
-    if final_metadata_path.is_some()
+    if let Some(expected) = &final_metadata_path
         && table
             .metadata()
             .properties()
-            .contains_key(WRITE_METADATA_PATH)
+            .get(WRITE_METADATA_PATH)
+            .map(String::as_str)
+            != Some(expected.as_str())
     {
         return Err(RestStagedPrepareFailure::AppliedButUnusable(
-            "REST stage returned write.metadata.path before the final MV publication".into(),
+            "REST stage returned a different write.metadata.path".into(),
         ));
     }
     let mut publication_updates = Vec::new();
@@ -1430,7 +1345,6 @@ async fn prepare_rest_staged_table_async(
         table,
         initialization_updates,
         publication_updates,
-        final_table_location: None,
         location_refusal,
         final_metadata_path,
     })
@@ -1637,7 +1551,6 @@ impl IcebergStagedCreateAdapter {
                         write: None,
                         document_properties: None,
                         publication: None,
-                        provenance_path: None,
                         publication_closed: false,
                     }),
                 );
@@ -2412,7 +2325,6 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                         write: None,
                         document_properties: None,
                         publication: None,
-                        provenance_path: None,
                         publication_closed: false,
                     }),
                 );
@@ -2573,17 +2485,28 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 "Iceberg staged-create write binding is stale, unplanned, or already bound",
             ));
         }
-        // Opening the receipt here is the binding check: a receipt this
-        // generation did not mint, or one whose artifacts do not fit this
-        // target's schema, is refused before the target records a write at all.
-        let files = match self.staged_write_files(&prepared, &write) {
-            Ok(files) => files,
+        let planning = prepared
+            .planning
+            .as_ref()
+            .expect("validated staged planning");
+        let owner = self.owner();
+        let seal = crate::metadata::staged_target_metadata(&owner.instance_id, planning.table())
+            .and_then(|target| {
+                crate::write_codec::open_compact_staged_files(
+                    write.receipt(),
+                    &target.metadata,
+                    write.row_count(),
+                    &owner,
+                )
+            });
+        let seal = match seal {
+            Ok(seal) => seal,
             Err(error) => {
                 self.record_terminal(operation_id, OperationState::Prepared(prepared));
                 return Err(error);
             }
         };
-        prepared.write = Some(StagedWrite { write, files });
+        prepared.write = Some(StagedWrite { write, seal });
         self.record_terminal(operation_id, OperationState::Prepared(prepared));
         Ok(())
     }
@@ -2957,8 +2880,6 @@ fn validate_publish_evidence(
     if evidence.version != EVIDENCE_VERSION
         || evidence.operation_marker != publication_marker(prepared.publication_id)
         || evidence.handle_digest != prepared.handle_digest
-        || evidence.final_table_location.as_deref()
-            != prepared.staged.final_table_location.as_deref()
         || evidence.final_metadata_path.as_deref()
             != prepared
                 .staged
@@ -3001,7 +2922,7 @@ fn publication_expectation(
     crate::catalog::StagedPublicationExpectation {
         staged_table_uuid: prepared.staged.table.metadata().uuid(),
         snapshot_id: expected_snapshot_id,
-        final_table_location: prepared.staged.final_table_location.clone(),
+        final_table_location: None,
         final_metadata_path: prepared.staged.final_metadata_path.clone(),
         properties,
     }
@@ -3015,11 +2936,7 @@ fn publication_matches(
 ) -> bool {
     let metadata = table.metadata();
     metadata.uuid() == prepared.staged.table.metadata().uuid()
-        && prepared
-            .staged
-            .final_table_location
-            .as_deref()
-            .is_none_or(|expected| metadata.location() == expected)
+        && metadata.location() == prepared.staged.table.metadata().location()
         && prepared
             .staged
             .final_metadata_path

@@ -126,7 +126,9 @@ impl OperationIntent {
         })
     }
     pub(crate) fn with_compact_stage(mut self, stage: usize) -> Result<Self> {
-        if self.shape() != RequestShape::SnapshotProducing || !self.parts.changes.added.is_empty() {
+        let supports_compact = self.shape() == RequestShape::SnapshotProducing
+            || matches!(self.protocol(), CommitProtocol::CreateTable);
+        if !supports_compact || !self.parts.changes.added.is_empty() {
             return Err(invalid(
                 "Compact additions require an exclusive snapshot stage source",
             ));

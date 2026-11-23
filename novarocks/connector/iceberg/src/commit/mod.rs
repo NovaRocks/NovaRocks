@@ -42,6 +42,7 @@ pub(crate) mod model;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod new_manifests;
+pub(crate) use new_manifests::PendingNewFiles;
 pub(crate) use new_manifests::{RegisteredFile, RegisteredNewFiles, RegisteredPaths};
 pub(crate) mod operation;
 pub(crate) mod overwrite;
@@ -107,6 +108,3 @@ pub use validation::{
     row_mutation_strategy_from_metadata,
 };
 pub use write_control::IcebergWriteControl;
-
-pub(crate) use data_file::from_written_file as frozen_data_file_from_written;
-pub(crate) use fast_append::FastAppendPreparer;

@@ -709,7 +709,7 @@ mod keyed_publication_trace_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_zero_row_append_preserves_live_data_and_publishes_one_session_marker() {
+    async fn ordinary_zero_row_append_preserves_live_data_and_dispatches_no_commit() {
         let fixture = fixture().await;
         append_snapshot_for_test(
             fixture.provider.clone(),
@@ -767,27 +767,22 @@ mod keyed_publication_trace_tests {
             })
             .expect("finish zero-row ordinary append");
         let ExternalMutationOutcome::KnownCommitted {
-            cleanup: _,
-            effect: ExternalMutationEffect::Applied,
+            cleanup: ExternalMutationFinalization::Complete,
+            effect: ExternalMutationEffect::NoOp,
             receipt,
             finalization: ExternalMutationFinalization::Complete,
         } = outcome
         else {
-            panic!("ordinary append must publish its session marker: {outcome:?}");
+            panic!("zero-row ordinary append must settle as a no-op: {outcome:?}");
         };
         let snapshot_id = receipt
             .committed_version()
             .and_then(|version| version.snapshot_id())
             .expect("ordinary append receipt snapshot");
-        assert_ne!(Some(snapshot_id), base_snapshot_id);
+        assert_eq!(Some(snapshot_id), base_snapshot_id);
         assert_eq!(receipt.resulting_row_count(), None);
         assert_eq!(before_live.values().sum::<u64>(), 3);
-        assert_exact_target_mutation(
-            &fixture,
-            base_snapshot_id,
-            &["add-snapshot", "set-snapshot-ref"],
-            snapshot_id,
-        );
+        assert!(fixture.catalog.commits().is_empty());
         let after = fixture
             .catalog
             .load_table(fixture.table.identifier())
@@ -797,11 +792,12 @@ mod keyed_publication_trace_tests {
             .await
             .expect("observe resulting live files");
         assert_eq!(after_live, before_live);
-        assert_eq!(
+        assert_eq!(after.metadata().current_snapshot_id(), base_snapshot_id);
+        assert_ne!(
             after
                 .metadata()
                 .current_snapshot()
-                .expect("marker snapshot")
+                .unwrap()
                 .summary()
                 .additional_properties
                 .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY),

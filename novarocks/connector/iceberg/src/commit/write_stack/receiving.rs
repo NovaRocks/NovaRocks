@@ -203,6 +203,17 @@ fn matches_rewritten_target(metadata: &TableMetadata, binding: RewrittenTargetBi
 }
 
 impl IcebergReceiving {
+    #[cfg(test)]
+    pub(crate) fn from_compact_files(files: ReceivedCompactFiles) -> Self {
+        Self {
+            compact: Some(CompactReceiving {
+                files,
+                ..CompactReceiving::default()
+            }),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn with_compact_mode(compact: bool, rewrite_groups: Option<usize>) -> Self {
         Self {
             compact: compact.then(CompactReceiving::default),

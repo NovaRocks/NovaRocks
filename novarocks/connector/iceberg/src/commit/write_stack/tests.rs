@@ -1904,7 +1904,10 @@ fn staged_target_handle_at(
         crate::iceberg::spec::SortOrder::unsorted_order(),
         location.to_string(),
         crate::iceberg::spec::FormatVersion::V2,
-        std::collections::HashMap::new(),
+        std::collections::HashMap::from([(
+            crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+            "false".to_string(),
+        )]),
     )
     .expect("metadata builder")
     .build()
@@ -2149,14 +2152,25 @@ fn a_staged_finish_seals_a_thousand_files_with_bounded_receipt_facts() {
         .collect();
     let fragments = paths
         .iter()
-        .map(|path| {
-            (
-                ordinal(0),
-                adapter.wrap_commit_fragment(data_fragment(path)),
-            )
-        })
+        .map(|path| adapter.wrap_commit_fragment(data_fragment(path)))
         .collect();
-    receive_write_query(&control, &commit, &expected, fragments).unwrap();
+    let (fragments, author) = super::test_support::paid_fragments(&adapter, fragments);
+    let query = write_query_identity();
+    control
+        .begin_write_query(&commit, &query, &expected, None, None)
+        .unwrap();
+    control
+        .arrive_write_fragments(
+            &commit,
+            &query,
+            fragments
+                .into_iter()
+                .map(|fragment| (ordinal(0), fragment))
+                .collect(),
+            &author,
+        )
+        .unwrap();
+    control.confirm_write_received(&commit, &query).unwrap();
     let result = control
         .finish_write(ConnectorWriteFinishRequest {
             commit: &commit,
@@ -2218,12 +2232,71 @@ fn a_staged_finish_seals_a_thousand_files_with_bounded_receipt_facts() {
     // Equal session identity/count with different file facts must remain a
     // different content receipt, even though the attachment is excluded from Eq.
     let mut changed = files.to_vec();
-    changed[0].record_count += 1;
+    changed[0].file_size_in_bytes += 1;
     let changed =
         crate::write_codec::seal_staged_files(changed, &metadata, session_id.to_bytes(), &owner)
             .unwrap();
     assert_ne!(receipt, changed);
     assert_ne!(receipt.digest(), changed.digest());
+}
+
+#[test]
+fn staged_abort_before_sealing_deletes_only_confirmed_output() {
+    use novarocks_spi::connector::ConnectorWriteAbortOutcome;
+    use novarocks_spi::connector::write_stack::{
+        ConnectorWriteAbortProduction, ConnectorWriteSessionAbortRequest,
+    };
+
+    let incarnation = ProviderBindingEpoch::new();
+    let (executor, runtime) = unreachable_rest_runtime();
+    let descriptor = descriptor("unit");
+    let catalog = CatalogHandle::new(
+        descriptor.instance_id.clone(),
+        CatalogVersion::from_bytes([1; 32]),
+    );
+    let adapter = super::runtime::build_write_adapter(descriptor.clone(), catalog.clone());
+    let control = super::control::IcebergWriteSessionControl::new(
+        descriptor,
+        incarnation,
+        catalog,
+        Arc::clone(&runtime),
+    );
+    let scratch = tempfile::TempDir::new().unwrap();
+    let location = format!("file://{}/table", scratch.path().display());
+    let request = staged_begin_request(staged_target_handle_at(&runtime, incarnation, &location));
+    let session = control.begin_write(request).unwrap();
+    let (output, _writer) =
+        seal_test_data_output(&control, &executor, &runtime, &adapter, &session);
+    let file = std::path::Path::new(output.paths[0].trim_start_matches("file://"));
+    let sibling = file.with_file_name("not-received.parquet");
+    std::fs::write(&sibling, b"external").unwrap();
+    assert!(file.is_file());
+    control
+        .confirm_write_received(session.commit_session(), &output.query)
+        .unwrap();
+    let outcome = executor
+        .block_on(
+            control.abort_write_async(ConnectorWriteSessionAbortRequest {
+                commit: session.commit_session(),
+                context: request_context(),
+                production: ConnectorWriteAbortProduction::CompleteReceived,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        ConnectorWriteAbortOutcome::KnownUncommitted {
+            cleanup: ExternalMutationFinalization::Complete,
+        },
+    ));
+    assert!(!file.exists());
+    assert!(sibling.is_file());
+    assert_eq!(
+        control
+            .cleanup_responsibility(session.commit_session())
+            .unwrap(),
+        novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed,
+    );
 }
 
 /// A staged write that produced no artifact still reaches the provider.
@@ -2487,9 +2560,10 @@ fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
                 .collect::<Vec<_>>(),
             prepared_fields
         );
-        // Staged create deliberately has no collect-on-write aggregates. The
-        // exact input-domain admission still applies before that eligibility gate.
-        assert!(session.targets()[0].statistics().is_empty());
+        assert_eq!(
+            session.targets()[0].statistics().is_empty(),
+            !collect_statistics
+        );
     }
 }
 
@@ -2793,8 +2867,6 @@ fn assert_write_admission_refused_without_io(
             .collect::<Vec<_>>(),
         [
             "append",
-            "overwrite",
-            "partition overwrite",
             "row delta",
             "equality delete",
             "staged create",
