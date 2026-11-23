@@ -65,6 +65,7 @@ struct Parser<'source> {
     tokens: Vec<Token>,
     position: usize,
     next_parameter: usize,
+    track_parameter_events: bool,
     // Only committed parameter productions enter this construction ledger.
     // Pattern quantifiers and trivia question marks are not parameter events.
     parameter_events: Vec<Span>,
@@ -89,11 +90,18 @@ impl<'source> Parser<'source> {
             tokens,
             position: 0,
             next_parameter: 0,
+            track_parameter_events: true,
             parameter_events: Vec::new(),
             grammar_boundary: None,
             alias_follow: false,
             routine_started: false,
         }
+    }
+
+    fn for_syntax_validation(source: &'source str, tokens: Vec<Token>) -> Self {
+        let mut parser = Self::from_tokens(source, tokens);
+        parser.track_parameter_events = false;
+        parser
     }
 
     fn parse_complete_statement(&mut self) -> Result<TrinoStatement, GrammarError> {

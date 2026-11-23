@@ -21,7 +21,7 @@ impl From<ParserError> for StatementValidationError {
 
 /// Verify a complete statement with the original grammar and a token buffer
 /// funded by the caller. Each grant stays alive until its buffer is released.
-/// No AST escapes validation, so final parameter renumbering is unnecessary.
+/// No AST escapes validation, so parameter event tracking is unnecessary.
 pub fn validate_statement_syntax<Grant>(
     source: &str,
     mut reserve_tokens: impl FnMut(usize) -> Option<Grant>,
@@ -51,7 +51,7 @@ pub fn validate_statement_syntax<Grant>(
         tokens.push(token);
         Ok::<_, StatementValidationError>(())
     })?;
-    let mut parser = Parser::from_tokens(source, tokens);
+    let mut parser = Parser::for_syntax_validation(source, tokens);
     let result = parser
         .parse_complete_statement()
         .map(|_| ())
@@ -75,6 +75,33 @@ mod tests {
     impl Drop for Charge<'_> {
         fn drop(&mut self) {
             self.current.set(self.current.get() - self.bytes);
+        }
+    }
+
+    #[test]
+    fn syntax_validation_discards_parameter_events_and_preserves_parser_results() {
+        let tracked_sql = "SELECT TRIM(? FROM ?), ?, ?, ?, ? FROM \
+                           TABLE(f(TABLE(t) PARTITION BY (?) + ? ORDER BY (?) DESC))";
+        let mut parser =
+            Parser::for_syntax_validation(tracked_sql, lexer::lex(tracked_sql).unwrap());
+        parser.parse_complete_statement().unwrap();
+        assert_eq!(parser.next_parameter, 9);
+        assert_eq!(parser.parameter_events.capacity(), 0);
+
+        for source in [
+            tracked_sql,
+            "SELECT TRIM(? FROM ?),",
+            "SELECT * FROM TABLE(f(TABLE(t) copartition(a,b)))",
+            "SELECT ?; SELECT ?",
+            "SELECT ?, 'unterminated",
+        ] {
+            let public_parse = super::super::parse_statement(source).map(|_| ());
+            let syntax_validation =
+                validate_statement_syntax(source, |_| Some(())).map_err(|error| match error {
+                    StatementValidationError::Syntax(error) => error,
+                    StatementValidationError::TokenCapacity => panic!("unexpected capacity error"),
+                });
+            assert_eq!(syntax_validation, public_parse, "{source}");
         }
     }
 
