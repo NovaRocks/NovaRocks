@@ -331,6 +331,21 @@ impl CatalogSymbols {
         {
             *target = format!("{mapped}.{table}");
         }
+        let fixture_target = meta
+            .iceberg_view_fixture
+            .as_mut()
+            .map(|fixture| &mut fixture.target);
+        let assertion_target = match &mut meta.iceberg_view_fixture_unchanged {
+            Some(crate::types::IcebergViewFixtureAssertion::Named(target)) => Some(target),
+            _ => None,
+        };
+        for target in fixture_target.into_iter().chain(assertion_target) {
+            if let Some(catalog) = &mut target.catalog
+                && let Some(mapped) = self.lookup(catalog)
+            {
+                *catalog = mapped.into();
+            }
+        }
         // Expected errors and these metadata/plan displays own qualified object
         // identities. Ordinary query result literals never enter this adapter.
         if let Some(error) = &mut meta.expect_error {
@@ -361,7 +376,9 @@ impl CatalogSymbols {
     /// not a free-text replacement over data cells or quoted SQL literals.
     fn display(&self, value: &str, kind: Display) -> Result<String> {
         let prefix = match kind {
-            Display::Error => r"(?i)(\btable\s+)",
+            Display::Error => {
+                r"(?i)(\b(?:table|view)(?:\s+already\s+exists:)?\s+'?|\bdrop\s+materialized\s+view\s+)"
+            }
             Display::Explain => r"(?m)^(\s*TABLE STATS ref=[0-9]+ table=)",
             Display::MvIdentity => r"^((?:mv:)?)",
         };
@@ -1528,6 +1545,24 @@ SET SESSION external.owned = 'owned';"#
             s.display("table owned.ns.t, column v", Display::Error)
                 .unwrap(),
             format!("table {name}.ns.t, column v")
+        );
+        assert_eq!(
+            s.display(
+                "View 'owned.ns.v' does not exist. Did you mean DROP MATERIALIZED VIEW owned.ns.v?",
+                Display::Error,
+            )
+            .unwrap(),
+            format!(
+                "View '{name}.ns.v' does not exist. Did you mean DROP MATERIALIZED VIEW {name}.ns.v?"
+            )
+        );
+        assert_eq!(
+            s.display(
+                "Materialized view already exists: 'owned.ns.v'",
+                Display::Error
+            )
+            .unwrap(),
+            format!("Materialized view already exists: '{name}.ns.v'")
         );
         assert_eq!(
             s.display("mv:owned.ns.target", Display::MvIdentity)

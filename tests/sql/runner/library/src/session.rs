@@ -112,6 +112,9 @@ impl TrinoCaseSession {
         self.namespace_guard = Some(guard);
         self.sync_guard();
     }
+    pub(crate) fn namespace_guard(&self) -> Option<&crate::namespace_guard::NamespaceGuard> {
+        self.namespace_guard.as_ref()
+    }
     fn sync_guard(&mut self) {
         if let Some(guard) = &mut self.namespace_guard {
             guard.set_session_context(self.state.catalog.clone(), self.state.schema.clone());

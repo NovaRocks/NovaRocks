@@ -1,0 +1,38 @@
+{
+  "name": "__VIEW__",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {
+        "id": 1,
+        "name": "id",
+        "required": false,
+        "type": "int"
+      }
+    ]
+  },
+  "view-version": {
+    "version-id": 1,
+    "schema-id": 0,
+    "timestamp-ms": 1700000000000,
+    "summary": {},
+    "representations": [
+      {
+        "type": "sql",
+        "sql": "SELECT id FROM mv_base",
+        "dialect": "spark"
+      }
+    ],
+    "default-namespace": [
+      "__NAMESPACE__"
+    ],
+    "storage-table": {
+      "namespace": [
+        "__NAMESPACE__"
+      ],
+      "name": "__STORAGE_TABLE__"
+    }
+  },
+  "properties": {}
+}

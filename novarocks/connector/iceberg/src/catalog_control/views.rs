@@ -30,9 +30,12 @@ pub(crate) use crate::catalog::view_request::VIEW_DIALECT_TRINO;
 use crate::catalog::view_request::ViewDefinition;
 #[cfg(test)]
 use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate};
-use crate::iceberg::spec::{ViewMetadata, ViewRepresentation};
 use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::metadata_context::IcebergMetadataContext;
+use crate::rest_protocol::endpoints::LoadedViewDocument;
+use crate::rest_protocol::view_metadata::{
+    SqlViewRepresentation, ViewMetadata, ViewObjectKind, ViewRepresentation, ViewVersion,
+};
 
 #[path = "views/async_listing.rs"]
 pub(crate) mod async_listing;
@@ -169,7 +172,8 @@ pub(crate) fn create_view(
             .catalog_runtime()
             .block_on({
                 let owner = Arc::clone(&owner);
-                async move { owner.load_view(target).await }
+                let context = context.clone();
+                async move { owner.load_view_document(target).await?.decode(&context) }
             })?
             .map_err(|error| match error.kind() {
                 ConnectorErrorKind::NotFound => format!("unknown view: {ident}"),
@@ -180,7 +184,7 @@ pub(crate) fn create_view(
         let replace = match ValidatedViewReplace::validate(ident, &current, definition, properties)
         {
             Ok(replace) => replace,
-            Err(message) => return Ok(locally_refused(message)),
+            Err(failure) => return Ok(CatalogOutcome::KnownUncommitted { failure }),
         };
         return publish_view_fixture(
             runtime,
@@ -188,7 +192,7 @@ pub(crate) fn create_view(
         );
     }
 
-    let creation = match ViewCreate::validate(ident.name.clone(), definition, properties) {
+    let creation = match ViewCreate::validate(ident.name.clone(), definition, properties, None) {
         Ok(creation) => creation,
         Err(message) => return Ok(locally_refused(message)),
     };
@@ -230,6 +234,31 @@ pub(super) fn load_view_metadata_for_request(
     view: &str,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ViewMetadata, ConnectorError> {
+    load_required_view_document_for_request(runtime, namespace, view, context)?.decode(context)
+}
+
+pub(super) fn load_view_document_for_request(
+    runtime: &IcebergMetadataContext,
+    namespace: &str,
+    view: &str,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Option<LoadedViewDocument>, ConnectorError> {
+    match load_required_view_document_for_request(runtime, namespace, view, context) {
+        Ok(document) => Ok(Some(document)),
+        Err(error) if error.kind() == ConnectorErrorKind::NotFound => {
+            context.check_active()?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_required_view_document_for_request(
+    runtime: &IcebergMetadataContext,
+    namespace: &str,
+    view: &str,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<LoadedViewDocument, ConnectorError> {
     let (_, ident) = view_ident(namespace, view).map_err(invalid_view_request)?;
     let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
     let target =
@@ -238,7 +267,7 @@ pub(super) fn load_view_metadata_for_request(
     runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move { owner.load_view_for_request(target, context).await })
+        .block_on(async move { owner.load_view_document_for_request(target, context).await })
         .map_err(unavailable)?
         .map_err(|error| match error.kind() {
             // Absence is read from the error's kind. The owner classifies it,
@@ -269,7 +298,7 @@ async fn observe_view_metadata_async(
 ) -> Result<ViewMetadata, ConnectorError> {
     let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
     owner
-        .load_view_for_request(target.clone(), context.clone())
+        .load_view_document_for_request(target.clone(), context.clone())
         .await
         .map_err(|error| match error.kind() {
             ConnectorErrorKind::NotFound => ConnectorError::new(
@@ -277,7 +306,8 @@ async fn observe_view_metadata_async(
                 format!("unknown view: {target}"),
             ),
             _ => error,
-        })
+        })?
+        .decode(context)
 }
 
 #[cfg(test)]
@@ -363,29 +393,15 @@ pub(crate) fn list_views(
     })
 }
 
-fn observed_view_version(
-    metadata: &ViewMetadata,
-) -> Result<&crate::iceberg::spec::ViewVersion, ConnectorError> {
-    metadata
-        .version_by_id(metadata.current_version_id())
-        .ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg view current version is absent from its same metadata observation",
-            )
-        })
-        .map(AsRef::as_ref)
-}
-
 fn trino_view_sql<'a>(
-    version: &'a crate::iceberg::spec::ViewVersion,
+    version: &'a ViewVersion,
     ident: &TableIdent,
-) -> Result<&'a crate::iceberg::spec::SqlViewRepresentation, ConnectorError> {
+) -> Result<&'a SqlViewRepresentation, ConnectorError> {
     let representations = || {
-        version.representations().iter().map(|representation| {
-            let ViewRepresentation::Sql(sql) = representation;
-            sql
-        })
+        version
+            .representations()
+            .iter()
+            .filter_map(ViewRepresentation::as_sql)
     };
     representations()
         .find(|sql| sql.dialect.eq_ignore_ascii_case(VIEW_DIALECT_TRINO))
@@ -393,26 +409,22 @@ fn trino_view_sql<'a>(
             let available = representations()
                 .map(|sql| sql.dialect.as_str())
                 .collect::<std::collections::BTreeSet<_>>();
+            let unknown = version.representations().iter().filter_map(|representation| {
+                match representation {
+                    ViewRepresentation::Sql(_) => None,
+                    ViewRepresentation::Unknown { representation_type } => Some(representation_type.as_str()),
+                }
+            }).collect::<std::collections::BTreeSet<_>>();
+            let mut message = format!(
+                "Iceberg view {ident} has no supported SQL representation for dialect '{VIEW_DIALECT_TRINO}'; available dialects: {available:?}"
+            );
+            if !unknown.is_empty() {
+                use std::fmt::Write;
+                let _ = write!(message, "; unknown representation types: {unknown:?}");
+            }
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
-                format!(
-                    "Iceberg view {ident} has no supported SQL representation for dialect '{VIEW_DIALECT_TRINO}'; available dialects: {available:?}"
-                ),
-            )
-        })
-}
-
-fn observed_view_schema<'a>(
-    metadata: &'a ViewMetadata,
-    version: &crate::iceberg::spec::ViewVersion,
-) -> Result<&'a crate::iceberg::spec::Schema, ConnectorError> {
-    metadata
-        .schema_by_id(version.schema_id())
-        .map(AsRef::as_ref)
-        .ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg view version schema is absent from its same metadata observation",
+                message,
             )
         })
 }
@@ -431,8 +443,8 @@ pub(crate) fn discover_view_metadata(
     };
 
     creation.work(1)?;
-    let version = observed_view_version(metadata)?;
-    let schema = observed_view_schema(metadata, version)?;
+    let version = metadata.current_version();
+    let schema = metadata.current_schema();
     let columns = if let Some(projection) = projection.columns {
         let fields = schema.as_struct().fields();
         let mut columns = creation.reserve(fields.len())?;
@@ -497,9 +509,9 @@ pub(crate) fn materialize_view_metadata(
     creation.work(0)?;
     let (_, ident) =
         view_ident(&request.view.namespace, &request.view.view).map_err(invalid_view_request)?;
-    let version = observed_view_version(metadata)?;
+    let version = metadata.current_version();
     let selected = trino_view_sql(version, &ident)?;
-    let schema = observed_view_schema(metadata, version)?;
+    let schema = metadata.current_schema();
     if version.default_namespace().iter().count() != 1 {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
@@ -542,9 +554,18 @@ pub(crate) fn materialize_view_metadata(
 use crate::metadata::IcebergMetadata;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorListViewsRequest,
-    ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata, ConnectorViewMetadataValue,
-    ConnectorViewRequest, ProviderBindingEpoch,
+    ConnectorObjectKind, ConnectorOperationControl, ConnectorViewDialect, ConnectorViewIdentity,
+    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest, ProviderBindingEpoch,
 };
+
+fn connector_object_kind(kind: ViewObjectKind) -> ConnectorObjectKind {
+    match kind {
+        ViewObjectKind::View => ConnectorObjectKind::View,
+        ViewObjectKind::MaterializedView { storage_table } => {
+            storage_table.materialized_view_kind()
+        }
+    }
+}
 
 impl ConnectorViewMetadata for IcebergMetadata {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
@@ -566,6 +587,49 @@ impl ConnectorViewMetadata for IcebergMetadata {
             &request.view.view,
             &request.context,
         )
+    }
+
+    fn classify_view(
+        &self,
+        request: ConnectorViewRequest,
+    ) -> Result<Option<ConnectorObjectKind>, ConnectorError> {
+        ensure_request(self, &request.view.instance_id, &request.context)?;
+        load_view_document_for_request(
+            self.runtime(),
+            &request.view.namespace,
+            &request.view.view,
+            &request.context,
+        )?
+        .map(|document| {
+            document
+                .classify(&request.context)
+                .map(connector_object_kind)
+        })
+        .transpose()
+    }
+
+    fn list_classified_views(
+        &self,
+        request: ConnectorListViewsRequest,
+    ) -> Result<Vec<(ConnectorViewIdentity, ConnectorObjectKind)>, ConnectorError> {
+        let context = request.context.clone();
+        self.list_views(request)?
+            .into_iter()
+            .map(|view| {
+                let kind = self
+                    .classify_view(ConnectorViewRequest {
+                        view: view.clone(),
+                        context: context.clone(),
+                    })?
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::NotFound,
+                            "listed Iceberg view disappeared before classification",
+                        )
+                    })?;
+                Ok((view, kind))
+            })
+            .collect()
     }
 
     fn load_view(
@@ -1150,7 +1214,7 @@ mod tests {
             let definition = novarocks_definition("SELECT CAST(NULL AS integer) AS a");
             let (prepared, properties) =
                 prepare_definition(&definition, None, &[], &test_context()).unwrap();
-            let creation = ViewCreate::validate("v".into(), prepared, properties).unwrap();
+            let creation = ViewCreate::validate("v".into(), prepared, properties, None).unwrap();
             // This original catalog client is already bound to the provider.
             // Publish with that same generation, not the unrelated fixed epoch
             // used by the old create_view convenience fixture.
@@ -1494,6 +1558,7 @@ mod tests {
 #[cfg(test)]
 mod declaration_tests {
     use super::*;
+    use crate::rest_protocol::view_metadata::decode_test_metadata;
     use arrow::datatypes::{DataType, Field, TimeUnit};
     use novarocks_spi::connector::ConnectorViewColumn;
     use novarocks_type_contract::{
@@ -1519,10 +1584,13 @@ mod declaration_tests {
         assert_eq!(value.summary.len(), 1);
         value
     }
-    fn metadata(mut definition: ViewDefinition, version: i32) -> ViewMetadata {
+    fn metadata(definition: ViewDefinition, version: i32) -> ViewMetadata {
+        decode_test_metadata(metadata_json(definition, version))
+    }
+    fn metadata_json(mut definition: ViewDefinition, version: i32) -> serde_json::Value {
         // Java REST rebuilds the first version; it does not echo client summary.
         definition.summary = HashMap::new();
-        serde_json::from_value(serde_json::json!({
+        serde_json::json!({
             "view-uuid": "fa6506c3-7681-40c8-86dc-e36561f83385", "format-version":1,
             "location":"s3://warehouse/db/v", "current-version-id":version,
             "versions":[{"version-id":version, "schema-id":definition.schema.schema_id(),
@@ -1532,8 +1600,7 @@ mod declaration_tests {
                 "default-namespace":definition.default_namespace}],
             "version-log":[{"version-id":version,"timestamp-ms":1_600_000_000_000_i64}],
             "schemas":[definition.schema], "properties":{}
-        }))
-        .unwrap()
+        })
     }
     fn request() -> ConnectorViewRequest {
         ConnectorViewRequest {
@@ -1556,7 +1623,7 @@ mod declaration_tests {
     fn java_created_view_without_client_summary_keeps_named_sql_context_and_nullable_type() {
         let stored = prepared(FunctionValueType::new(DataType::Int32, true));
         let (_, schema, version, _) =
-            ViewCreate::validate("v".into(), stored.clone(), HashMap::new())
+            ViewCreate::validate("v".into(), stored.clone(), HashMap::new(), None)
                 .unwrap()
                 .into_parts();
         assert_eq!(schema.schema_id(), version.schema_id);
@@ -1625,15 +1692,16 @@ mod declaration_tests {
     #[test]
     fn stored_view_selects_the_trino_representation_case_insensitively() {
         let stored = prepared(FunctionValueType::new(DataType::Int32, true));
-        let mut json = serde_json::to_value(metadata(stored, 1)).unwrap();
+        let mut json = metadata_json(stored, 1);
         let version = &mut json["versions"][0];
         version["representations"] = serde_json::json!([
+            {"type": "future-plan"},
             {"type": "sql", "dialect": "starrocks", "sql": "SELECT 9 AS a"},
             {"type": "sql", "dialect": "TrInO", "sql": "SELECT  /* authored */ 1 AS a"},
             {"type": "sql", "dialect": "spark", "sql": "SELECT 8 AS a"}
         ]);
         version.as_object_mut().unwrap().remove("default-catalog");
-        let metadata: ViewMetadata = serde_json::from_value(json).unwrap();
+        let metadata: ViewMetadata = decode_test_metadata(json);
         let observed = load(&metadata).unwrap();
         assert_eq!(observed.definition.dialect, ConnectorViewDialect::Trino);
         assert_eq!(
@@ -1650,7 +1718,7 @@ mod declaration_tests {
     #[test]
     fn stored_view_rejects_foreign_sql_representations_with_available_dialects() {
         let stored = prepared(FunctionValueType::new(DataType::Int32, true));
-        let mut json = serde_json::to_value(metadata(stored, 1)).unwrap();
+        let mut json = metadata_json(stored, 1);
         for dialects in [vec!["starrocks"], vec!["starrocks", "Spark"]] {
             json["versions"][0]["representations"] = serde_json::json!(
                 dialects
@@ -1660,7 +1728,7 @@ mod declaration_tests {
                     }))
                     .collect::<Vec<_>>()
             );
-            let metadata: ViewMetadata = serde_json::from_value(json.clone()).unwrap();
+            let metadata: ViewMetadata = decode_test_metadata(json.clone());
             let error = load(&metadata).unwrap_err();
             assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
             assert!(
@@ -1671,6 +1739,40 @@ mod declaration_tests {
             for dialect in dialects {
                 assert!(error.message().contains(dialect));
             }
+        }
+    }
+
+    #[test]
+    fn stored_view_without_sql_reports_the_unknown_representation_type() {
+        let mut document =
+            metadata_json(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
+        document["versions"][0]["representations"] = serde_json::json!([{"type":"future-plan"}]);
+        let error = load(&decode_test_metadata(document)).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(error.message().contains("future-plan"));
+    }
+
+    #[test]
+    fn declaration_identity_includes_the_complete_current_storage_table() {
+        let mut document =
+            metadata_json(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
+        let plain = load(&decode_test_metadata(document.clone())).unwrap();
+        document["versions"][0]["storage-table"] =
+            serde_json::json!({"namespace":["db"], "name":"storage"});
+        let materialized = load(&decode_test_metadata(document.clone())).unwrap();
+        assert_eq!(plain.definition, materialized.definition);
+        assert_ne!(plain.version, materialized.version);
+        for (field, value) in [
+            ("name", serde_json::json!("other")),
+            ("namespace", serde_json::json!(["other", "db"])),
+            ("catalog", serde_json::json!("other")),
+        ] {
+            let mut changed = document.clone();
+            changed["versions"][0]["storage-table"][field] = value;
+            assert_ne!(
+                materialized.version,
+                load(&decode_test_metadata(changed)).unwrap().version
+            );
         }
     }
 
@@ -1859,15 +1961,15 @@ mod declaration_tests {
             ]
             .into(),
         );
-        let raw = metadata(prepared(FunctionValueType::new(ty, false)), 1);
-        let mut changed = serde_json::to_value(&raw).unwrap();
+        let mut changed = metadata_json(prepared(FunctionValueType::new(ty, false)), 1);
+        let raw = decode_test_metadata(changed.clone());
         changed["schemas"][0]["fields"][0]["required"] = false.into();
         let members = &mut changed["schemas"][0]["fields"][0]["type"]["fields"];
         members[0]["required"] = true.into();
         members[0]["type"]["element-required"] = true.into();
         members[1]["required"] = true.into();
         members[1]["type"]["value-required"] = true.into();
-        let changed: ViewMetadata = serde_json::from_value(changed).unwrap();
+        let changed: ViewMetadata = decode_test_metadata(changed);
         let first = load(&raw).unwrap();
         let second = load(&changed).unwrap();
         assert_ne!(first.version, second.version);
@@ -1891,12 +1993,11 @@ mod declaration_tests {
     }
     #[test]
     fn standard_fixed_binary_never_recovers_a_nova_nominal_domain() {
-        let raw = metadata(prepared(FunctionValueType::new(DataType::Binary, true)), 1);
-        let mut value = serde_json::to_value(raw).unwrap();
+        let mut value = metadata_json(prepared(FunctionValueType::new(DataType::Binary, true)), 1);
         value["schemas"][0]["fields"][0]["type"] = "fixed[16]".into();
         value["versions"][0]["summary"] =
             serde_json::json!({"engine-name":"novarocks", "novarocks.source-format":"future"});
-        let observed = load(&serde_json::from_value(value).unwrap()).unwrap();
+        let observed = load(&decode_test_metadata(value)).unwrap();
         assert_eq!(
             observed.definition.columns[0].value_type,
             FunctionValueType::new(DataType::Binary, true)
@@ -1904,12 +2005,14 @@ mod declaration_tests {
     }
     #[test]
     fn reused_numeric_ids_bind_the_observed_schema_sql_and_context() {
-        let original = metadata(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
+        let original = metadata_json(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
         let other_type = metadata(prepared(FunctionValueType::new(DataType::Int64, true)), 1);
-        let baseline = load(&original).unwrap().version;
+        let baseline = load(&decode_test_metadata(original.clone()))
+            .unwrap()
+            .version;
         assert_ne!(baseline, load(&other_type).unwrap().version);
         for field in ["sql", "default-catalog", "default-namespace"] {
-            let mut value = serde_json::to_value(&original).unwrap();
+            let mut value = original.clone();
             match field {
                 "sql" => value["versions"][0]["representations"][0]["sql"] = "SELECT 2 AS a".into(),
                 "default-catalog" => value["versions"][0][field] = "another".into(),
@@ -1917,16 +2020,13 @@ mod declaration_tests {
             }
             assert_ne!(
                 baseline,
-                load(&serde_json::from_value(value).unwrap())
-                    .unwrap()
-                    .version
+                load(&decode_test_metadata(value)).unwrap().version
             );
         }
     }
     #[test]
     fn declaration_identity_canonicalizes_identifier_order_without_discarding_ids() {
-        let raw = metadata(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
-        let mut value = serde_json::to_value(raw).unwrap();
+        let mut value = metadata_json(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
         let mut second = value["schemas"][0]["fields"][0].clone();
         second["id"] = 2.into();
         second["name"] = "b".into();
@@ -1935,21 +2035,17 @@ mod declaration_tests {
             .unwrap()
             .push(second);
         value["schemas"][0]["identifier-field-ids"] = serde_json::json!([1, 2]);
-        let original: ViewMetadata = serde_json::from_value(value.clone()).unwrap();
+        let original: ViewMetadata = decode_test_metadata(value.clone());
         let identity = load(&original).unwrap().version;
         value["schemas"][0]["identifier-field-ids"] = serde_json::json!([2, 1]);
         assert_eq!(
             identity,
-            load(&serde_json::from_value(value.clone()).unwrap())
-                .unwrap()
-                .version
+            load(&decode_test_metadata(value.clone())).unwrap().version
         );
         value["schemas"][0]["identifier-field-ids"] = serde_json::json!([1]);
         assert_ne!(
             identity,
-            load(&serde_json::from_value(value).unwrap())
-                .unwrap()
-                .version
+            load(&decode_test_metadata(value)).unwrap().version
         );
     }
     #[test]
@@ -2020,11 +2116,10 @@ mod declaration_tests {
         use novarocks_type_contract::{
             CompileControlError, owned_resources::layout::LayoutResourceError,
         };
-        let raw = metadata(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
         let name = "a".repeat(277);
-        let mut value = serde_json::to_value(raw).unwrap();
+        let mut value = metadata_json(prepared(FunctionValueType::new(DataType::Int32, true)), 1);
         value["schemas"][0]["fields"][0]["name"] = name.clone().into();
-        let raw: ViewMetadata = serde_json::from_value(value).unwrap();
+        let raw: ViewMetadata = decode_test_metadata(value);
         let requested = novarocks_type_contract::owned_resources::layout::arc_layout(
             std::alloc::Layout::array::<u8>(name.len()).unwrap(),
         )

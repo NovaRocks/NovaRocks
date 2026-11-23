@@ -29,8 +29,8 @@ use uuid::Uuid;
 use super::{
     ConnectorCommittedPartitioning, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorNamespaceIdentity,
-    ConnectorProcessLocalPayload, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableIdentity, ProviderBindingEpoch,
+    ConnectorObjectKind, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorTableIdentity, ProviderBindingEpoch,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -175,6 +175,7 @@ pub struct ConnectorMutationFailure {
     kind: ConnectorMutationFailureKind,
     message: Arc<str>,
     source: Option<ConnectorError>,
+    existing_object: Option<Arc<ConnectorObjectKind>>,
 }
 
 impl From<ConnectorErrorKind> for ConnectorMutationFailureKind {
@@ -200,6 +201,7 @@ impl ConnectorMutationFailure {
             kind: error.kind().into(),
             message: error.to_string().into(),
             source: Some(error),
+            existing_object: None,
         }
     }
     /// Attach the originating connector fact while preserving the mutation disposition.
@@ -217,7 +219,17 @@ impl ConnectorMutationFailure {
             kind,
             message: message.into(),
             source: None,
+            existing_object: None,
         }
+    }
+
+    pub fn with_existing_object(mut self, kind: ConnectorObjectKind) -> Self {
+        self.existing_object = Some(Arc::new(kind));
+        self
+    }
+
+    pub fn existing_object(&self) -> Option<&ConnectorObjectKind> {
+        self.existing_object.as_deref()
     }
 
     pub const fn kind(&self) -> ConnectorMutationFailureKind {

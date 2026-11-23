@@ -16,9 +16,10 @@
 // under the License.
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningPin, ConnectorControlResolver, ConnectorInstanceId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
-    ConnectorTableObjectId, ConnectorTableObjectSelector, ConnectorTableResolution,
+    ConnectorControlPlanningPin, ConnectorControlResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectSelector,
+    ConnectorTableResolution,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -116,6 +117,46 @@ pub fn reject_if_iceberg_mv_table_with_planning_pin_and_context(
     mutation: IcebergMvUserMutation,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
+    check_iceberg_mv_table_mutation(exact_lease, readiness, target, mutation, context)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) enum IcebergMvMutationGuardError {
+    TableBinding(ConnectorError),
+    Other(String),
+}
+
+impl IcebergMvMutationGuardError {
+    pub(crate) fn target_missing(&self) -> bool {
+        matches!(self, Self::TableBinding(error) if error.kind() == ConnectorErrorKind::NotFound)
+    }
+}
+
+impl From<String> for IcebergMvMutationGuardError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl std::fmt::Display for IcebergMvMutationGuardError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TableBinding(error) => {
+                write!(formatter, "bind MV mutation guard target: {error}")
+            }
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// Preserve exact absence from the base-table binding for DROP TABLE.
+pub(crate) fn check_iceberg_mv_table_mutation(
+    exact_lease: &ConnectorControlPlanningPin,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+) -> Result<(), IcebergMvMutationGuardError> {
     if target.provider_id.as_str() != "iceberg" {
         return Ok(());
     }
@@ -124,7 +165,9 @@ pub fn reject_if_iceberg_mv_table_with_planning_pin_and_context(
         .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
     if exact_lease.binding().descriptor().instance_id != instance_id {
         return Err(
-            "MV mutation guard planning pin does not match the target connector".to_string(),
+            "MV mutation guard planning pin does not match the target connector"
+                .to_string()
+                .into(),
         );
     }
     let context = crate::connector::context_for_planning_pin(exact_lease, context)?;
@@ -142,10 +185,12 @@ pub fn reject_if_iceberg_mv_table_with_planning_pin_and_context(
             selector: ConnectorTableObjectSelector::Current,
             context: context.clone(),
         })
-        .map_err(|error| format!("bind MV mutation guard target: {error}"))?;
+        .map_err(IcebergMvMutationGuardError::TableBinding)?;
     if binding.metadata.identity != identity {
         return Err(
-            "connector loaded a different table while checking the MV mutation guard".to_string(),
+            "connector loaded a different table while checking the MV mutation guard"
+                .to_string()
+                .into(),
         );
     }
     let documents = exact_lease
@@ -165,10 +210,10 @@ pub fn reject_if_iceberg_mv_table_with_planning_pin_and_context(
             return if mutation == IcebergMvUserMutation::DropTable {
                 Ok(())
             } else {
-                Err(format!("LegacyFormat: {key}; only DROP TABLE is supported"))
+                Err(format!("LegacyFormat: {key}; only DROP TABLE is supported").into())
             };
         }
-        Err(error) => return Err(format!("observe MV mutation guard: {error}")),
+        Err(error) => return Err(format!("observe MV mutation guard: {error}").into()),
     };
     if is_materialized_view_documents(&view) {
         // The Provider marker decides denial. Keep its actual negative
@@ -182,7 +227,8 @@ pub fn reject_if_iceberg_mv_table_with_planning_pin_and_context(
             target.namespace,
             target.table,
             mutation.guidance()
-        ));
+        )
+        .into());
     }
 
     Ok(())

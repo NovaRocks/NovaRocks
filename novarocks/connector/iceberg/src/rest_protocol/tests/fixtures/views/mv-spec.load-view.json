@@ -1,0 +1,51 @@
+{"metadata-location": "s3://bucket/warehouse/default.db/event_agg_mv/metadata/00001-(uuid).metadata.json",
+"metadata": {
+  "view-uuid": "b2a12651-3038-4a72-8a31-5027ab84da35",
+  "format-version" : 1,
+  "location" : "s3://bucket/warehouse/default.db/event_agg_mv",
+  "current-version-id" : 1,
+  "properties" : {
+    "comment" : "Precomputed daily event counts"
+  },
+  "versions" : [ {
+    "version-id" : 1,
+    "timestamp-ms" : 1573518431292,
+    "schema-id" : 1,
+    "default-catalog" : "prod",
+    "default-namespace" : [ "default" ],
+    "summary" : {
+      "engine-name" : "Spark",
+      "engine-version" : "3.4.1"
+    },
+    "representations" : [ {
+      "type" : "sql",
+      "sql" : "SELECT\n    COUNT(1), CAST(event_ts AS DATE)\nFROM events\nGROUP BY 2",
+      "dialect" : "spark"
+    } ],
+    "storage-table" : {
+      "namespace" : [ "default" ],
+      "name" : "event_agg_mv__storage"
+    }
+  } ],
+  "schemas": [ {
+    "schema-id": 1,
+    "type" : "struct",
+    "fields" : [ {
+      "id" : 1,
+      "name" : "event_count",
+      "required" : false,
+      "type" : "int",
+      "doc" : "Count of events"
+    }, {
+      "id" : 2,
+      "name" : "event_date",
+      "required" : false,
+      "type" : "date"
+    } ]
+  } ],
+  "version-log" : [ {
+    "timestamp-ms" : 1573518431292,
+    "version-id" : 1
+  } ]
+}
+}

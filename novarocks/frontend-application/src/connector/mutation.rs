@@ -258,7 +258,14 @@ impl fmt::Display for CatalogMutationCommandFailure {
 }
 impl std::error::Error for CatalogMutationCommandFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.primary)
+        match &self.outcome {
+            ResolvedCatalogMutation::KnownUncommitted { failure, .. }
+                if failure.existing_object().is_some() =>
+            {
+                Some(failure)
+            }
+            _ => Some(&self.primary),
+        }
     }
 }
 impl FailureProjection for CatalogMutationCommandFailure {
@@ -770,6 +777,41 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn classified_object_failure_retains_the_mutation_and_connector_source() {
+        use novarocks_spi::connector::{ConnectorErrorKind, ConnectorObjectKind};
+        use std::error::Error;
+
+        let source = ConnectorError::new(ConnectorErrorKind::InvalidRequest, "original source");
+        let failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::AlreadyExists,
+            "original name collision",
+        )
+        .with_connector_source(source.clone())
+        .with_existing_object(ConnectorObjectKind::View);
+        let command =
+            present_catalog_mutation_command_result(ResolvedCatalogMutation::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            })
+            .unwrap_err();
+        let mutation = command
+            .failure_cause()
+            .unwrap()
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<ConnectorMutationFailure>()
+            .unwrap();
+        assert_eq!(mutation.existing_object(), Some(&ConnectorObjectKind::View));
+        assert_eq!(mutation.connector_source(), Some(&source));
+        assert_eq!(
+            command.execution_failure().unwrap().fact(),
+            source.failure_fact()
+        );
     }
 
     #[test]

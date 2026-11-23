@@ -84,10 +84,6 @@ impl CatalogDropContext for CatalogCommandExecutor {
     fn mv_readiness(&self) -> &MvReadinessPort {
         self.mv_readiness.as_ref()
     }
-
-    fn mv_storage_observation(&self) -> &dyn MvStorageObservationPort {
-        self.mv_storage_observation.as_ref()
-    }
 }
 
 impl CatalogMutationContext for CatalogCommandExecutor {

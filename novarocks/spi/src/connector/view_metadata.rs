@@ -38,6 +38,22 @@ pub struct ConnectorListViewsRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStorageTableIdentifier {
+    pub namespace: Arc<[Arc<str>]>,
+    pub name: Arc<str>,
+    pub catalog: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorObjectKind {
+    Table,
+    View,
+    MaterializedView {
+        storage_table: ConnectorStorageTableIdentifier,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 // Design: ADR-0218 (docs/adr/ADR-0218-sql-output-declarations-and-stored-view-analysis.md)
 pub struct ConnectorViewMetadataValue {
     pub identity: ConnectorViewIdentity,
@@ -186,6 +202,19 @@ pub trait ConnectorViewMetadata: Send + Sync {
 
     fn view_exists(&self, request: ConnectorViewRequest) -> Result<bool, ConnectorError>;
 
+    /// Identify a view by name independently of its SQL dialect and definition.
+    /// None means the view is absent. An unclassifiable view returns an error.
+    fn classify_view(
+        &self,
+        request: ConnectorViewRequest,
+    ) -> Result<Option<ConnectorObjectKind>, ConnectorError>;
+
+    /// Enumerate and classify all views in the namespace before returning any.
+    fn list_classified_views(
+        &self,
+        request: ConnectorListViewsRequest,
+    ) -> Result<Vec<(ConnectorViewIdentity, ConnectorObjectKind)>, ConnectorError>;
+
     fn load_view(
         &self,
         request: ConnectorViewRequest,
@@ -289,6 +318,25 @@ mod tests {
     }
 
     impl ConnectorViewMetadata for ViewCapability {
+        fn classify_view(
+            &self,
+            _: ConnectorViewRequest,
+        ) -> Result<Option<ConnectorObjectKind>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn list_classified_views(
+            &self,
+            request: ConnectorListViewsRequest,
+        ) -> Result<Vec<(ConnectorViewIdentity, ConnectorObjectKind)>, ConnectorError> {
+            self.list_views(request).map(|views| {
+                views
+                    .into_iter()
+                    .map(|view| (view, ConnectorObjectKind::View))
+                    .collect()
+            })
+        }
+
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }

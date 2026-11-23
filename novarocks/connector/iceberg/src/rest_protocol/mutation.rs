@@ -50,6 +50,7 @@ use crate::rest_protocol::json::{JsonScanner, ScanError, ViewSink};
 use crate::rest_protocol::minimal_view::{
     MutationView, NamespaceSink, TableResponseSink, ViewMutationSink,
 };
+use crate::rest_protocol::view_metadata::StorageTableIdentifier;
 #[cfg(test)]
 use crate::rest_protocol::wire::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
 
@@ -71,6 +72,8 @@ pub(crate) struct ViewVersionWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) default_catalog: Option<String>,
     pub(crate) default_namespace: NamespaceIdent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) storage_table: Option<StorageTableIdentifier>,
 }
 
 /// A SQL representation of a view version.
@@ -489,11 +492,14 @@ mod tests {
     use super::MutationOutcome;
     use crate::catalog::error::CatalogCommitEvidence;
     use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewDefinition};
-    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type, ViewMetadata};
+    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use crate::iceberg::{NamespaceIdent, TableIdent, TableRequirement};
     use crate::rest_protocol::endpoints::RestEndpoints;
     use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot, RestEvidence};
     use crate::rest_protocol::test_server::{BodyPlan, Reply, Script, TestServer};
+    use crate::rest_protocol::view_metadata::{
+        StorageTableIdentifier, ViewMetadata, decode_test_metadata,
+    };
     use crate::rest_protocol::wire::CommitTableRequest;
 
     const TABLE_UUID: &str = "1a2b3c4d-0000-4000-8000-000000000001";
@@ -678,12 +684,12 @@ mod tests {
     }
 
     fn view_creation() -> ViewCreate {
-        ViewCreate::validate("v".to_string(), view_definition(), HashMap::new()).unwrap()
+        ViewCreate::validate("v".to_string(), view_definition(), HashMap::new(), None).unwrap()
     }
 
     /// View `db.v` with one version over schema 0 (`schema()`).
     fn view_metadata() -> ViewMetadata {
-        serde_json::from_value(serde_json::json!({
+        decode_test_metadata(serde_json::json!({
             "view-uuid": VIEW_UUID,
             "format-version": 1,
             "location": "s3://warehouse/db/v",
@@ -700,7 +706,6 @@ mod tests {
             "schemas": [serde_json::to_value(schema()).unwrap()],
             "properties": {},
         }))
-        .unwrap()
     }
 
     fn view_replace() -> ValidatedViewReplace {
@@ -1118,6 +1123,7 @@ mod tests {
                 "v".to_string(),
                 definition(schema(), "select 1"),
                 HashMap::from([("comment".to_string(), "c".to_string())]),
+                None,
             )
             .unwrap();
             let json = serde_json::to_value(CreateViewRequest::encode(creation)).unwrap();
@@ -1149,6 +1155,46 @@ mod tests {
                     "view-version": serde_json::to_value(&upstream).unwrap(),
                     "properties": {"comment": "c"},
                 })
+            );
+        }
+
+        #[test]
+        fn a_creation_with_storage_table_matches_the_shared_rest_request() {
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .unwrap();
+            let definition = ViewDefinition {
+                schema,
+                sql: "SELECT id FROM mv_base".to_owned(),
+                summary: HashMap::new(),
+                default_catalog: None,
+                default_namespace: NamespaceIdent::new("__NAMESPACE__".to_owned()),
+                timestamp_ms: 1_700_000_000_000,
+            };
+            let storage_table = StorageTableIdentifier {
+                namespace: vec!["__NAMESPACE__".to_owned()],
+                name: "__STORAGE_TABLE__".to_owned(),
+                catalog: None,
+            };
+            let creation = ViewCreate::validate(
+                "__VIEW__".to_owned(),
+                definition,
+                HashMap::new(),
+                Some(storage_table),
+            )
+            .unwrap();
+            let expected: serde_json::Value = serde_json::from_str(include_str!(
+                "tests/fixtures/views/trino-mv.create-view.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(CreateViewRequest::encode(creation)).unwrap(),
+                expected,
             );
         }
 

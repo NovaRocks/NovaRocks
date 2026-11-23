@@ -29,11 +29,12 @@ use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorDataType,
     ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorOperationControl, ConnectorPartitionTransform,
-    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction,
-    ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity, CreateOrReplacePolicy,
-    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorMutationOperationId, ConnectorObjectKind, ConnectorOperationControl,
+    ConnectorPartitionTransform, ConnectorPropertyAuthority, ConnectorPropertyChange,
+    ConnectorRefAction, ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity,
+    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -2625,6 +2626,10 @@ fn execute_view_publication(
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     use crate::catalog::catalog_request::CatalogPublicationRequest;
     use crate::catalog::publication_dispatch::{PreparationFailure, PreparationResult};
+    use crate::catalog::view_request::{
+        ValidatedViewReplace, ViewCreate, materialized_view_already_exists,
+    };
+    use crate::rest_protocol::view_metadata::ViewObjectKind;
     enum PreparedView {
         NoOp(ConnectorCatalogMutationReceipt),
         Mutation(
@@ -2661,17 +2666,36 @@ fn execute_view_publication(
                         .iter()
                         .any(|table| table.eq_ignore_ascii_case(&name))
                 {
-                    return Err(PreparationFailure(ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::AlreadyExists,
-                        "a table with the requested Iceberg view name already exists",
-                    )));
+                    return Err(PreparationFailure(
+                        ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::AlreadyExists,
+                            "a table with the requested Iceberg view name already exists",
+                        )
+                        .with_existing_object(ConnectorObjectKind::Table),
+                    ));
                 }
-                let exists = super::views::view_exists(
+                let document = super::views::load_view_document_for_request(
                     provider.runtime(),
                     &namespace,
                     &name,
                     &request.context,
                 )?;
+                if let Some(ViewObjectKind::MaterializedView { storage_table }) = document
+                    .as_ref()
+                    .map(|document| document.classify(&request.context))
+                    .transpose()?
+                {
+                    let failure = if create {
+                        materialized_view_already_exists(&storage_table)
+                    } else {
+                        ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::InvalidRequest,
+                            "DROP VIEW cannot drop an Iceberg materialized view",
+                        )
+                        .with_existing_object(storage_table.materialized_view_kind())
+                    };
+                    return Err(PreparationFailure(failure));
+                }
                 let seed = receipt(provider, request.operation_id, request.operation.kind())?;
                 let publication = match &request.operation {
                     ConnectorCatalogMutationOperation::CreateView {
@@ -2681,16 +2705,19 @@ fn execute_view_publication(
                         policy,
                         ..
                     } => {
-                        if exists {
+                        if document.is_some() {
                             match policy {
                                 CreateOrReplacePolicy::NoOpIfExists => {
                                     return Ok(PreparedView::NoOp(seed));
                                 }
                                 CreateOrReplacePolicy::FailIfExists => {
-                                    return Err(PreparationFailure(ConnectorMutationFailure::new(
-                                        ConnectorMutationFailureKind::AlreadyExists,
-                                        "Iceberg view already exists",
-                                    )));
+                                    return Err(PreparationFailure(
+                                        ConnectorMutationFailure::new(
+                                            ConnectorMutationFailureKind::AlreadyExists,
+                                            "Iceberg view already exists",
+                                        )
+                                        .with_existing_object(ConnectorObjectKind::View),
+                                    ));
                                 }
                                 CreateOrReplacePolicy::ReplaceIfExists => (),
                             }
@@ -2701,30 +2728,21 @@ fn execute_view_publication(
                             &view_properties(properties)?,
                             &request.context,
                         )?;
-                        if exists {
-                            let current = super::views::load_view_metadata_for_request(
-                                provider.runtime(),
-                                &namespace,
-                                &name,
-                                &request.context,
-                            )?;
+                        if let Some(document) = document {
+                            let current = document.decode(&request.context)?;
                             let ident = TableIdent::new(
                                 NamespaceIdent::new(namespace.clone()),
                                 name.clone(),
                             );
-                            let replacement =
-                                crate::catalog::view_request::ValidatedViewReplace::validate(
-                                    ident, &current, definition, properties,
-                                )
-                                .map_err(invalid)?;
+                            let replacement = ValidatedViewReplace::validate(
+                                ident, &current, definition, properties,
+                            )
+                            .map_err(PreparationFailure)?;
                             CatalogPublicationRequest::ReplaceView(replacement)
                         } else {
-                            let creation = crate::catalog::view_request::ViewCreate::validate(
-                                name.clone(),
-                                definition,
-                                properties,
-                            )
-                            .map_err(invalid)?;
+                            let creation =
+                                ViewCreate::validate(name.clone(), definition, properties, None)
+                                    .map_err(invalid)?;
                             CatalogPublicationRequest::CreateView {
                                 namespace: CatalogNamespaceName::new(namespace.clone()),
                                 creation,
@@ -2732,7 +2750,7 @@ fn execute_view_publication(
                         }
                     }
                     ConnectorCatalogMutationOperation::DropView { policy, .. } => {
-                        if !exists {
+                        if document.is_none() {
                             return if *policy == DropPolicy::NoOpIfMissing {
                                 Ok(PreparedView::NoOp(seed))
                             } else {
@@ -3670,33 +3688,17 @@ fn reconcile_evidence(
                     view,
                     &fresh,
                 )?;
-                let current =
-                    serde_json::to_value(current).map_err(|error| internal(error.to_string()))?;
-                if current.get("view-uuid").and_then(serde_json::Value::as_str)
-                    != Some(view_uuid.as_str())
-                {
+                if current.uuid().to_string() != *view_uuid {
                     return Ok(None);
                 }
-                let matched = current
-                    .get("versions")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|versions| {
-                        versions.iter().any(|version| {
-                            version
-                                .get("summary")
-                                .and_then(|summary| summary.get("novarocks.operation-id"))
-                                .and_then(serde_json::Value::as_str)
-                                == Some(operation_marker.as_str())
-                        })
-                    });
+                let matched = current.versions().any(|version| {
+                    version.summary().get("novarocks.operation-id") == Some(operation_marker)
+                });
                 if !matched {
                     return Ok(None);
                 }
                 Ok(Some(Observation::ViewOperation {
-                    view_uuid: Some(
-                        uuid::Uuid::parse_str(view_uuid)
-                            .map_err(|error| invalid(error.to_string()))?,
-                    ),
+                    view_uuid: Some(current.uuid()),
                     operation_id: operation_marker.clone(),
                 }))
             }
@@ -5161,6 +5163,190 @@ mod tests {
     }
 
     #[test]
+    fn materialized_view_policies_refuse_before_any_rest_mutation() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        let mut document = complete_view_response();
+        document["metadata"]["versions"][0]["storage-table"] =
+            serde_json::json!({"namespace":["lake", "db"], "name":"storage", "catalog":"other"});
+        for mode in ["create", "replace", "create-noop", "drop", "drop-noop"] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &document),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let is_drop = mode.starts_with("drop");
+            let mut request = view_request(&provider, if is_drop { "drop" } else { mode });
+            match &mut request.operation {
+                ConnectorCatalogMutationOperation::CreateView { policy, .. }
+                    if mode == "create-noop" =>
+                {
+                    *policy = CreateOrReplacePolicy::NoOpIfExists;
+                }
+                ConnectorCatalogMutationOperation::DropView { policy, .. }
+                    if mode == "drop-noop" =>
+                {
+                    *policy = DropPolicy::NoOpIfMissing;
+                }
+                _ => (),
+            }
+            let ExternalMutationOutcome::KnownUncommitted { failure, .. } =
+                provider.execute(request).unwrap()
+            else {
+                panic!("{mode} must refuse a materialized view before dispatch");
+            };
+            assert_eq!(
+                failure.kind(),
+                if is_drop {
+                    ConnectorMutationFailureKind::InvalidRequest
+                } else {
+                    ConnectorMutationFailureKind::AlreadyExists
+                }
+            );
+            let Some(ConnectorObjectKind::MaterializedView { storage_table }) =
+                failure.existing_object()
+            else {
+                panic!("{mode} lost the materialized view kind: {failure:?}");
+            };
+            assert_eq!(
+                &*storage_table.namespace,
+                &[Arc::<str>::from("lake"), Arc::from("db")]
+            );
+            assert_eq!(&*storage_table.name, "storage");
+            assert_eq!(storage_table.catalog.as_deref(), Some("other"));
+            assert_eq!(server.count("GET", "/v1/namespaces/db/views/v"), 1);
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+        }
+    }
+
+    #[test]
+    fn view_publication_requires_only_the_facts_its_operation_consumes() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for (mode, broken_pointer, deletes) in [
+            ("create", true, false),
+            ("drop", true, false),
+            ("replace", false, false),
+            ("drop", false, true),
+        ] {
+            let mut document = complete_view_response();
+            if broken_pointer {
+                document["metadata"]["versions"][0]["storage-table"] =
+                    serde_json::json!({"name":"v"});
+            } else {
+                document["metadata"]["schemas"] = serde_json::json!("broken schema");
+            }
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &document),
+                    )
+                    .on("DELETE", "/v1/namespaces/db/views/v", Reply::status(204)),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let result = provider.execute(view_request(&provider, mode)).unwrap();
+            if deletes {
+                assert!(
+                    matches!(
+                        result,
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        }
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::CorruptData && failure.existing_object().is_none())
+                );
+            }
+            assert_eq!(server.count("GET", "/v1/namespaces/db/views/v"), 1);
+            assert_eq!(
+                server.count("DELETE", "/v1/namespaces/db/views/v"),
+                usize::from(deletes)
+            );
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|request| request.method != "POST")
+            );
+        }
+    }
+
+    #[test]
+    fn classified_view_listing_preserves_kinds_and_refuses_incomplete_classification() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{
+            ConnectorListViewsRequest, ConnectorListingPageSize, ConnectorNamespaceIdentity,
+            ConnectorViewMetadata,
+        };
+        let mut plain = complete_view_response();
+        plain["metadata"]["schemas"] = serde_json::json!("broken schema");
+        let mut spark = complete_view_response();
+        let version = &mut spark["metadata"]["versions"][0];
+        version["representations"][0]["dialect"] = serde_json::json!("spark");
+        version["storage-table"] = serde_json::json!({"namespace":["db"], "name":"storage"});
+        for corrupt in [false, true] {
+            let mut spark = spark.clone();
+            if corrupt {
+                spark["metadata"]["versions"][0]["storage-table"] =
+                    serde_json::json!({"namespace":42});
+            }
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("GET", "/v1/namespaces/db/views", Reply::json(200, &serde_json::json!({"identifiers":[{"namespace":["db"],"name":"plain"},{"namespace":["db"],"name":"spark"}]})))
+                    .on("GET", "/v1/namespaces/db/views/plain", Reply::json(200, &plain))
+                    .on("GET", "/v1/namespaces/db/views/spark", Reply::json(200, &spark)),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let classified = provider.list_classified_views(ConnectorListViewsRequest {
+                namespace: ConnectorNamespaceIdentity {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    namespace: "db".into(),
+                },
+                page_size: ConnectorListingPageSize::DEFAULT,
+                context: context(),
+            });
+            if corrupt {
+                assert_eq!(
+                    classified.unwrap_err().kind(),
+                    ConnectorErrorKind::CorruptData
+                );
+            } else {
+                let classified = classified.unwrap();
+                assert!(
+                    matches!(classified.as_slice(), [(plain, ConnectorObjectKind::View), (spark, ConnectorObjectKind::MaterializedView { storage_table })]
+                    if plain.view.as_ref() == "plain" && spark.view.as_ref() == "spark" && storage_table.name.as_ref() == "storage")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_view_types_are_typed_and_never_dispatch_create_or_replace() {
         use crate::rest_protocol::test_server::{Reply, Script, TestServer};
         for mode in ["create", "replace"] {
@@ -5173,14 +5359,13 @@ mod tests {
                         Reply::json(200, &serde_json::json!({"identifiers":[]})),
                     )
                     .on(
-                        "HEAD",
-                        "/v1/namespaces/db/views/v",
-                        Reply::status(if mode == "create" { 404 } else { 200 }),
-                    )
-                    .on(
                         "GET",
                         "/v1/namespaces/db/views/v",
-                        Reply::json(200, &complete_view_response()),
+                        if mode == "create" {
+                            Reply::status(404)
+                        } else {
+                            Reply::json(200, &complete_view_response())
+                        },
                     ),
             );
             let (_executor, provider) = variant_definition_provider(&server.url());
@@ -5229,7 +5414,6 @@ mod tests {
                         "/v1/namespaces/db/tables",
                         Reply::json(200, &serde_json::json!({"identifiers":[]})),
                     )
-                    .on("HEAD", "/v1/namespaces/db/views/v", Reply::status(200))
                     .on_fn("GET", "/v1/namespaces/db/views/v", move |_, _| {
                         Reply::json(200, &read_current.lock().unwrap())
                     })
@@ -5388,14 +5572,13 @@ mod tests {
                             Reply::json(200, &serde_json::json!({"identifiers":[]})),
                         )
                         .on(
-                            "HEAD",
-                            "/v1/namespaces/db/views/v",
-                            Reply::status(if mode == "create" { 404 } else { 200 }),
-                        )
-                        .on(
                             "GET",
                             "/v1/namespaces/db/views/v",
-                            Reply::json(200, &complete_view_response()),
+                            if mode == "create" {
+                                Reply::status(404)
+                            } else {
+                                Reply::json(200, &complete_view_response())
+                            },
                         )
                         .on(
                             method,
@@ -5533,9 +5716,13 @@ mod tests {
                         ),
                     )
                     .on(
-                        "HEAD",
+                        "GET",
                         "/v1/namespaces/db/views/v",
-                        Reply::status(if is_drop { 404 } else { 200 }),
+                        if is_drop {
+                            Reply::status(404)
+                        } else {
+                            Reply::json(200, &complete_view_response())
+                        },
                     ),
             );
             let (_executor, provider) = variant_definition_provider(&server.url());
@@ -5564,22 +5751,27 @@ mod tests {
                 (
                     "exists" | "table-collision",
                     ExternalMutationOutcome::KnownUncommitted { failure, .. },
-                ) => assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists),
+                ) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists);
+                    assert_eq!(
+                        failure.existing_object(),
+                        Some(&if case == "exists" {
+                            ConnectorObjectKind::View
+                        } else {
+                            ConnectorObjectKind::Table
+                        }),
+                    );
+                }
                 ("missing", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
                     assert_eq!(failure.kind(), ConnectorMutationFailureKind::NotFound)
                 }
                 (_, other) => panic!("Unexpected {case} preflight: {other:?}"),
             }
-            assert!(
-                server
-                    .requests()
-                    .iter()
-                    .all(|r| r.method == "GET" || r.method == "HEAD")
-            );
+            assert!(server.requests().iter().all(|r| r.method == "GET"));
             if case == "table-collision" {
                 assert!(
                     server
-                        .requests_to("HEAD", "/v1/namespaces/db/views/v")
+                        .requests_to("GET", "/v1/namespaces/db/views/v")
                         .is_empty()
                 );
             }
@@ -5638,7 +5830,7 @@ mod tests {
                         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
                     }
                 });
-                let method = if action == "load" { "GET" } else { "HEAD" };
+                let method = if action == "exists" { "HEAD" } else { "GET" };
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while server
                     .requests_to(method, "/v1/namespaces/db/views/v")
@@ -5697,7 +5889,7 @@ mod tests {
     #[test]
     fn view_each_preparation_read_stops_or_expires_without_mutation() {
         use crate::rest_protocol::test_server::{Reply, Script, TestServer};
-        for phase in ["listing", "head", "replacement"] {
+        for phase in ["listing", "create-view-read", "replacement-view-read"] {
             for cancel in [true, false] {
                 let delayed = if cancel {
                     Duration::from_millis(250)
@@ -5719,31 +5911,23 @@ mod tests {
                             ),
                         )
                         .on(
-                            "HEAD",
-                            "/v1/namespaces/db/views/v",
-                            Reply::status(if phase == "replacement" { 200 } else { 404 })
-                                .with_delay(if phase == "head" {
-                                    delayed
-                                } else {
-                                    Duration::ZERO
-                                }),
-                        )
-                        .on(
                             "GET",
                             "/v1/namespaces/db/views/v",
-                            Reply::json(200, &complete_view_response()).with_delay(
-                                if phase == "replacement" {
+                            if phase == "replacement-view-read" {
+                                Reply::json(200, &complete_view_response()).with_delay(delayed)
+                            } else {
+                                Reply::status(404).with_delay(if phase == "create-view-read" {
                                     delayed
                                 } else {
                                     Duration::ZERO
-                                },
-                            ),
+                                })
+                            },
                         ),
                 );
                 let (_executor, provider) = variant_definition_provider(&server.url());
                 let mut request = view_request(
                     &provider,
-                    if phase == "replacement" {
+                    if phase == "replacement-view-read" {
                         "replace"
                     } else {
                         "create"
@@ -5764,7 +5948,6 @@ mod tests {
                 .unwrap();
                 let (method, path) = match phase {
                     "listing" => ("GET", "/v1/namespaces/db/tables"),
-                    "head" => ("HEAD", "/v1/namespaces/db/views/v"),
                     _ => ("GET", "/v1/namespaces/db/views/v"),
                 };
                 let outcome = std::thread::scope(|scope| {
@@ -5790,12 +5973,7 @@ mod tests {
                     1,
                     "Original deadline must cover the actual {phase} wait"
                 );
-                assert!(
-                    server
-                        .requests()
-                        .iter()
-                        .all(|r| r.method == "GET" || r.method == "HEAD")
-                );
+                assert!(server.requests().iter().all(|r| r.method == "GET"));
             }
         }
     }
@@ -5822,14 +6000,13 @@ mod tests {
                         Reply::json(200, &serde_json::json!({"identifiers":[]})),
                     )
                     .on(
-                        "HEAD",
-                        "/v1/namespaces/db/views/v",
-                        Reply::status(if case == "history-create" { 404 } else { 200 }),
-                    )
-                    .on(
                         "GET",
                         "/v1/namespaces/db/views/v",
-                        Reply::json(200, &current),
+                        if case == "history-create" {
+                            Reply::status(404)
+                        } else {
+                            Reply::json(200, &current)
+                        },
                     ),
             );
             let (_executor, provider) = variant_definition_provider(&server.url());

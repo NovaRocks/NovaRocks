@@ -21,6 +21,103 @@ use super::{
 };
 
 #[test]
+fn view_fixture_directives_parse_bound_targets_and_statements_with_multiple_fixtures() {
+    use super::{
+        IcebergViewFixtureAssertion, IcebergViewFixtureDirective, IcebergViewFixtureEndpoint,
+        IcebergViewFixtureSample, IcebergViewFixtureTarget,
+    };
+
+    let re = meta_re();
+    let target = IcebergViewFixtureTarget {
+        catalog: Some("lake".into()),
+        namespace: "case_ns".into(),
+        view: "v".into(),
+    };
+    let meta = parse_meta(
+        &[
+            "-- @iceberg_view_fixture=rest-mv:lake.case_ns.v:spark-mv:storage".into(),
+            "-- @iceberg_view_fixture_unchanged=lake.case_ns.v".into(),
+        ],
+        &re,
+    )
+    .unwrap();
+    assert_eq!(
+        meta.iceberg_view_fixture,
+        Some(IcebergViewFixtureDirective {
+            endpoint: IcebergViewFixtureEndpoint::RestMv,
+            target: target.clone(),
+            sample: IcebergViewFixtureSample::SparkMv,
+            storage_table: Some("storage".into()),
+        })
+    );
+    assert_eq!(
+        meta.iceberg_view_fixture_unchanged,
+        Some(IcebergViewFixtureAssertion::Named(target))
+    );
+    let meta = parse_meta(
+        &[
+            "-- @iceberg_view_fixture=rest:case_ns.v:trino-mv".into(),
+            "-- @iceberg_view_fixture_unchanged".into(),
+        ],
+        &re,
+    )
+    .unwrap();
+    let fixture = meta.iceberg_view_fixture.unwrap();
+    assert_eq!(fixture.endpoint, IcebergViewFixtureEndpoint::Rest);
+    assert!(fixture.target.catalog.is_none());
+    assert!(fixture.storage_table.is_none());
+    assert_eq!(
+        meta.iceberg_view_fixture_unchanged,
+        Some(IcebergViewFixtureAssertion::InstalledOnStepOrOnlyFixture)
+    );
+}
+
+#[test]
+fn view_fixture_rejects_unrecognized_parameters_and_duplicate_directives() {
+    let re = meta_re();
+    for invalid in [
+        "-- @iceberg_view_fixture",
+        "-- @iceberg_view_fixture=",
+        "-- @iceberg_view_fixture=other:n.v:trino-mv",
+        "-- @iceberg_view_fixture=rest:other.namespace/schema.v:trino-mv",
+        "-- @iceberg_view_fixture=rest:n.v:../trino-mv",
+        "-- @iceberg_view_fixture=rest:n.v:trino-mv:s.extra",
+        "-- @iceberg_view_fixture=rest:n.v:trino-mv:",
+        "-- @iceberg_view_fixture=rest:n.v:trino-mv:s:extra",
+        "-- @iceberg_view_fixture_unchanged=",
+        "-- @iceberg_view_fixture_unchanged=lake.schema.*",
+    ] {
+        assert!(parse_meta(&[invalid.into()], &re).is_err(), "{invalid}");
+    }
+    let assertion = "-- @iceberg_view_fixture_unchanged".to_string();
+    assert!(parse_meta(&[assertion.clone(), assertion], &re).is_err());
+}
+
+#[test]
+fn view_fixture_definition_preserves_placeholder_names_without_authorizing_them() {
+    use super::{MetadataNameBinding, parse_meta_with_name_binding};
+
+    let line =
+        "-- @iceberg_view_fixture=rest-mv:lake_${suite_uuid0}.ns_${uuid0}.v:trino-mv:${table.name}";
+    let re = meta_re();
+    assert!(parse_meta(&[line.into()], &re).is_err());
+    let meta = parse_meta_with_name_binding(
+        &[line.into()],
+        &re,
+        &[],
+        MetadataNameBinding::LiteralDefinition,
+    )
+    .unwrap();
+    let fixture = meta.iceberg_view_fixture.unwrap();
+    assert_eq!(
+        fixture.target.catalog.as_deref(),
+        Some("lake_${suite_uuid0}")
+    );
+    assert_eq!(fixture.target.namespace, "ns_${uuid0}");
+    assert_eq!(fixture.storage_table.as_deref(), Some("${table.name}"));
+}
+
+#[test]
 fn update_count_expectation_parses_and_validates_one_statement() {
     use super::{UpdateCountExpectation, validate_update_count_expectation};
 

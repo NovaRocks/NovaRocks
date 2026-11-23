@@ -42,6 +42,8 @@ pub(crate) enum Document {
     /// response / metadata / schemas / schema / fields / field. Commit and
     /// stage-create responses use the same LoadTableResult wire shape.
     TableResponse,
+    /// response / metadata / schemas / schema / fields / field.
+    ViewResponse,
 }
 
 impl Document {
@@ -49,7 +51,7 @@ impl Document {
         let envelope = match self {
             Self::Schema => 3,
             Self::TableMetadata => 5,
-            Self::TableResponse => 6,
+            Self::TableResponse | Self::ViewResponse => 6,
         };
         envelope + 3 * (novarocks_type_contract::MAX_VALUE_TYPE_DEPTH - 1)
     }
@@ -154,7 +156,7 @@ pub(crate) fn future_table_format_error(
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
     decoder.disable_recursion_limit(); // The original scanner already bounded this document.
     let version = match document {
-        Document::Schema => return None,
+        Document::Schema | Document::ViewResponse => return None,
         Document::TableMetadata => TableVersion::deserialize(&mut decoder).ok()?.format_version,
         Document::TableResponse => {
             TableEnvelope::deserialize(&mut decoder)

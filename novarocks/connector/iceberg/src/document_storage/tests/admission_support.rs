@@ -180,10 +180,10 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         self.read()
     }
 
-    async fn load_view(
+    async fn load_view_document(
         &self,
         _view: CatalogTableName,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
         self.read()
     }
 

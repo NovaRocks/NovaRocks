@@ -447,12 +447,14 @@ impl NovaRocksCatalog for AdmittedCatalog {
     ) -> Result<bool, ConnectorError> {
         self.inner.view_exists_for_request(view, context).await
     }
-    async fn load_view_for_request(
+    async fn load_view_document_for_request(
         &self,
         view: CatalogTableName,
         context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-        self.inner.load_view_for_request(view, context).await
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
+        self.inner
+            .load_view_document_for_request(view, context)
+            .await
     }
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
         self.inner.view_exists(view).await
@@ -466,11 +468,11 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner.list_views(namespace, bound).await
     }
 
-    async fn load_view(
+    async fn load_view_document(
         &self,
         view: CatalogTableName,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-        self.inner.load_view(view).await
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
+        self.inner.load_view_document(view).await
     }
 
     async fn anchor_written_metadata(

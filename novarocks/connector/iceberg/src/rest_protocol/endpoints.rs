@@ -29,13 +29,14 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
+};
 use reqwest::Method;
 use reqwest::header::HeaderValue;
 use serde::de::DeserializeOwned;
 
 use crate::iceberg::io::StorageFactory;
-use crate::iceberg::spec::ViewMetadata;
 use crate::iceberg::{NamespaceIdent, Runtime, TableIdent};
 use crate::rest_protocol::attempt::{AttemptFailure, SessionGate, ensure_session};
 use crate::rest_protocol::auth::RestAuthOwner;
@@ -45,6 +46,7 @@ use crate::rest_protocol::evidence::DispatchStage;
 use crate::rest_protocol::http::{RequestContext, ResponseBody, RestRequest};
 use crate::rest_protocol::json::{JsonScanner, ViewSink};
 use crate::rest_protocol::minimal_view::{BackendAcquisitionSink, CredentialsSink};
+use crate::rest_protocol::view_metadata::{self, ViewMetadata, ViewObjectKind};
 use crate::rest_protocol::wire::{
     ListNamespaceResponse, ListTablesResponse, LoadTableResult, NamespaceResponse,
 };
@@ -52,14 +54,38 @@ use crate::rest_protocol::wire::{
 /// The value the client sends to ask for vended storage credentials.
 pub(crate) const VENDED_CREDENTIALS: HeaderValue = HeaderValue::from_static("vended-credentials");
 
-/// `GET .../views/{view}` response. NovaRocks owns this wire shape: the
-/// upstream REST crate has no view API.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct LoadViewResult {
-    #[allow(dead_code)]
-    metadata_location: String,
-    metadata: ViewMetadata,
+/// One view response, kept intact until the consumer selects its decoder.
+pub(crate) struct LoadedViewDocument {
+    view: TableIdent,
+    bytes: Vec<u8>,
+}
+
+impl LoadedViewDocument {
+    pub(crate) fn decode(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Result<ViewMetadata, ConnectorError> {
+        let metadata = view_metadata::decode_view_full(&self.bytes, &self.view)?;
+        context.check_active()?;
+        Ok(metadata)
+    }
+
+    pub(crate) fn classify(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Result<ViewObjectKind, ConnectorError> {
+        let kind = view_metadata::classify_view_metadata(&self.bytes, &self.view)?;
+        context.check_active()?;
+        Ok(kind)
+    }
+}
+
+impl fmt::Debug for LoadedViewDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedViewDocument")
+            .finish_non_exhaustive()
+    }
 }
 
 /// One catalog generation's REST session authority and read endpoints.
@@ -632,21 +658,21 @@ impl RestEndpoints {
         }
     }
 
-    /// Load one view's metadata; a missing view is `NotFound`.
-    pub(crate) async fn load_view(
+    /// Load one view response; a missing view is `NotFound`.
+    pub(crate) async fn load_view_document(
         &self,
         view: &TableIdent,
-    ) -> Result<ViewMetadata, ConnectorError> {
+    ) -> Result<LoadedViewDocument, ConnectorError> {
         const OPERATION: &str = "load view";
         let binding = self.binding().await?;
         match self
             .get(OPERATION, &binding, binding.view_url(view), None, &[200])
             .await?
         {
-            Answer::Success { body, .. } => {
-                let response: LoadViewResult = decode_document(OPERATION, body, false).await?;
-                Ok(response.metadata)
-            }
+            Answer::Success { body, .. } => Ok(LoadedViewDocument {
+                view: view.clone(),
+                bytes: read_document_bytes(OPERATION, body).await?,
+            }),
             Answer::Status(404) => Err(not_found(OPERATION)),
             Answer::Status(code) => Err(status_error(OPERATION, code)),
         }
@@ -1472,7 +1498,7 @@ mod tests {
         let endpoints = generation(&server, &[], None).await;
 
         let view = endpoints
-            .load_view(&table("v"))
+            .load_view_document(&table("v"))
             .await
             .expect_err("missing view");
         assert_eq!(view.kind(), ConnectorErrorKind::NotFound);

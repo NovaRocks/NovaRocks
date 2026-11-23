@@ -36,11 +36,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
 use uuid::Uuid;
 
-use crate::iceberg::spec::{Schema, ViewMetadata, ViewRepresentation};
+use crate::iceberg::spec::Schema;
 use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::rest_protocol::mutation::{SqlRepresentationWire, ViewVersionWire};
+use crate::rest_protocol::view_metadata::{
+    StorageTableIdentifier, ViewMetadata, ViewRepresentation,
+};
 
 /// The only dialect NovaRocks writes.
 pub(crate) const VIEW_DIALECT_TRINO: &str = "trino";
@@ -62,7 +66,12 @@ pub(crate) struct ViewDefinition {
 }
 
 impl ViewDefinition {
-    fn version(self, version_id: i32, schema_id: i32) -> ViewVersionWire {
+    fn version(
+        self,
+        version_id: i32,
+        schema_id: i32,
+        storage_table: Option<StorageTableIdentifier>,
+    ) -> ViewVersionWire {
         ViewVersionWire {
             version_id,
             schema_id,
@@ -74,6 +83,7 @@ impl ViewDefinition {
             }],
             default_catalog: self.default_catalog,
             default_namespace: self.default_namespace,
+            storage_table,
         }
     }
 }
@@ -92,10 +102,12 @@ impl ViewCreate {
         name: String,
         definition: ViewDefinition,
         properties: HashMap<String, String>,
+        storage_table: Option<StorageTableIdentifier>,
     ) -> Result<Self, String> {
         validate_history_entries(&properties)?;
         let schema = definition.schema.clone();
-        let version = definition.version(INITIAL_VIEW_VERSION_ID, schema.schema_id());
+        let version =
+            definition.version(INITIAL_VIEW_VERSION_ID, schema.schema_id(), storage_table);
         Ok(Self {
             name,
             schema,
@@ -140,20 +152,13 @@ impl ValidatedViewReplace {
         current: &ViewMetadata,
         definition: ViewDefinition,
         properties: HashMap<String, String>,
-    ) -> Result<Self, String> {
-        Self::validate_with_operation(ident, current, definition, properties, Uuid::now_v7())
-    }
-
-    fn validate_with_operation(
-        ident: TableIdent,
-        current: &ViewMetadata,
-        definition: ViewDefinition,
-        properties: HashMap<String, String>,
-        operation_id: Uuid,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ConnectorMutationFailure> {
+        if let Some(storage_table) = current.current_version().storage_table() {
+            return Err(materialized_view_already_exists(storage_table));
+        }
         let mut merged = current.properties().clone();
         merged.extend(properties.clone());
-        validate_history_entries(&merged)?;
+        validate_history_entries(&merged).map_err(invalid_replacement)?;
         if !merged
             .get(REPLACE_DROP_DIALECT_ALLOWED)
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))
@@ -162,10 +167,8 @@ impl ValidatedViewReplace {
                 .current_version()
                 .representations()
                 .iter()
-                .map(|representation| {
-                    let ViewRepresentation::Sql(sql) = representation;
-                    sql.dialect.to_ascii_lowercase()
-                })
+                .filter_map(ViewRepresentation::as_sql)
+                .map(|sql| sql.dialect.to_ascii_lowercase())
                 .collect::<BTreeSet<_>>();
             let new_dialects = BTreeSet::from([VIEW_DIALECT_TRINO.to_string()]);
             let dropped = current_dialects
@@ -175,11 +178,11 @@ impl ValidatedViewReplace {
             if !dropped.is_empty() {
                 let current_dialects = current_dialects.into_iter().collect::<Vec<_>>();
                 let new_dialects = new_dialects.into_iter().collect::<Vec<_>>();
-                return Err(format!(
+                return Err(invalid_replacement(format!(
                     "Iceberg view {ident} replacement would drop SQL dialects {dropped:?}: \
                      the current version has {current_dialects:?} and the new version has \
                      {new_dialects:?}; set {REPLACE_DROP_DIALECT_ALLOWED}=true to allow it"
-                ));
+                )));
             }
         }
 
@@ -197,7 +200,9 @@ impl ValidatedViewReplace {
                     .into_builder()
                     .with_schema_id(next_id)
                     .build()
-                    .map_err(|error| format!("build replaced Iceberg view schema: {error}"))?;
+                    .map_err(|error| {
+                        invalid_replacement(format!("build replaced Iceberg view schema: {error}"))
+                    })?;
                 (ViewSchema::New(Box::new(schema)), -1)
             }
         };
@@ -207,17 +212,19 @@ impl ValidatedViewReplace {
             .max()
             .unwrap_or(0)
             .checked_add(1)
-            .ok_or_else(|| format!("Iceberg view {ident} version ID space exhausted"))?;
+            .ok_or_else(|| {
+                invalid_replacement(format!("Iceberg view {ident} version ID space exhausted"))
+            })?;
         let mut definition = definition;
         definition.summary.insert(
             OPERATION_ID_SUMMARY_KEY.to_string(),
-            operation_id.to_string(),
+            Uuid::now_v7().to_string(),
         );
         Ok(Self {
             ident,
             uuid: current.uuid(),
             schema,
-            version: definition.version(version_id, schema_id),
+            version: definition.version(version_id, schema_id, None),
             properties,
         })
     }
@@ -241,6 +248,20 @@ impl ValidatedViewReplace {
     pub(crate) fn properties(&self) -> &HashMap<String, String> {
         &self.properties
     }
+}
+
+pub(crate) fn materialized_view_already_exists(
+    storage_table: &StorageTableIdentifier,
+) -> ConnectorMutationFailure {
+    ConnectorMutationFailure::new(
+        ConnectorMutationFailureKind::AlreadyExists,
+        "Iceberg materialized view already exists",
+    )
+    .with_existing_object(storage_table.materialized_view_kind())
+}
+
+fn invalid_replacement(message: String) -> ConnectorMutationFailure {
+    ConnectorMutationFailure::new(ConnectorMutationFailureKind::InvalidRequest, message)
 }
 
 /// The view's schema the reference server would reuse for `schema`: equal
@@ -284,6 +305,7 @@ mod tests {
 
     use super::*;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
+    use crate::rest_protocol::view_metadata::decode_test_metadata;
 
     fn columns(names: &[&str]) -> Schema {
         Schema::builder()
@@ -318,6 +340,14 @@ mod tests {
     /// Metadata of view `db.v` whose versions 1..=n all use schema 0 (`a`,
     /// `b`); the current version is n and carries `dialects`.
     fn metadata(versions: i32, dialects: &[&str], properties: serde_json::Value) -> ViewMetadata {
+        decode_test_metadata(metadata_json(versions, dialects, properties))
+    }
+
+    fn metadata_json(
+        versions: i32,
+        dialects: &[&str],
+        properties: serde_json::Value,
+    ) -> serde_json::Value {
         let version = |id: i32, dialects: &[&str]| {
             serde_json::json!({
                 "version-id": id,
@@ -330,7 +360,7 @@ mod tests {
                 "default-namespace": ["db"],
             })
         };
-        serde_json::from_value(serde_json::json!({
+        serde_json::json!({
             "view-uuid": "fa6506c3-7681-40c8-86dc-e36561f83385",
             "format-version": 1,
             "location": "s3://warehouse/db/v",
@@ -343,8 +373,7 @@ mod tests {
             })).collect::<Vec<_>>(),
             "schemas": [serde_json::to_value(columns(&["a", "b"]).into_builder().with_schema_id(0).build().unwrap()).unwrap()],
             "properties": properties,
-        }))
-        .unwrap()
+        })
     }
 
     fn ident() -> TableIdent {
@@ -355,7 +384,7 @@ mod tests {
         current: &ViewMetadata,
         schema: Schema,
         properties: &[(&str, &str)],
-    ) -> Result<ValidatedViewReplace, String> {
+    ) -> Result<ValidatedViewReplace, ConnectorMutationFailure> {
         ValidatedViewReplace::validate(
             ident(),
             current,
@@ -388,11 +417,22 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_replacement_validation_refuses_a_current_storage_table() {
+        let mut json = metadata_json(1, &["trino"], serde_json::json!({}));
+        json["versions"][0]["storage-table"] =
+            serde_json::json!({"namespace":["db"], "name":"storage"});
+        let error = replace(&decode_test_metadata(json), columns(&["a", "b"]), &[]).unwrap_err();
+        assert_eq!(error.kind(), ConnectorMutationFailureKind::AlreadyExists);
+        assert!(
+            matches!(error.existing_object(), Some(novarocks_spi::connector::ConnectorObjectKind::MaterializedView { storage_table }) if storage_table.name.as_ref() == "storage")
+        );
+    }
+
+    #[test]
     fn identifier_fields_take_part_in_schema_equality() {
-        let mut json =
-            serde_json::to_value(metadata(1, &["trino"], serde_json::json!({}))).unwrap();
+        let mut json = metadata_json(1, &["trino"], serde_json::json!({}));
         json["schemas"][0]["fields"][0]["required"] = true.into();
-        let current: ViewMetadata = serde_json::from_value(json).unwrap();
+        let current = decode_test_metadata(json);
         let fields = || {
             vec![
                 Arc::new(NestedField::required(
@@ -459,9 +499,15 @@ mod tests {
     fn dropping_a_dialect_is_refused_unless_allowed() {
         let current = metadata(2, &["trino", "Spark"], serde_json::json!({}));
         let error = replace(&current, columns(&["a", "b"]), &[]).unwrap_err();
-        assert!(error.contains("[\"spark\"]"), "{error}");
-        assert!(error.contains("[\"spark\", \"trino\"]"), "{error}");
-        assert!(error.contains(REPLACE_DROP_DIALECT_ALLOWED), "{error}");
+        assert!(error.message().contains("[\"spark\"]"), "{error}");
+        assert!(
+            error.message().contains("[\"spark\", \"trino\"]"),
+            "{error}"
+        );
+        assert!(
+            error.message().contains(REPLACE_DROP_DIALECT_ALLOWED),
+            "{error}"
+        );
 
         for allowed in ["true", "TRUE", "True"] {
             assert!(
@@ -499,7 +545,9 @@ mod tests {
         let retired_only = metadata(2, &["starrocks"], serde_json::json!({}));
         let error = replace(&retired_only, columns(&["a", "b"]), &[]).unwrap_err();
         assert!(
-            error.contains("would drop SQL dialects [\"starrocks\"]"),
+            error
+                .message()
+                .contains("would drop SQL dialects [\"starrocks\"]"),
             "{error}"
         );
     }
@@ -522,6 +570,7 @@ mod tests {
                     "v".to_string(),
                     definition(columns(&["a"]), "select 1"),
                     HashMap::from([(VERSION_HISTORY_NUM_ENTRIES.to_string(), invalid.to_string())]),
+                    None,
                 )
                 .is_err(),
                 "create {invalid:?}"
@@ -552,6 +601,7 @@ mod tests {
             "v".to_string(),
             definition(columns(&["a"]), "select 1"),
             HashMap::from([("comment".to_string(), "c".to_string())]),
+            None,
         )
         .unwrap();
         assert_eq!(creation.name(), "v");

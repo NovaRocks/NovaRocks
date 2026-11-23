@@ -16,7 +16,7 @@
 // under the License.
 
 //! Runner-owned shared REST namespace and fixed run-storage checks.
-use crate::types::ConnectionConfig;
+use crate::types::{ConnectionConfig, IcebergViewFixtureTarget};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::fixture_run::{RunStorageScope, ScratchIdentity, canonical_s3};
 use novarocks_cluster_harness::isolated_iceberg_rest::{RestObjectStoreOwner, RestStorageBinding};
@@ -484,6 +484,45 @@ impl NamespaceGuard {
         Ok(url)
     }
 
+    pub(crate) fn view_fixture_catalog<'a>(
+        &'a self,
+        target: &'a IcebergViewFixtureTarget,
+    ) -> Result<&'a str> {
+        target
+            .catalog
+            .as_deref()
+            .or(self.catalog.as_deref())
+            .context("Iceberg view fixture has no bound catalog")
+    }
+
+    pub(crate) fn view_fixture_url(
+        &self,
+        target: &IcebergViewFixtureTarget,
+        rest_endpoint: &str,
+        owns_case_namespace: impl FnOnce(&str) -> bool,
+    ) -> Result<reqwest::Url> {
+        let namespace = &target.namespace;
+        ensure!(
+            self.owned(namespace) && owns_case_namespace(namespace),
+            "Iceberg view fixture must address a namespace declared by the original case"
+        );
+        let catalog = self.view_fixture_catalog(target)?;
+        let Some(Catalog::Rest(base)) = self.catalog_fact(catalog)? else {
+            anyhow::bail!("Iceberg view fixture catalog {catalog} is not a bound REST catalog");
+        };
+        ensure!(
+            base == rest_endpoint.trim_end_matches('/')
+                && (self.facts.rest_storage_owner(&base)?.is_some() || self.storage.is_some()),
+            "Iceberg view fixture catalog differs from the original REST fixture"
+        );
+        let mut url = Self::namespace_url(&base, namespace)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid Iceberg view fixture URI"))?
+            .push("views")
+            .push(&target.view);
+        Ok(url)
+    }
+
     fn verify_object(
         &self,
         base: &str,
@@ -598,6 +637,57 @@ mod tests {
                 .orphan_fixture_table_url(Some("owned_rest"), &foreign_case, "test", endpoint)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn view_fixture_uses_the_published_endpoint_and_the_declared_case_namespace() {
+        let mut guard = guard();
+        let endpoint = "http://127.0.0.1:1";
+        let different_endpoint = "http://127.0.0.1:2";
+        let namespace = format!("{}_case", guard.identity.run_id);
+        let mut target = IcebergViewFixtureTarget {
+            catalog: None,
+            namespace: namespace.clone(),
+            view: "fixture".into(),
+        };
+        guard.set_session_context(Some("mv".into()), Some("different_schema".into()));
+        guard
+            .after("CREATE CATALOG mv USING iceberg WITH (\"iceberg.catalog.type\" = 'rest', \"uri\" = 'http://127.0.0.1:1')")
+            .unwrap();
+        // Shared publications carry original run storage and pass their exact
+        // published origin, while private fixtures bind their origins directly.
+        assert!(guard.view_fixture_url(&target, endpoint, |_| true).is_ok());
+        guard.storage = None;
+        assert!(guard.view_fixture_url(&target, endpoint, |_| true).is_err());
+        guard
+            .facts
+            .bind_origins(
+                &[endpoint, different_endpoint],
+                RestObjectStoreOwner::MachineScratch,
+            )
+            .unwrap();
+        let url = guard
+            .view_fixture_url(&target, endpoint, |name| name == namespace)
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!("{endpoint}/v1/namespaces/{namespace}/views/fixture")
+        );
+        assert!(
+            guard
+                .view_fixture_url(&target, endpoint, |_| false)
+                .is_err()
+        );
+        assert!(
+            guard
+                .view_fixture_url(&target, different_endpoint, |_| true)
+                .is_err()
+        );
+        target.namespace = "foreign".into();
+        assert!(guard.view_fixture_url(&target, endpoint, |_| true).is_err());
+        target.namespace = namespace;
+        target.catalog = Some("different_catalog".into());
+        assert!(guard.view_fixture_url(&target, endpoint, |_| true).is_err());
     }
 
     fn server(responses: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<Vec<String>>) {

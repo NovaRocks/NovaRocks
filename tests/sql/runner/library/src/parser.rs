@@ -29,6 +29,7 @@ use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
+use std::sync::LazyLock;
 
 pub(crate) const MV_DOCUMENT_OBSERVATION_TAG: &str = "test-capability:mv-document-observation";
 
@@ -86,7 +87,10 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
             let bare_key = body.trim().to_ascii_lowercase();
             if matches!(
                 bare_key.as_str(),
-                "expect_trino_error" | "expect_update_count"
+                "expect_trino_error"
+                    | "expect_update_count"
+                    | "iceberg_view_fixture"
+                    | "iceberg_view_fixture_unchanged"
             ) {
                 return Some((bare_key, String::new()));
             }
@@ -97,6 +101,8 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
                     | "expect_update_count"
                     | "iceberg_scan_layout"
                     | "iceberg_dictionary_output"
+                    | "iceberg_view_fixture"
+                    | "iceberg_view_fixture_unchanged"
                     | "native_observation_attempts"
                     | "publication_catalog_fault_target"
                     | "publication_catalog_fault_timing"
@@ -213,6 +219,73 @@ fn parse_publication_service_hold(raw: &str) -> anyhow::Result<PublicationServic
 enum MetadataNameBinding {
     Bound,
     LiteralDefinition,
+}
+
+fn view_fixture_names(value: &str, binding: MetadataNameBinding) -> Option<regex::Captures<'_>> {
+    if matches!(binding, MetadataNameBinding::Bound) && value.contains('$') {
+        return None;
+    }
+    static NAMES: LazyLock<Regex> = LazyLock::new(|| {
+        let ident = r"(?:[a-zA-Z0-9_]|\$\{[a-zA-Z0-9_.-]+\})+";
+        Regex::new(&format!(r"^(?:(?:({ident})\.)?({ident})\.)?({ident})$"))
+            .expect("view fixture name pattern")
+    });
+    NAMES.captures(value)
+}
+
+fn parse_view_fixture_target(
+    value: &str,
+    binding: MetadataNameBinding,
+) -> Result<IcebergViewFixtureTarget> {
+    let captures = view_fixture_names(value, binding)
+        .filter(|names| names.get(2).is_some())
+        .context("Iceberg view fixture target requires plain [catalog.]namespace.view names")?;
+    Ok(IcebergViewFixtureTarget {
+        catalog: captures.get(1).map(|value| value.as_str().to_string()),
+        namespace: captures[2].to_string(),
+        view: captures[3].to_string(),
+    })
+}
+
+fn parse_view_fixture(
+    raw: &str,
+    binding: MetadataNameBinding,
+) -> Result<IcebergViewFixtureDirective> {
+    let parts = raw.split(':').map(str::trim).collect::<Vec<_>>();
+    let (endpoint, target, sample, storage_table) = match parts.as_slice() {
+        [endpoint, target, sample] => (*endpoint, *target, *sample, None),
+        [endpoint, target, sample, storage_table] => {
+            (*endpoint, *target, *sample, Some(*storage_table))
+        }
+        _ => bail!(
+            "@iceberg_view_fixture requires endpoint:[catalog.]namespace.view:sample[:storage-table-name]"
+        ),
+    };
+    let endpoint = match endpoint {
+        "rest" => IcebergViewFixtureEndpoint::Rest,
+        "rest-mv" => IcebergViewFixtureEndpoint::RestMv,
+        _ => bail!("@iceberg_view_fixture endpoint must be rest or rest-mv"),
+    };
+    let sample = match sample {
+        "trino-mv" => IcebergViewFixtureSample::TrinoMv,
+        "spark-mv" => IcebergViewFixtureSample::SparkMv,
+        _ => bail!("@iceberg_view_fixture sample must be trino-mv or spark-mv"),
+    };
+    let storage_table = storage_table
+        .map(|name| {
+            ensure!(
+                view_fixture_names(name, binding).is_some_and(|names| names.get(2).is_none()),
+                "@iceberg_view_fixture storage table requires a plain name"
+            );
+            Ok::<_, anyhow::Error>(name.to_owned())
+        })
+        .transpose()?;
+    Ok(IcebergViewFixtureDirective {
+        endpoint,
+        target: parse_view_fixture_target(target, binding)?,
+        sample,
+        storage_table,
+    })
 }
 
 /// A definition retains placeholder spelling; it grants no executable target.
@@ -860,6 +933,31 @@ fn parse_meta_with_name_binding(
             "iceberg_orphan_fixture_absent" => {
                 meta.iceberg_orphan_fixture_absent = parse_bool(&raw_value)?;
             }
+            "iceberg_view_fixture" => {
+                ensure!(
+                    meta.iceberg_view_fixture.is_none(),
+                    "duplicate @iceberg_view_fixture"
+                );
+                meta.iceberg_view_fixture = Some(parse_view_fixture(&raw_value, name_binding)?);
+            }
+            "iceberg_view_fixture_unchanged" => {
+                ensure!(
+                    meta.iceberg_view_fixture_unchanged.is_none(),
+                    "duplicate @iceberg_view_fixture_unchanged"
+                );
+                meta.iceberg_view_fixture_unchanged = Some(if raw_value.is_empty() {
+                    ensure!(
+                        !line.contains('='),
+                        "@iceberg_view_fixture_unchanged target is empty"
+                    );
+                    IcebergViewFixtureAssertion::InstalledOnStepOrOnlyFixture
+                } else {
+                    IcebergViewFixtureAssertion::Named(parse_view_fixture_target(
+                        &raw_value,
+                        name_binding,
+                    )?)
+                });
+            }
             "imv_equivalence_check" => {
                 meta.imv_equivalence_check = Some(raw_value);
             }
@@ -1304,6 +1402,14 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .or_else(|| base.iceberg_orphan_fixture.clone()),
         iceberg_orphan_fixture_absent: override_meta.iceberg_orphan_fixture_absent
             || base.iceberg_orphan_fixture_absent,
+        iceberg_view_fixture: override_meta
+            .iceberg_view_fixture
+            .clone()
+            .or_else(|| base.iceberg_view_fixture.clone()),
+        iceberg_view_fixture_unchanged: override_meta
+            .iceberg_view_fixture_unchanged
+            .clone()
+            .or_else(|| base.iceberg_view_fixture_unchanged.clone()),
         imv_equivalence_check: override_meta
             .imv_equivalence_check
             .clone()
@@ -1647,6 +1753,13 @@ fn prepare_sql_case(
     let (file_meta, _) =
         extract_meta_and_sql_with_name_binding(&file_meta_lines, meta_re, name_binding)
             .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
+    ensure!(
+        frames.sections.len() <= 1
+            || (file_meta.iceberg_view_fixture.is_none()
+                && file_meta.iceberg_view_fixture_unchanged.is_none()),
+        "{}: Iceberg view fixture directives belong to a specific query step",
+        sql_path.display()
+    );
 
     // Detect case-level sequential flags from the native runner metadata and
     // from migrated legacy `-- name: ... @sequential` markers.
@@ -1676,6 +1789,14 @@ fn prepare_sql_case(
         let sql = crate::fixture_context::rewrite_metadata_filters(&sql, &namespace_rewrites);
 
         let mut merged_meta = merge_meta(&file_meta, &section_meta);
+        ensure!(
+            !merged_meta.cleanup
+                || (merged_meta.iceberg_view_fixture.is_none()
+                    && merged_meta.iceberg_view_fixture_unchanged.is_none()),
+            "{} ({}): Iceberg view fixture directives must precede cleanup steps",
+            sql_path.display(),
+            section_id
+        );
         catalogs.rewrite_meta(&mut merged_meta, &sql)?;
         if let Some(contract) = &merged_meta.query_stats_contract {
             if merged_meta.expect_trino_error.is_some()

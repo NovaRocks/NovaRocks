@@ -17,6 +17,7 @@
 
 use super::*;
 use novarocks_connector_contract::PureProviderCompileError;
+use novarocks_spi::connector::ConnectorObjectKind;
 use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
 use novarocks_type_contract::FunctionValueType;
 use std::collections::HashMap;
@@ -256,6 +257,20 @@ impl ObservedView {
     }
 }
 impl ConnectorViewMetadata for ObservedView {
+    fn classify_view(
+        &self,
+        _: ConnectorViewRequest,
+    ) -> Result<Option<ConnectorObjectKind>, ConnectorError> {
+        panic!("no view classification")
+    }
+
+    fn list_classified_views(
+        &self,
+        _: ConnectorListViewsRequest,
+    ) -> Result<Vec<(ConnectorViewIdentity, ConnectorObjectKind)>, ConnectorError> {
+        panic!("no classified view listing")
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }

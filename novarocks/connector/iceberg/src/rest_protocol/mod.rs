@@ -38,6 +38,7 @@ pub(crate) mod routing;
 pub(crate) mod test_server;
 
 pub(crate) mod configuration;
+pub(crate) mod view_metadata;
 pub(crate) mod wire;
 
 #[cfg(test)]

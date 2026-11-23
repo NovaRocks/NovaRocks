@@ -682,20 +682,20 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         Ok(result)
     }
     #[cfg(not(test))]
-    async fn load_view_for_request(
+    async fn load_view_document_for_request(
         &self,
         view: CatalogTableName,
         context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError>;
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError>;
     #[cfg(test)]
-    async fn load_view_for_request(
+    async fn load_view_document_for_request(
         &self,
         view: CatalogTableName,
         context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
         use novarocks_spi::connector::ConnectorOperationControl;
         context.check_active()?;
-        let result = self.load_view(view).await?;
+        let result = self.load_view_document(view).await?;
         context.check_active()?;
         Ok(result)
     }
@@ -742,10 +742,10 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError>;
 
-    async fn load_view(
+    async fn load_view_document(
         &self,
         view: CatalogTableName,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError>;
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError>;
 
     // ---- B. Direct mutations -------------------------------------------
 

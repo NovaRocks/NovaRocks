@@ -193,6 +193,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.admit.kill_query_target_not_running" => "NOT_SUPPORTED",
         "sql.admit.kill_query_permission_denied" => "PERMISSION_DENIED",
         "sql.admit.table_already_exists" => "TABLE_ALREADY_EXISTS",
+        "sql.admit.materialized_view_target" => "GENERIC_USER_ERROR",
         "sql.admit.schema_already_exists" => "SCHEMA_ALREADY_EXISTS",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
         "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",
@@ -1817,6 +1818,39 @@ fn ctas_existing_target_uses_the_original_statement_location_and_trino_code() {
         }),
     );
     assert!(wire.message.contains("test.s.destination"));
+}
+
+#[test]
+fn drop_view_materialized_target_uses_generic_user_error_and_its_statement_location() {
+    use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
+
+    let source = "-- comment before the statement\n  DROP VIEW ice.db.v";
+    let start = source.find("DROP").unwrap();
+    let message = "View 'ice.db.v' does not exist, but a materialized view with that name exists. Did you mean DROP MATERIALIZED VIEW ice.db.v?";
+    let user = DmlAdmissionError::MaterializedViewTarget.to_user_error(
+        source,
+        novarocks_parser::Span::new(start, source.len()),
+        message,
+    );
+    assert_eq!(user.code().as_str(), "sql.admit.materialized_view_target");
+    assert_eq!(user.retry(), RetryClass::Never);
+    let error = QueryServiceError::from_user_error(user);
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &error,
+        sql: source,
+    });
+    assert_wire(&wire, "GENERIC_USER_ERROR");
+    assert_eq!(
+        wire.message,
+        format!("[sql.admit.materialized_view_target] {message} at line 2 column 3")
+    );
+    assert_eq!(
+        wire.error_location,
+        Some(TrinoErrorLocation {
+            line_number: 2,
+            column_number: 3,
+        }),
+    );
 }
 
 mod iceberg_commit;

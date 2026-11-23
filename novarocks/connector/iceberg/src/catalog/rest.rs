@@ -954,14 +954,17 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         Ok(result)
     }
 
-    async fn load_view_for_request(
+    async fn load_view_document_for_request(
         &self,
         view: CatalogTableName,
         context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
         use novarocks_spi::connector::ConnectorOperationControl;
         context.check_active()?;
-        let result = self.listing.run(&context, self.load_view(view)).await?;
+        let result = self
+            .listing
+            .run(&context, self.load_view_document(view))
+            .await?;
         context.check_active()?;
         Ok(result)
     }
@@ -1016,12 +1019,12 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         Ok(super::delegate::sorted_unique(collector.finish()?))
     }
 
-    async fn load_view(
+    async fn load_view_document(
         &self,
         view: CatalogTableName,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+    ) -> Result<crate::rest_protocol::endpoints::LoadedViewDocument, ConnectorError> {
         let ident = super::delegate::table_ident(&view)?;
-        self.endpoints.load_view(&ident).await
+        self.endpoints.load_view_document(&ident).await
     }
 
     async fn load_table_for_read(
