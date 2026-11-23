@@ -218,7 +218,6 @@ impl SqlCapturedCatalogPreparation {
         self.describe_inner(parameters, session, functions, policy, None, None, true)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "Original description facts")]
     fn describe_inner(
         self,
         parameters: &super::SqlPreparedParameters,
