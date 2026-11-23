@@ -1022,7 +1022,7 @@ mod tests {
         }
 
         let mut wrong_metadata = source.metadata().clone();
-        wrong_metadata.insert(id_key.into(), "3".into());
+        wrong_metadata.insert(id_key, "3");
         let mut wrong_fields = schema.fields().to_vec();
         wrong_fields[1] = Arc::new(source.clone().with_metadata(wrong_metadata));
         let Err(error) = ConnectorRowMutationPreparation::try_new(
