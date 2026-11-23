@@ -83,11 +83,7 @@ impl SessionPropertyCpuInput {
     pub(crate) fn run(mut self) -> Result<PreparedSessionProperties, QueryServiceError> {
         let evaluator = SessionPropertyEvaluation {
             interpreter: &self.interpreter,
-            sql_semantics: self
-                .staged
-                .sql_semantics()
-                .clone()
-                .with_statement_time(self.staged.statement_time(self.statement_time)),
+            sql_semantics: self.staged.statement_sql_semantics(self.statement_time),
             control: &self.control,
             scope: &self.scope,
             window: &self.window,
@@ -416,11 +412,7 @@ impl QuerySessionPreparation {
             );
             let context = input.compiler.property_cpu_context(
                 input.original.current_database().to_owned(),
-                input
-                    .original
-                    .sql_semantics()
-                    .clone()
-                    .with_statement_time(input.original.statement_time(input.statement_time)),
+                input.original.statement_sql_semantics(input.statement_time),
                 input.interpreter,
                 control,
                 owner.scope().clone(),

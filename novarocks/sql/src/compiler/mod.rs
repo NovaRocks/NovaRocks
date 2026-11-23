@@ -948,6 +948,8 @@ pub enum RootDistributionRequirement {
 /// SQL-relevant session state frozen at statement admission.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlSessionContext {
+    /// Relation lookup uses these names, including any defaults from admission.
+    /// Caller session expressions consume the original facts in `sql_semantics`.
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub optimizer_settings: SessionOptimizerSettings,

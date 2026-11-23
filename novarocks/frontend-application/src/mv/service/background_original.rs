@@ -159,6 +159,7 @@ impl BackgroundManagementPass {
             let topology = dependencies.topology.snapshot().map_err(|e| {
                 QueryServiceError::new(QueryServiceErrorKind::Unavailable, e.to_string())
             })?;
+            // The cadence pass has a service-owned clock and no client session.
             let request = RequestContext::admit(RequestAdmission::new(
                 None,
                 String::new(),
@@ -513,6 +514,8 @@ impl ScheduledCall {
                 self.scope.cancellation().map_err(work_error)?,
                 None,
             );
+            // The scheduler uses the target namespace for lookup. Only client
+            // admission can supply caller facts to session expressions.
             let request = RequestContext::admit(RequestAdmission::new(
                 self.request.target.catalog.clone(),
                 self.request.target.database.clone(),

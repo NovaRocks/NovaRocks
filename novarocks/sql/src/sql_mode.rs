@@ -21,6 +21,7 @@
 //! Unknown modes remain in the original assignment.
 
 use novarocks_parser::ast;
+use std::sync::Arc;
 
 const ONLY_FULL_GROUP_BY: u64 = 1 << 5;
 const ALLOW_THROW_EXCEPTION: u64 = 1 << 9;
@@ -108,6 +109,37 @@ impl SqlMode {
 
 pub const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: i32 = 5;
 
+/// Session expressions read the admitted caller even when resolving names
+/// against a stored view's namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatementSessionEnvironment {
+    principal: Arc<str>,
+    catalog: Option<String>,
+    schema: Option<String>,
+}
+
+impl StatementSessionEnvironment {
+    pub fn new(principal: Arc<str>, catalog: Option<String>, schema: Option<String>) -> Self {
+        Self {
+            principal,
+            catalog,
+            schema,
+        }
+    }
+
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    pub fn catalog(&self) -> Option<&str> {
+        self.catalog.as_deref()
+    }
+
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+}
+
 /// Immutable SQL semantics frozen once for a connection or statement.
 /// Each field keeps its SQL owner; assigning one setting preserves the rest.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -115,9 +147,19 @@ pub struct SqlSemanticSettings {
     sql_mode: SqlMode,
     recursive_cte_max_depth: Option<i32>,
     statement_time: Option<novarocks_type_contract::StatementTimeEnvironment>,
+    statement_session: Option<Arc<StatementSessionEnvironment>>,
 }
 
 impl SqlSemanticSettings {
+    pub fn statement_session(&self) -> Option<&StatementSessionEnvironment> {
+        self.statement_session.as_deref()
+    }
+
+    pub fn with_statement_session(mut self, value: Option<StatementSessionEnvironment>) -> Self {
+        self.statement_session = value.map(Arc::new);
+        self
+    }
+
     pub const fn statement_time(
         &self,
     ) -> Option<novarocks_type_contract::StatementTimeEnvironment> {

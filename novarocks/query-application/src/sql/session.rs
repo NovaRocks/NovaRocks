@@ -21,8 +21,10 @@ use crate::session_error::QueryServiceError;
 use crate::session_value::{SessionTimeZone, SessionValue, StatementSessionError};
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_sql::compiler::SessionOptimizerSettings;
-use novarocks_types::naming::DEFAULT_DATABASE;
-use std::fmt;
+use novarocks_sql::sql_mode::{SqlSemanticSettings, StatementSessionEnvironment};
+use novarocks_type_contract::StatementTimeEnvironment;
+use novarocks_types::naming::{DEFAULT_CATALOG, DEFAULT_DATABASE};
+use std::{fmt, sync::Arc};
 mod property_error;
 pub mod registry;
 pub use property_error::session_property_error;
@@ -32,12 +34,12 @@ use registry::{SessionCatalogPropertyPort, SessionPropertyInputs, SessionPropert
 /// Runtime settings never author an explicit property override.
 #[derive(Clone)]
 pub struct SessionSqlState {
+    principal: Option<Arc<str>>,
     current_catalog: Option<String>,
-    current_database: String,
-    explicit_database: bool,
+    current_schema: Option<String>,
     execution_settings: SessionExecutionSettings,
     optimizer_settings: SessionOptimizerSettings,
-    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+    sql_semantics: SqlSemanticSettings,
     property_inputs: SessionPropertyInputs,
     presentation: Option<ClientPresentationFamily>,
     time_zone: Option<SessionTimeZone>,
@@ -46,12 +48,12 @@ pub struct SessionSqlState {
 impl Default for SessionSqlState {
     fn default() -> Self {
         Self {
+            principal: None,
             current_catalog: None,
-            current_database: DEFAULT_DATABASE.into(),
-            explicit_database: false,
+            current_schema: None,
             execution_settings: SessionExecutionSettings::default(),
             optimizer_settings: SessionOptimizerSettings::default(),
-            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            sql_semantics: SqlSemanticSettings::default(),
             property_inputs: SessionPropertyInputs::default(),
             presentation: None,
             time_zone: None,
@@ -61,16 +63,45 @@ impl Default for SessionSqlState {
 }
 impl SessionSqlState {
     pub fn current_catalog(&self) -> Option<&str> {
-        self.current_catalog.as_deref()
+        self.current_catalog
+            .as_deref()
+            .filter(|name| *name != DEFAULT_CATALOG)
     }
     pub fn current_database(&self) -> &str {
-        &self.current_database
+        self.current_schema.as_deref().unwrap_or(DEFAULT_DATABASE)
     }
     pub fn explicit_database(&self) -> Option<&str> {
-        self.explicit_database.then_some(&self.current_database)
+        self.current_schema.as_deref()
     }
-    pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
+    pub fn sql_semantics(&self) -> &SqlSemanticSettings {
         &self.sql_semantics
+    }
+
+    /// Retain the principal already checked by the frontend session boundary.
+    pub fn with_client_principal(mut self, principal: Arc<str>) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
+    fn statement_session(&self) -> Option<StatementSessionEnvironment> {
+        self.principal.as_ref().map(|principal| {
+            StatementSessionEnvironment::new(
+                Arc::clone(principal),
+                self.current_catalog.clone(),
+                self.current_schema.clone(),
+            )
+        })
+    }
+
+    /// Project the caller's frozen facts for computations before attempt admission.
+    pub fn statement_sql_semantics(
+        &self,
+        admitted: StatementTimeEnvironment,
+    ) -> SqlSemanticSettings {
+        self.sql_semantics
+            .clone()
+            .with_statement_session(self.statement_session())
+            .with_statement_time(self.statement_time(admitted))
     }
     pub fn execution_settings(&self) -> &SessionExecutionSettings {
         &self.execution_settings
@@ -88,11 +119,8 @@ impl SessionSqlState {
     }
     /// Preserve the original statement instant while resolving the effective
     /// zone of this session projection, including a statement-local override.
-    pub fn statement_time(
-        &self,
-        admitted: novarocks_type_contract::StatementTimeEnvironment,
-    ) -> novarocks_type_contract::StatementTimeEnvironment {
-        novarocks_type_contract::StatementTimeEnvironment {
+    pub fn statement_time(&self, admitted: StatementTimeEnvironment) -> StatementTimeEnvironment {
+        StatementTimeEnvironment {
             start: admitted.start,
             zone: self.effective_time_zone(admitted.zone),
         }
@@ -110,15 +138,12 @@ impl SessionSqlState {
             .prepare_header_inputs(&value.properties, catalogs)
             .map_err(session_property_error)?;
         let mut state = Self {
+            current_catalog: value.catalog,
+            current_schema: value.schema,
             presentation: Some(value.presentation),
             time_zone: value.time_zone,
             ..Self::default()
         };
-        state.current_catalog = value.catalog;
-        if let Some(schema) = value.schema {
-            state.current_database = schema;
-            state.explicit_database = true;
-        }
         inputs
             .project_into(&mut state)
             .map_err(session_property_error)?;
@@ -128,8 +153,7 @@ impl SessionSqlState {
     /// Names are client input until the role's original catalog owner admits them.
     pub fn assign_session_names(&mut self, catalog: Option<String>, schema: String) {
         self.current_catalog = catalog;
-        self.current_database = schema;
-        self.explicit_database = true;
+        self.current_schema = Some(schema);
     }
     pub fn set_resolved_database_context(&mut self, catalog: Option<String>, database: String) {
         self.assign_session_names(catalog, database);
@@ -162,7 +186,13 @@ impl SessionSqlState {
     fn stage_effects(&self, effects: &SessionEffects) -> Result<Self, QueryServiceError> {
         let mut staged = self.clone();
         if let Some(names) = &effects.catalog_schema {
-            staged.assign_session_names(names.catalog.clone(), names.schema.clone());
+            // A successful USE with the local namespace binds the same catalog
+            // sent to the client in the response headers.
+            let catalog = names
+                .catalog
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CATALOG.into());
+            staged.assign_session_names(Some(catalog), names.schema.clone());
         }
         for property in &effects.properties {
             property
@@ -198,15 +228,17 @@ impl SessionSqlState {
         String,
         SessionExecutionSettings,
         SessionOptimizerSettings,
-        novarocks_sql::sql_mode::SqlSemanticSettings,
+        SqlSemanticSettings,
         SessionPropertyInputs,
     ) {
+        let statement_session = self.statement_session();
         (
-            self.current_catalog,
-            self.current_database,
+            self.current_catalog.filter(|name| name != DEFAULT_CATALOG),
+            self.current_schema
+                .unwrap_or_else(|| DEFAULT_DATABASE.into()),
             self.execution_settings,
             self.optimizer_settings,
-            self.sql_semantics,
+            self.sql_semantics.with_statement_session(statement_session),
             self.property_inputs,
         )
     }

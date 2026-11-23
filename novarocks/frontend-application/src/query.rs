@@ -1068,7 +1068,8 @@ impl FrontendQueryService {
             value,
             &self.session_properties,
             self.session_catalog_resolver.as_ref(),
-        )?;
+        )?
+        .with_client_principal(Arc::clone(&principal));
         let identity = SessionIdentity::client_statement(query_id.clone(), Arc::clone(&principal));
         let lease = self
             .serving_admission
