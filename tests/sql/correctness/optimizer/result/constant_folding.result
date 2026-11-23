@@ -34,7 +34,7 @@ folded_upper
 MIXED
 
 -- query 18
--- legacy
+-- types	bigint
 folded_abs
 7
 
@@ -124,7 +124,7 @@ folded_upper
 MIXED
 
 -- query 37
--- legacy
+-- types	bigint
 folded_abs
 7
 

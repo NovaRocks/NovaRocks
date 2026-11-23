@@ -166,7 +166,7 @@ SELECT CAST('2020-01-02' AS DATE) AS folded_date_parse;
 SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS folded_decimal_rounding;
 
 -- @explain_contains=[NULL AS folded_decimal_overflow]
-SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
+SELECT TRY_CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
 
 -- ---------------------------------------------------------------------------
 -- 10. Disable folding and require the original operation to remain visible.
@@ -204,7 +204,7 @@ SELECT NOT CAST(NULL AS BOOLEAN) AS folded_not;
 -- @explain_contains= = CAST(
 SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decimal_compare;
 
--- @explain_contains= = CAST(
+-- @explain_contains=[CAST('2020-01-01' AS Date32) = 2020-01-01 AS folded_temporal_compare]
 SELECT CAST('2020-01-01' AS DATE) = DATE '2020-01-01' AS folded_temporal_compare;
 
 -- @explain_contains=IS NOT DISTINCT FROM
@@ -225,8 +225,8 @@ SELECT CAST('2020-01-02' AS DATE) AS folded_date_parse;
 -- @explain_contains=[CAST(CAST(12.345 AS
 SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS folded_decimal_rounding;
 
--- @explain_contains=[CAST(1000 AS
-SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
+-- @explain_contains=[CAST(1000 AS Decimal128(3, 0)) AS folded_decimal_overflow]
+SELECT TRY_CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
 
 -- ---------------------------------------------------------------------------
 -- 11. ERROR_IF_OVERFLOW still folds successful rounding, and an actual row
