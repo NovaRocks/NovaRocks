@@ -42,10 +42,6 @@ use novarocks_types::schema::{ColumnDef, ColumnDefault};
 /// Resolve and prepare the original INSERT through direct asynchronous
 /// Provider I/O. The admitted action retains its InitialComputationReservation;
 /// this entry neither reserves the old coordinator nor compiles a native plan.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The write preparation boundary keeps the exact target, statement and provider generation explicit."
-)]
 pub(crate) async fn prepare_iceberg_write_async(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
