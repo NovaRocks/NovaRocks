@@ -146,8 +146,6 @@ impl SqlDmlCatalogPreparation {
             Some(parameters) => parameters.complete_query(query)?,
             None => query,
         };
-        let query = crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
-            .map_err(SqlCompileError::from)?;
         let catalog = CatalogCompletionState::try_new_with_qualifications(
             query,
             &[],

@@ -432,8 +432,7 @@ fn actual_saved_view_analysis_inherits_query_settings_and_ignores_comment_hints(
     execute(&service, &engine, "CREATE VIEW v AS SELECT 1 AS a").unwrap();
     let snapshot = service.catalog_snapshot().unwrap();
     for (caller, hint) in [(
-        SqlSemanticSettings::default()
-            .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY")),
+        SqlSemanticSettings::default().with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW")),
         "sql_mode=32",
     )] {
         let original_caller = caller.clone();

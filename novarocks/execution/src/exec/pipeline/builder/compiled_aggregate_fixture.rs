@@ -36,11 +36,10 @@ use std::time::Duration;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_expression_contract::{BoundFunction, ExprKind, PhysicalCallRequest, RootScope};
 use novarocks_functions::{
-    AggregateKernelPhase, AggregatePreparationOptions, AggregateStateFormatIdentity,
-    CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest,
-    FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedRelationalEffects,
+    AggregateKernelPhase, AggregatePreparationOptions, CallEffectInput,
+    EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest,
+    FunctionBindingSelection, FunctionId, FunctionKind, FunctionResultType, InstalledPureKernel,
+    PureCallPreparation, PureEngineFunctionCatalog, PureKernelAbi, ScopedRelationalEffects,
 };
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -116,35 +115,38 @@ pub(crate) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineF
             )
             .unwrap();
     }
-    // Independent records of the actually installed implementations.
-    builder
-        .seal_pure(owners.iter().map(|(name, abi)| {
-            InstalledPureKernel {
-                function: FunctionId::try_new(format!("builtin.aggregate/{name}/v1")).unwrap(),
+    let mut installed = Vec::new();
+    for (name, abi) in owners {
+        let declaration = actual
+            .definition(name, FunctionKind::Aggregate)
+            .unwrap()
+            .binding_declaration()
+            .unwrap();
+        let mut has_abi = false;
+        for overload in declaration.overloads() {
+            let implementation = actual
+                .pure_overload_declaration_observed(
+                    declaration.function_id(),
+                    FunctionKind::Aggregate,
+                    &overload.identity,
+                    &FixtureControl,
+                )
+                .unwrap()
+                .implementation()
+                .clone();
+            has_abi |= implementation.abi == *abi;
+            installed.push(InstalledPureKernel {
+                function: declaration.function_id().clone(),
                 kind: FunctionKind::Aggregate,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(format!(
-                        "builtin.aggregate/{name}/derived-v1"
-                    ))
-                    .unwrap(),
-                    implementation: PureImplementationId::try_new(format!(
-                        "builtin.aggregate/{name}/selected-v1"
-                    ))
-                    .unwrap(),
-                    abi: *abi,
-                },
-                // SUM's exact state is its second format.
+                implementation,
                 aggregate_state_format: Some(
-                    AggregateStateFormatIdentity::try_new(if *name == "sum" {
-                        "novarocks/sum/state-v2".to_owned()
-                    } else {
-                        format!("novarocks/{name}/state-v1")
-                    })
-                    .unwrap(),
+                    overload.aggregate.as_ref().unwrap().state_format.clone(),
                 ),
-            }
-        }))
-        .unwrap()
+            });
+        }
+        assert!(has_abi, "{name} must install {abi:?}");
+    }
+    builder.seal_pure(installed).unwrap()
 }
 
 /// COUNT, MIN and MAX: the owners Stage 1 runs.
@@ -250,7 +252,7 @@ pub(crate) fn bind(
             &FixtureControl,
         )
     } else {
-        metadata.resolve_bound_user(name, FunctionKind::Aggregate, request, &FixtureControl)
+        metadata.resolve_bound_trusted(name, FunctionKind::Aggregate, request, &FixtureControl)
     }
     .unwrap_or_else(|error| panic!("{name} binds: {error}"));
     Bound {

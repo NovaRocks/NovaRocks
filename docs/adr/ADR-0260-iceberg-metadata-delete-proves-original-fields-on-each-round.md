@@ -1,5 +1,5 @@
 ---
-id: ADR-0259
+id: ADR-0260
 title: "Iceberg metadata DELETE proves original fields on every commit round"
 domain: [provider-spi, table-maintenance]
 status: active

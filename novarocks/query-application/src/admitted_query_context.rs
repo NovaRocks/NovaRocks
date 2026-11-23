@@ -1670,7 +1670,7 @@ mod tests {
     fn sql_mode_is_frozen_in_both_request_projections_and_topology_retries() {
         let mode = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
             novarocks_sql::sql_mode::SqlMode::from_assignment(
-                "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
             ),
         );
         let first = RequestContext::admit(RequestAdmission::new(

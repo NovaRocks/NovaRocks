@@ -119,7 +119,8 @@ pub fn grouped_state_topn_key_supported(
 /// Revision 39 admits composite predicate LeftMark over the full right relation.
 /// Revision 40 freezes ordered regexp argument demand and pattern conversion,
 /// and reserves the retired regexp and Base64 source claim fields.
-pub const PLAN_CONTRACT_REVISION: u32 = 40;
+/// Revision 41 reserves the retired string-aggregate semantic parameters.
+pub const PLAN_CONTRACT_REVISION: u32 = 41;
 
 #[cfg(test)]
 mod tests;

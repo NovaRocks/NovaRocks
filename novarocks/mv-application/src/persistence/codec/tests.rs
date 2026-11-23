@@ -157,6 +157,7 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
         aggregates: vec![AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "avg".to_string(),
+            semantic_contract: None,
             source_fields: vec![SourceFieldReference {
                 occurrence_id: 7,
                 field_id: field_id(2),
@@ -247,6 +248,7 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
         AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "sum".to_string(),
+            semantic_contract: None,
             source_fields: vec![SourceFieldReference {
                 occurrence_id: 7,
                 field_id: field_id(2),
@@ -257,6 +259,7 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
         AggregateInterpretation {
             aggregate_id: internal_retraction_count_aggregate_identity(),
             function_identity: INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY.to_string(),
+            semantic_contract: None,
             source_fields: Vec::new(),
             state_slot_ids: vec![state_slot_id(42)],
             branch_id: None,
@@ -778,6 +781,7 @@ fn user_count_without_automatic_retraction_state_remains_normal() {
     interpretation.aggregates = vec![AggregateInterpretation {
         aggregate_id: aggregate_id(51),
         function_identity: "count".to_string(),
+        semantic_contract: None,
         source_fields: Vec::new(),
         state_slot_ids: vec![state_slot_id(41)],
         branch_id: None,
@@ -1014,4 +1018,64 @@ fn valid_definition_with_many_outputs_and_source_fields_roundtrips() {
         encode_definition(&decoded).unwrap().as_bytes(),
         bytes.as_bytes()
     );
+}
+
+#[test]
+fn keyed_same_layout_aggregate_publication_requires_current_semantics() {
+    use crate::persistence::aggregate_bindings::validate_published_aggregate_contracts;
+    use arrow_schema::DataType;
+    use novarocks_functions::{
+        FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionValueType,
+        PersistentAggregateContract, builtin::catalogue::builtin_engine_function_catalog,
+    };
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+
+    let definition = encode_definition(&sample_definition()).unwrap();
+    let mut legacy = retraction_count_interpretation(&definition);
+    legacy.aggregates[0].function_identity = "max".to_owned();
+    let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
+    let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
+    assert_eq!(decoded.state_slots, legacy.state_slots);
+    assert_eq!(decoded.target, legacy.target);
+    let refusal = validate_published_aggregate_contracts(&decoded).unwrap_err();
+    assert!(refusal.contains("no selected aggregate semantic contract"));
+
+    let args = [FunctionArgument::Value {
+        value_type: FunctionValueType::new(DataType::Float64, true),
+        constant: None,
+    }];
+    let bound = builtin_engine_function_catalog()
+        .resolve_bound_user(
+            "max",
+            FunctionKind::Aggregate,
+            FunctionBindingRequest {
+                arguments: &args,
+                logical_argument_count: 1,
+                expected_result_type: None,
+            },
+            &Control,
+        )
+        .unwrap();
+    let selected = PersistentAggregateContract::from_binding(&bound).unwrap();
+    let mut previous = selected.clone();
+    previous.result_semantics = "legacy-total-order-v1".into();
+    legacy.aggregates[0].semantic_contract = Some(previous);
+    let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
+    let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
+    assert_eq!(decoded.state_slots, legacy.state_slots);
+    let refusal = validate_published_aggregate_contracts(&decoded).unwrap_err();
+    assert!(refusal.contains("legacy-total-order-v1"));
+
+    legacy.aggregates[0].semantic_contract = Some(selected);
+    let bytes = keyed::encode_keyed_interpretation(&legacy).unwrap();
+    let decoded = keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
+    assert_eq!(decoded, legacy);
+    validate_published_aggregate_contracts(&decoded).unwrap();
 }

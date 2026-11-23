@@ -48,10 +48,10 @@ pub(super) fn operation(name: &str) -> Option<BasicOperation> {
         "count_if" => CountIf,
         "bool_or" | "boolor_agg" => Or,
         "bool_and" | "booland_agg" => And,
-        "variance" | "variance_pop" | "var_pop" => VarPop,
-        "variance_samp" | "var_samp" => VarSamp,
-        "stddev" | "std" | "stddev_pop" => StdPop,
-        "stddev_samp" => StdSamp,
+        "var_pop" | "variance_pop" => VarPop,
+        "variance" | "var_samp" | "variance_samp" => VarSamp,
+        "std" | "stddev_pop" => StdPop,
+        "stddev" | "stddev_samp" => StdSamp,
         "covar_pop" => CovPop,
         "covar_samp" => CovSamp,
         "corr" => Corr,
@@ -252,6 +252,9 @@ impl super::aggregate_window_adapter::InlineAggregateWindowKernel for BasicKerne
     }
 }
 impl PreparedAggregateKernel for BasicKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,
@@ -610,8 +613,8 @@ impl BasicComputation<'_> {
     ) -> Result<(), KernelFailure> {
         let mut next = *state;
         if self.operation.boolean() {
-            next.seen = true;
             if let Some(BasicValue::Boolean(v)) = first {
+                next.seen = true;
                 next.boolean = if self.operation == BasicOperation::Or {
                     next.boolean || v
                 } else {

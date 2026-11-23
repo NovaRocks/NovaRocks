@@ -138,15 +138,18 @@ fn scoped_raw_values_sparse_ids_and_canonical_zone_identity_are_retained() {
     use SemanticParameterValue::*;
     let original = crate::TimeZoneKey::parse("+08:00").unwrap();
     let entries = vec![
-        entry(u32::MAX, GroupConcatMaxLen(i64::MIN)),
+        entry(
+            u32::MAX,
+            TimeZone(crate::TimeZoneKey::parse("-07:30").unwrap()),
+        ),
         entry(
             0,
             StatementStartUtc(crate::StatementStartUtc::try_new(i64::MAX, 0).unwrap()),
         ),
         entry(15, TimeZone(original)),
         entry(9, AllowThrowException(false)),
-        entry(8, GroupConcatLegacy(true)),
-        entry(7, GroupConcatLegacy(false)),
+        entry(8, AllowThrowException(true)),
+        entry(7, AllowThrowException(false)),
         entry(16, TimeZone(crate::TimeZoneKey::parse("UTC").unwrap())),
         entry(19, AllowThrowException(true)),
     ];

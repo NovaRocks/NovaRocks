@@ -224,7 +224,7 @@ SQL client
   主分支 DELETE 由 `delete/absorption.rs::select_delete_path` 复用原读观察和 Provider 吸收证明，
   在原 Root 选择空结果、元数据提交或行级执行。`query/delete_action/choice.rs` 仅在行级分支等待 BE。
   `query/delete_action/metadata_commit.rs` 沿原数据变更会话消费实际发布快照的计数并核对一次未知结果。
-  见 [ADR-0259](docs/adr/ADR-0259-iceberg-metadata-delete-proves-original-fields-on-each-round.md)。
+  见 [ADR-0260](docs/adr/ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md)。
 
 - `novarocks/frontend-application/src/query/{statement_action,read_action,write_action,mutation_action,ctas_action}.rs`
   当前 governed 语句接缝：普通 Read 保留 Client 窗口与流式 handle；Internal 写入由稳定 Action

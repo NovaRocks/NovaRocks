@@ -16,16 +16,18 @@
 // under the License.
 
 //! LEAD/LAG selected values from one complete original partition.
-//! Offset is a checked immutable preparation constant; frame geometry remains host-owned.
+//! Offsets come from the exact BIGINT argument or the default of one.
 
 use super::window_default::DefaultValueRecipe;
-use crate::kernel_control::{KernelControlObservation, internal, invalid};
+use crate::kernel_control::{
+    KernelControlObservation, internal, invalid, invalid_function_argument,
+};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
     KernelEvaluationControl, KernelFailure, PreparedWindowKernel, SelectedValues, Selection,
     WindowCallContract, WindowKernelPartition, WindowPartitionInput,
 };
-use arrow_array::{ArrayRef, BooleanArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, Int64Array, UInt64Array};
 use std::{alloc::Layout, ops::Range, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,7 +40,7 @@ pub(super) enum OffsetOperation {
 pub(super) struct PreparedOffset {
     pub(super) contract: Arc<WindowCallContract>,
     pub(super) operation: OffsetOperation,
-    pub(super) offset: i64,
+    pub(super) offset: Option<i64>,
     pub(super) default: Option<DefaultValueRecipe>,
 }
 
@@ -172,10 +174,40 @@ impl PreparedWindowKernel for PreparedOffset {
                     work.step()?;
                 }
             }
-            let offset = usize::try_from(self.offset).ok();
+            let dynamic_offset = if self.offset.is_none() {
+                let argument = input.full_input().logical_arguments()[1];
+                let array = argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        invalid("LEAD/LAG offset requires its selected BIGINT carrier")
+                    })?;
+                Some((argument, array))
+            } else {
+                None
+            };
             for row in 0..rows {
+                let offset = if let Some((argument, array)) = dynamic_offset {
+                    let address = argument.value_row(row, row);
+                    if array.is_null(address) {
+                        return Err(invalid_function_argument(
+                            "LEAD/LAG offset must not be NULL",
+                        ));
+                    }
+                    let offset = array.value(address);
+                    if offset < 0 {
+                        return Err(invalid_function_argument(
+                            "LEAD/LAG offset must be non-negative",
+                        ));
+                    }
+                    offset
+                } else {
+                    self.offset.expect("prepared default or constant offset")
+                };
+                let offset = usize::try_from(offset).ok();
                 let target = if ignore {
-                    if self.offset == 0 {
+                    if offset == Some(0) {
                         Some(row)
                     } else {
                         offset.and_then(|offset| match self.operation {

@@ -70,7 +70,7 @@ fn effects(scope: v2::proof_scope::Kind) -> v2::CallEffects {
 }
 
 #[test]
-fn all_five_parameter_variants_preserve_raw_values_and_oneof_presence() {
+fn all_parameter_variants_preserve_raw_values_and_oneof_presence() {
     use v2::semantic_parameter::Value;
     let values = [
         Value::StatementStartUtc(
@@ -81,15 +81,13 @@ fn all_five_parameter_variants_preserve_raw_values_and_oneof_presence() {
         ),
         Value::TimeZone("+08:00".into()),
         Value::AllowThrowException(false),
-        Value::GroupConcatLegacy(false),
-        Value::GroupConcatMaxLen(i64::MAX),
     ];
     let parameters = v2::SemanticParameters {
         entries: values
             .into_iter()
             .enumerate()
             .map(|(ordinal, value)| v2::SemanticParameter {
-                id: if ordinal == 4 {
+                id: if ordinal == 2 {
                     u32::MAX
                 } else {
                     ordinal as u32
@@ -110,7 +108,7 @@ fn all_five_parameter_variants_preserve_raw_values_and_oneof_presence() {
             .unwrap()
             .fields()
             .count(),
-        5
+        3
     );
     for entry in &parameters.entries {
         let absent = v2::SemanticParameter {
@@ -121,7 +119,7 @@ fn all_five_parameter_variants_preserve_raw_values_and_oneof_presence() {
     }
     let zero = v2::SemanticParameter {
         id: 0,
-        value: Some(Value::GroupConcatMaxLen(0)),
+        value: Some(Value::AllowThrowException(false)),
     };
     roundtrip(&zero);
     assert_ne!(

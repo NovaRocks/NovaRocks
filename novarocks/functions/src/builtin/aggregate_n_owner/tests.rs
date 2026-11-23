@@ -57,7 +57,7 @@ fn prepare(
         expected_result_type: None,
     };
     let bound = catalog
-        .resolve_bound_user(name, FunctionKind::Aggregate, request, &Control)
+        .resolve_bound_trusted(name, FunctionKind::Aggregate, request, &Control)
         .unwrap();
     let selected = Arc::new(bound.selected);
     let context = novarocks_type_contract::RelationEffectContext::call(
@@ -324,7 +324,7 @@ fn public_n_state_column_runs_selected_single_and_partial_final_with_last_alias_
                 };
                 let list = output.as_any().downcast_ref::<ListArray>().unwrap();
                 assert!(!list.is_null(0));
-                assert!(!list.is_null(1));
+                assert!(list.is_null(1));
                 assert_eq!(list.value_length(0), 2);
                 assert_eq!(list.value_length(1), 0);
                 let child = list
@@ -332,8 +332,13 @@ fn public_n_state_column_runs_selected_single_and_partial_final_with_last_alias_
                     .as_any()
                     .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
                     .unwrap();
-                assert_eq!(i128::from_be_bytes(child.value(0).try_into().unwrap()), -7);
-                assert_eq!(i128::from_be_bytes(child.value(1).try_into().unwrap()), 3);
+                let expected = if name == "min_n" { [-7, 3] } else { [3, -7] };
+                for (index, expected) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        i128::from_be_bytes(child.value(index).try_into().unwrap()),
+                        expected
+                    );
+                }
                 let DataType::List(field) = output.data_type() else {
                     panic!("List result")
                 };
@@ -456,4 +461,41 @@ fn private_dispatch_rejects_mixed_states_frames_and_emission_without_skipping_ro
         ));
     }
     clean(&host);
+}
+
+#[test]
+fn min_and_max_install_top_n_under_the_same_function_with_a_distinct_state() {
+    for name in ["min", "max"] {
+        let value_type = FunctionValueType::new(DataType::Int64, false);
+        let result = prepare(
+            name,
+            value_type.clone(),
+            value_type,
+            AggregateKernelPhase::Single,
+        )
+        .unwrap();
+        let PreparedPureKernel::Aggregate(handle) = result.prepared() else {
+            panic!("expected the prepared Top N aggregate")
+        };
+        let contract = handle.contract();
+        assert_eq!(
+            contract.call().function_id().as_str(),
+            format!("builtin.aggregate/{name}/v1")
+        );
+        assert_eq!(
+            contract.call().selected().overload.as_str(),
+            format!("builtin.aggregate/{name}/top-n-v1")
+        );
+        assert_eq!(
+            contract
+                .call()
+                .selected()
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .state_format
+                .as_str(),
+            format!("novarocks/{name}/top-n-state-v1")
+        );
+    }
 }

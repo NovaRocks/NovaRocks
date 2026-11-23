@@ -150,6 +150,9 @@ impl IcebergMvRewriteContext {
         }
         let runtime_bindings = reconstruct_keyed_runtime_bindings(facts, &exact_target)?;
         validate_target_schema(&target_arrow_schema, &exact_target)?;
+        if facts.publication().is_some() {
+            novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(facts.interpretation())?;
+        }
         let pin = validate_source_pins(facts.definition(), current)?;
         let (previous_snapshot_ids, previous_table_object_ids) =
             validate_history(&projection, previous.clone())?;

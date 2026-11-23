@@ -144,7 +144,7 @@ fn causes() -> [KernelFailure; 7] {
     ]
 }
 #[test]
-fn n_sort_scope_covers_original_comparisons_and_ends_between_both_sorts() {
+fn n_sort_scope_covers_directional_comparisons_before_truncation() {
     for smallest in [false, true] {
         let trace = Arc::new(Trace::default());
         let mut resources = Resources {
@@ -168,12 +168,7 @@ fn n_sort_scope_covers_original_comparisons_and_ends_between_both_sorts() {
                 .filter(|event| matches!(event, Event::Enter(_) | Event::Drop(_)))
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec![
-                Event::Enter(513),
-                Event::Drop(513),
-                Event::Enter(512),
-                Event::Drop(512)
-            ]
+            vec![Event::Enter(513), Event::Drop(513)]
         );
         assert!(
             events
@@ -186,7 +181,7 @@ fn n_sort_scope_covers_original_comparisons_and_ends_between_both_sorts() {
             if smallest {
                 (-1i128..511).collect::<Vec<_>>()
             } else {
-                (0i128..512).collect::<Vec<_>>()
+                (0i128..512).rev().collect::<Vec<_>>()
             }
         );
     }
@@ -279,7 +274,9 @@ fn n_sort_original_leading_flush_refuses_before_scope_birth() {
         work.step().unwrap();
         let mut state = state();
         let before = values(&state);
-        let error = state.sort_values(&mut resources, &mut work).unwrap_err();
+        let error = state
+            .sort_values(ExtremaDirection::Minimum, &mut resources, &mut work)
+            .unwrap_err();
         assert_eq!(error, cause);
         assert_eq!(*trace.events.lock().unwrap(), [Event::Check(1, false)]);
         assert_eq!(values(&state), before);
@@ -310,12 +307,7 @@ fn n_sort_update_forwards_independent_value_and_limit_addresses() {
     assert_eq!(self::values(&state), [-2]);
     assert_eq!(
         *trace.events.lock().unwrap(),
-        [
-            Event::Enter(1),
-            Event::Drop(1),
-            Event::Enter(1),
-            Event::Drop(1)
-        ]
+        [Event::Enter(1), Event::Drop(1)]
     );
 }
 #[test]
@@ -344,7 +336,7 @@ fn n_sort_merge_keeps_each_decoded_push_in_sequential_scopes() {
         .unwrap();
     assert_eq!(values(&state), [1, 2]);
     let events = trace.events.lock().unwrap();
-    let lengths = [1, 1, 2, 2, 3, 2];
+    let lengths = [1, 2, 3];
     assert_eq!(
         *events,
         lengths

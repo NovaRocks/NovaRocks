@@ -38,7 +38,7 @@ fn native_decimal_array_and_temporal_literal_compile_sources_remain_valid() {
         // One integer digit and two fractional digits require DECIMAL(3,2).
         ("SELECT [0.0,0.25,0.5,1.0]", decimal_items),
         (
-            "SELECT percentile_approx_weighted(2.0,1,[0.0,0.25,0.5,1.0],2048)",
+            "SELECT approx_percentile(DOUBLE '2.0',DOUBLE '1.5',ARRAY[DOUBLE '0.0',DOUBLE '0.25',DOUBLE '0.5',DOUBLE '1.0'])",
             double_items.clone(),
         ),
         (

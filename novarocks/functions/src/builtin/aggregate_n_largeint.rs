@@ -263,6 +263,9 @@ impl PreparedAggregateKernel for NLargeIntKernel {
     fn prepared_merge_retained_bytes(&self, batch: &Self::PreparedMergeBatch<'_>) -> usize {
         batch.retained
     }
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

@@ -1,0 +1,6 @@
+-- query 1
+-- types	integer	bigint	bigint
+x	prior	next_value
+10	10	10
+20	10	30
+30	10	99

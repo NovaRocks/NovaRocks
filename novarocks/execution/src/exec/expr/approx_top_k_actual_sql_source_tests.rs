@@ -29,23 +29,19 @@ fn source(full: bool) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
         Field::new("w", DataType::Int64, true),
     ];
     let sql = if full {
-        "WITH w1 AS (
-            SELECT approx_top_k(v, 3) AS x FROM fixture
-         ), entries AS (
-            SELECT ordinal, x[ordinal] AS entry,
-                   __array_struct_subfield(x, 'item')[ordinal] AS item
-            FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
-            WHERE ordinal <= cardinality(x)
+        "WITH frequency AS (
+            SELECT approx_most_frequent(3, v, 100001) AS counts FROM fixture
          )
-         SELECT array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS top_items
-         FROM entries"
+         SELECT element_at(counts, BIGINT '3') AS item_count FROM frequency"
     } else {
-        "SELECT approx_top_k(v) AS a,approx_top_k(v,3) AS b,approx_top_k(v,3,100) AS c FROM fixture"
+        "SELECT approx_most_frequent(2, v, 1) AS a,
+                approx_most_frequent(3, v, 100001) AS b,
+                approx_most_frequent(3, txt, 10) AS c FROM fixture"
     };
     super::sql_test_source::sql_source_with_declared_fields(sql, &fields)
 }
 #[test]
-fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
+fn approx_most_frequent_actual_sql_retains_exact_map_binding() {
     {
         let source = source(false);
         let mut found = 0;
@@ -56,7 +52,7 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
                 };
                 for (ordinal, call) in calls.iter().enumerate() {
                     if call.binding.function.function_id.as_str()
-                        != "builtin.aggregate/approx_top_k/v1"
+                        != "builtin.aggregate/approx_most_frequent/v1"
                     {
                         continue;
                     }
@@ -65,7 +61,7 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
                         call: u32::try_from(ordinal).unwrap(),
                     };
                     let req = fragment.call_requests().get(site).unwrap();
-                    assert!((1..=3).contains(&req.logical_argument_count));
+                    assert_eq!(req.logical_argument_count, 3);
                     assert_eq!(
                         req.logical_argument_count,
                         call.binding.function.argument_types.len()
@@ -76,11 +72,11 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
                     );
                     assert!(matches!(
                         call.binding.function.result_type.data_type(),
-                        DataType::List(_)
+                        DataType::Map(..)
                     ));
                     assert!(call.binding.function.result_type.nullable());
                     eprintln!(
-                        "APPROX_TOP_K actual mode=compiled fragment={:?} site={site:?} binding={:?} request={req:?}",
+                        "APPROX_MOST_FREQUENT actual mode=compiled fragment={:?} site={site:?} binding={:?} request={req:?}",
                         fragment.id(),
                         call.binding
                     );
@@ -92,7 +88,7 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
     }
 }
 #[test]
-fn approx_top_k_actual_original_required_sql_complete_compilation() {
+fn approx_most_frequent_actual_sql_complete_compilation() {
     let source = source(true);
     let results = super::filter_conjunction_actual_sql_compiler_tests::compiler_results(
         &source,

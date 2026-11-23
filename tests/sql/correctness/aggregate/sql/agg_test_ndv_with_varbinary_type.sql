@@ -43,19 +43,19 @@ FROM TABLE(sequence(1, 100)) AS generate_series(generate_series);
 
 -- query 4
 USE ${case_db};
-SELECT ndv(data) AS ndv_result FROM tbinary_ndv_test;
+SELECT approx_distinct(data) AS ndv_result FROM tbinary_ndv_test;
 
 -- query 5
 USE ${case_db};
-SELECT category, ndv(data) AS ndv_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
+SELECT category, approx_distinct(data) AS ndv_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
 
 -- query 6
 USE ${case_db};
-SELECT approx_count_distinct(data) AS approx_count_result FROM tbinary_ndv_test;
+SELECT approx_distinct(data) AS approx_count_result FROM tbinary_ndv_test;
 
 -- query 7
 USE ${case_db};
-SELECT category, approx_count_distinct(data) AS approx_count_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
+SELECT category, approx_distinct(data) AS approx_count_result FROM tbinary_ndv_test GROUP BY category ORDER BY category;
 
 -- query 8
 USE ${case_db};
@@ -90,11 +90,11 @@ ROW(9, to_utf8('fff'), 3);
 
 -- query 12
 USE ${case_db};
-SELECT ndv(data) AS ndv_with_null FROM tbinary_ndv_null_test;
+SELECT approx_distinct(data) AS ndv_with_null FROM tbinary_ndv_null_test;
 
 -- query 13
 USE ${case_db};
-SELECT category, ndv(data) AS ndv_with_null FROM tbinary_ndv_null_test GROUP BY category ORDER BY category;
+SELECT category, approx_distinct(data) AS ndv_with_null FROM tbinary_ndv_null_test GROUP BY category ORDER BY category;
 
 -- query 14
 USE ${case_db};
@@ -126,7 +126,7 @@ ROW(7, NULL);
 
 -- query 18
 USE ${case_db};
-SELECT ndv(data) AS ndv_dup_result FROM tbinary_ndv_dup_test;
+SELECT approx_distinct(data) AS ndv_dup_result FROM tbinary_ndv_dup_test;
 
 -- query 19
 USE ${case_db};
@@ -176,15 +176,15 @@ ORDER BY category;
 
 -- query 24
 USE ${case_db};
-SELECT ndv(data1) AS ndv_data1,
-       approx_count_distinct(data2) AS approx_data2
+SELECT approx_distinct(data1) AS ndv_data1,
+       approx_distinct(data2) AS approx_data2
 FROM tbinary_multi_distinct_test;
 
 -- query 25
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT category,
-       ndv(data1) AS ndv_data1,
-       approx_count_distinct(data2) AS approx_data2,
+       approx_distinct(data1) AS ndv_data1,
+       approx_distinct(data2) AS approx_data2,
        ds_theta_count_distinct(data3) AS theta_data3
 FROM ${case_db}.tbinary_multi_distinct_test
 GROUP BY category
@@ -193,7 +193,7 @@ ORDER BY category;
 -- query 26
 USE ${case_db};
 SELECT COUNT(DISTINCT data1) AS exact_count1,
-       ndv(data2) AS approx_count2,
+       approx_distinct(data2) AS approx_count2,
        COUNT(DISTINCT data3) AS exact_count3
 FROM tbinary_multi_distinct_test;
 
@@ -201,8 +201,8 @@ FROM tbinary_multi_distinct_test;
 USE ${case_db};
 SELECT category,
        COUNT(DISTINCT data1) AS exact_count1,
-       ndv(data2) AS approx_count2,
-       approx_count_distinct(data3) AS approx_count3
+       approx_distinct(data2) AS approx_count2,
+       approx_distinct(data3) AS approx_count3
 FROM tbinary_multi_distinct_test
 GROUP BY category
 ORDER BY category;
@@ -232,7 +232,7 @@ USE ${case_db};
 SELECT category,
        COUNT(DISTINCT data1) AS distinct_data1,
        COUNT(DISTINCT data2) AS distinct_data2,
-       ndv(data3) AS ndv_data3,
+       approx_distinct(data3) AS ndv_data3,
        COUNT(*) AS total
 FROM tbinary_multi_distinct_test
 WHERE id > 2
@@ -280,8 +280,8 @@ ORDER BY category;
 -- query 35
 USE ${case_db};
 SELECT COUNT(DISTINCT data1) AS exact1,
-       ndv(data2) AS approx2,
-       approx_count_distinct(data1) AS approx1,
+       approx_distinct(data2) AS approx2,
+       approx_distinct(data1) AS approx1,
        COUNT(DISTINCT data2) AS exact2
 FROM tbinary_multi_null_test;
 

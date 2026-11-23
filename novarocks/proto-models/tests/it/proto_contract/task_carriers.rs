@@ -170,7 +170,7 @@ fn query_options() -> novarocks::QueryOptions {
         runtime_filter_scan_wait_time_ms: Some(1500),
         runtime_filter_wait_timeout_ms: Some(3000),
         allow_throw_exception: true,
-        group_concat_max_len: Some(65_536),
+
         enable_scan_datacache: true,
         enable_populate_datacache: true,
         enable_datacache_async_populate_mode: true,
@@ -210,9 +210,9 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
     assert_eq!(
         fields,
         (1..=29)
-            .filter(|tag| ![1, 6, 11, 12].contains(tag))
+            .filter(|tag| ![1, 6, 10, 11, 12].contains(tag))
             .collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 1, 6, 11, 12"
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 1, 6, 10, 11, 12"
     );
 }
 

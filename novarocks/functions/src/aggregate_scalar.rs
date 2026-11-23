@@ -1180,6 +1180,40 @@ fn build_scalar_array_impl(
     }
 }
 
+/// Direction of an extrema comparison. NaN and nested null are disfavored
+/// by both extrema, while the order among the remaining values is unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtremaDirection {
+    Minimum,
+    Maximum,
+}
+
+impl ExtremaDirection {
+    fn compare_unordered(self, left: bool, right: bool) -> std::cmp::Ordering {
+        match self {
+            Self::Minimum => left.cmp(&right),
+            Self::Maximum => right.cmp(&left),
+        }
+    }
+
+    pub fn compare_float(self, left: f64, right: f64) -> std::cmp::Ordering {
+        left.partial_cmp(&right)
+            .unwrap_or_else(|| self.compare_unordered(left.is_nan(), right.is_nan()))
+    }
+
+    pub fn compare_tracked<A: ScalarStateAllocator>(
+        self,
+        left: &TrackedAggScalarValue<A>,
+        right: &TrackedAggScalarValue<A>,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<std::cmp::Ordering, KernelFailure> {
+        strict_scalar_ordering(
+            compare_tracked_values(left, right, Some(self), work)?,
+            "tracked extrema comparison type mismatch",
+        )
+    }
+}
+
 /// Partial comparison is a value result, never a failed control observation.
 /// Consumers own their policy for NaN and heterogeneous serialized values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1216,6 +1250,15 @@ pub fn compare_tracked_scalar_values_partial<A: ScalarStateAllocator>(
     right: &TrackedAggScalarValue<A>,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ScalarOrdering, KernelFailure> {
+    compare_tracked_values(left, right, None, work)
+}
+
+fn compare_tracked_values<A: ScalarStateAllocator>(
+    left: &TrackedAggScalarValue<A>,
+    right: &TrackedAggScalarValue<A>,
+    direction: Option<ExtremaDirection>,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<ScalarOrdering, KernelFailure> {
     work.step()?;
     match (left, right) {
         (TrackedAggScalarValue::Bool(left), TrackedAggScalarValue::Bool(right)) => {
@@ -1224,10 +1267,15 @@ pub fn compare_tracked_scalar_values_partial<A: ScalarStateAllocator>(
         (TrackedAggScalarValue::Int64(left), TrackedAggScalarValue::Int64(right)) => {
             Ok(ScalarOrdering::Ordered(left.cmp(right)))
         }
-        (TrackedAggScalarValue::Float64(left), TrackedAggScalarValue::Float64(right)) => Ok(left
-            .partial_cmp(right)
-            .map(ScalarOrdering::Ordered)
-            .unwrap_or(ScalarOrdering::UnorderedFloat)),
+        (TrackedAggScalarValue::Float64(left), TrackedAggScalarValue::Float64(right)) => {
+            Ok(match direction {
+                Some(direction) => ScalarOrdering::Ordered(direction.compare_float(*left, *right)),
+                None => left
+                    .partial_cmp(right)
+                    .map(ScalarOrdering::Ordered)
+                    .unwrap_or(ScalarOrdering::UnorderedFloat),
+            })
+        }
         (TrackedAggScalarValue::Utf8(left), TrackedAggScalarValue::Utf8(right))
         | (TrackedAggScalarValue::Binary(left), TrackedAggScalarValue::Binary(right)) => {
             for _ in left.iter().zip(right) {
@@ -1260,16 +1308,19 @@ pub fn compare_tracked_scalar_values_partial<A: ScalarStateAllocator>(
         }
         (TrackedAggScalarValue::Struct(left), TrackedAggScalarValue::Struct(right))
         | (TrackedAggScalarValue::List(left), TrackedAggScalarValue::List(right)) => {
-            compare_tracked_optional_slices(left, right, work)
+            compare_tracked_optional_slices(left, right, direction, work)
         }
-        (TrackedAggScalarValue::Map(left), TrackedAggScalarValue::Map(right)) => {
+        (TrackedAggScalarValue::Map(left), TrackedAggScalarValue::Map(right))
+            if direction.is_none() =>
+        {
             for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right) {
                 work.step()?;
-                let ordering = compare_tracked_optional_values(left_key, right_key, work)?;
+                let ordering = compare_tracked_optional_values(left_key, right_key, None, work)?;
                 if !matches!(ordering, ScalarOrdering::Ordered(std::cmp::Ordering::Equal)) {
                     return Ok(ordering);
                 }
-                let ordering = compare_tracked_optional_values(left_value, right_value, work)?;
+                let ordering =
+                    compare_tracked_optional_values(left_value, right_value, None, work)?;
                 if !matches!(ordering, ScalarOrdering::Ordered(std::cmp::Ordering::Equal)) {
                     return Ok(ordering);
                 }
@@ -1283,12 +1334,13 @@ pub fn compare_tracked_scalar_values_partial<A: ScalarStateAllocator>(
 fn compare_tracked_optional_slices<A: ScalarStateAllocator>(
     left: &[Option<TrackedAggScalarValue<A>>],
     right: &[Option<TrackedAggScalarValue<A>>],
+    direction: Option<ExtremaDirection>,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ScalarOrdering, KernelFailure> {
     work.step()?;
     for (left, right) in left.iter().zip(right) {
         work.step()?;
-        let ordering = compare_tracked_optional_values(left, right, work)?;
+        let ordering = compare_tracked_optional_values(left, right, direction, work)?;
         if !matches!(ordering, ScalarOrdering::Ordered(std::cmp::Ordering::Equal)) {
             return Ok(ordering);
         }
@@ -1299,14 +1351,17 @@ fn compare_tracked_optional_slices<A: ScalarStateAllocator>(
 fn compare_tracked_optional_values<A: ScalarStateAllocator>(
     left: &Option<TrackedAggScalarValue<A>>,
     right: &Option<TrackedAggScalarValue<A>>,
+    direction: Option<ExtremaDirection>,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ScalarOrdering, KernelFailure> {
     work.step()?;
     match (left, right) {
         (None, None) => Ok(ScalarOrdering::Ordered(std::cmp::Ordering::Equal)),
-        (None, Some(_)) => Ok(ScalarOrdering::Ordered(std::cmp::Ordering::Less)),
-        (Some(_), None) => Ok(ScalarOrdering::Ordered(std::cmp::Ordering::Greater)),
-        (Some(left), Some(right)) => compare_tracked_scalar_values_partial(left, right, work),
+        (Some(left), Some(right)) => compare_tracked_values(left, right, direction, work),
+        _ => Ok(ScalarOrdering::Ordered(match direction {
+            Some(direction) => direction.compare_unordered(left.is_none(), right.is_none()),
+            None => left.is_some().cmp(&right.is_some()),
+        })),
     }
 }
 

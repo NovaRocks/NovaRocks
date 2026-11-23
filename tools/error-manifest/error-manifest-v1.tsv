@@ -9,6 +9,7 @@ query.execution.date_result_out_of_range	Execution
 query.execution.deadline_exceeded	Execution
 query.execution.dependency	Execution
 query.execution.division_by_zero	Execution
+query.execution.exceeded_function_memory_limit	Execution
 query.execution.invalid_cast_argument	Execution
 query.execution.invalid_data	Execution
 query.execution.invalid_function_argument	Execution
@@ -58,6 +59,7 @@ sql.admit.update_unsupported_form	Admit
 sql.analyze.ambiguous_function_call	Analyze
 sql.analyze.duplicate_column_name	Analyze
 sql.analyze.expression_not_constant	Analyze
+sql.analyze.expression_not_in_distinct	Analyze
 sql.analyze.expression_not_scalar	Analyze
 sql.analyze.function_not_aggregate	Analyze
 sql.analyze.internal	Analyze
@@ -68,9 +70,11 @@ sql.analyze.invalid_literal	Analyze
 sql.analyze.invalid_query_shape	Analyze
 sql.analyze.invalid_type_argument	Analyze
 sql.analyze.invalid_view	Analyze
+sql.analyze.invalid_window_frame	Analyze
 sql.analyze.mismatched_column_aliases	Analyze
 sql.analyze.missing_argument	Analyze
 sql.analyze.missing_column_name	Analyze
+sql.analyze.missing_order_by	Analyze
 sql.analyze.numeric_out_of_range	Analyze
 sql.analyze.too_many_arguments	Analyze
 sql.analyze.type_mismatch	Analyze

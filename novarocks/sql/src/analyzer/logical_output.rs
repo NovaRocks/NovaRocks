@@ -838,7 +838,7 @@ mod scalar_domain_tests {
     fn m07_window_value_domains_follow_all_actual_value_suppliers() {
         assert_eq!(
             output_domains(
-                "select first_value(j) over (),last_value(h) over (),first_value(b) over (),last_value(v) over (),first_value(o) over (),last_value(p) over (),lead(j,1,j) over (),lag(j,1,null) over () from t"
+                "select first_value(j) over (),last_value(h) over (),first_value(b) over (),last_value(v) over (),first_value(o) over (),last_value(p) over (),lead(j,1,j) over (order by 1),lag(j,1,null) over (order by 1) from t"
             ),
             vec![
                 Some(SqlType::Json),
@@ -851,30 +851,26 @@ mod scalar_domain_tests {
                 Some(SqlType::Json)
             ]
         );
-        assert_eq!(
-            output_domains(
-                "select lead(j,1,s) over (),lag(s,1,j) over (),lead(h,1,b) over (),lag(b,1,h) over (),lead(j,1,cast(null as varchar)) over (),first_value(cast(j as varchar)) over (),lag(cast(j as varchar),1,j) over () from t"
-            ),
-            vec![
-                Some(SqlType::Json),
-                Some(SqlType::String),
-                Some(SqlType::Hll),
-                Some(SqlType::Bitmap),
-                Some(SqlType::Json),
-                Some(SqlType::String),
-                Some(SqlType::String)
-            ]
-        );
+        for sql in [
+            "select lead(j,1,s) over (order by 1) from t",
+            "select lead(h,1,b) over (order by 1) from t",
+        ] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+            );
+        }
         // The offset is a control operand, not a supplier of the result value.
         assert_eq!(
-            output_domains("select lead(j,2) over (),lag(h,2) over () from t"),
+            output_domains("select lead(j,2) over (order by 1),lag(h,2) over (order by 1) from t"),
             vec![Some(SqlType::Json), Some(SqlType::Hll)]
         );
     }
 
     #[test]
     fn m07_window_nested_value_identity_preserves_shape_and_null_siblings() {
-        let sql = "with q as (select [b] as b from t) select first_value(b) over (),last_value(b) over (),lead(b,1,b) over (),lag(b,1,null) over () from q";
+        let sql = "with q as (select [b] as b from t) select first_value(b) over (),last_value(b) over (),lead(b,1,b) over (order by 1),lag(b,1,null) over (order by 1) from q";
         assert_eq!(
             output_domains(sql),
             vec![Some(SqlType::Array(Box::new(SqlType::Bitmap))); 4]
@@ -930,7 +926,7 @@ mod scalar_domain_tests {
             output_domains("select first_value(row(null,b)) over () from t"),
             vec![None]
         );
-        let sql = "with q as (select [parse_json('{}')] as j,['plain'] as s) select lead(j,1,s) over () from q";
+        let sql = "with q as (select [parse_json('{}')] as j) select lead(j,1,j) over (order by 1) from q";
         let expression = output_expressions(sql).remove(0);
         let ExprKind::WindowCall { binding, args, .. } = &original_window(&expression).kind else {
             panic!("actual window");
@@ -967,19 +963,19 @@ mod scalar_domain_tests {
     fn m07_window_json_defaults_keep_identity_and_variant_casts_are_rejected() {
         assert_eq!(
             output_domains(
-                "select lead(j,1,cast(null as json)) over (),lag(j,1,cast(null as json)) over () from t"
+                "select lead(j,1,cast(null as json)) over (order by 1),lag(j,1,cast(null as json)) over (order by 1) from t"
             ),
             vec![Some(SqlType::Json); 2]
         );
         assert_eq!(
             output_domains(
-                "select lead(j,1,cast(j as json)) over (),lag(j,1,cast(j as json)) over (),first_value(cast(j as json)) over () from t"
+                "select lead(j,1,cast(j as json)) over (order by 1),lag(j,1,cast(j as json)) over (order by 1),first_value(cast(j as json)) over () from t"
             ),
             vec![Some(SqlType::Json); 3]
         );
         for sql in [
-            "select lead(v,1,cast(null as variant)) over () from t",
-            "select lag(v,1,cast(v as variant)) over () from t",
+            "select lead(v,1,cast(null as variant)) over (order by 1) from t",
+            "select lag(v,1,cast(v as variant)) over (order by 1) from t",
             "select first_value(cast(X'AB01' as variant)) over ()",
             "select first_value(cast(cast(X'AB01' as varbinary) as variant)) over ()",
         ] {
@@ -987,7 +983,7 @@ mod scalar_domain_tests {
         }
         // A NULL default cannot erase a known sibling in a partial Struct or
         // a nested Map value. SqlType has no complete Null-bearing counterpart.
-        let sql = "with q as (select row(null,map(ARRAY['k'],ARRAY[b])) as r from t) select lead(r,1,null) over (),lag(r,1,null) over () from q";
+        let sql = "with q as (select row(null,map(ARRAY['k'],ARRAY[b])) as r from t) select lead(r,1,null) over (order by 1),lag(r,1,null) over (order by 1) from q";
         for expression in output_expressions(sql) {
             let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
                 unreachable!()
@@ -1492,25 +1488,25 @@ mod scalar_domain_tests {
                 V::Json,
             ),
             (
-                "select lead(parse_json('{}'),1,null) over ()",
+                "select lead(parse_json('{}'),1,null) over (order by 1)",
                 false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select lag(parse_json('{}'),1,null) over ()",
+                "select lag(parse_json('{}'),1,null) over (order by 1)",
                 false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select lead(cast('plain' as varchar),1,cast(7 as bigint)) over ()",
+                "select lead(cast('plain' as varchar),1,'fallback') over (order by 1)",
                 false,
                 D::Plain,
                 V::String,
             ),
             (
-                "select lag(cast(7 as bigint),1,'2') over ()",
+                "select lag(cast(7 as bigint),1,2) over (order by 1)",
                 false,
                 D::Plain,
                 V::SignedInteger(64),
@@ -1522,13 +1518,13 @@ mod scalar_domain_tests {
                 V::Variant,
             ),
             (
-                "with q as (select v from t) select lead(v,1) over () from q",
+                "with q as (select v from t) select lead(v,1) over (order by 1) from q",
                 true,
                 D::Variant,
                 V::Variant,
             ),
             (
-                "with q as (select v from t) select lag(v,1) over () from q",
+                "with q as (select v from t) select lag(v,1) over (order by 1) from q",
                 true,
                 D::Variant,
                 V::Variant,

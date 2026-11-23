@@ -74,8 +74,6 @@ pub enum SemanticParameterKey {
     StatementStartUtc,
     TimeZone,
     AllowThrowException,
-    GroupConcatLegacy,
-    GroupConcatMaxLen,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -155,9 +153,6 @@ pub enum SemanticParameterValue {
     /// The exact zone identity in the frozen rule index.
     TimeZone(crate::TimeZoneKey),
     AllowThrowException(bool),
-    GroupConcatLegacy(bool),
-    /// Raw admitted setting; specialization applies the existing minimum clamp.
-    GroupConcatMaxLen(i64),
 }
 
 impl SemanticParameterValue {
@@ -166,8 +161,6 @@ impl SemanticParameterValue {
             Self::StatementStartUtc(_) => SemanticParameterKey::StatementStartUtc,
             Self::TimeZone(_) => SemanticParameterKey::TimeZone,
             Self::AllowThrowException(_) => SemanticParameterKey::AllowThrowException,
-            Self::GroupConcatLegacy(_) => SemanticParameterKey::GroupConcatLegacy,
-            Self::GroupConcatMaxLen(_) => SemanticParameterKey::GroupConcatMaxLen,
         }
     }
 }
@@ -582,7 +575,7 @@ mod tests {
                 ),
                 (
                     SemanticParameterId::new(1),
-                    SemanticParameterValue::GroupConcatLegacy(false),
+                    SemanticParameterValue::AllowThrowException(false),
                 ),
             ],
             [
@@ -622,7 +615,7 @@ mod tests {
             ),
             (
                 SemanticParameterId::new(2),
-                SemanticParameterValue::GroupConcatMaxLen(-121),
+                SemanticParameterValue::AllowThrowException(true),
             ),
         ])
         .unwrap();
@@ -638,7 +631,7 @@ mod tests {
         );
         assert_eq!(
             table.get(SemanticParameterId::new(2)),
-            Some(&SemanticParameterValue::GroupConcatMaxLen(-121))
+            Some(&SemanticParameterValue::AllowThrowException(true))
         );
         assert!(matches!(
             table.project([
@@ -667,7 +660,10 @@ mod tests {
             env.parameter(SemanticParameterKey::TimeZone),
             Some(SemanticParameterValue::TimeZone(zone))
         );
-        assert_eq!(env.parameter(SemanticParameterKey::GroupConcatLegacy), None);
+        assert_eq!(
+            env.parameter(SemanticParameterKey::AllowThrowException),
+            None
+        );
     }
 
     #[test]
@@ -690,7 +686,9 @@ mod tests {
         let mut over = entries;
         over.push((
             SemanticParameterId::new(0),
-            SemanticParameterValue::GroupConcatMaxLen(-1),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(-1, 0).unwrap(),
+            ),
         ));
         assert_eq!(
             SemanticParameters::try_new(over),

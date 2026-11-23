@@ -180,11 +180,10 @@ impl SqlFinalPlanCompileRequest {
                 .map_err(SqlCompileError::from)?;
             &query_semantics
         };
-        let query = crate::sql_mode::normalize_concat_query_with_semantics(query, effective);
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
         // Retain the producer's actual checked constants across discovery and
-        // catalog rounds. The loan is rebuilt against this normalized query;
+        // catalog rounds. The loan is rebuilt against the admitted query;
         // syntax transformations must validate the original structural sites.
         let prepared_parameters = statement.prepared_parameters;
         let materialized_source = match statement.kind {
@@ -2676,18 +2675,18 @@ mod tests {
     fn unsupported_caller_never_discovers_optional_mv_definitions() {
         use crate::sql_mode::SqlMode;
         for (sql, connection_mode) in [
-            ("SELECT order_key FROM orders", "GROUP_CONCAT_LEGACY"),
+            ("SELECT order_key FROM orders", "ERROR_IF_OVERFLOW"),
             (
-                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
                 "32",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM (SELECT order_key FROM orders) d",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
@@ -2720,7 +2719,7 @@ mod tests {
         for (sql, connection_mode) in [
             (
                 "WITH SESSION sql_mode = 32 SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
@@ -2780,7 +2779,7 @@ mod tests {
             table: "orders".to_string(),
         };
         let query = novarocks_parser::parser::parse_query(
-            "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
         )
         .unwrap();
         let definition = SqlMvRewriteDefinitionFacts::try_new(
@@ -3311,12 +3310,6 @@ mod tests {
                 .disabled_rules
                 .push("PushDownTopNToPreAgg".into());
         }
-        // Original compressed_key query 132 admits this value before 137.
-        input.session.sql_semantics = input
-            .session
-            .sql_semantics
-            .clone()
-            .with_group_concat_max_len(65_535);
         input.dop_domain = PipelineDopDomain {
             min: 2,
             max: 2,
@@ -3573,19 +3566,8 @@ mod tests {
                 "SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100",
             ),
             (
-                "original-137",
-                "WITH result AS (
-                    SELECT c1, c2, c3, COUNT(*) AS cnt FROM all_t0
-                    GROUP BY c1, c2, c3 ORDER BY c1, c2, c3 LIMIT 100
-                )
-                SELECT 'Test Case 39' AS test_name,
-                       LOWER(TO_HEX(MD5(TO_UTF8(GROUP_CONCAT(
-                           CAST(CAST(c1 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR
-                           CAST(CAST(c2 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR
-                           CAST(CAST(c3 AS VARCHAR) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR
-                           CAST(CAST(cnt AS VARCHAR) AS BOOLEAN)
-                       ))))) AS result_hash
-                FROM result",
+                "ordered-listagg",
+                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, LOWER(TO_HEX(MD5(TO_UTF8(LISTAGG(CAST(c1 AS VARCHAR), ':') WITHIN GROUP (ORDER BY c1, c2, c3))))) AS result_hash FROM result",
             ),
         ];
         let mut failures = Vec::new();
@@ -3593,8 +3575,10 @@ mod tests {
             match grouped_state_topn_sequence_fixture(sql) {
                 Ok(SqlCompileProgress::Complete(completed)) => {
                     let owner = completed.into_plan();
-                    {
+                    if label == "inner" {
                         assert_grouped_state_topn_sources(&owner);
+                    } else {
+                        assert_complete_group_topn_sources(&owner);
                     }
                 }
                 Ok(SqlCompileProgress::Incomplete(_)) => {

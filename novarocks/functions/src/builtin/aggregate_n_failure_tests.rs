@@ -147,7 +147,7 @@ fn kernel(
         expected_result_type: None,
     };
     let bound = catalog
-        .resolve_bound_user(name, FunctionKind::Aggregate, request, &Compile)
+        .resolve_bound_trusted(name, FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let selected = Arc::new(bound.selected);
     let context = novarocks_type_contract::RelationEffectContext::call(

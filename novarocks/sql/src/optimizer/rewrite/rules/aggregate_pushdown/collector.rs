@@ -51,13 +51,21 @@ pub(crate) fn entry_safety_check(
         if !spec.source.order_by().is_empty() {
             return None;
         }
-        // White-list check.
-        let name = spec.name.to_ascii_lowercase();
-        if !matches!(name.as_str(), "sum" | "min" | "max" | "count") {
+        // These exact overloads have the corresponding pushdown/merge rewrite.
+        let binding = spec.source.binding();
+        if !matches!(
+            binding.selected.overload.as_str(),
+            "builtin.aggregate/sum/derived-v1"
+                | "builtin.aggregate/min/derived-v1"
+                | "builtin.aggregate/max/derived-v1"
+                | "builtin.aggregate/count/derived-v1"
+        ) {
             return None;
         }
         // COUNT(*) has no args.
-        if name == "count" && spec.source.arguments().is_empty() {
+        if binding.function_id.as_str() == "builtin.aggregate/count/v1"
+            && spec.source.arguments().is_empty()
+        {
             return None;
         }
         // Args must be bare ColumnRefs.

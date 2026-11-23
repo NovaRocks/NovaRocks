@@ -21,7 +21,7 @@
 --    the join and a final AGGREGATE on top.
 -- 2. Future PRs touching aggregate pushdown must intentionally re-record.
 --
--- Data design: 20 000 rows on the left, NDV(k) = 100 (k = v % 100).
+-- Data design: 20 000 rows on the left, approx_distinct(k) = 100 (k = v % 100).
 -- With ANALYZE TABLE the cost gate sees NDV=100 << 20000*0.5, so it fires.
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_a;
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_b;

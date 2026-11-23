@@ -180,6 +180,11 @@ impl ExecutionFailurePresentation for ExecutionFailureInput {
             K::InvalidFunctionArgument
         } else if self.fact().class() == FailureClass::Data
             && self.fact().reason()
+                == novarocks_function_contract::kernel_failure::EXCEEDED_FUNCTION_MEMORY_LIMIT
+        {
+            K::ExceededFunctionMemoryLimit
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
                 == novarocks_function_contract::kernel_failure::DATE_RESULT_OUT_OF_RANGE
         {
             K::DateResultOutOfRange
@@ -283,6 +288,7 @@ pub enum SqlExecutionErrorKind {
     DivisionByZero,
     InvalidCastArgument,
     InvalidFunctionArgument,
+    ExceededFunctionMemoryLimit,
     DateResultOutOfRange,
     UnknownEpochTimeZone,
     Data,
@@ -314,6 +320,11 @@ impl SqlExecutionErrorDescriptor {
             DivisionByZero => ("query.execution.division_by_zero", 1365, "22012"),
             InvalidCastArgument => ("query.execution.invalid_cast_argument", 1105, "HY000"),
             InvalidFunctionArgument => ("query.execution.invalid_function_argument", 1105, "HY000"),
+            ExceededFunctionMemoryLimit => (
+                "query.execution.exceeded_function_memory_limit",
+                1105,
+                "HY000",
+            ),
             DateResultOutOfRange => ("query.execution.date_result_out_of_range", 1105, "HY000"),
             UnknownEpochTimeZone => ("query.execution.unknown_epoch_time_zone", 1105, "HY000"),
             Data => ("query.execution.invalid_data", 1105, "HY000"),
@@ -363,6 +374,8 @@ pub const EXECUTION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::InvalidCastArgument).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::InvalidFunctionArgument)
         .descriptor,
+    SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::ExceededFunctionMemoryLimit)
+        .descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::DateResultOutOfRange).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::UnknownEpochTimeZone).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Data).descriptor,
@@ -389,6 +402,7 @@ pub fn execution_descriptor_for_code(code: ErrorCodeId) -> Option<SqlExecutionEr
         DivisionByZero,
         InvalidCastArgument,
         InvalidFunctionArgument,
+        ExceededFunctionMemoryLimit,
         DateResultOutOfRange,
         UnknownEpochTimeZone,
         Data,

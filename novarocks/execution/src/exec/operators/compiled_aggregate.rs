@@ -523,12 +523,13 @@ impl CompiledAggregateProcessorFactory {
         })
     }
 
-    /// Exactly the original local two-stage condition except for upstream
-    /// DOP, which the pipeline builder observes after building the input.
+    /// Every call must have prepared its original local stages before the
+    /// pipeline can exchange intermediate states.
     pub(crate) fn requires_local_update_stages(&self) -> bool {
         self.completes_groups()
             && self.calls.iter().all(|call| {
                 call.contract.phase() == novarocks_functions::AggregateKernelPhase::Single
+                    && call.handle.local_stages().is_some()
             })
     }
     /// Consume the already prepared local lifecycle. The intermediate schema

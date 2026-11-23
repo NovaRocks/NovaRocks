@@ -476,8 +476,6 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 "builtin.aggregate/sum/v1" | "builtin.aggregate/avg/v1" => Some(DataType::Float64),
                 "builtin.aggregate/bool_or/v1"
                 | "builtin.aggregate/bool_and/v1"
-                | "builtin.aggregate/boolor_agg/v1"
-                | "builtin.aggregate/booland_agg/v1"
                 | "builtin.aggregate/every/v1"
                 | "builtin.aggregate/count_if/v1" => Some(DataType::Boolean),
                 _ => None,
@@ -612,7 +610,7 @@ pub(crate) fn resolve_sql_aggregate_call(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
-        match public_aggregate_target(name, distinct) {
+        let bound = match public_aggregate_target(name, distinct) {
             PublicAggregateTarget::Named(executable) => catalog.resolve_aggregate_binding(
                 executable,
                 request.logical_argument_count,
@@ -622,7 +620,19 @@ pub(crate) fn resolve_sql_aggregate_call(
             PublicAggregateTarget::Distinct(aggregate) => {
                 catalog.resolve_distinct_aggregate(aggregate, request, control)
             }
+        }?;
+        if distinct
+            && matches!(
+                bound.function_id.as_str(),
+                "builtin.aggregate/approx_percentile/v1"
+                    | "builtin.aggregate/approx_most_frequent/v1"
+            )
+        {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                bound.selected.overload,
+            ));
         }
+        Ok(bound)
     })
 }
 
@@ -637,7 +647,6 @@ fn public_aggregate_target(name: &str, distinct: bool) -> PublicAggregateTarget<
         (true, "count") => PublicAggregateTarget::Distinct(DistinctAggregate::Count),
         (true, "sum") => PublicAggregateTarget::Distinct(DistinctAggregate::Sum),
         (true, "avg") => PublicAggregateTarget::Distinct(DistinctAggregate::Avg),
-        (true, "array_agg") => PublicAggregateTarget::Named("array_agg_distinct"),
         _ => PublicAggregateTarget::Named(name),
     }
 }
@@ -1493,8 +1502,8 @@ mod tests {
             &[DataType::Int64],
             false,
             &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("std alias resolves for user SQL");
+        );
+        assert_eq!(std_user, Err(FunctionResolutionError::HiddenFunction));
         let std_trusted = resolve_bound_aggregate(
             &catalog,
             "std",
@@ -1504,14 +1513,13 @@ mod tests {
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("std alias resolves for trusted planning");
-        assert_eq!(std_user, std_trusted);
         assert_eq!(
-            std_user.overload.as_str(),
+            std_trusted.overload.as_str(),
             "builtin.aggregate/std/derived-v1"
         );
-        assert_eq!(std_user.intermediate_type, DataType::Binary);
-        assert_eq!(std_user.output_type, DataType::Float64);
-        assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
+        assert_eq!(std_trusted.intermediate_type, DataType::Binary);
+        assert_eq!(std_trusted.output_type, DataType::Float64);
+        assert_eq!(std_trusted.state_format.as_str(), "novarocks/std/state-v1");
     }
 
     #[test]

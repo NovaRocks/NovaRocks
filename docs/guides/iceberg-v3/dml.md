@@ -140,7 +140,7 @@ DELETE FROM expired_staging;
 
 `EXPLAIN DELETE` 显示 `TableDelete`、`Values (0 rows)` 或匹配读及行级删除格式。带约束的 `TableDelete` 显示原快照和约束列。显式分支带 WHERE 沿既有行级路径。整分支 DELETE 沿既有整分支清空契约，当前不支持该形态的 EXPLAIN。
 
-实现参见 [ADR-0259](../../adr/ADR-0259-iceberg-metadata-delete-proves-original-fields-on-each-round.md)。
+实现参见 [ADR-0260](../../adr/ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md)。
 
 ## ✅ UPDATE 与关联更新（MOR）
 

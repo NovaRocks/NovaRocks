@@ -1767,12 +1767,7 @@ impl SqlCompiler {
                 factory.clone(),
                 root_semantics.clone(),
                 true,
-                (request
-                    .session
-                    .sql_semantics
-                    .sql_mode()
-                    .group_concat_legacy()
-                    || request.session.sql_semantics.sql_mode().error_if_overflow()),
+                (request.session.sql_semantics.sql_mode().error_if_overflow()),
                 request
                     .session
                     .sql_semantics
@@ -2981,7 +2976,7 @@ mod tests {
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
             constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query(
-                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT k FROM missing_table",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT k FROM missing_table",
             ),
             current_database: "db".to_string(),
             catalog: &catalog,
@@ -2990,7 +2985,7 @@ mod tests {
         })
         .expect_err("unsupported persisted semantics");
         assert!(error.to_string().starts_with("Unsupported:"));
-        assert!(error.to_string().contains("GROUP_CONCAT_LEGACY"));
+        assert!(error.to_string().contains("ERROR_IF_OVERFLOW"));
         assert!(
             !error.to_string().contains("missing_table"),
             "guard precedes analyzer table materialization"

@@ -1,0 +1,19 @@
+-- query 1
+-- types	bigint
+cardinality
+0
+
+-- query 2
+-- types	bigint	bigint
+distinct_boolean	distinct_true
+2	1
+
+-- query 3
+-- types	bigint
+cardinality
+2
+
+-- query 7
+-- types	bigint	bigint	bigint	boolean
+groups	smallest_exact	largest_exact	within_rmse
+32	8192	8192	true

@@ -24,7 +24,7 @@ use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::task::ExecutionFailureCause;
 use arrow::datatypes::DataType;
-use novarocks_functions::{FunctionKind, KernelFailure};
+use novarocks_functions::FunctionKind;
 
 use novarocks_type_contract::FunctionValueType;
 fn whole_invocation_probe(step: usize, later_root_error: bool) {
@@ -150,31 +150,43 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
             break;
         }
     }
+    if !later_root_error {
+        assert!(earlier.is_none());
+        processor.signal_eos().unwrap();
+        let output = processor.collect_until_finished().unwrap();
+        let mut winners = Vec::new();
+        for chunk in &output {
+            let values = chunk
+                .record_batch()
+                .column(6)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
+            winners.extend_from_slice(values.values());
+        }
+        assert_eq!(winners, [10, 11, 20, 20]);
+        assert!(state.error().is_none());
+        drop(output);
+        drop(processor);
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
+        return;
+    }
     let first = earlier.unwrap_or_else(|| {
         processor.signal_eos().unwrap();
         processor.collect_until_finished().unwrap_err()
     });
     match first.cause() {
-        ExecutionFailureCause::WindowInvocationData(data) => {
-            assert_eq!(
-                data.message(),
-                "window function #0: update aggregate state: float comparison is not ordered"
+        ExecutionFailureCause::RequiredRow(row) => {
+            assert_eq!(row.batch_row(), 0);
+            assert!(
+                row.error()
+                    .message()
+                    .to_string()
+                    .contains("Arithmetic overflow")
             );
-            assert_eq!(data.call_ordinal(), 0);
-            assert_eq!(
-                data.scope(),
-                novarocks_functions::WindowInvocationScope::CompleteInvocation
-            );
-            assert_eq!(data.invocation_rows(), 4);
-            assert_eq!(data.partition_ordinal(), Some(1));
-            assert_eq!(data.partition_frame_ordinal(), Some(1));
-            assert_eq!(data.frame_ordinal(), Some(3));
-            assert_eq!(data.input_row(), Some(3));
         }
-        ExecutionFailureCause::Kernel(KernelFailure::Operational(error)) => {
-            panic!("raw Data must not be bounded/Operational: {error:?}")
-        }
-        other => panic!("actual original whole-call Data: {other:?}"),
+        other => panic!("expected the original later root failure: {other:?}"),
     }
     assert_eq!(
         processor
@@ -188,22 +200,18 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
     drop(processor);
     drop(operator);
     drop(first);
-    assert!(
-        tracker.current() > 0,
-        "the early failure observer still owns original invocation data"
-    );
     drop(state);
     assert_eq!(tracker.current(), 0);
 }
 
 #[test]
-fn by_window_compiled_first_math_data_precedes_later_root_for_original_chunk_shapes() {
+fn by_window_compiled_nan_does_not_mask_later_root_data_for_original_chunk_shapes() {
     for step in [1, 2, 4] {
         whole_invocation_probe(step, true);
     }
 }
 #[test]
-fn by_window_compiled_function_major_first_data_keeps_global_source_coordinates() {
+fn by_window_compiled_nan_keeps_winners_across_original_chunk_shapes() {
     for step in [1, 2, 4] {
         whole_invocation_probe(step, false);
     }

@@ -262,6 +262,7 @@ async fn freeze_mv_rewrite_definition_async(
             state,
         )?);
     }
+    novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(&frozen.interpretation)?;
     let selection = freeze_mv_rewrite_selection(&frozen, target_revision)?;
     SqlMvRewriteDefinitionFacts::try_new(
         projection.mv_id,

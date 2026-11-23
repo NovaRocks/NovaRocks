@@ -3516,7 +3516,7 @@ pub(crate) fn analyze_candidates(
         if consumer_requires_semantic_snapshot {
             entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(SqlMvRewriteDiagnostic {
                 mv_id: Some(definition.mv_id),
-                message: "mv rewrite: persisted definition is ineligible under GROUP_CONCAT_LEGACY or ERROR_IF_OVERFLOW because its semantic settings are not captured".to_string(),
+                message: "mv rewrite: persisted definition is ineligible under ERROR_IF_OVERFLOW or ERROR_IF_OVERFLOW because its semantic settings are not captured".to_string(),
             }));
             continue;
         }
@@ -3960,7 +3960,7 @@ mod tests {
                 .iter()
                 .all(|entry| !matches!(entry, SqlMvRewriteAnalysisEntry::Candidate(_)))
         );
-        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("GROUP_CONCAT_LEGACY"))));
+        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("ERROR_IF_OVERFLOW"))));
         assert_eq!(
             catalog.resolutions.load(Ordering::Acquire),
             resolutions_before,
@@ -3975,7 +3975,7 @@ mod tests {
         let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
         let mut index = candidate_index();
         index.definitions[0].select_query =
-            test_query("WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT k FROM base");
+            test_query("WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT k FROM base");
         let analysis = analyze_candidates(
             &index,
             &catalog,
