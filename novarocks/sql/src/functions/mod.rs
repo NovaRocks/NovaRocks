@@ -1077,21 +1077,10 @@ mod tests {
 
     #[test]
     fn sqlx1_function_builtin_snapshot_has_canonical_volatility_set() {
+        use novarocks_type_contract::SemanticParameterKey::{StatementStartUtc, TimeZone};
+
         let catalog = builtin_sql_function_catalog();
-        for name in [
-            "rand",
-            "random",
-            "uuid",
-            "sleep",
-            "now",
-            "current_timestamp",
-            "current_date",
-            "curdate",
-            "current_time",
-            "curtime",
-            "localtime",
-            "localtimestamp",
-        ] {
+        for name in ["rand", "random", "uuid", "sleep"] {
             assert_eq!(
                 catalog.volatility(name),
                 FunctionVolatility::Volatile,
@@ -1099,6 +1088,39 @@ mod tests {
             );
         }
         assert_eq!(catalog.volatility("lower"), FunctionVolatility::Immutable);
+
+        let definitions = builtin_engine_function_catalog();
+        for name in ["now", "current_date"] {
+            assert_eq!(catalog.volatility(name), FunctionVolatility::Immutable);
+            let declaration = definitions
+                .definition(name, FunctionKind::Scalar)
+                .unwrap()
+                .binding_declaration()
+                .unwrap();
+            let [overload] = declaration.overloads() else {
+                panic!("{name} has one clock overload");
+            };
+            let effects = declaration.effect_declaration(&overload.identity).unwrap();
+            assert_eq!(
+                effects.environment_dependencies.as_ref(),
+                &[StatementStartUtc, TimeZone],
+                "{name}"
+            );
+        }
+
+        for name in [
+            "current_timestamp",
+            "current_time",
+            "localtime",
+            "localtimestamp",
+            "curdate",
+            "curtime",
+        ] {
+            assert!(
+                definitions.definition(name, FunctionKind::Scalar).is_none(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -261,7 +261,7 @@ fn dedicated_extract_syntax_uses_its_catalogue_binding() {
     let result = constant(source, &context);
     assert_eq!(
         result.batch.values.to_data(),
-        Int32Array::from(vec![2025]).to_data()
+        Int64Array::from(vec![2025]).to_data()
     );
 }
 
@@ -371,6 +371,7 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     for (text, name) in [
         ("TRIM(x)", "trim"),
         ("count(x)", "count"),
+        ("IF(TRUE, x, x)", "if"),
         ("x.y", "qualified name or field reference"),
     ] {
         assert!(
@@ -381,7 +382,7 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
             "{text}"
         );
     }
-    let conditional = type_text("IF(TRUE, x, x)").unwrap();
+    let conditional = type_text("COALESCE(x, x)").unwrap();
     let values = Arc::new(StringArray::from(vec!["original value"]));
     let result = evaluate(&conditional, &batch(&columns, vec![values.clone()]));
     assert_eq!(result.batch.result_type, columns[0].value_type);

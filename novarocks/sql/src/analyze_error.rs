@@ -975,6 +975,7 @@ mod tests {
                 "sql.analyze.function_not_aggregate",
                 "sql.analyze.expression_not_scalar",
                 "sql.analyze.invalid_literal",
+                "sql.analyze.numeric_out_of_range",
                 "sql.analyze.invalid_argument",
                 "sql.analyze.missing_argument",
                 "sql.analyze.invalid_function_argument",

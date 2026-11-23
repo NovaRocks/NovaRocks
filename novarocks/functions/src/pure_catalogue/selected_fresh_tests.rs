@@ -297,7 +297,8 @@ fn ordinary_selected_fresh_refuses_missing_owner_binding_and_record_as_typed_err
             fixture.options(),
             &Control::default()
         ),
-        Err(FunctionSpecializationFailure::MissingPureImplementation(_))
+        Err(FunctionSpecializationFailure::MissingPureImplementation(overload))
+            if overload == selected.overload
     ));
     assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
 
@@ -308,9 +309,8 @@ fn ordinary_selected_fresh_refuses_missing_owner_binding_and_record_as_typed_err
     binding.pure.as_mut().unwrap().implementations = Arc::from([]);
     assert!(matches!(
         fixture.prepare(&Control::default()),
-        Err(FunctionSpecializationFailure::Binding(
-            FunctionBindingError::UnknownOverload(_)
-        ))
+        Err(FunctionSpecializationFailure::MissingPureImplementation(overload))
+            if overload == fixture.selected.overload
     ));
     fixture.catalog.definitions[index].binding = None;
     assert!(matches!(
