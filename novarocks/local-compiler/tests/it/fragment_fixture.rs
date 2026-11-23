@@ -59,7 +59,13 @@ pub(super) fn numeric_catalogue() -> PureEngineFunctionCatalog {
         ),
         (
             "rand",
-            &["()->f64;strict;legacy", "(i64)->f64;strict;legacy"][..],
+            &[
+                "()->f64;strict;legacy",
+                "(i8)->i8;strict;coerce",
+                "(i16)->i16;strict;coerce",
+                "(i32)->i32;strict;coerce",
+                "(i64)->i64;strict;coerce",
+            ][..],
             PureKernelAbi::ScalarV1,
         ),
         ("round", &["dynamic-v1"][..], PureKernelAbi::ScalarV1),
@@ -72,6 +78,11 @@ pub(super) fn numeric_catalogue() -> PureEngineFunctionCatalog {
                     .clone(),
             )
             .unwrap();
+        let implementation = if name == "round" {
+            "selected-v2"
+        } else {
+            "selected-v1"
+        };
         for overload in overloads {
             manifest.push(InstalledPureKernel {
                 function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
@@ -82,7 +93,7 @@ pub(super) fn numeric_catalogue() -> PureEngineFunctionCatalog {
                     ))
                     .unwrap(),
                     implementation: PureImplementationId::try_new(format!(
-                        "builtin.scalar/{name}/selected-v1"
+                        "builtin.scalar/{name}/{implementation}"
                     ))
                     .unwrap(),
                     abi,

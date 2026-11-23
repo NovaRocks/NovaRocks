@@ -633,33 +633,7 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
             false,
         ),
 
-        // Math functions that return Int64
-        "ceil" | "ceiling" | "dceil" | "floor" | "dfloor" => DataType::Int64,
-
-        // round/truncate:
-        // - Decimal input -> Decimal128 with adjusted scale
-        // - Non-decimal without explicit scale -> Int64
-        // - Non-decimal with explicit scale -> Float64
-        "round" | "truncate" => match arg_types.first() {
-            Some(DataType::Decimal128(_, s)) => {
-                // If second arg is an integer type, the value is the target
-                // decimal places.  We can't see the value here (only the type),
-                // so we keep the original scale.  The execution ROUND already
-                // handles the conversion.  To match StarRocks display, we'll
-                // rely on the execution layer's output scale adjustment.
-                DataType::Decimal128(38, *s)
-            }
-            _ if arg_types.len() >= 2 => DataType::Float64,
-            _ => DataType::Int64,
-        },
-
-        // Math functions that return Float64
-        "mod" | "fmod" | "pow" | "fpow" | "dpow" | "power" | "sqrt" | "dsqrt" | "cbrt" | "exp"
-        | "dexp" | "ln" | "log" | "log2" | "log10" | "dlog10" | "dlog1" | "dround" | "sin"
-        | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians" | "degrees"
-        | "degress" | "pi" | "e" | "sign" | "rand" | "random" | "positive"
-        | "cosine_similarity" | "l2_distance" => DataType::Float64,
-
+        "positive" => DataType::Float64,
         "equiwidth_bucket" => DataType::Int64,
 
         // Conditional functions -> widened type of value args.
@@ -703,16 +677,6 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         // Symmetric ciphers / hashes: aes_*/encode_* return BE-style VARCHAR
         // (raw bytes interpreted as latin-1); to_base64 wraps them in tests.
         // Iceberg internal transform functions.
-        // Bitwise functions return the same integer width as the first
-        // argument; mirror codegen so the lowering layer's integer-only
-        // requirement is satisfied (e.g. shift on LARGEINT).
-        "bitnot"
-        | "bitand"
-        | "bitor"
-        | "bitxor"
-        | "bit_shift_left"
-        | "bit_shift_right"
-        | "bit_shift_right_logical" => arg_types.first().cloned().unwrap_or(DataType::Int64),
         "to_binary" => DataType::Binary,
         "count_state_union"
         | "count_distinct_state_union"

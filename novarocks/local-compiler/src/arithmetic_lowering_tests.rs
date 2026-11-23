@@ -63,24 +63,30 @@ fn functions() -> PureEngineFunctionCatalog {
     // Independent actual RAND records; no comparison function or Server seal is invented.
     builder
         .seal_pure(
-            ["()->f64;strict;legacy", "(i64)->f64;strict;legacy"]
-                .into_iter()
-                .map(|overload| InstalledPureKernel {
-                    function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
-                    kind: FunctionKind::Scalar,
-                    implementation: PureImplementationDeclaration {
-                        overload: FunctionOverloadId::try_new(format!(
-                            "builtin.scalar/rand/{overload}"
-                        ))
-                        .unwrap(),
-                        implementation: PureImplementationId::try_new(
-                            "builtin.scalar/rand/selected-v1",
-                        )
-                        .unwrap(),
-                        abi: PureKernelAbi::ScalarV1,
-                    },
-                    aggregate_state_format: None,
-                }),
+            [
+                "()->f64;strict;legacy",
+                "(i8)->i8;strict;coerce",
+                "(i16)->i16;strict;coerce",
+                "(i32)->i32;strict;coerce",
+                "(i64)->i64;strict;coerce",
+            ]
+            .into_iter()
+            .map(|overload| InstalledPureKernel {
+                function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
+                kind: FunctionKind::Scalar,
+                implementation: PureImplementationDeclaration {
+                    overload: FunctionOverloadId::try_new(format!(
+                        "builtin.scalar/rand/{overload}"
+                    ))
+                    .unwrap(),
+                    implementation: PureImplementationId::try_new(
+                        "builtin.scalar/rand/selected-v1",
+                    )
+                    .unwrap(),
+                    abi: PureKernelAbi::ScalarV1,
+                },
+                aggregate_state_format: None,
+            }),
         )
         .unwrap()
 }

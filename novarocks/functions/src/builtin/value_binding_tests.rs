@@ -223,7 +223,7 @@ fn user_binding_refuses_retired_nominal_family_conversions() {
             vec![value(largeint()), value(physical(DataType::Int32))],
         ),
         (
-            "bitand",
+            "bitwise_and",
             vec![value(largeint()), value(physical(DataType::Int64))],
         ),
         (
@@ -267,7 +267,7 @@ fn undeclared_domains_do_not_gain_conversion_authority_from_carriers() {
             )),
             value(other),
         ];
-        for name in ["coalesce", "ifnull", "bitand"] {
+        for name in ["coalesce", "ifnull", "bitwise_and"] {
             assert!(
                 catalog
                     .resolve_bound_user(
@@ -386,8 +386,18 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
         DataType::FixedSizeBinary(16),
         ValueLogicalType::LargeInt,
     ))];
+    assert_eq!(
+        catalog
+            .resolve_bound_user(
+                "abs",
+                FunctionKind::Scalar,
+                request(&arguments),
+                crate::binding_test_control(),
+            )
+            .unwrap_err(),
+        FunctionBindingError::NoMatchingOverload,
+    );
     for (name, kind) in [
-        ("abs", FunctionKind::Scalar),
         ("sum", FunctionKind::Aggregate),
         ("multi_distinct_sum", FunctionKind::Aggregate),
     ] {
@@ -421,10 +431,7 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
         FunctionKind::Scalar,
         &[value(physical(DataType::Int64))],
     );
-    assert_eq!(
-        output(&abs_integer).logical_type(),
-        ValueLogicalType::LargeInt
-    );
+    assert_eq!(output(&abs_integer), &physical(DataType::Int64));
 }
 
 #[test]

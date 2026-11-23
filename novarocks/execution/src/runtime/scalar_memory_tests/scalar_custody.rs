@@ -68,14 +68,14 @@ fn functions() -> PureEngineFunctionCatalog {
     let mut builder = EngineFunctionCatalogBuilder::new();
     let mut installed = vec![];
     for name in [
-        "bit_shift_left",
-        "bit_shift_right",
-        "bit_shift_right_logical",
+        "bitwise_left_shift",
+        "bitwise_right_shift_arithmetic",
+        "bitwise_right_shift",
         "if",
-        "bitand",
-        "bitor",
-        "bitxor",
-        "bitnot",
+        "bitwise_and",
+        "bitwise_or",
+        "bitwise_xor",
+        "bitwise_not",
     ] {
         let definition = actual.definition(name, FunctionKind::Scalar).unwrap();
         builder.register(definition.clone()).unwrap();
@@ -125,9 +125,9 @@ fn fixture_family(
     let integer = FunctionValueType::new(source_type, true);
     let count_type = FunctionValueType::new(
         if bitwise {
-            integer.data_type().clone()
-        } else {
             DataType::Int64
+        } else {
+            DataType::Int32
         },
         true,
     );
@@ -188,7 +188,7 @@ fn fixture_family(
         .unwrap()
         .add(None, integer.clone(), ExprKind::Value(columns[0].0))
         .unwrap();
-    let count = if bitwise && name == "bitnot" && !matches!(shape, Shape::Nested) {
+    let count = if bitwise && name == "bitwise_not" && !matches!(shape, Shape::Nested) {
         // NOT has no right child. Do not create an unreachable definition.
         value
     } else {
@@ -216,14 +216,14 @@ fn fixture_family(
         author(
             &functions,
             name,
-            if bitwise && name == "bitnot" {
+            if bitwise && name == "bitwise_not" {
                 vec![argument(&integer)]
             } else {
                 vec![argument(&integer), argument(&count_type)]
             },
             ControlShape::Eager,
         ),
-        if bitwise && name == "bitnot" {
+        if bitwise && name == "bitwise_not" {
             vec![value]
         } else {
             vec![value, count]
@@ -236,7 +236,11 @@ fn fixture_family(
             &mut authors,
             author(
                 &functions,
-                if bitwise { "bitxor" } else { "bit_shift_right" },
+                if bitwise {
+                    "bitwise_xor"
+                } else {
+                    "bitwise_right_shift_arithmetic"
+                },
                 vec![argument(&integer), argument(&count_type)],
                 ControlShape::Eager,
             ),
@@ -441,7 +445,7 @@ fn batch(
                 DataType::Int64 => Arc::new(Int64Array::from(values)) as ArrayRef,
                 _ => panic!("exact shift fixture source"),
             },
-            Arc::new(Int64Array::from(vec![1; rows])),
+            Arc::new(Int32Array::from(vec![1; rows])),
             Arc::new(BooleanArray::from(flags)),
         ],
     )
@@ -473,9 +477,9 @@ fn runtime_control(binding: Option<&QueryMemoryBinding>) -> RuntimeKernelControl
 #[test]
 fn runtime_scalar_memory_original_frame_nested_and_selected_values_match_old_entry() {
     for name in [
-        "bit_shift_left",
-        "bit_shift_right",
-        "bit_shift_right_logical",
+        "bitwise_left_shift",
+        "bitwise_right_shift_arithmetic",
+        "bitwise_right_shift",
     ] {
         for shape in [Shape::Direct, Shape::Nested, Shape::IfThen, Shape::IfElse] {
             let program = fixture(name, shape);
@@ -539,7 +543,7 @@ fn runtime_scalar_memory_original_frame_nested_and_selected_values_match_old_ent
 }
 #[test]
 fn runtime_scalar_memory_required_helper_missing_binding_fails_root_without_scalar_call() {
-    let program = fixture("bit_shift_left", Shape::Direct);
+    let program = fixture("bitwise_left_shift", Shape::Direct);
     let input = batch(&program, vec![Some(7)], vec![Some(true)]);
     let control = runtime_control(None);
     let mut actual = CompiledExpressionInstance::try_new(
@@ -569,7 +573,7 @@ fn runtime_scalar_memory_if_undemanded_validate_only_and_strict_null_bypass_rema
         (Shape::IfElse, vec![Some(true); 3], vec![Some(7); 3]),
         (Shape::Direct, vec![Some(true); 3], vec![None; 3]),
     ] {
-        let program = fixture("bit_shift_left", shape);
+        let program = fixture("bitwise_left_shift", shape);
         let input = batch(&program, values, flags);
         let control = runtime_control(None);
         let mut actual = CompiledExpressionInstance::try_new(
@@ -580,7 +584,7 @@ fn runtime_scalar_memory_if_undemanded_validate_only_and_strict_null_bypass_rema
         .unwrap();
         evaluate_all(&mut actual, root(&program), &input, &control).unwrap();
     }
-    let program = fixture("bit_shift_left", Shape::Direct);
+    let program = fixture("bitwise_left_shift", Shape::Direct);
     let input = batch(&program, vec![], vec![]);
     let control = runtime_control(None);
     let mut actual = CompiledExpressionInstance::try_new(
@@ -615,7 +619,7 @@ fn runtime_scalar_memory_if_undemanded_validate_only_and_strict_null_bypass_rema
 }
 #[test]
 fn runtime_scalar_memory_direct_ordered_filter_uses_same_loan_and_first_host_failure() {
-    let program = fixture("bit_shift_left", Shape::Filter);
+    let program = fixture("bitwise_left_shift", Shape::Filter);
     let input = batch(
         &program,
         vec![Some(7), Some(3), None],
@@ -708,9 +712,9 @@ fn runtime_scalar_memory_direct_ordered_filter_uses_same_loan_and_first_host_fai
 fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scope() {
     for ty in [DataType::Int8, DataType::Int16, DataType::Int32] {
         for name in [
-            "bit_shift_left",
-            "bit_shift_right",
-            "bit_shift_right_logical",
+            "bitwise_left_shift",
+            "bitwise_right_shift_arithmetic",
+            "bitwise_right_shift",
         ] {
             for shape in [Shape::Direct, Shape::Nested, Shape::IfThen, Shape::IfElse] {
                 let program = fixture_typed(name, shape, ty.clone());
@@ -852,9 +856,9 @@ fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scop
 fn runtime_scalar_memory_narrow_roots_keep_missing_latch_and_strict_bypass_boundary() {
     for ty in [DataType::Int8, DataType::Int16, DataType::Int32] {
         for name in [
-            "bit_shift_left",
-            "bit_shift_right",
-            "bit_shift_right_logical",
+            "bitwise_left_shift",
+            "bitwise_right_shift_arithmetic",
+            "bitwise_right_shift",
         ] {
             let program = fixture_typed(name, Shape::Direct, ty.clone());
             let input = batch(&program, vec![Some(7)], vec![Some(true)]);
@@ -899,67 +903,116 @@ fn runtime_scalar_memory_narrow_roots_keep_missing_latch_and_strict_bypass_bound
 }
 
 #[test]
-fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_and_refusal() {
-    let names = ["bitand", "bitor", "bitxor", "bitnot"];
-    for ty in [
-        DataType::Int8,
-        DataType::Int16,
-        DataType::Int32,
-        DataType::Int64,
-    ] {
-        for name in names {
-            for shape in [
-                Shape::Direct,
-                Shape::Nested,
-                Shape::IfThen,
-                Shape::IfElse,
-                Shape::Filter,
-            ] {
-                let program = fixture_family(name, shape, ty.clone(), true);
-                let typed = |values: Vec<Option<i64>>| -> ArrayRef {
-                    macro_rules! narrow {
-                        ($array:ty,$native:ty) => {
-                            Arc::new(<$array>::from(
-                                values
-                                    .into_iter()
-                                    .map(|v| v.map(|v| <$native>::try_from(v).unwrap()))
-                                    .collect::<Vec<_>>(),
-                            )) as ArrayRef
-                        };
-                    }
-                    match ty {
-                        DataType::Int8 => narrow!(Int8Array, i8),
-                        DataType::Int16 => narrow!(Int16Array, i16),
-                        DataType::Int32 => narrow!(Int32Array, i32),
-                        DataType::Int64 => Arc::new(Int64Array::from(values)),
-                        _ => unreachable!(),
-                    }
-                };
-                let input = RecordBatch::try_new(
-                    program.graph().nodes()[1].output_layout().schema().clone(),
-                    vec![
-                        typed(vec![Some(-7), None, Some(-7), Some(-7)]),
-                        typed(vec![Some(3), Some(3), None, Some(3)]),
-                        Arc::new(BooleanArray::from(vec![
-                            Some(true),
-                            Some(true),
-                            Some(false),
-                            Some(false),
-                        ])) as ArrayRef,
-                    ],
+fn runtime_scalar_memory_bitwise_bigint_frames_and_filters_keep_same_scope_and_refusal() {
+    let names = ["bitwise_and", "bitwise_or", "bitwise_xor", "bitwise_not"];
+    for name in names {
+        for shape in [
+            Shape::Direct,
+            Shape::Nested,
+            Shape::IfThen,
+            Shape::IfElse,
+            Shape::Filter,
+        ] {
+            let program = fixture_family(name, shape, DataType::Int64, true);
+            let input = RecordBatch::try_new(
+                program.graph().nodes()[1].output_layout().schema().clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(-7), None, Some(-7), Some(-7)]))
+                        as ArrayRef,
+                    Arc::new(Int64Array::from(vec![Some(3), Some(3), None, Some(3)])) as ArrayRef,
+                    Arc::new(BooleanArray::from(vec![
+                        Some(true),
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                    ])) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let binding = bound();
+            let funded = runtime_control(Some(&binding));
+            if matches!(shape, Shape::Filter) {
+                assert!(matches!(
+                    program.graph().nodes()[2].kind(),
+                    novarocks_local_program::ProgramNodeKind::Filter { .. }
+                ));
+                let mut original = CompiledFilterConjunctionInstance::try_new_with_allocator(
+                    &predicate_units(&program),
+                    &Control,
+                    None,
                 )
                 .unwrap();
-                let binding = bound();
-                let funded = runtime_control(Some(&binding));
-                if matches!(shape, Shape::Filter) {
-                    assert!(matches!(
-                        program.graph().nodes()[2].kind(),
-                        novarocks_local_program::ProgramNodeKind::Filter { .. }
-                    ));
-                    let mut original = CompiledFilterConjunctionInstance::try_new_with_allocator(
-                        &predicate_units(&program),
+                let expected = original
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &input,
+                            source: None,
+                        },
+                        Selection::all(4),
                         &Control,
+                        &mut PassThroughCallHost,
+                    )
+                    .unwrap();
+                for has_binding in [false, true] {
+                    let control = runtime_control(has_binding.then_some(&binding));
+                    let mut actual = CompiledFilterConjunctionInstance::try_new_with_allocator(
+                        &predicate_units(&program),
+                        &control,
                         None,
+                    )
+                    .unwrap();
+                    let mut journal = RuntimeScalarMemoryJournal::default();
+                    let result = actual
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &input,
+                                source: None,
+                            },
+                            Selection::all(4),
+                            &control,
+                            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                        )
+                        .map_err(ExecutionFailure::from);
+                    if has_binding {
+                        assert_eq!(result.unwrap().to_data(), expected.to_data());
+                        assert_eq!(journal.body.settlement.unwrap().debt, 0);
+                    } else {
+                        assert_eq!(
+                            result.unwrap_err().cause(),
+                            &ExecutionFailureCause::RuntimeScalarMemory(
+                                RuntimeScalarMemoryRefusal::MissingQueryMemory
+                            )
+                        );
+                        let mut retry = RuntimeScalarMemoryJournal::default();
+                        assert!(matches!(
+                            actual
+                                .evaluate(
+                                    EvaluationInput::Batch {
+                                        batch: &input,
+                                        source: None
+                                    },
+                                    Selection::all(4),
+                                    &funded,
+                                    &mut RuntimeScalarMemoryScope::new(&funded, &mut retry),
+                                )
+                                .map_err(ExecutionFailure::from)
+                                .unwrap_err()
+                                .cause(),
+                            ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+                        ));
+                    }
+                }
+            } else {
+                for sparse in [false, true] {
+                    let selection = if sparse {
+                        Selection::try_sparse(4, &[0, 3]).unwrap()
+                    } else {
+                        Selection::all(4)
+                    };
+                    let mut original = CompiledExpressionInstance::try_new(
+                        program.unit(root(&program).unit).unwrap().clone(),
+                        root(&program).root,
+                        &Control,
                     )
                     .unwrap();
                     let expected = original
@@ -968,154 +1021,79 @@ fn runtime_scalar_memory_bitwise_16_explicit_frames_and_filters_keep_same_scope_
                                 batch: &input,
                                 source: None,
                             },
-                            Selection::all(4),
+                            ScalarInvocationScope::new(selection, selection),
+                            Activation::Activated,
                             &Control,
                             &mut PassThroughCallHost,
                         )
                         .unwrap();
-                    for has_binding in [false, true] {
-                        let control = runtime_control(has_binding.then_some(&binding));
-                        let mut actual = CompiledFilterConjunctionInstance::try_new_with_allocator(
-                            &predicate_units(&program),
-                            &control,
-                            None,
-                        )
-                        .unwrap();
-                        let mut journal = RuntimeScalarMemoryJournal::default();
-                        let result = actual
-                            .evaluate(
-                                EvaluationInput::Batch {
-                                    batch: &input,
-                                    source: None,
-                                },
-                                Selection::all(4),
-                                &control,
-                                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-                            )
-                            .map_err(ExecutionFailure::from);
-                        if has_binding {
-                            assert_eq!(result.unwrap().to_data(), expected.to_data());
-                            assert_eq!(journal.body.settlement.unwrap().debt, 0);
-                        } else {
-                            assert_eq!(
-                                result.unwrap_err().cause(),
-                                &ExecutionFailureCause::RuntimeScalarMemory(
-                                    RuntimeScalarMemoryRefusal::MissingQueryMemory
-                                )
-                            );
-                            let mut retry = RuntimeScalarMemoryJournal::default();
-                            assert!(matches!(
-                                actual
-                                    .evaluate(
-                                        EvaluationInput::Batch {
-                                            batch: &input,
-                                            source: None
-                                        },
-                                        Selection::all(4),
-                                        &funded,
-                                        &mut RuntimeScalarMemoryScope::new(&funded, &mut retry),
-                                    )
-                                    .map_err(ExecutionFailure::from)
-                                    .unwrap_err()
-                                    .cause(),
-                                ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
-                            ));
-                        }
-                    }
-                } else {
-                    for sparse in [false, true] {
-                        let selection = if sparse {
-                            Selection::try_sparse(4, &[0, 3]).unwrap()
-                        } else {
-                            Selection::all(4)
-                        };
-                        let mut original = CompiledExpressionInstance::try_new(
-                            program.unit(root(&program).unit).unwrap().clone(),
-                            root(&program).root,
-                            &Control,
-                        )
-                        .unwrap();
-                        let expected = original
-                            .evaluate(
-                                EvaluationInput::Batch {
-                                    batch: &input,
-                                    source: None,
-                                },
-                                ScalarInvocationScope::new(selection, selection),
-                                Activation::Activated,
-                                &Control,
-                                &mut PassThroughCallHost,
-                            )
-                            .unwrap();
-                        let mut actual = CompiledExpressionInstance::try_new(
-                            program.unit(root(&program).unit).unwrap().clone(),
-                            root(&program).root,
-                            &funded,
-                        )
-                        .unwrap();
-                        let mut journal = RuntimeScalarMemoryJournal::default();
-                        let result = actual
-                            .evaluate(
-                                EvaluationInput::Batch {
-                                    batch: &input,
-                                    source: None,
-                                },
-                                ScalarInvocationScope::new(selection, selection),
-                                Activation::Activated,
-                                &funded,
-                                &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
-                            )
-                            .map_err(ExecutionFailure::from)
-                            .unwrap();
-                        assert_eq!(result.values().data_type(), &ty);
-                        assert_eq!(result.values().to_data(), expected.values().to_data());
-                        assert_eq!(journal.body.settlement.as_ref().unwrap().debt, 0);
-                    }
-                    let missing = runtime_control(None);
                     let mut actual = CompiledExpressionInstance::try_new(
                         program.unit(root(&program).unit).unwrap().clone(),
                         root(&program).root,
-                        &missing,
+                        &funded,
                     )
                     .unwrap();
-                    assert_eq!(
-                        evaluate_all(&mut actual, root(&program), &input, &missing)
-                            .unwrap_err()
-                            .cause(),
-                        &ExecutionFailureCause::RuntimeScalarMemory(
-                            RuntimeScalarMemoryRefusal::MissingQueryMemory
+                    let mut journal = RuntimeScalarMemoryJournal::default();
+                    let result = actual
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &input,
+                                source: None,
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            Activation::Activated,
+                            &funded,
+                            &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
                         )
-                    );
-                    assert!(matches!(
-                        evaluate_all(&mut actual, root(&program), &input, &funded)
-                            .unwrap_err()
-                            .cause(),
-                        ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
-                    ));
-                    if matches!(shape, Shape::Direct) {
-                        for n in [0, 4] {
-                            let input = RecordBatch::try_new(
-                                program.graph().nodes()[1].output_layout().schema().clone(),
-                                vec![
-                                    typed(vec![None; n]),
-                                    typed(vec![None; n]),
-                                    Arc::new(BooleanArray::from(vec![Some(true); n])) as ArrayRef,
-                                ],
-                            )
-                            .unwrap();
-                            let mut bypass = CompiledExpressionInstance::try_new(
-                                program.unit(root(&program).unit).unwrap().clone(),
-                                root(&program).root,
-                                &missing,
-                            )
-                            .unwrap();
-                            let output =
-                                evaluate_all(&mut bypass, root(&program), &input, &missing)
-                                    .unwrap();
-                            assert_eq!(output.data_type(), &ty);
-                            assert_eq!(output.len(), n);
-                            assert_eq!(output.null_count(), n);
-                        }
+                        .map_err(ExecutionFailure::from)
+                        .unwrap();
+                    assert_eq!(result.values().data_type(), &DataType::Int64);
+                    assert_eq!(result.values().to_data(), expected.values().to_data());
+                    assert_eq!(journal.body.settlement.as_ref().unwrap().debt, 0);
+                }
+                let missing = runtime_control(None);
+                let mut actual = CompiledExpressionInstance::try_new(
+                    program.unit(root(&program).unit).unwrap().clone(),
+                    root(&program).root,
+                    &missing,
+                )
+                .unwrap();
+                assert_eq!(
+                    evaluate_all(&mut actual, root(&program), &input, &missing)
+                        .unwrap_err()
+                        .cause(),
+                    &ExecutionFailureCause::RuntimeScalarMemory(
+                        RuntimeScalarMemoryRefusal::MissingQueryMemory
+                    )
+                );
+                assert!(matches!(
+                    evaluate_all(&mut actual, root(&program), &input, &funded)
+                        .unwrap_err()
+                        .cause(),
+                    ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+                ));
+                if matches!(shape, Shape::Direct) {
+                    for n in [0, 4] {
+                        let input = RecordBatch::try_new(
+                            program.graph().nodes()[1].output_layout().schema().clone(),
+                            vec![
+                                Arc::new(Int64Array::from(vec![None; n])) as ArrayRef,
+                                Arc::new(Int64Array::from(vec![None; n])) as ArrayRef,
+                                Arc::new(BooleanArray::from(vec![Some(true); n])) as ArrayRef,
+                            ],
+                        )
+                        .unwrap();
+                        let mut bypass = CompiledExpressionInstance::try_new(
+                            program.unit(root(&program).unit).unwrap().clone(),
+                            root(&program).root,
+                            &missing,
+                        )
+                        .unwrap();
+                        let output =
+                            evaluate_all(&mut bypass, root(&program), &input, &missing).unwrap();
+                        assert_eq!(output.data_type(), &DataType::Int64);
+                        assert_eq!(output.len(), n);
+                        assert_eq!(output.null_count(), n);
                     }
                 }
             }

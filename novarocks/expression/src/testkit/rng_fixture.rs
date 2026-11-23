@@ -66,25 +66,25 @@ impl KernelEvaluationControl for RuntimeControl {
 }
 
 #[derive(Clone, Copy)]
-pub enum SeedMode {
+pub enum BoundMode {
     Input,
     DirectConstant,
 }
 
-impl SeedMode {
-    fn seed_type(self) -> FunctionValueType {
+impl BoundMode {
+    fn bound_type(self) -> FunctionValueType {
         FunctionValueType::new(DataType::Int64, matches!(self, Self::Input))
     }
 
-    fn seed_constant(self, pools: &mut ConstantPools) -> Option<ConstantValue> {
+    fn bound_constant(self, pools: &mut ConstantPools) -> Option<ConstantValue> {
         if matches!(self, Self::Input) {
             return None;
         }
-        let ty = self.seed_type();
+        let ty = self.bound_type();
         let value = ConstantValue::from_i64(
             Arc::new(ty.try_to_field("fixture").unwrap()),
             ty,
-            42,
+            1,
             POLICY,
             CompilePhase::FunctionSpecialization,
             &HarnessControl,
@@ -126,12 +126,12 @@ pub fn bool_source(pools: &mut ConstantPools, ty: &FunctionValueType, value: boo
 }
 
 fn source_columns(
-    mode: SeedMode,
+    mode: BoundMode,
     dictionary: bool,
     pools: &mut ConstantPools,
 ) -> Vec<(ValueId, FunctionValueType, ExprKind)> {
     let extra = FunctionValueType::new(DataType::Int64, false);
-    let seed = mode.seed_type();
+    let bound = mode.bound_type();
     let boolean = FunctionValueType::new(DataType::Boolean, false);
     let mut columns = vec![
         (
@@ -141,8 +141,8 @@ fn source_columns(
         ),
         (
             ValueId::new(100),
-            seed.clone(),
-            i64_source(pools, &seed, 42),
+            bound.clone(),
+            i64_source(pools, &bound, 1),
         ),
         (
             ValueId::new(7),
@@ -172,11 +172,11 @@ fn source_columns(
     columns
 }
 
-pub fn rng_unit(mode: SeedMode, twin: bool, dictionary: bool) -> Arc<CompiledExprSet> {
+pub fn rng_unit(mode: BoundMode, twin: bool, dictionary: bool) -> Arc<CompiledExprSet> {
     let functions = rng_subset();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut constants = ConstantPools::empty();
-    let constant = mode.seed_constant(&mut constants);
+    let constant = mode.bound_constant(&mut constants);
     let columns = source_columns(mode, dictionary, &mut constants);
     let port = ExprPort {
         values: columns.into_iter().map(|(id, ty, _)| (id, ty)).collect(),
@@ -195,17 +195,17 @@ pub fn rng_unit(mode: SeedMode, twin: bool, dictionary: bool) -> Arc<CompiledExp
             .collect::<Vec<_>>(),
     ));
     let layout = fixture_scope(&port, schema);
-    let seed = ValueId::new(100);
-    let seed_type = mode.seed_type();
+    let bound = ValueId::new(100);
+    let bound_type = mode.bound_type();
     let argument = match &constant {
         Some(value) => ExprKind::Constant(register_constant(&mut constants, value)),
-        None => ExprKind::Value(seed),
+        None => ExprKind::Value(bound),
     };
     let owner = ClaimAuthor::with_legacy_binding(
         &functions,
         "rand",
         vec![FunctionArgument::Value {
-            value_type: seed_type.clone(),
+            value_type: bound_type.clone(),
             constant,
         }],
         ControlShape::Eager,
@@ -215,7 +215,7 @@ pub fn rng_unit(mode: SeedMode, twin: bool, dictionary: bool) -> Arc<CompiledExp
     )
     .with_decimal_policy(DecimalOverflowPolicy::OutputNull);
     let mut draft = BoundExprSetBuilder::new(UNIT_LIMITS);
-    let argument = draft.add(None, seed_type.clone(), argument).unwrap();
+    let argument = draft.add(None, bound_type.clone(), argument).unwrap();
     let mut authors = BTreeMap::new();
     let call = add_call(&mut draft, &mut authors, owner, vec![argument]);
     register_call_requests(&mut draft, &authors, &mut constants);
@@ -223,9 +223,9 @@ pub fn rng_unit(mode: SeedMode, twin: bool, dictionary: bool) -> Arc<CompiledExp
         .root(call, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let identity_a = draft
-        .add(None, seed_type.clone(), ExprKind::Value(seed))
+        .add(None, bound_type.clone(), ExprKind::Value(bound))
         .unwrap();
-    let identity_b = draft.add(None, seed_type, ExprKind::Value(seed)).unwrap();
+    let identity_b = draft.add(None, bound_type, ExprKind::Value(bound)).unwrap();
     if twin {
         draft
             .root(call, EvaluationDemand::Value, RootScope::Port(0))
@@ -276,8 +276,8 @@ pub(crate) fn source_unit() -> Arc<CompiledExprSet> {
     let functions = rng_subset();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut constants = ConstantPools::empty();
-    let mode = SeedMode::DirectConstant;
-    let _seed_constant = mode.seed_constant(&mut constants);
+    let mode = BoundMode::DirectConstant;
+    let _bound_constant = mode.bound_constant(&mut constants);
     let mut draft = BoundExprSetBuilder::new(UNIT_LIMITS);
     let definitions = source_columns(mode, false, &mut constants)
         .into_iter()

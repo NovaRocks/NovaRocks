@@ -16,10 +16,10 @@
 // under the License.
 
 use super::{
-    Fixture, Shape, argument, author, catalogue, compile_project_unit, fixture_constant_policy,
-    integer_argument, project_port, unit_draft,
+    Fixture, Shape, argument, author, catalogue, compile_project_unit, project_port, round_value,
+    unit_draft,
 };
-use crate::testkit::{add_call, checked_constants};
+use crate::testkit::add_call;
 use arrow::{
     array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, LargeBinaryArray,
@@ -69,33 +69,12 @@ pub fn byte_program(carrier: DataType, required_error: bool) -> Fixture {
         let value = builder
             .add(None, decimal.clone(), ExprKind::Value(columns[3].0))
             .unwrap();
-        let digits = builder
-            .add(
-                None,
-                (FunctionValueType::new(DataType::Int64, false)).clone(),
-                checked_constants::kind(
-                    &mut source_pools,
-                    checked_constants::i64(
-                        &(FunctionValueType::new(DataType::Int64, false)),
-                        -1,
-                        fixture_constant_policy(),
-                    ),
-                ),
-            )
-            .unwrap();
-        let rounded = add_call(
+        let rounded = round_value(
             &mut builder,
             &mut authors,
-            author(
-                &functions,
-                "round",
-                vec![
-                    argument(decimal, None),
-                    integer_argument(FunctionValueType::new(DataType::Int64, false), -1),
-                ],
-                ControlShape::Eager,
-            ),
-            vec![value, digits],
+            &functions,
+            value,
+            &mut source_pools,
         );
         let condition = builder
             .add(

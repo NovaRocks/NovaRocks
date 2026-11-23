@@ -221,16 +221,16 @@ fn null_source(pools: &mut ConstantPools, ty: &FunctionValueType) -> ExprKind {
 
 fn rng_program(
     functions: &PureEngineFunctionCatalog,
-    seed_is_literal: bool,
+    bound_is_literal: bool,
     twin: bool,
     dictionary: bool,
 ) -> Arc<LocalProgram> {
-    let seed_type = FunctionValueType::new(DataType::Int64, !seed_is_literal);
-    let seed_constant = seed_is_literal.then(|| {
+    let bound_type = FunctionValueType::new(DataType::Int64, !bound_is_literal);
+    let bound_constant = bound_is_literal.then(|| {
         ConstantValue::from_i64(
-            Arc::new(seed_type.try_to_field("fixture").unwrap()),
-            seed_type.clone(),
-            42,
+            Arc::new(bound_type.try_to_field("fixture").unwrap()),
+            bound_type.clone(),
+            1,
             options().constants,
             CompilePhase::FunctionSpecialization,
             &HarnessControl,
@@ -238,7 +238,7 @@ fn rng_program(
         .unwrap()
     });
     let mut constants = ConstantPools::empty();
-    if let Some(value) = &seed_constant {
+    if let Some(value) = &bound_constant {
         constants
             .insert(ConstantPoolId::new(u32::MAX), value.pool().clone())
             .unwrap();
@@ -247,8 +247,8 @@ fn rng_program(
         functions,
         "rand",
         vec![FunctionArgument::Value {
-            value_type: seed_type.clone(),
-            constant: seed_constant.clone(),
+            value_type: bound_type.clone(),
+            constant: bound_constant.clone(),
         }],
         ControlShape::Eager,
         None,
@@ -264,7 +264,7 @@ fn rng_program(
     let filter = NodeId::new(3);
     let second_project = NodeId::new(8);
     let limit = NodeId::new(1);
-    let seed_value = ValueId::new(100);
+    let bound_value = ValueId::new(100);
     let bool_value = ValueId::new(7);
     let sample_value = ValueId::new(200);
     let extra_value = ValueId::new(0);
@@ -283,13 +283,13 @@ fn rng_program(
             i64_source(&mut constants, &extra_type, 999),
         )
         .unwrap();
-    let seed_expr = builder
+    let bound_expr = builder
         .unit(first_project)
         .unwrap()
         .add(
             None,
-            seed_type.clone(),
-            i64_source(&mut constants, &seed_type, 42),
+            bound_type.clone(),
+            i64_source(&mut constants, &bound_type, 1),
         )
         .unwrap();
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
@@ -304,7 +304,7 @@ fn rng_program(
         .unwrap();
     let mut first_definitions = vec![
         (extra_value, extra_type, extra_expr),
-        (seed_value, seed_type.clone(), seed_expr),
+        (bound_value, bound_type.clone(), bound_expr),
         (bool_value, bool_type.clone(), bool_expr),
     ];
     if dictionary {
@@ -340,7 +340,7 @@ fn rng_program(
             })
             .unwrap();
     }
-    // The extra actual output shifts the seed channel to ordinal one. ValueId
+    // The extra actual output shifts the bound channel to ordinal one. ValueId
     // 100 must never become either its ordinal or a local SlotId.
     builder
         .add_project(
@@ -363,14 +363,14 @@ fn rng_program(
     builder
         .add_filter(filter, first_project, Box::from([predicate]))
         .unwrap();
-    let argument = seed_constant.as_ref().map_or_else(
-        || ExprKind::Value(seed_value),
+    let argument = bound_constant.as_ref().map_or_else(
+        || ExprKind::Value(bound_value),
         |value| checked_source(&mut constants, value),
     );
     let call_argument = builder
         .unit(second_project)
         .unwrap()
-        .add(None, seed_type.clone(), argument)
+        .add(None, bound_type.clone(), argument)
         .unwrap();
     let mut authors = BTreeMap::new();
     let call = add_call(
@@ -397,12 +397,12 @@ fn rng_program(
     let identity_a = builder
         .unit(second_project)
         .unwrap()
-        .add(None, seed_type.clone(), ExprKind::Value(seed_value))
+        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
         .unwrap();
     let identity_b = builder
         .unit(second_project)
         .unwrap()
-        .add(None, seed_type.clone(), ExprKind::Value(seed_value))
+        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
         .unwrap();
     let mut project_expressions = vec![(call_root, sample_value)];
     let mut project_output = vec![sample_value];
@@ -436,8 +436,8 @@ fn rng_program(
         .unwrap()
         .root(identity_b, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
-    project_expressions.extend([(identity_a, seed_value), (identity_b, seed_value)]);
-    project_output.extend([seed_value, seed_value]);
+    project_expressions.extend([(identity_a, bound_value), (identity_b, bound_value)]);
+    project_output.extend([bound_value, bound_value]);
     builder
         .add_project(
             second_project,
@@ -477,17 +477,17 @@ fn rng_program(
     result_fields.extend([
         ResultField {
             domain: ResultValueDomain::Plain,
-            name: "seed_a".into(),
+            name: "bound_a".into(),
             alias: None,
-            value: seed_value,
-            ty: seed_type.clone(),
+            value: bound_value,
+            ty: bound_type.clone(),
         },
         ResultField {
             domain: ResultValueDomain::Plain,
-            name: "seed_b".into(),
+            name: "bound_b".into(),
             alias: None,
-            value: seed_value,
-            ty: seed_type,
+            value: bound_value,
+            ty: bound_type,
         },
     ]);
     let package = package(

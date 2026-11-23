@@ -32,7 +32,7 @@ use std::{num::NonZeroUsize, sync::Arc};
 mod frame;
 mod seed;
 pub(crate) use frame::{author, call, compile_checked_fragment_with_parameters};
-pub(crate) use seed::{SEED_42_FIRST, SeedMode, program};
+pub(crate) use seed::{RandArgument, program};
 
 struct FixtureControl;
 impl PureCompileControl for FixtureControl {

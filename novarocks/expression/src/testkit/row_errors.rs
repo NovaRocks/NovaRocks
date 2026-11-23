@@ -25,7 +25,7 @@ use crate::{
     ScopeLayouts, compile_expr_set_pure,
 };
 use arrow::{
-    array::{Decimal128Array, Int64Array},
+    array::{Decimal128Array, Int32Array},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
@@ -81,10 +81,18 @@ fn catalogue() -> PureEngineFunctionCatalog {
             "rand",
             vec![
                 "builtin.scalar/rand/()->f64;strict;legacy",
-                "builtin.scalar/rand/(i64)->f64;strict;legacy",
+                "builtin.scalar/rand/(i8)->i8;strict;coerce",
+                "builtin.scalar/rand/(i16)->i16;strict;coerce",
+                "builtin.scalar/rand/(i32)->i32;strict;coerce",
+                "builtin.scalar/rand/(i64)->i64;strict;coerce",
             ],
         ),
     ] {
+        let implementation = if name == "round" {
+            "selected-v2"
+        } else {
+            "selected-v1"
+        };
         for overload in overloads {
             manifest.push(InstalledPureKernel {
                 function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
@@ -92,7 +100,7 @@ fn catalogue() -> PureEngineFunctionCatalog {
                 implementation: PureImplementationDeclaration {
                     overload: FunctionOverloadId::try_new(overload).unwrap(),
                     implementation: PureImplementationId::try_new(format!(
-                        "builtin.scalar/{name}/selected-v1"
+                        "builtin.scalar/{name}/{implementation}"
                     ))
                     .unwrap(),
                     abi: PureKernelAbi::ScalarV1,
@@ -125,8 +133,8 @@ fn constant_policy() -> ConstantPolicy {
         max_library_validation_bytes: 1 << 20,
     }
 }
-fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
-    ConstantValue::from_i64(
+fn integer_constant(ty: &FunctionValueType, value: i32) -> ConstantValue {
+    ConstantValue::from_i32(
         Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
         value,
@@ -136,7 +144,7 @@ fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
     )
     .unwrap()
 }
-fn integer_argument(ty: FunctionValueType, value: i64) -> FunctionArgument {
+fn integer_argument(ty: FunctionValueType, value: i32) -> FunctionArgument {
     let constant = integer_constant(&ty, value);
     argument(ty, Some(constant))
 }
@@ -164,39 +172,49 @@ pub fn program(shape: Shape) -> Program {
     let value = ValueId::new(333);
     let digits_value = ValueId::new(901);
     let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
-    let integer = FunctionValueType::new(DataType::Int64, true);
+    let integer = FunctionValueType::new(DataType::Int32, true);
     let port_values = vec![(value, decimal.clone()), (digits_value, integer.clone())];
     let mut builder = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: MAX_CONTROL_DEPTH,
     });
     let mut authors = BTreeMap::new();
-    let first = if matches!(shape, Shape::ObservableSibling) {
-        let ty = FunctionValueType::new(DataType::Int64, false);
-        let seed = builder
+    let decimal_input = builder
+        .add(None, decimal.clone(), ExprKind::Value(value))
+        .unwrap();
+    let (first, source_type) = if matches!(shape, Shape::ObservableSibling) {
+        let bound_type = FunctionValueType::new(DataType::Int64, true);
+        let bound = builder
             .add(
                 None,
-                ty.clone(),
-                checked_constants::kind(
-                    &mut constants,
-                    checked_constants::i64(&ty, 42, constant_policy()),
-                ),
+                bound_type.clone(),
+                ExprKind::Cast {
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
+                    expr: decimal_input,
+                    target: DataType::Int64,
+                },
             )
             .unwrap();
-        call(
+        let call = call(
             &mut builder,
             &mut authors,
-            author(&functions, "rand", vec![integer_argument(ty, 42)]),
-            vec![seed],
-        )
+            author(&functions, "rand", vec![argument(bound_type, None)]),
+            vec![bound],
+        );
+        let floating = FunctionValueType::new(DataType::Float64, true);
+        let sample = builder
+            .add(
+                None,
+                floating.clone(),
+                ExprKind::Cast {
+                    cast_mode: novarocks_type_contract::TrinoCastMode::Explicit,
+                    expr: call,
+                    target: DataType::Float64,
+                },
+            )
+            .unwrap();
+        (sample, floating)
     } else {
-        builder
-            .add(None, decimal.clone(), ExprKind::Value(value))
-            .unwrap()
-    };
-    let source_type = if matches!(shape, Shape::ObservableSibling) {
-        authors[&first].result()
-    } else {
-        decimal.clone()
+        (decimal_input, decimal)
     };
     let digit = builder
         .add(
@@ -205,10 +223,7 @@ pub fn program(shape: Shape) -> Program {
             if matches!(shape, Shape::ObservableSibling) {
                 ExprKind::Value(digits_value)
             } else {
-                checked_constants::kind(
-                    &mut constants,
-                    checked_constants::i64(&integer, -1, constant_policy()),
-                )
+                checked_constants::kind(&mut constants, integer_constant(&integer, -1))
             },
         )
         .unwrap();
@@ -238,10 +253,7 @@ pub fn program(shape: Shape) -> Program {
             .add(
                 None,
                 integer.clone(),
-                checked_constants::kind(
-                    &mut constants,
-                    checked_constants::i64(&integer, 0, constant_policy()),
-                ),
+                checked_constants::kind(&mut constants, integer_constant(&integer, 0)),
             )
             .unwrap();
         call(
@@ -356,7 +368,7 @@ pub fn instance(program: &Program, expression: usize) -> CompiledExpressionInsta
 pub fn batch(
     program: &Program,
     values: Vec<Option<i128>>,
-    digits: Vec<Option<i64>>,
+    digits: Vec<Option<i32>>,
 ) -> RecordBatch {
     let root = program.unit.root(program.roots[0]).unwrap();
     RecordBatch::try_new(
@@ -367,7 +379,7 @@ pub fn batch(
                     .with_precision_and_scale(38, 0)
                     .unwrap(),
             ),
-            Arc::new(Int64Array::from(digits)),
+            Arc::new(Int32Array::from(digits)),
         ],
     )
     .unwrap()

@@ -1439,11 +1439,10 @@ mod tests {
     #[test]
     fn resolve_abs_picks_per_input_type_signature() {
         for (input, output) in [
-            (DataType::Int8, DataType::Int16),
-            (DataType::Int16, DataType::Int32),
-            (DataType::Int32, DataType::Int64),
-            (DataType::Int64, DataType::FixedSizeBinary(16)),
-            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
+            (DataType::Int8, DataType::Int8),
+            (DataType::Int16, DataType::Int16),
+            (DataType::Int32, DataType::Int32),
+            (DataType::Int64, DataType::Int64),
             (DataType::Float32, DataType::Float32),
             (DataType::Float64, DataType::Float64),
             (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
@@ -1679,8 +1678,8 @@ mod tests {
 
     #[test]
     fn non_opt_in_signature_keeps_legacy_no_match_policy() {
-        let err = resolve_scalar_function_signature("abs", &[DataType::Utf8])
-            .expect_err("abs requires a numeric source");
+        let err = resolve_scalar_function_signature("sleep", &[DataType::Utf8])
+            .expect_err("the legacy sleep declaration does not widen VARCHAR to BIGINT");
 
         assert!(matches!(
             err,

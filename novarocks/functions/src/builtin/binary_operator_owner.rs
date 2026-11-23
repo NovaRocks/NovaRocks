@@ -45,7 +45,34 @@ use crate::{
 pub(super) fn definition(
     operator: OperatorFunction,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
-    let id = operator.function_id();
+    operator_definition(
+        operator,
+        operator.catalog_name(),
+        operator.function_id(),
+        FunctionVisibility::Hidden,
+    )
+}
+
+pub(super) fn modulus_definition() -> Result<FunctionDefinition, FunctionCatalogError> {
+    operator_definition(
+        OperatorFunction::Modulo,
+        "mod",
+        FunctionId::try_new("builtin.scalar/mod/v1").map_err(|error| {
+            FunctionCatalogError::InvalidStableIdentity {
+                subject: "builtin mod function",
+                value: error.to_string().into(),
+            }
+        })?,
+        FunctionVisibility::Public,
+    )
+}
+
+fn operator_definition(
+    operator: OperatorFunction,
+    name: &str,
+    id: FunctionId,
+    visibility: FunctionVisibility,
+) -> Result<FunctionDefinition, FunctionCatalogError> {
     let declaration_error =
         |error: FunctionBindingError| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin binary operator declaration",
@@ -57,6 +84,7 @@ pub(super) fn definition(
             .map(|signature| {
                 overload(
                     operator,
+                    name,
                     signature.name(),
                     signature.pattern(),
                     signature.result_pattern(),
@@ -67,6 +95,7 @@ pub(super) fn definition(
     } else {
         vec![overload(
             operator,
+            name,
             "comparison",
             "(comparable T,comparable T)",
             "boolean",
@@ -75,10 +104,8 @@ pub(super) fn definition(
     };
     let declaration = FunctionBindingDeclaration::try_new(id, FunctionKind::Scalar, overloads)
         .map_err(declaration_error)?;
-    let implementation = PureImplementationId::try_new(format!(
-        "builtin.scalar/{}/selected-v1",
-        operator.catalog_name(),
-    ))?;
+    let implementation =
+        PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
     let implementations = declaration
         .overloads()
         .iter()
@@ -93,19 +120,17 @@ pub(super) fn definition(
         declaration,
         implementations,
     };
-    FunctionDefinition::try_new_pure_scalar(
-        operator.catalog_name(),
-        FunctionVisibility::Hidden,
-        Arc::new(owner),
-    )
-    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-        subject: "builtin binary operator owner",
-        value: error.to_string().into(),
+    FunctionDefinition::try_new_pure_scalar(name, visibility, Arc::new(owner)).map_err(|error| {
+        FunctionCatalogError::InvalidStableIdentity {
+            subject: "builtin binary operator owner",
+            value: error.to_string().into(),
+        }
     })
 }
 
 fn overload(
     operator: OperatorFunction,
+    catalogue_name: &str,
     name: &str,
     arguments: &str,
     result: &str,
@@ -113,10 +138,7 @@ fn overload(
 ) -> Result<FunctionOverloadDeclaration, FunctionCatalogError> {
     let identity = match operator.comparison_overload_text() {
         Some(identity) => FunctionOverloadId::try_new(identity),
-        None => FunctionOverloadId::try_new(format!(
-            "builtin.scalar/{}/{name}-v1",
-            operator.catalog_name(),
-        )),
+        None => FunctionOverloadId::try_new(format!("builtin.scalar/{catalogue_name}/{name}-v1")),
     }
     .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
         subject: "builtin binary operator overload",

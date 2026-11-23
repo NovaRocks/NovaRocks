@@ -22,11 +22,11 @@ use crate::{
         PassThroughCallHost,
         frame_fixtures::{
             Control, FrameFixture,
-            guarded::{SEED_42, Shape, batch, decimal_batch, program},
+            guarded::{Shape, batch, decimal_batch, program},
         },
     },
 };
-use arrow::array::{Array, Decimal128Array, Float64Array};
+use arrow::array::{Array, Decimal128Array, Int64Array};
 use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope, Selection};
 
 fn instance(program: &FrameFixture) -> CompiledExpressionInstance {
@@ -37,7 +37,7 @@ fn instance(program: &FrameFixture) -> CompiledExpressionInstance {
 fn guarded_constant_rng_stays_uninstantiated_until_coalesce_really_needs_it() {
     let program = program(Shape::Random);
     let mut evaluator = instance(&program);
-    let true_only = batch(&program, vec![Some(true); 3], vec![Some(42); 3]);
+    let true_only = batch(&program, vec![Some(true); 3], vec![Some(1); 3]);
     let output = evaluator
         .evaluate(
             EvaluationInput::Batch {
@@ -53,9 +53,9 @@ fn guarded_constant_rng_stays_uninstantiated_until_coalesce_really_needs_it() {
     let values = output
         .values()
         .as_any()
-        .downcast_ref::<Float64Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap();
-    assert!(values.iter().all(|v| v.unwrap().to_bits() == SEED_42[0]));
+    assert!(values.iter().all(|value| value == Some(0)));
     assert_eq!(evaluator.instances.len(), 1);
     let false_only = batch(&program, vec![Some(false); 2], vec![None; 2]);
     let output = evaluator
@@ -73,15 +73,9 @@ fn guarded_constant_rng_stays_uninstantiated_until_coalesce_really_needs_it() {
     let values = output
         .values()
         .as_any()
-        .downcast_ref::<Float64Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap();
-    assert_eq!(
-        values
-            .iter()
-            .map(|v| v.unwrap().to_bits())
-            .collect::<Vec<_>>(),
-        SEED_42[..2]
-    );
+    assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(0); 2]);
     assert_eq!(evaluator.instances.len(), 2);
 }
 
@@ -126,11 +120,10 @@ fn empty_guarded_selection_creates_no_kernel_instance_and_does_not_advance_rng()
         output
             .values()
             .as_any()
-            .downcast_ref::<Float64Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
-            .value(0)
-            .to_bits(),
-        SEED_42[0]
+            .value(0),
+        0
     );
     assert_eq!(evaluator.instances.len(), 1);
 }

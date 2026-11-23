@@ -630,7 +630,7 @@ fn dynamic_created_validation_first_refusal_and_control_have_no_tail() {
     }
 }
 #[test]
-fn round_created_validation_uses_actual_literal_scale_and_real_wrapper_loan() {
+fn round_created_validation_preserves_declared_scale_and_real_wrapper_loan() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let args = [
         FunctionArgument::Value {
@@ -638,11 +638,11 @@ fn round_created_validation_uses_actual_literal_scale_and_real_wrapper_loan() {
             constant: None,
         },
         FunctionArgument::Value {
-            value_type: FunctionValueType::new(DataType::Int64, false),
-            constant: Some(constant_binding_tests::i64(2, false)),
+            value_type: FunctionValueType::new(DataType::Int32, false),
+            constant: Some(constant_binding_tests::i32(2, false)),
         },
     ];
-    for name in ["round", "truncate"] {
+    for (name, precision) in [("round", 19), ("truncate", 18)] {
         let bound = catalog
             .resolve_bound_user(name, FunctionKind::Scalar, request(&args), &Control)
             .unwrap();
@@ -651,11 +651,13 @@ fn round_created_validation_uses_actual_literal_scale_and_real_wrapper_loan() {
         let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
             panic!("scalar result")
         };
-        assert_eq!(result.data_type(), &DataType::Decimal128(38, 2));
-        assert!(result.nullable());
+        assert_eq!(result.data_type(), &DataType::Decimal128(precision, 6));
+        assert!(!result.nullable());
         let mut stale = bound.clone();
-        stale.selected.result_type =
-            FunctionResultType::Scalar(FunctionValueType::new(DataType::Decimal128(38, 6), true));
+        stale.selected.result_type = FunctionResultType::Scalar(FunctionValueType::new(
+            DataType::Decimal128(precision, 2),
+            false,
+        ));
         assert!(matches!(
             created_map_validation(&catalog, &stale, &args, &mut scope, &Control),
             Err(crate::FunctionBindingCreationFailure::Binding(

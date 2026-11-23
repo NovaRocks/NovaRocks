@@ -44,11 +44,11 @@ impl novarocks_type_contract::PureCompileControl for MaterializedLayoutControl {
 
 #[test]
 fn root_positive_source_structural_local_compiler_unknown_owner_and_materialized_layout() {
-    use crate::exec::expr::fixtures::{SeedMode, program};
+    use crate::exec::expr::fixtures::{RandArgument, program};
     use novarocks_type_contract::owned_resources::metadata_materialization::{
         MaterializedFieldNamespace, TypedSchemaMaterializations, materialize_value_field,
     };
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Unbounded, false);
     let structural = program.graph().nodes()[program.graph().root().index()].output_layout();
     // This canonical structural fixture does not decode a type namespace.
     assert!(structural.metadata_materializations().is_none());

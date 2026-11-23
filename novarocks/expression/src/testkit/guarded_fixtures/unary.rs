@@ -18,9 +18,8 @@
 //! Actual IsNull, Not and stateful Boolean boundary units.
 
 use super::{
-    Fixture, Shape, argument, author, catalogue, compile_project_unit,
-    compile_project_unit_with_layout, fixture_constant_policy, integer_argument, project_port,
-    unit_draft,
+    Fixture, Shape, author, catalogue, compile_project_unit, compile_project_unit_with_layout,
+    fixture_constant_policy, integer_argument, project_port, round_value, unit_draft,
 };
 use crate::testkit::{add_call, checked_constants, fixture_scope};
 use arrow::{
@@ -119,29 +118,12 @@ pub fn unary_program(case: UnaryCase) -> Fixture {
         let value = builder
             .add(None, decimal.clone(), ExprKind::Value(decimal_value))
             .unwrap();
-        let digits = builder
-            .add(
-                None,
-                integer.clone(),
-                checked_constants::kind(
-                    &mut source_pools,
-                    checked_constants::i64(&(integer.clone()), -1, fixture_constant_policy()),
-                ),
-            )
-            .unwrap();
-        let round = add_call(
+        let round = round_value(
             &mut builder,
             &mut authors,
-            author(
-                &functions,
-                "round",
-                vec![
-                    argument(decimal, None),
-                    integer_argument(integer.clone(), -1),
-                ],
-                ControlShape::Eager,
-            ),
-            vec![value, digits],
+            &functions,
+            value,
+            &mut source_pools,
         );
         let test = unary(&mut builder, round, matches!(case, UnaryCase::IsNotNull));
         match case {
@@ -165,7 +147,7 @@ pub fn unary_program(case: UnaryCase) -> Fixture {
                 )
                 .unwrap(),
             UnaryCase::StateBoundary => {
-                let seed = builder
+                let bound = builder
                     .add(
                         None,
                         integer.clone(),
@@ -173,7 +155,7 @@ pub fn unary_program(case: UnaryCase) -> Fixture {
                             &mut source_pools,
                             checked_constants::i64(
                                 &(integer.clone()),
-                                42,
+                                1,
                                 fixture_constant_policy(),
                             ),
                         ),
@@ -185,10 +167,10 @@ pub fn unary_program(case: UnaryCase) -> Fixture {
                     author(
                         &functions,
                         "rand",
-                        vec![integer_argument(integer, 42)],
+                        vec![integer_argument(integer, 1)],
                         ControlShape::Eager,
                     ),
-                    vec![seed],
+                    vec![bound],
                 );
                 let rand_null = unary(&mut builder, rand, false);
                 builder

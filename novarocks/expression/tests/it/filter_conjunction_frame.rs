@@ -24,7 +24,7 @@ use novarocks_expression::{
 use novarocks_functions::Selection;
 
 #[test]
-fn filter_conjunction_actual_rand_domains_and_cross_batch_state() {
+fn filter_conjunction_actual_rand_domains_and_cross_batch_values() {
     let f = fixture(FilterShape::CountAndRandom);
     let mut narrow = group(&f);
     let mut guarded = group(&f);
@@ -56,8 +56,8 @@ fn filter_conjunction_actual_rand_domains_and_cross_batch_state() {
             )
             .unwrap(),
     );
-    assert_eq!(a, vec![b[0], b[2]]);
-    assert_eq!(b[1], Some(false));
+    assert_eq!(a, [Some(true), Some(true)]);
+    assert_eq!(b, [Some(true), Some(false), Some(true)]);
     assert_eq!(
         bits(
             &narrow

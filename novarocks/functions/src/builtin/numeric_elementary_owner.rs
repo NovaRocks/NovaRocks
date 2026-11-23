@@ -41,7 +41,7 @@ use super::numeric_elementary::NumericElementaryOp;
 
 #[cfg(test)]
 pub(super) fn names() -> &'static [&'static str] {
-    &["log", "sign", "e", "pi"]
+    &["log", "e", "pi"]
 }
 
 pub(super) fn is_installed(name: &str) -> bool {
@@ -51,7 +51,6 @@ pub(super) fn is_installed(name: &str) -> bool {
 #[derive(Clone, Copy)]
 enum Family {
     Log,
-    Sign,
     E,
     Pi,
 }
@@ -59,7 +58,6 @@ impl Family {
     fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "log" => Self::Log,
-            "sign" => Self::Sign,
             "e" => Self::E,
             "pi" => Self::Pi,
             _ => return None,
@@ -67,8 +65,7 @@ impl Family {
     }
     const fn overload_count(self) -> usize {
         match self {
-            Self::Log => 43,
-            Self::Sign => 7,
+            Self::Log => 1,
             Self::E | Self::Pi => 1,
         }
     }
@@ -77,9 +74,7 @@ impl Family {
     /// reinterpreted from an evaluated array or a runtime function name.
     const fn operation(self, selected_arity: usize) -> Option<NumericElementaryOp> {
         Some(match (self, selected_arity) {
-            (Self::Log, 1) => NumericElementaryOp::LogNatural,
             (Self::Log, 2) => NumericElementaryOp::LogBase,
-            (Self::Sign, 1) => NumericElementaryOp::Sign,
             (Self::E, 0) => NumericElementaryOp::E,
             (Self::Pi, 0) => NumericElementaryOp::Pi,
             _ => return None,
@@ -87,9 +82,7 @@ impl Family {
     }
 }
 
-/// Exact selected profiles describe successful NULL for logarithm domain
-/// failures, total sign comparison and finite mathematical constants. No
-/// mutable state or environment authority is retained by any of these owners.
+/// Binary logarithm and mathematical constants use immutable eager evaluation.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -480,36 +473,12 @@ mod tests {
         }
     }
 
-    fn signed_float_sources() -> [DataType; 6] {
-        [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-            DataType::Float32,
-            DataType::Float64,
-        ]
-    }
-
     fn source_profiles(name: &str) -> Vec<Vec<DataType>> {
-        match name {
-            "log" => {
-                let mut profiles = source_profiles("sign");
-                for left in signed_float_sources() {
-                    for right in signed_float_sources() {
-                        profiles.push(vec![left.clone(), right]);
-                    }
-                }
-                profiles
-            }
-            "sign" => signed_float_sources()
-                .into_iter()
-                .chain([DataType::Decimal128(38, -3)])
-                .map(|source| vec![source])
-                .collect(),
-            "e" | "pi" => vec![vec![]],
-            _ => panic!("unknown test profile"),
-        }
+        vec![if name == "log" {
+            vec![DataType::Float64; 2]
+        } else {
+            Vec::new()
+        }]
     }
 
     fn uses(count: usize) -> Vec<Option<ExpressionUseId>> {
@@ -543,36 +512,8 @@ mod tests {
     }
 
     #[test]
-    fn elementary_startup_mapping_keeps_four_exact_ids_and_five_prepared_operations() {
-        assert_eq!(names(), &["log", "sign", "e", "pi"]);
-        for name in names() {
-            assert!(is_installed(name));
-        }
-        for outside in [
-            "ln", "log2", "log10", "dlog1", "positive", "degrees", "sinh", "rand",
-        ] {
-            assert!(!is_installed(outside));
-        }
-        assert_eq!(
-            Family::Log.operation(1),
-            Some(NumericElementaryOp::LogNatural)
-        );
-        assert_eq!(Family::Log.operation(2), Some(NumericElementaryOp::LogBase));
-        assert_eq!(Family::Sign.operation(1), Some(NumericElementaryOp::Sign));
-        assert_eq!(Family::E.operation(0), Some(NumericElementaryOp::E));
-        assert_eq!(Family::Pi.operation(0), Some(NumericElementaryOp::Pi));
-        for arity in [0, 3] {
-            assert_eq!(Family::Log.operation(arity), None);
-        }
-        assert_eq!(Family::Sign.operation(0), None);
-        assert_eq!(Family::E.operation(1), None);
-        assert_eq!(Family::Pi.operation(1), None);
-    }
-
-    #[test]
-    fn actual_whole_catalogue_attaches_four_elementary_owners_and_52_records() {
+    fn actual_whole_catalogue_attaches_elementary_owners() {
         let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        let mut total = 0;
         for name in names() {
             let owner = owner(name);
             let definition = catalog
@@ -581,14 +522,8 @@ mod tests {
             assert!(definition.binding.as_ref().unwrap().pure.is_some());
             let declaration = definition.binding_declaration().unwrap();
             assert_eq!(declaration, owner.binding_declaration());
-            let expected_count = match *name {
-                "log" => 43,
-                "sign" => 7,
-                "e" | "pi" => 1,
-                _ => unreachable!(),
-            };
-            assert_eq!(declaration.overloads().len(), expected_count);
-            assert_eq!(owner.implementation_declarations().len(), expected_count);
+            assert_eq!(declaration.overloads().len(), 1);
+            assert_eq!(owner.implementation_declarations().len(), 1);
             for (overload, implementation) in declaration
                 .overloads()
                 .iter()
@@ -602,13 +537,11 @@ mod tests {
                 assert_eq!(implementation.abi, PureKernelAbi::ScalarV1);
                 assert_eq!(overload.effects.as_ref(), Some(&effects()));
             }
-            total += expected_count;
         }
-        assert_eq!(total, 52);
     }
 
     #[test]
-    fn all_52_elementary_profiles_and_nullable_combinations_prepare_exact_fresh_frozen() {
+    fn elementary_profiles_and_nullable_combinations_prepare_exact_fresh_frozen() {
         let parameters = SemanticParameters::try_new([]).unwrap();
         let mut count = 0;
         for name in names() {
@@ -653,11 +586,7 @@ mod tests {
                     assert_eq!(result.logical_type(), ValueLogicalType::Physical);
                     assert_eq!(
                         result.nullable(),
-                        if *name == "sign" {
-                            full_sources[0].nullable()
-                        } else {
-                            true
-                        }
+                        full_sources.iter().any(FunctionValueType::nullable)
                     );
                     let input = input(&owner, &selected, &arguments, &parameters, &uses);
                     let fresh = specialize_scalar(
@@ -709,7 +638,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 52);
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -789,7 +718,10 @@ mod tests {
     #[test]
     fn elementary_refinement_requires_exact_environment_domain_function_and_preparation() {
         let owner = owner("log");
-        let arguments = [argument(FunctionValueType::new(DataType::Float64, false))];
+        let arguments = [
+            argument(FunctionValueType::new(DataType::Float64, false)),
+            argument(FunctionValueType::new(DataType::Float64, false)),
+        ];
         let selected = Arc::new(
             owner
                 .resolve(request(&arguments), crate::binding_test_control())

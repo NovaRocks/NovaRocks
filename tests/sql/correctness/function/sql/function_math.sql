@@ -18,7 +18,7 @@
 -- Migrated from dev/test/sql/test_function/T/test_math
 -- Test Objective:
 -- 1. Validate cosine_similarity() on ARRAY<FLOAT> columns and literals.
--- 2. Validate l2_distance() on ARRAY<FLOAT> columns and literals.
+-- 2. Validate euclidean_distance() on ARRAY<FLOAT> columns and literals.
 -- 3. Verify vector math functions work correctly with table data and cross joins.
 -- 4. Cover ordering by similarity/distance results.
 
@@ -44,14 +44,14 @@ USE ${case_db};
 SELECT round(cosine_similarity(CAST([0.1, 0.2, 0.3] AS array<REAL>), CAST([0.1, 0.2, 0.3] AS array<REAL>)), 3) AS dist;
 
 -- query 5
--- l2_distance with literal array vs table column
+-- euclidean_distance with literal array vs table column
 USE ${case_db};
-SELECT round(l2_distance(CAST([0.1, 0.2, 0.3] AS array<REAL>), data), 3) AS dist, id FROM t1 ORDER BY dist desc, id;
+SELECT round(euclidean_distance(CAST([0.1, 0.2, 0.3] AS array<REAL>), data), 3) AS dist, id FROM t1 ORDER BY dist desc, id;
 
 -- query 6
--- l2_distance on two literal arrays
+-- euclidean_distance on two literal arrays
 USE ${case_db};
-SELECT round(l2_distance(CAST([0.1, 0.2, 0.3] AS array<REAL>), CAST([0.1, 0.2, 0.3] AS array<REAL>)), 3) AS dist;
+SELECT round(euclidean_distance(CAST([0.1, 0.2, 0.3] AS array<REAL>), CAST([0.1, 0.2, 0.3] AS array<REAL>)), 3) AS dist;
 
 -- query 7
 -- Setup: create test_vector table for cross join tests
@@ -90,6 +90,6 @@ USE ${case_db};
 SELECT a.id, b.id, a.data, b.data, round(cosine_similarity(a.data, b.data), 3) AS sim FROM test_vector AS a CROSS JOIN test_vector AS b ORDER BY sim desc, a.id, b.id;
 
 -- query 14
--- l2_distance with literal vs table column, ordered by distance
+-- euclidean_distance with literal vs table column, ordered by distance
 USE ${case_db};
-SELECT id, data, round(l2_distance(CAST([0.1, 0.2, 0.3] AS array<REAL>), data), 3) AS sim FROM test_vector ORDER BY sim desc, id;
+SELECT id, data, round(euclidean_distance(CAST([0.1, 0.2, 0.3] AS array<REAL>), data), 3) AS sim FROM test_vector ORDER BY sim desc, id;

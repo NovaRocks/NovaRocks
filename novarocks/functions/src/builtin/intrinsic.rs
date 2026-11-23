@@ -74,7 +74,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "abs",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "acos",
@@ -160,31 +160,31 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "bit_shift_left",
+        "bitwise_and",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "bit_shift_right",
+        "bitwise_left_shift",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "bit_shift_right_logical",
+        "bitwise_not",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "bitand",
+        "bitwise_or",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "bitnot",
+        "bitwise_right_shift",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "bitor",
+        "bitwise_right_shift_arithmetic",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "bitxor",
+        "bitwise_xor",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     ("bool_and", BuiltinDisposition::AggregateBoundary),
@@ -327,31 +327,10 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "dceil",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    ("degrees", BuiltinDisposition::Unavailable),
-    (
-        "degress",
+        "degrees",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     ("dense_rank", BuiltinDisposition::WindowBoundary),
-    (
-        "dexp",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "dfloor",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "dlog1",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "dlog10",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     (
         "dow",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
@@ -361,23 +340,15 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        "dpow",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "dround",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
-        "dsqrt",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "e",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "element_at",
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+    ),
+    (
+        "euclidean_distance",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     ("every", BuiltinDisposition::AggregateBoundary),
@@ -395,15 +366,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "floor",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "fmod",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     ("format", BuiltinDisposition::Unavailable),
-    (
-        "fpow",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
     (
         "from_base64",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
@@ -504,10 +467,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         "json_query",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
-    (
-        "l2_distance",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
-    ),
     ("lag", BuiltinDisposition::WindowBoundary),
     (
         "last_day_of_month",
@@ -602,7 +561,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "mod",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "month",
@@ -647,10 +606,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
-        "positive",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "pow",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
@@ -668,11 +623,11 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "rand",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
         "random",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     ("rank", BuiltinDisposition::WindowBoundary),
     (
@@ -842,7 +797,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ),
     (
         "truncate",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),
     (
         "try",

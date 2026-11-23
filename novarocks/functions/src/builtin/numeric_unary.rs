@@ -26,12 +26,8 @@ use crate::{
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{
-    Array, ArrayRef, Float64Array, UInt64Array,
-    types::{Decimal128Type, validate_decimal_precision_and_scale},
-};
-#[cfg(test)]
-use arrow_array::{Decimal128Array, Float32Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_array::{Array, ArrayRef, Float64Array, UInt64Array, types::Decimal128Type};
+use arrow_array::{PrimitiveArray, builder::PrimitiveBuilder, types::ArrowPrimitiveType};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;
@@ -55,11 +51,12 @@ pub enum NumericUnaryOp {
     Positive,
     Sin,
     Sqrt,
+    Sign,
     Tan,
 }
 impl NumericUnaryOp {
-    pub(super) const fn returns_integer(self) -> bool {
-        matches!(self, Self::Ceil | Self::Floor)
+    pub(super) const fn preserves_width(self) -> bool {
+        matches!(self, Self::Ceil | Self::Floor | Self::Sign)
     }
     fn apply(self, value: f64) -> f64 {
         match self {
@@ -81,6 +78,8 @@ impl NumericUnaryOp {
             Self::Radians => value.to_radians(),
             Self::Positive => value,
             Self::Sin => value.sin(),
+            Self::Sign if value == 0.0 || value.is_nan() => value,
+            Self::Sign => value.signum(),
             Self::Sqrt => value.sqrt(),
             Self::Tan => value.tan(),
         }
@@ -127,34 +126,6 @@ impl<'a> UnaryArgument<'a> {
 enum UnaryOperation<F> {
     Transform(F),
     Positive,
-}
-fn checked_view<'a>(
-    array: &'a ArrayRef,
-    source: &FunctionValueType,
-) -> Result<NumericArrayView<'a>, KernelFailure> {
-    if array.data_type() != source.data_type() {
-        return Err(internal(
-            "numeric unary carrier differs from its checked argument",
-        ));
-    }
-    match source.data_type() {
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Float32
-        | DataType::Float64 => {}
-        DataType::Decimal128(precision, scale) => {
-            validate_decimal_precision_and_scale::<Decimal128Type>(*precision, *scale)
-                .map_err(|_| invalid("numeric unary selected decimal parameters are invalid"))?
-        }
-        _ => {
-            return Err(invalid(
-                "numeric unary input is not an installed numeric profile",
-            ));
-        }
-    }
-    NumericArrayView::new(array).map_err(KernelFailure::from_domain)
 }
 fn compute_unary<F: Fn(f64) -> f64>(
     operation: UnaryOperation<F>,
@@ -269,35 +240,33 @@ pub(super) fn evaluate_numeric_unary<'a>(
         return Err(invalid("numeric unary requires one evaluated argument"));
     };
     let target = input.contract().result_type();
-    let expected = if op.returns_integer() {
-        DataType::Int64
-    } else {
-        DataType::Float64
-    };
     if source.logical_type() != ValueLogicalType::Physical
         || target.logical_type() != ValueLogicalType::Physical
-        || *target.data_type() != expected
+        || target.nullable() != source.nullable()
+        || argument.array().data_type() != source.data_type()
     {
         return Err(invalid(
-            "numeric unary logical or result type differs from its exact profile",
+            "numeric unary input or result differs from its exact profile",
         ));
     }
-    let view = checked_view(argument.array(), source)?;
-    let operation = if op == NumericUnaryOp::Positive {
-        UnaryOperation::Positive
+    let selection = input.selection();
+    output_capacity(selection.len())?;
+    let argument = UnaryArgument::Selected(*argument, source);
+    let mut work = EvaluationCheckpoints::new(control);
+    let values = if op.preserves_width() {
+        evaluate_width_preserving(op, &argument, selection, target.data_type(), &mut work)?
     } else {
-        UnaryOperation::Transform(move |value| op.apply(value))
+        if source.data_type() != &DataType::Float64 || target.data_type() != &DataType::Float64 {
+            return Err(invalid("numeric unary requires its exact DOUBLE profile"));
+        }
+        Arc::new(unary_array::<arrow_array::types::Float64Type>(
+            &argument,
+            selection,
+            &mut work,
+            |value| op.apply(value),
+        )?) as ArrayRef
     };
-    let values = compute_unary(
-        operation,
-        UnaryArgument::Selected(*argument, source),
-        Some(view),
-        input.selection(),
-        Some(target.data_type()),
-        Some(target.nullable()),
-        Some(control),
-    )
-    .map_err(MathNumericError::into_kernel)?;
+    work.finish()?;
     SelectedValues::try_new(
         input.selection(),
         target.data_type(),
@@ -306,6 +275,118 @@ pub(super) fn evaluate_numeric_unary<'a>(
     )
     .map_err(|_| internal("numeric unary compact output violates its selected contract"))
 }
+fn unary_array<T: ArrowPrimitiveType>(
+    argument: &UnaryArgument<'_>,
+    selection: Selection<'_>,
+    work: &mut EvaluationCheckpoints<'_>,
+    transform: impl Fn(T::Native) -> T::Native,
+) -> Result<PrimitiveArray<T>, KernelFailure> {
+    let source = argument
+        .array()
+        .as_any()
+        .downcast_ref::<PrimitiveArray<T>>()
+        .ok_or_else(|| internal("numeric unary selected carrier cannot be downcast"))?;
+    work.flush()?;
+    crate::selected_copy::fixed_interleave_extent(&T::DATA_TYPE, selection.len())
+        .map_err(crate::selected_copy::CopyError::into_kernel)?;
+    let mut output = PrimitiveBuilder::<T>::with_capacity(selection.len());
+    for (ordinal, batch_row) in selection.iter().enumerate() {
+        work.step()?;
+        let row = argument.row(ordinal, batch_row);
+        argument.check_row(row)?;
+        output.append_option((!source.is_null(row)).then(|| transform(source.value(row))));
+    }
+    work.flush()?;
+    let result = output.finish();
+    work.flush()?;
+    Ok(result)
+}
+
+fn evaluate_width_preserving(
+    op: NumericUnaryOp,
+    argument: &UnaryArgument<'_>,
+    selection: Selection<'_>,
+    target: &DataType,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    use arrow_array::types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type};
+    let source = argument.array().data_type();
+    if let DataType::Decimal128(precision, scale) = *source {
+        if !(1..=38).contains(&precision) || !(0..=precision as i8).contains(&scale) {
+            return Err(invalid(
+                "numeric unary decimal input differs from the installed precision or scale",
+            ));
+        }
+        let DataType::Decimal128(p, 0) = *target else {
+            return Err(invalid("numeric unary decimal result requires scale zero"));
+        };
+        let expected = if op == NumericUnaryOp::Sign {
+            1
+        } else {
+            super::signature::integral_decimal_precision(precision, scale)
+                .expect("validated decimal declaration")
+        };
+        if p != expected {
+            return Err(invalid(
+                "numeric unary decimal result differs from the installed precision",
+            ));
+        }
+        let factor = 10_i128.pow(scale as u32);
+        let result = unary_array::<Decimal128Type>(argument, selection, work, |value| {
+            let whole = value / factor;
+            let fraction = value % factor;
+            match op {
+                NumericUnaryOp::Ceil => whole + i128::from(fraction > 0),
+                NumericUnaryOp::Floor => whole - i128::from(fraction < 0),
+                NumericUnaryOp::Sign => value.signum(),
+                _ => unreachable!("typed decimal path is used for ceil, floor, and sign"),
+            }
+        })?
+        .with_precision_and_scale(p, 0)
+        .map_err(|_| internal("numeric unary cannot construct its declared DECIMAL result"))?;
+        return Ok(Arc::new(result));
+    }
+    if target != source {
+        return Err(invalid(
+            "numeric unary result must preserve the source width",
+        ));
+    }
+    macro_rules! integer {
+        ($ty:ty) => {
+            Arc::new(unary_array::<$ty>(argument, selection, work, |value| {
+                if op == NumericUnaryOp::Sign {
+                    value.signum()
+                } else {
+                    value
+                }
+            })?) as ArrayRef
+        };
+    }
+    Ok(match source {
+        DataType::Int8 => integer!(Int8Type),
+        DataType::Int16 => integer!(Int16Type),
+        DataType::Int32 => integer!(Int32Type),
+        DataType::Int64 => integer!(Int64Type),
+        DataType::Float32 => Arc::new(unary_array::<Float32Type>(
+            argument,
+            selection,
+            work,
+            |v| op.apply(f64::from(v)) as f32,
+        )?),
+        DataType::Float64 => Arc::new(unary_array::<Float64Type>(
+            argument,
+            selection,
+            work,
+            |v| op.apply(v),
+        )?),
+        _ => {
+            return Err(invalid(
+                "numeric unary carrier is outside the installed profile",
+            ));
+        }
+    })
+}
+
 /// v1 already evaluated its child and supplies actual carrier / batch facts.
 pub fn evaluate_legacy_numeric_unary(
     op: NumericUnaryOp,
@@ -416,22 +497,6 @@ mod tests {
         let prepared = super::super::numeric_unary_owner::prepared_for_test(name, source).unwrap();
         ScalarEvaluationInstance::instantiate(prepared).unwrap()
     }
-    fn dense(name: &str, source: FunctionValueType, array: ArrayRef) -> ArrayRef {
-        let mut instance = instance(name, source);
-        let arguments = [EvaluatedArgument::Column(&array)];
-        let output = instance
-            .evaluate(Selection::all(array.len()), &arguments, &Control::default())
-            .unwrap();
-        assert!(output.errors().is_empty());
-        output.into_parts().1
-    }
-    fn floats(name: &str, values: Vec<Option<f64>>) -> ArrayRef {
-        dense(
-            name,
-            FunctionValueType::new(DataType::Float64, true),
-            Arc::new(Float64Array::from(values)),
-        )
-    }
     fn assert_float(value: f64, expected: f64) {
         if expected == 0.0 {
             assert_eq!(
@@ -457,292 +522,6 @@ mod tests {
                 }
                 None => assert!(array.is_null(row)),
             }
-        }
-    }
-
-    #[test]
-    fn eighteen_real_operations_have_independent_finite_oracles() {
-        use std::f64::consts::{FRAC_PI_2, FRAC_PI_3, FRAC_PI_4, FRAC_PI_6, PI};
-        // Expected answers are identities/constants, not calls to the same
-        // operation used by the production enum. libm last-bit identity is
-        // not promised; signed zero has a separate exact-bit assertion.
-        let cases = [
-            ("acos", 0.5, FRAC_PI_3),
-            ("asin", 0.5, FRAC_PI_6),
-            ("atan", 1.0, FRAC_PI_4),
-            ("cbrt", -8.0, -2.0),
-            ("ceil", -1.2, -1.0),
-            ("cos", PI, -1.0),
-            ("degress", PI, 180.0),
-            ("dlog1", 0.0, 0.0),
-            ("exp", 0.0, 1.0),
-            ("floor", -1.2, -2.0),
-            ("ln", 1.0, 0.0),
-            ("log10", 100.0, 2.0),
-            ("log2", 8.0, 3.0),
-            ("radians", 180.0, PI),
-            ("positive", -2.0, -2.0),
-            ("sin", FRAC_PI_2, 1.0),
-            ("sqrt", 4.0, 2.0),
-            ("tan", FRAC_PI_4, 1.0),
-        ];
-        assert_eq!(cases.len(), 18);
-        for (name, value, expected) in cases {
-            let array = floats(name, vec![Some(value), None]);
-            if ["ceil", "floor"].contains(&name) {
-                let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                assert_eq!(array.value(0), if name == "ceil" { -1 } else { -2 });
-                assert!(array.is_null(1));
-            } else {
-                assert_floats(&array, &[Some(expected), None]);
-            }
-        }
-    }
-
-    #[test]
-    fn eighteen_real_operations_keep_nonfinite_domain_and_signed_zero_rules() {
-        use std::f64::consts::FRAC_PI_2;
-        let nan = f64::from_bits(0xfff8123456789abc);
-        let inf = f64::INFINITY;
-        let cases = [
-            (
-                "acos",
-                [2.0, nan, inf, -0.0],
-                [None, None, None, Some(FRAC_PI_2)],
-            ),
-            (
-                "asin",
-                [-2.0, nan, -inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-            (
-                "atan",
-                [nan, inf, -inf, -0.0],
-                [None, Some(FRAC_PI_2), Some(-FRAC_PI_2), Some(-0.0)],
-            ),
-            (
-                "cbrt",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-            (
-                "ceil",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(0.0)],
-            ),
-            ("cos", [nan, inf, -inf, -0.0], [None, None, None, Some(1.0)]),
-            (
-                "degress",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-            (
-                "dlog1",
-                [-2.0, -1.0, nan, -0.0],
-                [None, None, None, Some(0.0)],
-            ),
-            (
-                "exp",
-                [nan, inf, -inf, -0.0],
-                [None, None, Some(0.0), Some(1.0)],
-            ),
-            (
-                "floor",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(0.0)],
-            ),
-            ("ln", [0.0, -1.0, nan, inf], [None, None, None, None]),
-            ("log10", [0.0, -1.0, nan, inf], [None, None, None, None]),
-            ("log2", [0.0, -1.0, nan, inf], [None, None, None, None]),
-            (
-                "radians",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-            (
-                "positive",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-            (
-                "sin",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-            (
-                "sqrt",
-                [-1.0, nan, inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-            (
-                "tan",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(-0.0)],
-            ),
-        ];
-        assert_eq!(cases.len(), 18);
-        for (name, values, expected) in cases {
-            let array = floats(name, values.into_iter().map(Some).collect());
-            if ["ceil", "floor"].contains(&name) {
-                assert_eq!(
-                    array
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .iter()
-                        .collect::<Vec<_>>(),
-                    vec![None, None, None, Some(0)]
-                );
-            } else {
-                assert_floats(&array, &expected);
-            }
-        }
-    }
-
-    #[test]
-    fn aliases_use_only_the_existing_supported_operations() {
-        for (alias, canonical) in [
-            ("ceiling", "ceil"),
-            ("dceil", "ceil"),
-            ("dfloor", "floor"),
-            ("dexp", "exp"),
-            ("dlog10", "log10"),
-            ("dsqrt", "sqrt"),
-        ] {
-            let input = vec![Some(1.25), Some(-0.0), None];
-            let left = floats(alias, input.clone());
-            let right = floats(canonical, input);
-            assert_eq!(left.to_data(), right.to_data(), "alias {alias}");
-        }
-    }
-
-    #[test]
-    fn all_seven_actual_numeric_profiles_preserve_input_conversion() {
-        let profiles: [ArrayRef; 7] = [
-            Arc::new(Int8Array::from(vec![Some(-2), None])),
-            Arc::new(Int16Array::from(vec![Some(-2), None])),
-            Arc::new(Int32Array::from(vec![Some(-2), None])),
-            Arc::new(Int64Array::from(vec![Some(-2), None])),
-            Arc::new(Float32Array::from(vec![Some(-2.0), None])),
-            Arc::new(Float64Array::from(vec![Some(-2.0), None])),
-            Arc::new(
-                Decimal128Array::from(vec![Some(-20), None])
-                    .with_precision_and_scale(3, 1)
-                    .unwrap(),
-            ),
-        ];
-        for array in profiles {
-            let source =
-                FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
-            let result = dense("atan", source, array);
-            assert_floats(&result, &[Some(-1.1071487177940904), None]);
-        }
-    }
-
-    #[test]
-    fn decimal_scaling_large_precision_and_integer_rounding_remain_original() {
-        for (precision, scale, raw, expected) in [
-            (18, 3, 12345i128, 12.345_f64),
-            (18, -2, -12345, -1234500.0),
-            (38, 0, 99999999999999999999999999999999999999, 1e38),
-            (38, 0, 9007199254740993, 9007199254740992.0),
-        ] {
-            let array: ArrayRef = Arc::new(
-                Decimal128Array::from(vec![raw])
-                    .with_precision_and_scale(precision, scale)
-                    .unwrap(),
-            );
-            let result = dense(
-                "positive",
-                FunctionValueType::from_legacy_declared_projection(
-                    array.data_type().clone(),
-                    false,
-                ),
-                array,
-            );
-            assert_eq!(
-                result
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .unwrap()
-                    .value(0)
-                    .to_bits(),
-                expected.to_bits()
-            );
-        }
-        let result = dense(
-            "positive",
-            FunctionValueType::new(DataType::Int64, false),
-            Arc::new(Int64Array::from(vec![9007199254740993])),
-        );
-        assert_floats(&result, &[Some(9007199254740992.0)]);
-    }
-
-    #[test]
-    fn dlog1_retains_add_then_log_rounding_instead_of_ln_1p() {
-        let result = floats("dlog1", vec![Some(1e-20), Some(-1e-20), Some(-0.0)]);
-        assert_floats(&result, &[Some(0.0), Some(0.0), Some(0.0)]);
-    }
-
-    #[test]
-    fn ceil_floor_keep_arrow_safe_integer_boundary_instead_of_saturation() {
-        for name in ["ceil", "floor"] {
-            let result = dense(
-                name,
-                FunctionValueType::new(DataType::Int64, false),
-                Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 9007199254740993])),
-            );
-            assert_eq!(
-                result
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>(),
-                vec![None, Some(i64::MIN), Some(9007199254740992)]
-            );
-            let result = floats(
-                name,
-                vec![
-                    Some(9223372036854775808.0),
-                    Some(-9223372036854775808.0),
-                    Some(9223372036854774784.0),
-                    Some(-9223372036854777856.0),
-                ],
-            );
-            assert_eq!(
-                result
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>(),
-                vec![None, Some(i64::MIN), Some(9223372036854774784), None]
-            );
-        }
-    }
-
-    #[test]
-    fn positive_nonnullable_float_preserves_successful_null_and_minus_zero() {
-        for array in [
-            Arc::new(Float32Array::from(vec![f32::NAN, f32::INFINITY, -0.0])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![f64::NAN, f64::NEG_INFINITY, -0.0])) as ArrayRef,
-        ] {
-            let source = FunctionValueType::from_legacy_declared_projection(
-                array.data_type().clone(),
-                false,
-            );
-            let mut instance = instance("positive", source);
-            assert!(
-                instance.contract().result_type().nullable(),
-                "the exact float owner must admit its existing sanitized NULL result"
-            );
-            let arguments = [EvaluatedArgument::Column(&array)];
-            let result = instance
-                .evaluate(Selection::all(3), &arguments, &Control::default())
-                .unwrap();
-            assert!(result.errors().is_empty());
-            assert_floats(result.values(), &[None, None, Some(-0.0)]);
         }
     }
 
@@ -793,8 +572,8 @@ mod tests {
 
     #[test]
     fn constant_nonzero_ordinal_broadcasts_without_copying_its_pool() {
-        let ty = FunctionValueType::new(DataType::Int64, true);
-        let array: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(-1), Some(9)]));
+        let ty = FunctionValueType::new(DataType::Float64, true);
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![None, Some(-1.0), Some(9.0)]));
         // Explicit finite fixture policy only, not a production profile/grant.
         let policy = ConstantPolicy {
             max_rows: 3,
@@ -831,7 +610,7 @@ mod tests {
     fn empty_selection_keeps_result_profile_and_skips_private_body() {
         let array: ArrayRef = Arc::new(Float64Array::from(vec![None]));
         let arguments = [EvaluatedArgument::Scalar(&array)];
-        for (name, expected) in [("sqrt", DataType::Float64), ("floor", DataType::Int64)] {
+        for (name, expected) in [("sqrt", DataType::Float64), ("floor", DataType::Float64)] {
             let mut instance = instance(name, FunctionValueType::new(DataType::Float64, true));
             let control = Control::default();
             let result = instance

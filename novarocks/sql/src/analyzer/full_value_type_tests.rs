@@ -21,7 +21,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
-use novarocks_parser::ast;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, TrinoCastMode,
     ValueLogicalType,
@@ -501,46 +500,24 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
     use novarocks_functions::FunctionResultType;
 
     for name in ["round", "truncate"] {
-        for (digits, expected_scale) in [
-            (Some("2"), 2),
-            (Some("-1"), 0),
-            (Some("128"), 0),
-            (Some("256"), 0),
-            (Some("digits"), 6),
-            (Some("CAST(NULL AS BIGINT)"), 6),
-            (None, 6),
+        for digits in [
+            Some("2"),
+            Some("-1"),
+            Some("128"),
+            Some("256"),
+            Some("digits"),
+            Some("CAST(NULL AS INTEGER)"),
+            None,
         ] {
             let arguments = match digits {
                 Some(digits) => format!("decimal_value, {digits}"),
                 None => "decimal_value".to_string(),
             };
             let sql = format!(
-                "SELECT round({arguments}) FROM \
+                "SELECT {name}({arguments}) FROM \
                  (SELECT CAST(1.234 AS DECIMAL(18, 6)) AS decimal_value, 2 AS digits) source"
             );
-            let query = &mut novarocks_parser::parser::parse_query(&sql).unwrap();
-            if name == "truncate" {
-                // TRUNCATE is a statement keyword in the current parser. Rename
-                // only this call AST to isolate the analyzer contract regression.
-                let ast::SetExpr::Select(select) = query.body.as_mut() else {
-                    panic!("expected the decimal call projection");
-                };
-                let Some(ast::SelectItem::SingleColumn(projection_column)) =
-                    select.projection.first_mut()
-                else {
-                    panic!("expected the ordinary scalar call AST");
-                };
-                assert!(projection_column.alias.is_none(), "anonymous projection");
-                let ast::Expr::FunctionCall(call) = &mut projection_column.expression else {
-                    panic!("expected the ordinary scalar call AST");
-                };
-                call.name.parts.last_mut().unwrap().value = "truncate".to_string();
-            }
-            let resolved = super::analyze(query, &SourceCatalog, "default").unwrap().0;
-            let QueryBody::Select(mut select) = resolved.body else {
-                panic!("expected the analyzed decimal call projection");
-            };
-            let expression = select.projection.remove(0).expr;
+            let expression = projection(&sql);
             let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
                 panic!("expected the actual selected decimal call: {sql}");
             };
@@ -555,7 +532,19 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
             if digits == Some("digits") {
                 assert!(matches!(args[1].kind, ExprKind::ColumnRef { .. }));
             }
-            let expected = FunctionValueType::new(DataType::Decimal128(38, expected_scale), true);
+            if digits.is_some() {
+                assert_eq!(args[1].value_type.data_type(), &DataType::Int32);
+            }
+            let (precision, scale) = match (name, digits.is_some()) {
+                ("round", true) => (19, 6),
+                ("round", false) => (13, 0),
+                (_, true) => (18, 6),
+                (_, false) => (12, 0),
+            };
+            let expected = FunctionValueType::new(
+                DataType::Decimal128(precision, scale),
+                args.iter().any(|arg| arg.value_type.nullable()),
+            );
             let FunctionResultType::Scalar(selected) = &binding.selected.result_type else {
                 panic!("decimal scalar selected a relation result: {sql}");
             };
@@ -570,6 +559,19 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
                 "the real builtin must author the selected result: {sql}"
             );
         }
+    }
+    for sql in [
+        "SELECT round(1e0, BIGINT '1')",
+        "SELECT truncate(1e0, 1)",
+        "SELECT dround(1e0)",
+    ] {
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let error = super::analyze(&query, &SourceCatalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction,
+            "{sql}"
+        );
     }
 }
 

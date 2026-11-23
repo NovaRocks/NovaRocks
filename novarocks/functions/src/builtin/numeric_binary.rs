@@ -24,9 +24,9 @@ use crate::{
     kernel_input::EvaluationCheckpoints,
     math_numeric::NumericArrayView,
 };
-use arrow_array::{Array, ArrayRef, builder::Float64Builder};
 #[cfg(test)]
-use arrow_array::{Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_array::Float64Array;
+use arrow_array::{Array, ArrayRef, builder::Float64Builder};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;
@@ -75,7 +75,7 @@ pub(super) fn evaluate_numeric_binary<'a>(
         || right_type.logical_type() != ValueLogicalType::Physical
         || target.logical_type() != ValueLogicalType::Physical
         || target.data_type() != &DataType::Float64
-        || !target.nullable()
+        || target.nullable() != (left_type.nullable() || right_type.nullable())
     {
         return Err(invalid(
             "binary numeric logical or result type differs from its exact profile",
@@ -144,11 +144,7 @@ fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionValueType,
-        ScalarEvaluationInstance, Selection,
-    };
-    use novarocks_type_contract::CompilePhase;
+    use crate::{EvaluatedArgument, FunctionValueType, ScalarEvaluationInstance, Selection};
     use std::{sync::Mutex, time::Duration};
 
     #[derive(Default)]
@@ -219,7 +215,9 @@ mod tests {
                 Some(value) => {
                     assert!(!array.is_null(row));
                     let actual = array.value(row);
-                    if *value == 0.0 {
+                    if value.is_nan() {
+                        assert!(actual.is_nan());
+                    } else if *value == 0.0 || value.is_infinite() {
                         assert_eq!(actual.to_bits(), value.to_bits(), "signed zero");
                     } else {
                         assert!(
@@ -234,128 +232,14 @@ mod tests {
     }
 
     #[test]
-    fn three_actual_operations_have_independent_finite_oracles() {
-        let atan = floats(
-            "atan2",
-            vec![Some(1.0), Some(-1.0), Some(0.0), Some(3.0)],
-            vec![Some(1.0), Some(0.0), Some(-1.0), Some(4.0)],
-        );
-        assert_values(
-            &atan,
-            &[
-                Some(std::f64::consts::FRAC_PI_4),
-                Some(-std::f64::consts::FRAC_PI_2),
-                Some(std::f64::consts::PI),
-                Some(0.6435011087932844),
-            ],
-        );
-        let fmod = floats(
-            "fmod",
-            vec![Some(5.5), Some(-5.5), Some(5.5)],
-            vec![Some(2.0), Some(2.0), Some(-2.0)],
-        );
-        assert_values(&fmod, &[Some(1.5), Some(-1.5), Some(1.5)]);
-        let pow = floats(
-            "pow",
-            vec![Some(2.0), Some(-2.0), Some(4.0), Some(2.0)],
-            vec![Some(3.0), Some(3.0), Some(0.5), Some(-2.0)],
-        );
-        assert_values(&pow, &[Some(8.0), Some(-8.0), Some(2.0), Some(0.25)]);
-    }
-
-    #[test]
-    fn atan2_nonfinite_quadrants_and_signed_zero_keep_operand_order() {
-        let inf = f64::INFINITY;
-        let result = floats(
-            "atan2",
-            vec![
-                Some(0.0),
-                Some(-0.0),
-                Some(0.0),
-                Some(-0.0),
-                Some(inf),
-                Some(-inf),
-                Some(inf),
-                Some(-inf),
-                Some(-1.0),
-                Some(f64::NAN),
-            ],
-            vec![
-                Some(1.0),
-                Some(1.0),
-                Some(-1.0),
-                Some(-1.0),
-                Some(inf),
-                Some(inf),
-                Some(-inf),
-                Some(-inf),
-                Some(inf),
-                Some(1.0),
-            ],
-        );
-        use std::f64::consts::{FRAC_PI_4, PI};
-        assert_values(
-            &result,
-            &[
-                Some(0.0),
-                Some(-0.0),
-                Some(PI),
-                Some(-PI),
-                Some(FRAC_PI_4),
-                Some(-FRAC_PI_4),
-                Some(3.0 * FRAC_PI_4),
-                Some(-3.0 * FRAC_PI_4),
-                Some(-0.0),
-                None,
-            ],
-        );
-    }
-
-    #[test]
-    fn fmod_nonfinite_results_null_but_infinite_divisor_keeps_dividend() {
-        let result = floats(
-            "fmod",
-            vec![
-                Some(0.0),
-                Some(-0.0),
-                Some(5.5),
-                Some(-5.5),
-                Some(1.0),
-                Some(f64::INFINITY),
-                Some(f64::NAN),
-            ],
-            vec![
-                Some(2.0),
-                Some(2.0),
-                Some(f64::INFINITY),
-                Some(f64::NEG_INFINITY),
-                Some(0.0),
-                Some(2.0),
-                Some(1.0),
-            ],
-        );
-        assert_values(
-            &result,
-            &[
-                Some(0.0),
-                Some(-0.0),
-                Some(5.5),
-                Some(-5.5),
-                None,
-                None,
-                None,
-            ],
-        );
-    }
-
-    #[test]
-    fn pow_evaluates_raw_nan_and_zero_rules_before_finite_filtering() {
+    fn pow_preserves_raw_nan_and_zero_results() {
         let result = floats(
             "pow",
             vec![
                 Some(f64::NAN),
                 Some(1.0),
                 Some(f64::INFINITY),
+                Some(-1.0),
                 Some(-0.0),
                 Some(-0.0),
                 Some(-0.0),
@@ -367,6 +251,7 @@ mod tests {
                 Some(0.0),
                 Some(f64::NAN),
                 Some(0.0),
+                Some(f64::INFINITY),
                 Some(3.0),
                 Some(2.0),
                 Some(-1.0),
@@ -379,13 +264,14 @@ mod tests {
             &result,
             &[
                 Some(1.0),
+                Some(f64::NAN),
                 Some(1.0),
-                Some(1.0),
+                Some(f64::NAN),
                 Some(-0.0),
                 Some(0.0),
-                None,
-                None,
-                None,
+                Some(f64::NEG_INFINITY),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
                 None,
             ],
         );
@@ -393,7 +279,7 @@ mod tests {
 
     #[test]
     fn each_installed_alias_preserves_the_pow_body() {
-        for name in ["fpow", "dpow", "power"] {
+        for name in ["pow", "power"] {
             let output = floats(
                 name,
                 vec![Some(2.0), Some(f64::NAN), None],
@@ -401,193 +287,6 @@ mod tests {
             );
             assert_values(&output, &[Some(8.0), Some(1.0), None]);
         }
-    }
-
-    #[test]
-    fn all_36_actual_input_profile_pairs_use_float64_computation() {
-        fn profiles(value: i8) -> [ArrayRef; 6] {
-            [
-                Arc::new(Int8Array::from(vec![value])),
-                Arc::new(Int16Array::from(vec![i16::from(value)])),
-                Arc::new(Int32Array::from(vec![i32::from(value)])),
-                Arc::new(Int64Array::from(vec![i64::from(value)])),
-                Arc::new(Float32Array::from(vec![f32::from(value)])),
-                Arc::new(Float64Array::from(vec![f64::from(value)])),
-            ]
-        }
-        let mut pairs = 0;
-        for left in profiles(2) {
-            for right in profiles(3) {
-                let result = dense("pow", left.clone(), right);
-                assert_values(&result, &[Some(8.0)]);
-                pairs += 1;
-            }
-        }
-        assert_eq!(pairs, 36);
-        let result = dense(
-            "fmod",
-            Arc::new(Int64Array::from(vec![9007199254740993])),
-            Arc::new(Int64Array::from(vec![2])),
-        );
-        assert_values(&result, &[Some(0.0)]);
-        let result = dense(
-            "pow",
-            Arc::new(Float32Array::from(vec![f32::MAX])),
-            Arc::new(Int8Array::from(vec![2])),
-        );
-        assert_eq!(
-            result
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(0)
-                .to_bits(),
-            0x4fefffffc0000020
-        );
-    }
-
-    #[test]
-    fn selected_column_and_original_column_have_independent_maps() {
-        let rows = [1, 4];
-        let selection = Selection::try_sparse(6, &rows).unwrap();
-        let left: ArrayRef = Arc::new(Float64Array::from(vec![
-            f64::NAN,
-            -5.5,
-            f64::INFINITY,
-            99.0,
-            8.0,
-            100.0,
-        ]));
-        let right: ArrayRef = Arc::new(Int16Array::from(vec![2, 3]));
-        let compact =
-            SelectedValues::try_new(selection, &DataType::Int16, right, Box::default()).unwrap();
-        let arguments = [
-            EvaluatedArgument::Column(&left),
-            EvaluatedArgument::SelectedColumn(&compact),
-        ];
-        let mut instance = instance(
-            "fmod",
-            &[
-                FunctionValueType::new(DataType::Float64, false),
-                FunctionValueType::new(DataType::Int16, false),
-            ],
-        );
-        let result = instance
-            .evaluate(selection, &arguments, &Control::default())
-            .unwrap();
-        assert_eq!(result.selection(), selection);
-        assert_values(result.values(), &[Some(-1.5), Some(2.0)]);
-    }
-
-    #[test]
-    fn either_side_scalar_broadcast_is_explicit_and_null_is_strict() {
-        let rows = [1, 4];
-        let selection = Selection::try_sparse(6, &rows).unwrap();
-        let left: ArrayRef = Arc::new(Int8Array::from(vec![2]));
-        let right: ArrayRef = Arc::new(Int8Array::from(vec![99, 3, 99, 99, 4, 99]));
-        let arguments = [
-            EvaluatedArgument::Scalar(&left),
-            EvaluatedArgument::Column(&right),
-        ];
-        let mut broadcast = instance(
-            "pow",
-            &[
-                FunctionValueType::new(DataType::Int8, false),
-                FunctionValueType::new(DataType::Int8, false),
-            ],
-        );
-        assert_values(
-            broadcast
-                .evaluate(selection, &arguments, &Control::default())
-                .unwrap()
-                .values(),
-            &[Some(8.0), Some(16.0)],
-        );
-
-        let left: ArrayRef = Arc::new(Float64Array::from(vec![Some(4.0), None]));
-        let compact =
-            SelectedValues::try_new(selection, &DataType::Float64, left, Box::default()).unwrap();
-        let right: ArrayRef = Arc::new(Int32Array::from(vec![2]));
-        let arguments = [
-            EvaluatedArgument::SelectedColumn(&compact),
-            EvaluatedArgument::Scalar(&right),
-        ];
-        let mut reverse = instance(
-            "pow",
-            &[
-                FunctionValueType::new(DataType::Float64, true),
-                FunctionValueType::new(DataType::Int32, false),
-            ],
-        );
-        assert_values(
-            reverse
-                .evaluate(selection, &arguments, &Control::default())
-                .unwrap()
-                .values(),
-            &[Some(16.0), None],
-        );
-
-        let wrong = [
-            EvaluatedArgument::SelectedColumn(&compact),
-            EvaluatedArgument::Column(&right),
-        ];
-        let mut wrong_shape = instance(
-            "pow",
-            &[
-                FunctionValueType::new(DataType::Float64, true),
-                FunctionValueType::new(DataType::Int32, false),
-            ],
-        );
-        assert!(matches!(
-            wrong_shape.evaluate(selection, &wrong, &Control::default()),
-            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
-        ));
-    }
-
-    #[test]
-    fn constant_arguments_use_two_independent_checked_pool_ordinals() {
-        let ty = FunctionValueType::new(DataType::Int64, true);
-        let array: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(3), Some(10)]));
-        // Explicit finite fixture bounds, including the owner's measured
-        // opaque-validation scratch bound. This is not a production grant.
-        let policy = ConstantPolicy {
-            max_rows: 3,
-            max_array_nodes: 1,
-            max_logical_elements: 3,
-            max_retained_buffer_bytes: 1024,
-            max_type_depth: 1,
-            max_type_nodes: 1,
-            max_dictionary_depth: 0,
-            max_metadata_bytes: 1024,
-            max_library_validation_work: 4096,
-            max_library_validation_bytes: 8192,
-        };
-        let pool = ConstantPool::try_new(
-            Arc::new(ty.try_to_field("binary-input").unwrap()),
-            ty.clone(),
-            array.to_data(),
-            policy,
-            CompilePhase::Validate,
-            crate::binding_test_control(),
-        )
-        .unwrap();
-        let left = pool.value(2).unwrap();
-        let right = pool.value(1).unwrap();
-        let arguments = [
-            EvaluatedArgument::Constant(&left),
-            EvaluatedArgument::Constant(&right),
-        ];
-        let rows = [2, 7];
-        let selection = Selection::try_sparse(10, &rows).unwrap();
-        let mut instance = instance("fmod", &[ty.clone(), ty]);
-        assert_values(
-            instance
-                .evaluate(selection, &arguments, &Control::default())
-                .unwrap()
-                .values(),
-            &[Some(1.0), Some(1.0)],
-        );
-        assert!(Arc::ptr_eq(left.pool().array(), right.pool().array()));
     }
 
     #[test]
@@ -624,7 +323,7 @@ mod tests {
         let source = FunctionValueType::new(DataType::Float64, true);
         let types = [source.clone(), source];
         let selection = Selection::all(320);
-        for name in ["atan2", "fmod", "pow"] {
+        for name in ["atan2", "power", "pow"] {
             let mut baseline = instance(name, &types);
             let control = Control::default();
             baseline.evaluate(selection, &arguments, &control).unwrap();
@@ -674,7 +373,7 @@ mod tests {
             EvaluatedArgument::Scalar(&right),
         ];
         let source = FunctionValueType::new(DataType::Float64, true);
-        for name in ["atan2", "fmod", "pow"] {
+        for name in ["atan2", "power", "pow"] {
             let mut instance = instance(name, &[source.clone(), source.clone()]);
             let control = Control::default();
             assert_eq!(
@@ -694,17 +393,17 @@ mod tests {
     #[test]
     fn shared_binary_every_actual_callback_preserves_all_seven_causes_and_failed_latch() {
         let left: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
-        let right: ArrayRef = Arc::new(Int64Array::from(vec![0]));
+        let right: ArrayRef = Arc::new(Float64Array::from(vec![0.0]));
         let arguments = [
             EvaluatedArgument::Scalar(&left),
             EvaluatedArgument::Scalar(&right),
         ];
         let types = [
             FunctionValueType::new(DataType::Float64, false),
-            FunctionValueType::new(DataType::Int64, false),
+            FunctionValueType::new(DataType::Float64, false),
         ];
         let selection = Selection::all(513);
-        for name in ["atan2", "fmod", "pow", "fpow", "dpow", "power"] {
+        for name in ["atan2", "pow", "power"] {
             let mut baseline = instance(name, &types);
             let control = Control::default();
             baseline.evaluate(selection, &arguments, &control).unwrap();

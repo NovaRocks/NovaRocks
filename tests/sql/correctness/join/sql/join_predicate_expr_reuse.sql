@@ -20,7 +20,7 @@
 -- Validate correctness of join queries where the same expression subtree appears
 -- multiple times in WHERE predicates (expression reuse / CSE scenarios).
 -- Covers: LEFT/RIGHT/INNER/CROSS/LEFT SEMI/LEFT ANTI joins with reused abs(),
--- bit_shift_left(), and arithmetic expressions in filter predicates.
+-- bitwise_left_shift(), and arithmetic expressions in filter predicates.
 -- Test Flow:
 -- 1. Create t0 (100 rows) and t1 (100 rows) with non-overlapping v2/v5 values.
 -- 2. Run joins with reused expression predicates and verify counts.
@@ -103,9 +103,9 @@ SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 8
--- LEFT JOIN with reused bit_shift_left() in WHERE
+-- LEFT JOIN with reused bitwise_left_shift() in WHERE
 SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
-WHERE bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
+WHERE bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
 
 -- query 9
 -- RIGHT JOIN with reused abs() in WHERE
@@ -113,9 +113,9 @@ SELECT COUNT(*) FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 10
--- RIGHT JOIN with reused bit_shift_left() in WHERE
+-- RIGHT JOIN with reused bitwise_left_shift() in WHERE
 SELECT COUNT(*) FROM ${case_db}.pre_t0 RIGHT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
-WHERE bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
+WHERE bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
 
 -- query 11
 -- LEFT JOIN with inequality ON and reused abs() in WHERE
@@ -123,9 +123,9 @@ SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 12
--- LEFT JOIN with inequality ON and reused bit_shift_left() in WHERE
+-- LEFT JOIN with inequality ON and reused bitwise_left_shift() in WHERE
 SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 > ${case_db}.pre_t1.v4
-WHERE bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
+WHERE bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 10 OR bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) = 20;
 
 -- query 13
 -- RIGHT JOIN with inequality + equality ON and reused abs() in WHERE
@@ -138,11 +138,11 @@ SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5 AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) < 10;
 
 -- query 15
--- LEFT JOIN with reused abs() + bit_shift_left() combination
+-- LEFT JOIN with reused abs() + bitwise_left_shift() combination
 SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5)
-  AND bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) > 10
-  AND bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) < 20;
+  AND bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) > 10
+  AND bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1) < 20;
 
 -- query 16
 -- RIGHT JOIN with inequality ON and reused abs() OR ranges
@@ -151,10 +151,10 @@ WHERE (abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5 AND abs(${case_db}.p
    OR (abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 15 AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) < 20);
 
 -- query 17
--- LEFT JOIN with nested reused abs(bit_shift_left())
+-- LEFT JOIN with nested reused abs(bitwise_left_shift())
 SELECT COUNT(*) FROM ${case_db}.pre_t0 LEFT JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
-WHERE abs(bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1)) = abs(bit_shift_left(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5, 1))
-  AND abs(bit_shift_left(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1)) > 10;
+WHERE abs(bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1)) = abs(bitwise_left_shift(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5, 1))
+  AND abs(bitwise_left_shift(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4, 1)) > 10;
 
 -- query 18
 -- RIGHT JOIN with reused arithmetic multiplication

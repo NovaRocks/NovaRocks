@@ -44,10 +44,9 @@ use super::truncate::TruncateOp;
 
 const FUNCTION: &str = "builtin.scalar/truncate/v1";
 const OVERLOAD: &str = "builtin.scalar/truncate/dynamic-v1";
-const IMPLEMENTATION: &str = "builtin.scalar/truncate/selected-v1";
+const IMPLEMENTATION: &str = "builtin.scalar/truncate/selected-v2";
 
-/// The original safe output cast returns successful NULL on overflow.
-/// Frozen overflow policy remains part of the exact call contract.
+/// Dropping digits from the exact value cannot exceed its result declaration.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -364,12 +363,10 @@ impl TruncateOwner {
 }
 #[cfg(test)]
 mod tests {
-    use super::super::catalogue::constant_binding_tests as cv;
     use super::*;
     use crate::{
-        ConstantValue, FunctionArgument, FunctionArgumentType, FunctionResultType,
-        FunctionSpecializationFailure, FunctionValueType, ScopedExpressionEffects,
-        specialize_frozen_scalar, specialize_scalar,
+        ConstantValue, FunctionArgument, FunctionResultType, FunctionSpecializationFailure,
+        FunctionValueType, ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
     };
     use arrow_schema::{DataType, Field};
     use novarocks_type_contract::{
@@ -428,18 +425,6 @@ mod tests {
         }
     }
 
-    fn sources() -> [DataType; 8] {
-        [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-            DataType::Float32,
-            DataType::Float64,
-            DataType::Decimal128(38, -3),
-            DataType::Null,
-        ]
-    }
     fn uses(count: usize) -> Vec<Option<ExpressionUseId>> {
         (0..count)
             .map(|index| Some(ExpressionUseId::new(42 + index as u32)))
@@ -497,217 +482,6 @@ mod tests {
         assert_eq!(implementation.overload, overload.identity);
         assert_eq!(implementation.implementation.as_str(), IMPLEMENTATION);
         assert_eq!(implementation.abi, PureKernelAbi::ScalarV1);
-    }
-    #[test]
-    fn all_eight_sources_and_64_pairs_preserve_full_types_fresh_frozen_and_nullable() {
-        let owner = owner();
-        let parameters = SemanticParameters::try_new([]).unwrap();
-        let mut profiles = sources().into_iter().map(|ty| vec![ty]).collect::<Vec<_>>();
-        for source in sources() {
-            for digits in sources() {
-                profiles.push(vec![source.clone(), digits]);
-            }
-        }
-        assert_eq!(profiles.len(), 72);
-        for profile in profiles {
-            for mask in 0..1usize << profile.len() {
-                // Physical Null is necessarily nullable; other inputs cover both flags.
-                if profile
-                    .iter()
-                    .enumerate()
-                    .any(|(index, ty)| matches!(ty, DataType::Null) && mask & (1 << index) == 0)
-                {
-                    continue;
-                }
-                let types = profile
-                    .iter()
-                    .enumerate()
-                    .map(|(index, ty)| {
-                        FunctionValueType::from_legacy_declared_projection(
-                            ty.clone(),
-                            mask & (1 << index) != 0,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let arguments = types.iter().cloned().map(argument).collect::<Vec<_>>();
-                let uses = uses(arguments.len());
-                let selected = Arc::new(
-                    owner
-                        .resolve(request(&arguments), crate::binding_test_control())
-                        .unwrap(),
-                );
-                assert_eq!(selected.overload.as_str(), OVERLOAD);
-                assert_eq!(
-                    selected.argument_types.as_ref(),
-                    types
-                        .iter()
-                        .cloned()
-                        .map(FunctionArgumentType::Value)
-                        .collect::<Vec<_>>()
-                        .as_slice()
-                );
-                let expected = match &profile[0] {
-                    DataType::Decimal128(_, scale) => DataType::Decimal128(38, *scale),
-                    _ if profile.len() == 2 => DataType::Float64,
-                    _ => DataType::Int64,
-                };
-                assert_eq!(
-                    selected.result_type,
-                    FunctionResultType::Scalar(FunctionValueType::from_legacy_declared_projection(
-                        expected, true
-                    ))
-                );
-                for policy in [
-                    DecimalOverflowPolicy::OutputNull,
-                    DecimalOverflowPolicy::ReportError,
-                ] {
-                    let input = input(&owner, &selected, &arguments, &parameters, &uses, policy);
-                    let fresh = specialize_scalar(
-                        &owner,
-                        input,
-                        selected.clone(),
-                        ScopedExpressionEffects::pure_value(context()),
-                        crate::binding_test_control(),
-                    )
-                    .unwrap();
-                    let contract = fresh.prepared().contract().clone();
-                    let direct = owner
-                        .prepare_scalar(input, contract.clone(), crate::binding_test_control())
-                        .unwrap();
-                    assert!(Arc::ptr_eq(direct.contract(), &contract));
-                    assert!(std::ptr::eq(contract.selected(), selected.as_ref()));
-                    let frozen = contract.effects().clone();
-                    let be = specialize_frozen_scalar(
-                        &owner,
-                        input,
-                        selected.clone(),
-                        &frozen,
-                        ScopedExpressionEffects::pure_value(context()),
-                        crate::binding_test_control(),
-                    )
-                    .unwrap();
-                    assert_eq!(be.prepared().contract().effects(), &frozen);
-                    assert!(std::ptr::eq(
-                        be.prepared().contract().selected(),
-                        selected.as_ref()
-                    ));
-                    let instance = be.prepared().create_instance().unwrap();
-                    assert_eq!(
-                        instance.retained_bytes(),
-                        std::mem::size_of::<TruncateInstance>()
-                    );
-                    assert_eq!(
-                        instance.retained_bytes(),
-                        be.prepared().instance_retained_upper_bound()
-                    );
-                }
-            }
-        }
-    }
-    #[test]
-    fn literal_dependent_scale_stays_with_dynamic_binding_author_and_exact_validation() {
-        let owner = owner();
-        for (digits, scale) in [(2, 2), (257, 1), (128, 0), (-1, 0)] {
-            let arguments = [
-                argument(FunctionValueType::new(DataType::Decimal128(12, 5), false)),
-                FunctionArgument::Value {
-                    value_type: FunctionValueType::new(DataType::Int64, false),
-                    constant: Some(cv::i64(digits, false)),
-                },
-            ];
-            let selected = owner
-                .resolve(request(&arguments), crate::binding_test_control())
-                .unwrap();
-            assert_eq!(
-                selected.result_type,
-                FunctionResultType::Scalar(FunctionValueType::new(
-                    DataType::Decimal128(38, scale),
-                    true
-                ))
-            );
-            owner
-                .validate_selected(
-                    &selected,
-                    request(&arguments),
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-            let mut stale = selected.clone();
-            stale.result_type = FunctionResultType::Scalar(FunctionValueType::new(
-                DataType::Decimal128(38, 5),
-                true,
-            ));
-            assert!(
-                owner
-                    .validate_selected(&stale, request(&arguments), crate::binding_test_control())
-                    .is_err()
-            );
-            let prepared = prepared_for_test(
-                &[
-                    FunctionValueType::new(DataType::Decimal128(12, 5), false),
-                    FunctionValueType::new(DataType::Int64, false),
-                ],
-                &[None, Some(cv::i64(digits, false))],
-                DecimalOverflowPolicy::OutputNull,
-            )
-            .unwrap();
-            assert_eq!(prepared.contract().selected(), &selected);
-        }
-    }
-    #[test]
-    fn safe_output_effects_preserve_no_row_error_for_each_frozen_policy() {
-        let owner = owner();
-        let parameters = SemanticParameters::try_new([]).unwrap();
-        let uses = uses(1);
-        for source in [DataType::Float64, DataType::Decimal128(38, 3)] {
-            for policy in [
-                DecimalOverflowPolicy::OutputNull,
-                DecimalOverflowPolicy::ReportError,
-            ] {
-                let arguments = [argument(
-                    FunctionValueType::from_legacy_declared_projection(source.clone(), true),
-                )];
-                let selected = Arc::new(
-                    owner
-                        .resolve(request(&arguments), crate::binding_test_control())
-                        .unwrap(),
-                );
-                let input = input(&owner, &selected, &arguments, &parameters, &uses, policy);
-                let facts = owner
-                    .validate_and_refine(input, crate::binding_test_control())
-                    .unwrap();
-                let expected = FunctionIntrinsicRowError::NoRowError;
-                assert_eq!(facts.own_row_error, expected);
-                assert_eq!(facts.null_behavior, FunctionNullBehavior::Strict);
-                assert!(facts.environment.is_empty());
-                let mut foreign = facts.clone();
-                foreign.own_row_error = FunctionIntrinsicRowError::MayRaise;
-                assert!(matches!(
-                    specialize_frozen_scalar(
-                        &owner,
-                        input,
-                        selected.clone(),
-                        &foreign,
-                        ScopedExpressionEffects::pure_value(context()),
-                        crate::binding_test_control()
-                    ),
-                    Err(FunctionSpecializationFailure::InvalidInput(_))
-                ));
-                let mut foreign = facts;
-                foreign.null_behavior = FunctionNullBehavior::CalledOnNull;
-                assert!(
-                    specialize_frozen_scalar(
-                        &owner,
-                        input,
-                        selected.clone(),
-                        &foreign,
-                        ScopedExpressionEffects::pure_value(context()),
-                        crate::binding_test_control()
-                    )
-                    .is_err()
-                );
-            }
-        }
     }
     #[test]
     fn foreign_env_proof_context_policy_and_selected_pointer_do_not_reuse_receipt() {
@@ -828,7 +602,7 @@ mod tests {
             },
             FunctionBindingSelection {
                 result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                    DataType::Float64,
+                    DataType::Int64,
                     true,
                 )),
                 ..selected
@@ -951,7 +725,7 @@ mod tests {
         let selected = owner.resolve(request, &baseline).unwrap();
         assert_eq!(
             selected.result_type,
-            FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, true))
+            FunctionResultType::Scalar(FunctionValueType::new(DataType::Float64, true))
         );
         let calls = baseline.calls.lock().unwrap().clone();
         assert!(calls.contains(&256));

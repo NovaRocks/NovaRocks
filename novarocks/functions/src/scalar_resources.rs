@@ -240,9 +240,8 @@ impl ScalarInvocationResourceProfile {
                 // Original wrong arity exits before reading any argument.
                 // Do not inspect unrelated carriers or reorder that failure.
                 if arguments.len() == 2
-                    && arguments
-                        .iter()
-                        .any(|argument| !argument.array().as_any().is::<Int64Array>())
+                    && (!arguments[0].array().as_any().is::<Int64Array>()
+                        || !arguments[1].array().as_any().is::<Int32Array>())
                 {
                     return Err(ScalarResourceError::Invariant(
                         "prepared Int64 shift source has a different actual Arrow carrier",
@@ -252,7 +251,7 @@ impl ScalarInvocationResourceProfile {
             Source::NarrowShift(width) => {
                 if arguments.len() == 2
                     && (!width.matches(arguments[0].array().as_ref())
-                        || !arguments[1].array().as_any().is::<Int64Array>())
+                        || !arguments[1].array().as_any().is::<Int32Array>())
                 {
                     return Err(ScalarResourceError::Invariant(
                         "prepared narrow shift source has a different actual Arrow carrier",
@@ -699,7 +698,7 @@ mod tests {
         use crate::{EvaluatedArgument, Selection};
         use arrow_array::ArrayRef;
         use std::sync::Arc;
-        let count: ArrayRef = Arc::new(Int64Array::from(vec![Some(i64::MIN)]));
+        let count: ArrayRef = Arc::new(Int32Array::from(vec![Some(i32::MIN)]));
         let narrow: [(NarrowShiftWidth, ArrayRef); 3] = [
             (
                 NarrowShiftWidth::Int8,
@@ -715,6 +714,7 @@ mod tests {
             ),
         ];
         let selection = Selection::try_sparse(30, &[1, 9]).unwrap();
+        let wrong_count: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         for (width, array) in &narrow {
             let source = ScalarInvocationResourceProfile::narrow_shift(*width);
             let args = [
@@ -737,7 +737,10 @@ mod tests {
                 }
             }
             assert_eq!(
-                source.requests_for(selection, &[args[0], args[0]]),
+                source.requests_for(
+                    selection,
+                    &[args[0], EvaluatedArgument::Scalar(&wrong_count)]
+                ),
                 Err(ScalarResourceError::Invariant(
                     "prepared narrow shift source has a different actual Arrow carrier"
                 ))
@@ -757,7 +760,7 @@ mod tests {
         use arrow_array::{ArrayRef, Int32Array};
         use std::sync::Arc;
         let malformed_length: ArrayRef = Arc::new(Int64Array::from(vec![None]));
-        let count: ArrayRef = Arc::new(Int64Array::from(vec![Some(i64::MIN)]));
+        let count: ArrayRef = Arc::new(Int32Array::from(vec![Some(i32::MIN)]));
         let source = ScalarInvocationResourceProfile::int64_shift();
         let arguments = [
             EvaluatedArgument::Column(&malformed_length),
@@ -773,6 +776,15 @@ mod tests {
             source.requests_for(
                 selection,
                 &[EvaluatedArgument::Column(&different), arguments[1]]
+            ),
+            Err(ScalarResourceError::Invariant(
+                "prepared Int64 shift source has a different actual Arrow carrier"
+            )),
+        );
+        assert_eq!(
+            source.requests_for(
+                selection,
+                &[arguments[0], EvaluatedArgument::Scalar(&malformed_length)]
             ),
             Err(ScalarResourceError::Invariant(
                 "prepared Int64 shift source has a different actual Arrow carrier"

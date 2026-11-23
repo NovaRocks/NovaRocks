@@ -16,13 +16,13 @@
 // under the License.
 
 use super::scalar_rows::{Control, prepare};
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, ListArray, StringArray,
-    UInt32Array,
-};
+use arrow_array::{Array, ArrayRef, Float64Array, ListArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::Field;
-use novarocks_functions::{EvaluatedArgument, FunctionArgument, RowDataError, Selection};
+use novarocks_failure_contract::kernel_reason::INVALID_FUNCTION_ARGUMENT;
+use novarocks_functions::{
+    DataFailureReason, EvaluatedArgument, FunctionArgument, RowDataError, Selection,
+};
 use novarocks_type_contract::FunctionValueType;
 use std::sync::Arc;
 
@@ -90,64 +90,64 @@ fn assert_values(output: (Vec<Option<f64>>, Vec<RowDataError>), expected: &[Opti
 }
 
 #[test]
-fn vector_names_preserve_cosine_and_squared_l2() {
+fn vector_named_functions_preserve_cosine_and_return_euclidean_distance() {
     let base = vector(&[Some(3.0), Some(4.0)]);
     let target = vector(&[Some(6.0), Some(8.0)]);
-    for (name, expected) in [("cosine_similarity", 1.0), ("l2_distance", 25.0)] {
+    for (name, expected) in [("cosine_similarity", 1.0), ("euclidean_distance", 5.0)] {
         assert_values(pair(name, &base, &target), &[Some(expected)]);
     }
-
-    let zero = vector(&[Some(0.0), Some(0.0)]);
-    assert_values(pair("cosine_similarity", &zero, &base), &[Some(0.0)]);
 }
 
 #[test]
-fn vector_final_nonfinite_values_are_successful_nulls() {
-    for (name, base, target) in [
-        ("cosine_similarity", f64::INFINITY, 1.0),
-        ("l2_distance", f64::MAX, -f64::MAX),
-        ("l2_distance", f64::NAN, 0.0),
-    ] {
-        assert_values(
-            pair(name, &vector(&[Some(base)]), &vector(&[Some(target)])),
-            &[None],
+fn vector_final_nonfinite_results_preserve_ieee_values() {
+    for name in ["cosine_similarity", "euclidean_distance"] {
+        let (values, errors) = pair(
+            name,
+            &vector(&[Some(f64::INFINITY)]),
+            &vector(&[Some(f64::INFINITY)]),
         );
+        assert!(errors.is_empty());
+        assert!(values[0].unwrap().is_nan());
     }
 }
 
 #[test]
-fn vector_reports_selected_outer_child_empty_and_dimension_errors() {
+fn vector_errors_follow_length_then_null_then_cosine_magnitude() {
+    let null = vector(&[None]);
+    let empty = vector(&[]);
+    let zero = vector(&[Some(0.0)]);
+    let one = vector(&[Some(1.0)]);
+    assert_values(pair("euclidean_distance", &null, &one), &[Some(1.0)]);
+    assert_values(pair("euclidean_distance", &empty, &empty), &[Some(0.0)]);
+    assert_values(pair("cosine_similarity", &null, &zero), &[None]);
+    for (name, left, right) in [
+        ("cosine_similarity", &empty, &empty),
+        ("cosine_similarity", &zero, &one),
+        ("cosine_similarity", &null, &empty),
+        ("euclidean_distance", &null, &empty),
+    ] {
+        let (values, errors) = pair(name, left, right);
+        assert_eq!(values, [None]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].selected_ordinal(), 0);
+        assert_eq!(
+            errors[0].reason(),
+            DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT)
+        );
+    }
+
     let outer_null = list(
         Arc::new(Float64Array::from(vec![1.0])),
         vec![0, 1],
         Some(vec![false]),
     );
-    let required = vector(&[Some(1.0)]);
-    let child_null = vector(&[None]);
-    for (base, target, error) in [
-        (&outer_null, &required, "base array has null value"),
-        (&required, &outer_null, "target array has null value"),
-        (&child_null, &required, "base array has null value"),
-        (&required, &child_null, "target array has null value"),
-        (&vector(&[]), &vector(&[]), "requires non-empty arrays"),
-        (
-            &required,
-            &vector(&[Some(1.0), Some(2.0)]),
-            "requires equal length arrays",
-        ),
-    ] {
-        let (result, errors) = pair("l2_distance", base, target);
-        assert_eq!(result, [None]);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].selected_ordinal(), 0);
-        assert!(errors[0].message().contains(error), "{errors:?}");
+    for name in ["cosine_similarity", "euclidean_distance"] {
+        assert_values(pair(name, &outer_null, &empty), &[None]);
     }
 }
 
 #[test]
 fn vector_reads_only_selected_reachable_elements() {
-    // The first selected vector's child includes neither the unused prefix
-    // and suffix nor the child of the null-bearing unselected vector row.
     let base = list(
         Arc::new(Float64Array::from(vec![
             None,
@@ -166,68 +166,17 @@ fn vector_reads_only_selected_reachable_elements() {
     ];
     assert_values(
         evaluate(
-            "l2_distance",
+            "euclidean_distance",
             arguments,
             Selection::try_sparse(2, &[1]).unwrap(),
         ),
-        &[Some(25.0)],
+        &[Some(5.0)],
     );
-    let (result, errors) = evaluate("l2_distance", arguments, Selection::all(2));
-    assert_eq!(result, [None, Some(25.0)]);
-    assert_eq!(errors.len(), 1);
+    let (values, errors) = evaluate("euclidean_distance", arguments, Selection::all(2));
+    assert_eq!(values, [None, Some(5.0)]);
     assert_eq!(errors[0].selected_ordinal(), 0);
-    assert!(errors[0].message().contains("base array has null value"));
-}
-
-#[test]
-fn vector_reads_unsigned_and_scaled_decimal_children() {
-    let unsigned_base = list(Arc::new(UInt32Array::from(vec![3, 4])), vec![0, 2], None);
-    let unsigned_zero = list(Arc::new(UInt32Array::from(vec![0, 0])), vec![0, 2], None);
-    let decimal = |values| {
-        list(
-            Arc::new(
-                Decimal128Array::from(values)
-                    .with_precision_and_scale(8, 1)
-                    .unwrap(),
-            ),
-            vec![0, 2],
-            None,
-        )
-    };
-    for (base, zero) in [
-        (unsigned_base, unsigned_zero),
-        (decimal(vec![30i128, 40i128]), decimal(vec![0i128, 0i128])),
-    ] {
-        assert_values(pair("l2_distance", &base, &zero), &[Some(25.0)]);
-    }
-}
-
-#[test]
-fn vector_children_preserve_legacy_boolean_and_observed_text_conversion() {
-    let boolean = |values| list(Arc::new(BooleanArray::from(values)), vec![0, 2], None);
-    let base = boolean(vec![true, false]);
-    let zero = boolean(vec![false, false]);
-    assert_values(pair("l2_distance", &base, &zero), &[Some(1.0)]);
-
-    let text = |left, right| {
-        list(
-            Arc::new(StringArray::from(vec![left, right])),
-            vec![0, 2],
-            None,
-        )
-    };
-    let base = text("3", "4");
-    let zero = text("0", "0");
-    assert_values(pair("l2_distance", &base, &zero), &[Some(25.0)]);
-
-    let invalid = text("bad", "4");
-    for (left, right, message) in [
-        (&invalid, &zero, "base array has null value"),
-        (&zero, &invalid, "target array has null value"),
-    ] {
-        let (values, errors) = pair("l2_distance", left, right);
-        assert_eq!(values, [None]);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].message().contains(message), "{errors:?}");
-    }
+    assert_eq!(
+        errors[0].reason(),
+        DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT)
+    );
 }

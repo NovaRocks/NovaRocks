@@ -53,16 +53,16 @@ use novarocks_types::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-const NAMES: [&str; 4] = ["bitand", "bitor", "bitxor", "bitnot"];
+const NAMES: [&str; 4] = ["bitwise_and", "bitwise_or", "bitwise_xor", "bitwise_not"];
 fn arity(name: &str) -> usize {
-    if name == "bitnot" { 1 } else { 2 }
+    if name == "bitwise_not" { 1 } else { 2 }
 }
 fn value(name: &str) -> i64 {
     match name {
-        "bitand" => 1,
-        "bitor" => -5,
-        "bitxor" => -6,
-        "bitnot" => 6,
+        "bitwise_and" => 1,
+        "bitwise_or" => -5,
+        "bitwise_xor" => -6,
+        "bitwise_not" => 6,
         _ => panic!("exact SQL bitwise fixture"),
     }
 }
@@ -83,26 +83,6 @@ fn array(ty: &DataType, values: &[Option<i64>]) -> ArrayRef {
         DataType::Int32 => narrow!(Int32Array, i32),
         DataType::Int64 => Arc::new(Int64Array::from(values.to_vec())),
         _ => panic!("accurate SQL physical column"),
-    }
-}
-fn rows(values: &ArrayRef) -> Vec<Option<i64>> {
-    macro_rules! read {
-        ($array:ty) => {
-            values
-                .as_any()
-                .downcast_ref::<$array>()
-                .unwrap()
-                .iter()
-                .map(|v| v.map(i64::from))
-                .collect()
-        };
-    }
-    match values.data_type() {
-        DataType::Int8 => read!(Int8Array),
-        DataType::Int16 => read!(Int16Array),
-        DataType::Int32 => read!(Int32Array),
-        DataType::Int64 => read!(Int64Array),
-        _ => panic!("original bitwise result width"),
     }
 }
 fn binding() -> QueryMemoryBinding {
@@ -173,7 +153,7 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
             source_calls += 1;
             assert_eq!(args.len(), arity(name));
             assert_eq!(function.argument_types.len(), arity(name));
-            assert_eq!(function.result_type.data_type(), &ty);
+            assert_eq!(function.result_type.data_type(), &DataType::Int64);
             assert!(function.result_type.nullable());
             assert_eq!(
                 function.result_type.logical_type(),
@@ -199,11 +179,26 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                     panic!("actual typed column, not folded constant")
                 };
                 assert_eq!(bound, value_type);
-                assert_eq!(value_type.data_type(), &ty);
+                assert_eq!(value_type.data_type(), &DataType::Int64);
                 assert_eq!(value_type.logical_type(), ValueLogicalType::Physical);
                 assert_eq!(&unit.definition(*child).unwrap().ty, bound);
-                let ExprKind::Value(value) = unit.definition(*child).unwrap().kind else {
-                    panic!("the original typed column remains a Value child")
+                let input = if ty == DataType::Int64 {
+                    *child
+                } else {
+                    let ExprKind::Cast {
+                        expr,
+                        target: DataType::Int64,
+                        cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
+                    } = &unit.definition(*child).unwrap().kind
+                    else {
+                        panic!("the narrow SQL column is implicitly widened to BIGINT");
+                    };
+                    *expr
+                };
+                let input = unit.definition(input).unwrap();
+                assert_eq!(input.ty.data_type(), &ty);
+                let ExprKind::Value(value) = input.kind else {
+                    panic!("the original typed SQL column remains a Value leaf")
                 };
                 let scan = fragment
                     .nodes()
@@ -247,10 +242,13 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                 assert!(kernel.invocation_resource_profile().is_some());
                 assert_eq!(kernel.contract().value_argument_types().len(), arity(name));
                 for argument in kernel.contract().value_argument_types() {
-                    assert_eq!(argument.data_type(), &ty);
+                    assert_eq!(argument.data_type(), &DataType::Int64);
                     assert_eq!(argument.logical_type(), ValueLogicalType::Physical);
                 }
-                assert_eq!(kernel.contract().result_type().data_type(), &ty);
+                assert_eq!(
+                    kernel.contract().result_type().data_type(),
+                    &DataType::Int64
+                );
                 assert!(kernel.contract().result_type().nullable());
                 assert_eq!(kernel.contract().call(), call.call_contract());
                 assert_eq!(kernel.contract().effects(), call.call_contract().effects());
@@ -342,9 +340,15 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                     .collect::<Vec<_>>()
             );
         } else {
-            assert_eq!(result.values().data_type(), &ty);
+            assert_eq!(result.values().data_type(), &DataType::Int64);
             assert_eq!(
-                rows(result.values()),
+                result
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
                 ordinals
                     .iter()
                     .map(|row| {

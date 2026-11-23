@@ -2129,7 +2129,10 @@ mod tests {
             .seal_pure(
                 [
                     "builtin.scalar/rand/()->f64;strict;legacy",
-                    "builtin.scalar/rand/(i64)->f64;strict;legacy",
+                    "builtin.scalar/rand/(i8)->i8;strict;coerce",
+                    "builtin.scalar/rand/(i16)->i16;strict;coerce",
+                    "builtin.scalar/rand/(i32)->i32;strict;coerce",
+                    "builtin.scalar/rand/(i64)->i64;strict;coerce",
                 ]
                 .into_iter()
                 .map(|overload| InstalledPureKernel {

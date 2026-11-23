@@ -6857,14 +6857,14 @@ mod tests {
                 logical_type: None,
             };
             let expression = analyze_projection_expr_with_catalog(
-                "select bitnot(k) from unary_input",
+                "select bitwise_not(k) from unary_input",
                 &catalog,
                 crate::functions::builtin_sql_function_catalog(),
             )
             .unwrap();
             assert_eq!(expression.value_type.data_type().clone(), DataType::Int64);
             assert!(expression.value_type.nullable());
-            let operand = named_bitnot_operand(&expression);
+            let operand = named_bitwise_not_operand(&expression);
             assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }));
             assert_eq!(operand.value_type.data_type().clone(), DataType::Int64);
             assert_eq!(operand.value_type.nullable(), nullable);
@@ -7351,40 +7351,48 @@ mod tests {
     }
 
     #[test]
-    fn named_bitnot_requires_an_integer_width_without_erasing_a_nonliteral_argument() {
-        use crate::analyze_error::AnalyzeErrorKind;
+    fn named_bitwise_not_resolves_unknown_null_without_erasing_a_nonliteral_argument() {
         use novarocks_type_contract::FunctionValueType;
 
-        let control = crate::compiler::SqlCompileControl::unbounded();
-        for source in ["NULL", "element_at([], 1)"] {
-            let sql = format!("SELECT bitnot({source})");
-            let query = novarocks_parser::parser::parse_query(&sql).unwrap();
-            let error = super::super::analyze_with_function_catalog(
-                &query,
-                &EmptyCatalog,
-                "default",
-                crate::functions::builtin_sql_function_catalog(),
-                crate::constant::test_constant_policy(),
-                &control,
-            )
-            .expect_err("untyped bitnot probe");
-            assert_eq!(
-                error.kind(),
-                AnalyzeErrorKind::AmbiguousFunctionCall,
-                "{sql}"
-            );
-        }
+        let expected = FunctionValueType::new(DataType::Int64, true);
+        let literal = analyze_projection_expr("select bitwise_not(NULL)").unwrap();
+        assert_eq!(literal.value_type, expected);
+        let operand = named_bitwise_not_operand(&literal);
+        assert_eq!(operand.value_type, expected);
+        assert!(matches!(
+            operand.kind,
+            ExprKind::Literal(LiteralValue::Null)
+        ));
 
-        let expected = FunctionValueType::new(DataType::Int8, true);
-        for sql in ["cast(NULL as tinyint)", "cast(element_at([],1) as tinyint)"] {
-            let original = analyze_projection_expr(&format!("select {sql}")).unwrap();
-            let bound = analyze_projection_expr(&format!("select bitnot({sql})")).unwrap();
+        let nonliteral = analyze_projection_expr("select bitwise_not(element_at([],1))").unwrap();
+        assert_eq!(nonliteral.value_type, expected);
+        let operand = named_bitwise_not_operand(&nonliteral);
+        assert_eq!(operand.value_type, expected);
+        let ExprKind::Cast { expr, target, .. } = &operand.kind else {
+            panic!(
+                "named bitwise_not must bind the Unknown argument at its selected integer width"
+            );
+        };
+        assert_eq!(target, &DataType::Int64);
+        assert_eq!(
+            expr.value_type,
+            FunctionValueType::new(DataType::Null, true)
+        );
+        let ExprKind::FunctionCall { name, .. } = &expr.kind else {
+            panic!("bitwise_not must keep the original nonliteral NULL argument");
+        };
+        assert_eq!(name, "element_at");
+
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for sql in ["CAST(NULL AS BIGINT)", "CAST(element_at([], 1) AS BIGINT)"] {
+            let original = analyze_projection_expr(&format!("SELECT {sql}")).unwrap();
+            let bound = analyze_projection_expr(&format!("SELECT bitwise_not({sql})")).unwrap();
             assert_eq!(bound.value_type, expected);
-            let operand = named_bitnot_operand(&bound);
-            assert_eq!(operand.value_type, expected);
             assert!(
                 crate::analysis::expr_identity::typed_expr_semantically_eq(
-                    operand, &original, &control
+                    named_bitwise_not_operand(&bound),
+                    &original,
+                    &control,
                 )
                 .unwrap(),
                 "{sql}"
@@ -7392,13 +7400,13 @@ mod tests {
         }
     }
 
-    fn named_bitnot_operand(expression: &TypedExpr) -> &TypedExpr {
+    fn named_bitwise_not_operand(expression: &TypedExpr) -> &TypedExpr {
         let ExprKind::FunctionCall { name, args, .. } = &expression.kind else {
-            panic!("expected analyzed scalar bitnot");
+            panic!("expected analyzed scalar bitwise_not");
         };
-        assert_eq!(name, "bitnot");
+        assert_eq!(name, "bitwise_not");
         let [operand] = args.as_slice() else {
-            panic!("expected one bitnot argument");
+            panic!("expected one bitwise_not argument");
         };
         operand
     }
@@ -7447,11 +7455,11 @@ mod tests {
                 )
                 .unwrap(),
             );
-            for (sql, expected) in [
+            for (sql, expected_error) in [
                 ("select raw+1", AnalyzeErrorKind::TypeMismatch),
                 ("select raw+NULL", AnalyzeErrorKind::TypeMismatch),
                 ("select -raw", AnalyzeErrorKind::TypeMismatch),
-                ("select bitnot(raw)", AnalyzeErrorKind::UnknownFunction),
+                ("select bitwise_not(raw)", AnalyzeErrorKind::UnknownFunction),
             ] {
                 let query = &novarocks_parser::parser::parse_query(sql).unwrap();
                 let ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -7463,8 +7471,8 @@ mod tests {
                 assert!(projection_column.alias.is_none(), "anonymous projection");
                 let expr = &projection_column.expression;
                 let error = context.analyze_expr(expr, &scope).unwrap_err();
-                assert_eq!(error.kind(), expected, "{sql}: {error}");
-                if expected == AnalyzeErrorKind::UnknownFunction {
+                assert_eq!(error.kind(), expected_error, "{sql}: {error}");
+                if expected_error == AnalyzeErrorKind::UnknownFunction {
                     assert_eq!(error.message(), "no matching declared overload");
                 }
             }
@@ -7481,21 +7489,21 @@ mod tests {
         assert_eq!(negate.value_type.logical_type(), ValueLogicalType::LargeInt);
         assert!(!negate.value_type.nullable());
 
-        let bitnot = analyze_projection_expr_with_catalog(
-            "select bitnot(k) from unary_input",
+        let query = novarocks_parser::parser::parse_query("select bitwise_not(k) from unary_input")
+            .unwrap();
+        let error = super::super::analyze_with_function_catalog(
+            &query,
             &catalog,
+            "default",
             registry,
+            crate::constant::test_constant_policy(),
+            &control,
         )
-        .unwrap();
-        assert_eq!(bitnot.value_type.logical_type(), ValueLogicalType::LargeInt);
+        .unwrap_err();
         assert_eq!(
-            bitnot.value_type.data_type().clone(),
-            DataType::FixedSizeBinary(16)
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction
         );
-        assert!(bitnot.value_type.nullable());
-        let operand = named_bitnot_operand(&bitnot);
-        assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }));
-        assert_eq!(operand.value_type, negate.value_type);
     }
 
     #[test]
@@ -7725,10 +7733,14 @@ mod tests {
                 DataType::Decimal128(18, 9),
                 true,
             ),
-            ("select bitnot(cast(null as bigint))", DataType::Int64, true),
+            (
+                "select bitwise_not(cast(null as bigint))",
+                DataType::Int64,
+                true,
+            ),
             ("select -1.25", DataType::Decimal128(3, 2), false),
             ("select -1.25e2", DataType::Float64, false),
-            ("select bitnot(1)", DataType::Int32, true),
+            ("select bitwise_not(1)", DataType::Int64, true),
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
             assert_eq!(

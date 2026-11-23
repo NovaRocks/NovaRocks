@@ -17,7 +17,7 @@
 
 //! Actual Chunk projection, source authority and operator materialization.
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::fixtures::{SeedMode, input_chunk, input_project, program};
+use crate::exec::expr::fixtures::{RandArgument, input_chunk, input_project, program};
 use crate::exec::operators::compiled_expression::{
     InputAdapterObserver, RuntimeKernelControl, assert_original_chunk_input,
     chunk_evaluation_input, projected_chunk_evaluation_input,
@@ -108,7 +108,7 @@ fn evaluate<'a>(
 
 #[test]
 fn checked_slot_pairs_exact_column_and_original_chunk_authority() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let tracker = MemTracker::new_root("checked-slot-source");
     let mut chunk = input_chunk(&program, vec![Some(11), Some(42), None]);
     chunk.try_transfer_to(&tracker).unwrap();
@@ -141,7 +141,7 @@ fn checked_slot_pairs_exact_column_and_original_chunk_authority() {
 #[test]
 fn projected_input_maps_original_slots_through_actual_sparse_domains() {
     use novarocks_type_contract::ValueTypeStorageLifetime;
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let full = input_chunk(&program, vec![Some(11), Some(42), None, Some(7)]);
     let declared = full.chunk_schema_ref();
     // Plain Arrow fixture metadata is outside construction qualification.
@@ -233,7 +233,7 @@ fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
 
 #[test]
 fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let chunk = input_chunk(&program, vec![Some(42)]);
     assert!(!chunk.source_authority().is_attached());
     let bare = batch_input(chunk.record_batch());
@@ -255,7 +255,7 @@ fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
 
 #[test]
 fn chunk_and_batch_entries_keep_full_sparse_empty_null_results() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let tracker = MemTracker::new_root("input-selection-source");
     let mut chunk = input_chunk(&program, vec![Some(11), Some(42), None, Some(7)]);
     chunk.try_transfer_to(&tracker).unwrap();
@@ -310,7 +310,7 @@ fn chunk_and_batch_entries_keep_full_sparse_empty_null_results() {
 
 #[test]
 fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let chunk = input_chunk(&program, vec![Some(42)]);
     let bad = RecordBatch::try_new(
         Arc::new(arrow::datatypes::Schema::new(vec![
@@ -346,7 +346,7 @@ fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
 
 #[test]
 fn project_and_writer_entries_observe_original_slot_before_complete_custody_capture() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let tracker = MemTracker::new_root("operator-source-borrow");
     for writer in [false, true] {
         let mut chunk = input_chunk(&program, vec![Some(42), None, Some(7)]);
@@ -421,7 +421,7 @@ fn project_and_writer_entries_observe_original_slot_before_complete_custody_capt
 
 #[test]
 fn input_source_provider_token_survives_actual_frame_and_last_buffer_alias() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let original = input_chunk(&program, vec![Some(11), None, Some(7)]);
     let tracker = MemTracker::new_root("frame-provider-finite-custody");
     let (chunk, bytes) =
@@ -451,7 +451,7 @@ fn input_source_no_authority_single_creator_lifetime_is_not_a_pure_source() {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     for has_host in [false, true] {
         let drops = Arc::new(AtomicUsize::new(0));
         let creator = ValueTypeStorageLifetime::held(Arc::new(Creator(drops.clone())));
@@ -496,7 +496,7 @@ fn input_source_no_authority_single_creator_lifetime_is_not_a_pure_source() {
 
 #[test]
 fn input_source_additional_buffer_ledger_survives_actual_frame_and_last_alias() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let tracker = MemTracker::new_root("frame-complete-additional-buffer-ledger");
     tracker.install_limit_once(64 << 20).unwrap();
     let mut input = input_chunk(&program, vec![Some(11), Some(42), Some(7)]);
@@ -547,7 +547,7 @@ fn input_source_additional_buffer_ledger_survives_actual_frame_and_last_alias() 
 
 #[test]
 fn input_source_genuinely_pure_chunk_and_record_batch_keep_no_host_ability() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let chunk = input_chunk(&program, vec![Some(11), None, Some(7)]);
     let mut requests = 0;
     let storage = chunk.source_storage_lifetime_observed::<novarocks_type_contract::owned_resources::layout::LayoutResourceError>(

@@ -19,12 +19,12 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Float64Array, Int32Array, Int64Array};
+use arrow::array::{Int32Array, Int64Array};
 use novarocks_types::{QueryId, UniqueId};
 
 use super::*;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::fixtures::{SEED_42_FIRST, SeedMode, program};
+use crate::exec::expr::fixtures::{RandArgument, program};
 use crate::exec::fragment::program::FragmentContractVersion;
 use crate::exec::fragment::program::FragmentNodeId;
 use crate::exec::node::scan::{BoundScanRanges, ScanSource};
@@ -565,7 +565,7 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
             _ => unreachable!(),
         };
         let submission = CompiledTaskSubmission::try_new(
-            program(SeedMode::Input, false),
+            program(RandArgument::Input, false),
             CompiledScanSources::new(),
             instance(
                 UniqueId::new(201, 202),
@@ -599,7 +599,7 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
 // compiled roots.
 #[test]
 fn compiled_submission_prepares_and_runs_into_the_result_session() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let submission = CompiledTaskSubmission::try_new(
         program,
         CompiledScanSources::new(),
@@ -634,20 +634,20 @@ fn compiled_submission_prepares_and_runs_into_the_result_session() {
     let sample = batch
         .column(0)
         .as_any()
-        .downcast_ref::<Float64Array>()
-        .expect("RAND result is Float64");
-    assert_eq!(sample.value(0).to_bits(), SEED_42_FIRST);
-    let seed = batch
+        .downcast_ref::<Int64Array>()
+        .expect("bounded RAND result is Int64");
+    assert_eq!(sample.value(0), 0);
+    let bound = batch
         .column(1)
         .as_any()
         .downcast_ref::<Int64Array>()
-        .expect("seed passthrough is Int64");
-    assert_eq!(seed.value(0), 42);
+        .expect("bound passthrough is Int64");
+    assert_eq!(bound.value(0), 1);
 }
 
 #[test]
 fn compiled_submission_refuses_a_foreign_dop_and_unaddressed_inputs() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let error = CompiledTaskSubmission::try_new(
         Arc::clone(&program),
         CompiledScanSources::new(),
@@ -686,7 +686,7 @@ fn compiled_submission_refuses_a_foreign_dop_and_unaddressed_inputs() {
 
 #[test]
 fn a_host_root_sink_width_must_equal_the_compiled_width() {
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let submission = CompiledTaskSubmission::try_new(
         program,
         CompiledScanSources::new(),
@@ -828,7 +828,7 @@ fn a_compiled_scan_submission_refuses_unbound_and_unaddressed_scans() {
 
     // A program without a scan takes no scan source.
     let scanless = submission_refusal(
-        program(SeedMode::Input, false),
+        program(RandArgument::Input, false),
         scan_sources(&scanned, &op),
         scan_instance(UniqueId::new(219, 220), ScanAssignments::default()),
     );
@@ -927,7 +927,7 @@ impl crate::runtime::preparation_metadata::CompiledSchemaPreparationScope
 #[test]
 fn project_metadata_borrow_reaches_nested_projects_before_running() {
     use crate::runtime::preparation_metadata::CompiledSchemaSite;
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let submission = CompiledTaskSubmission::try_new(
         Arc::clone(&program),
         CompiledScanSources::new(),
@@ -993,11 +993,10 @@ fn project_metadata_borrow_reaches_nested_projects_before_running() {
         batch
             .column(0)
             .as_any()
-            .downcast_ref::<Float64Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
-            .value(0)
-            .to_bits(),
-        SEED_42_FIRST
+            .value(0),
+        0
     );
     assert_eq!(
         batch
@@ -1006,7 +1005,7 @@ fn project_metadata_borrow_reaches_nested_projects_before_running() {
             .downcast_ref::<Int64Array>()
             .unwrap()
             .value(0),
-        42
+        1
     );
 }
 
@@ -1034,7 +1033,7 @@ fn project_metadata_refusal_keeps_nominal_cause_through_the_original_prepare_cha
     ];
     for cause in causes {
         for at in [1, 2] {
-            let program = program(SeedMode::Input, false);
+            let program = program(RandArgument::Input, false);
             let submission = CompiledTaskSubmission::try_new(
                 Arc::clone(&program),
                 CompiledScanSources::new(),

@@ -161,9 +161,9 @@ fn causes() -> [KernelFailure; 7] {
 fn contract() -> Arc<ScalarCallContract> {
     // The actual installed SIGN author supplies immutable scalar identity for
     // diagnostic-only tests. These are not ARRAY producer/ABI acceptance probes.
-    let prepared = super::super::numeric_elementary_owner::prepared_for_test(
+    let prepared = super::super::numeric_unary_owner::prepared_for_test(
         "sign",
-        &[FunctionValueType::new(DataType::Int64, true)],
+        FunctionValueType::new(DataType::Int64, true),
     )
     .unwrap();
     Arc::clone(prepared.contract())

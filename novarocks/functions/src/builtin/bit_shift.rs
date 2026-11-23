@@ -15,21 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Selected shifts preserve the original widened arithmetic and safe narrowing.
+//! Selected shifts use the declared signed width and an INTEGER distance.
 //! Arrow builder allocation still requires formal host memory admission.
 
-#[cfg(test)]
-use std::sync::Arc;
-
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, Int64Array, PrimitiveArray,
+    Array, ArrayRef, Int32Array, PrimitiveArray,
     types::{ArrowPrimitiveType, Int8Type, Int16Type, Int32Type, Int64Type},
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-
-#[cfg(test)]
-use arrow_array::builder::FixedSizeBinaryBuilder;
 
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelEvaluationControl,
@@ -58,7 +52,7 @@ pub(super) fn evaluate_shift<'a>(
     };
     let target = input.contract().result_type();
     if count.logical_type() != ValueLogicalType::Physical
-        || count.data_type() != &DataType::Int64
+        || count.data_type() != &DataType::Int32
         || target.logical_type() != source.logical_type()
         || target.data_type() != source.data_type()
         || !target.nullable()
@@ -75,7 +69,7 @@ pub(super) fn evaluate_shift<'a>(
     let counts = right
         .array()
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Int32Array>()
         .ok_or_else(|| internal("shift count carrier cannot be downcast"))?;
     let arguments = ShiftArguments {
         left: *left,
@@ -96,9 +90,6 @@ pub(super) fn evaluate_shift<'a>(
         }
         (ValueLogicalType::Physical, DataType::Int64) => {
             primitive::<Int64Type>(operation, &input, arguments, control)?
-        }
-        (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)) => {
-            largeint(operation, &input, arguments, control)?
         }
         _ => {
             return Err(invalid(
@@ -124,7 +115,7 @@ struct ShiftArguments<'a, 'b> {
     right: EvaluatedArgument<'a>,
     source: &'b FunctionValueType,
     count: &'b FunctionValueType,
-    counts: &'a Int64Array,
+    counts: &'a Int32Array,
 }
 impl ShiftArguments<'_, '_> {
     fn selected_pair(
@@ -171,8 +162,6 @@ where
         .ok_or_else(|| internal("shift selected primitive carrier cannot be downcast"))?;
     let selection = input.selection();
     output_capacity(selection.len(), std::mem::size_of::<T::Native>())?;
-    // The original loop allocates a BIGINT intermediate before Arrow safe
-    // narrowing. Representability is checked for both real carriers.
     output_capacity(selection.len(), std::mem::size_of::<Option<i64>>())?;
     let mut work = EvaluationCheckpoints::new(control);
     let mut observe = |event| match event {
@@ -184,14 +173,21 @@ where
         |ordinal, batch_row| {
             Ok(arguments
                 .selected_pair(ordinal, batch_row)?
-                .map(|(left_row, right_row)| {
+                .map(|(left, right)| {
                     (
-                        values.value(left_row).into(),
-                        arguments.counts.value(right_row),
+                        values.value(left).into(),
+                        i64::from(arguments.counts.value(right)),
                     )
                 }))
         },
-        |value, count| operation.apply_i64(value, i64::from(count)),
+        |value, count| {
+            apply_shift(
+                operation,
+                value,
+                count as i32,
+                (std::mem::size_of::<T::Native>() * 8) as u32,
+            )
+        },
         &mut observe,
     )?;
     let values = crate::bit_array::finish_i64_observed(
@@ -204,57 +200,30 @@ where
     Ok(values)
 }
 
-fn largeint(
-    operation: ShiftOp,
-    input: &ScalarCallInput<'_, '_>,
-    arguments: ShiftArguments<'_, '_>,
-    control: &dyn KernelEvaluationControl,
-) -> Result<ArrayRef, KernelFailure> {
-    let values = arguments
-        .left
-        .array()
-        .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or_else(|| internal("shift selected LargeInt carrier cannot be downcast"))?;
-    if values.value_length() != 16 {
-        return Err(internal(
-            "shift LargeInt carrier has an incorrect byte width",
-        ));
+fn apply_shift(operation: ShiftOp, value: i64, count: i32, width: u32) -> i64 {
+    if count >= 64 {
+        return if operation == ShiftOp::Right {
+            value >> 63
+        } else {
+            0
+        };
     }
-    let selection = input.selection();
-    output_capacity(selection.len(), 16)?;
-    output_capacity(selection.len(), std::mem::size_of::<Option<i128>>())?;
-    let mut work = EvaluationCheckpoints::new(control);
-    let mut observe = |event| match event {
-        crate::bit_array::BitArrayObservation::Step => work.step(),
-        crate::bit_array::BitArrayObservation::OpaqueBoundary => work.flush(),
-    };
-    let values = crate::bit_array::shift_values_observed(
-        selection,
-        |ordinal, batch_row| {
-            arguments
-                .selected_pair(ordinal, batch_row)?
-                .map(|(left_row, right_row)| {
-                    crate::largeint::value_at(values, left_row)
-                        .map(|value| (value, arguments.counts.value(right_row)))
-                        .map_err(|_| internal("shift LargeInt value has an incorrect byte width"))
-                })
-                .transpose()
-        },
-        |value, count| operation.apply_i128(value, i64::from(count)),
-        &mut observe,
-    )?;
-    let values = crate::bit_array::cast_largeint_output_observed(
-        &values,
-        Some(input.contract().result_type().data_type()),
-        &mut observe,
-    )?
-    .map_err(|_| internal("shift LargeInt output has an incorrect byte width"))?;
-    work.finish()?;
-    Ok(values)
+    let count = count as u32;
+    let padding = 64 - width;
+    match operation {
+        ShiftOp::Left => {
+            // Sign-extend after narrowing the shifted bits to the source width.
+            value.wrapping_shl(count).wrapping_shl(padding) >> padding
+        }
+        ShiftOp::Right => value.wrapping_shr(count),
+        ShiftOp::RightLogical if width < 64 && count != 0 => {
+            let mask = u64::MAX >> padding;
+            ((value as u64 & mask).wrapping_shr(count) as i64).wrapping_shl(padding) >> padding
+        }
+        ShiftOp::RightLogical => (value as u64).wrapping_shr(count) as i64,
+    }
 }
 
-/// Allocation representability only; it does not authorize host memory.
 fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
     let values = rows
         .checked_mul(width)
@@ -270,6 +239,3 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

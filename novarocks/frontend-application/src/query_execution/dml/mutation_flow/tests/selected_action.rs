@@ -135,8 +135,12 @@ fn is_rand(kind: &ExprKind) -> bool {
 #[test]
 fn volatile_when_has_one_physical_author_per_clause() {
     for matched in [MERGE_ACTION_MATCHED_UPDATE, MERGE_ACTION_MATCHED_DELETE] {
-        let authored =
-            compile_selected_action(Some(matched), "rand(17) > 0.5", "rand(29) > 0.5", true);
+        let authored = compile_selected_action(
+            Some(matched),
+            "rand() > DOUBLE '0.5'",
+            "rand() < DOUBLE '0.5'",
+            true,
+        );
         let plan = authored.plan();
         let (fragment, owner, action) = selected_action_author(plan);
         let unit = plan.fragments()[&fragment].unit(owner).unwrap();

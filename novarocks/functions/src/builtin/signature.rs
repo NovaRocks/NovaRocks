@@ -94,6 +94,10 @@ pub enum TypeSpec {
     /// same decimal on both sides of the signature. `AnyDecimal128`
     /// carries no name to refer back to.
     Decimal128Of(&'static str),
+    /// Result of rounding a declared decimal towards an integer.
+    DecimalIntegralOf(&'static str),
+    /// Result of taking the sign of a decimal.
+    DecimalSign,
     /// Analogous named decimal template for the Decimal256 carrier.
     Decimal256Of(&'static str),
     /// LARGEINT, whose physical carrier is `FixedSizeBinary(16)`. It is one
@@ -375,6 +379,12 @@ impl TypeSpec {
                 output.push_str(name);
                 output.push('>');
             }
+            Self::DecimalIntegralOf(name) => {
+                output.push_str("decimal128-integral<");
+                output.push_str(name);
+                output.push('>');
+            }
+            Self::DecimalSign => output.push_str("decimal128(1,0)"),
             Self::Decimal256Of(name) => {
                 output.push_str("decimal256<");
                 output.push_str(name);
@@ -487,6 +497,14 @@ fn names_a_type(spec: &TypeSpec) -> bool {
     }
 }
 
+pub(super) fn integral_decimal_precision(precision: u8, scale: i8) -> Option<u8> {
+    if (1..=38).contains(&precision) && (0..=precision as i8).contains(&scale) {
+        Some(precision - scale as u8 + u8::from(scale > 0))
+    } else {
+        None
+    }
+}
+
 /// Realize a `TypeSpec` (the return-type slot of a matched signature) into
 /// a concrete `DataType`. `bindings` carries the type-variable assignments
 /// produced by the polymorphic match — looking up `Any("T")` returns the
@@ -517,6 +535,17 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => bindings
             .lookup(name)
             .ok_or_else(|| format!("decimal type variable {name} is unbound in the return type"))?,
+        TypeSpec::DecimalIntegralOf(name) => {
+            let precision = match bindings.lookup(name) {
+                Some(DataType::Decimal128(precision, scale)) => {
+                    integral_decimal_precision(precision, scale)
+                }
+                _ => None,
+            }
+            .ok_or_else(|| format!("invalid decimal type for integral result {name}"))?;
+            DataType::Decimal128(precision, 0)
+        }
+        TypeSpec::DecimalSign => DataType::Decimal128(1, 0),
         TypeSpec::MapWithUninhabitedKey { map, .. } => bindings
             .lookup(map)
             .ok_or_else(|| format!("uninhabited-key Map variable {map} is unbound"))?,

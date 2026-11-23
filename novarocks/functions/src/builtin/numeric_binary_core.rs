@@ -28,12 +28,12 @@ impl NumericBinaryOp {
         match self {
             Self::Atan2 => a.atan2(b),
             Self::Fmod => a % b,
+            Self::Pow if b.is_nan() || (a.abs() == 1.0 && b.is_infinite()) => f64::NAN,
             Self::Pow => a.powf(b),
         }
     }
 }
-/// Preserve original raw inputs through the formula, THEN filter the result.
-/// NaN^0, atan2(Inf,Inf), finite%Inf and signed zero are not input errors.
+/// Preserve raw IEEE inputs and results, including NaN and signed zero.
 /// Exact caller addresses and output emit describe the existing carrier contract.
 pub fn evaluate_binary_rows(
     op: NumericBinaryOp,
@@ -50,10 +50,7 @@ pub fn evaluate_binary_rows(
         let l = left_view.value_f64(left_row);
         let r = right_view.value_f64(right_row);
         emit(match (l, r) {
-            (Some(a), Some(b)) => {
-                let value = op.apply(a, b);
-                value.is_finite().then_some(value)
-            }
+            (Some(a), Some(b)) => Some(op.apply(a, b)),
             _ => None,
         })?;
     }

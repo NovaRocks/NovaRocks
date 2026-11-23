@@ -74,7 +74,9 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: match operation {
-            Operation::Bar | Operation::Bucket => FunctionNullBehavior::Strict,
+            Operation::Bar | Operation::Bucket | Operation::Vector(_) => {
+                FunctionNullBehavior::Strict
+            }
             _ => FunctionNullBehavior::CalledOnNull,
         },
         argument_control: ArgumentControl::Eager,

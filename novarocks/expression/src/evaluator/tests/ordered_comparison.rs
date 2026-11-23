@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::evaluator::scalar_invocation::{LeafCallObservation, observe_calls};
 use crate::{
     EvaluationInput,
     testkit::{
@@ -43,7 +44,7 @@ fn result(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>>
 }
 
 #[test]
-fn ordered_eager_right_rand_advances_on_left_null_and_both_instances_keep_independent_batches() {
+fn ordered_eager_right_rand_visits_left_null_and_both_instances_keep_independent_batches() {
     let program = ordered_program(BinaryOperator::Lt, DataType::Float64, Source::Random, false);
     let input = ordered_batch(
         &program,
@@ -54,20 +55,29 @@ fn ordered_eager_right_rand_advances_on_left_null_and_both_instances_keep_indepe
     let rows = [1, 4];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let mut evaluator = ordered_instance(&program);
-    let output = evaluator
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &input,
-                source: None,
-            },
-            ScalarInvocationScope::new(selection, selection),
-            ScalarInvocationActivation::Activated,
-            &Control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
-    // Left instance gets r0 only; right gets r0,r1 even for left's NULL row.
-    assert_eq!(result(&output), vec![None, Some(true)]);
+    let (output, calls) = observe_calls(|| {
+        evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
+    let rows = calls
+        .into_iter()
+        .filter_map(|call| match call {
+            LeafCallObservation::Rows { actual, .. } => Some(actual),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, vec![vec![4], vec![1, 4]]);
+    assert_eq!(result(&output), vec![None, Some(false)]);
     assert!(output.errors().is_empty());
     assert_eq!(evaluator.instances.len(), 2);
     let next = ordered_batch(
@@ -88,8 +98,6 @@ fn ordered_eager_right_rand_advances_on_left_null_and_both_instances_keep_indepe
             &mut PassThroughCallHost,
         )
         .unwrap();
-    // Independent locked seed42 oracle: r1=0x3fe15e014267f5aa,
-    // r2=0x3fe45dec0e3bca26. Skipping right on NULL would compare r1 to r1.
-    assert_eq!(result(&output), vec![Some(true)]);
+    assert_eq!(result(&output), vec![Some(false)]);
     assert!(output.errors().is_empty());
 }

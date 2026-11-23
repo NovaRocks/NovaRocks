@@ -40,14 +40,16 @@ use crate::{
 const FUNCTION: &str = "builtin.scalar/abs/v1";
 const IMPLEMENTATION: &str = "builtin.scalar/abs/selected-v1";
 
-/// These facts describe the eight actual selected signatures. Integer inputs
-/// widen before ABS; valid decimal values fit their declared precision;
-/// LARGEINT intentionally preserves its existing wrapping minimum contract.
-/// Stale bindings and malformed carriers are outer preparation/input failures.
-pub(super) fn effects() -> FunctionEffectDeclaration {
+/// Signed overloads preserve width and can raise on their unrepresentable minimum.
+/// Floating and DECIMAL overloads propagate NULL and preserve their declared type.
+pub(super) fn effects(signature: &str) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        own_row_error: if signature.starts_with("(i") {
+            FunctionIntrinsicRowError::MayRaise
+        } else {
+            FunctionIntrinsicRowError::NoRowError
+        },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
         argument_control: ArgumentControl::Eager,
@@ -80,12 +82,12 @@ impl AbsOwner {
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        let expected = effects();
         if declaration.function_id().as_str() != FUNCTION
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 8
+            || declaration.overloads().len() != 7
             || declaration.overloads().iter().any(|overload| {
-                overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
+                overload.aggregate.is_some()
+                    || overload.effects.as_ref() != Some(&effects(&overload.argument_pattern))
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
@@ -110,9 +112,14 @@ impl AbsOwner {
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
-        CallEffects {
+    fn call_effects(
+        &self,
+        input: CallEffectInput<'_>,
+    ) -> Result<CallEffects, FunctionBindingError> {
+        let base = self
+            .declaration
+            .effect_declaration(&input.selected.overload)?;
+        Ok(CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
             failure_behavior: base.failure_behavior,
@@ -121,8 +128,8 @@ impl AbsOwner {
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
             environment: Box::new([]),
-            proof_scope: scope,
-        }
+            proof_scope: input.proof_scope,
+        })
     }
 }
 
@@ -259,7 +266,7 @@ impl AbsOwner {
             FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
             other => FunctionEffectOwnerError::Owner(other),
         })?;
-        let result = self.call_effects(input.proof_scope);
+        let result = self.call_effects(input)?;
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         Ok(result)
     }
@@ -279,7 +286,10 @@ impl AbsOwner {
             || !std::ptr::eq(contract.selected(), input.selected)
             || novarocks_type_contract::CallEffectContext::from(contract.context()) != input.context
             || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || contract.effects() != &self.call_effects(input.proof_scope)
+            || contract.effects()
+                != &self
+                    .call_effects(input)
+                    .map_err(|_| invalid("ABS effects differ from its checked overload"))?
             || !input.environment.is_empty()
         {
             return Err(invalid(
@@ -339,7 +349,7 @@ pub(super) fn prepared_for_test(source: crate::FunctionValueType) -> Arc<dyn Pre
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int8Array, Int16Array};
+    use arrow_array::{ArrayRef, Int8Array};
     use arrow_schema::DataType;
     use novarocks_type_contract::{
         CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
@@ -424,7 +434,7 @@ mod tests {
         );
         let declaration = definition.binding_declaration().unwrap();
         assert_eq!(declaration, owner.binding_declaration());
-        assert_eq!(owner.implementation_declarations().len(), 8);
+        assert_eq!(owner.implementation_declarations().len(), 7);
         for (overload, implementation) in declaration
             .overloads()
             .iter()
@@ -433,7 +443,10 @@ mod tests {
             assert_eq!(implementation.overload, overload.identity);
             assert_eq!(implementation.abi, PureKernelAbi::ScalarV1);
             assert_eq!(implementation.implementation.as_str(), IMPLEMENTATION);
-            assert_eq!(overload.effects.as_ref(), Some(&effects()));
+            assert_eq!(
+                overload.effects.as_ref(),
+                Some(&effects(&overload.argument_pattern))
+            );
         }
     }
 
@@ -443,11 +456,10 @@ mod tests {
         let parameters = SemanticParameters::try_new([]).unwrap();
         let uses = [Some(ExpressionUseId::new(42))];
         for (source, target) in [
-            (DataType::Int8, DataType::Int16),
-            (DataType::Int16, DataType::Int32),
-            (DataType::Int32, DataType::Int64),
-            (DataType::Int64, DataType::FixedSizeBinary(16)),
-            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
+            (DataType::Int8, DataType::Int8),
+            (DataType::Int16, DataType::Int16),
+            (DataType::Int32, DataType::Int32),
+            (DataType::Int64, DataType::Int64),
             (DataType::Float32, DataType::Float32),
             (DataType::Float64, DataType::Float64),
             (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
@@ -553,7 +565,7 @@ mod tests {
             .resolve(request(&arguments), crate::binding_test_control())
             .unwrap();
         selected.result_type =
-            FunctionResultType::Scalar(FunctionValueType::new(DataType::Int8, false));
+            FunctionResultType::Scalar(FunctionValueType::new(DataType::Int16, false));
         assert!(
             owner
                 .validate_selected(
@@ -580,9 +592,10 @@ mod tests {
         let facts = owner
             .validate_and_refine(input, crate::binding_test_control())
             .unwrap();
-        assert_eq!(facts, owner.call_effects(CallProofScope::Unconditional));
+        assert_eq!(facts, owner.call_effects(input).unwrap());
+        assert_eq!(facts.own_row_error, FunctionIntrinsicRowError::MayRaise);
         let mut foreign = facts;
-        foreign.own_row_error = FunctionIntrinsicRowError::MayRaise;
+        foreign.own_row_error = FunctionIntrinsicRowError::NoRowError;
         assert!(matches!(
             specialize_frozen_scalar(
                 &owner,
@@ -675,7 +688,7 @@ mod tests {
         let prepared = prepared_for_test(FunctionValueType::new(DataType::Int8, false));
         let mut fe = ScalarEvaluationInstance::instantiate(prepared.clone()).unwrap();
         let mut be = ScalarEvaluationInstance::instantiate(prepared).unwrap();
-        let column: ArrayRef = Arc::new(Int8Array::from(vec![i8::MIN, 5, -7]));
+        let column: ArrayRef = Arc::new(Int8Array::from(vec![-8, 5, -7]));
         let evaluated = [EvaluatedArgument::Column(&column)];
         let rows = [0, 2];
         let sparse = fe
@@ -689,17 +702,17 @@ mod tests {
         let values = sparse
             .values()
             .as_any()
-            .downcast_ref::<Int16Array>()
+            .downcast_ref::<Int8Array>()
             .unwrap();
-        assert_eq!(values.values().as_ref(), &[128, 7]);
+        assert_eq!(values.values().as_ref(), &[8, 7]);
         let full = be
             .evaluate(Selection::all(3), &evaluated, &EvaluationControl)
             .unwrap();
-        let values = full.values().as_any().downcast_ref::<Int16Array>().unwrap();
-        assert_eq!(values.values().as_ref(), &[128, 5, 7]);
+        let values = full.values().as_any().downcast_ref::<Int8Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[8, 5, 7]);
         assert_eq!(
             fe.contract().result_type().data_type().clone(),
-            DataType::Int16
+            DataType::Int8
         );
         assert_eq!(fe.retained_bytes().unwrap(), fe.retained_upper_bound());
     }

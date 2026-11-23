@@ -20,7 +20,7 @@ use novarocks_expression::StaticExprKind;
 use novarocks_expression_contract::{BoundFunction, ExprKind, ExpressionCallClaim, RootScope};
 
 use super::*;
-use arrow_array::{ArrayRef, Float64Array, Int64Array};
+use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
 use novarocks_functions::{
     CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder,
@@ -70,7 +70,10 @@ fn rng_subset() -> PureEngineFunctionCatalog {
         .seal_pure(
             [
                 "builtin.scalar/rand/()->f64;strict;legacy",
-                "builtin.scalar/rand/(i64)->f64;strict;legacy",
+                "builtin.scalar/rand/(i8)->i8;strict;coerce",
+                "builtin.scalar/rand/(i16)->i16;strict;coerce",
+                "builtin.scalar/rand/(i32)->i32;strict;coerce",
+                "builtin.scalar/rand/(i64)->i64;strict;coerce",
             ]
             .into_iter()
             .map(|overload| InstalledPureKernel {
@@ -112,31 +115,31 @@ fn options(dop: usize) -> LocalCompileOptions {
 }
 
 #[derive(Clone, Copy)]
-enum SeedMode {
+enum BoundMode {
     Input,
     DirectConstant,
     LiteralWithoutConstant,
 }
 
-fn package(functions: &PureEngineFunctionCatalog, mode: SeedMode) -> Arc<FragmentPackage> {
+fn package(functions: &PureEngineFunctionCatalog, mode: BoundMode) -> Arc<FragmentPackage> {
     package_with_outputs(functions, mode, false, false)
 }
 
 fn package_with_outputs(
     functions: &PureEngineFunctionCatalog,
-    mode: SeedMode,
+    mode: BoundMode,
     downstream_consumer: bool,
     repeated_rand: bool,
 ) -> Arc<FragmentPackage> {
-    let seed_type = FunctionValueType::new(DataType::Int64, matches!(mode, SeedMode::Input));
+    let bound_type = FunctionValueType::new(DataType::Int64, matches!(mode, BoundMode::Input));
     let arguments = [FunctionArgument::Value {
-        value_type: seed_type.clone(),
-        constant: if matches!(mode, SeedMode::DirectConstant) {
+        value_type: bound_type.clone(),
+        constant: if matches!(mode, BoundMode::DirectConstant) {
             Some(
                 ConstantValue::from_i64(
-                    Arc::new(seed_type.try_to_field("fixture").unwrap()),
-                    seed_type.clone(),
-                    42,
+                    Arc::new(bound_type.try_to_field("fixture").unwrap()),
+                    bound_type.clone(),
+                    1,
                     options(1).constants,
                     CompilePhase::FunctionSpecialization,
                     &FixtureControl,
@@ -204,7 +207,7 @@ fn package_with_outputs(
     let second_project = NodeId::new(8);
     let downstream = NodeId::new(13);
     let limit = NodeId::new(1);
-    let seed_value = ValueId::new(100);
+    let bound_value = ValueId::new(100);
     let bool_value = ValueId::new(7);
     let sample_value = ValueId::new(200);
     let extra_value = ValueId::new(0);
@@ -220,11 +223,11 @@ fn package_with_outputs(
             crate::test_constants::i64(&mut constants, &extra_type, 999, options(1).constants),
         )
         .unwrap();
-    let seed_expr = builder
+    let bound_expr = builder
         .fixture_value_root(
             first_project,
-            seed_type.clone(),
-            crate::test_constants::i64(&mut constants, &seed_type, 42, options(1).constants),
+            bound_type.clone(),
+            crate::test_constants::i64(&mut constants, &bound_type, 1, options(1).constants),
         )
         .unwrap();
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
@@ -237,7 +240,7 @@ fn package_with_outputs(
         .unwrap();
     for (id, ty, expr) in [
         (extra_value, extra_type, extra_expr),
-        (seed_value, seed_type.clone(), seed_expr),
+        (bound_value, bound_type.clone(), bound_expr),
         (bool_value, bool_type.clone(), bool_expr),
     ] {
         builder
@@ -251,7 +254,7 @@ fn package_with_outputs(
             })
             .unwrap();
     }
-    // The extra actual output shifts the seed channel to ordinal one. ValueId
+    // The extra actual output shifts the bound channel to ordinal one. ValueId
     // 100 must never become either its ordinal or a local SlotId.
     builder
         .add_project(
@@ -259,10 +262,10 @@ fn package_with_outputs(
             values_node,
             Box::from([
                 (extra_expr, extra_value),
-                (seed_expr, seed_value),
+                (bound_expr, bound_value),
                 (bool_expr, bool_value),
             ]),
-            Box::from([extra_value, seed_value, bool_value]),
+            Box::from([extra_value, bound_value, bool_value]),
         )
         .unwrap();
     let predicate_definition = builder
@@ -282,11 +285,11 @@ fn package_with_outputs(
     let call_argument = builder
         .fixture_definition(
             second_project,
-            seed_type.clone(),
+            bound_type.clone(),
             match mode {
-                SeedMode::Input => ExprKind::Value(seed_value),
-                SeedMode::DirectConstant | SeedMode::LiteralWithoutConstant => {
-                    crate::test_constants::i64(&mut constants, &seed_type, 42, options(1).constants)
+                BoundMode::Input => ExprKind::Value(bound_value),
+                BoundMode::DirectConstant | BoundMode::LiteralWithoutConstant => {
+                    crate::test_constants::i64(&mut constants, &bound_type, 1, options(1).constants)
                 }
             },
         )
@@ -365,15 +368,15 @@ fn package_with_outputs(
     let identity_a = builder
         .fixture_value_root(
             second_project,
-            seed_type.clone(),
-            ExprKind::Value(seed_value),
+            bound_type.clone(),
+            ExprKind::Value(bound_value),
         )
         .unwrap();
     let identity_b = builder
         .fixture_value_root(
             second_project,
-            seed_type.clone(),
-            ExprKind::Value(seed_value),
+            bound_type.clone(),
+            ExprKind::Value(bound_value),
         )
         .unwrap();
     let mut project_expressions = vec![(call, sample_value)];
@@ -385,8 +388,8 @@ fn package_with_outputs(
         project_expressions.push((repeated, sample_value));
         project_output.push(sample_value);
     }
-    project_expressions.extend([(identity_a, seed_value), (identity_b, seed_value)]);
-    project_output.extend([seed_value, seed_value]);
+    project_expressions.extend([(identity_a, bound_value), (identity_b, bound_value)]);
+    project_output.extend([bound_value, bound_value]);
     builder
         .add_project(
             second_project,
@@ -397,14 +400,14 @@ fn package_with_outputs(
         .unwrap();
     let limit_input = if downstream_consumer {
         let downstream_expr = builder
-            .fixture_value_root(downstream, seed_type.clone(), ExprKind::Value(seed_value))
+            .fixture_value_root(downstream, bound_type.clone(), ExprKind::Value(bound_value))
             .unwrap();
         builder
             .add_project(
                 downstream,
                 second_project,
-                Box::from([(downstream_expr, seed_value)]),
-                Box::from([seed_value]),
+                Box::from([(downstream_expr, bound_value)]),
+                Box::from([bound_value]),
             )
             .unwrap();
         downstream
@@ -486,10 +489,10 @@ fn package_with_outputs(
     let mut result_fields = if downstream_consumer {
         vec![ResultField {
             domain: novarocks_physical_plan::ResultValueDomain::Plain,
-            name: "seed_downstream".into(),
+            name: "bound_downstream".into(),
             alias: None,
-            value: seed_value,
-            ty: seed_type.clone(),
+            value: bound_value,
+            ty: bound_type.clone(),
         }]
     } else {
         vec![ResultField {
@@ -513,17 +516,17 @@ fn package_with_outputs(
         result_fields.extend([
             ResultField {
                 domain: novarocks_physical_plan::ResultValueDomain::Plain,
-                name: "seed_a".into(),
+                name: "bound_a".into(),
                 alias: None,
-                value: seed_value,
-                ty: seed_type.clone(),
+                value: bound_value,
+                ty: bound_type.clone(),
             },
             ResultField {
                 domain: novarocks_physical_plan::ResultValueDomain::Plain,
-                name: "seed_b".into(),
+                name: "bound_b".into(),
                 alias: None,
-                value: seed_value,
-                ty: seed_type,
+                value: bound_value,
+                ty: bound_type,
             },
         ]);
     }
@@ -607,7 +610,7 @@ fn input_count(program: &novarocks_local_program::LocalProgram) -> usize {
 #[test]
 fn value_channels_keep_original_source_ordinals_and_each_occurrence_lexical_binding() {
     let functions = rng_subset();
-    let source = package(&functions, SeedMode::Input);
+    let source = package(&functions, BoundMode::Input);
     let program = compile(source.clone(), &functions);
     let graph = program.graph();
     assert_eq!(graph.nodes().len(), 5);
@@ -690,7 +693,7 @@ fn value_channels_keep_original_source_ordinals_and_each_occurrence_lexical_bind
 #[test]
 fn transparent_repeated_value_outputs_preserve_all_three_positions_and_distinct_slots() {
     let functions = rng_subset();
-    let source = package(&functions, SeedMode::Input);
+    let source = package(&functions, BoundMode::Input);
     assert_eq!(
         source.result().unwrap().output.columns.as_ref(),
         &[ValueId::new(200), ValueId::new(100), ValueId::new(100)]
@@ -701,8 +704,8 @@ fn transparent_repeated_value_outputs_preserve_all_three_positions_and_distinct_
     assert_eq!(layout.slots().len(), 3);
     assert_ne!(layout.slots()[1], layout.slots()[2]);
     assert_eq!(layout.schema().field(0).name(), "sample");
-    assert_eq!(layout.schema().field(1).name(), "seed_a");
-    assert_eq!(layout.schema().field(2).name(), "seed_b");
+    assert_eq!(layout.schema().field(1).name(), "bound_a");
+    assert_eq!(layout.schema().field(2).name(), "bound_b");
     assert_eq!(graph.nodes()[4].output_layout().slots(), layout.slots());
     let ProgramNodeKind::Project {
         exprs,
@@ -733,7 +736,7 @@ fn transparent_repeated_value_outputs_preserve_all_three_positions_and_distinct_
 #[test]
 fn downstream_value_uses_first_proven_repeated_child_output_without_collapsing_positions() {
     let functions = rng_subset();
-    let source = package_with_outputs(&functions, SeedMode::Input, true, false);
+    let source = package_with_outputs(&functions, BoundMode::Input, true, false);
     let upstream = &source.fragment().nodes()[&NodeId::new(8)];
     assert_eq!(
         upstream.output.columns.as_ref(),
@@ -853,7 +856,7 @@ fn downstream_value_uses_first_proven_repeated_child_output_without_collapsing_p
 
     // Complete frozen facts for both independently controlled RAND roots do
     // not make their repeated publication a transparent value read.
-    let repeated_rand = package_with_outputs(&functions, SeedMode::Input, false, true);
+    let repeated_rand = package_with_outputs(&functions, BoundMode::Input, false, true);
     assert_eq!(
         repeated_rand.fragment().nodes()[&NodeId::new(8)]
             .expressions
@@ -925,7 +928,7 @@ impl PureCompileControl for CallbackControl {
 #[test]
 fn every_actual_value_channel_callback_and_ordinary_tail_preserves_primary_control_prefix() {
     let functions = rng_subset();
-    let source = package_with_outputs(&functions, SeedMode::Input, true, false);
+    let source = package_with_outputs(&functions, BoundMode::Input, true, false);
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();
@@ -959,7 +962,7 @@ fn every_actual_value_channel_callback_and_ordinary_tail_preserves_primary_contr
 
     // Exercise the ordinary channel refusal separately: its actual final
     // observation must still expose control, without retrying a primary cause.
-    let source = package_with_outputs(&functions, SeedMode::Input, false, true);
+    let source = package_with_outputs(&functions, BoundMode::Input, false, true);
     let validate =
         || validate_fragment_providers(source.clone(), &providers, &FixtureControl).unwrap();
     let recorder = CallbackControl::new(CompileControlError::Cancelled, usize::MAX);
@@ -1014,76 +1017,58 @@ fn instance(program: &novarocks_local_program::LocalProgram) -> ScalarEvaluation
     assert!(std::ptr::eq(kernel.contract().call(), call.call_contract()));
     ScalarEvaluationInstance::instantiate(kernel.clone()).unwrap()
 }
-fn bits(output: SelectedValues<'_>) -> Vec<u64> {
-    assert!(output.errors().is_empty());
+fn selected_integers(output: &SelectedValues<'_>) -> Vec<Option<i64>> {
     output
         .values()
         .as_any()
-        .downcast_ref::<Float64Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap()
-        .values()
         .iter()
-        .map(|value| value.to_bits())
         .collect()
 }
 
 #[test]
-fn compiled_value_seed_rand_uses_actual_sparse_rows_and_is_invariant_across_batches() {
+fn compiled_bounded_rand_preserves_selected_rows_nulls_and_row_errors() {
     let functions = rng_subset();
-    let program = compile(package(&functions, SeedMode::Input), &functions);
+    let program = compile(package(&functions, BoundMode::Input), &functions);
     let mut instance = instance(&program);
-    let seed: ArrayRef = Arc::new(Int64Array::from(vec![Some(42), Some(7), Some(42), None]));
-    let args = [EvaluatedArgument::Column(&seed)];
-    // Independent PCG32 seed expansion + ChaCha12 reference, matching locked
-    // rand 0.8.5 seed 0/42 published oracle bits; seed 7 is independently derived.
-    const S42: u64 = 0x3fe0d98eec6444e4;
-    const S7: u64 = 0x3f9f0b83a5aaa3e0;
-    const S0: u64 = 0x3fe76547f659a58d;
-    assert_eq!(
-        bits(
-            instance
-                .evaluate(Selection::all(4), &args, &EvaluationControl)
-                .unwrap()
-        ),
-        vec![S42, S7, S42, S0]
-    );
-    let rows = [1, 2, 3];
-    let sparse = Selection::try_sparse(4, &rows).unwrap();
-    assert_eq!(
-        bits(
-            instance
-                .evaluate(sparse, &args, &EvaluationControl)
-                .unwrap()
-        ),
-        vec![S7, S42, S0]
-    );
-    let a: ArrayRef = Arc::new(Int64Array::from(vec![Some(42), Some(7)]));
-    let b: ArrayRef = Arc::new(Int64Array::from(vec![Some(42), None]));
-    let first = bits(
-        instance
-            .evaluate(
-                Selection::all(2),
-                &[EvaluatedArgument::Column(&a)],
-                &EvaluationControl,
-            )
-            .unwrap(),
-    );
-    let second = bits(
-        instance
-            .evaluate(
-                Selection::all(2),
-                &[EvaluatedArgument::Column(&b)],
-                &EvaluationControl,
-            )
-            .unwrap(),
-    );
-    assert_eq!([first, second].concat(), vec![S42, S7, S42, S0]);
+    let bounds: ArrayRef = Arc::new(Int64Array::from(vec![Some(-1), Some(1), None, Some(2)]));
+    let arguments = [EvaluatedArgument::Column(&bounds)];
+
+    let sparse = instance
+        .evaluate(
+            Selection::try_sparse(4, &[1, 2, 3]).unwrap(),
+            &arguments,
+            &EvaluationControl,
+        )
+        .unwrap();
+    assert!(sparse.errors().is_empty());
+    let values = selected_integers(&sparse);
+    assert_eq!(values[..2], [Some(0), None]);
+    assert!((0..2).contains(&values[2].unwrap()));
+
+    let all = instance
+        .evaluate(Selection::all(4), &arguments, &EvaluationControl)
+        .unwrap();
+    assert_eq!(all.errors().len(), 1);
+    assert_eq!(all.errors()[0].selected_ordinal(), 0);
+    let values = selected_integers(&all);
+    assert_eq!(values[..3], [None, Some(0), None]);
+    assert!((0..2).contains(&values[3].unwrap()));
+
+    let bounds: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(1)]));
+    let arguments = [EvaluatedArgument::Column(&bounds)];
+    let next = instance
+        .evaluate(Selection::all(2), &arguments, &EvaluationControl)
+        .unwrap();
+    assert!(next.errors().is_empty());
+    assert_eq!(selected_integers(&next), [None, Some(0)]);
 }
 
 #[test]
-fn original_nonconstant_seed_is_not_promoted_by_its_physical_literal() {
+fn original_nonconstant_bound_is_not_promoted_by_its_physical_literal() {
     let functions = rng_subset();
-    let source = package(&functions, SeedMode::LiteralWithoutConstant);
+    let source = package(&functions, BoundMode::LiteralWithoutConstant);
     let unit = source.fragment().nodes()[&NodeId::new(8)]
         .expressions
         .as_ref()
@@ -1100,7 +1085,7 @@ fn original_nonconstant_seed_is_not_promoted_by_its_physical_literal() {
     };
     let child = unit.definition(args[0]).unwrap();
     let ExprKind::Constant(reference) = child.kind else {
-        panic!("actual checked seed")
+        panic!("actual checked bound")
     };
     assert_eq!(
         source
@@ -1113,68 +1098,46 @@ fn original_nonconstant_seed_is_not_promoted_by_its_physical_literal() {
             .unwrap()
             .try_i64()
             .unwrap(),
-        Some(42)
+        Some(1)
     );
     let program = compile(source, &functions);
     let mut instance = instance(&program);
-    let seed: ArrayRef = Arc::new(Int64Array::from(vec![42]));
-    let arguments = [EvaluatedArgument::Scalar(&seed)];
-    // Original None selects the original per-row recipe: equal row seeds each
-    // produce the first draw, rather than a constant recipe's advancing state.
+    let bound: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let arguments = [EvaluatedArgument::Scalar(&bound)];
     for _ in 0..2 {
-        assert_eq!(
-            bits(
-                instance
-                    .evaluate(Selection::all(2), &arguments, &EvaluationControl)
-                    .unwrap()
-            ),
-            vec![0x3fe0d98eec6444e4, 0x3fe0d98eec6444e4]
-        );
+        let output = instance
+            .evaluate(Selection::all(2), &arguments, &EvaluationControl)
+            .unwrap();
+        assert!(output.errors().is_empty());
+        assert_eq!(selected_integers(&output), [Some(0), Some(0)]);
     }
 }
 
 #[test]
-fn compiled_direct_constant_seed_retains_exact_value_and_continuous_independent_state() {
+fn compiled_direct_constant_bound_retains_exact_value_across_instances_and_batches() {
     let functions = rng_subset();
-    let program = compile(package(&functions, SeedMode::DirectConstant), &functions);
+    let program = compile(package(&functions, BoundMode::DirectConstant), &functions);
     let mut a = instance(&program);
     let mut b = instance(&program);
-    let seed: ArrayRef = Arc::new(Int64Array::from(vec![42]));
-    let arguments = [EvaluatedArgument::Scalar(&seed)];
-    assert_eq!(
-        bits(
-            a.evaluate(Selection::all(2), &arguments, &EvaluationControl)
-                .unwrap()
-        ),
-        vec![0x3fe0d98eec6444e4, 0x3fe15e014267f5aa]
-    );
-    assert_eq!(
-        bits(
-            b.evaluate(Selection::all(1), &arguments, &EvaluationControl)
-                .unwrap()
-        ),
-        vec![0x3fe0d98eec6444e4]
-    );
-    assert_eq!(
-        bits(
-            a.evaluate(Selection::all(1), &arguments, &EvaluationControl)
-                .unwrap()
-        ),
-        vec![0x3fe45dec0e3bca26]
-    );
-    assert_eq!(
-        bits(
-            b.evaluate(Selection::all(1), &arguments, &EvaluationControl)
-                .unwrap()
-        ),
-        vec![0x3fe15e014267f5aa]
-    );
+    let bound: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let arguments = [EvaluatedArgument::Scalar(&bound)];
+    let evaluate = |instance: &mut ScalarEvaluationInstance, rows| {
+        let output = instance
+            .evaluate(Selection::all(rows), &arguments, &EvaluationControl)
+            .unwrap();
+        assert!(output.errors().is_empty());
+        assert_eq!(selected_integers(&output), vec![Some(0); rows]);
+    };
+    evaluate(&mut a, 2);
+    evaluate(&mut b, 1);
+    evaluate(&mut a, 1);
+    evaluate(&mut b, 2);
 }
 
 #[test]
-fn compiled_seeded_kernel_empty_selection_keeps_zero_rows_without_fallback() {
+fn compiled_bounded_rand_kernel_empty_selection_keeps_zero_rows_without_fallback() {
     let functions = rng_subset();
-    let program = compile(package(&functions, SeedMode::Input), &functions);
+    let program = compile(package(&functions, BoundMode::Input), &functions);
     let mut instance = instance(&program);
     let empty: ArrayRef = Arc::new(Int64Array::from(Vec::<Option<i64>>::new()));
     let arguments = [EvaluatedArgument::Column(&empty)];

@@ -635,7 +635,7 @@ pub(super) fn checked_into_parts(
 }
 
 #[test]
-fn actual_builtin_abs_installs_eight_cpu_records_without_sealing_unmigrated_catalogue() {
+fn actual_builtin_abs_installs_exact_cpu_records_without_sealing_unmigrated_catalogue() {
     let mut builder = EngineFunctionCatalogBuilder::new();
     crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
     let definition = builder.definition("abs", FunctionKind::Scalar).unwrap();
@@ -645,8 +645,8 @@ fn actual_builtin_abs_installs_eight_cpu_records_without_sealing_unmigrated_cata
         binding.declaration.function_id().as_str(),
         "builtin.scalar/abs/v1"
     );
-    assert_eq!(binding.declaration.overloads().len(), 8);
-    assert_eq!(attachment.implementations.len(), 8);
+    assert_eq!(binding.declaration.overloads().len(), 7);
+    assert_eq!(attachment.implementations.len(), 7);
     for (overload, installed) in binding
         .declaration
         .overloads()
@@ -661,7 +661,14 @@ fn actual_builtin_abs_installs_eight_cpu_records_without_sealing_unmigrated_cata
         assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
         let effects = overload.effects.as_ref().unwrap();
         assert_eq!(effects.instance_state, FunctionInstanceState::None);
-        assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
+        assert_eq!(
+            effects.own_row_error,
+            if overload.argument_pattern.starts_with("(i") {
+                FunctionIntrinsicRowError::MayRaise
+            } else {
+                FunctionIntrinsicRowError::NoRowError
+            },
+        );
         assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
     }
     // A real migrated family is not coverage of the remaining whole catalogue.
@@ -685,8 +692,8 @@ fn actual_builtin_rand_and_random_install_each_exact_cpu_record_and_observable_d
             binding.declaration.function_id().as_str(),
             format!("builtin.scalar/{name}/v1")
         );
-        assert_eq!(binding.declaration.overloads().len(), 2);
-        assert_eq!(attachment.implementations.len(), 2);
+        assert_eq!(binding.declaration.overloads().len(), 5);
+        assert_eq!(attachment.implementations.len(), 5);
         for (overload, installed) in binding
             .declaration
             .overloads()
@@ -705,8 +712,15 @@ fn actual_builtin_rand_and_random_install_each_exact_cpu_record_and_observable_d
                 effects.instance_state,
                 FunctionInstanceState::ScalarInstance
             );
-            assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
-            assert_eq!(effects.null_behavior, FunctionNullBehavior::CalledOnNull);
+            assert_eq!(
+                effects.own_row_error,
+                if overload.argument_pattern.starts_with("()") {
+                    FunctionIntrinsicRowError::NoRowError
+                } else {
+                    FunctionIntrinsicRowError::MayRaise
+                },
+            );
+            assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
             assert_eq!(effects.argument_control, ArgumentControl::Eager);
             assert!(effects.observable_effects.rng_sampling);
             assert!(effects.environment_dependencies.is_empty());
@@ -720,13 +734,12 @@ fn actual_builtin_rand_and_random_install_each_exact_cpu_record_and_observable_d
 }
 
 #[test]
-fn actual_builtin_numeric_unary_installs_all_168_exact_cpu_records() {
+fn actual_builtin_numeric_unary_installs_trino_cpu_profiles() {
     let mut builder = EngineFunctionCatalogBuilder::new();
     crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
     let names = [
-        "acos", "asin", "atan", "cbrt", "ceil", "ceiling", "dceil", "cos", "degress", "dlog1",
-        "exp", "dexp", "floor", "dfloor", "ln", "log10", "dlog10", "log2", "radians", "sin",
-        "sqrt", "dsqrt", "tan", "positive",
+        "acos", "asin", "atan", "cbrt", "ceil", "ceiling", "cos", "degrees", "exp", "floor", "ln",
+        "log10", "log2", "radians", "sign", "sin", "sqrt", "tan",
     ];
     let mut installed_count = 0;
     for name in names {
@@ -736,6 +749,118 @@ fn actual_builtin_numeric_unary_installs_all_168_exact_cpu_records() {
             .pure
             .as_ref()
             .expect("actual numeric unary CPU owner");
+        assert_eq!(
+            binding.declaration.function_id().as_str(),
+            format!("builtin.scalar/{name}/v1")
+        );
+        let expected = if matches!(name, "ceil" | "ceiling" | "floor" | "sign") {
+            7
+        } else {
+            1
+        };
+        assert_eq!(binding.declaration.overloads().len(), expected);
+        assert_eq!(attachment.implementations.len(), expected);
+        for (overload, installed) in binding
+            .declaration
+            .overloads()
+            .iter()
+            .zip(attachment.implementations.iter())
+        {
+            assert_eq!(installed.overload, overload.identity);
+            assert_eq!(
+                installed.implementation.as_str(),
+                format!("builtin.scalar/{name}/selected-v1")
+            );
+            assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
+            let effects = overload.effects.as_ref().unwrap();
+            assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
+            assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
+            assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
+            assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
+            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.instance_state, FunctionInstanceState::None);
+            assert_eq!(effects.observable_effects, ObservableEffects::NONE);
+            assert!(effects.environment_dependencies.is_empty());
+        }
+        installed_count += attachment.implementations.len();
+    }
+    assert_eq!(installed_count, 42);
+    for name in ["sinh", "cosh", "tanh"] {
+        let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
+        let binding = definition.binding.as_ref().unwrap();
+        assert_eq!(binding.declaration.overloads().len(), 1);
+        assert!(binding.pure.is_none());
+    }
+    assert!(matches!(
+        builder.seal_pure(std::iter::empty()),
+        Err(PureCatalogError::MissingOwner(_)
+            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
+    ));
+}
+
+#[test]
+fn actual_builtin_numeric_binary_installs_double_cpu_profiles() {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
+    let mut installed_count = 0;
+    for name in ["atan2", "pow", "power"] {
+        let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
+        let binding = definition.binding.as_ref().unwrap();
+        let attachment = binding
+            .pure
+            .as_ref()
+            .expect("actual binary numeric CPU owner");
+        assert_eq!(
+            binding.declaration.function_id().as_str(),
+            format!("builtin.scalar/{name}/v1")
+        );
+        assert_eq!(binding.declaration.overloads().len(), 1);
+        assert_eq!(attachment.implementations.len(), 1);
+        for (overload, installed) in binding
+            .declaration
+            .overloads()
+            .iter()
+            .zip(attachment.implementations.iter())
+        {
+            assert_eq!(installed.overload, overload.identity);
+            assert_eq!(
+                installed.implementation.as_str(),
+                format!("builtin.scalar/{name}/selected-v1")
+            );
+            assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
+            let effects = overload.effects.as_ref().unwrap();
+            assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
+            assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
+            assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
+            assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
+            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.instance_state, FunctionInstanceState::None);
+            assert_eq!(effects.observable_effects, ObservableEffects::NONE);
+            assert!(effects.environment_dependencies.is_empty());
+        }
+        installed_count += attachment.implementations.len();
+    }
+    assert_eq!(installed_count, 3);
+    // Installing a complete module must not authorize a partial whole seal.
+    assert!(matches!(
+        builder.seal_pure(std::iter::empty()),
+        Err(PureCatalogError::MissingOwner(_)
+            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
+    ));
+}
+
+#[test]
+fn actual_builtin_mod_installs_trino_numeric_cpu_records() {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
+    let mut installed_count = 0;
+    for name in ["mod"] {
+        let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
+        let binding = definition.binding.as_ref().unwrap();
+        let attachment = binding
+            .pure
+            .as_ref()
+            .expect("actual integer remainder CPU owner");
         assert_eq!(
             binding.declaration.function_id().as_str(),
             format!("builtin.scalar/{name}/v1")
@@ -756,61 +881,17 @@ fn actual_builtin_numeric_unary_installs_all_168_exact_cpu_records() {
             assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
             let effects = overload.effects.as_ref().unwrap();
             assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
-            assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
-            assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
-            assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
-            assert_eq!(effects.instance_state, FunctionInstanceState::None);
-            assert_eq!(effects.observable_effects, ObservableEffects::NONE);
-            assert!(effects.environment_dependencies.is_empty());
-        }
-        installed_count += attachment.implementations.len();
-    }
-    assert_eq!(installed_count, 168);
-    // Declared but unavailable names must not become new product support.
-    for name in ["degrees", "sinh", "cosh", "tanh"] {
-        assert!(builder.definition(name, FunctionKind::Scalar).is_none());
-    }
-    assert!(matches!(
-        builder.seal_pure(std::iter::empty()),
-        Err(PureCatalogError::MissingOwner(_)
-            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
-    ));
-}
-
-#[test]
-fn actual_builtin_numeric_binary_installs_all_216_exact_cpu_records() {
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
-    let mut installed_count = 0;
-    for name in ["atan2", "fmod", "pow", "fpow", "dpow", "power"] {
-        let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
-        let binding = definition.binding.as_ref().unwrap();
-        let attachment = binding
-            .pure
-            .as_ref()
-            .expect("actual binary numeric CPU owner");
-        assert_eq!(
-            binding.declaration.function_id().as_str(),
-            format!("builtin.scalar/{name}/v1")
-        );
-        assert_eq!(binding.declaration.overloads().len(), 36);
-        assert_eq!(attachment.implementations.len(), 36);
-        for (overload, installed) in binding
-            .declaration
-            .overloads()
-            .iter()
-            .zip(attachment.implementations.iter())
-        {
-            assert_eq!(installed.overload, overload.identity);
             assert_eq!(
-                installed.implementation.as_str(),
-                format!("builtin.scalar/{name}/selected-v1")
+                effects.own_row_error,
+                if matches!(
+                    overload.argument_pattern.as_ref(),
+                    "(real,real)" | "(double,double)"
+                ) {
+                    FunctionIntrinsicRowError::NoRowError
+                } else {
+                    FunctionIntrinsicRowError::MayRaise
+                },
             );
-            assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
-            let effects = overload.effects.as_ref().unwrap();
-            assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
-            assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
             assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
             assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
             assert_eq!(effects.argument_control, ArgumentControl::Eager);
@@ -820,8 +901,7 @@ fn actual_builtin_numeric_binary_installs_all_216_exact_cpu_records() {
         }
         installed_count += attachment.implementations.len();
     }
-    assert_eq!(installed_count, 216);
-    // Installing a complete module must not authorize a partial whole seal.
+    assert_eq!(installed_count, 7);
     assert!(matches!(
         builder.seal_pure(std::iter::empty()),
         Err(PureCatalogError::MissingOwner(_)
@@ -830,61 +910,11 @@ fn actual_builtin_numeric_binary_installs_all_216_exact_cpu_records() {
 }
 
 #[test]
-fn actual_builtin_mod_installs_all_36_exact_cpu_records() {
+fn actual_builtin_log_sign_e_pi_install_exact_cpu_records() {
     let mut builder = EngineFunctionCatalogBuilder::new();
     crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
     let mut installed_count = 0;
-    for name in ["mod"] {
-        let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
-        let binding = definition.binding.as_ref().unwrap();
-        let attachment = binding
-            .pure
-            .as_ref()
-            .expect("actual integer remainder CPU owner");
-        assert_eq!(
-            binding.declaration.function_id().as_str(),
-            format!("builtin.scalar/{name}/v1")
-        );
-        assert_eq!(binding.declaration.overloads().len(), 36);
-        assert_eq!(attachment.implementations.len(), 36);
-        for (overload, installed) in binding
-            .declaration
-            .overloads()
-            .iter()
-            .zip(attachment.implementations.iter())
-        {
-            assert_eq!(installed.overload, overload.identity);
-            assert_eq!(
-                installed.implementation.as_str(),
-                format!("builtin.scalar/{name}/selected-v1")
-            );
-            assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
-            let effects = overload.effects.as_ref().unwrap();
-            assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
-            assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
-            assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
-            assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
-            assert_eq!(effects.instance_state, FunctionInstanceState::None);
-            assert_eq!(effects.observable_effects, ObservableEffects::NONE);
-            assert!(effects.environment_dependencies.is_empty());
-        }
-        installed_count += attachment.implementations.len();
-    }
-    assert_eq!(installed_count, 36);
-    assert!(matches!(
-        builder.seal_pure(std::iter::empty()),
-        Err(PureCatalogError::MissingOwner(_)
-            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
-    ));
-}
-
-#[test]
-fn actual_builtin_log_sign_e_pi_install_all_52_exact_cpu_records() {
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
-    let mut installed_count = 0;
-    for (name, count) in [("log", 43), ("sign", 7), ("e", 1), ("pi", 1)] {
+    for (name, count) in [("log", 1), ("sign", 7), ("e", 1), ("pi", 1)] {
         let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
         let binding = definition.binding.as_ref().unwrap();
         let attachment = binding
@@ -921,7 +951,7 @@ fn actual_builtin_log_sign_e_pi_install_all_52_exact_cpu_records() {
         }
         installed_count += attachment.implementations.len();
     }
-    assert_eq!(installed_count, 52);
+    assert_eq!(installed_count, 10);
     assert!(matches!(
         builder.seal_pure(std::iter::empty()),
         Err(PureCatalogError::MissingOwner(_)
@@ -930,45 +960,10 @@ fn actual_builtin_log_sign_e_pi_install_all_52_exact_cpu_records() {
 }
 
 #[test]
-fn actual_builtin_dround_installs_all_eight_exact_cpu_records() {
+fn retired_dround_does_not_install_a_public_binding() {
     let mut builder = EngineFunctionCatalogBuilder::new();
     crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
-    let definition = builder.definition("dround", FunctionKind::Scalar).unwrap();
-    let binding = definition.binding.as_ref().unwrap();
-    let attachment = binding.pure.as_ref().expect("actual DROUND CPU owner");
-    assert_eq!(
-        binding.declaration.function_id().as_str(),
-        "builtin.scalar/dround/v1"
-    );
-    assert_eq!(binding.declaration.overloads().len(), 8);
-    assert_eq!(attachment.implementations.len(), 8);
-    for (overload, installed) in binding
-        .declaration
-        .overloads()
-        .iter()
-        .zip(attachment.implementations.iter())
-    {
-        assert_eq!(installed.overload, overload.identity);
-        assert_eq!(
-            installed.implementation.as_str(),
-            "builtin.scalar/dround/selected-v1"
-        );
-        assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
-        let effects = overload.effects.as_ref().unwrap();
-        assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
-        assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
-        assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
-        assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-        assert_eq!(effects.argument_control, ArgumentControl::Eager);
-        assert_eq!(effects.instance_state, FunctionInstanceState::None);
-        assert_eq!(effects.observable_effects, ObservableEffects::NONE);
-        assert!(effects.environment_dependencies.is_empty());
-    }
-    assert!(matches!(
-        builder.seal_pure(std::iter::empty()),
-        Err(PureCatalogError::MissingOwner(_)
-            | PureCatalogError::Binding(FunctionBindingError::MissingEffectDeclaration(_)))
-    ));
+    assert!(builder.definition("dround", FunctionKind::Scalar).is_none());
 }
 
 #[test]
@@ -995,7 +990,7 @@ fn actual_builtin_truncate_installs_its_exact_dynamic_cpu_record_and_complete_ef
     assert_eq!(installed.overload, declared.identity);
     assert_eq!(
         installed.implementation.as_str(),
-        "builtin.scalar/truncate/selected-v1"
+        "builtin.scalar/truncate/selected-v2"
     );
     assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
     let effects = declared.effects.as_ref().unwrap();
@@ -1038,7 +1033,7 @@ fn actual_builtin_round_installs_its_exact_dynamic_cpu_record_and_complete_effec
     assert_eq!(installed.overload, declared.identity);
     assert_eq!(
         installed.implementation.as_str(),
-        "builtin.scalar/round/selected-v1"
+        "builtin.scalar/round/selected-v2"
     );
     assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
     let effects = declared.effects.as_ref().unwrap();

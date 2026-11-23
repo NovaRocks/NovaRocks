@@ -925,23 +925,12 @@ fn runtime_scalar_memory_real_account_policy_refusal_never_runs_body() {
 }
 
 fn actual_shift(name: &str, source: arrow::datatypes::DataType) -> ScalarEvaluationInstance {
-    actual_typed_shift(
-        name,
-        novarocks_type_contract::FunctionValueType::new(source, true),
-    )
-}
-fn actual_typed_shift(
-    name: &str,
-    source: novarocks_type_contract::FunctionValueType,
-) -> ScalarEvaluationInstance {
+    use novarocks_type_contract::FunctionValueType;
     actual_scalar(
         name,
         &[
-            source,
-            novarocks_type_contract::FunctionValueType::new(
-                arrow::datatypes::DataType::Int64,
-                true,
-            ),
+            FunctionValueType::new(source, true),
+            FunctionValueType::new(arrow::datatypes::DataType::Int32, true),
         ],
     )
 }
@@ -1021,13 +1010,13 @@ fn actual_prepared(
 #[test]
 fn runtime_scalar_memory_actual_three_sources_use_same_wrapper_arguments_and_empty_path() {
     use arrow::{
-        array::{Array, ArrayRef, Int64Array},
+        array::{Array, ArrayRef, Int32Array, Int64Array},
         datatypes::DataType,
     };
     for name in [
-        "bit_shift_left",
-        "bit_shift_right",
-        "bit_shift_right_logical",
+        "bitwise_left_shift",
+        "bitwise_right_shift_arithmetic",
+        "bitwise_right_shift",
     ] {
         for rows in [0, 3] {
             let binding = bound();
@@ -1035,7 +1024,7 @@ fn runtime_scalar_memory_actual_three_sources_use_same_wrapper_arguments_and_emp
             let mut instance = actual_shift(name, DataType::Int64);
             let values: ArrayRef =
                 Arc::new(Int64Array::from(vec![Some(7), None, Some(-1)]).slice(0, rows));
-            let counts: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 1]).slice(0, rows));
+            let counts: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 1]).slice(0, rows));
             let arguments = [
                 EvaluatedArgument::Column(&values),
                 EvaluatedArgument::Column(&counts),
@@ -1078,9 +1067,9 @@ fn runtime_scalar_memory_positive_source_errors_never_become_uncovered_or_latch_
     };
     let binding = bound();
     let control = control(Some(&binding), Arc::default());
-    let mut instance = actual_shift("bit_shift_left", DataType::Int64);
+    let mut instance = actual_shift("bitwise_left_shift", DataType::Int64);
     let values: ArrayRef = Arc::new(Int32Array::from(vec![7]));
-    let counts: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let counts: ArrayRef = Arc::new(Int32Array::from(vec![1]));
     let wrong = [
         EvaluatedArgument::Column(&values),
         EvaluatedArgument::Column(&counts),
@@ -1189,290 +1178,259 @@ fn narrow_rows(values: &arrow::array::ArrayRef) -> Vec<Option<i64>> {
     }
 }
 
-fn bitwise_array(
-    ty: &arrow::datatypes::DataType,
-    values: Vec<Option<i64>>,
-) -> arrow::array::ArrayRef {
-    if ty == &arrow::datatypes::DataType::Int64 {
-        Arc::new(arrow::array::Int64Array::from(values))
-    } else {
-        narrow_array(ty, values)
-    }
-}
-fn bitwise_rows(values: &arrow::array::ArrayRef) -> Vec<Option<i64>> {
-    if values.data_type() == &arrow::datatypes::DataType::Int64 {
-        values
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap()
-            .iter()
-            .collect()
-    } else {
-        narrow_rows(values)
-    }
-}
-
 #[test]
-fn runtime_scalar_memory_actual_bitwise_16_sources_keep_exact_arity_mapping_and_nulls() {
-    use arrow::datatypes::DataType;
+fn runtime_scalar_memory_actual_bitwise_bigint_sources_keep_exact_arity_mapping_and_nulls() {
+    use arrow::{
+        array::{ArrayRef, Int64Array},
+        datatypes::DataType,
+    };
     use novarocks_type_contract::FunctionValueType;
-    for ty in [
-        DataType::Int8,
-        DataType::Int16,
-        DataType::Int32,
-        DataType::Int64,
+    let ty = DataType::Int64;
+    for (name, arity) in [
+        ("bitwise_and", 2),
+        ("bitwise_or", 2),
+        ("bitwise_xor", 2),
+        ("bitwise_not", 1),
     ] {
-        for (name, arity) in [("bitand", 2), ("bitor", 2), ("bitxor", 2), ("bitnot", 1)] {
-            let types = vec![FunctionValueType::new(ty.clone(), true); arity];
-            for (rows, sparse, scalar, compact) in [
-                (0, false, false, false),
-                (3, false, false, false),
-                (3, true, false, false),
-                (3, false, true, false),
-                (3, true, false, true),
-            ] {
-                let binding = bound();
-                let control = control(Some(&binding), Arc::default());
-                let mut instance = actual_scalar(name, &types);
-                assert_eq!(instance.contract().value_argument_types().len(), arity);
-                let selection = if sparse {
-                    Selection::try_sparse(3, &[0, 2]).unwrap()
-                } else {
-                    Selection::all(rows)
-                };
-                let values = bitwise_array(
-                    &ty,
-                    if scalar {
-                        vec![Some(7)]
-                    } else {
-                        vec![Some(7), None, Some(-1)]
-                            .into_iter()
-                            .take(rows)
-                            .collect()
-                    },
-                );
-                let right = bitwise_array(
-                    &ty,
-                    vec![Some(3), Some(2), None]
-                        .into_iter()
-                        .take(rows)
-                        .collect(),
-                );
-                let compact_left = compact.then(|| {
-                    SelectedValues::try_new(
-                        selection,
-                        &ty,
-                        bitwise_array(&ty, vec![Some(7), Some(-1)]),
-                        Box::default(),
-                    )
-                    .unwrap()
-                });
-                let compact_right = compact.then(|| {
-                    SelectedValues::try_new(
-                        selection,
-                        &ty,
-                        bitwise_array(&ty, vec![Some(3), None]),
-                        Box::default(),
-                    )
-                    .unwrap()
-                });
-                let left_argument = if compact {
-                    EvaluatedArgument::SelectedColumn(compact_left.as_ref().unwrap())
-                } else if scalar {
-                    EvaluatedArgument::Scalar(&values)
-                } else {
-                    EvaluatedArgument::Column(&values)
-                };
-                let right_argument = if compact {
-                    EvaluatedArgument::SelectedColumn(compact_right.as_ref().unwrap())
-                } else {
-                    EvaluatedArgument::Column(&right)
-                };
-                let args = [left_argument, right_argument];
-                let arguments = &args[..arity];
-                let facts = instance
-                    .invocation_resource_profile()
-                    .unwrap()
-                    .requests_for(selection, arguments)
-                    .unwrap();
-                assert_eq!(
-                    facts.requests(),
-                    if rows == 0 {
-                        6
-                    } else if ty == DataType::Int64 {
-                        7
-                    } else {
-                        12
-                    }
-                );
-                let mut journal = RuntimeScalarMemoryJournal::default();
-                let selected = call_scalar(
-                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
-                    &mut instance,
+        let types = vec![FunctionValueType::new(DataType::Int64, true); arity];
+        for (rows, sparse, scalar, compact) in [
+            (0, false, false, false),
+            (3, false, false, false),
+            (3, true, false, false),
+            (3, false, true, false),
+            (3, true, false, true),
+        ] {
+            let binding = bound();
+            let control = control(Some(&binding), Arc::default());
+            let mut instance = actual_scalar(name, &types);
+            assert_eq!(instance.contract().value_argument_types().len(), arity);
+            let selection = if sparse {
+                Selection::try_sparse(3, &[0, 2]).unwrap()
+            } else {
+                Selection::all(rows)
+            };
+            let values: ArrayRef = Arc::new(Int64Array::from(if scalar {
+                vec![Some(7)]
+            } else {
+                vec![Some(7), None, Some(-1)]
+                    .into_iter()
+                    .take(rows)
+                    .collect::<Vec<_>>()
+            }));
+            let right: ArrayRef = Arc::new(Int64Array::from(
+                vec![Some(3), Some(2), None]
+                    .into_iter()
+                    .take(rows)
+                    .collect::<Vec<_>>(),
+            ));
+            let compact_left = compact.then(|| {
+                SelectedValues::try_new(
                     selection,
-                    arguments,
-                    &control,
+                    &ty,
+                    Arc::new(Int64Array::from(vec![Some(7), Some(-1)])),
+                    Box::default(),
                 )
+                .unwrap()
+            });
+            let compact_right = compact.then(|| {
+                SelectedValues::try_new(
+                    selection,
+                    &ty,
+                    Arc::new(Int64Array::from(vec![Some(3), None])),
+                    Box::default(),
+                )
+                .unwrap()
+            });
+            let left_argument = if compact {
+                EvaluatedArgument::SelectedColumn(compact_left.as_ref().unwrap())
+            } else if scalar {
+                EvaluatedArgument::Scalar(&values)
+            } else {
+                EvaluatedArgument::Column(&values)
+            };
+            let right_argument = if compact {
+                EvaluatedArgument::SelectedColumn(compact_right.as_ref().unwrap())
+            } else {
+                EvaluatedArgument::Column(&right)
+            };
+            let args = [left_argument, right_argument];
+            let arguments = &args[..arity];
+            let facts = instance
+                .invocation_resource_profile()
+                .unwrap()
+                .requests_for(selection, arguments)
                 .unwrap();
-                let expected = match (name, scalar) {
-                    ("bitand", false) => vec![Some(3), None, None],
-                    ("bitor", false) => vec![Some(7), None, None],
-                    ("bitxor", false) => vec![Some(4), None, None],
-                    ("bitnot", false) => vec![Some(-8), None, Some(0)],
-                    ("bitand", true) => vec![Some(3), Some(2), None],
-                    ("bitor", true) => vec![Some(7), Some(7), None],
-                    ("bitxor", true) => vec![Some(4), Some(5), None],
-                    ("bitnot", true) => vec![Some(-8); 3],
-                    _ => unreachable!(),
-                };
-                let expected = if sparse {
-                    vec![expected[0], expected[2]]
-                } else {
-                    expected.into_iter().take(rows).collect()
-                };
-                assert_eq!(selected.values().data_type(), &ty);
-                assert_eq!(bitwise_rows(selected.values()), expected);
-                assert!(
-                    selected
-                        .selection()
-                        .same_rows_observed(selection, || {
-                            Ok::<(), std::convert::Infallible>(())
-                        })
-                        .unwrap()
-                );
-                assert!(selected.errors().is_empty());
-                assert_eq!(
-                    journal.workset_bytes,
-                    Some(facts.bytes() + 8 * facts.requests())
-                );
-                assert_eq!(
-                    journal.body.observation.entry(),
-                    AmbientEntryObservation::Bound
-                );
-                assert_eq!(journal.body.stopped, Some(Ok(())));
-                assert_eq!(journal.body.settlement.as_ref().unwrap().debt, 0);
-            }
+            assert_eq!(facts.requests(), if rows == 0 { 6 } else { 7 });
+            let mut journal = RuntimeScalarMemoryJournal::default();
+            let selected = call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                &mut instance,
+                selection,
+                arguments,
+                &control,
+            )
+            .unwrap();
+            let expected = match (name, scalar) {
+                ("bitwise_and", false) => vec![Some(3), None, None],
+                ("bitwise_or", false) => vec![Some(7), None, None],
+                ("bitwise_xor", false) => vec![Some(4), None, None],
+                ("bitwise_not", false) => vec![Some(-8), None, Some(0)],
+                ("bitwise_and", true) => vec![Some(3), Some(2), None],
+                ("bitwise_or", true) => vec![Some(7), Some(7), None],
+                ("bitwise_xor", true) => vec![Some(4), Some(5), None],
+                ("bitwise_not", true) => vec![Some(-8); 3],
+                _ => unreachable!(),
+            };
+            let expected = if sparse {
+                vec![expected[0], expected[2]]
+            } else {
+                expected.into_iter().take(rows).collect()
+            };
+            assert_eq!(selected.values().data_type(), &ty);
+            assert_eq!(
+                selected
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                selected
+                    .selection()
+                    .same_rows_observed(selection, || { Ok::<(), std::convert::Infallible>(()) })
+                    .unwrap()
+            );
+            assert!(selected.errors().is_empty());
+            assert_eq!(
+                journal.workset_bytes,
+                Some(facts.bytes() + 8 * facts.requests())
+            );
+            assert_eq!(
+                journal.body.observation.entry(),
+                AmbientEntryObservation::Bound
+            );
+            assert_eq!(journal.body.stopped, Some(Ok(())));
+            assert_eq!(journal.body.settlement.as_ref().unwrap().debt, 0);
         }
     }
 }
 
 #[test]
 fn runtime_scalar_memory_actual_bitwise_refusals_preserve_uncalled_instance_and_original_errors() {
-    use arrow::datatypes::DataType;
+    use arrow::{
+        array::{ArrayRef, Int8Array, Int64Array},
+        datatypes::DataType,
+    };
     use novarocks_type_contract::FunctionValueType;
-    for ty in [
-        DataType::Int8,
-        DataType::Int16,
-        DataType::Int32,
-        DataType::Int64,
+    for (name, arity) in [
+        ("bitwise_and", 2),
+        ("bitwise_or", 2),
+        ("bitwise_xor", 2),
+        ("bitwise_not", 1),
     ] {
-        for (name, arity) in [("bitand", 2), ("bitor", 2), ("bitxor", 2), ("bitnot", 1)] {
-            let binding = bound();
-            let funded = control(Some(&binding), Arc::default());
-            let missing = control(None, Arc::default());
-            let types = vec![FunctionValueType::new(ty.clone(), true); arity];
-            let values = bitwise_array(&ty, vec![Some(7)]);
-            let right = bitwise_array(&ty, vec![Some(3)]);
-            let args = [
-                EvaluatedArgument::Column(&values),
-                EvaluatedArgument::Column(&right),
-            ];
-            let arguments = &args[..arity];
-            let mut instance = actual_scalar(name, &types);
-            let mut journal = RuntimeScalarMemoryJournal::default();
-            assert_eq!(
-                call_scalar(
-                    &mut RuntimeScalarMemoryScope::new(&missing, &mut journal),
-                    &mut instance,
-                    Selection::all(1),
-                    arguments,
-                    &missing
-                )
-                .unwrap_err(),
-                CallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
-            );
-            assert!(journal.body.settlement.is_none());
-            let other_type = if ty == DataType::Int8 {
-                DataType::Int16
-            } else {
-                DataType::Int8
-            };
-            let other = bitwise_array(&other_type, vec![Some(7)]);
-            let mut wrong = args;
-            wrong[arity - 1] = EvaluatedArgument::Column(&other);
-            assert!(matches!(
-                call_scalar(
-                    &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
-                    &mut instance,
-                    Selection::all(1),
-                    &wrong[..arity],
-                    &funded
-                ),
-                Err(CallFailure::Source(ScalarResourceError::Invariant(_)))
-            ));
-            assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
-            assert_eq!(binding.account().snapshot().granted_bytes, 0);
-            assert_eq!(
-                call_scalar(
-                    &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
-                    &mut instance,
-                    Selection::all(usize::MAX),
-                    &[],
-                    &funded
-                )
-                .unwrap_err(),
-                CallFailure::Source(ScalarResourceError::Arithmetic)
-            );
-            assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
+        let binding = bound();
+        let funded = control(Some(&binding), Arc::default());
+        let missing = control(None, Arc::default());
+        let types = vec![FunctionValueType::new(DataType::Int64, true); arity];
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(7)]));
+        let right: ArrayRef = Arc::new(Int64Array::from(vec![Some(3)]));
+        let args = [
+            EvaluatedArgument::Column(&values),
+            EvaluatedArgument::Column(&right),
+        ];
+        let arguments = &args[..arity];
+        let mut instance = actual_scalar(name, &types);
+        let mut journal = RuntimeScalarMemoryJournal::default();
+        assert_eq!(
+            call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&missing, &mut journal),
+                &mut instance,
+                Selection::all(1),
+                arguments,
+                &missing
+            )
+            .unwrap_err(),
+            CallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
+        );
+        assert!(journal.body.settlement.is_none());
+        let other: ArrayRef = Arc::new(Int8Array::from(vec![Some(7)]));
+        let mut wrong = args;
+        wrong[arity - 1] = EvaluatedArgument::Column(&other);
+        assert!(matches!(
             call_scalar(
                 &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
                 &mut instance,
                 Selection::all(1),
-                arguments,
+                &wrong[..arity],
+                &funded
+            ),
+            Err(CallFailure::Source(ScalarResourceError::Invariant(_)))
+        ));
+        assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
+        assert_eq!(binding.account().snapshot().granted_bytes, 0);
+        assert_eq!(
+            call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                &mut instance,
+                Selection::all(usize::MAX),
+                &[],
+                &funded
+            )
+            .unwrap_err(),
+            CallFailure::Source(ScalarResourceError::Arithmetic)
+        );
+        assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
+        call_scalar(
+            &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+            &mut instance,
+            Selection::all(1),
+            arguments,
+            &funded,
+        )
+        .unwrap();
+        for wrong_arity in [false, true] {
+            let unrelated = [EvaluatedArgument::Column(&other); 2];
+            let invalid = if wrong_arity {
+                &unrelated[..if arity == 1 { 2 } else { 1 }]
+            } else {
+                arguments
+            };
+            let selection = Selection::all(if wrong_arity { 1 } else { 2 });
+            let expected = actual_scalar(name, &types)
+                .evaluate(selection, invalid, &funded)
+                .unwrap_err();
+            let mut malformed = actual_scalar(name, &types);
+            let actual = call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                &mut malformed,
+                selection,
+                invalid,
                 &funded,
             )
-            .unwrap();
-            for wrong_arity in [false, true] {
-                let unrelated = [EvaluatedArgument::Column(&other); 2];
-                let invalid = if wrong_arity {
-                    &unrelated[..if arity == 1 { 2 } else { 1 }]
-                } else {
-                    arguments
-                };
-                let selection = Selection::all(if wrong_arity { 1 } else { 2 });
-                let expected = actual_scalar(name, &types)
-                    .evaluate(selection, invalid, &funded)
-                    .unwrap_err();
-                let mut malformed = actual_scalar(name, &types);
-                let actual = call_scalar(
+            .unwrap_err();
+            let CallFailure::Kernel(actual) = actual else {
+                panic!("the exact outer shape failure must survive the host");
+            };
+            assert_eq!(
+                novarocks_failure_contract::FailureProjection::failure_fact(&actual),
+                novarocks_failure_contract::FailureProjection::failure_fact(&expected)
+            );
+            assert_eq!(actual.to_string(), expected.to_string());
+            assert!(journal.body.settlement.is_some());
+            assert_eq!(
+                call_scalar(
                     &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
                     &mut malformed,
-                    selection,
-                    invalid,
-                    &funded,
+                    Selection::all(1),
+                    arguments,
+                    &funded
                 )
-                .unwrap_err();
-                let CallFailure::Kernel(actual) = actual else {
-                    panic!("the exact outer shape failure must survive the host");
-                };
-                assert_eq!(
-                    novarocks_failure_contract::FailureProjection::failure_fact(&actual),
-                    novarocks_failure_contract::FailureProjection::failure_fact(&expected)
-                );
-                assert_eq!(actual.to_string(), expected.to_string());
-                assert!(journal.body.settlement.is_some());
-                assert_eq!(
-                    call_scalar(
-                        &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
-                        &mut malformed,
-                        Selection::all(1),
-                        arguments,
-                        &funded
-                    )
-                    .unwrap_err(),
-                    CallFailure::Kernel(KernelFailure::InstanceFailed)
-                );
-            }
+                .unwrap_err(),
+                CallFailure::Kernel(KernelFailure::InstanceFailed)
+            );
         }
     }
 }
@@ -1480,14 +1438,14 @@ fn runtime_scalar_memory_actual_bitwise_refusals_preserve_uncalled_instance_and_
 #[test]
 fn runtime_scalar_memory_actual_nine_narrow_sources_keep_original_mapping_and_successful_null() {
     use arrow::{
-        array::{ArrayRef, Int64Array},
+        array::{ArrayRef, Int32Array},
         datatypes::DataType,
     };
     for ty in [DataType::Int8, DataType::Int16, DataType::Int32] {
         for name in [
-            "bit_shift_left",
-            "bit_shift_right",
-            "bit_shift_right_logical",
+            "bitwise_left_shift",
+            "bitwise_right_shift_arithmetic",
+            "bitwise_right_shift",
         ] {
             for (rows, sparse, scalar) in [
                 (0, false, false),
@@ -1503,7 +1461,7 @@ fn runtime_scalar_memory_actual_nine_narrow_sources_keep_original_mapping_and_su
                 } else {
                     narrow_array(&ty, vec![Some(7), None, Some(-1)]).slice(0, rows)
                 };
-                let counts: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 1]).slice(0, rows));
+                let counts: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 1]).slice(0, rows));
                 let arguments = [
                     if scalar {
                         EvaluatedArgument::Scalar(&values)
@@ -1533,11 +1491,19 @@ fn runtime_scalar_memory_actual_nine_narrow_sources_keep_original_mapping_and_su
                 )
                 .unwrap();
                 let expected = match (name, scalar) {
-                    ("bit_shift_left", false) => vec![Some(14), None, Some(-2)],
-                    ("bit_shift_right", false) => vec![Some(3), None, Some(-1)],
-                    ("bit_shift_right_logical", false) => vec![Some(3), None, None],
-                    ("bit_shift_left", true) => vec![Some(14), Some(28), Some(14)],
-                    ("bit_shift_right" | "bit_shift_right_logical", true) => {
+                    ("bitwise_left_shift", false) => vec![Some(14), None, Some(-2)],
+                    ("bitwise_right_shift_arithmetic", false) => vec![Some(3), None, Some(-1)],
+                    ("bitwise_right_shift", false) => {
+                        let positive = match ty {
+                            DataType::Int8 => i64::from(i8::MAX),
+                            DataType::Int16 => i64::from(i16::MAX),
+                            DataType::Int32 => i64::from(i32::MAX),
+                            _ => unreachable!("narrow source"),
+                        };
+                        vec![Some(3), None, Some(positive)]
+                    }
+                    ("bitwise_left_shift", true) => vec![Some(14), Some(28), Some(14)],
+                    ("bitwise_right_shift_arithmetic" | "bitwise_right_shift", true) => {
                         vec![Some(3), Some(1), Some(3)]
                     }
                     _ => unreachable!(),
@@ -1569,20 +1535,20 @@ fn runtime_scalar_memory_actual_nine_narrow_sources_keep_original_mapping_and_su
 fn runtime_scalar_memory_actual_narrow_refusals_preserve_uncalled_instance_and_original_shape_error()
  {
     use arrow::{
-        array::{ArrayRef, Int64Array},
+        array::{ArrayRef, Int32Array, Int64Array},
         datatypes::DataType,
     };
     for ty in [DataType::Int8, DataType::Int16, DataType::Int32] {
         for name in [
-            "bit_shift_left",
-            "bit_shift_right",
-            "bit_shift_right_logical",
+            "bitwise_left_shift",
+            "bitwise_right_shift_arithmetic",
+            "bitwise_right_shift",
         ] {
             let binding = bound();
             let funded = control(Some(&binding), Arc::default());
             let missing = control(None, Arc::default());
             let values = narrow_array(&ty, vec![Some(7)]);
-            let counts: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+            let counts: ArrayRef = Arc::new(Int32Array::from(vec![1]));
             let arguments = [
                 EvaluatedArgument::Column(&values),
                 EvaluatedArgument::Column(&counts),
@@ -1601,7 +1567,8 @@ fn runtime_scalar_memory_actual_narrow_refusals_preserve_uncalled_instance_and_o
                 CallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
             );
             assert!(journal.body.settlement.is_none());
-            let wrong = [EvaluatedArgument::Column(&counts), arguments[1]];
+            let wrong_width: ArrayRef = Arc::new(Int64Array::from(vec![7]));
+            let wrong = [EvaluatedArgument::Column(&wrong_width), arguments[1]];
             assert!(matches!(
                 call_scalar(
                     &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
@@ -1661,27 +1628,16 @@ fn runtime_scalar_memory_actual_narrow_refusals_preserve_uncalled_instance_and_o
 #[test]
 fn runtime_scalar_memory_uncovered_original_source_has_no_host_substitution() {
     use arrow::{
-        array::{ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Int64Array},
+        array::{ArrayRef, Int64Array},
         datatypes::DataType,
     };
-    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    use novarocks_type_contract::FunctionValueType;
     let control = control(None, Arc::default());
-    let source = FunctionValueType::try_with_logical_type(
-        DataType::FixedSizeBinary(16),
-        true,
-        ValueLogicalType::LargeInt,
-    )
-    .unwrap();
-    let mut instance = actual_typed_shift("bit_shift_left", source);
+    // ABS remains an installed scalar without the call-scoped memory profile.
+    let mut instance = actual_scalar("abs", &[FunctionValueType::new(DataType::Int64, true)]);
     assert!(instance.invocation_resource_profile().is_none());
-    let mut builder = FixedSizeBinaryBuilder::with_capacity(1, 16);
-    builder.append_value(7_i128.to_be_bytes()).unwrap();
-    let values: ArrayRef = Arc::new(builder.finish());
-    let counts: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-    let arguments = [
-        EvaluatedArgument::Column(&values),
-        EvaluatedArgument::Column(&counts),
-    ];
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(-14)]));
+    let arguments = [EvaluatedArgument::Column(&values)];
     let mut journal = RuntimeScalarMemoryJournal::default();
     let selected = call_scalar(
         &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
@@ -1695,10 +1651,11 @@ fn runtime_scalar_memory_uncovered_original_source_has_no_host_substitution() {
         selected
             .values()
             .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
-            .value(0),
-        &14_i128.to_be_bytes()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(14)]
     );
     assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
 }

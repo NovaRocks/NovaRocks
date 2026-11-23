@@ -74,7 +74,7 @@ _col0
 0
 
 -- query 22
--- types	bigint	bigint
+-- types	bigint	integer
 _col0	_col1
 1	6
 1	7
@@ -82,5 +82,5 @@ _col0	_col1
 1	9
 
 -- query 23
--- types	bigint	bigint
+-- types	bigint	integer
 _col0	_col1

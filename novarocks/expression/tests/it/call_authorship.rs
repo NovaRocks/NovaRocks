@@ -258,6 +258,13 @@ impl AuthorFixture {
     }
 
     fn seal(&mut self) -> novarocks_expression_contract::SealedUnit {
+        self.seal_with_ports(Vec::new())
+    }
+
+    fn seal_with_ports(
+        &mut self,
+        ports: Vec<ExprPort>,
+    ) -> novarocks_expression_contract::SealedUnit {
         register_call_requests(&mut self.draft, &self.authors, &mut self.constants);
         let parameters = SemanticParameters::default();
         let inputs = CallAuthorInputs {
@@ -280,7 +287,7 @@ impl AuthorFixture {
                 expression_semantic_depth: 64,
             }),
         );
-        let sealed = draft.seal(Vec::new(), &mut work).unwrap();
+        let sealed = draft.seal(ports, &mut work).unwrap();
         work.finish().unwrap();
         sealed
     }
@@ -722,7 +729,9 @@ fn ordered_regexp_authorship_guards_each_argument_after_its_predecessor() {
 fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     use arrow::array::{BooleanArray, Decimal128Array, Float64Array};
     use novarocks_expression_contract::BinaryOperator;
-    use novarocks_type_contract::{FunctionVolatility, GuardKind, RegionGuard};
+    use novarocks_type_contract::{
+        FunctionIntrinsicRowError, FunctionVolatility, GuardKind, RegionGuard,
+    };
     use std::sync::Arc;
 
     let mut fixture = AuthorFixture::new();
@@ -737,7 +746,14 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
         ),
         FunctionValueType::new(DataType::Decimal128(38, 0), true),
     );
-    let round = fixture.call("round", &[decimal], DecimalOverflowPolicy::ReportError);
+    let digits_value = ValueId::new(1);
+    let digits_type = FunctionValueType::new(DataType::Int32, false);
+    let digits = fixture.add(digits_type.clone(), ExprKind::Value(digits_value));
+    let round = fixture.call(
+        "round",
+        &[decimal, digits],
+        DecimalOverflowPolicy::ReportError,
+    );
     let then_value = fixture.add(
         required,
         ExprKind::IsNull {
@@ -774,7 +790,9 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
         },
     );
     fixture.root(root, EvaluationDemand::Value);
-    let sealed = fixture.seal();
+    let sealed = fixture.seal_with_ports(vec![ExprPort {
+        values: Box::from([(digits_value, digits_type)]),
+    }]);
     let authored = fixture
         .author(&sealed, &SemanticParameters::default(), &HarnessControl)
         .unwrap();
@@ -791,6 +809,12 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     let case_id = flow.uses()[&id].arguments[1];
     let case_use = &flow.uses()[&case_id];
     assert_eq!(case_use.definition, case);
+    let round_use = flow.uses()[&case_use.arguments[1]].arguments[0];
+    assert_eq!(flow.uses()[&round_use].definition, round);
+    assert_eq!(
+        authored.claims[&round_use].effects.own_row_error,
+        FunctionIntrinsicRowError::MayRaise
+    );
     assert_eq!(
         case_use.control,
         ControlShape::Case {

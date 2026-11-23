@@ -81,7 +81,13 @@ fn catalogue() -> PureEngineFunctionCatalog {
         ),
         (
             "rand",
-            &["()->f64;strict;legacy", "(i64)->f64;strict;legacy"][..],
+            &[
+                "()->f64;strict;legacy",
+                "(i8)->i8;strict;coerce",
+                "(i16)->i16;strict;coerce",
+                "(i32)->i32;strict;coerce",
+                "(i64)->i64;strict;coerce",
+            ][..],
             PureKernelAbi::ScalarV1,
         ),
     ] {

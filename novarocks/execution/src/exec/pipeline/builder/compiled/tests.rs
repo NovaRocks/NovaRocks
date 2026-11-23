@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::fixtures::{SEED_42_FIRST, SeedMode, program};
+use crate::exec::expr::fixtures::{RandArgument, program};
 use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::runtime::runtime_state::RuntimeState;
@@ -52,12 +52,12 @@ fn run(program: Arc<novarocks_local_program::LocalProgram>) -> Vec<Chunk> {
     output.take_chunks()
 }
 
-// Values -> Project(literals) -> Filter -> Project(RAND(seed), seed, seed) ->
+// Values -> Project(literals) -> Filter -> Project(RAND(bound), bound, bound) ->
 // Limit -> Result, compiled by local-compiler and executed only through
 // compiled roots. The RAND oracle is independent of the evaluator.
 #[test]
 fn compiled_program_runs_through_compiled_roots_to_result_rows() {
-    for mode in [SeedMode::Input, SeedMode::DirectConstant] {
+    for mode in [RandArgument::Input, RandArgument::DirectConstant] {
         let chunks = run(program(mode, false));
         let rows: usize = chunks.iter().map(Chunk::len).sum();
         assert_eq!(rows, 1);
@@ -65,33 +65,127 @@ fn compiled_program_runs_through_compiled_roots_to_result_rows() {
         let sample = batch
             .column(0)
             .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("RAND result is Float64");
-        assert_eq!(sample.value(0).to_bits(), SEED_42_FIRST);
+            .downcast_ref::<Int64Array>()
+            .expect("bounded RAND result is Int64");
+        assert_eq!(sample.value(0), 0);
         for column in 1..3 {
-            let seed = batch
+            let bound = batch
                 .column(column)
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .expect("seed passthrough is Int64");
-            assert_eq!(seed.value(0), 42);
+                .expect("bound passthrough is Int64");
+            assert_eq!(bound.value(0), 1);
         }
     }
 }
 
-// One RAND definition with two actual root uses: each root owns its own
-// instance in the compiled Project, so both start from the seed's first value.
+// A shared volatile definition has two independently activated uses. A
+// cancellation within one frame must not poison its sibling's RNG instance.
 #[test]
 fn twin_roots_of_one_definition_keep_independent_instances_in_the_pipeline() {
-    let chunks = run(program(SeedMode::DirectConstant, true));
+    use crate::exec::expr::fixtures::{input_chunk, input_project};
+    use crate::exec::operators::compiled_expression::{RuntimeKernelControl, instances};
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use novarocks_expression::{
+        EvaluationInput, ExprEvaluationFailure, testkit::PassThroughCallHost,
+    };
+    use novarocks_functions::{
+        KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
+        Selection,
+    };
+
+    struct Cancel;
+    impl KernelEvaluationControl for Cancel {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Err(KernelFailure::Cancelled)
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("RAND cannot wait")
+        }
+    }
+
+    let program = program(RandArgument::Unbounded, true);
+    let (_, sites) = input_project(&program);
+    let left = program
+        .unit(sites[0].unit)
+        .unwrap()
+        .root(sites[0].root)
+        .unwrap();
+    let right = program
+        .unit(sites[1].unit)
+        .unwrap()
+        .root(sites[1].root)
+        .unwrap();
+    assert_eq!(sites[0].unit, sites[1].unit);
+    assert_eq!(left.definition, right.definition);
+    assert_ne!(left.use_id, right.use_id);
+
+    let mut frames = None;
+    let control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+    instances(&mut frames, &program, &sites[..2], &control).unwrap();
+    let mut frames = frames.unwrap();
+    let input = input_chunk(&program, vec![Some(1)]);
+    let data = EvaluationInput::Batch {
+        batch: input.record_batch(),
+        source: None,
+    };
+    let selection = Selection::all(1);
+    let invocation = ScalarInvocationScope::new(selection, selection);
+    let activation = ScalarInvocationActivation::Activated;
+    frames[0]
+        .evaluate(
+            data,
+            invocation,
+            activation,
+            &control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    assert!(matches!(
+        frames[0].evaluate(
+            data,
+            invocation,
+            activation,
+            &Cancel,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(KernelFailure::Cancelled))
+    ));
+    assert!(matches!(
+        frames[0].evaluate(
+            data,
+            invocation,
+            activation,
+            &control,
+            &mut PassThroughCallHost
+        ),
+        Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
+    ));
+    let sibling = frames[1]
+        .evaluate(
+            data,
+            invocation,
+            activation,
+            &control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    let values = sibling
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!((0.0..1.0).contains(&values.value(0)));
+
+    let chunks = run(program);
     let batch = chunks.iter().find(|c| c.len() == 1).unwrap().record_batch();
     for column in 0..2 {
         let sample = batch
             .column(column)
             .as_any()
             .downcast_ref::<Float64Array>()
-            .expect("RAND result is Float64");
-        assert_eq!(sample.value(0).to_bits(), SEED_42_FIRST, "root {column}");
+            .expect("unbounded RAND result is Float64");
+        assert!((0.0..1.0).contains(&sample.value(0)), "root {column}");
     }
 }
 
@@ -103,7 +197,7 @@ fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
     use crate::runtime::runtime_state::RuntimeErrorState;
     use novarocks_local_program::{ProgramNodeId, ProgramNodeKind};
 
-    let program = program(SeedMode::Input, false);
+    let program = program(RandArgument::Input, false);
     let filter = ProgramNodeId::new(2);
     let project = ProgramNodeId::new(3);
     assert!(matches!(

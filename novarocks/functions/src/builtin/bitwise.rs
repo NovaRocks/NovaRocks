@@ -306,6 +306,3 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

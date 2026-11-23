@@ -21,7 +21,7 @@ use novarocks_expression::{
     testkit::{
         PassThroughCallHost,
         guarded_fixtures::{
-            CallbackControl, Fixture, GUARDED_CONTROL as Control, SEED_42,
+            CallbackControl, Fixture, GUARDED_CONTROL as Control,
             case::{CaseKind, case_batch, case_program, rand_bits},
             causes,
         },
@@ -201,10 +201,7 @@ fn searched_case_later_round_when_is_required_only_for_remaining_rows_and_error_
             &mut PassThroughCallHost,
         )
         .unwrap();
-    assert_eq!(
-        rand_bits(&output),
-        vec![Some(SEED_42[0]), Some(SEED_42[0]), Some(SEED_42[0]), None]
-    );
+    assert_eq!(rand_bits(&output), vec![Some(0), Some(0), Some(0), None]);
     assert_eq!(output.errors().len(), 1);
     assert_eq!(output.errors()[0].selected_ordinal(), 3);
     assert_eq!(output.selection().row(3), Some(7));
@@ -229,7 +226,7 @@ fn searched_case_later_round_when_is_required_only_for_remaining_rows_and_error_
             &mut PassThroughCallHost,
         )
         .unwrap();
-    assert_eq!(rand_bits(&output), vec![Some(SEED_42[1]); 3]);
+    assert_eq!(rand_bits(&output), vec![Some(0); 3]);
     assert!(output.errors().is_empty());
 }
 

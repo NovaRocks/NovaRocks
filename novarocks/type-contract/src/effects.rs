@@ -360,8 +360,8 @@ impl CallEffects {
         ) {
             return Err(EffectContractError::InvalidRefinement);
         }
-        // Stateful scalar declarations may specialize to a stateless per-row
-        // implementation (e.g. nonconstant rand(seed)); RNG remains observable.
+        // Stateful scalar declarations may specialize to stateless implementations.
+        // The specialization retains the original observable effects.
         if self.instance_state != base.instance_state
             && !(base.instance_state == FunctionInstanceState::ScalarInstance
                 && self.instance_state == FunctionInstanceState::None)

@@ -2506,7 +2506,7 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
             layout.schema().clone(),
             vec![
                 Arc::new(arrow::array::Int64Array::from(vec![7, 3])) as arrow::array::ArrayRef,
-                Arc::new(arrow::array::Int64Array::from(vec![1, 1])),
+                Arc::new(arrow::array::Int32Array::from(vec![1, 1])),
             ],
         )
         .unwrap();

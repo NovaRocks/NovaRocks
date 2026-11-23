@@ -18,7 +18,7 @@
 //! Binary and simple CASE fixtures authored as one neutral expression unit.
 
 use super::{
-    Fixture, SEED_42, Shape, catalogue, compile_project_unit, fixture_constant_policy, literal,
+    Fixture, Shape, catalogue, compile_project_unit, fixture_constant_policy, literal,
     project_port, random, round_value, unit_draft,
 };
 use crate::{ComparisonSite, testkit::checked_constants};
@@ -102,31 +102,44 @@ pub fn equality_program(kind: EqualityCase) -> Fixture {
                 value(&mut builder, 1),
                 value(&mut builder, 2),
             ),
-            EqualityCase::RandomOperand => {
-                let operand = random(&mut builder, &mut authors, &functions, &mut source_pools);
-                let first = literal(
+            EqualityCase::RandomOperand => (
+                random(&mut builder, &mut authors, &functions, &mut source_pools),
+                value(&mut builder, 1),
+                value(&mut builder, 2),
+            ),
+            EqualityCase::RandomLabels => {
+                let first = random(&mut builder, &mut authors, &functions, &mut source_pools);
+                let second = random(&mut builder, &mut authors, &functions, &mut source_pools);
+                let one = literal(
                     &mut builder,
                     floating.clone(),
                     checked_constants::f64_bits(
-                        &(floating.clone()),
-                        SEED_42[0],
+                        &floating,
+                        1.0_f64.to_bits(),
                         fixture_constant_policy(),
                     ),
                     &mut source_pools,
                 );
-                let second = literal(
+                let zero = literal(
                     &mut builder,
-                    (floating).clone(),
-                    checked_constants::f64_bits(&(floating), SEED_42[1], fixture_constant_policy()),
+                    floating.clone(),
+                    checked_constants::f64_bits(&floating, 0, fixture_constant_policy()),
                     &mut source_pools,
                 );
-                (operand, first, second)
+                let second = builder
+                    .add(
+                        None,
+                        floating.clone(),
+                        ExprKind::Case {
+                            ieee_float_equality: false,
+                            operand: Some(second),
+                            when_then: Box::from([(zero, one)]),
+                            else_expr: None,
+                        },
+                    )
+                    .unwrap();
+                (value(&mut builder, 0), first, second)
             }
-            EqualityCase::RandomLabels => (
-                value(&mut builder, 0),
-                random(&mut builder, &mut authors, &functions, &mut source_pools),
-                random(&mut builder, &mut authors, &functions, &mut source_pools),
-            ),
             EqualityCase::ErrorOperand => {
                 let source = value(&mut builder, 3);
                 let operand = round_value(

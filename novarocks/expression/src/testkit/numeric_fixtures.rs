@@ -61,7 +61,13 @@ fn catalogue() -> PureEngineFunctionCatalog {
         ),
         (
             "rand",
-            &["()->f64;strict;legacy", "(i64)->f64;strict;legacy"][..],
+            &[
+                "()->f64;strict;legacy",
+                "(i8)->i8;strict;coerce",
+                "(i16)->i16;strict;coerce",
+                "(i32)->i32;strict;coerce",
+                "(i64)->i64;strict;coerce",
+            ][..],
             PureKernelAbi::ScalarV1,
         ),
         ("round", &["dynamic-v1"][..], PureKernelAbi::ScalarV1),
@@ -74,6 +80,11 @@ fn catalogue() -> PureEngineFunctionCatalog {
                     .clone(),
             )
             .unwrap();
+        let implementation = if name == "round" {
+            "selected-v2"
+        } else {
+            "selected-v1"
+        };
         for overload in overloads {
             manifest.push(InstalledPureKernel {
                 function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
@@ -84,7 +95,7 @@ fn catalogue() -> PureEngineFunctionCatalog {
                     ))
                     .unwrap(),
                     implementation: PureImplementationId::try_new(format!(
-                        "builtin.scalar/{name}/selected-v1"
+                        "builtin.scalar/{name}/{implementation}"
                     ))
                     .unwrap(),
                     abi,
@@ -133,9 +144,18 @@ fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionA
         constant,
     }
 }
-fn integer_argument(ty: FunctionValueType, value: i64) -> FunctionArgument {
-    let constant = checked_constants::i64(&ty, value, fixture_constant_policy());
-    argument(ty, Some(constant))
+fn round_digits() -> (FunctionValueType, ConstantValue) {
+    let ty = FunctionValueType::new(DataType::Int32, false);
+    let constant = ConstantValue::from_i32(
+        Arc::new(ty.try_to_field("digits").unwrap()),
+        ty.clone(),
+        -1,
+        fixture_constant_policy(),
+        CompilePhase::FunctionSpecialization,
+        &HarnessControl,
+    )
+    .unwrap();
+    (ty, constant)
 }
 
 /// The target unit and its original root ordinal, with its actual Arrow scope.
@@ -467,10 +487,10 @@ pub fn cast_fixture_in_mode(
     let mut source_pools = ConstantPools::empty();
     let functions = catalogue();
     let boolean = FunctionValueType::new(DataType::Boolean, true);
-    let seed_type = FunctionValueType::new(DataType::Int64, true);
+    let bound_type = FunctionValueType::new(DataType::Int64, true);
     let columns = [
         (ValueId::new(91), source_type.clone()),
-        (ValueId::new(7), seed_type.clone()),
+        (ValueId::new(7), bound_type.clone()),
         (ValueId::new(333), boolean.clone()),
     ];
     let mut source_prefix = unit_draft();
@@ -686,8 +706,8 @@ pub fn cast_fixture_in_mode(
                 )
             } else {
                 let flag = if matches!(source, Source::RandCondition) {
-                    let seed = builder
-                        .add(None, seed_type.clone(), ExprKind::Value(columns[1].0))
+                    let bound = builder
+                        .add(None, bound_type.clone(), ExprKind::Value(columns[1].0))
                         .unwrap();
                     let random = add_call(
                         &mut builder,
@@ -695,10 +715,10 @@ pub fn cast_fixture_in_mode(
                         author(
                             &functions,
                             "rand",
-                            vec![argument(seed_type, None)],
+                            vec![argument(bound_type, None)],
                             ControlShape::Eager,
                         ),
-                        vec![seed],
+                        vec![bound],
                     );
                     builder
                         .add(
@@ -1212,17 +1232,13 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
     let decimal_expr = builder
         .add(None, decimal.clone(), ExprKind::Value(inputs[1].0))
         .unwrap();
-    let digits_type = FunctionValueType::new(DataType::Int64, false);
-    let digits = builder
-        .add(
-            None,
-            digits_type.clone(),
-            checked_constants::kind(
-                &mut source_pools,
-                checked_constants::i64(&(digits_type.clone()), -1, fixture_constant_policy()),
-            ),
-        )
-        .unwrap();
+    let (digits_type, places) = round_digits();
+    let digits = literal(
+        &mut builder,
+        &digits_type,
+        places.clone(),
+        &mut source_pools,
+    );
     let mut authors = BTreeMap::new();
     let round = add_call(
         &mut builder,
@@ -1230,7 +1246,7 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
         author(
             &functions,
             "round",
-            vec![argument(decimal, None), integer_argument(digits_type, -1)],
+            vec![argument(decimal, None), argument(digits_type, Some(places))],
             ControlShape::Eager,
         ),
         vec![decimal_expr, digits],
@@ -1324,35 +1340,21 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
         NullSafeRight::Column => builder
             .add(None, ty.clone(), ExprKind::Value(ids[1]))
             .unwrap(),
-        NullSafeRight::Random => {
-            let integer = FunctionValueType::new(DataType::Int64, false);
-            let seed = literal(
-                &mut builder,
-                &integer,
-                checked_constants::i64(&integer, 42, fixture_constant_policy()),
-                &mut source_pools,
-            );
-            add_call(
-                &mut builder,
-                &mut authors,
-                author(
-                    &functions,
-                    "rand",
-                    vec![integer_argument(integer, 42)],
-                    ControlShape::Eager,
-                ),
-                vec![seed],
-            )
-        }
+        NullSafeRight::Random => add_call(
+            &mut builder,
+            &mut authors,
+            author(&functions, "rand", vec![], ControlShape::Eager),
+            vec![],
+        ),
         NullSafeRight::Round => {
             let source = builder
                 .add(None, ty.clone(), ExprKind::Value(ids[1]))
                 .unwrap();
-            let integer = FunctionValueType::new(DataType::Int64, false);
+            let (digits_type, places) = round_digits();
             let digits = literal(
                 &mut builder,
-                &integer,
-                checked_constants::i64(&integer, -1, fixture_constant_policy()),
+                &digits_type,
+                places.clone(),
                 &mut source_pools,
             );
             add_call(
@@ -1361,7 +1363,10 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
                 author(
                     &functions,
                     "round",
-                    vec![argument(ty.clone(), None), integer_argument(integer, -1)],
+                    vec![
+                        argument(ty.clone(), None),
+                        argument(digits_type, Some(places)),
+                    ],
                     ControlShape::Eager,
                 ),
                 vec![source, digits],
@@ -1593,7 +1598,7 @@ pub fn sliced_batch(program: &CompiledFixture, values: &[Option<i64>]) -> Record
         schema,
         vec![
             source,
-            Arc::new(Int64Array::from(vec![Some(42); values.len()])),
+            Arc::new(Int64Array::from(vec![Some(1); values.len()])),
             Arc::new(BooleanArray::from(vec![Some(true); values.len()])),
         ],
     )
@@ -1619,7 +1624,7 @@ pub fn float_batch(program: &CompiledFixture, values: &[Option<f64>]) -> RecordB
         schema,
         vec![
             array.slice(1, values.len()),
-            Arc::new(Int64Array::from(vec![Some(42); values.len()])),
+            Arc::new(Int64Array::from(vec![Some(1); values.len()])),
             Arc::new(BooleanArray::from(vec![Some(true); values.len()])),
         ],
     )
