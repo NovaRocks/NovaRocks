@@ -125,6 +125,7 @@ pub struct RuntimeStateSlotFacts {
 pub struct RuntimeAggregateFacts {
     pub aggregate_id: AggregateIdentity,
     pub function_identity: String,
+    pub semantic_contract: Option<novarocks_functions::PersistentAggregateContract>,
     pub source_fields: Vec<RuntimeSourceFieldReference>,
     /// Ordered algorithm state; AVG is sum followed by count.
     pub state_slot_ids: Vec<StateSlotIdentity>,
@@ -342,6 +343,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                     aggregate_id: aggregate.aggregate_id,
                     branch_id: aggregate.branch_id,
                     function_identity: aggregate.function_identity,
+                    semantic_contract: aggregate.semantic_contract,
                     source_fields: aggregate
                         .source_fields
                         .into_iter()
@@ -418,6 +420,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                         aggregate_id: aggregate.aggregate_id.clone(),
                         branch_id: aggregate.branch_id.clone(),
                         function_identity: aggregate.function_identity.clone(),
+                        semantic_contract: aggregate.semantic_contract.clone(),
                         source_fields: aggregate
                             .source_fields
                             .iter()

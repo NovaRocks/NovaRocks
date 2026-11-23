@@ -42,6 +42,7 @@ pub(super) enum Schema {
     ApplyKey,
     ApplyKeyComponent,
     AggregateInterpretation,
+    PersistentAggregateContract,
     BranchInterpretation,
     TargetBinding,
     TargetPartitionFieldBinding,
@@ -246,8 +247,10 @@ const AGGREGATE: &[Field] = &[
     ),
     repeated_bytes(4),
     bytes(5),
+    message(6, Schema::PersistentAggregateContract),
 ];
 // Repeated uint32 is encoded packed and therefore length-delimited.
+const PERSISTENT_AGGREGATE: &[Field] = &[bytes(1), bytes(2), bytes(3), bytes(4)];
 const BRANCH: &[Field] = &[bytes(1), packed_varints(2), repeated_bytes(3)];
 const TARGET: &[Field] = &[
     bytes(1),
@@ -284,6 +287,7 @@ impl Schema {
             Self::ApplyKey => APPLY_KEY,
             Self::ApplyKeyComponent => APPLY_KEY_COMPONENT,
             Self::AggregateInterpretation => AGGREGATE,
+            Self::PersistentAggregateContract => PERSISTENT_AGGREGATE,
             Self::BranchInterpretation => BRANCH,
             Self::TargetBinding => TARGET,
             Self::TargetPartitionFieldBinding => TARGET_PARTITION_FIELD,

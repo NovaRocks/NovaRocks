@@ -308,6 +308,30 @@ async fn build_aggregate_layout_for_refresh_query(
     novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
     PreparationError,
 > {
+    let visible_analysis = analyze_visible_refresh_query(
+        io,
+        ports,
+        current_catalog,
+        current_database,
+        visible_query,
+        connector_context,
+    )
+    .await?;
+    let facts = visible_analysis
+        .refresh_input
+        .aggregate_layout_facts(visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
+    novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
+        .map_err(PreparationError::from)
+}
+
+async fn analyze_visible_refresh_query(
+    io: &MvRefreshPreparationIo,
+    ports: &IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    visible_query: &novarocks_parser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::mv::domain::analysis::MvAnalysis, PreparationError> {
     let captured_catalog = capture_catalog(
         MvCatalogCaptureInput {
             query: MvCatalogCaptureQuery::Query(Box::new(visible_query.clone())),
@@ -326,7 +350,7 @@ async fn build_aggregate_layout_for_refresh_query(
         io,
     )
     .await?;
-    let visible_analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
+    crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
         current_catalog,
         captured_catalog.catalog.provider(),
         current_database,
@@ -336,12 +360,8 @@ async fn build_aggregate_layout_for_refresh_query(
         crate::query_execution::planning::sql_compile_control_from_connector_request(
             connector_context,
         ),
-    )?;
-    let facts = visible_analysis
-        .refresh_input
-        .aggregate_layout_facts(visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
-    novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
-        .map_err(PreparationError::from)
+    )
+    .map_err(PreparationError::from)
 }
 
 async fn retain_exact_repartition_target(
@@ -821,16 +841,28 @@ async fn prepare_frontend_first_refresh_write(
     // P's input watermark is exactly what this pin says, so it is frozen here,
     // beside the pin, rather than reconstructed at the commit from facts that
     // would by then be a second reading of the same sources.
-    let admitted_publication = AdmittedMvDataPublication::try_new(
-        admitted_publication,
-        &pin.exact_revisions_by_occurrence(),
-    )?;
     // The canonical definition owns name resolution. The execution artifact is
     // transient and may be canonicalized, but it must never fall back to the
     // session which happens to issue REFRESH.
     let resolution = &projection.facts.definition().query.resolution;
     let source_catalog = Some(resolution.default_catalog.clone());
     let source_database = resolution.default_namespace.clone();
+    if capabilities.has_agg_state
+        && novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(
+            projection.facts.interpretation(),
+        ).is_err()
+    {
+        let analyzed = analyze_visible_refresh_query(
+            io, source, source_catalog.as_deref(), &source_database, &query, &connector_context,
+        ).await?;
+        admitted_publication.rebind_aggregate_contracts(
+            &analyzed.refresh_input.create_persistence_facts()?,
+        )?;
+    }
+    let admitted_publication = AdmittedMvDataPublication::try_new(
+        admitted_publication,
+        &pin.exact_revisions_by_occurrence(),
+    )?;
     let expected_target_snapshot_id = match &contract.state_baseline {
         RefreshStateBaseline::SnapshotBacked {
             target_snapshot_id, ..
@@ -1383,6 +1415,9 @@ async fn prepare_frontend_incremental_write(
         )
         .map_err(PreparationError::from)?;
     let runtime_bindings = validate_projection_target(&projection, &target_schema_validation)?;
+    if projection.facts.publication().is_some() {
+        novarocks_mv_application::persistence::aggregate_bindings::validate_published_aggregate_contracts(projection.facts.interpretation())?;
+    }
     // An incremental refresh of an aggregate view needs the same analyzed
     // aggregate facts a first refresh does: L says the view aggregates, and a
     // rewrite that cannot say which SQL call each aggregate identity belongs

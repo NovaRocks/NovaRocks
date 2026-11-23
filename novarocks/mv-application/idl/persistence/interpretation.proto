@@ -95,6 +95,15 @@ message AggregateInterpretation {
   // state column their rows are told apart in. Absent on a view with no
   // branches.
   optional bytes branch_id = 5;
+  // Absent in interpretation documents authored before selected aggregate contracts.
+  PersistentAggregateContract semantic_contract = 6;
+}
+
+message PersistentAggregateContract {
+  optional string function_identity = 1;
+  optional string overload_identity = 2;
+  optional string result_semantics = 3;
+  optional string state_format = 4;
 }
 
 // Branch order is semantic and is therefore preserved exactly.

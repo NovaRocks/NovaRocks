@@ -3666,6 +3666,7 @@ fn is_aggregate_function(name: &str) -> bool {
             | "percentile_approx"
             | "percentile_approx_weighted"
             | "approx_count_distinct"
+            | "approx_distinct"
             | "approx_top_k"
             | "hll_raw"
             | "ndv"
@@ -5946,6 +5947,7 @@ fn count_aggregate_projection_outputs(
                 distinct,
                 order_by,
                 filter,
+                resolved,
                 ..
             } => {
                 if filter.is_some() {
@@ -5957,6 +5959,21 @@ fn count_aggregate_projection_outputs(
                     );
                 }
                 work.flush()?;
+                if resolved.function_id.as_str() == "builtin.aggregate/approx_distinct/v1" {
+                    let state = resolved
+                        .selected
+                        .aggregate
+                        .as_ref()
+                        .expect("resolved approx_distinct state signature");
+                    return Err(
+                        crate::analyze_error::AnalyzeError::unsupported_expression_without_span(
+                            format!(
+                                "Iceberg IMV requires an installed persistent state author for overload {} (ordinary state format {}). The approx_distinct IVM state contract is unavailable",
+                                resolved.selected.overload.as_str(), state.state_format.as_str(),
+                            ),
+                        ).into(),
+                    );
+                }
                 validate_supported_aggregate_call(name, args.len(), *distinct, order_by)?;
                 validate_aggregate_argument_exprs(args)?;
                 aggregate_count += 1;
