@@ -46,9 +46,9 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorMetadataCleanupResponsibility, ConnectorRequestContext,
-    ConnectorWriteAbortOutcome, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, LakePublicationDisposition, LakePublicationFamily,
-    LakePublicationId, LakePublicationStatementTag, LakePublicationTarget,
+    ConnectorStagedWriteProof, ConnectorWriteAbortOutcome, CreatePolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationDisposition,
+    LakePublicationFamily, LakePublicationId, LakePublicationStatementTag, LakePublicationTarget,
 };
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::{
@@ -60,6 +60,29 @@ use novarocks_spi::connector::write_stack::{
     ConnectorWriteNeededReady, ConnectorWritePublicationCompletion,
 };
 type WriteOutcome = Result<ConnectorWritePublicationCompletion, ConnectorError>;
+
+#[derive(Default)]
+struct CtasSealBinding {
+    context: Option<ConnectorRequestContext>,
+    proof: Option<ConnectorStagedWriteProof>,
+}
+impl CtasSealBinding {
+    fn bind_once(
+        &mut self,
+        needed: Arc<ConnectorWriteNeededReady>,
+        bind: impl FnOnce(
+            Arc<ConnectorWriteNeededReady>,
+            ConnectorRequestContext,
+        ) -> StandardCtasWriteOutcome,
+    ) -> Option<StandardCtasWriteOutcome> {
+        let outcome = bind(needed, self.context.take()?);
+        if let StandardCtasWriteOutcome::Completed { write, .. } = &outcome {
+            self.proof = Some(write.clone());
+        }
+        Some(outcome)
+    }
+}
+
 /// Original receiving storage exists before its first foreign poll and Drop.
 struct PhaseSlot<T> {
     future: Option<Pin<Box<dyn Future<Output = T> + Send>>>,
@@ -223,8 +246,8 @@ struct CtasSource {
     seal_needed: Option<Arc<ConnectorWriteNeededReady>>,
     seal_abort: Option<Result<ConnectorWriteAbortOutcome, ConnectorError>>,
     seal_settled: bool,
-    terminal_context: Option<ConnectorRequestContext>,
     seal_reconciled: bool,
+    seal_binding: CtasSealBinding,
     publish_input: Option<Arc<CatalogInput>>,
     publish: PhaseSlot<Result<StandardCtasPublishOutcome, CtasFailure>>,
     publication_boundary_received: bool,
@@ -387,8 +410,8 @@ fn prepare_from_preflight(
             seal_needed: None,
             seal_abort: None,
             seal_settled: false,
-            terminal_context: None,
             seal_reconciled: false,
+            seal_binding: CtasSealBinding::default(),
             publish_input: None,
             publish: PhaseSlot::default(),
             publication_boundary_received: false,
@@ -562,7 +585,7 @@ impl CtasSource {
                 // Retain the same terminal resolver BEFORE the original Call
                 // releases its alias. A context clone grants no seal proof.
                 match session.following_terminal_context(self.context.clone()) {
-                    Ok(context) => self.terminal_context = Some(context),
+                    Ok(context) => self.seal_binding.context = Some(context),
                     Err(error) => {
                         self.close_failure =
                             Some(StatementNativeHealthFailure::actual_exit_unproven(
@@ -660,8 +683,49 @@ impl CtasSource {
             ));
             return Poll::Pending;
         }
+        if (matches!(
+            self.seal_outcome,
+            Some(Ok(
+                ConnectorWritePublicationCompletion::CommitUnknown { .. }
+            ))
+        ) || matches!(
+            self.seal_abort,
+            Some(Ok(ConnectorWriteAbortOutcome::CommitUnknown { .. }))
+        )) && let Some(target) = &self.target
+            && let Err(error) = mark_governed_ctas_write_unknown(target.handle.as_ref())
+        {
+            self.close_failure = Some(StatementNativeHealthFailure::actual_exit_unproven(
+                "CTAS unknown write responsibility transition failed",
+                Arc::new(error),
+            ));
+            return Poll::Pending;
+        }
         self.seal_settled = true;
         Poll::Ready(())
+    }
+
+    /// The exact seal transfers custody even after the statement has selected a failure.
+    fn bind_sealed_write(&mut self) -> Option<StandardCtasWriteOutcome> {
+        let needed = self.seal_needed.as_ref().map(Arc::clone).or_else(|| {
+            match self.seal_outcome.as_ref() {
+                Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
+                    needed, ..
+                })) => Some(Arc::clone(needed)),
+                _ => None,
+            }
+        })?;
+        self.seal_binding.bind_once(needed, |needed, context| {
+            self.prepared_write
+                .as_ref()
+                .expect("original CTAS sealed write")
+                .bind_needed_sealed_write(
+                    self.ready
+                        .as_ref()
+                        .expect("original CTAS write computation"),
+                    needed,
+                    context,
+                )
+        })
     }
     fn poll_inner(
         &mut self,
@@ -970,46 +1034,12 @@ impl CtasSource {
                         self.fail(governed_query_execution_error(error));
                         continue;
                     }
-                    // Only the lease-validated ACTUAL seal can authorize this
-                    // pure bind and consume the retained terminal resolver.
-                    if self.seal_needed.is_none()
-                        && let Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
-                            needed,
-                            ..
-                        })) = self.seal_outcome.as_ref()
-                    {
-                        self.seal_needed = Some(Arc::clone(needed));
-                    }
-                    let Some(needed) = self.seal_needed.as_ref().map(Arc::clone) else {
-                        if matches!(
-                            self.seal_outcome,
-                            Some(Ok(
-                                ConnectorWritePublicationCompletion::CommitUnknown { .. }
-                            ))
-                        ) && let Err(error) =
-                            self.prepared_write.as_ref().unwrap().mark_write_unknown()
-                        {
-                            self.close_failure =
-                                Some(StatementNativeHealthFailure::actual_exit_unproven(
-                                    "CTAS unknown write responsibility transition failed",
-                                    Arc::new(error),
-                                ));
-                            return Poll::Pending;
-                        }
+                    let Some(write) = self.bind_sealed_write() else {
                         self.fail(internal_error(
                             "CTAS staged write sealing did not prove a publishable write",
                         ));
                         continue;
                     };
-                    let write = self
-                        .prepared_write
-                        .as_ref()
-                        .unwrap()
-                        .bind_needed_sealed_write(
-                            self.ready.as_ref().unwrap(),
-                            needed,
-                            self.terminal_context.take().unwrap(),
-                        );
                     match write {
                         StandardCtasWriteOutcome::Completed {
                             write,
@@ -1226,10 +1256,15 @@ impl CtasSource {
                     if self.poll_seal(&cancellation, cx).is_pending() {
                         return Poll::Pending;
                     }
+                    if let Some(StandardCtasWriteOutcome::KnownUncommitted { failure }) =
+                        self.bind_sealed_write()
+                    {
+                        self.failure(*failure);
+                    }
                     if !self.native_launch_attempted
                         && !self.publish.started
                         && let Some(target) = self.target.as_ref()
-                        && self.unlaunched_session_disposed()
+                        && self.unsealed_write_disposed()
                     {
                         if let Some(health) = self.subordinate_health() {
                             self.close_failure = Some(health);
@@ -1246,11 +1281,11 @@ impl CtasSource {
                                 }
                                 Poll::Ready(Ok(())) => {}
                             }
-                            self.target_abort
-                                .start(abort_governed_unlaunched_ctas_target(
-                                    target.handle.clone(),
-                                    self.controls.clone(),
-                                ));
+                            self.target_abort.start(abort_governed_ctas_target(
+                                target.handle.clone(),
+                                self.controls.clone(),
+                                None,
+                            ));
                         }
                         if self.target_abort.poll_settled(cx).is_pending() {
                             return Poll::Pending;
@@ -1292,7 +1327,7 @@ impl CtasSource {
                     // observes both physical exit and inventory disposition.
                     drop(self.adjudication_input.take());
                     drop(self.assembly.take());
-                    drop(self.terminal_context.take());
+                    drop(self.seal_binding.context.take());
                     self.phase = Phase::Done;
                     self.completed = true;
                 }
@@ -1329,7 +1364,7 @@ impl CtasSource {
         )));
         self.phase = Phase::Close;
     }
-    fn unlaunched_session_disposed(&self) -> bool {
+    fn unsealed_write_disposed(&self) -> bool {
         match self.session() {
             None => {
                 self.seal_needed.is_none()
@@ -1337,10 +1372,15 @@ impl CtasSource {
                     && self.seal_abort.is_none()
             }
             Some(session) => {
-                matches!(
+                (matches!(
                     self.seal_abort,
                     Some(Ok(ConnectorWriteAbortOutcome::KnownUncommitted { .. }))
-                ) && matches!(
+                ) || matches!(
+                    self.seal_outcome,
+                    Some(Ok(
+                        ConnectorWritePublicationCompletion::KnownUncommitted { .. }
+                    ))
+                )) && matches!(
                     session.cleanup_responsibility(),
                     Ok(ConnectorMetadataCleanupResponsibility::Disposed)
                 )
@@ -1530,6 +1570,22 @@ impl GovernedStatementResidual for CtasResidual {
         let mut physical_pending = pending;
         if !pending && !source.target_disposed {
             if let Some(target) = &source.target {
+                if !source.target_abort.started
+                    && source.native_launch_attempted
+                    && (!source.publish.started || source.controls.publication_factory_refused())
+                    && (source.seal_binding.proof.is_some() || source.unsealed_write_disposed())
+                {
+                    source.target_abort.start(abort_governed_ctas_target(
+                        target.handle.clone(),
+                        source.controls.clone(),
+                        source.seal_binding.proof.clone(),
+                    ));
+                }
+                if source.target_abort.started && source.target_abort.poll_settled(cx).is_pending()
+                {
+                    source.busy = false;
+                    return Poll::Pending;
+                }
                 if !source.target_disposal_observed {
                     let may_settle =
                         match governed_ctas_target_cleanup_responsibility(target.handle.as_ref()) {
@@ -1817,7 +1873,7 @@ mod tests {
         ));
     }
     #[test]
-    fn terminal_context_retention_does_not_substitute_for_actual_seal_receipt() {
+    fn actual_seal_transfers_once_and_keeps_the_exact_proof_for_abort() {
         use crate::query_execution::{
             write_result::DecodedPreparedWriteSet, write_session::tests as fixture,
         };
@@ -1841,6 +1897,12 @@ mod tests {
             .session
             .following_terminal_context(fixture::request_context())
             .unwrap();
+        let deadline = retained.deadline();
+        let mut binding = CtasSealBinding {
+            context: Some(retained),
+            ..Default::default()
+        };
+        assert!(binding.proof.is_none());
         assert_eq!(fixture.session.finish_invocations(), 0);
         let mut call = fixture
             .session
@@ -1852,11 +1914,33 @@ mod tests {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(call.poll_completed(&mut cx).is_ready());
         call.take_outcome_in(&mut original_result).unwrap();
-        assert!(matches!(
-            original_result,
-            Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted { needed, .. })) if needed.effect() == ExternalMutationEffect::NoOp
-        ));
+        let Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted { needed, .. })) =
+            original_result
+        else {
+            panic!("original CTAS seal must report completion");
+        };
+        assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
         assert_eq!(fixture.session.finish_invocations(), 1);
-        drop(retained);
+
+        let result = binding.bind_once(Arc::clone(&needed), |seal, context| {
+            assert!(Arc::ptr_eq(&seal, &needed));
+            assert_eq!(context.deadline(), deadline);
+            StandardCtasWriteOutcome::Completed {
+                write: ConnectorStagedWriteProof::try_from_needed_ready(seal, 7).unwrap(),
+                execution_identity: [3; 32],
+            }
+        });
+        drop(result);
+        let proof = binding
+            .proof
+            .as_ref()
+            .expect("same seal retained for abort");
+        assert!(std::ptr::eq(proof.receipt(), needed.receipt()));
+        assert_eq!(proof.row_count(), 7);
+        assert!(
+            binding
+                .bind_once(needed, |_, _| panic!("a sealed write binds once"))
+                .is_none()
+        );
     }
 }

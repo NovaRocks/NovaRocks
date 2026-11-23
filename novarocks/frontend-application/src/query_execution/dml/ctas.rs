@@ -2269,8 +2269,12 @@ fn map_governed_ctas_publish_outcome(
     }
 }
 impl GovernedCtasControlReceiving {
-    pub(crate) fn publication_confirmed_not_dispatched(&self) -> bool {
+    pub(crate) fn publication_factory_refused(&self) -> bool {
         self.publication_factory_refused.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publication_confirmed_not_dispatched(&self) -> bool {
+        self.publication_factory_refused()
             || self
                 .publication_original
                 .observation()
@@ -2443,12 +2447,12 @@ impl PreparedStandardCtasTarget {
         ))
     }
 }
-impl PreparedGovernedCtasWrite {
-    pub(crate) fn mark_write_unknown(
-        &self,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        self.target.mark_write_unknown()
-    }
+pub(crate) fn mark_governed_ctas_write_unknown(
+    target: &dyn CtasPreparedTarget,
+) -> Result<(), CtasFailure> {
+    downcast_standard_target(target)?
+        .mark_write_unknown()
+        .map_err(connector_failure)
 }
 impl CtasFailure {
     pub(crate) fn into_governed_dml_error(self, source: &str) -> crate::dml::error::DmlError {
@@ -2547,20 +2551,20 @@ pub(crate) fn acknowledge_governed_ctas_target_cleanup(
         .map_err(connector_failure)
 }
 
-/// The original Action calls this only after its exclusive target was
-/// prepared, before any Native launch attempt, and after actual local I/O
-/// quiescence. The same lease still independently checks the exact handle
-/// and unpublished frontier before entering the Provider.
-pub(crate) async fn abort_governed_unlaunched_ctas_target(
+/// The original Action calls this after the prior work has retired and before
+/// any publication execution took custody. The lease independently checks
+/// the exact handle, unpublished frontier and bound proof before Provider I/O.
+pub(crate) async fn abort_governed_ctas_target(
     target: Arc<dyn CtasPreparedTarget>,
     receiving: Arc<GovernedCtasControlReceiving>,
+    write: Option<ConnectorStagedWriteProof>,
 ) -> Result<novarocks_spi::connector::ConnectorStagedCreateAbortOutcome, CtasFailure> {
     let target = downcast_standard_target(target.as_ref())?;
     if target.write_unknown_latched.load(Ordering::Acquire)
-        || target.publish_started.load(Ordering::Acquire)
+        || (write.is_none() && target.publish_started.load(Ordering::Acquire))
     {
         return Err(internal_failure(
-            "Unlaunched CTAS cleanup requires its original unpublished resolved target",
+            "CTAS abort requires its original unpublished resolved target",
         ));
     }
     let context = target
@@ -2574,7 +2578,7 @@ pub(crate) async fn abort_governed_unlaunched_ctas_target(
             novarocks_spi::connector::ConnectorStagedCreateAbortRequest {
                 operation_id: target.handle.operation_id(),
                 handle: target.handle.clone(),
-                write: None,
+                write,
                 context,
             },
             &receiving.target_abort,
