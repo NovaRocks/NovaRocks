@@ -19,12 +19,12 @@ use super::*;
 use crate::constant::test_constant_policy;
 use crate::optimizer::test_optimizer_control;
 use arrow::array::{
-    Array, FixedSizeBinaryArray, Float32Array, Int32Array, UInt32Array, make_array, new_null_array,
+    Array, FixedSizeBinaryArray, Float32Array, Int32Array, StringArray, UInt32Array, make_array,
+    new_null_array,
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::i256;
 use novarocks_failure_contract::{FailureClass, FailureProjection};
-use novarocks_functions::ConstantError;
 use novarocks_type_contract::{
     CompileControlError, NR_LOGICAL_TYPE_KEY, ValueLayout, ValueTypeStorageLifetime,
 };

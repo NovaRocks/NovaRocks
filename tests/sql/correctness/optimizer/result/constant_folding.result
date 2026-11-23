@@ -1,6 +1,6 @@
 -- query 4
 -- types	integer
-_col0
+int_sum
 42096
 
 -- query 5
@@ -20,7 +20,7 @@ id
 
 -- query 13
 -- types	integer
-_col0
+int_sum
 42096
 
 -- query 14

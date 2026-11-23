@@ -41,9 +41,9 @@ INSERT INTO ${case_db}.t_fold_dates VALUES
 -- ---------------------------------------------------------------------------
 -- 1. Constant arithmetic collapses to one literal.
 -- ---------------------------------------------------------------------------
--- @explain_contains=[42096 AS
--- @explain_not_contains=[40000 + 2000 + 96 AS
-SELECT 40000 + 2000 + 96;
+-- @explain_contains=[42096 AS int_sum]
+-- @explain_not_contains=40000 + 2000
+SELECT 40000 + 2000 + 96 AS int_sum;
 
 -- ---------------------------------------------------------------------------
 -- 2. A constant function call collapses to its result literal. The DATE cast
@@ -99,10 +99,10 @@ SELECT 1 / 0;
 -- ---------------------------------------------------------------------------
 SET SESSION disable_optimizer_rules = 'FoldConstant';
 
--- @explain_contains=[40000 + 2000 + 96 AS
-SELECT 40000 + 2000 + 96;
+-- @explain_contains=40000 + 2000
+SELECT 40000 + 2000 + 96 AS int_sum;
 
--- @explain_contains=predicates: dt = CAST('2020-01-01' AS Date32)
+-- @explain_contains=predicate: dt = CAST('2020-01-01' AS Date32)
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = CAST('2020-01-01' AS DATE);
 
 -- ---------------------------------------------------------------------------

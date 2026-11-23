@@ -251,7 +251,9 @@ impl TemporalSyntax {
             let precision = match source.value_type().kind() {
                 ValueKind::Temporal(T::Timestamp(p)) => *p,
                 ValueKind::Temporal(T::TimestampWithTimeZone(p)) if !interpret_local => *p,
-                ValueKind::Scalar(DataType::Date32 | DataType::Null) => TemporalPrecision::DEFAULT,
+                ValueKind::Scalar(DataType::Date32 | DataType::Null) => {
+                    TemporalPrecision::WHOLE_SECONDS
+                }
                 _ => return Err(FunctionBindingError::NoMatchingOverload),
             };
             let argument_type = if interpret_local {

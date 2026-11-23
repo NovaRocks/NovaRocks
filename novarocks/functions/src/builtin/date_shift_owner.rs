@@ -348,7 +348,7 @@ impl DateShiftResolver {
                     ValueKind::Scalar(DataType::Date32 | DataType::Null) => temporal_argument(
                         source,
                         &ValueKind::Temporal(TemporalType::Timestamp(
-                            novarocks_type_contract::TemporalPrecision::DEFAULT,
+                            novarocks_type_contract::TemporalPrecision::WHOLE_SECONDS,
                         )),
                     )?,
                     ValueKind::Temporal(
@@ -381,7 +381,7 @@ impl DateShiftResolver {
                     ValueKind::Scalar(DataType::Date32) => temporal_argument(
                         source,
                         &ValueKind::Temporal(TemporalType::Timestamp(
-                            novarocks_type_contract::TemporalPrecision::DEFAULT,
+                            novarocks_type_contract::TemporalPrecision::WHOLE_SECONDS,
                         )),
                     )?,
                     ValueKind::Temporal(

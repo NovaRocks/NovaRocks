@@ -172,6 +172,20 @@ fn temporal_public_clocks_and_epoch_share_the_frozen_environment() {
         &context,
     );
 
+    for sql in [
+        "at_timezone(DATE '2024-03-01', 'UTC')",
+        "with_timezone(DATE '2024-03-01', 'UTC')",
+    ] {
+        let result = constant(sql, &context);
+        assert_eq!(
+            result.batch.result_type.value_type().temporal(),
+            Some(TemporalType::TimestampWithTimeZone(
+                TemporalPrecision::WHOLE_SECONDS
+            )),
+            "{sql}"
+        );
+    }
+
     let sql = "TRY(from_unixtime(DOUBLE '0.0', 'Not/AZone'))";
     let unit = compile(sql, &[], &context);
     let result = evaluate(&unit, &batch(&[], vec![]));
