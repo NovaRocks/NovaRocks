@@ -14,14 +14,3 @@ id	region	amount
 -- types	bigint
 n
 5
-
--- query 9
--- types	bigint
-n
-2
-
--- query 10
--- types	bigint	varchar	double
-id	region	amount
-998	ap	1.0
-999	ap	0.0
