@@ -22,20 +22,25 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+#[cfg(test)]
 use crate::iceberg::expr::Predicate;
-use crate::iceberg::spec::{DataContentType, ManifestFile, TableMetadata};
+#[cfg(test)]
+use crate::iceberg::spec::TableMetadata;
+use crate::iceberg::spec::{DataContentType, ManifestFile};
 use crate::iceberg::{Error, ErrorKind, Result};
 use crate::manifest::target_query::ManifestReadScope;
 
 use super::conflict::CandidateFile;
+use super::delete_condition::IcebergDeleteConditionFact;
 use super::manifest_sources::{LocatedEntry, duplicate_identity};
 use super::model::OperationIntent;
 use super::staging::{PreparedChange, Preparer, StagedView};
+use condition::ConditionJudge;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "The production TRUNCATE judge matches all rows")
-)]
+mod condition;
+mod metrics;
+mod projection;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileVerdict {
     All,
@@ -43,9 +48,8 @@ pub(crate) enum FileVerdict {
     None,
 }
 
-/// One judge evaluates the same frozen row predicate at two levels.
-pub(crate) trait RowFilterJudge: Send + Sync {
-    /// An inclusive test: false is proof that the manifest cannot match.
+#[cfg(test)]
+trait RowFilterJudge: Send + Sync {
     fn manifest_may_match(
         &self,
         filter: &Predicate,
@@ -56,42 +60,75 @@ pub(crate) trait RowFilterJudge: Send + Sync {
     fn file_verdict(&self, filter: &Predicate, file: &CandidateFile<'_>) -> FileVerdict;
 }
 
-pub(crate) struct AlwaysTrue;
-
-impl RowFilterJudge for AlwaysTrue {
-    fn manifest_may_match(
-        &self,
-        _filter: &Predicate,
-        _metadata: &TableMetadata,
-        _manifest: &ManifestFile,
-    ) -> bool {
-        true
-    }
-
-    fn file_verdict(&self, _filter: &Predicate, _file: &CandidateFile<'_>) -> FileVerdict {
-        FileVerdict::All
-    }
+enum Selection {
+    AllRows,
+    Condition(Arc<IcebergDeleteConditionFact>),
+    #[cfg(test)]
+    Scripted(Predicate, Arc<dyn RowFilterJudge>),
 }
 
 // Design: ADR-0251 (docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)
 /// Selection is always derived from B. The operation intent owns the protocol label.
 pub(crate) struct FilterDeletePreparer {
-    filter: Predicate,
-    judge: Arc<dyn RowFilterJudge>,
+    selection: Selection,
     full_refresh: bool,
 }
 
 impl FilterDeletePreparer {
-    pub(crate) fn new(filter: Predicate, judge: Arc<dyn RowFilterJudge>) -> Self {
+    #[cfg(test)]
+    fn new(filter: Predicate, judge: Arc<dyn RowFilterJudge>) -> Self {
         Self {
-            filter,
-            judge,
+            selection: Selection::Scripted(filter, judge),
             full_refresh: false,
         }
     }
 
     pub(crate) fn always_true() -> Self {
-        Self::new(Predicate::AlwaysTrue, Arc::new(AlwaysTrue))
+        Self {
+            selection: Selection::AllRows,
+            full_refresh: false,
+        }
+    }
+
+    pub(crate) fn for_condition(fact: Arc<IcebergDeleteConditionFact>) -> Self {
+        Self {
+            selection: Selection::Condition(fact),
+            full_refresh: false,
+        }
+    }
+
+    fn manifest_may_match(
+        &self,
+        _metadata: &crate::iceberg::spec::TableMetadata,
+        prepared: Option<&ConditionJudge<'_>>,
+        manifest: &ManifestFile,
+    ) -> bool {
+        #[cfg(test)]
+        if let Selection::Scripted(filter, judge) = &self.selection {
+            return judge.manifest_may_match(filter, _metadata, manifest);
+        }
+        prepared.is_none_or(|judge| judge.manifest_may_match(manifest))
+    }
+
+    fn file_verdict(
+        &self,
+        prepared: Option<&ConditionJudge<'_>>,
+        file: &CandidateFile<'_>,
+    ) -> Result<FileVerdict> {
+        #[cfg(test)]
+        if let Selection::Scripted(filter, judge) = &self.selection {
+            return Ok(judge.file_verdict(filter, file));
+        }
+        prepared.map_or(Ok(FileVerdict::All), |judge| judge.file_verdict(file))
+    }
+
+    fn filter_description(&self) -> String {
+        match &self.selection {
+            Selection::AllRows => "true".to_owned(),
+            Selection::Condition(fact) => condition::describe(&fact.condition),
+            #[cfg(test)]
+            Selection::Scripted(filter, _) => filter.to_string(),
+        }
     }
 
     pub(crate) fn for_full_refresh() -> Self {
@@ -121,15 +158,32 @@ impl Preparer for FilterDeletePreparer {
 
         let artifacts = view.artifacts();
         let active = || artifacts.check_active();
+        active()?;
+        let operation = intent.protocol().operation();
+        let mut prepared = match &self.selection {
+            Selection::Condition(fact) => {
+                Some(ConditionJudge::for_base(fact, metadata, operation)?)
+            }
+            _ => None,
+        };
         let sources = view.target_sources().await?;
         let mut removals = BTreeMap::new();
         let mut scope = None;
         if let Some(sources) = &sources {
+            if let Some(judge) = &mut prepared {
+                judge.prepare_specs(
+                    metadata,
+                    sources
+                        .sources()
+                        .map(|source| source.descriptor.partition_spec_id),
+                    &active,
+                )?;
+            }
             sources
                 .fold_indexed(
                     artifacts.file_io(),
                     active,
-                    |manifest| self.judge.manifest_may_match(&self.filter, metadata, manifest),
+                    |manifest| self.manifest_may_match(metadata, prepared.as_ref(), manifest),
                     |index, entry| {
                         if !entry.raw.is_alive() {
                             return Ok(());
@@ -140,7 +194,7 @@ impl Preparer for FilterDeletePreparer {
                             spec_id: entry.source.descriptor.partition_spec_id,
                             file,
                         };
-                        match self.judge.file_verdict(&self.filter, &candidate) {
+                        match self.file_verdict(prepared.as_ref(), &candidate)? {
                             FileVerdict::All => {
                                 let entry = LocatedEntry::from_bound(index, &entry)?;
                                 let identity = entry.frozen.identity().clone();
@@ -154,9 +208,9 @@ impl Preparer for FilterDeletePreparer {
                                 }
                             }
                             FileVerdict::Partial if file.content_type() == DataContentType::Data => {
-                                return Err(super::new_manifests::commit_validation_error(format!(
+                                return Err(super::new_manifests::commit_validation_error_for(operation, format!(
                                     "Cannot delete file where some, but not all, rows match filter {}: {}",
-                                    self.filter,
+                                    self.filter_description(),
                                     file.file_path(),
                                 )));
                             }

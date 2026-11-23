@@ -1,0 +1,34 @@
+-- query 1
+-- types	double	double	double	double	double	double
+sample_sd	sample_sd_alias	population_sd	sample_variance	sample_variance_alias	population_variance
+NULL	NULL	NULL	NULL	NULL	NULL
+
+-- query 2
+-- types	double	double	double	double	double	double
+sample_sd	sample_sd_alias	population_sd	sample_variance	sample_variance_alias	population_variance
+NULL	NULL	0.0	NULL	NULL	0.0
+
+-- query 3
+-- types	double	double	double	double	double	double
+sample_sd	sample_sd_alias	population_sd	sample_variance	sample_variance_alias	population_variance
+1.4142135623730951	1.4142135623730951	1.0	2.0	2.0	1.0
+
+-- query 4
+-- types	array(integer)	array(integer)
+smallest	largest
+NULL	NULL
+
+-- query 5
+-- types	array(integer)	array(integer)
+smallest	largest
+[1,2,2]	[2,2,1]
+
+-- query 7
+-- types	array(integer)	array(integer)	map(integer, integer)	map(integer, integer)
+empty_array	selected_null	empty_map	valid_key_with_null_value
+NULL	[null]	NULL	{"1":null}
+
+-- query 8
+-- types	boolean	boolean	boolean
+some_true	all_true	all_true_alias
+true	false	false

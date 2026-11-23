@@ -1,0 +1,16 @@
+-- query 2
+-- types	bigint
+snapshots
+1
+
+-- query 7
+-- types	bigint
+snapshots
+1
+
+-- query 8
+-- types	bigint	integer
+id	p
+1	10
+2	10
+3	20

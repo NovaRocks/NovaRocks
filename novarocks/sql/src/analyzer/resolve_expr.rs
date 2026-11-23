@@ -28,7 +28,8 @@ use novarocks_parser::printer::print_object_name;
 use crate::analysis::*;
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use novarocks_type_contract::{
-    ArithmeticOperator, TemporalType, ValueTypeRef, arithmetic_result_value_type_with_op,
+    ArithmeticOperator, CharacterKind, TemporalType, ValueKind, ValueTypeRef,
+    arithmetic_result_value_type_with_op,
 };
 
 use super::functions::*;
@@ -197,14 +198,13 @@ struct FunctionMetadata<'a> {
 fn unsupported_remaining_root(expr: &ast::Expr) -> bool {
     matches!(
         expr,
-        ast::Expr::Overlay(_)
-            | ast::Expr::MethodCall(_)
+        ast::Expr::MethodCall(_)
             | ast::Expr::StaticMethodCall(_)
             | ast::Expr::CurrentCatalog(_)
             | ast::Expr::CurrentPath(_)
             | ast::Expr::CurrentSchema(_)
             | ast::Expr::CurrentUser(_)
-    ) || matches!(expr, ast::Expr::Trim(node) if node.trim_character.is_some())
+    )
 }
 
 impl<'a> super::AnalyzerContext<'a> {
@@ -216,6 +216,9 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         self.check_control()?;
+        if let ast::Expr::Parameter(parameter) = expr {
+            return self.analyze_prepared_parameter(parameter);
+        }
         // Direct expression admission precedes its own CV lookup. This is not
         // a whole-tree prepass over opaque declaration shortcuts.
         if unsupported_remaining_root(expr) {
@@ -257,6 +260,43 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(resolved)
     }
 
+    fn analyze_prepared_parameter(
+        &self,
+        parameter: &ast::Parameter,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let parameters = self
+            .prepared_parameters
+            .filter(|parameters| parameters.ordinal(parameter.span).is_some())
+            .ok_or_else(|| {
+                AnalyzeError::unsupported_expression(
+                    "Parameter has no binding in this statement",
+                    parameter.span,
+                )
+            })?;
+        if parameters.is_description() {
+            let ordinal = parameters
+                .ordinal(parameter.span)
+                .expect("validated occurrence");
+            return self
+                .factory
+                .borrow()
+                .prepared_description
+                .as_ref()
+                .ok_or_else(|| {
+                    AnalyzeError::internal("Unknown parameter outside description analysis")
+                })?
+                .parameter(ordinal);
+        }
+        let argument = parameters
+            .argument_at(parameter.span)
+            .expect("validated parameter ordinal");
+        let source_sql = parameters
+            .argument_sql()
+            .expect("validated argument source");
+        self.analyze_expr(argument, &self.new_scope())
+            .map_err(|error| error.in_expression_source(source_sql.clone()))
+    }
+
     #[recursive::recursive]
     fn analyze_expr_impl(
         &self,
@@ -285,6 +325,8 @@ impl<'a> super::AnalyzerContext<'a> {
             | ast::Expr::NullIf(_)
             | ast::Expr::Coalesce(_)
             | ast::Expr::Try(_)
+            | ast::Expr::Format(_)
+            | ast::Expr::Overlay(_)
             | ast::Expr::Extract(_) => unreachable!("canonical syntax call was already mapped"),
             ast::Expr::JsonQuery(node) => self.analyze_json_query_syntax(node, scope),
             ast::Expr::JsonObject(node) => self.analyze_json_object_syntax(node, scope),
@@ -354,8 +396,7 @@ impl<'a> super::AnalyzerContext<'a> {
             | ast::Expr::CurrentTimestamp(_)
             | ast::Expr::LocalTime(_)
             | ast::Expr::LocalTimestamp(_) => self.type_clock(expr),
-            ast::Expr::Overlay(_)
-            | ast::Expr::MethodCall(_)
+            ast::Expr::MethodCall(_)
             | ast::Expr::StaticMethodCall(_)
             | ast::Expr::CurrentCatalog(_)
             | ast::Expr::CurrentPath(_)
@@ -454,11 +495,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 scope,
                 case.span,
             ),
-
-            ast::Expr::Format(node) => Err(AnalyzeError::unsupported_expression(
-                "FORMAT expressions are not supported",
-                node.span,
-            )),
 
             // Function call
             ast::Expr::FunctionCall(func) => self.analyze_function(func, scope),
@@ -1582,6 +1618,21 @@ impl<'a> super::AnalyzerContext<'a> {
         )
     }
 
+    fn coerce_window_operand(
+        &self,
+        source: TypedExpr,
+        target: &novarocks_type_contract::FunctionValueType,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        if source.value_type.data_type() == &DataType::Null
+            && matches!(&source.kind, ExprKind::Literal(LiteralValue::Null))
+        {
+            let target = super::helpers::with_nullability(target.clone(), true);
+            return self.cast_to_value_type(source, target, span);
+        }
+        self.coerce_common_value(source, target, span)
+    }
+
     fn analyze_binary_op(
         &self,
         binary: &ast::BinaryExpr,
@@ -2009,26 +2060,14 @@ impl<'a> super::AnalyzerContext<'a> {
         if let Some(reason) = unsupported_call_facts(func) {
             return Err(AnalyzeError::unsupported_expression(reason, func.span));
         }
-        // These exact canonical Trino calls have no selected implementation.
-        // Keep this direct capability refusal after the original metadata guard;
-        // qualified and differently quoted ordinary names retain their lookup.
-        if let [name] = func.name.parts.as_slice()
-            && ((!name.quoted && name.value.eq_ignore_ascii_case("strpos"))
-                || (name.quoted && name.value == "normalize"))
-        {
-            return Err(AnalyzeError::unsupported_expression(
-                format!(
-                    "builtin function `{}` has no admitted selected scalar implementation",
-                    name.value.to_ascii_lowercase()
-                ),
-                func.span,
-            ));
-        }
-        let original_name = print_object_name(&func.name).to_ascii_lowercase();
+        let original_name = match func.name.parts.as_slice() {
+            [name] if name.value.eq_ignore_ascii_case("normalize") => "normalize".to_owned(),
+            _ => print_object_name(&func.name).to_ascii_lowercase(),
+        };
         let original_input = if func.filter.is_some()
             && func.window.is_none()
             && (is_aggregate_function(self.function_catalog, &original_name)
-                || is_analyzer_aggregate_syntax(&original_name))
+                || analyzer_aggregate_alias(&original_name).is_some())
         {
             self.grouping_scope
                 .borrow()
@@ -2122,7 +2161,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         call.window.is_some()
                             || name == "grouping"
                             || is_aggregate_function(self.analyzer.function_catalog, &name)
-                            || is_analyzer_aggregate_syntax(&name)
+                            || analyzer_aggregate_alias(&name).is_some()
                     }
                     _ => false,
                 };
@@ -2193,14 +2232,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 func.span,
             ));
         }
-        let name = match original_name.as_str() {
-            "every" => "bool_and".to_string(),
-            _ => original_name,
-        };
-        let mut name = name;
+        let mut name = analyzer_aggregate_alias(&original_name)
+            .map(str::to_owned)
+            .unwrap_or(original_name);
 
-        // Preserve the original zero-input ORDER BY refusal before aggregate
-        // ordering validation. Legacy SEPARATOR is normalized by its parser owner.
+        // Reject a function-local ordering with no arguments.
         if original_arguments.is_empty() && func.order_by.is_some() {
             return Err(AnalyzeError::invalid_query_shape(
                 if func.distinct {
@@ -2248,13 +2284,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
             });
         }
-        if matches!(name.as_str(), "group_concat" | "string_agg") && arg_exprs.is_empty() {
-            return Err(AnalyzeError::invalid_argument(
-                "group_concat should have at least one input.",
-                func.span,
-            ));
-        }
-        if matches!(name.as_str(), "array_agg" | "array_agg_distinct") {
+        if name == "array_agg" {
             if arg_exprs.is_empty() {
                 return Err(AnalyzeError::invalid_argument(
                     "array_agg should have at least one input.",
@@ -2423,10 +2453,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
 
-        let needs_boolean_args = matches!(
-            name.as_str(),
-            "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" | "count_if"
-        );
+        let needs_boolean_args = matches!(name.as_str(), "bool_or" | "bool_and" | "count_if");
         if needs_boolean_args {
             let boolean = novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true);
             args_typed = args_typed
@@ -2445,17 +2472,85 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
+        if matches!(
+            name.as_str(),
+            "approx_distinct" | "approx_percentile" | "approx_most_frequent"
+        ) {
+            args_typed = args_typed
+                .into_iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    if let Some(data_type) = approximate_aggregate_target(
+                        &name,
+                        index,
+                        arg_types.len(),
+                        &argument.value_type,
+                    ) {
+                        let target = novarocks_type_contract::FunctionValueType::new(
+                            data_type,
+                            argument.value_type.nullable(),
+                        );
+                        self.coerce_common_value(argument, &target, func.span)
+                    } else {
+                        Ok(argument)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            arg_types = args_typed
+                .iter()
+                .map(|argument| argument.value_type.data_type().clone())
+                .collect();
+        }
+
+        if name == "listagg" && args_typed.len() == 5 {
+            if args_typed[0].value_type.data_type() != &DataType::Utf8
+                || args_typed[0].value_type.logical_type()
+                    != novarocks_type_contract::ValueLogicalType::Physical
+            {
+                return Err(AnalyzeError::type_mismatch(
+                    "LISTAGG requires VARCHAR input",
+                    arg_exprs[0].span(),
+                ));
+            }
+            for (index, expected) in [
+                (1, DataType::Utf8),
+                (2, DataType::Boolean),
+                (3, DataType::Utf8),
+                (4, DataType::Boolean),
+            ] {
+                if args_typed[index].value_type.data_type() == &DataType::Null {
+                    let target =
+                        novarocks_type_contract::FunctionValueType::new(expected.clone(), true);
+                    let argument =
+                        self.coerce_common_value(args_typed.remove(index), &target, func.span)?;
+                    args_typed.insert(index, argument);
+                    arg_types[index] = expected;
+                }
+            }
+        }
+
+        if matches!(name.as_str(), "min" | "max") && args_typed.len() == 2 {
+            let n = &args_typed[1].value_type;
+            if n.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && matches!(
+                    n.data_type(),
+                    DataType::Null | DataType::Int8 | DataType::Int16 | DataType::Int32
+                )
+            {
+                let bigint =
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, n.nullable());
+                let limit = self.coerce_common_value(args_typed.remove(1), &bigint, func.span)?;
+                args_typed.push(limit);
+                arg_types[1] = DataType::Int64;
+            }
+        }
+
         if name == "count_if" && is_distinct {
             return Err(AnalyzeError::invalid_query_shape(
                 "Unexpected input '(', the most similar input is {<EOF>, ';'}.",
                 func.span,
             ));
         }
-
-        validate_group_concat_separator_argument(&name, &arg_exprs, &args_typed)
-            .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
-        validate_group_concat_value_arguments(&name, &args_typed)
-            .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
 
         // Extract ORDER BY within function args (for aggregates like array_agg)
         let func_order_by = match func.original {
@@ -2538,21 +2633,36 @@ impl<'a> super::AnalyzerContext<'a> {
                     func.span,
                 ));
             }
-            // StarRocks rejects LEAD/LAG when the third (default) argument
-            // doesn't match a per-shape type rule. The error message echoes
-            // the value column's type (INT/FLOAT/DECIMAL...) and is asserted
-            // by SQL regression tests.
-            if matches!(name.as_str(), "lead" | "lag") && args_typed.len() >= 3 {
-                let value_type = args_typed[0].value_type.data_type().clone();
-                let default_arg = &args_typed[2];
-                if !is_lead_lag_default_arg_acceptable(default_arg, &value_type) {
-                    return Err(AnalyzeError::type_mismatch(
-                        format!(
-                            "The type of the third parameter of LEAD/LAG not match the type {}.",
-                            lead_lag_type_display(&value_type)
-                        ),
+            if matches!(name.as_str(), "lead" | "lag") {
+                if let ast::Window::Specification(specification) = window_type {
+                    if specification.order_by.is_none() {
+                        return Err(AnalyzeError::missing_order_by(
+                            format!("{name} requires an ORDER BY window clause"),
+                            specification.span,
+                        ));
+                    }
+                    if let Some(frame) = &specification.window_frame {
+                        return Err(AnalyzeError::invalid_window_frame(
+                            format!("Cannot specify a window frame for {name}"),
+                            frame.span,
+                        ));
+                    }
+                }
+                if let [value, _, default] = args_typed.as_mut_slice() {
+                    let common = self.require_common_trino_type(
+                        &value.value_type,
+                        &default.value_type,
                         func.span,
-                    ));
+                    )?;
+                    *value = self.coerce_window_operand(value.clone(), &common, func.span)?;
+                    *default = self.coerce_window_operand(default.clone(), &common, func.span)?;
+                }
+                if let Some(offset) = args_typed.get_mut(1) {
+                    let bigint = novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        offset.value_type.nullable(),
+                    );
+                    *offset = self.coerce_window_operand(offset.clone(), &bigint, func.span)?;
                 }
             }
             let (partition_by, order_by, window_frame) =
@@ -2560,6 +2670,7 @@ impl<'a> super::AnalyzerContext<'a> {
             let (execution_name, order_by, window_frame) =
                 crate::analysis::normalize_window_for_execution(&name, order_by, window_frame);
             name = execution_name;
+            let ordinals = self.described_arguments(&args_typed);
             let binding = if let Some(aggregate) = &aggregate_binding {
                 aggregate.clone()
             } else {
@@ -2575,6 +2686,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 args_typed = coerced;
                 binding
             };
+            self.observe_argument_types(
+                ordinals,
+                binding
+                    .selected
+                    .argument_types
+                    .iter()
+                    .map(|target| match target {
+                        novarocks_functions::FunctionArgumentType::Value(value) => Some(value),
+                        novarocks_functions::FunctionArgumentType::Lambda { .. } => None,
+                    }),
+            )?;
             // OVER is authored here; aggregate presence alone is not an OVER ABI.
             let lifecycle = if aggregate_binding.is_some() {
                 novarocks_functions::PureCallLifecycle::AggregateWindow
@@ -2610,35 +2732,6 @@ impl<'a> super::AnalyzerContext<'a> {
             });
         }
 
-        if matches!(name.as_str(), "group_concat" | "string_agg") {
-            args_typed = args_typed
-                .into_iter()
-                .map(|arg| {
-                    if matches!(
-                        arg.value_type.data_type(),
-                        DataType::Utf8 | DataType::LargeUtf8
-                    ) {
-                        Ok(arg)
-                    } else {
-                        let result = novarocks_type_contract::FunctionValueType::new(
-                            DataType::Utf8,
-                            arg.value_type.nullable(),
-                        );
-                        self.cast_with_trino_mode(
-                            arg,
-                            result,
-                            novarocks_type_contract::TrinoCastMode::Explicit,
-                            func.span,
-                        )
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            arg_types = args_typed
-                .iter()
-                .map(|arg| arg.value_type.data_type().clone())
-                .collect();
-        }
-
         if name == "if" && !args_typed.is_empty() {
             let condition = self.require_boolean_predicate(
                 args_typed.remove(0),
@@ -2650,7 +2743,6 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         let mut bound_scalar = None;
-        self.validate_percentile_arguments(&name, &args_typed, func.span)?;
         let mut bound_aggregate = None;
         if is_aggregate_function(self.function_catalog, &name) {
             bound_aggregate = Some(resolve_aggregate_function_call_with_order(
@@ -2711,7 +2803,7 @@ impl<'a> super::AnalyzerContext<'a> {
             };
             // Legacy declarations are type-inspection facts, not installed selected bindings.
             // A custom contribution of the same name is resolved by its own catalog identity.
-            if unknown {
+            if unknown && !matches!(name.as_str(), "format" | "$overlay") {
                 if matches!(
                     crate::functions::builtin_disposition(&name),
                     Some(
@@ -2740,6 +2832,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
             }
+            let ordinals = match route {
+                ScalarTypingRoute::Shared => None,
+                ScalarTypingRoute::Legacy => self.described_arguments(&args_typed),
+            };
             let bound = match route {
                 ScalarTypingRoute::Shared => {
                     let shape = if func.original.is_none() && name == "coalesce" {
@@ -2762,6 +2858,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 )
                 .map_err(|error| error.at_type_mismatch(func.span))?,
             };
+            self.observe_argument_types(
+                ordinals,
+                bound.args.iter().map(|argument| Some(&argument.value_type)),
+            )?;
             // This overload is also exposed by Trino's named array concat call.
             if bound.binding.function_id.as_str() == "builtin.scalar/concat/v1"
                 && bound.binding.logical_argument_count > 127
@@ -2811,16 +2911,19 @@ impl<'a> super::AnalyzerContext<'a> {
                         keys.into_boxed_slice(),
                     ),
                 });
-                if matches!(name.as_str(), "group_concat" | "string_agg") {
-                    signature = signature.with_group_concat_source(
-                        crate::binding::GroupConcatSourceFacts {
-                            legacy: self.sql_semantics.sql_mode().group_concat_legacy(),
-                            max_len: self.sql_semantics.group_concat_max_len(),
-                        },
-                    );
-                }
                 work.finish().map_err(AnalyzeError::control)?;
             }
+            self.observe_argument_types(
+                self.described_arguments(&args_typed),
+                signature
+                    .selected
+                    .argument_types
+                    .iter()
+                    .map(|target| match target {
+                        novarocks_functions::FunctionArgumentType::Value(value) => Some(value),
+                        novarocks_functions::FunctionArgumentType::Lambda { .. } => None,
+                    }),
+            )?;
             let value_type = crate::functions::aggregate_result_type(&signature).clone();
             Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
@@ -2916,114 +3019,6 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
-    fn validate_percentile_arguments(
-        &self,
-        name: &str,
-        args: &[TypedExpr],
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        match name {
-            "percentile_approx" => {
-                if let Some(expr) = args.first() {
-                    validate_percentile_numeric_arg(name, 0, "value", expr)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-            }
-            "percentile_approx_weighted" => {
-                if let Some(expr) = args.first() {
-                    validate_percentile_numeric_arg(name, 0, "value", expr)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-                if let Some(expr) = args.get(1) {
-                    validate_percentile_numeric_arg(name, 1, "weight", expr)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-            }
-            _ => {}
-        }
-
-        let (quantile_idx, compression_idx) = match name {
-            "percentile_approx" => (1usize, 2usize),
-            "percentile_approx_weighted" => (2usize, 3usize),
-            _ => return Ok(()),
-        };
-        if let Some(expr) = args.get(quantile_idx) {
-            self.validate_percentile_quantile_arg(name, quantile_idx, expr, span)?;
-        }
-        if let Some(expr) = args.get(compression_idx) {
-            self.validate_percentile_compression_arg(name, expr, span)?;
-        }
-        Ok(())
-    }
-
-    fn validate_percentile_quantile_arg(
-        &self,
-        name: &str,
-        quantile_idx: usize,
-        expr: &TypedExpr,
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        match &expr.value_type.data_type() {
-            DataType::List(item) => {
-                if matches!(item.data_type(), DataType::Null) {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<NULL_TYPE>.",
-                            ordinal_name(quantile_idx)
-                        ),
-                        span,
-                    ));
-                }
-                if !is_numeric_type(item.data_type()) {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<{:?}>.",
-                            ordinal_name(quantile_idx),
-                            item.data_type()
-                        ),
-                        span,
-                    ));
-                }
-                if let Some(items) = array_literal_items(expr) {
-                    for (idx, item) in items.iter().enumerate() {
-                        if let Some(value) = const_numeric_value(item) {
-                            validate_percentile_value(name, value, Some(idx))
-                                .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                        }
-                    }
-                }
-            }
-            data_type if is_numeric_type(data_type) => {
-                if let Some(value) = const_numeric_value(expr) {
-                    validate_percentile_value(name, value, None)
-                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn validate_percentile_compression_arg(
-        &self,
-        name: &str,
-        expr: &TypedExpr,
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        if let Some(value) = const_numeric_value(expr)
-            && value <= 0.0
-        {
-            return Err(AnalyzeError::invalid_argument(
-                format!(
-                    "Type check failed. compression parameter must be positive in {name}, but got: {}",
-                    format_percentile_error_value(value)
-                ),
-                span,
-            ));
-        }
-        Ok(())
-    }
-
     /// Extract ORDER BY clauses from within function arguments (e.g. array_agg(x ORDER BY y)).
     fn extract_function_order_by(
         &self,
@@ -3032,12 +3027,16 @@ impl<'a> super::AnalyzerContext<'a> {
         args: &[TypedExpr],
     ) -> Result<Vec<SortItem>, AnalyzeError> {
         let func_name = print_object_name(&func.name).to_ascii_lowercase();
-        let visible_args =
-            if matches!(func_name.as_str(), "group_concat" | "string_agg") && !args.is_empty() {
-                &args[..args.len() - 1]
-            } else {
-                args
-            };
+        let trino_order = matches!(func_name.trim_matches('"'), "listagg" | "array_agg");
+        let distinct_order = trino_order && func.distinct;
+        let distinct_arguments = if distinct_order {
+            func.arguments
+                .iter()
+                .map(|argument| ordered_aggregate_syntax(&argument.value))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         if let Some(order_by) = &func.order_by {
             if order_by.items.is_empty() {
                 return Err(AnalyzeError::invalid_argument(
@@ -3047,33 +3046,18 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             let mut items = Vec::with_capacity(order_by.items.len());
             for ob in &order_by.items {
-                let typed = if let Some(pos) = function_order_by_position(&ob.sort_key) {
-                    let pos_index = usize::try_from(pos).ok();
-                    if let Some(pos_index) = pos_index
-                        && (1..=visible_args.len()).contains(&pos_index)
-                    {
-                        visible_args[pos_index - 1].clone()
-                    } else if matches!(
-                        func_name.as_str(),
-                        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
-                    ) {
-                        let display_name = if func_name == "string_agg" {
-                            "group_concat"
-                        } else {
-                            func_name.as_str()
-                        };
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "ORDER BY position {pos} is not in {display_name} output list."
-                            ),
-                            ob.span,
-                        ));
-                    } else {
-                        self.analyze_expr(&ob.sort_key, scope)?
-                    }
-                } else {
-                    self.analyze_expr(&ob.sort_key, scope)?
-                };
+                let typed = self.analyze_expr(&ob.sort_key, scope)?;
+                if distinct_order
+                    && !matches!(&typed.kind, ExprKind::ColumnRef { column_id, .. }
+                        if args.iter().any(|arg| matches!(&arg.kind,
+                            ExprKind::ColumnRef { column_id: argument_id, .. } if argument_id == column_id)))
+                    && !distinct_arguments.contains(&ordered_aggregate_syntax(&ob.sort_key)?)
+                {
+                    return Err(AnalyzeError::expression_not_in_distinct(
+                        "For aggregate function with DISTINCT, ORDER BY expressions must appear in arguments",
+                        ob.span,
+                    ));
+                }
                 let (asc, nulls_first) = super::helpers::sort_item_flags(ob);
                 items.push(SortItem {
                     expr: typed,
@@ -3278,7 +3262,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 let name = print_object_name(&f.name).to_ascii_lowercase();
                 if is_aggregate_function(self.function_catalog, &name)
-                    || is_analyzer_aggregate_syntax(&name)
+                    || analyzer_aggregate_alias(&name).is_some()
                 {
                     return true;
                 }
@@ -3348,19 +3332,6 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             _ => false,
         }
-    }
-}
-
-fn function_order_by_position(expr: &ast::Expr) -> Option<i64> {
-    match expr {
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Long { parsed_value, .. },
-            ..
-        }) => Some(*parsed_value),
-        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
-            function_order_by_position(&unary.expression)?.checked_neg()
-        }
-        _ => None,
     }
 }
 
@@ -3921,32 +3892,18 @@ fn coerce_selected_function_argument(
             control,
         );
     }
-    // ARRAY child declarations, such as VARCHAR widths, can change without
-    // changing the Arrow carrier. A bound call must keep its declared result.
-    if matches!(&expr.kind, ExprKind::FunctionCall { .. })
-        && matches!(
-            expr.value_type.value_type().kind(),
-            novarocks_type_contract::ValueKind::List(_)
-        )
-        && expr.value_type.data_type() == value_type.data_type()
-        && !expr
-            .value_type
-            .same_semantics_ignoring_nullability_observed::<novarocks_functions::FunctionBindingError>(
-                &value_type,
-                || {
-                    control
-                        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
-                        .map_err(Into::into)
-                },
-            )
-            .map_err(AnalyzeError::function_binding)?
+    // An unchanged Arrow carrier can still require a semantic conversion,
+    // such as widening the declared VARCHAR width of an array element. Keep
+    // the original call and its exact result together below the conversion.
+    if expr.value_type.data_type() == value_type.data_type()
+        && matches!(&expr.kind, ExprKind::FunctionCall { .. })
     {
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
-                cast_mode: None,
                 expr: novarocks_parser::ast::AstBox::new(expr),
                 target: value_type.data_type().clone(),
                 decimal_overflow_policy,
+                cast_mode: None,
             },
             value_type,
         });
@@ -3977,21 +3934,6 @@ fn timestamp_unit_cast_can_return_null(source: &DataType, target: &DataType) -> 
             DataType::Timestamp(TimeUnit::Millisecond, _),
             DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
         )
-    )
-}
-
-#[cfg(test)]
-fn bind_scalar_function_call(
-    name: &str,
-    args: Vec<TypedExpr>,
-) -> Result<BoundScalarCall, AnalyzeError> {
-    bind_scalar_function_call_with_catalog(
-        crate::functions::builtin_sql_function_catalog(),
-        name,
-        args,
-        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        crate::constant::test_constant_policy(),
-        &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
 
@@ -4319,6 +4261,65 @@ pub(super) fn resolve_aggregate_function_call(
     )
 }
 
+fn ordered_aggregate_syntax(expression: &ast::Expr) -> Result<String, AnalyzeError> {
+    novarocks_parser::printer::print_expression(expression)
+        .map_err(|error| AnalyzeError::unsupported_expression(error.to_string(), expression.span()))
+}
+
+fn approximate_aggregate_target(
+    name: &str,
+    index: usize,
+    arity: usize,
+    input: &novarocks_type_contract::FunctionValueType,
+) -> Option<DataType> {
+    if input.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
+        return None;
+    }
+    let data_type = input.data_type();
+    let small_integer = matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32
+    );
+    let numeric_or_unknown = |data_type: &DataType| {
+        matches!(
+            data_type,
+            DataType::Null
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Decimal128(..)
+        )
+    };
+    match (name, index, arity) {
+        ("approx_distinct", 1, 2) if numeric_or_unknown(data_type) => Some(DataType::Float64),
+        ("approx_percentile", 0, 2..=4) if small_integer || data_type == &DataType::Null => {
+            Some(DataType::Int64)
+        }
+        ("approx_percentile", 0, 2..=4) if matches!(data_type, DataType::Decimal128(..)) => {
+            Some(DataType::Float64)
+        }
+        ("approx_percentile", 1..=3, 2..=4) if numeric_or_unknown(data_type) => {
+            Some(DataType::Float64)
+        }
+        ("approx_percentile", 1..=2, 2..=3) if index + 1 == arity => {
+            if let DataType::List(item) = data_type
+                && numeric_or_unknown(item.data_type())
+            {
+                return Some(DataType::List(std::sync::Arc::new(
+                    arrow::datatypes::Field::new("item", DataType::Float64, item.is_nullable()),
+                )));
+            }
+            None
+        }
+        ("approx_most_frequent", _, 3) if small_integer || data_type == &DataType::Null => {
+            Some(DataType::Int64)
+        }
+        _ => None,
+    }
+}
+
 fn resolve_aggregate_function_call_with_order(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
@@ -4377,437 +4378,11 @@ fn resolve_aggregate_function_call_with_order(
     })
 }
 
-fn is_analyzer_aggregate_syntax(name: &str) -> bool {
-    name == "every"
-}
-
-fn validate_group_concat_separator_argument(
-    name: &str,
-    arg_exprs: &[&ast::Expr],
-    args: &[TypedExpr],
-) -> Result<(), String> {
-    if !matches!(name, "group_concat" | "string_agg") {
-        return Ok(());
-    }
-    let Some(separator) = args.last() else {
-        return Ok(());
-    };
-    if matches!(
-        separator.value_type.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
-    ) {
-        return Ok(());
-    }
-    Err(format!(
-        "group_concat requires separator to be of getType() STRING: {}.",
-        group_concat_separator_signature(arg_exprs)
-    ))
-}
-
-fn group_concat_separator_signature(arg_exprs: &[&ast::Expr]) -> String {
-    let args = arg_exprs
-        .iter()
-        .map(|arg| expr_display_name(arg))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("group_concat({args})")
-}
-
-fn validate_group_concat_value_arguments(name: &str, args: &[TypedExpr]) -> Result<(), String> {
-    if !matches!(name, "group_concat" | "string_agg") || args.is_empty() {
-        return Ok(());
-    }
-    let value_args = &args[..args.len().saturating_sub(1)];
-    if value_args.iter().all(is_supported_group_concat_value_type) {
-        return Ok(());
-    }
-    Err(format!(
-        "No matching function with signature: group_concat({}).",
-        args.iter()
-            .enumerate()
-            .map(|(idx, arg)| group_concat_signature_type(arg, idx == args.len() - 1))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
-}
-
-fn is_supported_group_concat_value_type(expr: &TypedExpr) -> bool {
-    !matches!(
-        expr.value_type.data_type(),
-        DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Map(_, _)
-            | DataType::Struct(_)
-            | DataType::Union(_, _)
-    )
-}
-
-fn group_concat_signature_type(expr: &TypedExpr, separator: bool) -> String {
-    if separator
-        && matches!(
-            expr.value_type.data_type(),
-            DataType::Utf8 | DataType::LargeUtf8
-        )
-    {
-        return "varchar".to_string();
-    }
-    match &expr.kind {
-        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => {
-            let item = infer_literal_signature_type(args).unwrap_or_else(|| {
-                match &expr.value_type.data_type() {
-                    DataType::List(item) => {
-                        group_concat_data_type_signature(item.data_type(), false)
-                    }
-                    _ => group_concat_data_type_signature(expr.value_type.data_type(), false),
-                }
-            });
-            format!("array<{item}>")
-        }
-        ExprKind::FunctionCall { name, args, .. } if name == "map" => {
-            let (keys, values): (Vec<_>, Vec<_>) = args
-                .chunks(2)
-                .filter_map(|chunk| match chunk {
-                    [key, value] => Some((key.clone(), value.clone())),
-                    _ => None,
-                })
-                .unzip();
-            let key_type = infer_literal_signature_type(&keys).unwrap_or_else(|| {
-                map_entry_data_type(expr.value_type.data_type(), 0)
-                    .map(|data_type| group_concat_data_type_signature(data_type, false))
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
-            let value_type = infer_literal_signature_type(&values).unwrap_or_else(|| {
-                map_entry_data_type(expr.value_type.data_type(), 1)
-                    .map(|data_type| group_concat_data_type_signature(data_type, true))
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
-            format!("map<{key_type},{value_type}>")
-        }
-        _ => group_concat_data_type_signature(expr.value_type.data_type(), false),
-    }
-}
-
-fn infer_literal_signature_type(args: &[TypedExpr]) -> Option<String> {
-    let mut rank = None;
-    for arg in args {
-        let ExprKind::Literal(LiteralValue::Int(value)) = arg.kind else {
-            return None;
-        };
-        let current = integer_literal_signature_rank(value);
-        rank = Some(rank.map_or(current, |existing: usize| existing.max(current)));
-    }
-    rank.map(integer_literal_signature_type)
-}
-
-fn integer_literal_signature_rank(value: i64) -> usize {
-    if i32::try_from(value).is_ok() { 2 } else { 3 }
-}
-
-fn integer_literal_signature_type(rank: usize) -> String {
-    match rank {
-        0 => "tinyint(4)",
-        1 => "smallint(6)",
-        2 => "int(11)",
-        _ => "bigint(20)",
-    }
-    .to_string()
-}
-
-fn map_entry_data_type(data_type: &DataType, index: usize) -> Option<&DataType> {
-    let DataType::Map(entries, _) = data_type else {
-        return None;
-    };
-    let DataType::Struct(fields) = entries.data_type() else {
-        return None;
-    };
-    fields.get(index).map(|field| field.data_type())
-}
-
-fn group_concat_data_type_signature(data_type: &DataType, map_value_context: bool) -> String {
-    match data_type {
-        DataType::Null => "null_type".to_string(),
-        DataType::Boolean => "boolean".to_string(),
-        DataType::Int8 => "tinyint(4)".to_string(),
-        DataType::Int16 => "smallint(6)".to_string(),
-        DataType::Int32 => "int(11)".to_string(),
-        DataType::Int64 => "bigint(20)".to_string(),
-        DataType::Float32 => "float".to_string(),
-        DataType::Float64 => "double".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => {
-            if map_value_context {
-                "varchar(20)".to_string()
-            } else {
-                "varchar".to_string()
-            }
-        }
-        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
-        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-            format!("decimal({precision},{scale})")
-        }
-        DataType::List(item) => {
-            format!(
-                "array<{}>",
-                group_concat_data_type_signature(item.data_type(), false)
-            )
-        }
-        DataType::Map(entries, _) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return "map<unknown,unknown>".to_string();
-            };
-            if fields.len() != 2 {
-                return "map<unknown,unknown>".to_string();
-            }
-            format!(
-                "map<{},{}>",
-                group_concat_data_type_signature(fields[0].data_type(), false),
-                group_concat_data_type_signature(fields[1].data_type(), true)
-            )
-        }
-        DataType::Struct(fields) => format!(
-            "struct<{}>",
-            fields
-                .iter()
-                .map(|field| group_concat_data_type_signature(field.data_type(), false))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        other => format!("{other:?}").to_lowercase(),
-    }
-}
-
-fn ordinal_name(index: usize) -> &'static str {
-    match index {
-        0 => "first",
-        1 => "second",
-        2 => "third",
-        3 => "fourth",
-        _ => "unknown",
-    }
-}
-
-fn is_numeric_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
-}
-
-fn validate_percentile_numeric_arg(
-    name: &str,
-    index: usize,
-    role: &str,
-    expr: &TypedExpr,
-) -> Result<(), String> {
-    if is_numeric_type(expr.value_type.data_type()) {
-        return Ok(());
-    }
-    Err(format!(
-        "{name} requires the {} parameter ({role}) to be numeric type, but got: {}.",
-        ordinal_name(index),
-        percentile_argument_type_name(expr.value_type.data_type())
-    ))
-}
-
-fn percentile_argument_type_name(data_type: &DataType) -> String {
-    match data_type {
-        DataType::Null => "NULL_TYPE".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => "varchar(65533)".to_string(),
-        DataType::Date32 => "date".to_string(),
-        DataType::Timestamp(_, _) => "datetime".to_string(),
-        dt if novarocks_types::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
-        other => format!("{other:?}").to_lowercase(),
-    }
-}
-
-fn strip_casts(expr: &TypedExpr) -> &TypedExpr {
-    match &expr.kind {
-        ExprKind::Cast { expr, .. } => strip_casts(expr),
-        ExprKind::Nested(inner) => strip_casts(inner),
-        _ => expr,
-    }
-}
-
-/// StarRocks's LEAD/LAG default-argument check uses different rules per
-/// expression shape:
-///   - Plain literal (or NULL): always accepted; runtime coerces to the value
-///     type.
-///   - Bare column reference: type must be in the same broad family as the
-///     value column (numeric/string/temporal).
-///   - Constant expression (literals + arithmetic on literals): type must be
-///     in the same *narrow* numeric family as the value column (INT-INT,
-///     FLOAT-FLOAT, DECIMAL-DECIMAL...). This is stricter than the bare
-///     ColumnRef rule because StarRocks doesn't constant-fold the expression
-///     for type purposes.
-///   - Anything else (function calls, column-bearing arithmetic): rejected
-///     for INT/FLOAT/DECIMAL value columns; VARCHAR allows them through
-///     because StarRocks stringifies arbitrary scalars.
-fn is_lead_lag_default_arg_acceptable(default_arg: &TypedExpr, value_type: &DataType) -> bool {
-    // VARCHAR is the lenient case: StarRocks stringifies arbitrary scalars,
-    // so any expression is accepted as the default.
-    if matches!(value_type, DataType::Utf8 | DataType::LargeUtf8) {
-        return true;
-    }
-    let stripped = strip_casts(default_arg);
-    // Plain (signed) literal — `1`, `-1`, `(1)`, etc. — is always accepted.
-    // The native parser represents `-1` as a unary minus around `Literal(1)`,
-    // so peel the unary minus before deciding.
-    if is_signed_literal(stripped) {
-        return true;
-    }
-    if matches!(stripped.kind, ExprKind::ColumnRef { .. }) {
-        return lead_lag_family_compatible(value_type, default_arg.value_type.data_type());
-    }
-    if is_constant_default_expression(stripped) {
-        return lead_lag_narrow_numeric_compatible(value_type, stripped.value_type.data_type());
-    }
-    false
-}
-
-fn is_signed_literal(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::Literal(_) | ExprKind::Constant(_) => true,
-        ExprKind::Nested(inner) => is_signed_literal(inner),
-        ExprKind::UnaryOp { expr: inner, .. } => is_signed_literal(inner),
-        ExprKind::Cast { expr: inner, .. } => is_signed_literal(inner),
-        _ => false,
-    }
-}
-
-fn is_constant_default_expression(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::Literal(_) | ExprKind::Constant(_) => true,
-        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
-            is_constant_default_expression(expr)
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            is_constant_default_expression(left) && is_constant_default_expression(right)
-        }
-        ExprKind::FunctionCall { .. } => crate::common::binary_operator::typed_operands(expr)
-            .is_some_and(|(_, [left, right])| {
-                is_constant_default_expression(left) && is_constant_default_expression(right)
-            }),
-        ExprKind::UnaryOp { expr, .. } => is_constant_default_expression(expr),
-        _ => false,
-    }
-}
-
-fn lead_lag_family_compatible(value: &DataType, default: &DataType) -> bool {
-    if value == default || matches!(default, DataType::Null) {
-        return true;
-    }
-    if value.is_numeric() && default.is_numeric() {
-        return true;
-    }
-    let is_str = |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8);
-    if is_str(value) && is_str(default) {
-        return true;
-    }
-    let is_temporal = |t: &DataType| {
-        matches!(
-            t,
-            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
-        )
-    };
-    if is_temporal(value) && is_temporal(default) {
-        return true;
-    }
-    false
-}
-
-fn lead_lag_narrow_numeric_compatible(value: &DataType, default: &DataType) -> bool {
-    use DataType::*;
-    if matches!(default, Null) {
-        return true;
-    }
-    let is_int = |t: &DataType| matches!(t, Int8 | Int16 | Int32 | Int64);
-    let is_float = |t: &DataType| matches!(t, Float32 | Float64);
-    let is_decimal = |t: &DataType| matches!(t, Decimal128(_, _) | Decimal256(_, _));
-    let is_str = |t: &DataType| matches!(t, Utf8 | LargeUtf8);
-    if is_int(value) && is_int(default) {
-        return true;
-    }
-    if is_float(value) && is_float(default) {
-        return true;
-    }
-    if is_decimal(value) && is_decimal(default) {
-        return true;
-    }
-    if is_str(value) && is_str(default) {
-        return true;
-    }
-    value == default
-}
-
-fn lead_lag_type_display(t: &DataType) -> &'static str {
-    use DataType::*;
-    match t {
-        Int8 => "TINYINT",
-        Int16 => "SMALLINT",
-        Int32 => "INT",
-        Int64 => "BIGINT",
-        Float32 => "FLOAT",
-        Float64 => "DOUBLE",
-        Decimal128(_, _) | Decimal256(_, _) => "DECIMAL",
-        Utf8 | LargeUtf8 => "VARCHAR",
-        Date32 | Date64 => "DATE",
-        Timestamp(_, _) => "DATETIME",
-        Boolean => "BOOLEAN",
-        Binary | LargeBinary => "VARBINARY",
-        _ => "UNKNOWN",
-    }
-}
-
-fn array_literal_items(expr: &TypedExpr) -> Option<&[TypedExpr]> {
-    match &strip_casts(expr).kind {
-        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => Some(args),
+fn analyzer_aggregate_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "every" => Some("bool_and"),
+        "\"listagg\"" => Some("listagg"),
         _ => None,
-    }
-}
-
-fn const_numeric_value(expr: &TypedExpr) -> Option<f64> {
-    match &strip_casts(expr).kind {
-        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
-        ExprKind::Literal(LiteralValue::Decimal(v)) => v.parse::<f64>().ok(),
-        _ => crate::common::negation::typed_operand(strip_casts(expr))
-            .and_then(const_numeric_value)
-            .map(|value| -value),
-    }
-}
-
-fn validate_percentile_value(
-    name: &str,
-    value: f64,
-    array_index: Option<usize>,
-) -> Result<(), String> {
-    if (0.0..=1.0).contains(&value) {
-        return Ok(());
-    }
-    match array_index {
-        Some(idx) => Err(format!(
-            "Type check failed. percentile array element[{idx}] must be between 0 and 1 in {name}, but got: {}",
-            format_percentile_error_value(value)
-        )),
-        None => Err(format!(
-            "Type check failed. percentile parameter must be between 0 and 1 in {name}, but got: {}",
-            format_percentile_error_value(value)
-        )),
-    }
-}
-
-fn format_percentile_error_value(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.1}")
-    } else {
-        value.to_string()
     }
 }
 
@@ -4816,6 +4391,13 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
 }
 
 fn typeof_name(dt: &DataType, declared: Option<&ValueTypeRef>) -> String {
+    if let Some(ValueKind::BoundedCharacter(character)) = declared.map(ValueTypeRef::kind) {
+        let name = match character.kind() {
+            CharacterKind::Char => "char",
+            CharacterKind::Varchar => "varchar",
+        };
+        return format!("{name}({})", character.length());
+    }
     fn contains_temporal(ty: &ValueTypeRef) -> bool {
         ty.temporal().is_some()
             || (0..ty.child_count())
@@ -4828,6 +4410,18 @@ fn typeof_cast_name(
     syntax: &ast::TypeName,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<String>, AnalyzeError> {
+    if let ast::TypeKind::Generic(generic) = &syntax.kind
+        && !generic.arguments.is_empty()
+        && (generic.name.value.eq_ignore_ascii_case("char")
+            || generic.name.value.eq_ignore_ascii_case("varchar"))
+    {
+        let declared = super::helpers::sql_type_to_value_type(syntax, false, control)?;
+        return Ok(Some(typeof_name(
+            declared.data_type(),
+            Some(declared.value_type()),
+        )));
+    }
+
     struct ContainsTemporal(bool);
 
     impl ast::Visit for ContainsTemporal {
@@ -5228,6 +4822,8 @@ mod tests {
             control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &EmptyCatalog,
             current_database: "default",
@@ -5245,7 +4841,7 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_trim_profiles_keep_original_binding_and_refuse_explicit_characters() {
+    fn dedicated_trim_profiles_keep_original_binding_and_name_unavailable_overloads() {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let ctx = logical_context(&control);
         let scope = ctx.new_scope();
@@ -5278,23 +4874,32 @@ mod tests {
             };
             assert_eq!(actual.selected.overload, expected.selected.overload);
             let mut node = node;
-            node.trim_source =
-                ast::Expr::Identifier(novarocks_parser::build::ident("must_not_resolve", false));
             node.trim_character = Some(string_literal_expr("x".into(), node.span));
+            let error = ctx
+                .analyze_expr(&ast::Expr::Trim(ast::AstBox::new(node)), &scope)
+                .unwrap_err();
             assert_eq!(
-                ctx.analyze_expr(&ast::Expr::Trim(ast::AstBox::new(node)), &scope)
-                    .unwrap_err()
-                    .kind(),
-                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+            );
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("/{name}/trino-varchar-codepoints-v1"))
             );
         }
         let leaf = ast::Expr::CurrentTimestamp(ast::CurrentTimestamp {
             precision: Some(-17),
             span: novarocks_parser::SYNTHETIC,
         });
+        let error = ctx.analyze_expr(&leaf, &scope).unwrap_err();
         assert_eq!(
-            ctx.analyze_expr(&leaf, &scope).unwrap_err().kind(),
+            error.kind(),
             crate::analyze_error::AnalyzeErrorKind::NumericOutOfRange
+        );
+        assert_eq!(
+            error.message(),
+            "Temporal clock precision must be in range [0, 12]: -17"
         );
         // The original ordinary CAST declaration shortcut remains opaque.
         assert!(
@@ -5587,6 +5192,24 @@ mod tests {
                 panic!("expected a type name: {source}");
             };
             assert_eq!(actual, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn typeof_preserves_the_width_of_bounded_character_values() {
+        for (expression, expected) in [
+            ("''", "varchar(0)"),
+            ("'é中'", "varchar(2)"),
+            ("CAST(only_missing_child AS CHAR(3))", "char(3)"),
+            ("CAST(only_missing_child AS VARCHAR(5))", "varchar(5)"),
+            ("CAST(only_missing_child AS VARCHAR(2147483647))", "varchar"),
+        ] {
+            let sql = format!("SELECT typeof({expression})");
+            let actual = analyze_projection_expr(&sql).expect("character type should resolve");
+            let ExprKind::Literal(LiteralValue::String(actual)) = actual.kind else {
+                panic!("expected a type name: {sql}");
+            };
+            assert_eq!(actual, expected, "{sql}");
         }
     }
 
@@ -6260,7 +5883,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_missing_specials_refuse_before_children_but_keep_metadata_and_opaque_casts() {
+    fn canonical_string_calls_keep_metadata_and_opaque_casts() {
         use crate::analyze_error::AnalyzeErrorKind;
         use novarocks_parser::build;
         let control = crate::compiler::SqlCompileControl::unbounded();
@@ -6274,9 +5897,9 @@ mod tests {
                 vec![missing.clone(), build::string("NFC")],
             );
             let error = ctx.analyze_expr(&expression, &scope).unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert!(error.message().contains(name), "{error}");
-            assert_eq!(error.span(), Some(expression.span()));
+            assert_eq!(error.kind(), missing_kind);
+            assert!(error.message().contains("only_missing_child"), "{error}");
+            assert_eq!(error.span(), Some(missing.span()));
 
             let ast::Expr::FunctionCall(call) = &mut expression else {
                 panic!("call");
@@ -6347,7 +5970,136 @@ mod tests {
             assert_eq!(
                 ctx.analyze_expr(&expression, &scope).unwrap_err().kind(),
                 missing_kind,
-                "noncanonical names must still analyze their original child before catalog lookup"
+                "calls must analyze their original child before catalog lookup"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_position_and_normalize_share_the_ordinary_catalogue_binding() {
+        for (syntax, ordinary, result_type) in [
+            (
+                "POSITION('é' IN ' aé')",
+                "strpos(' aé', 'é')",
+                DataType::Int64,
+            ),
+            (
+                "NORMALIZE('é')",
+                "\"normalize\"('é', 'NFC')",
+                DataType::Utf8,
+            ),
+            (
+                "NORMALIZE('é', NFD)",
+                "\"normalize\"('é', 'NFD')",
+                DataType::Utf8,
+            ),
+        ] {
+            let selected = |source| {
+                let typed = analyze_projection_expr(&format!("SELECT {source}")).unwrap();
+                assert_eq!(typed.value_type.data_type(), &result_type);
+                let ExprKind::FunctionCall { binding, .. } = typed.kind else {
+                    panic!("expected catalogue binding: {source}");
+                };
+                binding
+            };
+            let syntax = selected(syntax);
+            let ordinary = selected(ordinary);
+            assert_eq!(syntax.function_id, ordinary.function_id);
+            assert_eq!(syntax.selected, ordinary.selected);
+        }
+    }
+
+    #[test]
+    fn derived_char_concat_width_preserves_type_resolution_failure() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_type_contract::{CharacterKind, ValueTypeError};
+
+        for (left, right) in [("'a'", "'b'"), ("NULL", "NULL")] {
+            let query = format!(
+                "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32768))))"
+            );
+            let expression = analyze_projection_expr(&query).unwrap();
+            assert!(matches!(
+                expression.kind,
+                ExprKind::Literal(LiteralValue::String(value)) if value == "char(65536)"
+            ));
+
+            let query = novarocks_parser::parser::parse_query(&format!(
+                "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32769))))"
+            ))
+            .unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnknownType);
+            assert_eq!(error.code().as_str(), "sql.analyze.unknown_type");
+            assert_eq!(error.message(), "Unknown type: char(65537)");
+            assert_eq!(
+                error
+                    .source_failure()
+                    .unwrap()
+                    .downcast_ref::<ValueTypeError>(),
+                Some(&ValueTypeError::InvalidCharacterWidth {
+                    kind: CharacterKind::Char,
+                    length: 65537,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn recognized_unsupported_string_profiles_report_named_capability() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        for (expression, overload) in [
+            ("format('%s', 7)", "/format/trino-variadic-v1"),
+            (
+                "overlay('abcd' PLACING 'xy' FROM 2)",
+                "/$overlay/trino-varchar-three-v1",
+            ),
+            (
+                "overlay('abcd' PLACING 'xy' FROM 2 FOR 1)",
+                "/$overlay/trino-varchar-four-v1",
+            ),
+            ("ltrim('abcd', 'a')", "/ltrim/trino-varchar-codepoints-v1"),
+            (
+                "TRIM(TRAILING 'd' FROM CAST('abcd' AS CHAR(4)))",
+                "/rtrim/trino-char-codepoints-v1",
+            ),
+        ] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT {expression}")).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+            assert!(error.message().contains(overload), "{error}");
+        }
+        for expression in [
+            "overlay('abcd' PLACING 'xy' FROM 'not a number')",
+            "overlay('abcd' PLACING 7 FROM 1)",
+            "\"$overlay\"('abcd', 'xy', 2)",
+            "ltrim('abcd', 7)",
+            "trim(7 FROM 'abcd')",
+            "translate('x', 'y')",
+            "lower(7)",
+            "length(7)",
+            "substring('x', '1')",
+            "char_length('xyz')",
+            "initcap('xyz')",
+        ] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT {expression}")).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::UnknownFunction,
+                "{expression}: {error}"
+            );
+        }
+        for expression in ["format(7, 'text')", "format(CAST('x' AS CHAR(1)), 'text')"] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT {expression}")).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::TypeMismatch,
+                "{expression}: {error}"
             );
         }
     }
@@ -6752,6 +6504,77 @@ mod tests {
     }
 
     #[test]
+    fn lag_and_lead_bind_common_value_and_validate_original_window_shape() {
+        for name in ["lag", "lead"] {
+            let statement =
+                format!("SELECT {name}(CAST(1 AS INTEGER), 0, BIGINT '2') OVER (ORDER BY 1)");
+            let expression = analyze_projection_expr(&statement).unwrap();
+            assert_eq!(expression.value_type.data_type(), &DataType::Int64);
+            let ExprKind::WindowCall { args, .. } = expression.kind else {
+                panic!("window selection");
+            };
+            assert!(
+                args.iter()
+                    .all(|argument| argument.value_type.data_type() == &DataType::Int64)
+            );
+            let missing_order =
+                analyze_projection_expr(&format!("SELECT {name}(1) OVER ()")).unwrap_err();
+            assert!(missing_order.contains("requires an ORDER BY window clause"));
+            let explicit_frame = analyze_projection_expr(&format!(
+                "SELECT {name}(1) OVER (ORDER BY 1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+            )).unwrap_err();
+            assert!(explicit_frame.contains("Cannot specify a window frame"));
+            assert!(
+                analyze_projection_expr(&format!("SELECT {name}('a', 1, 2) OVER (ORDER BY 1)"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn approximate_aggregate_sql_selects_exact_supported_and_declared_overloads() {
+        for (sql, expected) in [
+            ("SELECT approx_distinct(TRUE)", DataType::Int64),
+            ("SELECT approx_percentile(2, 0.5)", DataType::Int64),
+            (
+                "SELECT approx_percentile(CAST(2 AS REAL), 1.9, DOUBLE '0.5')",
+                DataType::Float32,
+            ),
+        ] {
+            assert_eq!(
+                analyze_projection_expr(sql).unwrap().value_type.data_type(),
+                &expected
+            );
+        }
+        let output = analyze_projection_expr("SELECT approx_percentile(2, ARRAY[0, 1])")
+            .unwrap()
+            .value_type;
+        assert!(
+            matches!(output.data_type(), DataType::List(item) if item.data_type() == &DataType::Int64)
+        );
+        let output = analyze_projection_expr("SELECT approx_most_frequent(2, 'a', 100001)")
+            .unwrap()
+            .value_type;
+        assert!(matches!(output.data_type(), DataType::Map(..)));
+        for (sql, missing) in [
+            ("SELECT approx_distinct(TRUE, 0.02)", "boolean-error-v1"),
+            (
+                "SELECT approx_percentile(2, 1.0, 0.5, 0.02)",
+                "bigint-accuracy-v1",
+            ),
+        ] {
+            let resolved = analyze_projection_expr(sql).unwrap();
+            let ExprKind::AggregateCall { resolved, .. } = resolved.kind else {
+                panic!("expected typed aggregate");
+            };
+            assert!(resolved.selected.overload.as_str().ends_with(missing));
+        }
+        let error = analyze_projection_expr("SELECT approx_most_frequent(DISTINCT 2, 'a', 100001)")
+            .unwrap_err();
+        assert!(error.contains("varchar-v1"), "{error}");
+    }
+
+    #[test]
     fn array_agg_freezes_json_output_separately_from_physical_binding() {
         for sql in [
             "select array_agg(JSON_OBJECT('2': 3))",
@@ -7048,6 +6871,27 @@ mod tests {
         }
     }
 
+    fn checked_largeint_null(
+        control: &crate::compiler::SqlCompileControl,
+    ) -> novarocks_functions::ConstantValue {
+        use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
+
+        let value_type = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        novarocks_functions::ConstantValue::null(
+            std::sync::Arc::new(value_type.try_to_field("largeint_null").unwrap()),
+            value_type,
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            control,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn arithmetic_preserves_authored_largeint_and_nullable_null_lifts() {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
@@ -7090,6 +6934,51 @@ mod tests {
             );
             assert!(!operand.value_type.nullable());
         }
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let query = novarocks_parser::parser::parse_query("select k+NULL").unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select");
+        };
+        let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("arithmetic projection");
+        };
+        let ast::Expr::Binary(binary) = &column.expression else {
+            panic!("arithmetic source");
+        };
+        let null = checked_largeint_null(&control);
+        let mut materialized =
+            crate::compiler::materialized_values::MaterializedSourceBorrow::empty(&query);
+        materialized
+            .insert_context_constant(binary.right.as_ref(), null.clone(), &control)
+            .unwrap();
+        let mut context = logical_context(&control);
+        context.materialized_values = Some(materialized.view());
+        let mut scope = context.new_scope();
+        let required_largeint = expected.clone().with_nullable(false).unwrap();
+        scope.add_column(None, "k", required_largeint.clone());
+        let typed = context.analyze_expr(&column.expression, &scope).unwrap();
+        assert_eq!(typed.value_type, expected);
+        let ExprKind::BinaryOp {
+            left,
+            op: BinOp::Add,
+            right,
+            ..
+        } = typed.kind
+        else {
+            panic!("expected exact signed addition");
+        };
+        assert!(matches!(left.kind, ExprKind::ColumnRef { .. }));
+        assert_eq!(left.value_type, required_largeint);
+        assert_eq!(right.value_type, expected);
+        let ExprKind::Constant(witness) = &right.kind else {
+            panic!("expected original typed NULL");
+        };
+        assert_eq!(witness.ordinal(), null.ordinal());
+        assert_eq!(
+            witness.pool().backing_identity(),
+            null.pool().backing_identity()
+        );
+
         let expression = analyze_projection_expr_with_catalog(
             "select element_at([],1)+k from unary_input",
             &catalog,
@@ -7151,70 +7040,73 @@ mod tests {
 
     #[test]
     fn comparisons_freeze_exact_largeint_domains_without_identity_casts() {
-        use crate::analyze_error::AnalyzeErrorKind;
-        use novarocks_type_contract::ValueLogicalType;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
-        let catalog = UnaryInputCatalog {
-            key_type: DataType::FixedSizeBinary(16),
-            nullable: false,
-            logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
-        };
-        let functions = crate::functions::builtin_sql_function_catalog();
-        for sql in [
-            "SELECT k = 1 FROM unary_input",
-            "SELECT k IN (1, CAST(2 AS INTEGER)) FROM unary_input",
-            "SELECT k BETWEEN 1 AND CAST(2 AS INTEGER) FROM unary_input",
-            "SELECT CASE k WHEN 1 THEN 7 WHEN CAST(2 AS INTEGER) THEN 8 ELSE 9 END FROM unary_input",
-        ] {
-            let query = novarocks_parser::parser::parse_query(sql).unwrap();
-            let error = super::super::analyze(&query, &catalog, "default").unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
-            assert!(
-                error.message().contains("common Trino type"),
-                "{sql}: {error}"
-            );
-        }
-
-        for (sql, arity, result) in [
-            (
-                "SELECT k = k FROM unary_input",
-                2,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            (
-                "SELECT k IN (k, k) FROM unary_input",
-                3,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            (
-                "SELECT k BETWEEN k AND k FROM unary_input",
-                3,
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            ),
-            (
-                "SELECT CASE k WHEN k THEN 7 WHEN k THEN 8 ELSE 9 END FROM unary_input",
-                3,
-                novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
-            ),
-        ] {
-            let expression =
-                analyze_projection_expr_with_catalog(sql, &catalog, functions).unwrap();
-            assert_eq!(expression.value_type, result, "{sql}");
-            let operands = comparison_operands(&expression);
-            assert_eq!(operands.len(), arity, "{sql}");
-            for operand in operands {
-                assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }), "{sql}");
+        for nullable in [false, true] {
+            let catalog = UnaryInputCatalog {
+                key_type: DataType::FixedSizeBinary(16),
+                nullable,
+                logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
+            };
+            let analyze = |sql| {
+                analyze_projection_expr_with_catalog(
+                    sql,
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                )
+            };
+            let expected_largeint = FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                nullable,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap();
+            // Different numeric domains have no implicit Trino common type.
+            for sql in [
+                "SELECT k = 1 FROM unary_input",
+                "SELECT k IN (1, CAST(2 AS INTEGER)) FROM unary_input",
+                "SELECT k BETWEEN 1 AND CAST(2 AS INTEGER) FROM unary_input",
+                "SELECT CASE k WHEN 1 THEN 7 WHEN CAST(2 AS INTEGER) THEN 8 ELSE 9 END FROM unary_input",
+            ] {
+                let query = novarocks_parser::parser::parse_query(sql).unwrap();
+                let error = super::super::analyze(&query, &catalog, "default").unwrap_err();
                 assert_eq!(
-                    operand.value_type.logical_type(),
-                    ValueLogicalType::LargeInt,
+                    error.kind(),
+                    crate::analyze_error::AnalyzeErrorKind::TypeMismatch,
                     "{sql}"
                 );
+                assert!(
+                    error.message().contains("common Trino type"),
+                    "{sql}: {error}"
+                );
+            }
+            for (sql, operand_count, result) in [
+                ("select k=k from unary_input", 2, DataType::Boolean),
+                ("select k IN (k,k) from unary_input", 3, DataType::Boolean),
+                (
+                    "select k BETWEEN k AND k from unary_input",
+                    3,
+                    DataType::Boolean,
+                ),
+                (
+                    "select CASE k WHEN k THEN 7 WHEN k THEN 8 ELSE 9 END from unary_input",
+                    3,
+                    DataType::Int32,
+                ),
+            ] {
+                let expression = analyze(sql).unwrap();
+                let operands = comparison_operands(&expression);
+                assert_eq!(operands.len(), operand_count, "{sql}");
+                for operand in operands {
+                    assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }), "{sql}");
+                    assert_eq!(operand.value_type, expected_largeint, "{sql}");
+                }
+                let result_nullable = nullable || result == DataType::Int32;
                 assert_eq!(
-                    operand.value_type.data_type(),
-                    &DataType::FixedSizeBinary(16),
+                    expression.value_type,
+                    FunctionValueType::new(result, result_nullable),
                     "{sql}"
                 );
-                assert!(!operand.value_type.nullable(), "{sql}");
             }
         }
     }
@@ -7222,45 +7114,90 @@ mod tests {
     #[test]
     fn comparison_null_targets_keep_largeint_identity_and_original_nullability() {
         use novarocks_type_contract::{FunctionValueType, TrinoCastMode, ValueLogicalType};
+
         let catalog = UnaryInputCatalog {
             key_type: DataType::FixedSizeBinary(16),
             nullable: false,
             logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
         };
-        let functions = crate::functions::builtin_sql_function_catalog();
-        let unknown = FunctionValueType::new(DataType::Null, true);
-        let target = FunctionValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(16),
-            true,
+        let original_type = FunctionValueType::try_with_logical_type(
+            catalog.key_type.clone(),
+            false,
             ValueLogicalType::LargeInt,
         )
         .unwrap();
+        let target_type = original_type.with_nullable(true).unwrap();
+        let unknown = FunctionValueType::new(DataType::Null, true);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let computed_null = analyze_projection_expr("select element_at([],1)").unwrap();
+        assert!(matches!(computed_null.kind, ExprKind::FunctionCall { .. }));
 
-        for sql in [
-            "SELECT k = NULL FROM unary_input",
-            "SELECT k IN (NULL, NULL) FROM unary_input",
-            "SELECT k BETWEEN NULL AND NULL FROM unary_input",
-            "SELECT CASE k WHEN NULL THEN 7 WHEN NULL THEN 8 ELSE 9 END FROM unary_input",
+        for (sql, null_count, computed) in [
+            ("select k=NULL from unary_input", 1, false),
+            ("select k IN (NULL,NULL) from unary_input", 2, false),
+            ("select k BETWEEN NULL AND NULL from unary_input", 2, false),
+            (
+                "select CASE k WHEN NULL THEN 7 WHEN NULL THEN 8 ELSE 9 END from unary_input",
+                2,
+                false,
+            ),
+            ("select k=element_at([],1) from unary_input", 1, true),
         ] {
-            let expression =
-                analyze_projection_expr_with_catalog(sql, &catalog, functions).unwrap();
+            let expression = analyze_projection_expr_with_catalog(
+                sql,
+                &catalog,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
             let operands = comparison_operands(&expression);
-            assert!(!operands[0].value_type.nullable(), "{sql}");
-            for operand in operands.iter().skip(1) {
-                assert_eq!(operand.value_type, target, "{sql}");
+            assert_eq!(operands.len(), 1 + null_count, "{sql}");
+            assert!(
+                matches!(&operands[0].kind, ExprKind::ColumnRef { column, .. } if column == "k"),
+                "{sql}"
+            );
+            assert_eq!(operands[0].value_type, original_type, "{sql}");
+            for operand in &operands[1..] {
+                assert_eq!(operand.value_type, target_type, "{sql}");
                 let ExprKind::Cast {
-                    expr,
                     cast_mode: Some(TrinoCastMode::Implicit),
+                    expr,
+                    target,
                     ..
                 } = &operand.kind
                 else {
-                    panic!("NULL is coerced by the actual comparison owner: {sql}");
+                    panic!("expected exact implicit NULL conversion: {sql}");
                 };
                 assert_eq!(expr.value_type, unknown, "{sql}");
-                assert!(
-                    matches!(expr.kind, ExprKind::Literal(LiteralValue::Null)),
-                    "{sql}"
-                );
+                assert_eq!(target, target_type.data_type(), "{sql}");
+                novarocks_functions::PreparedCastRecipe::try_new_trino(
+                    &expr.value_type,
+                    &operand.value_type,
+                    TrinoCastMode::Implicit,
+                    &control,
+                )
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+
+                if computed {
+                    assert!(
+                        crate::analysis::expr_identity::typed_expr_semantically_eq(
+                            expr,
+                            &computed_null,
+                            &control,
+                        )
+                        .unwrap(),
+                        "nonliteral NULL keeps its original invocation and arguments: {sql}"
+                    );
+                } else {
+                    assert!(
+                        super::super::value_conversion::constant_is_null(
+                            expr,
+                            crate::constant::test_constant_policy(),
+                            &control
+                        )
+                        .unwrap(),
+                        "literal NULL keeps its original constant source: {sql}"
+                    );
+                }
             }
             assert!(expression.value_type.nullable(), "{sql}");
         }
@@ -7268,33 +7205,13 @@ mod tests {
         let expression = analyze_projection_expr_with_catalog(
             "SELECT k = CASE WHEN TRUE THEN NULL ELSE k END FROM unary_input",
             &catalog,
-            functions,
+            crate::functions::builtin_sql_function_catalog(),
         )
         .unwrap();
         let operands = comparison_operands(&expression);
         assert!(!operands[0].value_type.nullable());
-        assert_eq!(operands[1].value_type, target);
+        assert_eq!(operands[1].value_type, target_type);
         assert!(matches!(operands[1].kind, ExprKind::Case { .. }));
-
-        let expression = analyze_projection_expr_with_catalog(
-            "SELECT k = element_at([], 1) FROM unary_input",
-            &catalog,
-            functions,
-        )
-        .unwrap();
-        let operands = comparison_operands(&expression);
-        assert!(!operands[0].value_type.nullable());
-        assert_eq!(operands[1].value_type, target);
-        let ExprKind::Cast {
-            expr,
-            cast_mode: Some(TrinoCastMode::Implicit),
-            ..
-        } = &operands[1].kind
-        else {
-            panic!("nonliteral NULL must preserve its source invocation");
-        };
-        assert_eq!(expr.value_type, unknown);
-        assert!(matches!(&expr.kind, ExprKind::FunctionCall { name, .. } if name == "element_at"));
     }
 
     #[test]
@@ -7434,41 +7351,44 @@ mod tests {
     }
 
     #[test]
-    fn named_bitnot_requires_a_width_and_keeps_the_original_null_argument() {
+    fn named_bitnot_requires_an_integer_width_without_erasing_a_nonliteral_argument() {
         use crate::analyze_error::AnalyzeErrorKind;
-        use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
+        use novarocks_type_contract::FunctionValueType;
+
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for source in ["NULL", "element_at([], 1)"] {
+            let sql = format!("SELECT bitnot({source})");
+            let query = novarocks_parser::parser::parse_query(&sql).unwrap();
+            let error = super::super::analyze_with_function_catalog(
+                &query,
+                &EmptyCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .expect_err("untyped bitnot probe");
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::AmbiguousFunctionCall,
+                "{sql}"
+            );
+        }
 
         let expected = FunctionValueType::new(DataType::Int8, true);
-        let unknown = FunctionValueType::new(DataType::Null, true);
-        for (source, literal) in [("NULL", true), ("element_at([], 1)", false)] {
-            let query =
-                novarocks_parser::parser::parse_query(&format!("SELECT bitnot({source})")).unwrap();
-            let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::AmbiguousFunctionCall);
-
-            let bound =
-                analyze_projection_expr(&format!("SELECT bitnot(CAST({source} AS TINYINT))"))
-                    .unwrap();
+        for sql in ["cast(NULL as tinyint)", "cast(element_at([],1) as tinyint)"] {
+            let original = analyze_projection_expr(&format!("select {sql}")).unwrap();
+            let bound = analyze_projection_expr(&format!("select bitnot({sql})")).unwrap();
             assert_eq!(bound.value_type, expected);
             let operand = named_bitnot_operand(&bound);
             assert_eq!(operand.value_type, expected);
-            let ExprKind::Cast {
-                expr,
-                target: DataType::Int8,
-                cast_mode: Some(TrinoCastMode::Explicit),
-                ..
-            } = &operand.kind
-            else {
-                panic!("bitnot must retain the original explicit width: {source}");
-            };
-            assert_eq!(expr.value_type, unknown);
-            if literal {
-                assert!(matches!(expr.kind, ExprKind::Literal(LiteralValue::Null)));
-            } else {
-                assert!(
-                    matches!(&expr.kind, ExprKind::FunctionCall { name, .. } if name == "element_at")
-                );
-            }
+            assert!(
+                crate::analysis::expr_identity::typed_expr_semantically_eq(
+                    operand, &original, &control
+                )
+                .unwrap(),
+                "{sql}"
+            );
         }
     }
 
@@ -7485,6 +7405,7 @@ mod tests {
 
     #[test]
     fn arithmetic_and_unary_do_not_infer_numeric_identity_from_fixed_binary() {
+        use crate::analyze_error::AnalyzeErrorKind;
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
         use std::{
             cell::{Cell, RefCell},
@@ -7497,6 +7418,8 @@ mod tests {
             purpose: super::super::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
+            statement_relation: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &EmptyCatalog,
             current_database: "default",
@@ -7524,7 +7447,6 @@ mod tests {
                 )
                 .unwrap(),
             );
-            use crate::analyze_error::AnalyzeErrorKind;
             for (sql, expected) in [
                 ("select raw+1", AnalyzeErrorKind::TypeMismatch),
                 ("select raw+NULL", AnalyzeErrorKind::TypeMismatch),
@@ -7879,6 +7801,8 @@ mod tests {
             );
         }
 
+        let error = analyze_projection_expr("select cast('1' as largeint)").unwrap_err();
+        assert_eq!(error, "Unknown type: largeint");
         for value in [
             i128::MIN,
             i128::MAX,
@@ -8079,19 +8003,21 @@ mod tests {
     }
 
     #[test]
-    fn array_sort_lambda_refusal_and_statement_clock_bindings_use_the_real_catalog() {
+    fn array_sort_clock_comparators_report_the_unavailable_lambda_overload() {
         use crate::analyze_error::AnalyzeErrorKind;
-        use novarocks_functions::builtin::temporal_context::TemporalSyntax;
-        use novarocks_type_contract::{
-            SemanticParameterValue, StatementStartUtc, StatementTimeEnvironment, TimeZoneKey,
-        };
+        use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
 
-        for body in [
-            "0",
-            "IF(CURRENT_DATE IS NULL, -1, 0)",
-            "IF(LOCALTIME IS NULL, -1, 0)",
+        let overload = FunctionOverloadId::try_new("builtin.scalar/array_sort/lambda-v1").unwrap();
+        let expected = FunctionBindingError::UnavailableImplementation(overload).to_string();
+        for clock in [
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "CURRENT_TIMESTAMP",
+            "LOCALTIME",
+            "LOCALTIMESTAMP",
+            "now()",
         ] {
-            let sql = format!("SELECT array_sort(ARRAY[1, 2], (x, y) -> {body})");
+            let sql = format!("SELECT array_sort([2, 1], (x, y) -> IF({clock} IS NULL, -1, 0))");
             let query = novarocks_parser::parser::parse_query(&sql).unwrap();
             let error = super::super::analyze(&query, &EmptyCatalog, "default").unwrap_err();
             assert_eq!(
@@ -8099,13 +8025,88 @@ mod tests {
                 AnalyzeErrorKind::UnavailableImplementation,
                 "{sql}"
             );
-            assert!(
-                error
-                    .message()
-                    .contains("builtin.scalar/array_sort/lambda-v1"),
-                "{sql}: {error}"
-            );
+            assert_eq!(error.message(), expected, "{sql}");
         }
+    }
+
+    fn analyze_manually_constructed_scalar_function(
+        name: &str,
+        sql: &str,
+    ) -> Result<crate::analysis::TypedExpr, String> {
+        let query =
+            &mut novarocks_parser::parser::parse_query(sql).map_err(|error| error.to_string())?;
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            return Err("expected select".to_string());
+        };
+        let Some(ast::SelectItem::SingleColumn(projection_column)) = select.projection.first_mut()
+        else {
+            return Err("expected ordinary scalar function".to_string());
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::FunctionCall(func) = &mut projection_column.expression else {
+            return Err("expected ordinary scalar function".to_string());
+        };
+        let Some(last_name_part) = func.name.parts.last_mut() else {
+            return Err("expected scalar function name".to_string());
+        };
+        last_name_part.value = name.to_string();
+
+        let (resolved, _registry, _factory) =
+            analyze(query, &EmptyCatalog, "default").map_err(|error| error.to_string())?;
+        let QueryBody::Select(select) = resolved.body else {
+            return Err("expected select".to_string());
+        };
+        select
+            .projection
+            .into_iter()
+            .next()
+            .map(|item| item.expr)
+            .ok_or_else(|| "expected projection".to_string())
+    }
+
+    fn assert_substring_bigint_arguments(sql: &str, expected_name: &str, expected_arity: usize) {
+        let expr = analyze_projection_expr(sql).expect("substring should analyze");
+        let crate::analysis::ExprKind::FunctionCall { name, args, .. } = expr.kind else {
+            panic!("expected FunctionCall, got {:?}", expr.kind);
+        };
+        assert_eq!(name, expected_name);
+        assert_eq!(args.len(), expected_arity);
+        assert_eq!(args[0].value_type.data_type().clone(), DataType::Utf8);
+        for arg in &args[1..] {
+            assert_eq!(arg.value_type.data_type(), &DataType::Int64);
+        }
+    }
+
+    fn assert_substring_bigint_literal(argument: &TypedExpr, expected: i64) {
+        use novarocks_type_contract::TrinoCastMode;
+
+        assert_eq!(argument.value_type.data_type(), &DataType::Int64);
+        assert!(!argument.value_type.nullable());
+        let original = if i32::try_from(expected).is_ok() {
+            let ExprKind::Cast {
+                expr,
+                target: DataType::Int64,
+                cast_mode: Some(TrinoCastMode::Implicit),
+                ..
+            } = &argument.kind
+            else {
+                panic!("expected implicit widening of the INTEGER literal {expected}");
+            };
+            assert_eq!(expr.value_type.data_type(), &DataType::Int32);
+            assert!(!expr.value_type.nullable());
+            expr.as_ref()
+        } else {
+            argument
+        };
+        assert_eq!(super::signed_int_literal_value(original), Some(expected));
+    }
+
+    #[test]
+    fn statement_clock_syntax_keeps_the_original_statement_parameters() {
+        use novarocks_functions::builtin::temporal_context::TemporalSyntax;
+        use novarocks_type_contract::{
+            SemanticParameterValue, StatementStartUtc, StatementTimeEnvironment, TimeZoneKey,
+        };
 
         let start = StatementStartUtc::try_new(1_700_000_000, 0).unwrap();
         let zone = TimeZoneKey::UTC;
@@ -8158,60 +8159,16 @@ mod tests {
         }
     }
 
-    fn analyze_manually_constructed_scalar_function(
-        name: &str,
-        sql: &str,
-    ) -> Result<crate::analysis::TypedExpr, String> {
-        let query =
-            &mut novarocks_parser::parser::parse_query(sql).map_err(|error| error.to_string())?;
-        let ast::SetExpr::Select(select) = query.body.as_mut() else {
-            return Err("expected select".to_string());
-        };
-        let Some(ast::SelectItem::SingleColumn(projection_column)) = select.projection.first_mut()
-        else {
-            return Err("expected ordinary scalar function".to_string());
-        };
-        assert!(projection_column.alias.is_none(), "anonymous projection");
-        let ast::Expr::FunctionCall(func) = &mut projection_column.expression else {
-            return Err("expected ordinary scalar function".to_string());
-        };
-        let Some(last_name_part) = func.name.parts.last_mut() else {
-            return Err("expected scalar function name".to_string());
-        };
-        last_name_part.value = name.to_string();
-
-        let (resolved, _registry, _factory) =
-            analyze(query, &EmptyCatalog, "default").map_err(|error| error.to_string())?;
-        let QueryBody::Select(select) = resolved.body else {
-            return Err("expected select".to_string());
-        };
-        select
-            .projection
-            .into_iter()
-            .next()
-            .map(|item| item.expr)
-            .ok_or_else(|| "expected projection".to_string())
-    }
-
-    fn assert_substring_int32_arguments(sql: &str, expected_name: &str, expected_arity: usize) {
-        let expr = analyze_projection_expr(sql).expect("substring should analyze");
-        let crate::analysis::ExprKind::FunctionCall { name, args, .. } = expr.kind else {
-            panic!("expected FunctionCall, got {:?}", expr.kind);
-        };
-        assert_eq!(name, expected_name);
-        assert_eq!(args.len(), expected_arity);
-        assert_eq!(args[0].value_type.data_type().clone(), DataType::Utf8);
-        for arg in &args[1..] {
-            assert_eq!(arg.value_type.data_type().clone(), DataType::Int32);
-        }
-    }
-
     #[test]
-    fn substring_function_syntax_binds_integer_literals_to_int32() {
+    fn substring_function_syntax_binds_integer_literals_to_bigint() {
         for (sql, values) in [
             ("select substring('STARROCKS', 2, 3)", &[2, 3][..]),
             ("select substring('x', 2147483647)", &[2147483647][..]),
             ("select substring('x', -2147483648)", &[-2147483648][..]),
+            (
+                "select substring('x', 9223372036854775807)",
+                &[i64::MAX][..],
+            ),
         ] {
             let expr = analyze_projection_expr(sql).expect("in-range literals should analyze");
             let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
@@ -8219,21 +8176,14 @@ mod tests {
             };
             assert_eq!(args.len(), values.len() + 1);
             for (arg, expected) in args.iter().skip(1).zip(values) {
-                assert_eq!(arg.value_type.data_type().clone(), DataType::Int32);
-                assert!(!arg.value_type.nullable());
-                assert!(matches!(
-                    arg.kind,
-                    crate::analysis::ExprKind::Literal(
-                        crate::analysis::LiteralValue::Int(value)
-                    ) if value == *expected
-                ));
+                assert_substring_bigint_literal(arg, *expected);
             }
         }
     }
 
     #[test]
     fn substring_normal_and_special_syntax_bind_identical_arguments() {
-        use novarocks_type_contract::ValueKind;
+        use novarocks_type_contract::{CharacterKind, ValueKind};
 
         let ordinary = analyze_projection_expr("SELECT substring('x', 2, 3)").unwrap();
         let special = analyze_projection_expr("SELECT substring('x' FROM 2 FOR 3)").unwrap();
@@ -8244,9 +8194,12 @@ mod tests {
             };
             assert_eq!(name, expected_name);
             assert_eq!(args.len(), 3);
-            assert_eq!(
-                args[0].value_type.value_type().kind(),
-                &ValueKind::String,
+            assert!(
+                matches!(
+                    args[0].value_type.value_type().kind(),
+                    ValueKind::BoundedCharacter(character)
+                        if character.kind() == CharacterKind::Varchar && character.length() == 1
+                ),
                 "{name}"
             );
             assert!(!args[0].value_type.nullable());
@@ -8254,19 +8207,19 @@ mod tests {
                 matches!(&args[0].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "x")
             );
             for (argument, expected) in args.iter().skip(1).zip([2, 3]) {
-                assert_eq!(argument.value_type.data_type(), &DataType::Int32);
-                assert!(!argument.value_type.nullable());
-                assert!(
-                    matches!(argument.kind, ExprKind::Literal(LiteralValue::Int(value)) if value == expected)
-                );
+                assert_substring_bigint_literal(argument, expected);
             }
         }
     }
 
     #[test]
     fn substring_special_syntax_uses_the_same_binding() {
-        assert_substring_int32_arguments("select substring('STARROCKS' from 2 for 3)", "substr", 3);
-        assert_substring_int32_arguments("select substring('STARROCKS' from 2)", "substr", 2);
+        assert_substring_bigint_arguments(
+            "select substring('STARROCKS' from 2 for 3)",
+            "substr",
+            3,
+        );
+        assert_substring_bigint_arguments("select substring('STARROCKS' from 2)", "substr", 2);
     }
 
     #[test]
@@ -8321,11 +8274,19 @@ mod tests {
                 panic!("expected substring: {sql}");
             };
             let ExprKind::Cast {
+                expr: integer,
+                target: DataType::Int64,
+                ..
+            } = &args[1].kind
+            else {
+                panic!("expected the BIGINT parameter to widen its INTEGER input: {sql}");
+            };
+            let ExprKind::Cast {
                 expr: original,
                 cast_mode: Some(TrinoCastMode::Explicit),
                 target: DataType::Int32,
                 ..
-            } = &args[1].kind
+            } = &integer.kind
             else {
                 panic!("expected explicit CAST to INTEGER: {sql}");
             };
@@ -8338,31 +8299,48 @@ mod tests {
     }
 
     #[test]
-    fn scalar_binder_never_inserts_implicit_narrowing_for_substring() {
+    fn listagg_keeps_trino_argument_and_distinct_order_boundaries() {
         use crate::analyze_error::AnalyzeErrorKind;
-        use novarocks_type_contract::FunctionValueType;
 
-        let error = super::bind_scalar_function_call(
-            "substring",
-            vec![
-                TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
-                    value_type: FunctionValueType::new(DataType::Utf8, false),
-                },
-                TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: crate::column_id::ColumnId(42),
-                        qualifier: None,
-                        column: "offset".to_string(),
-                    },
-                    value_type: FunctionValueType::new(DataType::Int64, false),
-                },
-            ],
+        let analyze_error = |sql| {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            analyze(&query, &EmptyCatalog, "default").unwrap_err()
+        };
+        for sql in [
+            "SELECT LISTAGG(NULL) WITHIN GROUP (ORDER BY 1)",
+            r#"SELECT "listagg"(NULL, '|', true, '...', false)"#,
+        ] {
+            let error = analyze_error(sql);
+            assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
+        }
+
+        let error = analyze_error("SELECT LISTAGG(DISTINCT 'a') WITHIN GROUP (ORDER BY 'A')");
+        assert_eq!(error.kind(), AnalyzeErrorKind::ExpressionNotInDistinct);
+
+        for sql in [
+            "SELECT LISTAGG(CAST(NULL AS VARCHAR)) WITHIN GROUP (ORDER BY 1)",
+            r#"SELECT "listagg"(DISTINCT 'a', '|', true, '...', false ORDER BY '|')"#,
+        ] {
+            assert_eq!(
+                analyze_projection_expr(sql).unwrap().value_type.data_type(),
+                &DataType::Utf8
+            );
+        }
+    }
+
+    #[test]
+    fn substring_keeps_bigint_columns_as_the_selected_argument() {
+        let expression = analyze_projection_expr_with_catalog(
+            "SELECT substring('x', offset) FROM offsets",
+            &BigintOffsetCatalog,
+            crate::functions::builtin_sql_function_catalog(),
         )
-        .err()
-        .expect("the declared INTEGER overload must not implicitly narrow BIGINT");
-        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
-        assert_eq!(error.message(), "no matching declared overload");
+        .unwrap();
+        let ExprKind::FunctionCall { args, .. } = expression.kind else {
+            panic!("expected substring");
+        };
+        assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
+        assert!(matches!(args[1].kind, ExprKind::ColumnRef { .. }));
     }
 
     #[test]
@@ -8372,7 +8350,7 @@ mod tests {
         )
         .expect("substring query should parse");
         let (resolved, _registry, _factory) = analyze(query, &BigintOffsetCatalog, "default")
-            .expect("the explicit CAST supplies the declared INTEGER parameter");
+            .expect("the explicit CAST supplies the INTEGER expression for the BIGINT parameter");
         let QueryBody::Select(select) = resolved.body else {
             panic!("expected select");
         };
@@ -8386,14 +8364,22 @@ mod tests {
             panic!("expected FunctionCall, got {:?}", expr.kind);
         };
         let offset = args.into_iter().nth(1).expect("expected offset argument");
-        assert_eq!(offset.value_type.data_type().clone(), DataType::Int32);
+        assert_eq!(offset.value_type.data_type(), &DataType::Int64);
         assert!(!offset.value_type.nullable());
+        let ExprKind::Cast {
+            expr: integer,
+            target: DataType::Int64,
+            ..
+        } = offset.kind
+        else {
+            panic!("expected the original INTEGER expression to be widened");
+        };
         let crate::analysis::ExprKind::Cast {
             expr,
             target: DataType::Int32,
             cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
             ..
-        } = offset.kind
+        } = &integer.kind
         else {
             panic!("expected BIGINT offset runtime cast");
         };
@@ -8408,46 +8394,11 @@ mod tests {
     }
 
     #[test]
-    fn group_concat_and_string_agg_keep_implicit_utf8_coercion() {
-        for name in ["group_concat", "string_agg"] {
-            let expr = analyze_projection_expr(&format!("select {name}(1, ',')"))
-                .expect("aggregate should preserve implicit string coercion");
-            let crate::analysis::ExprKind::AggregateCall { args, .. } = expr.kind else {
-                panic!("expected AggregateCall, got {:?}", expr.kind);
-            };
-            assert!(!args.is_empty());
-            assert!(
-                args.iter()
-                    .all(|arg| *arg.value_type.data_type() == DataType::Utf8)
-            );
-            assert!(args.iter().all(|arg| matches!(
-                arg.kind,
-                crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::String(_))
-                    | crate::analysis::ExprKind::Cast {
-                        target: DataType::Utf8,
-                        ..
-                    }
-            )));
-        }
-    }
-
-    #[test]
-    fn canonical_concat_zero_arguments_keep_the_original_analysis_refusal() {
-        for sql in ["SELECT group_concat()", "SELECT string_agg()"] {
-            let error = analyze_projection_expr(sql).expect_err("zero value arguments are invalid");
-            assert!(
-                error.contains("group_concat should have at least one input."),
-                "{sql}: {error}"
-            );
-        }
-    }
-
-    #[test]
     fn ordered_aggregate_binding_freezes_every_update_channel() {
         let expr = analyze_projection_expr(
-            "select string_agg('v' \n,\n '|'\norder by 1, cast(7 as bigint) \n)",
+            "SELECT LISTAGG('v', '|') WITHIN GROUP (ORDER BY 1, BIGINT '7')",
         )
-        .expect("ordered group_concat should analyze");
+        .expect("ordered LISTAGG should analyze");
         let crate::analysis::ExprKind::AggregateCall {
             args,
             order_by,
@@ -8457,58 +8408,40 @@ mod tests {
         else {
             panic!("expected AggregateCall, got {:?}", expr.kind);
         };
-        assert_eq!(args.len(), 2, "value and separator remain logical args");
+        assert_eq!(args.len(), 5);
         assert_eq!(order_by.len(), 2);
-        let argument_types = resolved
-            .selected
-            .argument_types
-            .iter()
-            .map(|argument| match argument {
-                novarocks_functions::FunctionArgumentType::Value(value) => {
-                    value.data_type().clone()
-                }
-                novarocks_functions::FunctionArgumentType::Lambda { .. } => {
-                    panic!("aggregate update arguments cannot be lambdas")
-                }
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            argument_types,
-            [
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Int64,
-            ]
+            resolved.selected.overload.as_str(),
+            "builtin.aggregate/listagg/derived-v1"
         );
-        let DataType::Struct(fields) = &crate::functions::aggregate_selection(&resolved)
-            .intermediate_type
-            .data_type()
-        else {
-            panic!("expected Struct intermediate for ordered group_concat");
-        };
-        assert_eq!(fields.len(), 4);
-        for (field, input_type) in fields.iter().zip(argument_types.iter()) {
-            let DataType::List(item) = field.data_type() else {
-                panic!("expected List field in group_concat intermediate");
-            };
-            assert_eq!(item.data_type(), input_type);
-        }
+        let update_types: Vec<_> = args
+            .iter()
+            .chain(order_by.iter().map(|key| &key.expr))
+            .map(|expr| novarocks_functions::FunctionArgumentType::Value(expr.value_type.clone()))
+            .collect();
+        assert_eq!(resolved.selected.argument_types.as_ref(), update_types);
     }
 
     #[test]
-    fn generic_fixed_offset_binding_uses_the_original_checked_literal_normalization() {
-        let expression = analyze_projection_expr("SELECT lead('a', 1, 'b') OVER ()").unwrap();
+    fn generic_fixed_offset_binding_preserves_the_literal_and_its_widening() {
+        let expression =
+            analyze_projection_expr("SELECT lead('a', 1, 'b') OVER (ORDER BY 1)").unwrap();
         let ExprKind::WindowCall { args, binding, .. } = expression.kind else {
             panic!("window");
         };
         assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
         assert!(!args[1].value_type.nullable());
-        // The existing syntax-literal author normalizes a checked value before
-        // its first canonical CV admission; already-admitted ConstantValue and
-        // nonliteral inputs never enter signed_int_literal_value.
+        let ExprKind::Cast {
+            expr: original,
+            target: DataType::Int64,
+            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+            ..
+        } = &args[1].kind
+        else {
+            panic!("expected implicit BIGINT widening: {:?}", args[1].kind);
+        };
         assert!(matches!(
-            args[1].kind,
+            original.kind,
             ExprKind::Literal(LiteralValue::Int(1))
         ));
         assert_eq!(
@@ -8566,18 +8499,19 @@ mod tests {
 
     #[test]
     fn fixed_wide_parameters_do_not_erase_original_unary_integer_overflow() {
-        let safe = analyze_projection_expr("SELECT lead('a', - -1, 'b') OVER ()").unwrap();
+        let safe =
+            analyze_projection_expr("SELECT lead('a', - -1, 'b') OVER (ORDER BY 1)").unwrap();
         let ExprKind::WindowCall { args, .. } = safe.kind else {
             panic!("window");
         };
-        assert!(
-            matches!(args[1].kind, ExprKind::Literal(LiteralValue::Int(1))),
-            "existing safe normalization remains"
-        );
+        let ExprKind::Cast { expr: original, .. } = &args[1].kind else {
+            panic!("expected implicit BIGINT widening: {:?}", args[1].kind);
+        };
+        assert_eq!(super::signed_int_literal_value(original), Some(1));
         assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
         for sql in [
-            "SELECT lead('a', - -2147483648, 'b') OVER ()",
-            "SELECT lead('a', -(-2147483648), 'b') OVER ()",
+            "SELECT lead('a', - -2147483648, 'b') OVER (ORDER BY 1)",
+            "SELECT lead('a', -(-2147483648), 'b') OVER (ORDER BY 1)",
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
             let ExprKind::WindowCall { args, .. } = expression.kind else {
@@ -8636,9 +8570,18 @@ mod tests {
         let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
             panic!("expected FunctionCall, got {:?}", expr.kind);
         };
-        assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
+        assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
+        let ExprKind::Cast {
+            expr: arithmetic,
+            target: DataType::Int64,
+            ..
+        } = &args[1].kind
+        else {
+            panic!("expected the original INTEGER expression to be widened");
+        };
+        assert_eq!(arithmetic.value_type.data_type(), &DataType::Int32);
         let (operator, [left, right]) =
-            crate::common::binary_operator::typed_operands(&args[1]).expect("runtime arithmetic");
+            crate::common::binary_operator::typed_operands(arithmetic).expect("runtime arithmetic");
         assert_eq!(operator, novarocks_type_contract::OperatorFunction::Add);
         assert_eq!(left.value_type.data_type(), &DataType::Int32);
         assert_eq!(right.value_type.data_type(), &DataType::Int32);
@@ -8653,7 +8596,7 @@ mod tests {
     }
 
     #[test]
-    fn substring_null_offset_binds_to_nullable_int32() {
+    fn substring_null_offset_binds_to_nullable_bigint() {
         for sql in [
             "select substring('x', NULL)",
             "select substring('x' FROM NULL)",
@@ -8663,7 +8606,7 @@ mod tests {
             let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
                 panic!("expected FunctionCall, got {:?}", expr.kind);
             };
-            assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
+            assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
             assert!(args[1].value_type.nullable());
         }
     }
@@ -8904,6 +8847,56 @@ mod tests {
         assert!(matches!(args[0].kind, ExprKind::Case { .. }));
         assert_eq!(args[0].value_type, nominal.value_type);
 
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let query = novarocks_parser::parser::parse_query("select abs(NULL)").unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select");
+        };
+        let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("ABS projection");
+        };
+        let ast::Expr::FunctionCall(call) = &column.expression else {
+            panic!("ABS source");
+        };
+        let null = checked_largeint_null(&control);
+        let mut materialized =
+            crate::compiler::materialized_values::MaterializedSourceBorrow::empty(&query);
+        materialized
+            .insert_context_constant(&call.arguments[0].value, null.clone(), &control)
+            .unwrap();
+        let mut context = logical_context(&control);
+        context.materialized_values = Some(materialized.view());
+        let abs = context
+            .analyze_expr(&column.expression, &context.new_scope())
+            .unwrap();
+        assert_eq!(&abs.value_type, null.value_type());
+        let ExprKind::FunctionCall { binding, args, .. } = abs.kind else {
+            panic!("expected exact ABS call");
+        };
+        assert_eq!(binding.function_id.as_str(), "builtin.scalar/abs/v1");
+        assert_eq!(
+            binding.selected.argument_types.as_ref(),
+            &[novarocks_functions::FunctionArgumentType::Value(
+                null.value_type().clone()
+            )]
+        );
+        assert_eq!(
+            binding.selected.result_type,
+            novarocks_functions::FunctionResultType::Scalar(null.value_type().clone())
+        );
+        let [arg] = args.as_slice() else {
+            panic!("ABS must have one argument");
+        };
+        assert_eq!(&arg.value_type, null.value_type());
+        let ExprKind::Constant(witness) = &arg.kind else {
+            panic!("expected original typed NULL");
+        };
+        assert_eq!(witness.ordinal(), null.ordinal());
+        assert_eq!(
+            witness.pool().backing_identity(),
+            null.pool().backing_identity()
+        );
+
         let expression =
             analyze_projection_expr("select cast(abs(cast(-128 as tinyint)) as decimal(38,15))")
                 .unwrap();
@@ -8919,65 +8912,6 @@ mod tests {
             panic!("expected inner ABS")
         };
         assert_eq!(args[0].value_type.data_type().clone(), DataType::Int8);
-    }
-
-    #[test]
-    fn concat_modes_control_argument_channels_ordinals_and_output_names() {
-        fn resolved(
-            sql: &str,
-            mode: &str,
-        ) -> Result<crate::analysis::ResolvedQuery, crate::analyze_error::AnalyzeError> {
-            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
-            super::super::analyze_with_function_catalog_and_sql_semantics(
-                query,
-                &EmptyCatalog,
-                "default",
-                crate::functions::builtin_sql_function_catalog(),
-                &crate::sql_mode::SqlSemanticSettings::default()
-                    .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode)),
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .map(|(query, _, _)| query)
-        }
-        for (mode, args_len, heading) in [
-            ("32", 3, "group_concat('a','-' SEPARATOR ',')"),
-            ("GROUP_CONCAT_LEGACY", 2, "group_concat('a' SEPARATOR '-')"),
-        ] {
-            let query = resolved("SELECT group_concat('a','-')", mode).unwrap();
-            let QueryBody::Select(select) = query.body else {
-                panic!("select");
-            };
-            assert_eq!(select.projection[0].output_name, heading);
-            let crate::analysis::ExprKind::AggregateCall { args, .. } =
-                &select.projection[0].expr.kind
-            else {
-                panic!("aggregate");
-            };
-            assert_eq!(args.len(), args_len);
-        }
-        resolved("SELECT group_concat('a','-' ORDER BY 2)", "32").unwrap();
-        let error = resolved(
-            "SELECT group_concat('a','-' ORDER BY 2)",
-            "GROUP_CONCAT_LEGACY",
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("ORDER BY position 2 is not in group_concat output list")
-        );
-        for mode in ["32", "GROUP_CONCAT_LEGACY"] {
-            let query = resolved("SELECT string_agg('a','-' \n,\n '|'\n\n)", mode).unwrap();
-            let QueryBody::Select(select) = query.body else {
-                panic!("select");
-            };
-            assert_eq!(
-                select.projection[0].output_name,
-                "group_concat('a','-' SEPARATOR '|')"
-            );
-            assert!(resolved("SELECT string_agg('a','-' ORDER BY 2)", mode).is_err());
-        }
     }
 
     #[test]
@@ -9238,12 +9172,12 @@ mod tests {
             &expected_type
         );
         let legacy = crate::sql_mode::SqlSemanticSettings::default().with_sql_mode(
-            crate::sql_mode::SqlMode::from_assignment("GROUP_CONCAT_LEGACY"),
+            crate::sql_mode::SqlMode::from_assignment("ERROR_IF_OVERFLOW"),
         );
         for sql in [
-            "WITH t AS (SELECT group_concat('a','-') x) SELECT x FROM t",
-            "SELECT x FROM (SELECT group_concat('a','-') x) t",
-            "SELECT group_concat('a','-') UNION ALL SELECT group_concat('b','-')",
+            "WITH t AS (SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1) x) SELECT x FROM t",
+            "SELECT x FROM (SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1) x) t",
+            "SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1) UNION ALL SELECT LISTAGG('b', '-') WITHIN GROUP (ORDER BY 1)",
         ] {
             resolved(sql, &legacy);
         }
@@ -9454,14 +9388,24 @@ mod tests {
 
     #[test]
     fn decimal_largeint_add_sub_seal_exact_result_without_operand_retagging() {
-        use novarocks_type_contract::ValueLogicalType;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
+        let largeint = DataType::FixedSizeBinary(16);
         let catalog = UnaryInputCatalog {
-            key_type: DataType::FixedSizeBinary(16),
+            key_type: largeint.clone(),
             nullable: false,
             logical_type: Some(novarocks_types::schema::SqlType::LargeInt),
         };
-        let functions = crate::functions::builtin_sql_function_catalog();
+        let expected_largeint =
+            FunctionValueType::try_with_logical_type(largeint, false, ValueLogicalType::LargeInt)
+                .unwrap();
+        let analyze = |sql: &str| {
+            analyze_projection_expr_with_catalog(
+                sql,
+                &catalog,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+        };
         for op in ["+", "-"] {
             for reverse in [false, true] {
                 let decimal = "CAST(1.25 AS DECIMAL(38,15))";
@@ -9470,21 +9414,19 @@ mod tests {
                 } else {
                     (decimal, "k")
                 };
-                let sql = format!("SELECT {left} {op} {right} FROM unary_input");
-                let expr = analyze_projection_expr_with_catalog(&sql, &catalog, functions).unwrap();
+                let sql = format!("select {left} {op} {right} from unary_input");
+                let expr = analyze(&sql).unwrap();
                 assert_eq!(expr.value_type.data_type(), &DataType::Decimal256(55, 15));
                 let ExprKind::BinaryOp { left, right, .. } = expr.kind else {
                     panic!("expected frozen arithmetic");
                 };
-                let (wide, decimal) = if reverse {
+                let (source, decimal) = if reverse {
                     (left, right)
                 } else {
                     (right, left)
                 };
-                assert_eq!(wide.value_type.data_type(), &DataType::FixedSizeBinary(16));
-                assert_eq!(wide.value_type.logical_type(), ValueLogicalType::LargeInt);
-                assert!(!wide.value_type.nullable());
-                assert!(matches!(wide.kind, ExprKind::ColumnRef { .. }));
+                assert!(matches!(source.kind, ExprKind::ColumnRef { .. }));
+                assert_eq!(source.value_type, expected_largeint);
                 assert_eq!(
                     decimal.value_type.data_type(),
                     &DataType::Decimal128(38, 15)
@@ -9492,19 +9434,18 @@ mod tests {
                 assert!(matches!(decimal.kind, ExprKind::Cast { .. }));
             }
         }
-        let widest = analyze_projection_expr_with_catalog(
-            "SELECT CAST(0 AS DECIMAL(38,36)) + k FROM unary_input",
-            &catalog,
-            functions,
-        )
-        .unwrap();
-        assert_eq!(widest.value_type.data_type(), &DataType::Decimal256(76, 36));
-
+        assert_eq!(
+            analyze("select cast(0.000000000000000000000000000000000001 as decimal(38,36)) + k from unary_input")
+                .unwrap()
+                .value_type
+                .data_type(),
+            &DataType::Decimal256(76, 36)
+        );
         for sql in [
-            "SELECT CAST(0 AS DECIMAL(38,37)) + k FROM unary_input",
-            "SELECT CAST(1 AS DECIMAL(38,15)) * k FROM unary_input",
-            "SELECT CAST(1 AS DECIMAL(38,15)) / k FROM unary_input",
-            "SELECT CAST(1 AS DECIMAL(38,15)) % k FROM unary_input",
+            "select cast(0 as decimal(38,37)) + k from unary_input",
+            "select cast(1 as decimal(38,15)) * k from unary_input",
+            "select cast(1 as decimal(38,15)) / k from unary_input",
+            "select cast(1 as decimal(38,15)) % k from unary_input",
         ] {
             let query = novarocks_parser::parser::parse_query(sql).unwrap();
             let error = super::super::analyze(&query, &catalog, "default").unwrap_err();
@@ -9519,6 +9460,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn unavailable_builtin_is_explicitly_rejected_before_false_filter_pruning() {
         let error = analyze_projection_expr("select reverse(ARRAY[1,2]) where false").unwrap_err();
@@ -9873,8 +9815,8 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "group_concat_source_tests.rs"]
-mod group_concat_source_tests;
+#[path = "aggregate_state_source_tests.rs"]
+mod aggregate_state_source_tests;
 
 /// Project one complete child and its exact physical layout through the same
 /// pure SQL construction body and the original cancellation/deadline observer.

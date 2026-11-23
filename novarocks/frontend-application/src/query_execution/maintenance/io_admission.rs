@@ -319,6 +319,25 @@ impl RequestCell {
     fn wake(&self) {
         self.observer.wake();
     }
+    fn loan_cleanup(&self) -> Option<Loan<'_, StreamBody>> {
+        let mut original = self.stream.lock().unwrap_or_else(|p| p.into_inner());
+        let stream = original.as_ref()?;
+        // A live writer owns normal close until it transfers its disposition
+        // with a cleanup future. Keep that writer's stream state in its cell.
+        if stream.future.is_none()
+            || stream.poll_failure.is_some()
+            || stream.drop_failure.is_some()
+            || stream.custody_lost
+        {
+            return None;
+        }
+        Some(Loan {
+            source: &self.stream,
+            body: original.take(),
+            on_return: None,
+        })
+    }
+
     fn poll_original(&self, cx: &mut Context<'_>) -> bool {
         let mut changed = false;
         let progress = self
@@ -344,29 +363,24 @@ impl RequestCell {
             drop(retired);
             changed = true;
         }
-        let Some(mut original) = loan(&self.stream) else {
+        let Some(mut original) = self.loan_cleanup() else {
             return changed;
         };
         let stream = original.body.as_mut().unwrap();
-        if stream.poll_failure.is_some() || stream.drop_failure.is_some() || stream.custody_lost {
-            return changed;
+        let future = stream.future.as_mut().unwrap();
+        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => return changed,
+            Ok(Poll::Ready(result)) => stream.result = Some(result),
+            Err(cause) => stream.poll_failure = Some(cause),
         }
-        if let Some(future) = stream.future.as_mut() {
-            match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
-                Ok(Poll::Pending) => return changed,
-                Ok(Poll::Ready(result)) => stream.result = Some(result),
-                Err(cause) => stream.poll_failure = Some(cause),
-            }
-            let future = stream.future.take();
-            if let Err(cause) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
-                stream.drop_failure = Some(cause);
-            }
-            if stream.poll_failure.is_none() && stream.drop_failure.is_none() {
-                stream.reserved = false;
-            }
-            changed = true;
+        let future = stream.future.take();
+        if let Err(cause) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
+            stream.drop_failure = Some(cause);
         }
-        changed
+        if stream.poll_failure.is_none() && stream.drop_failure.is_none() {
+            stream.reserved = false;
+        }
+        true
     }
     fn has_health_failure(&self) -> bool {
         self.stream

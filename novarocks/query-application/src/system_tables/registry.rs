@@ -19,6 +19,9 @@
 //! This is an external naming contract, not a source-shape guard.
 
 use super::SystemTableRegistryError;
+use super::metadata_declarations::{
+    information_schema_registrations, jdbc_registrations, runtime_registrations,
+};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_sql::system_table::{SystemTableBinding, SystemTableColumn, SystemTableDeclaration};
 use novarocks_type_contract::FunctionValueType;
@@ -72,7 +75,7 @@ pub struct SystemTableRegistry {
 }
 
 impl SystemTableRegistry {
-    /// Install the three supported standard tables, then compose extensions.
+    /// Install the supported standard tables, then compose extensions.
     /// Extensions cannot claim any name reserved by the Trino baseline.
     pub fn try_new(
         additional: impl IntoIterator<Item = SystemTableRegistration>,
@@ -80,7 +83,11 @@ impl SystemTableRegistry {
         let mut registry = Self {
             tables: BTreeMap::new(),
         };
-        for registration in standard_registrations() {
+        for registration in std::iter::once(materialized_views_registration())
+            .chain(information_schema_registrations())
+            .chain(jdbc_registrations())
+            .chain(runtime_registrations())
+        {
             registry.insert(registration, true)?;
         }
         for registration in additional {
@@ -105,6 +112,7 @@ impl SystemTableRegistry {
         let scope_allowed = match registration.scope {
             SystemTableScope::System => {
                 matches!(registration.schema.as_str(), "metadata" | "runtime")
+                    || standard && registration.schema == "jdbc"
             }
             SystemTableScope::CatalogInformationSchema => {
                 standard && registration.schema == INFORMATION_SCHEMA
@@ -202,13 +210,18 @@ impl SystemTableRegistry {
         schemas.into_iter().collect()
     }
 
-    /// Read-only descriptions used when listing the system catalog itself.
-    pub fn declarations(&self, binding: &SystemTableBinding) -> Vec<Arc<SystemTableDeclaration>> {
+    /// Declarations installed in this catalog, including its information schema.
+    pub fn declarations<'a>(
+        &'a self,
+        binding: &'a SystemTableBinding,
+    ) -> impl Iterator<Item = Arc<SystemTableDeclaration>> + 'a {
         self.tables
             .values()
-            .filter(|table| table.scope == binding_scope(binding))
-            .map(|table| table.bind(binding.clone()))
-            .collect()
+            .filter(move |table| {
+                table.scope == SystemTableScope::CatalogInformationSchema
+                    || table.scope == binding_scope(binding)
+            })
+            .map(move |table| table.bind(binding.clone()))
     }
 }
 
@@ -290,12 +303,13 @@ fn varchar_columns(columns: &[(&str, bool)]) -> Arc<[SystemTableColumn]> {
         .iter()
         .map(|(name, nullable)| SystemTableColumn {
             name: (*name).into(),
+            hidden: false,
             value_type: FunctionValueType::new(DataType::Utf8, *nullable),
         })
         .collect()
 }
 
-fn standard_registrations() -> [SystemTableRegistration; 3] {
+fn materialized_views_registration() -> SystemTableRegistration {
     let mut mv = varchar_columns(&[
         ("catalog_name", true),
         ("schema_name", true),
@@ -315,40 +329,13 @@ fn standard_registrations() -> [SystemTableRegistration; 3] {
         DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         true,
     );
-    [
-        SystemTableRegistration {
-            scope: SystemTableScope::System,
-            schema: "metadata".into(),
-            table: "materialized_views".into(),
-            columns: mv.into(),
-            key_columns: Arc::from([0, 1, 2]),
-        },
-        SystemTableRegistration {
-            scope: SystemTableScope::CatalogInformationSchema,
-            schema: INFORMATION_SCHEMA.into(),
-            table: "schemata".into(),
-            columns: varchar_columns(&[
-                ("catalog_name", false),
-                ("schema_name", false),
-                ("default_character_set_name", false),
-                ("default_collation_name", false),
-                ("sql_path", true),
-            ]),
-            key_columns: Arc::from([1]),
-        },
-        SystemTableRegistration {
-            scope: SystemTableScope::CatalogInformationSchema,
-            schema: INFORMATION_SCHEMA.into(),
-            table: "tables".into(),
-            columns: varchar_columns(&[
-                ("table_catalog", false),
-                ("table_schema", false),
-                ("table_name", false),
-                ("table_type", false),
-            ]),
-            key_columns: Arc::from([1, 2, 3]),
-        },
-    ]
+    SystemTableRegistration {
+        scope: SystemTableScope::System,
+        schema: "metadata".into(),
+        table: "materialized_views".into(),
+        columns: mv.into(),
+        key_columns: Arc::from([0, 1, 2]),
+    }
 }
 
 #[cfg(test)]
@@ -379,19 +366,22 @@ mod tests {
         declaration
     }
     #[test]
-    fn system_schemas_appear_only_when_they_have_registered_tables() {
+    fn standard_and_extended_runtime_tables_share_the_registered_schema() {
         let standard = SystemTableRegistry::try_new([]).unwrap();
-        assert_eq!(standard.schemas(&SystemTableBinding::System), ["metadata"]);
+        assert_eq!(
+            standard.schemas(&SystemTableBinding::System),
+            ["jdbc", "metadata", "runtime"]
+        );
         assert_eq!(
             standard.declare(&SystemTableBinding::System, "runtime", "missing"),
-            SystemTableLookup::UnknownSchema
+            SystemTableLookup::UnknownTable
         );
 
         let extended =
             SystemTableRegistry::try_new([extension("runtime", "query_events")]).unwrap();
         assert_eq!(
             extended.schemas(&SystemTableBinding::System),
-            ["metadata", "runtime"]
+            ["jdbc", "metadata", "runtime"]
         );
         assert_eq!(
             extended.declare(&SystemTableBinding::System, "runtime", "missing"),
@@ -399,9 +389,9 @@ mod tests {
         );
     }
     #[test]
-    fn system_information_schema_uses_shared_declarations_without_extra_listing_rows() {
+    fn system_information_schema_uses_and_lists_shared_declarations() {
         let registry = SystemTableRegistry::try_new([]).unwrap();
-        for table in ["schemata", "tables"] {
+        for table in ["columns", "schemata", "tables", "views"] {
             let system = declared(
                 &registry,
                 SystemTableBinding::System,
@@ -428,12 +418,29 @@ mod tests {
             registry.declare(&SystemTableBinding::System, INFORMATION_SCHEMA, "missing"),
             SystemTableLookup::UnknownTable
         );
-        assert_eq!(registry.schemas(&SystemTableBinding::System), ["metadata"]);
-        let listed = registry.declarations(&SystemTableBinding::System);
-        assert_eq!(listed.len(), 1);
         assert_eq!(
-            listed[0].qualified_name(),
-            "system.metadata.materialized_views"
+            registry.schemas(&SystemTableBinding::System),
+            ["jdbc", "metadata", "runtime"]
+        );
+        assert!(
+            registry
+                .declarations(&SystemTableBinding::System)
+                .any(|table| { table.qualified_name() == "system.information_schema.columns" })
+        );
+        let columns = declared(
+            &registry,
+            SystemTableBinding::System,
+            INFORMATION_SCHEMA,
+            "columns",
+        );
+        assert_eq!(
+            columns
+                .columns
+                .iter()
+                .filter(|column| column.hidden)
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["comment", "extra_info", "column_comment"]
         );
     }
     #[test]
@@ -547,21 +554,21 @@ mod tests {
         for (table, names, nullability, keys) in [
             (
                 "schemata",
-                vec![
-                    "catalog_name",
-                    "schema_name",
-                    "default_character_set_name",
-                    "default_collation_name",
-                    "sql_path",
-                ],
-                vec![false, false, false, false, true],
-                vec![1],
+                vec!["catalog_name", "schema_name"],
+                vec![true, true],
+                vec![0, 1],
             ),
             (
                 "tables",
-                vec!["table_catalog", "table_schema", "table_name", "table_type"],
-                vec![false; 4],
-                vec![1, 2, 3],
+                vec![
+                    "table_catalog",
+                    "table_schema",
+                    "table_name",
+                    "table_type",
+                    "table_comment",
+                ],
+                vec![true; 5],
+                vec![0, 1, 2, 3],
             ),
         ] {
             let declaration = declared(&registry, binding.clone(), INFORMATION_SCHEMA, table);

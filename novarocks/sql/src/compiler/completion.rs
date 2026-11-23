@@ -584,6 +584,7 @@ impl fmt::Debug for ProviderReadRelationNeed {
 pub struct ProviderReadPredicateNeed {
     occurrence: ProviderPredicateOccurrenceId,
     constraint: Constraint<u32>,
+    exact_eligible: bool,
 }
 
 impl ProviderReadPredicateNeed {
@@ -594,7 +595,17 @@ impl ProviderReadPredicateNeed {
         Self {
             occurrence,
             constraint,
+            exact_eligible: true,
         }
+    }
+
+    pub(super) const fn with_exact_eligibility(mut self, exact_eligible: bool) -> Self {
+        self.exact_eligible = exact_eligible;
+        self
+    }
+
+    pub const fn exact_eligible(&self) -> bool {
+        self.exact_eligible
     }
 
     pub const fn occurrence(&self) -> ProviderPredicateOccurrenceId {
@@ -611,6 +622,7 @@ impl fmt::Debug for ProviderReadPredicateNeed {
         formatter
             .debug_struct("ProviderReadPredicateNeed")
             .field("occurrence", &self.occurrence)
+            .field("exact_eligible", &self.exact_eligible)
             .field(
                 "summary_columns",
                 &self.constraint.summary().columns().count(),
@@ -965,6 +977,7 @@ fn validate_provider_constraint(
 pub struct SystemTableSnapshotNeed {
     id: CompileNeedId,
     occurrence: crate::system_table::SystemTableOccurrenceId,
+    statement_relation: Option<crate::system_table::StatementSystemRelation>,
     declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
     required_columns: Box<[usize]>,
     key_constraint: crate::system_table::SystemTableKeyConstraint,
@@ -973,6 +986,7 @@ impl SystemTableSnapshotNeed {
     pub(super) fn new(
         id: CompileNeedId,
         occurrence: crate::system_table::SystemTableOccurrenceId,
+        statement_relation: Option<crate::system_table::StatementSystemRelation>,
         declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
         required_columns: Box<[usize]>,
         key_constraint: crate::system_table::SystemTableKeyConstraint,
@@ -980,6 +994,7 @@ impl SystemTableSnapshotNeed {
         Self {
             id,
             occurrence,
+            statement_relation,
             declaration,
             required_columns,
             key_constraint,
@@ -990,6 +1005,9 @@ impl SystemTableSnapshotNeed {
     }
     pub const fn occurrence(&self) -> crate::system_table::SystemTableOccurrenceId {
         self.occurrence
+    }
+    pub const fn statement_relation(&self) -> Option<crate::system_table::StatementSystemRelation> {
+        self.statement_relation
     }
     pub fn declaration(&self) -> &std::sync::Arc<crate::system_table::SystemTableDeclaration> {
         &self.declaration

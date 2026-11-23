@@ -17,9 +17,11 @@
 
 //! Typed DELETE input and preparation for the supervised write action.
 
+pub(crate) mod absorption;
 #[cfg(any(test, novarocks_dev_controls))]
 pub(crate) mod equality;
-pub(crate) mod standard;
+mod standard;
+pub(crate) use absorption::{DeletePath, select_delete_path};
 
 use std::sync::Arc;
 
@@ -32,7 +34,6 @@ use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 pub(crate) struct PreparedPredicateDelete {
     pub(crate) target: super::mutation::RowMutationTarget,
     pub(crate) selection: Option<novarocks_parser::ast::Expr>,
-    pub(crate) span: novarocks_parser::Span,
 }
 
 /// The admitted statement retained by the supervised write action.
@@ -193,6 +194,7 @@ pub(crate) async fn prepare_delete_write_async(
     target: &crate::catalog_application::resolver::TargetBackend,
     target_ref: &str,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    retained_target: Option<crate::connector::write_target::ConnectorWriteTargetBinding>,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
@@ -205,7 +207,8 @@ pub(crate) async fn prepare_delete_write_async(
                 statement,
                 target,
                 target_ref,
-                planning_pin,
+                retained_target
+                    .ok_or_else(|| "DELETE writer lost its original target".to_owned())?,
                 execution,
                 connector_context,
                 operation_id,
@@ -286,15 +289,51 @@ pub struct DeleteStatementInput {
     pub(crate) sql: String,
     pub(crate) context: novarocks_query_application::admitted_query_context::RequestContext,
     pub(crate) query_options: QueryOptions,
+    pub(crate) topology: novarocks_query_application::api::BackendTopologyService,
     pub(crate) launcher:
         Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
     #[cfg(novarocks_dev_controls)]
     pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 
+pub struct DeleteDescriptionInput {
+    pub(crate) statement: OwnedDeleteStatement,
+    pub(crate) request: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) connector: novarocks_spi::connector::ConnectorRequestContext,
+    pub(crate) parameters: Arc<novarocks_sql::compiler::SqlPreparedParameters>,
+    pub(crate) target_span: novarocks_parser::Span,
+    pub(crate) source: Arc<str>,
+}
+
+pub struct PreparedDeleteDescription {
+    pub(crate) query: novarocks_parser::ast::Query,
+    pub(crate) overlay: crate::catalog_application::query_materializer::QueryLocalTableOverlay,
+}
+
+/// Original Root and matching-read inputs for a read-only DELETE explanation.
+pub struct DeleteExplainStatementInput {
+    pub(crate) statement: OwnedDeleteStatement,
+    pub(crate) sql: Arc<str>,
+    pub(crate) context: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) command: novarocks_query_application::api::CommandContext,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) detail: novarocks_query_application::sql::session::ExplainDetail,
+    pub(crate) timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
+    pub(crate) environment: crate::query::QueryActionEnvironment,
+    pub(crate) family: novarocks_result_contract::ClientPresentationFamily,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+}
+
 /// One-to-one core capability used only by the frontend DML application owner.
 // Design: ADR-0020 (docs/adr/ADR-0020-frontend-delete-application-owner.md)
+#[async_trait::async_trait]
 pub trait DeleteEngine: Send + Sync {
+    async fn describe_delete(
+        &self,
+        input: DeleteDescriptionInput,
+    ) -> Result<PreparedDeleteDescription, crate::dml::error::DmlExecutionError>;
+
     fn prepare_statement_action(
         &self,
         input: DeleteStatementInput,
@@ -302,9 +341,79 @@ pub trait DeleteEngine: Send + Sync {
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         crate::catalog_application::resolver::TargetResolutionError,
     >;
+    fn prepare_explain_action(
+        &self,
+        input: DeleteExplainStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::session_error::QueryServiceError,
+    >;
 }
 
+#[async_trait::async_trait]
 impl DeleteEngine for DmlExecutionKernel {
+    async fn describe_delete(
+        &self,
+        input: DeleteDescriptionInput,
+    ) -> Result<PreparedDeleteDescription, crate::dml::error::DmlExecutionError> {
+        use crate::dml::error::DmlExecutionError;
+        use novarocks_query_application::session_error::QueryServiceError;
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        use novarocks_sql::analyze_error::AnalyzeError;
+
+        let session = input.request.session();
+        let (target, reference) = resolve_target(
+            self,
+            &input.statement,
+            session.current_catalog(),
+            session.current_database(),
+        )?;
+        let statement = match &input.statement {
+            OwnedDeleteStatement::Predicate(statement) => statement,
+            #[cfg(novarocks_dev_controls)]
+            OwnedDeleteStatement::TrinoEquality { .. } => {
+                return Err("Only predicate DELETE has a description".into());
+            }
+        };
+        let pin = crate::connector::acquire_metadata_planning_pin(
+            self.connector_control().as_ref(),
+            &target.catalog,
+        )?;
+        let (query, overlay) = standard::describe_predicate_delete(
+            self,
+            statement,
+            &target,
+            &reference,
+            pin,
+            &input.connector,
+            &input.parameters,
+        )
+        .await
+        .map_err(|error| {
+            if let DmlExecutionError::Application(service) = &error
+                && let Some(cause) = service.failure_cause()
+                && cause
+                    .downcast_ref::<ConnectorError>()
+                    .is_some_and(|cause| cause.kind() == ConnectorErrorKind::NotFound)
+            {
+                return QueryServiceError::from_user_error_with_cause(
+                    AnalyzeError::unknown_table(
+                        format!(
+                            "Table '{}.{}.{}' does not exist",
+                            target.catalog, target.namespace, target.table
+                        ),
+                        input.target_span,
+                    )
+                    .to_user_error(Some(&input.source)),
+                    cause.clone(),
+                )
+                .into();
+            }
+            error
+        })?;
+        Ok(PreparedDeleteDescription { query, overlay })
+    }
+
     fn prepare_statement_action(
         &self,
         input: DeleteStatementInput,
@@ -313,5 +422,14 @@ impl DeleteEngine for DmlExecutionKernel {
         crate::catalog_application::resolver::TargetResolutionError,
     > {
         crate::query::delete_action::prepare(self.clone(), input)
+    }
+    fn prepare_explain_action(
+        &self,
+        input: DeleteExplainStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
+        crate::query::prepare_delete_explain(self.clone(), input)
     }
 }

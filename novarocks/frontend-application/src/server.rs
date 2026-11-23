@@ -93,6 +93,8 @@ pub struct FrontendManagementConfig {
 pub struct FrontendServingConfig {
     /// Executable-frozen version exposed by the Trino information endpoint.
     pub server_version: String,
+    pub client_query_history:
+        Option<novarocks_query_application::query_control::ClientQueryHistoryConfig>,
     pub report_bind_host: String,
     pub report_grpc_port: u16,
     /// Maximum time admitted FE workload leases may continue after drain starts.
@@ -100,6 +102,7 @@ pub struct FrontendServingConfig {
     /// Upper bound for terminal resource cleanup after graceful/deadline drain.
     pub frontend_cleanup_timeout: Duration,
     pub trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
+    pub memory_authority: Arc<novarocks_memory::MemoryAuthority>,
     pub native_trust: Arc<NativeTrust>,
     pub native_transport: FrontendNativeTransport,
     pub native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
@@ -265,6 +268,9 @@ async fn build_frontend_role_products(
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     system_catalog: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+    client_query_history: Option<
+        novarocks_query_application::query_control::ClientQueryHistoryConfig,
+    >,
 ) -> Result<FrontendRoleProducts, FrontendApplicationError> {
     let catalog_service =
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
@@ -277,11 +283,12 @@ async fn build_frontend_role_products(
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
     let system_relations = system_catalog;
-    let query_application_control = Arc::new(
-        novarocks_query_application::query_control::QueryApplicationControl::new(
-            host.frontend_process_id(),
-        ),
-    );
+    use novarocks_query_application::query_control::QueryApplicationControl;
+    let process = host.frontend_process_id();
+    let query_application_control = Arc::new(match client_query_history {
+        Some(config) => QueryApplicationControl::with_client_query_history(process, config),
+        None => QueryApplicationControl::new(process),
+    });
     let query_control = novarocks_query_application::session_control::QueryControlService::new(
         query_application_control.clone(),
     );
@@ -577,6 +584,7 @@ async fn build_frontend_role_products(
 fn build_frontend_query_session_factory_from_role_products(
     host: &FrontendApplicationHost,
     products: &FrontendRoleProducts,
+    runtime_metadata: Option<Arc<crate::system_tables::FrontendRuntimeMetadata>>,
 ) -> Result<Arc<crate::query::FrontendQueryService>, FrontendApplicationError> {
     let catalog_service = Arc::clone(&products.catalog_service);
     let unified_statistics = Arc::clone(&products.unified_statistics);
@@ -614,7 +622,8 @@ fn build_frontend_query_session_factory_from_role_products(
             host.constant_policy(),
             host.static_plan_carrier(),
             host.required_constant_interpreter().sealed_functions(),
-        ));
+        ))
+        .with_runtime_metadata(runtime_metadata);
     let session_catalog_resolver =
         core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(
             Arc::clone(&catalog_service),
@@ -769,11 +778,17 @@ async fn build_frontend_query_session_factory(
     ),
     FrontendApplicationError,
 > {
-    let products =
-        build_frontend_role_products(host, exchange_port, mv_storage_observation, system_catalog)
-            .await?;
+    let products = build_frontend_role_products(
+        host,
+        exchange_port,
+        mv_storage_observation,
+        system_catalog,
+        None,
+    )
+    .await?;
     products.start_background_workers(host.required_constant_interpreter().sealed_functions())?;
-    let session_factory = build_frontend_query_session_factory_from_role_products(host, &products)?;
+    let session_factory =
+        build_frontend_query_session_factory_from_role_products(host, &products, None)?;
     Ok((session_factory, products))
 }
 
@@ -989,6 +1004,7 @@ where
         exchange_port,
         mv_storage_observation,
         system_catalog,
+        config.client_query_history,
     )
     .await
     {
@@ -1016,24 +1032,34 @@ where
             stop_result,
         );
     }
-    let session_factory =
-        match build_frontend_query_session_factory_from_role_products(host, &products) {
-            Ok(factory) => factory,
-            Err(error) => {
-                let product_shutdown = shutdown_frontend_role_products_to_convergence(
-                    &mut products,
-                    config.frontend_cleanup_timeout,
-                )
-                .await;
-                let stop_result = report_server
-                    .stop()
-                    .map_err(FrontendApplicationError::server);
-                return combine_server_and_shutdown(
-                    combine_server_and_shutdown(Err(error), product_shutdown),
-                    stop_result,
-                );
-            }
-        };
+    let runtime_metadata = Arc::new(crate::system_tables::FrontendRuntimeMetadata::new(
+        host.frontend_process_id(),
+        config.server_version.clone(),
+        host.serving_lifecycle().admission(),
+        host.backend_membership_ingress(),
+        products.query_control.clone(),
+    ));
+    let session_factory = match build_frontend_query_session_factory_from_role_products(
+        host,
+        &products,
+        Some(runtime_metadata.clone()),
+    ) {
+        Ok(factory) => factory,
+        Err(error) => {
+            let product_shutdown = shutdown_frontend_role_products_to_convergence(
+                &mut products,
+                config.frontend_cleanup_timeout,
+            )
+            .await;
+            let stop_result = report_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
+            return combine_server_and_shutdown(
+                combine_server_and_shutdown(Err(error), product_shutdown),
+                stop_result,
+            );
+        }
+    };
     let server_result = run_client_listeners_with_supervision(
         #[cfg(novarocks_dev_controls)]
         Arc::clone(&config.native_trust),
@@ -1042,6 +1068,7 @@ where
             server_version: config.server_version,
             session_factory,
             query_control: products.query_control.clone(),
+            runtime_metadata,
         },
         shutdown,
         &mut report_server,
@@ -1073,6 +1100,7 @@ struct ClientListenerInputs {
     server_version: String,
     session_factory: Arc<dyn QuerySessionFactory>,
     query_control: novarocks_query_application::session_control::QueryControlService,
+    runtime_metadata: Arc<crate::system_tables::FrontendRuntimeMetadata>,
 }
 
 async fn run_client_listeners_with_supervision<F>(
@@ -1093,17 +1121,23 @@ where
         server_version,
         session_factory,
         query_control,
+        runtime_metadata,
     } = listeners;
     let mut trino_server = novarocks_trino_adapter::TrinoListener::bind(
         &trino_listener,
         server_version,
         host.serving_lifecycle().admission(),
         Arc::clone(&session_factory),
-        query_control,
+        query_control.clone(),
     )
     .await
     .map_err(FrontendApplicationError::server)?;
     let result = async {
+        runtime_metadata
+            .publish_http(trino_server.bound_addr())
+            .map_err(FrontendApplicationError::server)?;
+        management_server.metrics_registry.install_query_history(query_control)
+            .map_err(FrontendApplicationError::server)?;
         management_server.metrics_registry.install_trino(&trino_server.observation())
             .map_err(FrontendApplicationError::server)?;
         #[cfg(novarocks_dev_controls)]
@@ -1412,6 +1446,65 @@ mod tests {
         QuerySession, QuerySessionFactory, QuerySessionStatement, StatementSessionRequest,
     };
     use novarocks_query_application::session_error::QueryServiceErrorKind;
+
+    #[tokio::test]
+    async fn trino_prepared_headers_validate_before_statement_execution() {
+        use novarocks_query_application::{
+            cancellation::QueryCancellationReason, serving_admission::FrontendServingAdmission,
+            session_control::QueryControlService, session_value::StatementSessionError,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NoExecution;
+        impl QuerySessionFactory for NoExecution {
+            fn open_statement_session(
+                &self,
+                _: StatementSessionRequest,
+            ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+                panic!("POST must not instantiate a session before the first GET")
+            }
+            fn cancel_all(&self, _: QueryCancellationReason) {}
+        }
+
+        async fn post(address: std::net::SocketAddr, definition: &str) -> String {
+            let request = format!(
+                "POST /v1/statement HTTP/1.1\r\nHost: localhost\r\nX-Trino-User: root\r\nX-Trino-Prepared-Statement: {definition}\r\nContent-Length: 9\r\nConnection: close\r\n\r\nEXECUTE p"
+            );
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        }
+
+        let control = QueryControlService::new(Arc::new(
+            novarocks_query_application::query_control::QueryApplicationControl::new(
+                novarocks_types::FrontendProcessId::new_v7(),
+            ),
+        ));
+        let mut listener = novarocks_trino_adapter::TrinoListener::bind(
+            &novarocks_trino_adapter::TrinoListenerSettings {
+                port: 0,
+                user: "root".into(),
+                ..Default::default()
+            },
+            "test".into(),
+            FrontendServingAdmission::new(),
+            Arc::new(NoExecution),
+            control,
+        )
+        .await
+        .unwrap();
+        let address = listener.bound_addr();
+        for invalid in ["missing-assignment", "p=SELECT+1%3BSELECT+2"] {
+            assert!(post(address, invalid).await.starts_with("HTTP/1.1 400"));
+        }
+        let queued = post(address, "p=SELECT+1").await;
+        assert!(queued.starts_with("HTTP/1.1 200"));
+        assert!(queued.contains("nextUri"));
+        listener.finalize();
+        listener.wait_stopped().await.unwrap();
+    }
 
     fn test_statement_request(
         control: &novarocks_query_application::session_control::QueryControlService,

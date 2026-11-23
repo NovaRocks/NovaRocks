@@ -211,7 +211,6 @@ pub struct StaticAggregateOrder {
     pub is_asc_order: Vec<bool>,
     pub nulls_first: Vec<bool>,
     pub is_distinct: bool,
-    pub group_concat_max_len: Option<i64>,
 }
 
 #[derive(Clone, Debug)]

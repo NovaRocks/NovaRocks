@@ -253,6 +253,8 @@ pub(crate) fn analyze_mv_definition_with_factory(
         None,
         None,
         false,
+        None,
+        None,
         QueryAnalysisPurpose::MaterializedViewDefinition,
         None,
     )
@@ -321,7 +323,7 @@ pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Analysis receives the original statement inputs, assignments, and table arguments."
+    reason = "Analysis receives the original statement, write, SHOW, and table argument inputs."
 )]
 pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     query: &ast::Query,
@@ -334,6 +336,8 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
+    prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
 ) -> Result<
     (
@@ -355,9 +359,80 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         materialized,
         assignments,
         root_session_admitted,
+        statement_relation,
+        prepared_parameters,
         QueryAnalysisPurpose::Ordinary,
         table_sequence,
     )
+}
+
+/// Describe one effective query directly from semantic analysis and the captured schema.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Original statement facts and analysis authority"
+)]
+pub(crate) fn describe_prepared_query(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+    assignments: Option<&crate::compiler::SqlWriteAssignments>,
+    materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
+    parameters: &crate::compiler::SqlPreparedParameters,
+    ctas_source: bool,
+) -> Result<crate::compiler::SqlPreparedDescription, crate::compiler::SqlCompileError> {
+    let mut description = crate::compiler::DescriptionAnalysis::new(
+        parameters.positions().len(),
+        constant_policy,
+        control,
+    )?;
+    for need in parameters.contextual_needs(query) {
+        if need.is_row_count() {
+            let ordinal = parameters.ordinal(need.span()).ok_or_else(|| {
+                AnalyzeError::internal("Row count parameter has no description occurrence")
+            })?;
+            description.coerce_parameter(
+                ordinal,
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )?;
+        }
+    }
+    let mut factory = crate::column_id::ColumnRefFactory::new();
+    factory.prepared_description = Some(Box::new(description));
+    let (resolved, _, mut factory) =
+        analyze_with_factory_and_function_catalog_and_assignments_inner(
+            query,
+            catalog,
+            current_database,
+            factory,
+            function_catalog,
+            sql_semantics,
+            constant_policy,
+            control,
+            materialized,
+            assignments,
+            true,
+            None,
+            Some(parameters),
+            QueryAnalysisPurpose::Ordinary,
+            None,
+        )?;
+    if ctas_source {
+        crate::analysis::schema::validate_definition_column_names(
+            &resolved.output_columns,
+            query.span,
+        )?;
+        crate::planning::mv::validate_persistable_output(&resolved, &factory)
+            .map_err(crate::compiler::SqlCompileError::Compilation)?;
+    }
+    let description = factory
+        .prepared_description
+        .take()
+        .expect("description state belongs to the original analysis");
+    Ok(description.into_description(resolved.output_columns))
 }
 
 /// Test-only analysis helper that threads an existing [`ColumnRefFactory`] so that
@@ -456,6 +531,8 @@ fn analyze_with_factory_and_function_catalog_inner(
         materialized,
         None,
         false,
+        None,
+        None,
         QueryAnalysisPurpose::Ordinary,
         None,
     )
@@ -477,6 +554,8 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
     root_session_admitted: bool,
+    statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
+    prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     purpose: QueryAnalysisPurpose,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
 ) -> Result<
@@ -500,9 +579,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         query_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
         &query_semantics
     };
-    let query =
-        crate::sql_mode::normalize_concat_query_with_semantics(query.clone(), sql_semantics);
-    let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
+    let query = query_prepass::preanalyze_with_semantics(query.clone(), sql_semantics)?;
     let materialized_source = materialized
         .map(|source| source.loan(&query, control))
         .transpose()
@@ -519,6 +596,13 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
             other => AnalyzeError::internal(other.to_string()),
         })?;
     let materialized_values = materialized_source.as_ref().map(|source| source.view());
+    let statement_relation = statement_relation
+        .map(|source| {
+            crate::compiler::statement_system_relation_site(&query)
+                .map(|site| (site, source))
+                .map_err(|error| AnalyzeError::internal(error.to_string()))
+        })
+        .transpose()?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         grouping_scope: std::cell::RefCell::new(None),
@@ -528,6 +612,8 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         function_catalog,
         constant_policy,
         materialized_values,
+        statement_relation,
+        prepared_parameters,
         table_sequence,
         control,
         sql_semantics: sql_semantics.clone(),
@@ -541,7 +627,14 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     };
     let resolved = ctx.analyze_query(&query)?;
     let resolved = match assignments {
-        Some(assignments) => ctx.bind_write_source_query(resolved, assignments, query.span)?,
+        Some(assignments) => {
+            if prepared_parameters
+                .is_some_and(crate::compiler::SqlPreparedParameters::is_description)
+            {
+                ctx.check_described_write_width(&resolved, assignments, query.span)?;
+            }
+            ctx.bind_write_source_query(resolved, assignments, query.span)?
+        }
         None => resolved,
     };
     ctx.check_control()?;
@@ -656,6 +749,11 @@ pub(super) struct AnalyzerContext<'a> {
     pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) constant_policy: novarocks_functions::ConstantPolicy,
     materialized_values: Option<crate::compiler::materialized_values::MaterializedValuesLoan<'a>>,
+    statement_relation: Option<(
+        &'a ast::Table,
+        &'a crate::compiler::StatementSystemRelationSource,
+    )>,
+    prepared_parameters: Option<&'a crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&'a crate::compiler::table_sequence::TableSequencePass>,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
@@ -1021,6 +1119,8 @@ impl<'a> AnalyzerContext<'a> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
+            statement_relation: self.statement_relation,
+            prepared_parameters: self.prepared_parameters,
             table_sequence: self.table_sequence,
             catalog: self.catalog,
             current_database: self.current_database,
@@ -1124,8 +1224,8 @@ impl<'a> AnalyzerContext<'a> {
             }
 
             // Extract LIMIT / OFFSET
-            let limit = extract_limit(modifiers)?;
-            let offset = extract_offset(modifiers)?;
+            let limit = extract_limit(modifiers, ctx.prepared_parameters)?;
+            let offset = extract_offset(modifiers, ctx.prepared_parameters)?;
 
             // Build output columns from the body
             let output_columns = body_output;
@@ -1324,7 +1424,11 @@ impl<'a> AnalyzerContext<'a> {
                     self.control,
                 )?;
                 let column_id = self.alloc_column_id(None, lc.name.clone(), value_type.clone());
+                if let Some(description) = &mut self.factory.borrow_mut().prepared_description {
+                    description.copy_origin(lc.column_id, column_id);
+                }
                 output_cols.push(OutputColumn {
+                    aliased: lc.aliased,
                     field_name: lc.field_name.clone(),
                     column_id,
                     name: lc.name.clone(),
@@ -1427,6 +1531,7 @@ impl<'a> AnalyzerContext<'a> {
                 let value_type = helpers::with_nullability(ty.clone(), true);
                 let column_id = self.alloc_column_id(None, name.clone(), value_type.clone());
                 Ok(OutputColumn {
+                    aliased: false,
                     field_name: None,
                     column_id,
                     name,
@@ -1436,15 +1541,20 @@ impl<'a> AnalyzerContext<'a> {
             })
             .collect::<Result<Vec<_>, AnalyzeError>>()?;
         for (ordinal, column) in output_cols.iter().enumerate() {
-            if column.value_type.value_type().temporal().is_none() {
+            let temporal = column.value_type.value_type().temporal().is_some();
+            if !temporal && self.factory.borrow().prepared_description.is_none() {
                 continue;
             }
-            for cell in resolved_rows
-                .iter_mut()
-                .filter_map(|row| row.get_mut(ordinal))
-            {
+            for (row, source) in resolved_rows.iter_mut().zip(values.rows.iter()) {
                 self.check_control()?;
-                if !cell.value_type.same_value_domain(&column.value_type) {
+                let Some(cell) = row.get_mut(ordinal) else {
+                    continue;
+                };
+                // The VALUES coercion is attached to the original row expression.
+                if !matches!(source, ast::Expr::Row(_)) {
+                    self.observe_implicit_type(cell, &column.value_type)?;
+                }
+                if temporal && !cell.value_type.same_value_domain(&column.value_type) {
                     *cell = self.cast_to_value_type(
                         cell.clone(),
                         column.value_type.clone(),
@@ -2451,6 +2561,23 @@ impl<'a> AnalyzerContext<'a> {
         Ok((QueryBody::Select(sel), cols))
     }
 
+    fn keeps_described_projection_origin(
+        &self,
+        expression: &ast::Expr,
+        scope: &AnalyzerScope,
+    ) -> bool {
+        if self.factory.borrow().prepared_description.is_none() {
+            return true;
+        }
+        match expression {
+            ast::Expr::Identifier(identifier) => {
+                scope.computed_column_for(&identifier.value).is_none()
+            }
+            ast::Expr::Dereference(_) => true,
+            _ => false,
+        }
+    }
+
     /// Analyze the SELECT projection list.
     fn analyze_projection(
         &self,
@@ -2477,9 +2604,12 @@ impl<'a> AnalyzerContext<'a> {
                         let typed =
                             self.substitute_select_aliases_for_select(typed, &projection, scope);
                         let name = alias.value.clone();
+                        let projection_origin =
+                            self.keeps_described_projection_origin(expr, &effective_scope);
                         let column_id = match &typed.kind {
                             ExprKind::ColumnRef { column_id, .. }
-                                if !matches!(expr, ast::Expr::Cast(_))
+                                if projection_origin
+                                    && !matches!(expr, ast::Expr::Cast(_))
                                     && !is_grouping_call(expr) =>
                             {
                                 *column_id
@@ -2491,7 +2621,8 @@ impl<'a> AnalyzerContext<'a> {
                         // before planner symbol rewrites hand it to the root owner.
                         // A same-carrier explicit CAST may simplify to a reference,
                         // but still owns a separate output domain occurrence.
-                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                        if !projection_origin
+                            || !matches!(&typed.kind, ExprKind::ColumnRef { .. })
                             || matches!(expr, ast::Expr::Cast(_))
                             || is_grouping_call(expr)
                         {
@@ -2502,6 +2633,7 @@ impl<'a> AnalyzerContext<'a> {
                                 .set_logical_type(column_id, logical);
                         }
                         output_columns.push(OutputColumn {
+                            aliased: true,
                             field_name: Some(name.clone()),
                             column_id,
                             name: name.clone(),
@@ -2533,10 +2665,15 @@ impl<'a> AnalyzerContext<'a> {
                         let typed = self.analyze_expr(expr, &effective_scope)?;
                         let typed =
                             self.substitute_select_aliases_for_select(typed, &projection, scope);
+                        let projection_origin =
+                            self.keeps_described_projection_origin(expr, &effective_scope);
                         let (name, column_id) = match &typed.kind {
                             ExprKind::ColumnRef {
                                 column_id, column, ..
-                            } if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) => {
+                            } if projection_origin
+                                && !matches!(expr, ast::Expr::Cast(_))
+                                && !is_grouping_call(expr) =>
+                            {
                                 (column.clone(), *column_id)
                             }
                             _ => {
@@ -2551,7 +2688,8 @@ impl<'a> AnalyzerContext<'a> {
                         // before planner symbol rewrites hand it to the root owner.
                         // A same-carrier explicit CAST may simplify to a reference,
                         // but still owns a separate output domain occurrence.
-                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                        if !projection_origin
+                            || !matches!(&typed.kind, ExprKind::ColumnRef { .. })
                             || matches!(expr, ast::Expr::Cast(_))
                             || is_grouping_call(expr)
                         {
@@ -2562,6 +2700,7 @@ impl<'a> AnalyzerContext<'a> {
                                 .set_logical_type(column_id, logical);
                         }
                         output_columns.push(OutputColumn {
+                            aliased: false,
                             field_name: natural_field_name(expr),
                             column_id,
                             name: name.clone(),
@@ -2642,6 +2781,7 @@ impl<'a> AnalyzerContext<'a> {
                             value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
+                            aliased: false,
                             field_name: field_name.clone(),
                             column_id: *col_id,
                             name: col_name.clone(),
@@ -2701,6 +2841,7 @@ impl<'a> AnalyzerContext<'a> {
                 )
             };
             output_columns.push(OutputColumn {
+                aliased: false,
                 field_name: field_name.clone(),
                 column_id: id,
                 name: col_name.clone(),
@@ -2754,6 +2895,7 @@ impl<'a> AnalyzerContext<'a> {
                             value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
+                            aliased: false,
                             field_name: field_name.clone(),
                             column_id: *col_id,
                             name: col_name.clone(),
@@ -2799,15 +2941,17 @@ impl<'a> AnalyzerContext<'a> {
         match relation {
             Relation::SystemTable {
                 alias,
+                declaration,
                 output_columns,
+                required_columns,
                 ..
-            } => {
-                for column in output_columns {
-                    self.check_control()?;
-                    scope.add_field(Some(alias), column);
-                }
-                Ok(())
-            }
+            } => self.add_system_table_scope_fields(
+                scope,
+                alias,
+                declaration,
+                output_columns,
+                required_columns,
+            ),
             Relation::Scan(scan) => {
                 let mut local_scope = self.new_scope();
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
@@ -5324,6 +5468,29 @@ mod tests {
     }
 
     #[test]
+    fn using_rejects_repeated_column_names_at_the_second_identifier() {
+        let sql =
+            "SELECT * FROM (VALUES (1, 10)) a(id, x) JOIN (VALUES (1, 20)) b(id, y) USING (id, ID)";
+        let query = parse_native_query(sql).unwrap();
+        let Err(error) = analyze(&query, &TestCatalog, "default") else {
+            panic!("duplicate USING columns must fail analysis");
+        };
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::DuplicateColumnName
+        );
+        assert_eq!(
+            error.message(),
+            "Column 'ID' appears multiple times in USING clause"
+        );
+        let start = sql.rfind("ID").unwrap();
+        assert_eq!(
+            error.span(),
+            Some(novarocks_parser::Span::new(start, start + 2))
+        );
+    }
+
+    #[test]
     fn using_requires_a_real_column_binding_on_both_sides() {
         for sql in [
             "SELECT 1 FROM (VALUES (1)) l(other) JOIN (VALUES (2)) r(key) USING (key)",
@@ -5986,8 +6153,8 @@ mod tests {
 
     #[test]
     fn correlated_exists_apply_inner_preserves_original_compare_sides() {
-        let sql = "SELECT s.s_1 FROM array_test s \
-                   WHERE EXISTS (SELECT 1 FROM array_test t WHERE t.s_1 = s.d_1)";
+        let sql = "SELECT s.i_1 FROM array_test s \
+                   WHERE EXISTS (SELECT 1 FROM array_test t WHERE t.i_1 = s.i_1)";
         let resolved = parse_and_analyze(sql).expect("analysis should succeed");
         let sel = select_body(&resolved);
         let spec = only_predicate_spec(sel);
@@ -5998,8 +6165,8 @@ mod tests {
         else {
             panic!("expected original correlation equality, got: {cond:?}");
         };
-        assert!(expr_has_qualified_column(left, "t", "s_1"));
-        assert!(expr_has_qualified_column(right, "s", "d_1"));
+        assert!(expr_has_qualified_column(left, "t", "i_1"));
+        assert!(expr_has_qualified_column(right, "s", "i_1"));
     }
 
     #[test]
@@ -6560,103 +6727,26 @@ mod tests {
     }
 
     #[test]
-    fn test_percentile_approx_with_array_literal_returns_array_type() {
-        let resolved = parse_raw_and_analyze(
-            "SELECT percentile_approx(o_totalprice, CAST([0.25, 0.5] AS ARRAY<double>)) FROM orders",
-        )
-        .expect("analysis should succeed");
-        assert_eq!(resolved.output_columns.len(), 1);
-        assert!(matches!(
-            resolved.output_columns[0].value_type.data_type(),
-            arrow::datatypes::DataType::List(_)
-        ));
-    }
-
-    #[test]
-    fn test_percentile_approx_weighted_rejects_null_weight_in_analyzer() {
-        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, NULL, 0.9)")
-            .expect_err("analysis should reject NULL weight");
-        assert!(err.contains(
-            "percentile_approx_weighted requires the second parameter (weight) to be numeric type, but got: NULL_TYPE."
-        ));
-    }
-
-    #[test]
-    fn test_percentile_approx_weighted_rejects_negative_scalar_percentile_in_analyzer() {
-        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, 1, -0.1)")
-            .expect_err("analysis should reject negative percentile");
-        assert!(err.contains(
-            "Type check failed. percentile parameter must be between 0 and 1 in percentile_approx_weighted, but got: -0.1"
-        ));
-    }
-
-    #[test]
-    fn test_percentile_approx_weighted_rejects_negative_array_percentile_in_analyzer() {
-        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, 1, [-0.1, 0.5])")
-            .expect_err("analysis should reject negative percentile array item");
-        assert!(err.contains(
-            "Type check failed. percentile array element[0] must be between 0 and 1 in percentile_approx_weighted, but got: -0.1"
-        ));
-    }
-
-    #[test]
-    fn test_group_concat_rejects_negative_order_by_position() {
-        let err = parse_raw_and_analyze(
-            "SELECT group_concat(distinct 3.1323, o_orderstatus order by 1, 2, -20) FROM orders GROUP BY o_orderkey",
-        )
-        .expect_err("negative group_concat ORDER BY position should be rejected");
-        assert!(
-            err.contains("ORDER BY position -20 is not in group_concat output list."),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_empty_input() {
-        let err = parse_raw_and_analyze("SELECT group_concat()")
-            .expect_err("group_concat without input should be rejected");
-        assert!(
-            err.contains("group_concat should have at least one input."),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_non_string_separator() {
-        let err = parse_raw_and_analyze(
-            "SELECT string_agg('中国' \n,\n 1\nORDER BY '第一' \n) FROM orders",
-        )
-        .expect_err("group_concat should reject non-string separator");
-        assert!(
-            err.contains(
-                "group_concat requires separator to be of getType() STRING: group_concat('中国', 1)."
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_array_input() {
-        let err = parse_raw_and_analyze("SELECT group_concat([1,2]) FROM orders")
-            .expect_err("group_concat should reject array input");
-        assert!(
-            err.contains(
-                "No matching function with signature: group_concat(array<int(11)>, varchar)."
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_group_concat_rejects_map_input() {
-        let err = parse_raw_and_analyze("SELECT group_concat(map(ARRAY[2],ARRAY[3])) FROM orders")
-            .expect_err("group_concat should reject map input");
-        assert!(
-            err.contains(
-                "No matching function with signature: group_concat(map<int(11),int(11)>, varchar)."
-            ),
-            "unexpected error: {err}"
-        );
+    fn retired_aggregate_names_do_not_bind_in_user_sql() {
+        for call in [
+            "group_concat('a')",
+            "string_agg('a', ',')",
+            "percentile_approx(1, 0.5)",
+            "percentile_approx_weighted(1, 1, -0.1)",
+            "approx_top_k(1, 1)",
+            "array_agg_distinct(1)",
+            "max_n(1, 1)",
+            "ndv(1)",
+            "std(1)",
+        ] {
+            let query = parse_native_query(&format!("SELECT {call}")).unwrap();
+            let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownFunction,
+                "{call}: {error}",
+            );
+        }
     }
 
     #[test]
@@ -7420,6 +7510,8 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &TestCatalog,
             current_database: "default",
@@ -7763,6 +7855,8 @@ mod tests {
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
             materialized_values: None,
+            statement_relation: None,
+            prepared_parameters: None,
             table_sequence: None,
             catalog: &TestCatalog,
             current_database: "default",
@@ -8058,9 +8152,8 @@ mod tests {
 
     #[test]
     fn length_requires_an_explicit_varchar_cast_for_numeric_input() {
-        let Err(error) = parse_and_analyze("select length(o_orderkey) from orders") else {
-            panic!("length requires a character argument");
-        };
+        let error = parse_and_analyze("select length(o_orderkey) from orders")
+            .expect_err("length requires a character argument");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze("select length(CAST(o_orderkey AS VARCHAR)) from orders")
             .expect("length accepts the explicit text value");
@@ -8114,6 +8207,7 @@ mod tests {
             );
         };
         assert_eq!(name, "substring");
+        assert_eq!(args.len(), 3);
         let ExprKind::Cast {
             target,
             expr,
@@ -8132,10 +8226,34 @@ mod tests {
             expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64
         );
-        for position in &args[1..] {
+        for (position, expected) in args[1..].iter().zip(["1", "6"]) {
             assert_eq!(
                 position.value_type.data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            let ExprKind::Cast {
+                expr,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                ..
+            } = &position.kind
+            else {
+                panic!("expected the original INTEGER position widened to BIGINT");
+            };
+            assert_eq!(
+                expr.value_type.data_type(),
                 &arrow::datatypes::DataType::Int32
+            );
+            let ExprKind::Cast {
+                expr: literal,
+                target: arrow::datatypes::DataType::Int32,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                ..
+            } = &expr.kind
+            else {
+                panic!("expected the original INTEGER typed string cast");
+            };
+            assert!(
+                matches!(&literal.kind, ExprKind::Literal(LiteralValue::String(value)) if value == expected)
             );
         }
     }
@@ -8174,9 +8292,8 @@ mod tests {
 
     #[test]
     fn split_returns_varchar_array_after_explicit_argument_casts() {
-        let Err(error) = parse_and_analyze("select split(o_orderkey, 1) from orders") else {
-            panic!("split requires character arguments");
-        };
+        let error = parse_and_analyze("select split(o_orderkey, 1) from orders")
+            .expect_err("split requires character arguments");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze(
             "select split(CAST(o_orderkey AS VARCHAR), CAST(1 AS VARCHAR)) from orders",

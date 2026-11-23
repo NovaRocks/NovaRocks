@@ -18,6 +18,16 @@ col_1	col_2	lead_result
 5	5	55
 6	6	66
 
+-- query 4
+-- types	integer	integer	integer
+col_1	col_2	lag_result
+1	1	121
+2	2	143
+3	3	1
+4	NULL	2
+5	5	3
+6	6	NULL
+
 -- query 5
 -- types	integer	integer	integer
 col_1	col_2	lag_result

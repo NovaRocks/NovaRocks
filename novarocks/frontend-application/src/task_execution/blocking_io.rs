@@ -86,6 +86,13 @@ impl std::error::Error for OriginalFailure {
     }
 }
 impl ConnectorBlockingIoError {
+    pub(crate) fn admission_refusal(&self) -> Option<&WorkError> {
+        match &self.original.cause {
+            OriginalFailureCause::Admission(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// Alias the existing opaque carrier, without moving or formatting its raw
     /// panic payload and without allocating a second payload wrapper.
     pub(crate) fn health_cause(&self) -> Arc<dyn std::error::Error + Send + Sync> {
@@ -187,7 +194,8 @@ impl ConnectorBlockingIoResponsibility {
 pub(crate) struct ConnectorBlockingIoBacking(#[allow(dead_code)] Arc<ResponsibilityCell>);
 
 /// Remains in the original header outside the panic-able synchronous apply.
-/// Only observing that job's original actual-exit receipt may mark it joined.
+/// Marked joined after observing the original actual exit or after withdrawing
+/// and destroying the original input before queue publication.
 pub(crate) struct ConnectorBlockingIoJoinPin {
     cell: Arc<ResponsibilityCell>,
     joined: AtomicBool,

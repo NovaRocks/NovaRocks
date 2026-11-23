@@ -436,7 +436,6 @@ pub(crate) fn lower_call<H>(
             is_asc_order: ascending,
             nulls_first,
             is_distinct: call.distinct,
-            group_concat_max_len: None,
         },
         resolved: ResolvedAggregateSignature {
             overload,

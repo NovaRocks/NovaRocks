@@ -268,15 +268,7 @@ impl AnalyzerScope {
         value_type: FunctionValueType,
     ) {
         if let Some(name) = field_name {
-            let name_lower = name.to_lowercase();
-            if let Some(q) = qualifier {
-                self.qualified.insert(
-                    (q.to_lowercase(), name_lower.clone()),
-                    (column_id, value_type.clone()),
-                );
-            }
-            self.unqualified
-                .insert(name_lower, (column_id, value_type.clone()));
+            self.add_name_binding(qualifier, name, column_id, &value_type);
         }
         self.ordered.push((
             qualifier.map(str::to_lowercase),
@@ -299,6 +291,35 @@ impl AnalyzerScope {
             field.column_id,
             field.value_type.clone(),
         );
+    }
+
+    /// Bind a field for explicit lookup without contributing to star expansion.
+    pub(super) fn add_hidden_field(
+        &mut self,
+        qualifier: &str,
+        field: &crate::analysis::AnalyzedOutputField,
+    ) {
+        if let Some(name) = &field.field_name {
+            self.add_name_binding(Some(qualifier), name, field.column_id, &field.value_type);
+        }
+    }
+
+    fn add_name_binding(
+        &mut self,
+        qualifier: Option<&str>,
+        name: &str,
+        column_id: ColumnId,
+        value_type: &FunctionValueType,
+    ) {
+        let name = name.to_lowercase();
+        if let Some(qualifier) = qualifier {
+            self.qualified.insert(
+                (qualifier.to_lowercase(), name.clone()),
+                (column_id, value_type.clone()),
+            );
+        }
+        self.unqualified
+            .insert(name, (column_id, value_type.clone()));
     }
 
     /// Rebind visible fields only; hidden lineage lookup retains its own names.
@@ -642,11 +663,18 @@ impl AnalyzerScope {
     /// FULL OUTER joins where the left side is the primary qualifier
     /// true → keep the right
     /// occurrence, used for RIGHT joins.
-    pub(super) fn apply_using_layout(&mut self, using_cols: &[String], prefer_right: bool) {
+    pub(super) fn apply_using_layout(
+        &mut self,
+        using_cols: &[(String, ColumnId, ColumnId, crate::analysis::TypedExpr)],
+        prefer_right: bool,
+    ) {
         if using_cols.is_empty() {
             return;
         }
-        let names_lower: Vec<String> = using_cols.iter().map(|s| s.to_lowercase()).collect();
+        let names_lower: Vec<String> = using_cols
+            .iter()
+            .map(|(name, ..)| name.to_lowercase())
+            .collect();
         if prefer_right {
             // Reverse-scan dedup: keep the *last* occurrence of each USING name.
             let mut keep_indices: std::collections::HashMap<String, usize> =
@@ -692,15 +720,22 @@ impl AnalyzerScope {
         }
         // Move USING columns to the front in USING-clause order.
         let mut front: Vec<ScopedField> = Vec::with_capacity(names_lower.len());
-        for (ordinal, using_name) in names_lower.iter().enumerate() {
-            if let Some(pos) = self.ordered.iter().position(|(_, _, _, _, name)| {
+        for (using_name, (name, left_id, right_id, expression)) in
+            names_lower.iter().zip(using_cols)
+        {
+            let mut entry = if let Some(pos) = self.ordered.iter().position(|(_, _, _, _, name)| {
                 name.as_ref()
                     .is_some_and(|n| n.to_lowercase() == *using_name)
             }) {
-                let mut entry = self.ordered.remove(pos);
-                entry.4 = Some(using_cols[ordinal].clone());
-                front.push(entry);
-            }
+                self.ordered.remove(pos)
+            } else {
+                // An explicit USING reference can resolve a hidden key. The
+                // named join output becomes visible at this occurrence.
+                let id = if prefer_right { *right_id } else { *left_id };
+                (None, name.clone(), id, expression.value_type.clone(), None)
+            };
+            entry.4 = Some(name.clone());
+            front.push(entry);
         }
         front.append(&mut self.ordered);
         self.ordered = front;

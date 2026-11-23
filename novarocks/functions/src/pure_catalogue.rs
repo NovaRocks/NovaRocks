@@ -175,10 +175,19 @@ impl PureKernelAbi {
                             | ArgumentControl::SimpleCase
                             | ArgumentControl::SearchedCase
                             | ArgumentControl::TemporalSource(_)
+                            | ArgumentControl::OrderedRegexp
                     )
-                    && (base.own_row_error == FunctionIntrinsicRowError::NoRowError
-                        || (matches!(base.argument_control, ArgumentControl::TemporalSource(_))
-                            && base.own_row_error == FunctionIntrinsicRowError::MayRaise))
+                    && match base.argument_control {
+                        ArgumentControl::OrderedRegexp => {
+                            base.own_row_error == FunctionIntrinsicRowError::MayRaise
+                        }
+                        ArgumentControl::TemporalSource(_) => matches!(
+                            base.own_row_error,
+                            FunctionIntrinsicRowError::NoRowError
+                                | FunctionIntrinsicRowError::MayRaise
+                        ),
+                        _ => base.own_row_error == FunctionIntrinsicRowError::NoRowError,
+                    }
                     && base.instance_state == FunctionInstanceState::None
                     && base.observable_effects == ObservableEffects::NONE
                     && base.environment_dependencies.is_empty()
@@ -519,6 +528,7 @@ pub enum PreparedPureKernel {
     /// Exact typed control facts for LocalProgram's intrinsic controller;
     /// this variant never pretends to be an ordinary evaluated-argument CPU.
     ControlIntrinsic(Arc<FunctionCallContract>),
+    OrderedRegexp(crate::PreparedRegexp),
 }
 impl PreparedPureKernel {
     /// Borrow the exact call owned by this resolved lifecycle implementation.
@@ -533,6 +543,7 @@ impl PreparedPureKernel {
             Self::Window(kernel) => kernel.contract().call(),
             Self::Table(kernel) => kernel.contract().call(),
             Self::ControlIntrinsic(call) => call,
+            Self::OrderedRegexp(prepared) => prepared.call(),
         }
     }
 }
@@ -985,6 +996,72 @@ struct HigherOrderOwner<O>(Arc<RegisteredOwner<O>>);
 struct ScalarHigherOrderOwner<O>(Arc<RegisteredOwner<O>>);
 struct AggregateOwner<O>(Arc<RegisteredOwner<O>>);
 struct AggregateWindowOwner<O>(Arc<RegisteredOwner<O>>);
+
+struct AggregateOverloadOwners<W, A> {
+    window: AggregateWindowOwner<W>,
+    ordinary: AggregateOwner<A>,
+    implementations: Arc<[PureImplementationDeclaration]>,
+}
+
+impl<W, A> AggregateOverloadOwners<W, A>
+where
+    W: PureFunctionMetadataOwner + PureAggregateWindowImplementation,
+    A: PureFunctionMetadataOwner + PureAggregateImplementation,
+{
+    fn select(
+        &self,
+        overload: &FunctionOverloadId,
+    ) -> Result<&dyn InstalledPureOwner, FunctionSpecializationFailure> {
+        let implementation = self
+            .implementations
+            .binary_search_by(|item| item.overload.cmp(overload))
+            .map(|index| &self.implementations[index])
+            .map_err(|_| wrong_options())?;
+        match implementation.abi {
+            PureKernelAbi::AggregateV1 => Ok(&self.ordinary),
+            PureKernelAbi::AggregateWindowV1 => Ok(&self.window),
+            _ => Err(wrong_options()),
+        }
+    }
+}
+impl<W, A> InstalledPureOwner for AggregateOverloadOwners<W, A>
+where
+    W: PureFunctionMetadataOwner + PureAggregateWindowImplementation,
+    A: PureFunctionMetadataOwner + PureAggregateImplementation,
+{
+    fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
+        matches!(
+            abi,
+            PureKernelAbi::AggregateV1 | PureKernelAbi::AggregateWindowV1
+        )
+    }
+
+    fn prepare(
+        &self,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
+        self.select(&selected.overload)?
+            .prepare(input, selected, frozen, options, control)
+    }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        self.select(&selected.overload)?
+            .prepare_checked(checked, input, selected, frozen, options, control)
+    }
+}
 struct WindowOwner<O>(Arc<RegisteredOwner<O>>);
 struct TableOwner<O>(Arc<RegisteredOwner<O>>);
 struct ControlOwner<O>(Arc<RegisteredOwner<O>>);
@@ -1560,7 +1637,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: PreparedPureKernel::ControlIntrinsic(call),
+            prepared: prepared_control_call(call)?,
         })
     }
 
@@ -1594,9 +1671,18 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
             .map_err(FunctionSpecializationFailure::Control)?;
         Ok(PreparedPureCallDraft {
             effects: effects.into(),
-            prepared: PreparedPureKernel::ControlIntrinsic(call),
+            prepared: prepared_control_call(call)?,
         })
     }
+}
+
+fn prepared_control_call(
+    call: Arc<FunctionCallContract>,
+) -> Result<PreparedPureKernel, FunctionSpecializationFailure> {
+    if call.effects().argument_control == ArgumentControl::OrderedRegexp {
+        return crate::PreparedRegexp::from_call(call).map(PreparedPureKernel::OrderedRegexp);
+    }
+    Ok(PreparedPureKernel::ControlIntrinsic(call))
 }
 
 type RegisteredParts<O> = (
@@ -1848,6 +1934,85 @@ impl FunctionDefinition {
             Some(legacy),
         )
     }
+
+    /// Declared signatures remain bindable even when this edition installs
+    /// only a subset of the family.
+    pub(crate) fn try_new_pure_aggregate_with_declared_only<O>(
+        name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        owner: Arc<O>,
+        declared_only: &[FunctionOverloadId],
+    ) -> Result<Self, PureCatalogError>
+    where
+        O: PureFunctionMetadataOwner
+            + PureAggregateImplementation
+            + AggregateSignatureResolver
+            + 'static,
+    {
+        let legacy = owner.clone();
+        let (registered, implementations) =
+            register_owner_with_declared_only(owner, &[PureKernelAbi::AggregateV1], declared_only)?;
+        attach_definition(
+            name,
+            visibility,
+            registered.clone(),
+            implementations,
+            Arc::new(AggregateOwner(registered)),
+            Some(legacy),
+        )
+    }
+
+    /// One registered binding author can install distinct aggregate kernels
+    /// with different lifecycle support. Both kernels use the same checked
+    /// binding declaration and dispatch by the selected overload identity.
+    pub(crate) fn try_new_pure_aggregate_overloads<W, A>(
+        name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        window: Arc<W>,
+        ordinary: Arc<A>,
+    ) -> Result<Self, PureCatalogError>
+    where
+        W: PureFunctionMetadataOwner
+            + PureAggregateWindowImplementation
+            + AggregateSignatureResolver
+            + 'static,
+        A: PureFunctionMetadataOwner + PureAggregateImplementation + 'static,
+    {
+        let legacy = window.clone();
+        let (registered, implementations) = register_owner(
+            window,
+            &[PureKernelAbi::AggregateV1, PureKernelAbi::AggregateWindowV1],
+        )?;
+        let mut declared_ordinary = ordinary.implementation_declarations().to_vec();
+        declared_ordinary.sort_unstable();
+        if registered.declaration.as_ref() != ordinary.binding_declaration()
+            || !implementations
+                .iter()
+                .filter(|entry| entry.abi == PureKernelAbi::AggregateV1)
+                .eq(declared_ordinary.iter())
+        {
+            return Err(PureCatalogError::ImplementationCoverage(
+                registered.declaration.function_id().clone(),
+            ));
+        }
+        let owner = Arc::new(AggregateOverloadOwners {
+            window: AggregateWindowOwner(registered.clone()),
+            ordinary: AggregateOwner(Arc::new(RegisteredOwner {
+                declaration: registered.declaration.clone(),
+                owner: ordinary,
+            })),
+            implementations: implementations.clone(),
+        });
+        attach_definition(
+            name,
+            visibility,
+            registered,
+            implementations,
+            owner,
+            Some(legacy),
+        )
+    }
+
     pub fn try_new_pure_aggregate_window<
         O: PureFunctionMetadataOwner
             + PureAggregateWindowImplementation
@@ -1964,7 +2129,51 @@ impl EngineFunctionCatalogBuilder {
         })
     }
 }
+/// One SQL-visible name and originally installed overload.
+#[derive(Clone, Copy, Debug)]
+pub struct PublicFunctionOverload<'a> {
+    pub name: &'a str,
+    pub function_id: &'a FunctionId,
+    pub overload_id: &'a FunctionOverloadId,
+    pub return_type: &'a str,
+    pub argument_types: &'a str,
+    pub kind: FunctionKind,
+    pub deterministic: bool,
+    pub description: &'a str,
+}
+
 impl PureEngineFunctionCatalog {
+    /// Borrow published overloads without allocating rows or copying strings.
+    pub fn public_function_overloads(&self) -> impl Iterator<Item = PublicFunctionOverload<'_>> {
+        self.catalog
+            .definitions()
+            .iter()
+            .filter_map(|function| {
+                if function.visibility() == FunctionVisibility::Public {
+                    Some((function, function.binding_declaration()?))
+                } else {
+                    None
+                }
+            })
+            .flat_map(|(function, declaration)| {
+                declaration
+                    .public_signatures()
+                    .filter(move |(overload, _)| {
+                        !function.is_declared_only_pure_overload(&overload.identity)
+                    })
+                    .map(move |(overload, signature)| PublicFunctionOverload {
+                        name: function.canonical_name(),
+                        function_id: declaration.function_id(),
+                        overload_id: &overload.identity,
+                        return_type: &signature.return_type,
+                        argument_types: &signature.argument_types,
+                        kind: declaration.kind(),
+                        deterministic: overload.semantics.volatility.is_replica_deterministic(),
+                        description: &signature.description,
+                    })
+            })
+    }
+
     pub fn metadata(&self) -> &EngineFunctionCatalog {
         &self.catalog
     }

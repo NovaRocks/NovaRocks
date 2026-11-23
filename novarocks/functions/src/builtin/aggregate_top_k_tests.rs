@@ -176,7 +176,7 @@ fn kernel(types: &[DataType], phase: AggregateKernelPhase) -> TopKKernel {
         expected_result_type: None,
     };
     let bound = catalog
-        .resolve_bound_user("approx_top_k", FunctionKind::Aggregate, request, &Compile)
+        .resolve_bound_trusted("approx_top_k", FunctionKind::Aggregate, request, &Compile)
         .unwrap();
     let selected = Arc::new(bound.selected);
     let context = novarocks_type_contract::RelationEffectContext::call(

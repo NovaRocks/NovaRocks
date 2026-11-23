@@ -44,6 +44,10 @@ impl RowMutationTarget {
         }
     }
 
+    pub(crate) fn branch_is_explicit(&self) -> bool {
+        self.reference.is_some()
+    }
+
     pub(crate) fn table_and_reference(&self) -> Result<(&ObjectName, &str), String> {
         let reference = match &self.reference {
             None => "main",
@@ -102,9 +106,36 @@ pub struct MutationStatementInput {
     pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 
+/// Original mutation syntax and authority consumed for a SchemaOnly description.
+pub struct MutationDescriptionInput {
+    pub(crate) statement: OwnedMutationStatement,
+    pub(crate) request: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) connector: novarocks_spi::connector::ConnectorRequestContext,
+    pub(crate) control: novarocks_sql::compiler::SqlCompileControl,
+    pub(crate) target_span: novarocks_parser::Span,
+    pub(crate) source: Arc<str>,
+}
+
+pub struct PreparedMutationDescription {
+    pub(crate) query: novarocks_parser::ast::Query,
+    pub(crate) assignments: Option<Arc<novarocks_sql::compiler::SqlWriteAssignments>>,
+    pub(crate) overlay: crate::catalog_application::query_materializer::QueryLocalTableOverlay,
+}
+
 /// One-to-one capability consumed only by the frontend DML application owner.
 // Design: ADR-0033 (docs/adr/ADR-0033-frontend-update-merge-application-owner.md)
+#[async_trait::async_trait]
 pub trait MutationEngine: Send + Sync {
+    async fn describe_update(
+        &self,
+        input: MutationDescriptionInput,
+    ) -> Result<PreparedMutationDescription, crate::dml::error::DmlExecutionError>;
+
+    async fn describe_merge(
+        &self,
+        input: MutationDescriptionInput,
+    ) -> Result<PreparedMutationDescription, crate::dml::error::DmlExecutionError>;
+
     fn prepare_statement_action(
         &self,
         input: MutationStatementInput,
@@ -114,7 +145,22 @@ pub trait MutationEngine: Send + Sync {
     >;
 }
 
+#[async_trait::async_trait]
 impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
+    async fn describe_update(
+        &self,
+        input: MutationDescriptionInput,
+    ) -> Result<PreparedMutationDescription, crate::dml::error::DmlExecutionError> {
+        super::mutation_flow::describe_update(self, input).await
+    }
+
+    async fn describe_merge(
+        &self,
+        input: MutationDescriptionInput,
+    ) -> Result<PreparedMutationDescription, crate::dml::error::DmlExecutionError> {
+        super::mutation_flow::describe_merge(self, input).await
+    }
+
     fn prepare_statement_action(
         &self,
         input: MutationStatementInput,

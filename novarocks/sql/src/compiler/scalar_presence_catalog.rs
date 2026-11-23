@@ -150,66 +150,39 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             CompileCheckpoints, CompilePhase, SemanticParameterProjectionError, SemanticParameters,
         };
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let result =
-            (|| {
-                if let Some(facts) = binding.group_concat_source() {
-                    let entries = facts.parameter_entries().ok_or_else(|| {
-                        FunctionBindingError::UnavailableImplementation(
-                            binding.selected.overload.clone(),
-                        )
-                    })?;
-                    // These are the original two primitive lexical values, not inferred defaults.
-                    // This existing observed constructor controls its actual tree operations;
-                    // a formal FE capacity port remains an explicit separate interface gate.
-                    let parameters = SemanticParameters::try_new_observed(entries, &mut work)
-                        .map_err(|error| match error {
-                            SemanticParameterProjectionError::Control(cause) => {
-                                FunctionBindingError::Control(cause)
-                            }
-                            SemanticParameterProjectionError::Parameter(_) => {
-                                FunctionBindingError::UnavailableImplementation(
-                                    binding.selected.overload.clone(),
-                                )
-                            }
-                        })?;
-                    self.admit_bound_environment_observed(
-                        binding.resolved(),
-                        &facts.environment(),
-                        &parameters,
-                        control,
-                    )
-                } else {
-                    let (references, entries): (Vec<_>, Vec<_>) = binding
-                        .statement_time_parameters()
-                        .map(|(reference, value)| (reference, (reference.id, value)))
-                        .unzip();
-                    if references.is_empty() {
-                        return self.admit_bound_environment_observed(
-                            binding.resolved(),
-                            &[],
-                            &SemanticParameters::default(),
-                            control,
-                        );
+        let result = (|| {
+            let (references, entries): (Vec<_>, Vec<_>) = binding
+                .statement_time_parameters()
+                .map(|(reference, value)| (reference, (reference.id, value)))
+                .unzip();
+            if references.is_empty() {
+                return self.admit_bound_environment_observed(
+                    binding.resolved(),
+                    &[],
+                    &SemanticParameters::default(),
+                    control,
+                );
+            }
+            let parameters =
+                SemanticParameters::try_new_observed(entries, &mut work).map_err(|error| {
+                    match error {
+                        SemanticParameterProjectionError::Control(cause) => {
+                            FunctionBindingError::Control(cause)
+                        }
+                        SemanticParameterProjectionError::Parameter(_) => {
+                            FunctionBindingError::UnavailableImplementation(
+                                binding.selected.overload.clone(),
+                            )
+                        }
                     }
-                    let parameters = SemanticParameters::try_new_observed(entries, &mut work)
-                        .map_err(|error| match error {
-                            SemanticParameterProjectionError::Control(cause) => {
-                                FunctionBindingError::Control(cause)
-                            }
-                            SemanticParameterProjectionError::Parameter(_) => {
-                                FunctionBindingError::UnavailableImplementation(
-                                    binding.selected.overload.clone(),
-                                )
-                            }
-                        })?;
-                    self.admit_bound_environment_observed(
-                        binding.resolved(),
-                        &references,
-                        &parameters,
-                        control,
-                    )
-                }
-            })();
+                })?;
+            self.admit_bound_environment_observed(
+                binding.resolved(),
+                &references,
+                &parameters,
+                control,
+            )
+        })();
         if matches!(&result, Err(FunctionBindingError::Control(_))) {
             return result;
         }
@@ -315,6 +288,18 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         let binding = self
             .original
             .resolve_scalar_operator_binding(operator, request, control)?;
+        self.admit(binding, control)
+    }
+
+    fn resolve_trusted_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let binding = self
+            .original
+            .resolve_trusted_scalar_binding(function, request, control)?;
         self.admit(binding, control)
     }
 

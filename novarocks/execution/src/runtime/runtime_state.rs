@@ -33,7 +33,7 @@ use novarocks_types::UniqueId;
 
 #[cfg(novarocks_dev_controls)]
 #[derive(Clone, Debug)]
-pub(crate) struct PositionShardTestObservation {
+pub(crate) struct TaskProtocolTestObservation {
     pub execution: novarocks_types::QueryExecutionId,
     pub task_key: UniqueId,
     pub observer: std::sync::Arc<dyn crate::runtime::exchange::TestEventObserver>,
@@ -58,7 +58,7 @@ pub struct RuntimeState {
     #[cfg(novarocks_dev_controls)]
     exchange_test_observer: Option<std::sync::Arc<dyn crate::runtime::exchange::TestEventObserver>>,
     #[cfg(novarocks_dev_controls)]
-    pub(crate) position_shard_observation: Option<PositionShardTestObservation>,
+    pub(crate) task_protocol_observation: Option<TaskProtocolTestObservation>,
     #[cfg(novarocks_dev_controls)]
     join_build_control:
         Option<std::sync::Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
@@ -331,7 +331,7 @@ impl Default for RuntimeState {
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
             #[cfg(novarocks_dev_controls)]
-            position_shard_observation: None,
+            task_protocol_observation: None,
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
             #[cfg(novarocks_dev_controls)]
@@ -359,7 +359,7 @@ impl Clone for RuntimeState {
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: self.exchange_test_observer.clone(),
             #[cfg(novarocks_dev_controls)]
-            position_shard_observation: self.position_shard_observation.clone(),
+            task_protocol_observation: self.task_protocol_observation.clone(),
             #[cfg(novarocks_dev_controls)]
             join_build_control: self.join_build_control.clone(),
             #[cfg(novarocks_dev_controls)]
@@ -475,7 +475,7 @@ impl RuntimeState {
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
             #[cfg(novarocks_dev_controls)]
-            position_shard_observation: None,
+            task_protocol_observation: None,
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
             #[cfg(novarocks_dev_controls)]

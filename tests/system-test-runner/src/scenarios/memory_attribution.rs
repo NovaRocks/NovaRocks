@@ -18,11 +18,15 @@
 //! Functional native observation and cancellation on independent processes.
 use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use crate::scenarios::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 use crate::scenarios::{query_lifecycle, task_evidence};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{QueryExecutionResourceSnapshot, TestClusterOwner};
-use novarocks_test_trino_client::CancelHandle;
+use novarocks_failpoint::observation_marker::{
+    ObservationAction, REGEXP_SEARCH_PROGRESS, REGEXP_SEARCH_STOPPED, TASK_PREPARED_DOP,
+    TASK_TERMINAL_RETAINED,
+};
+use novarocks_test_trino_client::{CancelHandle, PendingStatement};
 use std::{
     collections::BTreeSet,
     fs,
@@ -37,6 +41,7 @@ const OBSERVATION_QUERIES: [&str; 2] = [
 ];
 const CANCELLATION_QUERY: &str =
     "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
+const REGEXP_CANCELLATION_QUERY: &str = "SELECT sum(regexp_count(rpad('', 8192, CASE WHEN i <= BIGINT '50000' THEN 'a' ELSE 'b' END), 'a+a+a+a+a+a+z')) FROM TABLE(sequence(1, 100000)) AS t(i)";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(ObservationFamilies::default())]
@@ -66,9 +71,10 @@ impl Scenario for ObservationFamilies {
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let statements = OBSERVATION_QUERIES
-            .iter()
+            .into_iter()
+            .chain([REGEXP_CANCELLATION_QUERY])
             .map(|sql| StatementSpec {
-                sql: (*sql).into(),
+                sql: sql.into(),
                 faults: vec![],
                 observations: (0..cluster_size)
                     .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None))
@@ -210,20 +216,193 @@ impl Scenario for ObservationFamilies {
         let convergence = query_lifecycle::await_resource_convergence(context, &baseline);
         let during = combine(result, convergence)?;
         let after = query_lifecycle::resource_snapshot(context)?;
+        let regexp = cancel_during_regexp(
+            context,
+            &self.intent.take(OBSERVATION_QUERIES.len())?,
+            &baseline,
+        )?;
         fs::write(
             context.scenario_root().join("memory-attribution.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "backend_process_ids": ids.backends,
                 "functional_native_observation": true,
                 "active_cancellation_observed": true,
                 "reader_joined": true,
                 "during_query": resource_record(&during),
                 "after_cancel": resource_record(&after),
+                "regexp_cancellation": regexp,
             }))?,
         )?;
         context.action("verified distributed rows, original Native boundary evidence and active Trino cancellation with actual reader exit and resource convergence on independent backends");
         Ok(())
+    }
+}
+
+fn cancel_during_regexp(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+    baseline: &QueryExecutionResourceSnapshot,
+) -> Result<serde_json::Value> {
+    let deadline = context.deadline();
+    let session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+    let pending = session.submit(REGEXP_CANCELLATION_QUERY)?;
+    let (pending, observation) =
+        selected.arm_pending(context, pending, REGEXP_CANCELLATION_QUERY)?;
+    let started = CancellationQuery::start_pending(session, pending, deadline);
+    let result = (|| -> Result<_> {
+        let mut actor = started?;
+        let progress = await_regexp_search(context, selected, &actor).and_then(|progress| {
+            let during = query_lifecycle::resource_snapshot(context)?;
+            ensure!(
+                during != *baseline,
+                "observed regexp search has no active resource delta"
+            );
+            Ok((progress, during))
+        });
+        let cancelled = actor.cancel.delete(deadline).map_err(anyhow::Error::from);
+        let shutdown = if cancelled.is_err() {
+            context.shutdown()
+        } else {
+            Ok(())
+        };
+        let joined = actor.join();
+        let read = match joined {
+            Ok(Err(error)) => sql::expect_error(&error, 3, "USER_CANCELED")
+                .map(|_| ())
+                .with_context(|| format!("original regexp reader outcome: {error:?}")),
+            Ok(Ok(rows)) => Err(anyhow::anyhow!(
+                "active regexp cancellation unexpectedly returned rows: {rows:?}"
+            )),
+            Err(error) => Err(error),
+        };
+        let ((backend, execution, task_key, offset), during) =
+            combine(progress, combine(combine(cancelled, shutdown), read))?;
+        query_lifecycle::await_resource_convergence(context, baseline)?;
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&observation, false, deadline)?;
+        ensure!(
+            terminal.execution_id.as_deref() == Some(&execution)
+                && terminal.worker_participations_converged,
+            "regexp cancellation did not converge on the observed Native execution: {terminal:?}"
+        );
+        let (stage, task, stop_offset) =
+            await_regexp_exit(context, backend, &execution, &task_key)?;
+        let after = query_lifecycle::resource_snapshot(context)?;
+        Ok(serde_json::json!({
+            "backend": backend,
+            "execution_id": execution,
+            "task_key": task_key,
+            "stage": stage,
+            "task": task,
+            "search_offset": offset,
+            "stop_offset": stop_offset,
+            "during_query": resource_record(&during),
+            "after_cancel": resource_record(&after),
+        }))
+    })();
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_binding(&observation, deadline);
+    combine(result, drained)
+}
+
+fn await_regexp_search(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+    actor: &CancellationQuery,
+) -> Result<(usize, String, String, usize)> {
+    loop {
+        for backend in 0..context.handle().be_count() {
+            let Some(binding) = context.handle().selected_native_observation_binding(
+                backend,
+                ObservationAction::TaskProtocol.as_str(),
+                &selected.token,
+                None,
+            )?
+            else {
+                continue;
+            };
+            let execution = format!(
+                "{}:{}:{}",
+                binding.query_id_hi, binding.query_id_lo, binding.attempt_id
+            );
+            let identity = format!("execution_id={execution} ");
+            let log = context.handle().be_log_contents(backend)?;
+            if let Some(line) = log
+                .lines()
+                .find(|line| line.contains(REGEXP_SEARCH_PROGRESS) && line.contains(&identity))
+            {
+                let task = marker_field(line, "task_key=")?.to_owned();
+                let offset = marker_field(line, "offset=")?.parse::<usize>()?;
+                ensure!(
+                    offset >= 256 && !actor.is_finished(),
+                    "regexp search has no live reader at the reached boundary"
+                );
+                return Ok((backend, execution, task, offset));
+            }
+        }
+        ensure!(
+            !actor.is_finished(),
+            "regexp query finished before its BE search was observed"
+        );
+        thread::sleep(
+            context
+                .remaining("observe exact regexp search")?
+                .min(Duration::from_millis(25)),
+        );
+    }
+}
+
+fn marker_field<'a>(line: &'a str, key: &str) -> Result<&'a str> {
+    line.split_whitespace()
+        .find_map(|word| word.strip_prefix(key))
+        .with_context(|| format!("original Native marker omitted {key}"))
+}
+
+fn await_regexp_exit(
+    context: &mut ScenarioContext,
+    backend: usize,
+    execution: &str,
+    task_key: &str,
+) -> Result<(u32, u32, usize)> {
+    let execution_field = format!("execution_id={execution} ");
+    let task_field = format!("task_key={task_key} ");
+    loop {
+        let log = context.handle().be_log_contents(backend)?;
+        let same_task = |line: &&str| line.contains(&execution_field) && line.contains(&task_field);
+        let prepared = log
+            .lines()
+            .filter(same_task)
+            .find(|line| line.contains(TASK_PREPARED_DOP));
+        let stopped = log
+            .lines()
+            .filter(same_task)
+            .find(|line| line.contains(REGEXP_SEARCH_STOPPED));
+        if let (Some(prepared), Some(stopped)) = (prepared, stopped) {
+            let stage = marker_field(prepared, "stage=")?.parse::<u32>()?;
+            let task = marker_field(prepared, "task=")?.parse::<u32>()?;
+            let stage_field = format!("stage={stage} ");
+            let task_id_field = format!("task={task} ");
+            // Worker emits the retained terminal only after the original
+            // accepted Task's physical payload is destroyed.
+            let retired = log.lines().any(|line| {
+                line.contains(TASK_TERMINAL_RETAINED)
+                    && line.contains(&execution_field)
+                    && line.contains(&stage_field)
+                    && line.contains(&task_id_field)
+                    && marker_field(line, "state=").is_ok_and(|state| state == "ABORTED")
+            });
+            if retired {
+                return Ok((stage, task, marker_field(stopped, "offset=")?.parse()?));
+            }
+        }
+        thread::sleep(
+            context
+                .remaining("observe exact regexp Task search stop and termination")?
+                .min(Duration::from_millis(25)),
+        );
     }
 }
 
@@ -244,8 +423,16 @@ struct CancellationQuery {
     deadline: Instant,
 }
 impl CancellationQuery {
-    fn start(mut session: SqlSession, deadline: Instant) -> Result<Self> {
+    fn start(session: SqlSession, deadline: Instant) -> Result<Self> {
         let pending = session.submit(CANCELLATION_QUERY)?;
+        Self::start_pending(session, pending, deadline)
+    }
+
+    fn start_pending(
+        mut session: SqlSession,
+        pending: PendingStatement,
+        deadline: Instant,
+    ) -> Result<Self> {
         let cancel = pending.cancel_handle();
         let actor = match thread::Builder::new()
             .name("native-observation-cancel".into())

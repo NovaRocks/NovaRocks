@@ -50,6 +50,11 @@ const UNKNOWN_FUNCTION: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const UNKNOWN_TYPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.unknown_type"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const AMBIGUOUS_FUNCTION_CALL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.ambiguous_function_call"),
     phase: ErrorPhase::Analyze,
@@ -62,6 +67,21 @@ const FUNCTION_NOT_AGGREGATE: ErrorCodeDescriptor = ErrorCodeDescriptor {
 };
 const EXPRESSION_NOT_SCALAR: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.expression_not_scalar"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const EXPRESSION_NOT_IN_DISTINCT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.expression_not_in_distinct"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const MISSING_ORDER_BY: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.missing_order_by"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const INVALID_WINDOW_FRAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.invalid_window_frame"),
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
@@ -179,10 +199,14 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_SCHEMA,
     UNKNOWN_COLUMN,
     UNKNOWN_FUNCTION,
+    UNKNOWN_TYPE,
     AMBIGUOUS_FUNCTION_CALL,
     TYPE_MISMATCH,
     FUNCTION_NOT_AGGREGATE,
     EXPRESSION_NOT_SCALAR,
+    EXPRESSION_NOT_IN_DISTINCT,
+    MISSING_ORDER_BY,
+    INVALID_WINDOW_FRAME,
     INVALID_LITERAL,
     NUMERIC_OUT_OF_RANGE,
     INVALID_ARGUMENT,
@@ -213,10 +237,14 @@ pub enum AnalyzeErrorKind {
     UnknownSchema,
     UnknownColumn,
     UnknownFunction,
+    UnknownType,
     AmbiguousFunctionCall,
     TypeMismatch,
     FunctionNotAggregate,
     ExpressionNotScalar,
+    ExpressionNotInDistinct,
+    MissingOrderBy,
+    InvalidWindowFrame,
     InvalidLiteral,
     NumericOutOfRange,
     InvalidArgument,
@@ -249,10 +277,14 @@ impl AnalyzeErrorKind {
             Self::UnknownSchema => UNKNOWN_SCHEMA,
             Self::UnknownColumn => UNKNOWN_COLUMN,
             Self::UnknownFunction => UNKNOWN_FUNCTION,
+            Self::UnknownType => UNKNOWN_TYPE,
             Self::AmbiguousFunctionCall => AMBIGUOUS_FUNCTION_CALL,
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
             Self::ExpressionNotScalar => EXPRESSION_NOT_SCALAR,
+            Self::ExpressionNotInDistinct => EXPRESSION_NOT_IN_DISTINCT,
+            Self::MissingOrderBy => MISSING_ORDER_BY,
+            Self::InvalidWindowFrame => INVALID_WINDOW_FRAME,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::NumericOutOfRange => NUMERIC_OUT_OF_RANGE,
             Self::InvalidArgument => INVALID_ARGUMENT,
@@ -339,6 +371,7 @@ pub struct AnalyzeError {
     kind: AnalyzeErrorKind,
     message: String,
     span: Option<Span>,
+    source_sql: Option<std::sync::Arc<str>>,
     control: Option<novarocks_type_contract::CompileControlError>,
     source: Option<novarocks_failure_contract::SharedFailureCause>,
     view_cause: Option<Box<StoredDefinitionCause>>,
@@ -354,6 +387,7 @@ impl AnalyzeError {
             kind,
             message: message.into(),
             span,
+            source_sql: None,
             control: None,
             source: None,
             view_cause: None,
@@ -513,6 +547,7 @@ impl AnalyzeError {
     pub(crate) fn at_view_reference(self, source_sql: std::sync::Arc<str>, span: Span) -> Self {
         let mut outer = self.clone();
         outer.span = (!span.is_empty()).then_some(span);
+        outer.source_sql = None;
         outer.view_cause = Some(Box::new(StoredDefinitionCause::Analysis(
             StoredViewAnalysisCause {
                 source_sql,
@@ -615,6 +650,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: source.detail().to_owned(),
             span: None,
+            source_sql: None,
             control: None,
             source: Some(source),
             view_cause: None,
@@ -637,6 +673,10 @@ impl AnalyzeError {
         error.span = Some(span);
         error
     }
+    pub(crate) fn numeric_out_of_range(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::NumericOutOfRange, message, span)
+    }
+
     pub fn invalid_literal(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::InvalidLiteral, message, span)
     }
@@ -661,6 +701,18 @@ impl AnalyzeError {
         Self::at(AnalyzeErrorKind::InvalidFunctionArgument, message, span)
     }
 
+    pub(crate) fn expression_not_in_distinct(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::ExpressionNotInDistinct, message, span)
+    }
+
+    pub(crate) fn missing_order_by(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::MissingOrderBy, message, span)
+    }
+
+    pub(crate) fn invalid_window_frame(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::InvalidWindowFrame, message, span)
+    }
+
     pub(crate) fn expression_not_constant(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::ExpressionNotConstant, message, span)
     }
@@ -679,6 +731,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::UnsupportedExpression,
             message: message.into(),
             span: None,
+            source_sql: None,
             control: None,
             source: None,
             view_cause: None,
@@ -696,6 +749,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: message.into(),
             span: None,
+            source_sql: None,
             control: None,
             source: None,
             view_cause: None,
@@ -709,6 +763,7 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: error.to_string(),
             span: None,
+            source_sql: None,
             control: Some(error),
             source: None,
             view_cause: None,
@@ -734,10 +789,18 @@ impl AnalyzeError {
                     kind: AnalyzeErrorKind::Internal,
                     message: source.detail().to_owned(),
                     span: None,
+                    source_sql: None,
                     control: None,
                     source: Some(source),
                     view_cause: None,
                 }
+            }
+            novarocks_functions::FunctionBindingError::ValueType(
+                source @ novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. },
+            ) => {
+                let mut error = Self::domain_source(source);
+                error.kind = AnalyzeErrorKind::UnknownType;
+                error
             }
             novarocks_functions::FunctionBindingError::VariantTargetType(source) => {
                 let mut error = Self::domain_source(source);
@@ -749,6 +812,7 @@ impl AnalyzeError {
                     kind: AnalyzeErrorKind::UnavailableImplementation,
                     message: error.to_string(),
                     span: None,
+                    source_sql: None,
                     control: None,
                     source: None,
                     view_cause: None,
@@ -765,6 +829,7 @@ impl AnalyzeError {
                 },
                 message: error.to_string(),
                 span: None,
+                source_sql: None,
                 control: None,
                 source: None,
                 view_cause: None,
@@ -776,6 +841,9 @@ impl AnalyzeError {
     pub(crate) fn function_resolution(error: novarocks_functions::FunctionResolutionError) -> Self {
         match error {
             novarocks_functions::FunctionResolutionError::Control(error) => Self::control(error),
+            novarocks_functions::FunctionResolutionError::ResultType(source) => {
+                Self::function_binding(source.into())
+            }
             error => Self::internal(error.to_string()),
         }
     }
@@ -790,6 +858,7 @@ impl AnalyzeError {
             AnalyzeErrorKind::UnavailableImplementation
                 | AnalyzeErrorKind::UnsupportedExpression
                 | AnalyzeErrorKind::UnknownFunction
+                | AnalyzeErrorKind::UnknownType
                 | AnalyzeErrorKind::AmbiguousFunctionCall
         ) {
             Self {
@@ -845,6 +914,19 @@ impl AnalyzeError {
         self.span
     }
 
+    pub(crate) fn in_expression_source(mut self, source_sql: std::sync::Arc<str>) -> Self {
+        self.source_sql = Some(source_sql);
+        self
+    }
+
+    pub fn expression_source(&self) -> Option<&str> {
+        self.source_sql.as_deref()
+    }
+
+    pub fn expression_source_arc(&self) -> Option<&std::sync::Arc<str>> {
+        self.source_sql.as_ref()
+    }
+
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -856,7 +938,7 @@ impl AnalyzeError {
         let location = self
             .span
             .filter(|span| !span.is_empty())
-            .zip(source)
+            .zip(self.expression_source().or(source))
             .map(|(span, source)| span.to_user_error_location(source));
         UserError::from_descriptor(
             self.kind.descriptor(),
@@ -970,10 +1052,14 @@ mod tests {
                 "sql.analyze.unknown_schema",
                 "sql.analyze.unknown_column",
                 "sql.analyze.unknown_function",
+                "sql.analyze.unknown_type",
                 "sql.analyze.ambiguous_function_call",
                 "sql.analyze.type_mismatch",
                 "sql.analyze.function_not_aggregate",
                 "sql.analyze.expression_not_scalar",
+                "sql.analyze.expression_not_in_distinct",
+                "sql.analyze.missing_order_by",
+                "sql.analyze.invalid_window_frame",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.numeric_out_of_range",
                 "sql.analyze.invalid_argument",

@@ -92,163 +92,163 @@ SET SESSION enable_global_runtime_filter = false;
 
 -- query 2
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 INNER JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 3
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 INNER JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT JOIN[broadcast] pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 4
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 LEFT JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 5
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 LEFT JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- FULL JOIN[shuffle] pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 6
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 FULL JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 7
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 FULL JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- CROSS JOIN pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 8
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 INNER JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 9
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
 cte1 as(
-select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(murmur_hash3_32(t0.c0)) as d0
+select  coalesce(cte0.c0, -1) as c0, sum(cte0.c1) c1, sum(cte0.c2) c2, sum(crc32(to_utf8(CAST(t0.c0 AS VARCHAR)))) as d0
 from cte0 INNER JOIN t0 on t0.c0 = cte0.c0
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, cte1.d0, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, cte1.d0, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+d0+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+d0+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT SEMI JOIN[broadcast] pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 10
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -259,16 +259,16 @@ WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 11
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -279,17 +279,17 @@ WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- LEFT ANTI JOIN[broadcast] pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 12
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -300,16 +300,16 @@ WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 13
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -320,17 +320,17 @@ WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- RIGHT SEMI JOIN[shuffle] pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 14
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -341,16 +341,16 @@ WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 15
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -361,17 +361,17 @@ WHERE EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- RIGHT ANTI JOIN[shuffle] pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 16
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -382,16 +382,16 @@ WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 17
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -402,17 +402,17 @@ WHERE NOT EXISTS (SELECT 1 FROM t0 WHERE t0.c0 = cte0.c0)
 group by 1
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- NOT IN subquery pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 18
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -423,16 +423,16 @@ where cte0.c0 not in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 19
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -443,17 +443,17 @@ where cte0.c0 not in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- IN subquery pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 20
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -464,16 +464,16 @@ where cte0.c0 in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 21
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -484,17 +484,17 @@ where cte0.c0 in (select t0.c0 from t0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- EXISTS subquery pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 22
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -505,16 +505,16 @@ where exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 23
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -525,17 +525,17 @@ where exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 -- NOT EXISTS subquery pair
 SET SESSION enable_global_runtime_filter = false;
 -- query 24
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -546,16 +546,16 @@ where not exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;
 
 SET SESSION enable_global_runtime_filter = true;
 -- query 25
 with cte0 as (
-select t1.c0, sum(murmur_hash3_32(t1.c1)) as c1, sum(murmur_hash3_32(t1.c2)) as c2
+select t1.c0, sum(crc32(to_utf8(CAST(t1.c1 AS VARCHAR)))) as c1, sum(crc32(to_utf8(CAST(t1.c2 AS VARCHAR)))) as c2
 from t1
 group by t1.c0
 ),
@@ -566,8 +566,8 @@ where not exists (select t0.c0 from t0 where t0.c0 = cte0.c0)
 group by cte0.c0
 ),
 cte2 as(
-select cte1.c0, cte1.c1, cte1.c2, murmur_hash3_32(t2.c0) as e0
+select cte1.c0, cte1.c1, cte1.c2, crc32(to_utf8(CAST(t2.c0 AS VARCHAR))) as e0
 from cte1 inner join t2 on cte1.c0 = t2.c0
 )
-select coalesce(sum(murmur_hash3_32(c0)+c1+c2+e0), 0) as fingerprint
+select coalesce(sum(crc32(to_utf8(CAST(c0 AS VARCHAR)))+c1+c2+e0), 0) as fingerprint
 from cte2;

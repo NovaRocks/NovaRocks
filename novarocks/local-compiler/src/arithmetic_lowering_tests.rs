@@ -718,7 +718,9 @@ fn checked_arithmetic_package_refuses_missing_or_wrong_parameter_authority() {
     let mut input = package_input(&fixture);
     input.parameters = SemanticParameters::try_new([(
         SemanticParameterId::new(u32::MAX),
-        SemanticParameterValue::GroupConcatLegacy(true),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
     )])
     .unwrap();
     assert_eq!(

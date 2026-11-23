@@ -268,6 +268,13 @@ pub const MAX_UNOBSERVED_KERNEL_WORK: u32 = 256;
 pub trait KernelEvaluationControl: Send + Sync {
     fn checkpoint(&self, work_units: u32) -> Result<(), KernelFailure>;
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure>;
+    /// Report a source boundary reached by an actual regexp search.
+    fn regexp_search_progress(&self, _offset: usize) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    /// Observe an original control refusal within the search. This report
+    /// cannot replace the refusal or start more fallible kernel work.
+    fn regexp_search_stopped(&self, _offset: usize) {}
 }
 
 /// Borrow the original host control across a nested lifecycle call. This
@@ -313,6 +320,35 @@ impl KernelEvaluationControl for KernelControlObservation<'_> {
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
         self.observe(|| self.original.wait(duration))
     }
+    fn regexp_search_progress(&self, offset: usize) -> Result<(), KernelFailure> {
+        self.observe(|| self.original.regexp_search_progress(offset))
+    }
+    fn regexp_search_stopped(&self, offset: usize) {
+        self.original.regexp_search_stopped(offset);
+    }
+}
+
+#[derive(Debug)]
+struct InvalidParameter(&'static str);
+
+impl std::fmt::Display for InvalidParameter {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(self.0)
+    }
+}
+impl std::error::Error for InvalidParameter {}
+impl novarocks_failure_contract::FailureProjection for InvalidParameter {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Data,
+            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for InvalidParameter {}
+
+pub(crate) fn invalid_function_argument(message: &'static str) -> KernelFailure {
+    KernelFailure::from_domain(InvalidParameter(message))
 }
 
 pub(crate) fn invalid(message: &str) -> KernelFailure {

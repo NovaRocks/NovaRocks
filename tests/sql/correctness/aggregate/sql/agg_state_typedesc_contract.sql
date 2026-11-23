@@ -33,8 +33,8 @@ INSERT INTO ${case_db}.agg_state_typedesc_contract VALUES
 SELECT
        grp,
        CAST(avg(v) AS DECIMAL(18, 4)) AS avg_v,
-       ndv(k) AS ndv_k,
-       CAST(percentile_approx(d, 0.5) AS DECIMAL(18, 4)) AS p50_d
+       approx_distinct(k) AS ndv_k,
+       CAST(approx_percentile(d, 0.5) AS DECIMAL(18, 4)) AS p50_d
 FROM ${case_db}.agg_state_typedesc_contract
 GROUP BY grp
 ORDER BY grp;
@@ -42,7 +42,7 @@ ORDER BY grp;
 SELECT
        grp,
        CAST(avg(v) AS DECIMAL(18, 4)) AS avg_v,
-       ndv(k) AS ndv_k
+       approx_distinct(k) AS ndv_k
 FROM ${case_db}.agg_state_typedesc_contract
 GROUP BY grp
 ORDER BY grp;

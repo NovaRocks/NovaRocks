@@ -19,6 +19,7 @@
 //! Two passes measure and write into one output backing; no row String is built.
 //! Layout checks prove representation only, not a formal host memory grant.
 
+use super::string_measure::fixed_char_width;
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -33,6 +34,7 @@ use std::{alloc::Layout, sync::Arc};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StringInitcapOp {
     Initcap,
+    TitleCase,
 }
 
 fn visit_mapped(
@@ -41,9 +43,22 @@ fn visit_mapped(
     work: &mut EvaluationCheckpoints<'_>,
     mut visit: impl FnMut(char, &mut EvaluationCheckpoints<'_>) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
-    let StringInitcapOp::Initcap = operation;
     let mut new_word = true;
     for ch in text.chars() {
+        if operation == StringInitcapOp::TitleCase {
+            let space = super::string_trim_core::trino_whitespace(ch);
+            let mapped = if space {
+                ch
+            } else if new_word {
+                super::string_case::unicode::titlecase(ch)
+            } else {
+                super::string_case::unicode::lowercase(ch)
+            };
+            new_word = space;
+            work.step()?;
+            visit(mapped, work)?;
+            continue;
+        }
         // Each UTF-8 scalar decode and Unicode classification has completed.
         // Per-char mapping preserves the legacy non-contextual sigma rule.
         let alphanumeric = ch.is_alphanumeric();
@@ -105,11 +120,13 @@ pub(super) fn evaluate_string_initcap<'a>(
             return Err(invalid("initcap requires one checked value argument"));
         };
         let target = input.contract().result_type();
+        let source_width = fixed_char_width(source);
         if source.logical_type() != ValueLogicalType::Physical
             || source.data_type() != &DataType::Utf8
             || target.logical_type() != ValueLogicalType::Physical
             || target.data_type() != &DataType::Utf8
-            || !target.nullable()
+            || source_width != fixed_char_width(target)
+            || (op == StringInitcapOp::Initcap && (!target.nullable() || source_width.is_some()))
         {
             return Err(invalid("initcap differs from its exact installed profile"));
         }

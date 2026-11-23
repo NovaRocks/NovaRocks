@@ -40,6 +40,9 @@ pub const JSON_VALUE_RESULT_ERROR: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(49).unwrap());
 pub const DATE_RESULT_OUT_OF_RANGE: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(53).unwrap());
+pub const EXCEEDED_FUNCTION_MEMORY_LIMIT: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(55).unwrap());
+
 pub const UNKNOWN_EPOCH_TIME_ZONE: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(54).unwrap());
 

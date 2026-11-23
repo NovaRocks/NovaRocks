@@ -16,46 +16,17 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Weighted CDF reference: centers .5,2,4.5 for (2,w1),(3,w2),(4,w3).
--- q=.5 interpolates 3.4; q=.25 interpolates 8/3. NULL/zero rows add no mass.
+-- Values and types captured from Trino 484.
+
 -- query 1
--- @skip_result_check=true
-USE ${case_db};
-CREATE TABLE weighted_cdf_control (v DOUBLE, w BIGINT) WITH (format_version = 3);
-INSERT INTO weighted_cdf_control VALUES ROW(2,1),ROW(3,2),ROW(4,3),ROW(NULL,100),ROW(100,NULL),ROW(200,0),ROW(999,0);
+SELECT approx_percentile(x,w,DOUBLE '0.5') AS fractional, approx_percentile(x, floor(w), DOUBLE '0.5') AS integral FROM (VALUES (BIGINT '0', DOUBLE '1.1'), (BIGINT '10', DOUBLE '1.9'), (BIGINT '20', DOUBLE '1.1'), (BIGINT '30', DOUBLE '1.9')) t(x,w);
 
 -- query 2
-SELECT COUNT() AS rows_seen, COUNT(v) AS values_seen, COUNT(w) AS weights_seen FROM weighted_cdf_control;
+SELECT approx_percentile(x,w,ARRAY[DOUBLE '0', DOUBLE '0.25', DOUBLE '0.5', DOUBLE '1']) AS estimates FROM (VALUES (DOUBLE '2', DOUBLE '1'), (DOUBLE '3', DOUBLE '2'), (DOUBLE '4', DOUBLE '3'), (NULL, DOUBLE '100'), (DOUBLE '100', NULL)) t(x,w);
 
 -- query 3
-SELECT percentile_approx_weighted(v,w,0.5,10000) AS p FROM weighted_cdf_control;
+SELECT approx_percentile(x,w,DOUBLE '0.5') IS NULL AS empty_state FROM (VALUES (CAST(NULL AS DOUBLE), DOUBLE '0'), (DOUBLE '10', CAST(NULL AS DOUBLE))) t(x,w);
 
 -- query 4
-SELECT percentile_approx_weighted(v,w,[0.0,0.25,0.5,1.0],2048) AS p FROM weighted_cdf_control;
-
--- query 5
-SELECT percentile_approx_weighted(v,0,0.5) IS NULL AS empty FROM weighted_cdf_control;
-
--- query 6
-SELECT percentile_approx_weighted(v,w,0.5) IS NULL AS empty FROM weighted_cdf_control WHERE v IS NULL;
-
--- query 7
-SELECT percentile_approx_weighted(v,w,0.5) IS NULL AS empty FROM weighted_cdf_control WHERE w IS NULL;
-
--- query 8
--- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
-SELECT percentile_approx_weighted(v,-1,0.5) FROM weighted_cdf_control;
-
--- query 9
-SELECT percentile_approx_weighted(1,1,0.5) AS p FROM weighted_cdf_control;
-
--- query 10
--- @expect_error=compression parameter must be positive
--- @expect_sql_code=sql.analyze.invalid_argument
--- @expect_sql_phase=Analyze
-SELECT percentile_approx_weighted(v,w,0.5,0) FROM weighted_cdf_control;
-
--- query 11
--- @cleanup=true
--- @skip_result_check=true
-DROP TABLE weighted_cdf_control;
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT approx_percentile(x, DOUBLE '0', DOUBLE '0.5') AS invalid FROM (VALUES DOUBLE '2') t(x);

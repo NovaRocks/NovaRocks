@@ -17,7 +17,8 @@
 //! Original N admission, stable sort and scalar codec, over explicit storage.
 use super::aggregate_by_core::ByEncodeBuffer;
 use crate::aggregate_scalar::{
-    self as scalar, AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
+    self as scalar, AggScalarValue, ExtremaDirection, ScalarStateAllocator, ScalarWork,
+    TrackedAggScalarValue,
 };
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
@@ -26,6 +27,8 @@ use arrow_schema::DataType;
 use std::cmp::Ordering;
 #[path = "aggregate_n_source_failure.rs"]
 mod source_failure;
+
+const MAX_TOP_N: i64 = 10_000;
 
 /// Decoded N state containing its source slot and allocator-owned values.
 #[expect(
@@ -183,8 +186,21 @@ impl<A: ScalarStateAllocator> NState<A> {
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), crate::KernelFailure> {
-        let limit = parse_limit(limits, limit_row, work)?;
-        self.init_limit_if_needed(limit)?;
+        if value_row >= values.len() || limit_row >= limits.len() {
+            return Err(source_failure::contract(
+                "min/max Top N input address is out of bounds",
+            ));
+        }
+        if limits.is_null(limit_row)
+            || values.is_null(value_row)
+            || limits.data_type() == &DataType::Null
+            || values.data_type() == &DataType::Null
+        {
+            return Ok(());
+        }
+        if !self.initialized {
+            self.init_limit_if_needed(parse_limit(limits, limit_row, work)?)?;
+        }
         let Some(value) =
             scalar::tracked_scalar_from_array(values, value_row, &self.allocator, work)?
         else {
@@ -255,14 +271,13 @@ impl<A: ScalarStateAllocator> NState<A> {
     }
     fn sort_values<R: NSortResources>(
         &mut self,
+        direction: ExtremaDirection,
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), crate::KernelFailure> {
         work.flush()?;
         let lease = resources.before_sort(self.values.len(), work)?;
         let mut primary = None;
-        // Keep the original stable ordering policy for heterogeneous values
-        // and NaN. Actual comparison/control failures always propagate.
         self.values.sort_by(|left, right| {
             if primary.is_some() {
                 return Ordering::Equal;
@@ -274,12 +289,11 @@ impl<A: ScalarStateAllocator> NState<A> {
                     return Ordering::Equal;
                 }
             };
-            let ordering = match scalar::compare_tracked_scalar_values_partial(left, right, work) {
-                Ok(scalar::ScalarOrdering::Ordered(order)) => order,
-                Ok(
-                    scalar::ScalarOrdering::UnorderedFloat
-                    | scalar::ScalarOrdering::MismatchedKinds,
-                ) => Ordering::Equal,
+            let ordering = match direction.compare_tracked(left, right, work) {
+                Ok(order) => match direction {
+                    ExtremaDirection::Minimum => order,
+                    ExtremaDirection::Maximum => order.reverse(),
+                },
                 Err(error) => {
                     primary = Some(error);
                     Ordering::Equal
@@ -327,12 +341,12 @@ impl<A: ScalarStateAllocator> NState<A> {
             .payload_bytes
             .checked_add(retained)
             .ok_or(crate::KernelFailure::ResourceExhausted)?;
-        self.sort_values(resources, work)?;
-        if !keep_smallest {
-            work.flush()?;
-            self.values.reverse();
-            work.flush()?;
-        }
+        let direction = if keep_smallest {
+            ExtremaDirection::Minimum
+        } else {
+            ExtremaDirection::Maximum
+        };
+        self.sort_values(direction, resources, work)?;
         if self.values.len() > self.limit {
             for value in &self.values[self.limit..] {
                 work.step()?;
@@ -342,7 +356,6 @@ impl<A: ScalarStateAllocator> NState<A> {
             self.values.truncate(self.limit);
             work.flush()?;
         }
-        self.sort_values(resources, work)?;
         Ok(())
     }
     pub fn serialize<B: ByEncodeBuffer>(
@@ -376,13 +389,16 @@ impl<A: ScalarStateAllocator> NState<A> {
     pub fn output(
         &self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<AggScalarValue, crate::KernelFailure> {
+    ) -> Result<Option<AggScalarValue>, crate::KernelFailure> {
+        if self.values.is_empty() {
+            return Ok(None);
+        }
         let mut list = Vec::with_capacity(self.values.len());
         for value in &self.values {
             work.step()?;
             list.push(Some(scalar::tracked_scalar_to_output(value, work)?));
         }
-        Ok(AggScalarValue::List(list))
+        Ok(Some(AggScalarValue::List(list)))
     }
 }
 pub fn parse_limit(
@@ -398,10 +414,9 @@ pub fn parse_limit(
             "min_n/max_n limit must be integer",
         ));
     };
-    if value <= 0 {
-        return Err(source_failure::value(format_args!(
-            "min_n/max_n limit must be positive, got {}",
-            value
+    if !(1..=MAX_TOP_N).contains(&value) {
+        return Err(source_failure::argument(format_args!(
+            "min/max number of values must be between 1 and {MAX_TOP_N}, got {value}"
         )));
     }
     usize::try_from(value).map_err(source_failure::numeric_conversion)

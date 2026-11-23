@@ -1,0 +1,125 @@
+-- query 5
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	2	true	true
+
+-- query 8
+-- types	boolean
+added_positions
+true
+
+-- query 9
+-- types	boolean
+has_delete_file
+true
+
+-- query 10
+-- types	bigint
+id
+3
+5
+
+-- query 15
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	2	true	true
+
+-- query 18
+-- types	boolean
+added_positions
+true
+
+-- query 19
+-- types	boolean
+has_delete_file
+true
+
+-- query 20
+-- types	bigint
+id
+1
+4
+
+-- query 25
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	2	true	true
+
+-- query 28
+-- types	boolean
+added_positions
+true
+
+-- query 29
+-- types	boolean
+has_delete_file
+true
+
+-- query 30
+-- types	bigint
+id
+3
+5
+
+-- query 35
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	2	true	true
+
+-- query 38
+-- types	boolean
+added_positions
+true
+
+-- query 39
+-- types	boolean
+has_delete_file
+true
+
+-- query 40
+-- types	bigint
+id
+3
+5
+
+-- query 45
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	2	true	true
+
+-- query 48
+-- types	boolean
+added_positions
+true
+
+-- query 49
+-- types	boolean
+has_delete_file
+true
+
+-- query 50
+-- types	bigint
+id
+1
+4
+6
+
+-- query 55
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	1	true	true
+
+-- query 59
+-- types	boolean
+added_positions
+NULL
+
+-- query 60
+-- types	boolean
+has_delete_file
+false
+
+-- query 61
+-- types	bigint
+id
+3

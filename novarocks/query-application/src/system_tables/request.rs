@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn invalid_projection_and_nonkey_constraints_are_rejected() {
         let context = context();
-        for columns in [vec![4], vec![1, 1]] {
+        for columns in [vec![5], vec![1, 1]] {
             assert!(matches!(
                 SystemTableRequest::try_new(
                     declaration(),
@@ -138,7 +138,7 @@ mod tests {
             ));
         }
         let mut keys = SystemTableKeyConstraint::default();
-        keys.set_values(0, SystemTableKeyValues::Any);
+        keys.set_values(4, SystemTableKeyValues::Any);
         assert!(matches!(
             SystemTableRequest::try_new(declaration(), vec![], keys, &context, 4096),
             Err(SystemTableError::InvalidRequest(_))

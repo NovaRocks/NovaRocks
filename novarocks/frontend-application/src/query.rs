@@ -69,10 +69,10 @@ use novarocks_query_application::session::{
     StatementOutputShape, StatementSessionRequest,
 };
 use novarocks_query_application::session_control::{
-    GovernedQueryStatementBeginError, GovernedQueryStatementOwner, GovernedStatementAction,
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementActionReady,
-    StatementActionValue, StatementCommandCompletion, StatementCompletionProjection,
-    StatementToken,
+    ClientQueryTiming, GovernedQueryStatementBeginError, GovernedQueryStatementOwner,
+    GovernedStatementAction, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
+    StatementActionReady, StatementActionValue, StatementCommandCompletion,
+    StatementCompletionProjection, StatementToken,
 };
 use novarocks_query_application::session_effects::SessionEffects;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
@@ -80,7 +80,9 @@ use novarocks_query_application::session_outcome::{
     cancellation_error, cancellation_requires_statement_fence, governed_cancellation_error,
     governed_query_deadline, governed_query_execution_error, governed_statement_begin_error,
 };
-use novarocks_query_application::session_value::StatementSessionError;
+use novarocks_query_application::session_value::{
+    PreparedStatementSnapshot, StatementSessionError,
+};
 use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::session::{SessionExecutionSettings, SessionSqlState};
 use novarocks_query_application::sql::trino_admission::TrinoSessionAction;
@@ -106,6 +108,8 @@ pub(crate) mod compiler;
 pub(crate) mod ctas_action;
 pub(crate) mod delete_action;
 mod explain_action;
+pub(crate) use explain_action::prepare_delete_explain;
+pub(crate) use query_session_action::QueryActionEnvironment;
 pub(crate) mod insert_action;
 mod maintenance_action;
 pub(crate) mod mutation_action;
@@ -125,7 +129,7 @@ pub(crate) mod statement_publication;
 mod table_create_action;
 pub(crate) mod table_mutation_action;
 pub(crate) mod table_property_computation;
-mod trino_statement;
+pub(crate) mod trino_statement;
 pub(crate) mod write_action;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -569,7 +573,15 @@ fn routed_compiler_failure(error: FrontendQueryCompilerError, sql: &str) -> Rout
             RoutedExecutionError::Control(CompileControlError::Source(source))
         }
         FrontendQueryCompilerError::Analyze(error) => {
-            RoutedExecutionError::User(error.to_user_error(Some(sql)))
+            let user = error.to_user_error(Some(sql));
+            match error.expression_source_arc() {
+                Some(source) => RoutedExecutionError::Application(
+                    QueryServiceError::from_user_error(user).with_trino_statement_source(
+                        novarocks_query_application::sql::trino_admission::TrinoStatementSource::request(source.clone()),
+                    ),
+                ),
+                None => RoutedExecutionError::User(user),
+            }
         }
     }
 }
@@ -739,6 +751,7 @@ async fn execute_synchronous_stage<T, F>(
     cancellation: QueryCancellationView,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
+    control_timing: Option<ClientQueryTiming>,
     call: F,
 ) -> Result<
     (
@@ -760,6 +773,9 @@ where
                         .to_owned(),
                 ))
             } else {
+                if let Some(timing) = control_timing {
+                    timing.start_control();
+                }
                 call()
             };
             (result, execution_owner, result_window)
@@ -784,6 +800,7 @@ async fn execute_prepared_dml_statement<P, Prepare, Execute>(
     cancellation: QueryCancellationView,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
+    control_timing: Option<ClientQueryTiming>,
     prepare: Prepare,
     execute: Execute,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
@@ -797,6 +814,7 @@ where
         cancellation.clone(),
         execution_owner,
         result_window,
+        control_timing,
         prepare,
     )
     .await?;
@@ -806,6 +824,7 @@ where
             cancellation,
             execution_owner,
             result_window,
+            None,
             move || execute(prepared),
         )
         .await
@@ -820,7 +839,13 @@ async fn execute_product_statement(
     request_context: RequestContext,
     command_context: CommandContext,
     execution_owner: WorkOwner,
+    control_timing: Option<ClientQueryTiming>,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String> {
+    if let Some(timing) = control_timing
+        && command_context.scope().check().is_ok()
+    {
+        timing.start_control();
+    }
     let result = router
         .execute(command, request_context, command_context)
         .await
@@ -1037,7 +1062,8 @@ impl FrontendQueryService {
         request: StatementSessionRequest,
     ) -> Result<Arc<FrontendQuerySession>, StatementSessionError> {
         let admission = request.admission();
-        let (query_id, principal, value) = request.into_parts();
+        let (query_id, principal, value, claim) = request.into_parts_with_client_query_claim();
+        let prepared_statements = value.prepared_statements().clone();
         let state = SessionSqlState::from_session_value(
             value,
             &self.session_properties,
@@ -1046,7 +1072,10 @@ impl FrontendQueryService {
         let identity = SessionIdentity::client_statement(query_id.clone(), Arc::clone(&principal));
         let lease = self
             .serving_admission
-            .register_session(|| self.query_control.register_session(identity))
+            .register_session(|| match claim {
+                Some(claim) => self.query_control.register_claimed_session(identity, claim),
+                None => self.query_control.register_session(identity),
+            })
             .map_err(query_service_admission_error)?
             .map_err(|error| {
                 internal_error(format!(
@@ -1060,6 +1089,7 @@ impl FrontendQueryService {
             ),
             lease: Mutex::new(Some(lease)),
             state: Arc::new(Mutex::new(state)),
+            prepared_statements: Mutex::new(prepared_statements),
             statement_ready: statement_action::StatementReadyReceiver::default(),
             principal,
             admission,
@@ -1098,6 +1128,7 @@ pub(crate) struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
     state: Arc<Mutex<SessionSqlState>>,
+    prepared_statements: Mutex<PreparedStatementSnapshot>,
     statement_ready: statement_action::StatementReadyReceiver,
     /// Who the server authenticated on this connection. A command that records
     /// what someone did takes this, never an argument that claims an identity.
@@ -1158,6 +1189,7 @@ impl FrontendQuerySession {
         &self,
         source: Arc<str>,
         action: TrinoSessionAction,
+        parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
         statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<QuerySessionStatement, QueryServiceError> {
         let (kind, work) = lower_trino_session_action(action);
@@ -1179,10 +1211,14 @@ impl FrontendQuerySession {
                 )
                 .await
             }
+            TrinoSessionWork::PreparedEffects(effects) => StatementResult::GovernedCompletion(
+                GovernedCompletionStatementResult::with_session_effects(governed, effects),
+            ),
             TrinoSessionWork::Mutation(mutation) => {
                 self.execute_observed_scoped_session_mutation(
                     source,
                     mutation,
+                    parameters,
                     deadline,
                     governed,
                     statement_time,
@@ -1224,8 +1260,9 @@ impl FrontendQuerySession {
     async fn execute_session_use(
         &self,
         namespace: SessionNamespace<'_>,
-        governed: GovernedQueryStatementOwner,
+        mut governed: GovernedQueryStatementOwner,
     ) -> StatementResult {
+        governed.observe_control_start();
         let cancellation =
             QueryCancellationView::governed(governed.cancellation().clone(), governed.timeout_ms());
         match self
@@ -1498,6 +1535,7 @@ enum TrinoSessionWork {
         schema: ast::Ident,
     },
     Mutation(session_property_computation::ScopedSessionMutation),
+    PreparedEffects(SessionEffects),
 }
 
 fn lower_trino_session_action(action: TrinoSessionAction) -> (StatementKind, TrinoSessionWork) {
@@ -1518,6 +1556,14 @@ fn lower_trino_session_action(action: TrinoSessionAction) -> (StatementKind, Tri
         TrinoSessionAction::Reset { name, span } => (
             StatementKind::ResetSession,
             TrinoSessionWork::Mutation(ScopedSessionMutation::Reset { name, span }),
+        ),
+        TrinoSessionAction::Prepare { name, sql } => (
+            StatementKind::Prepare,
+            TrinoSessionWork::PreparedEffects(SessionEffects::prepare(name, sql)),
+        ),
+        TrinoSessionAction::DeallocatePrepare { name } => (
+            StatementKind::DeallocatePrepare,
+            TrinoSessionWork::PreparedEffects(SessionEffects::deallocate_prepare(name)),
         ),
         TrinoSessionAction::SetTimeZone(node) => (
             StatementKind::SetTimeZone,
@@ -1717,7 +1763,6 @@ async fn wait_for_eligible_query_topology_after(
 /// the native query-options DTO consumed at the execution boundary.
 fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> QueryOptions {
     QueryOptions::from_proto(novarocks::QueryOptions {
-        group_concat_max_len: Some(settings.group_concat_max_len()),
         query_mem_limit: settings.query_mem_limit_bytes().unwrap_or_default(),
         query_timeout: settings
             .query_timeout_secs()
@@ -1896,7 +1941,6 @@ mod tests {
         );
         settings.set_query_mem_limit_bytes(23).unwrap();
         settings.set_query_timeout_secs(17);
-        settings.set_group_concat_max_len(-1);
         settings.set_pipeline_dop(4);
         settings
             .set_runtime_filter_scan_wait_time_ms(0)
@@ -1910,7 +1954,7 @@ mod tests {
 
         let options = query_options_from_session_settings(&settings);
         let proto = options.as_proto();
-        assert_eq!(proto.group_concat_max_len, Some(-1));
+
         assert_eq!(proto.query_timeout, 17);
         assert_eq!(proto.query_mem_limit, 23);
         assert_eq!(proto.pipeline_dop, 4);
@@ -2445,7 +2489,7 @@ mod tests {
                 assert!(*open, "test worker gate timed out");
                 Ok(StatementResult::Ok)
             };
-            execute_synchronous_stage(executor, cancellation, owner, Some(alias), produce)
+            execute_synchronous_stage(executor, cancellation, owner, Some(alias), None, produce)
                 .await
                 .map(|(result, owner, _window)| (result, owner))
         });
@@ -2727,7 +2771,7 @@ mod tests {
     fn execution_throw_policy_uses_the_same_effective_mode_as_sql_analysis() {
         let session = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
             novarocks_sql::sql_mode::SqlMode::from_assignment(
-                "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION",
+                "ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION",
             ),
         );
         let query =
@@ -2744,7 +2788,7 @@ mod tests {
             with_query_sql_semantics(query_options_from_session_settings(&execution), &session);
         assert!(restored.as_proto().allow_throw_exception);
         assert_eq!(restored.as_proto().query_mem_limit, 9);
-        assert!(session.sql_mode().group_concat_legacy());
+        assert!(session.sql_mode().error_if_overflow());
     }
 }
 

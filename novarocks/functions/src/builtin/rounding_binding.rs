@@ -225,6 +225,30 @@ fn select_union_cast_field<'a>(
     )
 }
 
+/// Public call shapes of the original rounding result rules. For decimal
+/// calls with digits the selected scale also depends on a constant argument.
+pub(super) fn public_signatures(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "round" => &[
+            ("double", "bigint"),
+            ("double, bigint", "double"),
+            ("decimal(p,s)", "decimal(38,s)"),
+            ("decimal(p,s), bigint", "decimal(38,output_scale)"),
+        ],
+        "truncate" => &[
+            ("bigint", "bigint"),
+            ("real", "bigint"),
+            ("double", "bigint"),
+            ("bigint, bigint", "double"),
+            ("real, bigint", "double"),
+            ("double, bigint", "double"),
+            ("decimal(p,s)", "decimal(38,s)"),
+            ("decimal(p,s), bigint", "decimal(38,output_scale)"),
+        ],
+        _ => &[],
+    }
+}
+
 fn truncate_input(source: &DataType) -> bool {
     matches!(
         source,

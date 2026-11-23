@@ -18,7 +18,9 @@
 //! System-table leaves retain declarations through optimization; data arrives
 //! only in the provider completion round and keeps its original storage.
 use crate::common::OutputColumn;
-use crate::system_table::{SystemTableDeclaration, SystemTableKeyConstraint};
+use crate::system_table::{
+    StatementSystemRelation, SystemTableDeclaration, SystemTableKeyConstraint,
+};
 use arrow::record_batch::RecordBatch;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 use std::sync::Arc;
@@ -30,6 +32,7 @@ pub(crate) struct PlanSystemTableNode {
     /// Original declaration ordinals, aligned exactly with columns. Empty is
     /// a real zero-column projection and preserves the snapshot cardinality.
     pub required_columns: Vec<usize>,
+    pub statement_relation: Option<StatementSystemRelation>,
 }
 #[derive(Clone, Debug)]
 pub(crate) enum PhysicalSystemTableState {

@@ -25,7 +25,7 @@ INSERT INTO ${case_db}.struct_named_metadata_value VALUES
   ROW(2,ROW(NULL,X'')),ROW(3,NULL);
 
 -- query 2
-SELECT id,hex(s.metadata) AS metadata_hex,hex(s.value) AS value_hex,s IS NULL AS whole_null
+SELECT id,to_hex(s.metadata) AS metadata_hex,to_hex(s.value) AS value_hex,s IS NULL AS whole_null
 FROM ${case_db}.struct_named_metadata_value ORDER BY id;
 
 -- query 3

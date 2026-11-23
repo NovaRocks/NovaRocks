@@ -42,7 +42,7 @@ impl KernelEvaluationControl for Control {
         panic!("these Filter roots do not wait")
     }
 }
-const NATIVE: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;";
+const NATIVE: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING approx_distinct(v) = 0 AND approx_distinct(CAST(v AS BIGINT)) = 0 ORDER BY k;";
 struct Fixture {
     source: SqlAuthoredPhysicalPlan,
     fragment: FragmentId,
@@ -141,7 +141,7 @@ fn batch(f: &Fixture, counts: &[i64], doubles: &[Option<f64>]) -> RecordBatch {
         } else {
             let call = calls.iter().find(|call| call.output == value).unwrap();
             match call.binding.function.function_id.as_str() {
-                "builtin.aggregate/ndv/v1" | "builtin.aggregate/approx_count_distinct/v1" => {
+                "builtin.aggregate/approx_distinct/v1" => {
                     Arc::new(Int64Array::from_iter_values(counts.iter().copied()))
                 }
                 "builtin.aggregate/max/v1" => {
@@ -261,7 +261,7 @@ fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
 #[test]
 fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latches() {
     let f = fixture(
-        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NOT NULL AND ndv(v)=0",
+        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NOT NULL AND approx_distinct(v) = 0",
     );
     let input = batch(
         &f,
@@ -326,7 +326,7 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
 #[test]
 fn filter_conjunction_actual_nested_not_is_null_keeps_value_demand() {
     let f = fixture(
-        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING NOT (CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NULL) AND ndv(v)=0",
+        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING NOT (CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NULL) AND approx_distinct(v) = 0",
     );
     let input = batch(&f, &[0, 1, 0], &[None, Some(f64::NAN), Some(20200101.)]);
     assert_eq!(

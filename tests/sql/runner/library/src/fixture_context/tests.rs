@@ -898,6 +898,27 @@ fn metadata_namespace_filters_and_expected_cells_do_not_rewrite_data_literals() 
     assert_eq!(result.rows[0], vec!["new_ns", "old_ns"]);
 }
 #[test]
+fn views_and_jdbc_metadata_filters_bind_fixture_schema_literals() {
+    let mapping = BTreeMap::from([("old_ns".into(), "new_ns".into())]);
+    for (relation, schema_column) in [
+        ("owned.information_schema.views", "table_schema"),
+        ("system.jdbc.schemas", "table_schem"),
+        ("system.jdbc.tables", "table_schem"),
+        ("system.jdbc.columns", "table_schem"),
+    ] {
+        let sql = format!(
+            "SELECT {schema_column}, 'old_ns' AS data_value FROM {relation} WHERE {schema_column} = 'old_ns'"
+        );
+        let actual = rewrite_metadata_filters(&sql, &mapping);
+        assert!(actual.contains(&format!("WHERE {schema_column} = 'new_ns'")));
+        assert!(actual.contains("'old_ns' AS data_value"));
+        assert_eq!(
+            metadata_columns(&sql),
+            BTreeSet::from([schema_column.to_owned()])
+        );
+    }
+}
+#[test]
 fn standard_mv_metadata_maps_schema_and_storage_schema_without_changing_data() {
     let mapping = BTreeMap::from([("old_ns".into(), "new_ns".into())]);
     let sql = "SELECT schema_name, storage_schema AS stored_db, 'old_ns' AS business FROM system.metadata.materialized_views WHERE schema_name = 'old_ns' AND storage_schema = 'old_ns'";

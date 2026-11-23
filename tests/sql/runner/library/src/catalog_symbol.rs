@@ -22,7 +22,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const VARIABLE: &str = "__fe_catalog_symbols";
-const CATALOG_COLUMNS: &[&str] = &["catalog_name", "table_catalog", "storage_catalog"];
+const CATALOG_COLUMNS: &[&str] = &[
+    "catalog_name",
+    "table_catalog",
+    "table_cat",
+    "storage_catalog",
+];
 const CAPACITY: usize = 36 * 36 * 36 * 36;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct CatalogSymbols(BTreeMap<String, String>);
@@ -1213,6 +1218,23 @@ SET SESSION external.owned = 'owned';"#
         ] {
             assert_eq!(symbols.rewrite_source(source).unwrap(), source);
         }
+    }
+
+    #[test]
+    fn jdbc_metadata_binds_catalog_filter_and_output_without_rewriting_data() {
+        let symbols = symbols();
+        let name = symbols.lookup("owned").unwrap();
+        let sql = "SELECT table_cat, 'owned' AS data_value FROM system.jdbc.columns WHERE table_cat = 'owned'";
+        let rewritten = symbols.rewrite_source(sql).unwrap();
+        assert!(rewritten.contains(&format!("WHERE table_cat = '{name}'")));
+        assert!(rewritten.contains("'owned' AS data_value"));
+        let mut result = crate::types::ResultSet {
+            golden: None,
+            header: vec!["table_cat".into(), "data_value".into()],
+            rows: vec![vec!["owned".into(), "owned".into()]],
+        };
+        symbols.render_expected(&rewritten, &mut result).unwrap();
+        assert_eq!(result.rows, vec![vec![name.to_string(), "owned".into()]]);
     }
 
     #[test]

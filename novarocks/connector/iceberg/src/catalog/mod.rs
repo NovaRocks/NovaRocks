@@ -100,12 +100,21 @@ pub(crate) enum SnapshotLoading {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CatalogNamespaceName {
     pub(crate) namespace: Arc<str>,
+    exact_discovery: bool,
 }
 
 impl CatalogNamespaceName {
     pub(crate) fn new(namespace: impl Into<Arc<str>>) -> Self {
         Self {
             namespace: namespace.into(),
+            exact_discovery: false,
+        }
+    }
+
+    pub(crate) fn discovery(namespace: impl Into<Arc<str>>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            exact_discovery: true,
         }
     }
 }
@@ -121,6 +130,7 @@ impl std::fmt::Display for CatalogNamespaceName {
 pub(crate) struct CatalogTableName {
     pub(crate) namespace: Arc<str>,
     pub(crate) name: Arc<str>,
+    exact_discovery: bool,
 }
 
 /// One provider-owned catalog page. The continuation remains opaque outside
@@ -136,6 +146,15 @@ impl CatalogTableName {
         Self {
             namespace: namespace.into(),
             name: name.into(),
+            exact_discovery: false,
+        }
+    }
+
+    pub(crate) fn discovery(namespace: impl Into<Arc<str>>, name: impl Into<Arc<str>>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+            exact_discovery: true,
         }
     }
 
@@ -809,10 +828,10 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
 /// The answer of a catalog that cannot hold views. It is given by the owner
 /// itself: no listing admission, no SDK call.
-pub(super) fn views_unsupported(operation: &str) -> ConnectorError {
-    ConnectorError::new(
+pub(super) fn views_unsupported(operation: &'static str) -> ConnectorError {
+    ConnectorError::from_domain(
         novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-        format!("{operation} is not supported by this catalog"),
+        novarocks_spi::connector::DiscoveryViewDomainUnavailable(operation),
     )
 }
 

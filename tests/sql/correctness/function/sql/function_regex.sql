@@ -35,7 +35,7 @@ CREATE TABLE "ts" (
   "replaced" varchar(65533)
 ) WITH (format_version = 3);
 
-insert into ts values ROW('abcd', '.*', 'xx'), ROW('abcd', 'a.*', 'xx'), ROW('abcd', '.*abc.*', 'xx'), ROW('abcd', '.*cd', 'xx'), ROW('abcd', 'bc', 'xx'), ROW('', '', 'xx'), ROW(NULL, '', 'xx'), ROW('abc中文def', '[\p{Han}]+', 'xx');
+insert into ts values ROW('abcd', '.*', 'xx'), ROW('abcd', 'a.*', 'xx'), ROW('abcd', '.*abc.*', 'xx'), ROW('abcd', '.*cd', 'xx'), ROW('abcd', 'bc', 'xx'), ROW('', '', 'xx'), ROW(NULL, '', 'xx'), ROW('abc中文def', '[中文]+', 'xx');
 insert into ts values ROW('a b c', ' ', '-'), ROW('           XXXX', '       ', '');
 insert into ts values ROW('xxxx', 'x', '-'), ROW('xxxx', 'xx', '-'), ROW('xxxx', 'xxx', '-'), ROW('xxxx', 'xxxx', '-');
 insert into ts values ROW('xxxx', 'not', 'xxxxxxxx'), ROW('xxaxx', 'xx', 'aaa'), ROW('xaxaxax', 'xax', '-');
@@ -72,7 +72,7 @@ select regexp_replace('abc中文def', '中文', 'xx');
 
 -- query 9
 USE ${case_db};
-select regexp_replace('abc中文def', '[\p{Han}]+', 'xx');
+select regexp_replace('abc中文def', '[中文]+', 'xx');
 
 -- query 10
 USE ${case_db};
@@ -111,9 +111,12 @@ USE ${case_db};
 select regexp_replace('xaxaxax', 'xax', '-');
 
 -- query 19
--- Table-based regexp_replace
+-- Iceberg stores these columns as strings. The test reinstates the bounded SQL operands.
 USE ${case_db};
-select str, regex, replaced, regexp_replace(str, regex, replaced) from ts order by str, regex, replaced;
+select str, regex, replaced, regexp_replace(str, regex, replaced) FROM (
+    SELECT CAST(str AS VARCHAR(65533)) AS str, CAST(regex AS VARCHAR(65533)) AS regex, CAST(replaced AS VARCHAR(65533)) AS replaced
+    FROM ts
+) AS typed_values order by str, regex, replaced;
 
 -- query 20
 -- Setup: create table tsr for regexp_extract_all tests
@@ -124,49 +127,52 @@ CREATE TABLE "tsr" (
   "pos" int
 ) WITH (format_version = 3);
 
-insert into tsr values ROW('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 3), ROW('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 0);
+insert into tsr values ROW('AbCdExCeF', '([a-z]+)C([a-z]+)', 1), ROW('AbCdExCeF', '([a-z]+)C([a-z]+)', 0);
 
-SELECT regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 0);
+SELECT regexp_extract_all('AbCdExCeF', '([a-z]+)C([a-z]+)', 0);
 
 -- query 21
 USE ${case_db};
-SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', 0) from tsr;
+SELECT regexp_extract_all(CAST(str AS VARCHAR(65533)), '([a-z]+)C([a-z]+)', 0) from tsr;
 
 -- query 22
 USE ${case_db};
-SELECT regexp_extract_all(str, regex, 0) from tsr;
+SELECT regexp_extract_all(CAST(str AS VARCHAR(65533)), CAST(regex AS VARCHAR(65533)), 0) from tsr;
 
 -- query 23
 USE ${case_db};
-SELECT regexp_extract_all(str, regex, pos) from tsr;
+SELECT regexp_extract_all(CAST(str AS VARCHAR(65533)), CAST(regex AS VARCHAR(65533)), pos) from tsr;
 
 -- query 24
 USE ${case_db};
-SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', pos) from tsr;
+SELECT regexp_extract_all(CAST(str AS VARCHAR(65533)), '([a-z]+)C([a-z]+)', pos) from tsr;
 
 -- query 25
 USE ${case_db};
-SELECT regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', pos) from tsr;
+SELECT regexp_extract_all('AbCdExCeF', '([a-z]+)C([a-z]+)', pos) from tsr;
 
 -- query 26
 USE ${case_db};
-SELECT regexp_extract_all('AbCdExCeF', regex, pos) from tsr;
+SELECT regexp_extract_all('AbCdExCeF', CAST(regex AS VARCHAR(65533)), pos) from tsr;
 
 -- query 27
 USE ${case_db};
-SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', pos) from tsr;
+SELECT regexp_extract_all(CAST(str AS VARCHAR(65533)), '([a-z]+)C([a-z]+)', pos) from tsr;
 
 -- query 28
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
-SELECT regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 3);
+SELECT regexp_extract_all('AbCdExCeF', '([a-z]+)C([a-z]+)', 3);
 
 -- query 29
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
-SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', 3) from tsr;
+SELECT regexp_extract_all(CAST(str AS VARCHAR(65533)), '([a-z]+)C([a-z]+)', 3) from tsr;
 
 -- query 30
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
-SELECT regexp_extract_all(str, regex, 3) from tsr;
+SELECT regexp_extract_all(CAST(str AS VARCHAR(65533)), CAST(regex AS VARCHAR(65533)), 3) from tsr;
 
 -- query 31
 -- regexp_position constant tests
@@ -311,10 +317,7 @@ USE ${case_db};
 SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ROW('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 65
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position(column_0, '(unclosed') FROM (VALUES ROW('oops')) AS tmp(column_0);
 
@@ -339,21 +342,30 @@ ROW('abc def ghi', '\s+', 1, 1),
 ROW('test@email.com', '@[a-zA-Z]+', 1, 1),
 ROW('hello world hello universe', 'hello', 1, 2),
 ROW('complex(pattern)test', '\([^)]*\)', 1, 1),
-ROW('abc123def456ghi', '[0-9]{2,}', 1, 2),
+ROW('abc123def456ghi', '[0-9][0-9]+', 1, 2),
 ROW('', '.', 1, 1),
 ROW(NULL, '[0-9]', 1, 1),
 ROW('test string', NULL, 1, 1),
 ROW(NULL, NULL, 1, 1);
 
-SELECT str, pattern, regexp_position(str, pattern) from tsp_general order by str, pattern;
+SELECT str, pattern, regexp_position(str, pattern) FROM (
+    SELECT CAST(str AS VARCHAR(65533)) AS str, CAST(pattern AS VARCHAR(65533)) AS pattern, start_pos, occurrence
+    FROM tsp_general
+) AS typed_values order by str, pattern;
 
 -- query 68
 USE ${case_db};
-SELECT str, pattern, start_pos, regexp_position(str, pattern, start_pos) from tsp_general where start_pos is not null order by str, pattern;
+SELECT str, pattern, start_pos, regexp_position(str, pattern, start_pos) FROM (
+    SELECT CAST(str AS VARCHAR(65533)) AS str, CAST(pattern AS VARCHAR(65533)) AS pattern, start_pos, occurrence
+    FROM tsp_general
+) AS typed_values where start_pos is not null order by str, pattern;
 
 -- query 69
 USE ${case_db};
-SELECT str, pattern, start_pos, occurrence, regexp_position(str, pattern, start_pos, occurrence) from tsp_general where start_pos is not null and occurrence is not null order by str, pattern;
+SELECT str, pattern, start_pos, occurrence, regexp_position(str, pattern, start_pos, occurrence) FROM (
+    SELECT CAST(str AS VARCHAR(65533)) AS str, CAST(pattern AS VARCHAR(65533)) AS pattern, start_pos, occurrence
+    FROM tsp_general
+) AS typed_values where start_pos is not null and occurrence is not null order by str, pattern;
 
 -- query 70
 -- NULL input tests for regexp_position
@@ -398,67 +410,53 @@ SELECT regexp_position('test', '[0-9]', 1, NULL);
 
 -- query 80
 -- Invalid regex patterns for regexp_position
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test string', '[0-9');
 
 -- query 81
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test string', '(unclosed');
 
 -- query 82
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test string', '?invalid');
 
 -- query 83
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test string', '*invalid');
 
 -- query 84
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test string', '+invalid');
 
 -- query 85
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test string', '\');
 
 -- query 86
 -- Edge cases with invalid start/occurrence parameters
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test', '[0-9]', 0);
 
 -- query 87
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test', '[0-9]', -1);
 
 -- query 88
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test', '[0-9]', 1, 0);
 
 -- query 89
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 SELECT regexp_position('test', '[0-9]', 1, -1);
 
@@ -500,7 +498,7 @@ select regexp_count('abc', NULL);
 
 -- query 97
 USE ${case_db};
-select regexp_count('abc中文def', '[\p{Han}]+');
+select regexp_count('abc中文def', '[中文]+');
 
 -- query 98
 USE ${case_db};
@@ -513,10 +511,14 @@ select regexp_count('1a 2b 14m', '\d+');
 -- query 100
 -- Table-based regexp_count
 USE ${case_db};
-select str, regex, regexp_count(str, regex) from tsc order by str, regex;
+select str, regex, regexp_count(str, regex) FROM (
+    SELECT CAST(str AS VARCHAR(65533)) AS str, CAST(regex AS VARCHAR(65533)) AS regex
+    FROM tsc
+) AS typed_values order by str, regex;
 
 -- query 101
 -- Setup: create table tsc_invalid with invalid regex patterns
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,4
 USE ${case_db};
 CREATE TABLE "tsc_invalid" (
   "str" varchar(65533),
@@ -529,30 +531,24 @@ ROW('test string', '(unclosed'),
 ROW('repetition test', '?invalid'),
 ROW('valid test', 'valid');
 
-select str, regex, regexp_count(str, regex) from tsc_invalid order by str, regex;
+select str, regex, regexp_count(str, regex) FROM (
+    SELECT CAST(str AS VARCHAR(65533)) AS str, CAST(regex AS VARCHAR(65533)) AS regex
+    FROM tsc_invalid
+) AS typed_values order by str, regex;
 
 -- query 102
 -- Invalid regex constant tests for regexp_count
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 select regexp_count('test string', '[0-9');
 
 -- query 103
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 select regexp_count('test string', '(unclosed');
 
 -- query 104
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 select regexp_count('test string', '?invalid');
 
@@ -565,10 +561,7 @@ USE ${case_db};
 select regexp_count(NULL, '[0-9');
 
 -- query 107
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data]
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
 select regexp_count('', '[0-9');
 
@@ -598,23 +591,137 @@ FROM (VALUES
 
 -- query 110
 USE ${case_db};
-SELECT regexp_replace(column_value, '_package_.*', '')
+SELECT regexp_replace(CAST(column_value AS VARCHAR(100)), '_package_.*', '')
 FROM test_regexp_replace_multirow
 ORDER BY column_value;
 
 -- query 111
 USE ${case_db};
-SELECT regexp_replace(column_value, '_[0-9]+', '_X')
+SELECT regexp_replace(CAST(column_value AS VARCHAR(100)), '_[0-9]+', '_X')
 FROM test_regexp_replace_multirow
 ORDER BY column_value;
 
 -- query 112
+-- Evaluation order with actual typed source, pattern, and late arguments.
 USE ${case_db};
-SELECT regexp_replace(column_value, '_package_', '_pkg_')
-FROM test_regexp_replace_multirow
-ORDER BY column_value;
+CREATE TABLE regex_evaluation_order (
+    id integer, source varchar(10), pattern varchar(10), replacement varchar(10),
+    group_id bigint, start_position integer
+) WITH (format_version = 3);
+INSERT INTO regex_evaluation_order VALUES
+    ROW(1, 'a', '[', NULL, NULL, NULL),
+    ROW(2, 'a', '(a)', 'X', 1, 1),
+    ROW(3, NULL, '[', 'X', 0, 1);
+SELECT id,
+       TRY(regexp_replace(source, pattern, replacement)) AS replaced,
+       TRY(regexp_extract(source, pattern, group_id)) AS extracted,
+       TRY(regexp_position(source, pattern, start_position)) AS position,
+       IF(id = 1, BIGINT '0', regexp_count(source, pattern)) AS lazy_count
+FROM (
+    SELECT id, CAST(source AS VARCHAR(10)) AS source, CAST(pattern AS VARCHAR(10)) AS pattern, CAST(replacement AS VARCHAR(10)) AS replacement, group_id, start_position
+    FROM regex_evaluation_order
+) AS typed_values
+ORDER BY id;
 
 -- query 113
--- @skip_result_check=true
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
 USE ${case_db};
-DROP TABLE test_regexp_replace_multirow;
+SELECT regexp_replace(source, pattern, replacement) FROM (
+    SELECT id, CAST(source AS VARCHAR(10)) AS source, CAST(pattern AS VARCHAR(10)) AS pattern, CAST(replacement AS VARCHAR(10)) AS replacement, group_id, start_position
+    FROM regex_evaluation_order
+) AS typed_values WHERE id = 1;
+
+-- query 114
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
+USE ${case_db};
+SELECT regexp_extract(source, pattern, group_id) FROM (
+    SELECT id, CAST(source AS VARCHAR(10)) AS source, CAST(pattern AS VARCHAR(10)) AS pattern, CAST(replacement AS VARCHAR(10)) AS replacement, group_id, start_position
+    FROM regex_evaluation_order
+) AS typed_values WHERE id = 1;
+
+-- query 115
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR,2
+USE ${case_db};
+SELECT regexp_position(source, pattern, start_position) FROM (
+    SELECT id, CAST(source AS VARCHAR(10)) AS source, CAST(pattern AS VARCHAR(10)) AS pattern, CAST(replacement AS VARCHAR(10)) AS replacement, group_id, start_position
+    FROM regex_evaluation_order
+) AS typed_values WHERE id = 1;
+
+-- query 116
+USE ${case_db};
+SELECT regexp_replace('a', '[', CAST(NULL AS varchar)) AS known_null_skip,
+       regexp_replace(source, pattern, replacement) AS null_source_skip,
+       regexp_extract(source, pattern, group_id) AS null_extract,
+       regexp_position(source, pattern, start_position) AS null_position
+FROM (
+    SELECT id, CAST(source AS VARCHAR(10)) AS source, CAST(pattern AS VARCHAR(10)) AS pattern, CAST(replacement AS VARCHAR(10)) AS replacement, group_id, start_position
+    FROM regex_evaluation_order
+) AS typed_values WHERE id = 3;
+
+-- query 117
+SELECT regexp_count('١', '\d') AS ascii_digit_class,
+       regexp_position('é中a中', '中', 2, 2) AS multibyte_position,
+       regexp_position('ab', '^b', 2) AS absolute_anchor,
+       regexp_extract_all('ab', '(x)?a', 1) AS missing_capture,
+       regexp_replace('abcd', '.*', 'xx') AS repeated_empty_match,
+       regexp_replace('no match', '(a)b', '$2') AS unused_replacement,
+       regexp_count('a{,}a{,}', 'a{,}') AS literal_braces;
+
+-- query 118
+SELECT regexp_extract('ab', '(?:a)?b') AS optional_piece,
+       regexp_extract('aabb', '(?:a?b)+') AS advancing_repeat,
+       regexp_count('é中', '') AS empty_pattern,
+       regexp_count(U&'a\000Ab', '.') AS plain_dot,
+       regexp_count(U&'a\000Ab', '(?s).') AS dotall;
+
+-- query 119
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT regexp_extract('ab', '\p{Han}');
+
+-- query 120
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT regexp_extract('ab', '[[:lower:]]');
+
+-- query 121
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT regexp_extract('ab', 'a{2,4}');
+
+-- query 122
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT regexp_extract('ab', 'a(?=b)');
+
+-- query 123
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT regexp_extract('ab', '(a)\1');
+
+-- query 124
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT regexp_extract('ab', '(?:a?|b)*');
+
+-- query 125
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SELECT regexp_extract('ab', '(?m)^');
+
+-- query 126
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT regexp_extract('ab', 'a{2,1}');
+
+-- query 127
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT regexp_extract('ab', 'a(?=b)(');
+
+-- query 128
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT regexp_extract('ab', '(a)\1[');
+
+-- query 129
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT regexp_replace('a', '(a)', '$2');
+
+-- query 130
+USE ${case_db};
+SELECT str, regex, regexp_count(str, regex)
+FROM (
+    SELECT CAST(str AS VARCHAR(65533)) AS str, CAST(regex AS VARCHAR(65533)) AS regex
+    FROM tsc_invalid
+) AS typed_values WHERE str = 'valid test';

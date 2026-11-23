@@ -73,16 +73,12 @@ fn check_operation_control(
     stop: &ConnectorStopView,
 ) -> Result<(), ConnectorError> {
     if stop.is_stopped() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Cancelled,
+        return Err(ConnectorError::observed_cancellation(
             OPERATION_CANCELLED_DETAIL,
         ));
     }
     if Instant::now() >= deadline {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::DeadlineExceeded,
-            OPERATION_DEADLINE_DETAIL,
-        ));
+        return Err(ConnectorError::observed_deadline(OPERATION_DEADLINE_DETAIL));
     }
     Ok(())
 }
@@ -492,6 +488,7 @@ pub struct ConnectorRequestContext {
     metadata_cpu: Option<Arc<dyn super::ProviderMetadataCpuPort>>,
     io_phase: Option<super::ConnectorIoPermit>,
     io_weak_phase: Option<super::ConnectorIoWeakPhase>,
+    reuse_original_table_preparation: bool,
     fresh_catalog_observation_required: bool,
     initiation: ConnectorRequestInitiation,
 }
@@ -590,9 +587,22 @@ impl ConnectorRequestContext {
             metadata_cpu: None,
             io_phase: None,
             io_weak_phase: None,
+            reuse_original_table_preparation: false,
             fresh_catalog_observation_required: false,
             initiation: ConnectorRequestInitiation::Statement,
         })
+    }
+
+    /// The statement will consume the same observed table in two serial read
+    /// preparations. A provider may keep completed immutable preparation in
+    /// the original request scope under its existing payload receipt.
+    pub fn with_original_table_preparation_reuse(mut self) -> Self {
+        self.reuse_original_table_preparation = true;
+        self
+    }
+
+    pub const fn reuses_original_table_preparation(&self) -> bool {
+        self.reuse_original_table_preparation
     }
 
     /// Explicit same-action capability; never inferred from request extensions.
@@ -1272,6 +1282,7 @@ mod tests {
 #[cfg(test)]
 mod control_failure_geometry_tests {
     use super::*;
+    use novarocks_failure_contract::{FailureEvidence, FailureProjection};
     #[test]
     fn original_control_failure_strings_fit_their_actual_author_quote() {
         let stopped = super::super::ConnectorStopOwner::new();
@@ -1288,6 +1299,10 @@ mod control_failure_geometry_tests {
         assert_eq!(cancelled.message(), OPERATION_CANCELLED_DETAIL);
         assert_eq!(deadline.message(), OPERATION_DEADLINE_DETAIL);
         for error in [cancelled, deadline] {
+            assert_eq!(
+                error.failure_fact().evidence(),
+                FailureEvidence::StopObservation
+            );
             assert!(
                 error.message().len() <= ConnectorOperationControlView::failure_backing_bytes()
             );

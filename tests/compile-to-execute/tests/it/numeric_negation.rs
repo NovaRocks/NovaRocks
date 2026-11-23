@@ -381,13 +381,8 @@ mod ordered {
     use novarocks_sql_testkit::sql_source_with_semantics;
     use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
-    fn check(sql: &str, group_concat: bool) {
+    fn check(sql: &str) {
         let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
-        let semantics = if group_concat {
-            semantics.with_group_concat_max_len(4096)
-        } else {
-            semantics
-        };
         let source = sql_source_with_semantics(sql, DataType::Int8, semantics);
         let mut count = 0usize;
         for fragment in source.plan().fragments().values() {
@@ -454,17 +449,13 @@ mod ordered {
 
     #[test]
     fn numeric_unary_exact_ordered_sql_array_agg() {
-        check(
-            "SELECT ARRAY_AGG(k ORDER BY -k) AS observed FROM fixture",
-            false,
-        );
+        check("SELECT ARRAY_AGG(k ORDER BY -k) AS observed FROM fixture");
     }
 
     #[test]
-    fn numeric_unary_exact_ordered_sql_group_concat() {
+    fn numeric_unary_exact_ordered_sql_listagg() {
         check(
-            "SELECT GROUP_CONCAT(CAST(k AS VARCHAR) ORDER BY -k) AS observed FROM fixture",
-            true,
+            "SELECT LISTAGG(CAST(k AS VARCHAR)) WITHIN GROUP (ORDER BY -k) AS observed FROM fixture",
         );
     }
 }

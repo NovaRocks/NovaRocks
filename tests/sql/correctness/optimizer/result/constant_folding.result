@@ -29,7 +29,7 @@ id
 2
 
 -- query 17
--- types	varchar
+-- types	varchar(5)
 folded_upper
 MIXED
 
@@ -119,7 +119,7 @@ folded_decimal_overflow
 NULL
 
 -- query 36
--- types	varchar
+-- types	varchar(5)
 folded_upper
 MIXED
 

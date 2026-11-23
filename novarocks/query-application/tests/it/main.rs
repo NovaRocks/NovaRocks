@@ -17,7 +17,9 @@
 mod fixtures;
 mod frozen_output_contract;
 
+mod prepared_admission;
 mod property_evaluation;
 
+mod kill_query;
 mod statement_environment;
 mod unsupported_admission;

@@ -2,7 +2,7 @@
 -- types	integer	decimal(18, 4)	bigint	decimal(18, 4)
 grp	avg_v	ndv_k	p50_d
 1	16.6667	3	0.2000
-2	150.0000	3	0.4500
+2	150.0000	3	0.5000
 
 -- query 4
 -- types	integer	decimal(18, 4)	bigint

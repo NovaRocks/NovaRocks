@@ -1895,6 +1895,34 @@ pub trait ConnectorMetadata: Send + Sync {
         })
     }
 
+    /// Capability for broad catalog discovery. An exact request still calls
+    /// the original preparation so its provider returns any typed refusal.
+    fn supports_table_discovery(&self) -> bool {
+        false
+    }
+
+    /// Whether a direct name probe would preserve this exact SQL metadata key.
+    /// Other spellings are matched against the original bounded inventory.
+    fn can_probe_discovery_name(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Project only requested discovery facts from one original catalog load.
+    /// Discovery does not author scan, write or statistics capabilities.
+    fn discover_table_async(
+        &self,
+        _request: ConnectorTableRequest,
+        _projection: super::DiscoveryProjection,
+        _cpu: Arc<dyn super::ProviderMetadataCpuPort>,
+    ) -> futures::future::BoxFuture<'_, Result<super::DiscoveredRelation, ConnectorError>> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector does not expose table discovery metadata",
+            ))
+        })
+    }
+
     /// Capture the original base source with the complete snapshot inventory
     /// required to distinguish an absent historical endpoint from an unloaded
     /// one. Ordinary metadata preparation keeps its own selection contract.

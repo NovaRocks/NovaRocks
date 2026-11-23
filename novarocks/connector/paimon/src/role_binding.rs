@@ -89,6 +89,15 @@ impl ConnectorMetadata for PaimonGenericControl {
     ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorTableIdentity>, ConnectorError>> {
         Box::pin(async { Err(suspended()) })
     }
+    fn discover_table_async(
+        &self,
+        _request: ConnectorTableRequest,
+        _projection: novarocks_spi::connector::DiscoveryProjection,
+        _cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    ) -> BoxFuture<'_, Result<novarocks_spi::connector::DiscoveredRelation, ConnectorError>> {
+        Box::pin(async { Err(suspended()) })
+    }
+
     fn prepare_table(
         &self,
         _request: ConnectorTableRequest,

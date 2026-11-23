@@ -50,16 +50,17 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadRuntime, ProviderReadSplitSource, ProviderReadSystemTablePlan,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, Bound, ConnectorExpression, ConnectorMvPartitionValue,
-    ConnectorMvTargetPartitionSelection, ConnectorReadAttemptAccessMint,
-    ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
-    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
-    ConnectorReadMetadataRequest, ConnectorReadMetadataVersion, ConnectorReadPublicSchema,
-    ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
-    ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch,
-    ConnectorSplitSource, ConnectorTableHandle as _, ConnectorValue, ConnectorValueType,
-    Constraint, Domain, DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName,
-    SystemTableUnitHint, TupleDomain, ValueSet,
+    Assignment, Bound, ConnectorDeleteConditionOutcome, ConnectorDeleteTargetFacts,
+    ConnectorExpression, ConnectorMvPartitionValue, ConnectorMvTargetPartitionSelection,
+    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
+    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
+    ConnectorReadAttemptRuntime, ConnectorReadChangeWindow, ConnectorReadMetadataRequest,
+    ConnectorReadMetadataVersion, ConnectorReadPublicSchema, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadStaticFacts,
+    ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
+    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
+    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SystemTableUnitHint,
+    TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
@@ -78,6 +79,7 @@ use crate::iceberg::table::Table;
 use crate::loaded_table::{IcebergAttemptTableAccess, IcebergPhysicalTable};
 use crate::metadata_context::IcebergMetadataContext;
 use crate::read_model::{IcebergReadFile, IcebergReadSnapshot};
+use crate::read_snapshot::PreparedReadManifestList;
 use crate::ref_snapshot::resolve_branch_head_snapshot_id;
 use crate::scan_model::{
     IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue,
@@ -334,13 +336,13 @@ impl IcebergTypedBoundary {
         Arc::clone(&self.runtime)
     }
 
-    fn prepare_original_write_target(
+    fn validate_original_write_target<'a>(
         &self,
-        name: &SchemaTableName,
+        name: Option<&SchemaTableName>,
         table: &novarocks_spi::connector::ConnectorTableHandle,
-        original_source: &novarocks_spi::connector::ConnectorProcessLocalPayload,
-        snapshot_id: Option<i64>,
-    ) -> Result<(IcebergPhysicalTable, SchemaRef), ConnectorError> {
+        original_source: &'a novarocks_spi::connector::ConnectorProcessLocalPayload,
+        selector: OriginalTargetSnapshot,
+    ) -> Result<(&'a IcebergObservedSourceReadFacts, SchemaRef), ConnectorError> {
         let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
             instance_id: self.descriptor.instance_id.clone(),
             incarnation: self.incarnation,
@@ -349,18 +351,27 @@ impl IcebergTypedBoundary {
         if table.owner() != &owner.instance_id {
             return Err(invalid("frozen write target belongs to another provider"));
         }
-        let original =
-            original_source.value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?;
         let payload: crate::metadata::IcebergTablePayload =
             crate::file_reader::execution_payload::decode_payload(
                 table.payload(),
                 "frozen write target",
             )?;
+        let original = match selector {
+            OriginalTargetSnapshot::Signed(_) => original_source
+                .value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?,
+            OriginalTargetSnapshot::Current => IcebergObservedSourceReadFacts::current_all(
+                original_source,
+                &owner,
+                &payload.namespace,
+                &payload.table,
+            )?,
+        };
         if payload.metadata_table_type.is_some()
             || payload.explicit_files.is_some()
             || !payload.prepared_files.is_empty()
-            || payload.namespace != name.schema_name()
-            || payload.table != name.table_name()
+            || name.is_some_and(|name| {
+                name.schema_name() != payload.namespace || name.table_name() != payload.table
+            })
             || original.access.identifier().namespace().to_url_string() != payload.namespace
             || original.access.identifier().name() != payload.table
         {
@@ -379,10 +390,22 @@ impl IcebergTypedBoundary {
         let signed: TableMetadata = crate::metadata_json::from_metadata_str(serialized)
             .map_err(|error| invalid(format!("decode frozen write target metadata: {error}")))?;
         let metadata = original.access.metadata();
+        let snapshot_id = match selector {
+            OriginalTargetSnapshot::Signed(snapshot_id) => snapshot_id,
+            OriginalTargetSnapshot::Current => {
+                if info.schema_id != metadata.current_schema_id() {
+                    return Err(invalid(
+                        "Frozen write target does not carry its original current schema",
+                    ));
+                }
+                metadata.current_snapshot_id()
+            }
+        };
         if &signed != metadata
             || info.current_snapshot_id != snapshot_id
             || info.table_uuid.as_deref() != Some(metadata.uuid().to_string().as_str())
             || snapshot_id.is_some_and(|id| metadata.snapshot_by_id(id).is_none())
+            || original.access.metadata_location() != payload.metadata_location.as_deref()
         {
             return Err(invalid(
                 "frozen write target differs from its original metadata or base",
@@ -394,6 +417,18 @@ impl IcebergTypedBoundary {
             .ok_or_else(|| {
                 invalid("frozen write target schema is absent from its original metadata")
             })?;
+        Ok((original, schema))
+    }
+
+    fn prepare_original_write_target(
+        &self,
+        name: &SchemaTableName,
+        table: &novarocks_spi::connector::ConnectorTableHandle,
+        original_source: &novarocks_spi::connector::ConnectorProcessLocalPayload,
+        selector: OriginalTargetSnapshot,
+    ) -> Result<(IcebergPhysicalTable, SchemaRef), ConnectorError> {
+        let (original, schema) =
+            self.validate_original_write_target(Some(name), table, original_source, selector)?;
         let context = self.prepared_source_request_context()?;
         let physical = original.access.reacquired_request_scoped(
             self.runtime
@@ -406,11 +441,6 @@ impl IcebergTypedBoundary {
                 .iceberg_runtime()
                 .clone(),
         )?;
-        if physical.table.metadata_location() != payload.metadata_location.as_deref() {
-            return Err(invalid(
-                "frozen write target metadata location differs from its observation",
-            ));
-        }
         self.check_request_active()?;
         let mut tables = self
             .request_pinned_physical_tables
@@ -780,7 +810,7 @@ impl IcebergTypedBoundary {
         let projection = ChangeWindowEndpointProjection::new(table.metadata(), &domain)?;
         let table = table.clone();
         let control = self.request_context.clone();
-        let result = plan_pinned_snapshot(table, domain, control.as_ref()).await;
+        let result = plan_pinned_snapshot(table, domain, control.as_ref(), None).await;
         self.check_request_active()?;
         let read_snapshot = result?;
         projection.plan(read_snapshot.files, self.request_context.as_ref())
@@ -999,10 +1029,23 @@ impl IcebergTypedRequestControlFactory {
 /// SDK graphs and retained variable payload are admitted where they form.
 pub fn read_io_geometry()
 -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+    use crate::typed_read::table_handle::OriginalDeleteFilter;
+
     let io = std::num::NonZeroUsize::new(2).unwrap();
+    let delete_filter_header =
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            OriginalDeleteFilter,
+        >())
+        .map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "read Source header geometry overflow",
+            )
+        })?;
     let headers = std::mem::size_of::<IcebergTypedBoundary>()
         .checked_add(std::mem::size_of::<IcebergTypedRequestControlFactory>())
         .and_then(|n| n.checked_add(std::mem::size_of::<ConnectorReadRequestControl>()))
+        .and_then(|n| n.checked_add(delete_filter_header.size()))
         .and_then(|n| {
             n.checked_add(std::mem::size_of::<
                 novarocks_spi::connector::read_stack::ConnectorReadRelationPreparation,
@@ -1088,6 +1131,182 @@ impl ConnectorReadAttemptAccessSealer for IcebergAttemptAccessSealer {
             name,
             access,
         })))
+    }
+
+    fn observe_delete_target(
+        &self,
+        original: &novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation,
+        reference: Option<&str>,
+    ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
+        use crate::catalog::CatalogTableName;
+        use crate::catalog::admission::{
+            CatalogAdmissionRequest, CatalogOperation, connector_unsupported,
+        };
+
+        let context = self.boundary.prepared_source_request_context()?;
+        let (original, _) = self.boundary.validate_original_write_target(
+            None,
+            &original.table,
+            &original.source,
+            OriginalTargetSnapshot::Current,
+        )?;
+        let table = original.access.identifier();
+        self.boundary
+            .runtime
+            .novarocks_catalog()
+            .admit(&CatalogAdmissionRequest::new(
+                CatalogOperation::Delete,
+                CatalogTableName::new(table.namespace().to_url_string(), table.name()),
+                context.initiation(),
+            ))
+            .map_err(connector_unsupported)?;
+        let metadata = original.access.metadata();
+        let snapshot_id = match reference {
+            Some(reference) => read_only_delete_ref(metadata, reference)?.0,
+            None => metadata.current_snapshot_id(),
+        };
+        let row_delete_strategy = if metadata.format_version() == FormatVersion::V1 {
+            None
+        } else {
+            crate::commit::validation::row_mutation_strategy_from_metadata(
+                metadata,
+                &novarocks_spi::connector::ConnectorRowMutationIntent::Delete,
+                table.name(),
+            )
+            .ok()
+        };
+        context.check_active()?;
+        Ok(Some(ConnectorDeleteTargetFacts {
+            snapshot_id,
+            row_delete_strategy,
+        }))
+    }
+
+    fn seal_delete_condition<'a>(
+        &'a self,
+        frozen: &'a ConnectorReadTableHandle,
+    ) -> futures::future::BoxFuture<'a, Result<ConnectorDeleteConditionOutcome, ConnectorError>>
+    {
+        Box::pin(async move {
+            use crate::commit::delete_condition::{
+                DeleteCondition, IcebergDeleteConditionFact, delete_seal_backing,
+            };
+            use crate::typed_read::table_handle::OriginalDeleteFilter;
+            use sha2::{Digest, Sha256};
+
+            self.boundary.check_request_active()?;
+            let refused = || ConnectorDeleteConditionOutcome::Refused {
+                reason: "Iceberg did not absorb the complete original target filter".into(),
+            };
+            let relation = self.adapter.table(frozen)?;
+            let crate::typed_read::IcebergRuntimeRelation::Table(table) = relation else {
+                return Ok(refused());
+            };
+            let Some(origin) = table.complete_delete_filter() else {
+                return Ok(refused());
+            };
+            let context = self.boundary.prepared_source_request_context()?;
+            let request_origin =
+                context.request_scope_extension_or_insert_with(OriginalDeleteFilter::default);
+            if !Arc::ptr_eq(origin, &request_origin)
+                || !table.unenforced_predicate().is_all()
+                || table.enforced_predicate().is_all()
+            {
+                return Ok(refused());
+            }
+            let Some(domain) = table.read_domain() else {
+                return Ok(ConnectorDeleteConditionOutcome::Empty);
+            };
+            let endpoint = domain.endpoint();
+            let physical = self
+                .boundary
+                .pinned_table_for_attempt(table.schema_table_name())?;
+            let metadata = physical.table.metadata();
+            let metadata_identity =
+                crate::read_snapshot::metadata_identity(metadata).map_err(corrupt)?;
+            if endpoint.table_uuid() != metadata.uuid()
+                || endpoint.metadata_identity() != metadata_identity
+                || metadata.current_snapshot_id() != Some(endpoint.snapshot_id())
+            {
+                return Err(invalid(
+                    "Iceberg DELETE filter differs from the original current observation",
+                ));
+            }
+            if table.enforced_predicate().columns().any(|column| {
+                IcebergMetadataColumn::from_field_id(column.base_field_id()).is_some()
+            }) {
+                return Ok(refused());
+            }
+            if table.enforced_predicate().is_none() {
+                return Ok(ConnectorDeleteConditionOutcome::Empty);
+            }
+            let schema = metadata.current_schema();
+            if context.io_admission().is_some() {
+                let owned_list = table
+                    .prepared_manifest_list()
+                    .map_or(0, PreparedReadManifestList::owned_bytes);
+                let sealed = delete_seal_backing(
+                    schema,
+                    table.enforced_predicate(),
+                    &metadata_identity,
+                    || context.check_active(),
+                )?;
+                let headers = read_io_geometry()?.initial_owned_bytes().get();
+                let peak = sealed
+                    .checked_add(owned_list)
+                    .and_then(|bytes| bytes.checked_add(headers))
+                    .and_then(std::num::NonZeroU64::new)
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::ResourceExhausted,
+                            "Iceberg delete seal peak is unrepresentable",
+                        )
+                    })?;
+                context.reserve_owned_metadata(peak).await?;
+            }
+            context.check_active()?;
+            let condition = DeleteCondition::from_enforced(schema, table.enforced_predicate())
+                .map_err(|error| invalid(error.to_string()))?;
+            if matches!(condition, DeleteCondition::Never) {
+                return Ok(ConnectorDeleteConditionOutcome::Empty);
+            }
+            if matches!(condition, DeleteCondition::AllRows) {
+                return Ok(refused());
+            }
+            let digest = condition
+                .digest()
+                .map_err(|error| corrupt(error.to_string()))?;
+            let mut proof = Sha256::new();
+            proof.update(b"novarocks.iceberg.delete-partition-proof.v1\0");
+            proof.update(metadata.uuid().as_bytes());
+            proof.update(endpoint.snapshot_id().to_be_bytes());
+            proof.update(metadata_identity.as_bytes());
+            let spec_ids = table.absorption_spec_ids();
+            proof.update((spec_ids.clone().count() as u64).to_be_bytes());
+            for id in spec_ids {
+                proof.update(id.to_be_bytes());
+            }
+            proof.update(digest);
+            let retention = context.retain_owned_metadata()?;
+            self.boundary.check_request_active()?;
+            let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.boundary.descriptor.instance_id.clone(),
+                incarnation: self.boundary.incarnation,
+            };
+            let payload = novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                owner,
+                Arc::new(IcebergDeleteConditionFact {
+                    table_uuid: metadata.uuid(),
+                    snapshot_id: endpoint.snapshot_id(),
+                    metadata_identity,
+                    partition_proof_digest: proof.finalize().into(),
+                    digest,
+                    condition,
+                    _retention: retention,
+                }),
+            );
+            Ok(ConnectorDeleteConditionOutcome::Condition { payload, digest })
+        })
     }
 
     fn rewritten_target_fact(
@@ -1339,8 +1558,15 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OriginalTargetSnapshot {
+    Signed(Option<i64>),
+    Current,
+}
+
 /// Completed facts for one exact original relation request. Fields are private.
 pub struct IcebergPreparedRelation {
+    prepared_manifest_list: Option<Arc<PreparedReadManifestList>>,
     partition_snapshot: Option<crate::read_model::IcebergReadSnapshot>,
     mutation_match_schema: Option<SchemaRef>,
     physical: IcebergPhysicalTable,
@@ -1514,6 +1740,22 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             use novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationKind as K;
             self.check_request_active()?;
             let name = request.name();
+            if request.original_table().is_some()
+                && !matches!(
+                    request.kind(),
+                    K::Table {
+                        version: ConnectorReadRelationVersion::Current,
+                        reference: None,
+                    } | K::Table {
+                        version: ConnectorReadRelationVersion::Reference,
+                        reference: Some(_),
+                    }
+                )
+            {
+                return Err(invalid(
+                    "Original Iceberg table observation requires Current or one named reference",
+                ));
+            }
             if let K::RowMutationMatch {
                 table,
                 original_source,
@@ -1521,90 +1763,144 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 ..
             } = request.kind()
             {
-                let (physical, schema) =
-                    self.prepare_original_write_target(name, table, original_source, *snapshot_id)?;
+                let (physical, schema) = self.prepare_original_write_target(
+                    name,
+                    table,
+                    original_source,
+                    OriginalTargetSnapshot::Signed(*snapshot_id),
+                )?;
                 return Ok(Some(IcebergPreparedRelation {
+                    prepared_manifest_list: None,
                     partition_snapshot: None,
                     mutation_match_schema: Some(schema),
                     physical,
                     request: request.clone(),
                 }));
             }
-            let physical = match request.kind() {
-                K::RowMutationCurrent(source) => {
-                    Some(self.prepare_row_mutation_current(name, source)?)
-                }
-                K::FrozenMvTarget {
-                    table,
-                    original_source,
-                    object_id,
-                    snapshot_id,
-                    selection,
-                } => {
-                    let (physical, _) = self.prepare_original_write_target(
+            let physical = if let Some(original) = request.original_table() {
+                Some(
+                    self.prepare_original_write_target(
                         name,
+                        &original.table,
+                        &original.source,
+                        OriginalTargetSnapshot::Current,
+                    )?
+                    .0,
+                )
+            } else {
+                match request.kind() {
+                    K::RowMutationCurrent(source) => {
+                        Some(self.prepare_row_mutation_current(name, source)?)
+                    }
+                    K::FrozenMvTarget {
                         table,
                         original_source,
-                        *snapshot_id,
-                    )?;
-                    validate_mv_target_pin(physical.table.metadata(), object_id, *snapshot_id)?;
-                    if selection.as_ref().is_some_and(|selection| {
-                        selection.object_id() != object_id
-                            || Some(selection.snapshot_id()) != *snapshot_id
-                    }) {
-                        return Err(invalid(
-                            "frozen MV target partition selection differs from its base",
-                        ));
-                    }
-                    Some(physical)
-                }
-                K::Metadata {
-                    request: metadata_request,
-                } => {
-                    let Some((base_table, relation)) = system_relation_of(name.table_name()) else {
-                        return Ok(None);
-                    };
-                    let (system_table_type, _) = relation.runtime_worker_plan();
-                    if let Some(metadata_request) = metadata_request {
-                        if metadata_request.kind().as_str() != system_table_type.suffix() {
-                            return Err(invalid(format!(
-                                "iceberg metadata request kind {} does not match relation {}",
-                                metadata_request.kind().as_str(),
-                                system_table_type.suffix()
-                            )));
+                        object_id,
+                        snapshot_id,
+                        selection,
+                    } => {
+                        let (physical, _) = self.prepare_original_write_target(
+                            name,
+                            table,
+                            original_source,
+                            OriginalTargetSnapshot::Signed(*snapshot_id),
+                        )?;
+                        validate_mv_target_pin(physical.table.metadata(), object_id, *snapshot_id)?;
+                        if selection.as_ref().is_some_and(|selection| {
+                            selection.object_id() != object_id
+                                || Some(selection.snapshot_id()) != *snapshot_id
+                        }) {
+                            return Err(invalid(
+                                "frozen MV target partition selection differs from its base",
+                            ));
                         }
-                        match metadata_request.version() {
-                            ConnectorReadMetadataVersion::Current => {}
-                            ConnectorReadMetadataVersion::SnapshotId(snapshot_id) => {
-                                return Err(unsupported(format!(
-                                    "iceberg metadata snapshot request {snapshot_id} is unsupported because this read handle cannot prove the matching immutable metadata-file identity"
+                        Some(physical)
+                    }
+                    K::Metadata {
+                        request: metadata_request,
+                    } => {
+                        let Some((base_table, relation)) = system_relation_of(name.table_name())
+                        else {
+                            return Ok(None);
+                        };
+                        let (system_table_type, _) = relation.runtime_worker_plan();
+                        if let Some(metadata_request) = metadata_request {
+                            if metadata_request.kind().as_str() != system_table_type.suffix() {
+                                return Err(invalid(format!(
+                                    "iceberg metadata request kind {} does not match relation {}",
+                                    metadata_request.kind().as_str(),
+                                    system_table_type.suffix()
                                 )));
                             }
-                            ConnectorReadMetadataVersion::TimestampMillis(timestamp_millis) => {
-                                return Err(unsupported(format!(
-                                    "iceberg metadata timestamp request {timestamp_millis} is unsupported because this read handle cannot prove the matching immutable metadata-file identity"
-                                )));
+                            match metadata_request.version() {
+                                ConnectorReadMetadataVersion::Current => {}
+                                ConnectorReadMetadataVersion::SnapshotId(snapshot_id) => {
+                                    return Err(unsupported(format!(
+                                        "iceberg metadata snapshot request {snapshot_id} is unsupported because this read handle cannot prove the matching immutable metadata-file identity"
+                                    )));
+                                }
+                                ConnectorReadMetadataVersion::TimestampMillis(timestamp_millis) => {
+                                    return Err(unsupported(format!(
+                                        "iceberg metadata timestamp request {timestamp_millis} is unsupported because this read handle cannot prove the matching immutable metadata-file identity"
+                                    )));
+                                }
                             }
                         }
+                        let base_name = SchemaTableName::try_new(name.schema_name(), &base_table)?;
+                        self.load_relation_async(&base_name).await?
                     }
-                    let base_name = SchemaTableName::try_new(name.schema_name(), &base_table)?;
-                    self.load_relation_async(&base_name).await?
-                }
-                K::MvTarget { .. } | K::MvTargetPartition { .. } => {
-                    if system_relation_of(name.table_name()).is_some() {
-                        return Ok(None);
+                    K::MvTarget { .. } | K::MvTargetPartition { .. } => {
+                        if system_relation_of(name.table_name()).is_some() {
+                            return Ok(None);
+                        }
+                        self.load_mv_target_relation_async(name).await?
                     }
-                    self.load_mv_target_relation_async(name).await?
-                }
-                _ => {
-                    if system_relation_of(name.table_name()).is_some() {
-                        return Ok(None);
+                    _ => {
+                        if system_relation_of(name.table_name()).is_some() {
+                            return Ok(None);
+                        }
+                        self.load_relation_async(name).await?
                     }
-                    self.load_relation_async(name).await?
                 }
             };
             let Some(physical) = physical else {
                 return Ok(None);
+            };
+            let metadata = physical.table.metadata();
+            let prepared_manifest_list = if request.has_filter_offer()
+                && metadata.partition_specs_iter().len() > 1
+                && let K::Table { version, reference } = request.kind()
+                && let Some(snapshot_id) = if request.original_table().is_some()
+                    && let Some(reference) = reference
+                {
+                    read_only_delete_ref(metadata, reference)?.0
+                } else {
+                    pin_snapshot(metadata, *version, reference.as_deref())?
+                } {
+                let list = if request.original_table().is_some()
+                    && reference.is_none()
+                    && let Some(context) = self
+                        .request_context
+                        .as_ref()
+                        .filter(|context| context.reuses_original_table_preparation())
+                {
+                    let origin = context.request_scope_extension_or_insert_with(
+                        crate::typed_read::table_handle::OriginalDeleteFilter::default,
+                    );
+                    origin
+                        .prepare_manifest_list(&physical.table, snapshot_id, context)
+                        .await?
+                } else {
+                    PreparedReadManifestList::prepare(
+                        &physical.table,
+                        snapshot_id,
+                        self.request_context.as_ref(),
+                    )
+                    .await?
+                };
+                Some(list)
+            } else {
+                None
             };
             let partition_selection = match request.kind() {
                 K::MvTargetPartition { selection } => Some(selection),
@@ -1639,6 +1935,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             Ok(Some(IcebergPreparedRelation {
                 request: request.clone(),
                 physical,
+                prepared_manifest_list,
                 partition_snapshot,
                 mutation_match_schema: None,
             }))
@@ -1658,6 +1955,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         let IcebergPreparedRelation {
             request,
             physical,
+            prepared_manifest_list,
             partition_snapshot,
             mutation_match_schema,
         } = prepared;
@@ -1672,14 +1970,29 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     None,
                 )?),
             ),
-            K::Table { version, reference } => Some(
-                crate::typed_read::IcebergRuntimeRelation::Table(table_handle_for_version(
-                    name,
-                    physical.table.metadata(),
-                    *version,
-                    reference.as_deref(),
-                )?),
-            ),
+            K::Table { version, reference } => {
+                let is_original = request.original_table().is_some();
+                let origin = if is_original && reference.is_none() {
+                    Some(
+                        self.prepared_source_request_context()?
+                            .request_scope_extension_or_insert_with(
+                                crate::typed_read::table_handle::OriginalDeleteFilter::default,
+                            ),
+                    )
+                } else {
+                    None
+                };
+                let metadata = physical.table.metadata();
+                let handle = if is_original && let Some(reference) = reference {
+                    let (snapshot, schema) = read_only_delete_ref(metadata, reference)?;
+                    pinned_table_handle_with_schema(name, metadata, snapshot, schema, None)?
+                } else {
+                    table_handle_for_version(name, metadata, *version, reference.as_deref())?
+                };
+                Some(crate::typed_read::IcebergRuntimeRelation::Table(
+                    handle.with_prepared_manifest_list(prepared_manifest_list, origin)?,
+                ))
+            }
             K::RowMutationMatch {
                 snapshot_id,
                 preparation_digest,
@@ -2595,8 +2908,13 @@ impl IcebergTypedBoundary {
             .read_domain()
             .cloned()
             .ok_or_else(|| corrupt("snapshot handle has no read domain"))?;
-        let result =
-            (async move { plan_pinned_snapshot(table, domain, control.as_ref()).await }).await;
+        let result = plan_pinned_snapshot(
+            table,
+            domain,
+            control.as_ref(),
+            handle.prepared_manifest_list(),
+        )
+        .await;
         self.check_request_active()?;
         let read_snapshot = result?;
         self.planned_files_from_observation(
@@ -3035,6 +3353,31 @@ fn mv_target_partition_value(value: Option<&Literal>) -> Option<ConnectorMvParti
         | PrimitiveLiteral::BelowMin => return None,
     };
     Some(ConnectorMvPartitionValue::String(Arc::from(string)))
+}
+
+fn read_only_delete_ref(
+    metadata: &TableMetadata,
+    reference: &str,
+) -> Result<(Option<i64>, SchemaRef), ConnectorError> {
+    use crate::commit::write_shared::{position_mutation_read_schema, write_target_snapshot_id};
+
+    if reference != "main" && metadata.format_version() != FormatVersion::V3 {
+        return Err(invalid(
+            "iceberg ref: branch writes require Iceberg v3 tables",
+        ));
+    }
+    if reference != "main" {
+        crate::commit::model::validate_target_branch(metadata, reference).map_err(invalid)?;
+    }
+    let snapshot = write_target_snapshot_id(metadata, reference)?;
+    let schema = position_mutation_read_schema(metadata, reference, snapshot)?;
+    if schema.schema_id() != metadata.current_schema_id() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "EXPLAIN DELETE requires an exact read projection for the branch's evolved schema",
+        ));
+    }
+    Ok((snapshot, schema))
 }
 
 /// Resolve the requested version to exactly one snapshot, once.
@@ -3687,9 +4030,16 @@ async fn plan_pinned_snapshot(
     table: Table,
     domain: Arc<crate::delete_semantics::ReadDomain>,
     control: Option<&ConnectorRequestContext>,
+    prepared: Option<&PreparedReadManifestList>,
 ) -> Result<IcebergReadSnapshot, ConnectorError> {
     let operation_control = control.map(|control| control as &dyn ConnectorOperationControl);
-    crate::read_snapshot::build_read_snapshot_in_domain(&table, domain, operation_control).await
+    crate::read_snapshot::build_read_snapshot_with_prepared_list(
+        &table,
+        domain,
+        operation_control,
+        prepared,
+    )
+    .await
 }
 
 /// Every partition spec a table has ever had, in the order the metadata holds
@@ -4425,6 +4775,30 @@ mod mv_target_selection_tests {
             ],
         };
         (metadata, selection, snapshot)
+    }
+
+    #[test]
+    fn same_observation_delete_explain_resolves_branch_instead_of_current() {
+        use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+
+        let (metadata, _, _) = fixture();
+        let metadata = metadata
+            .into_builder(None)
+            .upgrade_format_version(FormatVersion::V3)
+            .unwrap()
+            .set_ref(
+                "dev",
+                SnapshotReference::new(41, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(metadata.current_snapshot_id(), None);
+        let (snapshot_id, schema) = super::read_only_delete_ref(&metadata, "dev").unwrap();
+        assert_eq!(snapshot_id, Some(41));
+        assert_eq!(schema.schema_id(), metadata.current_schema_id());
+        assert!(super::read_only_delete_ref(&metadata, "missing").is_err());
     }
 
     #[test]

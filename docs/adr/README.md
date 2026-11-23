@@ -170,7 +170,8 @@ code-anchors:
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — Iceberg 写类为何共用紧凑接收与 operation 账本，怎样选择建表位置、冻结追加条件并按精确对象清理（active；部分替代 lake publication ADR-0110、ADR-0171、ADR-0198、Iceberg ADR-0239 与维护 ADR-0243）
-- [ADR-0251](ADR-0251-iceberg-maintenance-commits-by-operation.md) — Iceberg OPTIMIZE 与主分支 TRUNCATE 为何按各自协议在当轮基准验证，如何原子保护输出规范、保留统计来源并由 Provider 撰写提交失败（active）
+- [ADR-0260](ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md) — Iceberg 元数据 DELETE 如何在原读观察证明完全吸收，并按当轮最新文件与获胜快照解释原字段和计数（active；部分替代 ADR-0251）
+- [ADR-0251](ADR-0251-iceberg-maintenance-commits-by-operation.md) — Iceberg OPTIMIZE 与主分支 TRUNCATE 为何按各自协议在当轮基准验证，如何原子保护输出规范、保留统计来源并由 Provider 撰写提交失败（active；一般过滤删除由 ADR-0260 细化，TRUNCATE 和重试规则保留）
 - [ADR-0248](ADR-0248-parquet-reader-sizing-and-scan-output-policy.md) — Iceberg 如何按准确语句冻结 Parquet reader 设置，最终输出和来源保管为何归实际 producer 与持有方（active，部分替代 ADR-0014 及会话属性 ADR-0222）
 - [ADR-0247](ADR-0247-footer-derived-parquet-reader-representation.md) — FS 如何从验证后的 footer 导出解码表示，并隔离解释缓存、原表字段身份及 reader 局部范围（active，部分替代 ADR-0213）
 - [ADR-0246](ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md) — Iceberg ADD FILES 为何共用读取绑定，如何按准确 main 核对候选、原子保存名称映射并保管登记条目（active；部分替代 ADR-0024、lake-publication ADR-0110、ADR-0171 及 Iceberg ADR-0239 的 ADD FILES 条款）
@@ -335,6 +336,7 @@ code-anchors:
 
 - [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
 
+- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
 
 - [ADR-0254](ADR-0254-exact-temporal-values-and-frozen-statement-time.md) — 精确时态值如何保留逐值时区，语句环境与规则如何在折叠、执行、存储和结果呈现之间传递（active）
@@ -345,6 +347,7 @@ code-anchors:
 - [ADR-0250](ADR-0250-standard-numeric-operator-semantics.md) — 标准数值怎样经共享定型和普通调用冻结，并保留遗留宽数消费者（active）
 
 - [ADR-0249](ADR-0249-trino-public-functions-and-internal-aggregate-identities.md) — Trino 公开候选如何尊重可见性，标准 DISTINCT 如何保留内部准确重载和状态（active）
+- [ADR-0257](ADR-0257-ordered-regexp-evaluation-and-resource-ownership.md) — 正则模式如何在原实参位置受控编译、搜索和归还资源（active）
 - [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
 - [ADR-0244](ADR-0244-operators-are-identified-catalogue-functions.md) — 隐藏目录函数为何按身份表示运算符，如何沿普通调用迁移、渲染和折叠（active；部分替代 ADR-0242 的取负范围）
 
@@ -389,6 +392,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 语言或durable authority。
 
 - [ADR-0261](ADR-0261-trino-sql-without-syntax-extensions.md) — Trino SQL 为何使用单一文法并退役覆盖写扩展，能力准入如何保留原所有者（active；部分替代 ADR-0241）
+- [ADR-0258](ADR-0258-prepared-sql-request-snapshots-and-semantic-authors.md) — 预编译语句为何依赖请求定义快照、原参数位置以及 SchemaOnly 描述（active；实现与验证状态独立核对）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 公开集合签名和关系 `TABLE(sequence(...))` 如何独立绑定（active）
 - [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) — Iceberg 元数据维护为何由原语句和准确表对象授权，如何保留 Trino 结果形状、完整有效文件集合、Hadoop 发现根与已确认删除事实（active；部分替代 ADR-0110/0198 的显式扫描和自有 ref 条款，以及 ADR-0111/0114/0232 的首次观察状态。内建无表锚 CTAS 扫描由 [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) 退役）
 - [ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) — Trino SQL 为何是唯一文法，语法扩展、AST 差异、能力准入与 printer 的边界（active；补充 ADR-0090／0101／0231。扩展清单由 [ADR-0261](ADR-0261-trino-sql-without-syntax-extensions.md) 清空，AST、printer 与准入规则继续有效）
@@ -404,6 +408,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 领域哲学：Map 键域在构造时成立，不能由写出路径或运行时字段放宽来补救。非空且唯一是值语义；构造拒绝与具有明确优先级的合并分开，唯一性复用 GROUP BY 规范键等价。实施覆盖必须如实记录，局部入口的校验不代表所有生产者已经收敛。
 
+- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — MAP 聚合空结果、所选状态以及已发布聚合语义的准入（active）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 构造、DDL 属性和聚合如何共用 MAP 键契约，查找如何沿普通等值（active；部分替代 ADR-0183 的作者及判重合同）
 - [ADR-0183](ADR-0183-map-keys-are-non-null-and-unique.md) — Map 键为何非空且唯一，构造拒绝为何与合并优先级分开（active；键域和合并规则保留，构造作者及判重合同见 ADR-0255）
 
@@ -575,7 +580,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 领域哲学：Frontend host 拥有表维护生命周期与执行入口，Connector 保留 catalog、snapshot、file 与 commit 等外部事实。维护与统计由原语句执行。显式孤儿扫描由原 Provider 按准确对象、保留期、完整有效引用和发现根保护授权。必要 finalize、可延后维护、已确认的部分删除与原 Source 的实际退出分别取证。
 
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — CTAS 无表锚扫描为何退役，原操作的准确清理、显式维护和 Unknown 保护如何分工（active）
-- [ADR-0251](ADR-0251-iceberg-maintenance-commits-by-operation.md) — Iceberg OPTIMIZE 与主分支 TRUNCATE 为何按各自协议在当轮基准验证，如何原子保护输出规范、保留统计来源并由 Provider 撰写提交失败（active）
+- [ADR-0260](ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md) — Iceberg 元数据 DELETE 如何在原读观察证明完全吸收，并按当轮最新文件与获胜快照解释原字段和计数（active；部分替代 ADR-0251）
+- [ADR-0251](ADR-0251-iceberg-maintenance-commits-by-operation.md) — Iceberg OPTIMIZE 与主分支 TRUNCATE 为何按各自协议在当轮基准验证，如何原子保护输出规范、保留统计来源并由 Provider 撰写提交失败（active；一般过滤删除由 ADR-0260 细化，TRUNCATE 和重试规则保留）
 - [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) — Iceberg 元数据维护为何由原语句和准确表对象授权，如何保留 Trino 结果形状、完整有效文件集合、Hadoop 发现根与已确认删除事实（active；部分替代 ADR-0110/0198 的显式扫描和自有 ref 条款，以及 ADR-0111/0114/0232 的首次观察状态。内建无表锚 CTAS 扫描由 [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) 退役）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator 由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，Catalog 准入与三态 publication 保留）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代；异步逻辑 actor 与分散授权的妥协由 ADR-0237 部分替代；显式孤儿扫描与自有 ref 回收由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，原 publication 与实际退出规则保留。无表锚 CTAS 扫描由 [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) 退役）

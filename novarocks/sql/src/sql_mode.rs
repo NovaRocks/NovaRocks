@@ -18,18 +18,14 @@
 //! SQL-owned interpretation of the modes consumed by this engine.
 //!
 //! A setting retains its full assignment, including modes not consumed here.
-//! Adding GROUP_CONCAT_LEGACY does not introduce a validator for all MySQL or
-//! StarRocks modes. Unknown names and numeric bits retain their existing
-//! admission behavior; retaining them is not an implementation claim.
+//! Unknown modes remain in the original assignment.
 
-use novarocks_parser::ast::{self, Fold};
+use novarocks_parser::ast;
 
 const ONLY_FULL_GROUP_BY: u64 = 1 << 5;
 const ALLOW_THROW_EXCEPTION: u64 = 1 << 9;
-const GROUP_CONCAT_LEGACY: u64 = 1 << 36;
 const ERROR_IF_OVERFLOW: u64 = 1 << 35;
-const CONSUMED_MASK: u64 =
-    ONLY_FULL_GROUP_BY | ALLOW_THROW_EXCEPTION | GROUP_CONCAT_LEGACY | ERROR_IF_OVERFLOW;
+const CONSUMED_MASK: u64 = ONLY_FULL_GROUP_BY | ALLOW_THROW_EXCEPTION | ERROR_IF_OVERFLOW;
 
 /// One complete connection or statement setting. Successive assignments
 /// replace this value; comma-separated items within an assignment combine.
@@ -51,7 +47,7 @@ impl SqlMode {
             let code = match item.to_ascii_uppercase().as_str() {
                 "ONLY_FULL_GROUP_BY" => ONLY_FULL_GROUP_BY,
                 "ALLOW_THROW_EXCEPTION" => ALLOW_THROW_EXCEPTION,
-                "GROUP_CONCAT_LEGACY" => GROUP_CONCAT_LEGACY,
+
                 "ERROR_IF_OVERFLOW" => ERROR_IF_OVERFLOW,
                 _ => item.parse::<u64>().unwrap_or(0) & CONSUMED_MASK,
             };
@@ -65,10 +61,6 @@ impl SqlMode {
 
     pub fn assignment(&self) -> &str {
         &self.assignment
-    }
-
-    pub const fn group_concat_legacy(&self) -> bool {
-        self.consumed_bits & GROUP_CONCAT_LEGACY != 0
     }
 
     pub const fn allow_throw_exception(&self) -> bool {
@@ -121,8 +113,6 @@ pub const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: i32 = 5;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SqlSemanticSettings {
     sql_mode: SqlMode,
-    /// Raw value projected from the actual admitted SessionExecutionSettings.
-    group_concat_max_len: Option<i64>,
     recursive_cte_max_depth: Option<i32>,
     statement_time: Option<novarocks_type_contract::StatementTimeEnvironment>,
 }
@@ -152,14 +142,6 @@ impl SqlSemanticSettings {
     }
     pub const fn sql_mode(&self) -> &SqlMode {
         &self.sql_mode
-    }
-
-    pub const fn group_concat_max_len(&self) -> Option<i64> {
-        self.group_concat_max_len
-    }
-    pub fn with_group_concat_max_len(mut self, value: i64) -> Self {
-        self.group_concat_max_len = Some(value);
-        self
     }
 
     pub fn with_sql_mode(mut self, value: SqlMode) -> Self {
@@ -209,74 +191,6 @@ pub fn statement_sql_semantics(
     )
 }
 
-/// Canonicalize the existing concat aliases to their declared ordinary args.
-/// STRING_AGG owns its final separator, making repeated preparation idempotent.
-pub(crate) fn normalize_concat_query(
-    query: ast::Query,
-    session: &SqlSemanticSettings,
-) -> Result<ast::Query, crate::analyze_error::AnalyzeError> {
-    let settings = query_sql_semantics(session, &query)?;
-    Ok(normalize_concat_query_with_semantics(query, &settings))
-}
-
-/// The admitted settings authorize all expression normalization in this Query.
-pub(crate) fn normalize_concat_query_with_semantics(
-    query: ast::Query,
-    settings: &SqlSemanticSettings,
-) -> ast::Query {
-    struct Normalizer<'a> {
-        sql_semantics: &'a SqlSemanticSettings,
-    }
-    impl Fold for Normalizer<'_> {
-        fn fold_function_call(&mut self, call: ast::FunctionCall) -> ast::FunctionCall {
-            let mut call = ast::fold_function_call(self, call);
-            if call.arguments.is_empty()
-                || call.processing_mode.is_some()
-                || call
-                    .arguments
-                    .iter()
-                    .any(|argument| argument.name.is_some())
-            {
-                return call;
-            }
-            let [name] = call.name.parts.as_mut_slice() else {
-                return call;
-            };
-            if name.quoted {
-                return call;
-            }
-            let separator = if name.value.eq_ignore_ascii_case("group_concat") {
-                let legacy = self.sql_semantics.sql_mode().group_concat_legacy();
-                name.value = "string_agg".to_owned();
-                name.span = novarocks_parser::SYNTHETIC;
-                call.name.span = novarocks_parser::SYNTHETIC;
-                if legacy && call.arguments.len() > 1 {
-                    None
-                } else {
-                    Some(if legacy { ", " } else { "," })
-                }
-            } else if name.value.eq_ignore_ascii_case("string_agg") && call.arguments.len() == 1 {
-                Some(",")
-            } else {
-                None
-            };
-            if let Some(separator) = separator {
-                let value = ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::String(separator.to_string()),
-                    span: call.span,
-                });
-                call.arguments
-                    .push(novarocks_parser::build::call_argument(value, None));
-            }
-            call
-        }
-    }
-    Normalizer {
-        sql_semantics: settings,
-    }
-    .fold_query(query)
-}
-
 /// Persisted definitions can contain a SELECT under VALUES or a CTE.
 fn query_has_select(query: &ast::Query) -> bool {
     use ast::Visit;
@@ -299,17 +213,7 @@ pub(crate) fn query_requires_semantic_snapshot(
     settings: &SqlSemanticSettings,
     query: &ast::Query,
 ) -> bool {
-    (settings.sql_mode().group_concat_legacy() || settings.sql_mode().error_if_overflow())
-        && query_has_select(query)
-}
-
-/// Detect uncaptured legacy mode under the root query setting.
-pub fn query_uses_group_concat_legacy(
-    session: &SqlSemanticSettings,
-    query: &ast::Query,
-) -> Result<bool, crate::analyze_error::AnalyzeError> {
-    let settings = query_sql_semantics(session, query)?;
-    Ok(settings.sql_mode().group_concat_legacy() && query_has_select(query))
+    settings.sql_mode().error_if_overflow() && query_has_select(query)
 }
 
 /// Detect uncaptured strict overflow policy under the root query setting.
@@ -354,14 +258,6 @@ fn check_persisted_query_semantics(
     query: &ast::Query,
     caller: &SqlSemanticSettings,
 ) -> Result<(), PersistedSemanticsError> {
-    if caller.sql_mode().group_concat_legacy()
-        || query_uses_group_concat_legacy(caller, query)
-            .map_err(PersistedSemanticsError::Analyze)?
-    {
-        return Err(PersistedSemanticsError::Uncaptured(
-            "GROUP_CONCAT_LEGACY is not captured for persisted VIEW or MATERIALIZED VIEW definition replay",
-        ));
-    }
     if caller.sql_mode().error_if_overflow()
         || query_uses_error_if_overflow(caller, query).map_err(PersistedSemanticsError::Analyze)?
     {
@@ -389,105 +285,22 @@ mod tests {
         query(&format!("WITH SESSION {assignments} {sql}"))
     }
 
-    fn calls(query: &ast::Query) -> Vec<ast::FunctionCall> {
-        struct Collector(Vec<ast::FunctionCall>);
-        impl ast::Visit for Collector {
-            fn visit_function_call(&mut self, call: &ast::FunctionCall) {
-                if matches!(
-                    call.name
-                        .parts
-                        .last()
-                        .map(|name| name.value.to_ascii_lowercase())
-                        .as_deref(),
-                    Some("group_concat" | "string_agg")
-                ) {
-                    self.0.push(call.clone());
-                }
-                ast::walk_function_call(self, call);
-            }
-        }
-        let mut collector = Collector(Vec::new());
-        ast::Visit::visit_query(&mut collector, query);
-        collector.0
-    }
-
-    fn display(sql: &str, mode: &str) -> String {
-        let query = normalize_concat_query(query(sql), &semantics(mode)).unwrap();
-        let calls = calls(&query);
-        crate::analyzer::display_expr_for_test(&ast::Expr::FunctionCall(ast::AstBox::new(
-            calls[0].clone(),
-        )))
-    }
-
-    #[test]
-    fn persisted_definition_detector_uses_one_query_setting() {
-        let legacy = semantics("GROUP_CONCAT_LEGACY");
-        let modern = semantics("32");
-        let original_legacy = legacy.clone();
-        let original_modern = modern.clone();
-        for sql in [
-            "SELECT 1",
-            "WITH c AS (SELECT 1) SELECT * FROM c",
-            "SELECT * FROM (SELECT 1) d",
-            "SELECT 1 UNION ALL SELECT 2",
-            "SELECT (SELECT 1)",
-        ] {
-            assert!(query_uses_group_concat_legacy(&legacy, &query(sql)).unwrap());
-            assert!(!query_uses_group_concat_legacy(&modern, &query(sql)).unwrap());
-            let reset = query_with_assignments(sql, "sql_mode=32");
-            assert!(!query_uses_group_concat_legacy(&legacy, &reset).unwrap());
-            let enabled = query_with_assignments(sql, "sql_mode='GROUP_CONCAT_LEGACY'");
-            assert!(query_uses_group_concat_legacy(&modern, &enabled).unwrap());
-        }
-        assert_eq!(legacy, original_legacy);
-        assert_eq!(modern, original_modern);
-    }
-
-    #[test]
-    fn persisted_replay_rejects_legacy_caller_and_stored_legacy_mode() {
-        let modern = semantics("32");
-        let legacy = semantics("GROUP_CONCAT_LEGACY");
-        assert!(validate_persisted_query_semantics(&query("SELECT 1"), &modern).is_ok());
-        assert!(
-            validate_persisted_query_semantics(&query("SELECT 1"), &legacy)
-                .unwrap_err()
-                .starts_with("Unsupported:")
-        );
-        let stored = query("WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT 1");
-        assert!(validate_persisted_query_semantics(&stored, &modern).is_err());
-        assert_eq!(modern.sql_mode().assignment(), "32");
-        assert_eq!(legacy.sql_mode().assignment(), "GROUP_CONCAT_LEGACY");
-    }
-
     #[test]
     fn combines_consumed_tokens_and_preserves_unconsumed_assignment() {
         for setting in [
             "GROUP_CONCAT_LEGACY",
             "68719476736",
-            "32, group_concat_legacy",
-            "GROUP_CONCAT_LEGACY,512,ERROR_IF_OVERFLOW,STRUCT_CAST_BY_NAME",
-        ] {
-            let mode = SqlMode::from_assignment(setting);
-            assert!(mode.group_concat_legacy());
-            assert_eq!(mode.assignment(), setting);
-        }
-        for setting in [
-            "",
-            "0",
-            "32",
-            "ERROR_IF_OVERFLOW",
-            "STRUCT_CAST_BY_NAME",
-            "1",
+            "32,group_concat_legacy",
             "FUTURE_MODE",
-            "18446744073709551615_BAD",
-            "-1",
-            "NOT_GROUP_CONCAT_LEGACY",
-            "34359738368",
         ] {
             let mode = SqlMode::from_assignment(setting);
-            assert!(!mode.group_concat_legacy());
             assert_eq!(mode.assignment(), setting);
+            assert!(!mode.error_if_overflow());
+            assert!(!mode.allow_throw_exception());
         }
+        let mode = SqlMode::from_assignment("ERROR_IF_OVERFLOW,512,STRUCT_CAST_BY_NAME");
+        assert!(mode.error_if_overflow());
+        assert!(mode.allow_throw_exception());
         assert!(SqlMode::from_assignment("512").allow_throw_exception());
         assert!(!SqlMode::from_assignment("NOT_ALLOW_THROW_EXCEPTION").allow_throw_exception());
     }
@@ -495,29 +308,26 @@ mod tests {
     #[test]
     fn last_sql_mode_assignment_wins_without_mutating_session() {
         let query = |sql: &str| novarocks_parser::parser::parse_query(sql).expect("fixture parses");
-        let session = semantics("GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION");
+        let session = semantics("ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION");
         for sql in [
-            "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY', sql_mode = 32 SELECT 1",
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW', sql_mode = 32 SELECT 1",
             "WITH SESSION sql_mode = '68719476736', sql_mode = '32' SELECT 1",
         ] {
             let effective = query_sql_semantics(&session, &query(sql)).unwrap();
-            assert!(!effective.sql_mode().group_concat_legacy());
             assert!(!effective.sql_mode().allow_throw_exception());
         }
         let effective = query_sql_semantics(
             &SqlSemanticSettings::default(),
-            &query("WITH SESSION sql_mode = 68719477248, query_timeout = 1 SELECT 1"),
+            &query("WITH SESSION sql_mode = 34359738880, query_timeout = 1 SELECT 1"),
         )
         .unwrap();
-        assert!(effective.sql_mode().group_concat_legacy());
         assert!(effective.sql_mode().allow_throw_exception());
-        assert!(session.sql_mode().group_concat_legacy());
         assert!(session.sql_mode().allow_throw_exception());
         for value in [
-            "GROUP_CONCAT_LEGACY",
-            "'GROUP_CONCAT_LEGACY, ONLY_full_group_by'",
-            "'68719476768'",
-            "68719476768",
+            "ERROR_IF_OVERFLOW",
+            "'ERROR_IF_OVERFLOW, ONLY_full_group_by'",
+            "'34359738400'",
+            "34359738400",
         ] {
             assert!(
                 query_sql_semantics(
@@ -526,183 +336,25 @@ mod tests {
                 )
                 .unwrap()
                 .sql_mode()
-                .group_concat_legacy()
+                .error_if_overflow()
             );
-        }
-    }
-
-    #[test]
-    fn separator_normalization_is_idempotent_and_display_uses_its_contract() {
-        assert_eq!(
-            display("SELECT group_concat(v,'-' ORDER BY id)", "32"),
-            "group_concat(v,'-' ORDER BY id ASC SEPARATOR ',')"
-        );
-        assert_eq!(
-            display(
-                "SELECT group_concat(v,'-' ORDER BY id)",
-                "GROUP_CONCAT_LEGACY"
-            ),
-            "group_concat(v ORDER BY id ASC SEPARATOR '-')"
-        );
-        assert_eq!(
-            display("SELECT group_concat(v ORDER BY id)", "GROUP_CONCAT_LEGACY"),
-            "group_concat(v ORDER BY id ASC SEPARATOR ', ')"
-        );
-        for mode in ["32", "GROUP_CONCAT_LEGACY"] {
-            assert_eq!(
-                display("SELECT string_agg(v,'-' \n,\n '|'\nORDER BY id \n)", mode),
-                "group_concat(v,'-' ORDER BY id ASC SEPARATOR '|')"
-            );
-            assert_eq!(
-                display("SELECT string_agg(v,sep ORDER BY id)", mode),
-                "group_concat(v ORDER BY id ASC SEPARATOR sep)"
-            );
-            let once =
-                normalize_concat_query(query("SELECT group_concat(v,'-')"), &semantics(mode))
-                    .unwrap();
-            assert_eq!(
-                normalize_concat_query(once.clone(), &semantics(mode)).unwrap(),
-                once
-            );
-        }
-        assert_eq!(
-            display(
-                "SELECT group_concat(v,u,sep ORDER BY 1,2)",
-                "GROUP_CONCAT_LEGACY"
-            ),
-            "group_concat(v,u ORDER BY v ASC, u ASC SEPARATOR sep)"
-        );
-    }
-
-    #[test]
-    fn canonical_concat_alias_preserves_source_spans_and_skips_quoted_qualified_and_zero_calls() {
-        for mode in ["32", "GROUP_CONCAT_LEGACY"] {
-            let settings = semantics(mode);
-            let raw = query("SELECT group_concat(v,u)");
-            let original = calls(&raw).remove(0);
-            let prepared = normalize_concat_query(raw, &settings).unwrap();
-            let call = calls(&prepared).remove(0);
-            assert_eq!(call.name.parts[0].value, "string_agg");
-            assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
-            assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
-            assert_eq!(call.span, original.span);
-            assert_eq!(
-                &call.arguments[..original.arguments.len()],
-                original.arguments.as_slice()
-            );
-            assert_eq!(
-                normalize_concat_query(prepared.clone(), &settings).unwrap(),
-                prepared
-            );
-            assert_eq!(
-                display("SELECT string_agg(v)", mode),
-                "group_concat(v SEPARATOR ',')"
-            );
-            for source in [
-                "SELECT group_concat()",
-                "SELECT string_agg()",
-                "SELECT schema.group_concat(v,u)",
-                "SELECT schema.string_agg(v,u)",
-            ] {
-                let original = query(source);
-                assert_eq!(
-                    normalize_concat_query(original.clone(), &settings).unwrap(),
-                    original
-                );
-            }
-            for source in ["SELECT group_concat(v,u)", "SELECT string_agg(v,u)"] {
-                let mut quoted = query(source);
-                let ast::SetExpr::Select(select) = quoted.body.as_mut() else {
-                    panic!("select");
-                };
-                let ast::SelectItem::SingleColumn(projection_column) = &mut select.projection[0]
-                else {
-                    panic!("call");
-                };
-                assert!(projection_column.alias.is_none(), "anonymous projection");
-                let ast::Expr::FunctionCall(call) = &mut projection_column.expression else {
-                    panic!("call");
-                };
-                call.name.parts[0].quoted = true;
-                assert_eq!(
-                    normalize_concat_query(quoted.clone(), &settings).unwrap(),
-                    quoted
-                );
-            }
         }
     }
 
     #[test]
     fn statement_admission_freezes_root_query_overrides() {
-        let session = semantics("GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION");
+        let session = semantics("ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION");
         for sql in [
-            "WITH SESSION sql_mode = 32 SELECT group_concat('a','-')",
-            "EXPLAIN WITH SESSION sql_mode = 32  SELECT group_concat('a','-')",
-            "EXPLAIN ANALYZE WITH SESSION sql_mode = 32 SELECT group_concat('a','-')",
+            "WITH SESSION sql_mode = 32 SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1)",
+            "EXPLAIN WITH SESSION sql_mode = 32  SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1)",
+            "EXPLAIN ANALYZE WITH SESSION sql_mode = 32 SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1)",
         ] {
             let statement =
                 novarocks_parser::parser::parse_statement(sql).expect("statement parses");
             let effective = statement_sql_semantics(&session, &statement).unwrap();
-            assert!(!effective.sql_mode().group_concat_legacy());
             assert!(!effective.sql_mode().allow_throw_exception());
         }
-        assert!(session.sql_mode().group_concat_legacy());
         assert!(session.sql_mode().allow_throw_exception());
-    }
-
-    #[test]
-    fn concat_calls_in_ctes_subqueries_and_union_inherit_query_policy() {
-        fn assert_calls(sql: &str, mode: &str, counts: &[usize], separators: &[&str]) {
-            let caller = SqlSemanticSettings::default();
-            let original_caller = caller.clone();
-            let query = query_with_assignments(sql, &format!("sql_mode='{mode}'"));
-            let normalized = normalize_concat_query(query, &caller).unwrap();
-            let collected = calls(&normalized);
-            assert!(collected.iter().all(|call| call.name.parts.len() == 1
-                && !call.name.parts[0].quoted
-                && call.name.parts[0].value.eq_ignore_ascii_case("string_agg")
-                && call.arguments.len() >= 2));
-            assert_eq!(collected.len(), counts.len());
-            assert_eq!(
-                collected
-                    .iter()
-                    .map(|call| call.arguments.len())
-                    .collect::<Vec<_>>(),
-                counts
-            );
-            let actual = collected
-                .iter()
-                .map(|call| {
-                    novarocks_parser::printer::print_expression(
-                        &call.arguments.last().expect("canonical separator").value,
-                    )
-                    .unwrap()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(actual, separators);
-            let effective = query_sql_semantics(&caller, &normalized).unwrap();
-            assert_eq!(effective.sql_mode().assignment(), mode);
-            assert_eq!(caller, original_caller);
-        }
-        let nested = "WITH c AS (SELECT group_concat(v) x FROM t) SELECT group_concat(v,'-'), (SELECT group_concat(v) FROM t), (SELECT group_concat(v,'-') FROM t) FROM t";
-        assert_calls(nested, "32", &[2, 3, 2, 3], &["','", "','", "','", "','"]);
-        assert_calls(
-            nested,
-            "GROUP_CONCAT_LEGACY",
-            &[2, 2, 2, 2],
-            &["', '", "'-'", "', '", "'-'"],
-        );
-        let scalar = "SELECT group_concat(v), (SELECT group_concat(v,'-') FROM t), (SELECT group_concat(v) FROM t) FROM t";
-        assert_calls(scalar, "32", &[2, 3, 2], &["','", "','", "','"]);
-        assert_calls(
-            scalar,
-            "GROUP_CONCAT_LEGACY",
-            &[2, 2, 2],
-            &["', '", "'-'", "', '"],
-        );
-        let branches = "SELECT group_concat(v) FROM t UNION ALL SELECT group_concat(v,'-') FROM t";
-        assert_calls(branches, "32", &[2, 3], &["','", "','"]);
-        assert_calls(branches, "GROUP_CONCAT_LEGACY", &[2, 2], &["', '", "'-'"]);
     }
 
     #[test]

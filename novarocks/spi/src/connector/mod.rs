@@ -38,6 +38,7 @@ mod listing;
 mod maintenance_data_size;
 mod maintenance_duration;
 mod metadata;
+mod metadata_discovery;
 mod metadata_maintenance;
 mod mutation;
 mod mv_storage_observation;
@@ -143,8 +144,8 @@ pub use data_mutation::{
     ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
     ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
-    ConnectorDataMutationResolver, ConnectorDataMutationSession,
-    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    ConnectorDataMutationResolver, ConnectorDataMutationSession, ConnectorDeleteCondition,
+    DELETE_KIND, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, REGISTER_EXISTING_FILES_KIND, TRUNCATE_KIND,
 };
 pub use distributed_rewrite::{
@@ -210,6 +211,10 @@ pub use metadata::{
     MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
+};
+pub use metadata_discovery::{
+    DiscoveredColumn, DiscoveredRelation, DiscoveryAllocation, DiscoveryColumnProjection,
+    DiscoveryProjection, DiscoveryRelationKind, DiscoveryViewDomainUnavailable,
 };
 pub use metadata_maintenance::{
     CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorExpireSnapshotsExecute,

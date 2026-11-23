@@ -318,7 +318,10 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
         original_null.value_type(),
         &ValueType::new(DataType::Null, true)
     );
-    assert_eq!(value_type, &ValueType::new(DataType::Utf8, true));
+    assert_eq!(
+        value_type,
+        &scalar::nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0)
+    );
     let canonical_null = owner
         .plan()
         .constants()

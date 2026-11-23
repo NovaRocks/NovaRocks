@@ -23,6 +23,8 @@
 //! Every case requires a fresh 1FE+3BE harness. Inputs are finite constants in
 //! this module; no Trino image or external shared endpoint is used. The Trino
 //! entrypoint owner maintains these cases with the default functional suite.
+mod query_observation;
+
 use super::result_delivery_support::{await_idle, metric};
 use crate::{
     actors::trino_protocol::{RawResponse, TrinoClient},
@@ -62,6 +64,7 @@ pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
         Case::Completion,
         Case::StatementSize,
         Case::Info,
+        Case::QueryObservation,
     ]
     .into_iter()
     .map(|case| {
@@ -86,6 +89,7 @@ enum Case {
     Completion,
     StatementSize,
     Info,
+    QueryObservation,
 }
 struct TrinoProtocol {
     case: Case,
@@ -110,16 +114,29 @@ impl Scenario for TrinoProtocol {
             Case::Completion => "trino-protocol/command-completion-shape",
             Case::StatementSize => "trino-protocol/statement-too-large",
             Case::Info => "trino-protocol/info-and-head",
+            Case::QueryObservation => "trino-protocol/query-observation-and-kill",
         }
     }
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module("trino_protocol", self.name(), false, false)
+        let mut declaration =
+            crate::scenarios::declarations::for_module("trino_protocol", self.name(), false, false);
+        if matches!(self.case, Case::QueryObservation) {
+            declaration.impact.paths.extend([
+                "tests/system-test-runner/src/scenarios/trino_protocol/query_observation.rs".into(),
+                "novarocks/query-application/src/query_control/**".into(),
+                "novarocks/query-application/src/system_tables/**".into(),
+                "novarocks/query-application/src/sql/trino_admission.rs".into(),
+                "novarocks/sql/src/compiler/completion_driver.rs".into(),
+            ]);
+        }
+        declaration
     }
     fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
         let fe = match self.case {
             Case::Abandon => Some(format!(
                 "[standalone_server]\ntrino_client_timeout_ms = {ABANDON_MS}\n"
             )),
+            Case::QueryObservation => Some(query_observation::frontend_overlay()),
             _ => None,
         };
         Ok(ScenarioLaunchConfig {
@@ -166,10 +183,14 @@ impl Scenario for TrinoProtocol {
             }
             Case::StatementSize => statement_size(context, &actor),
             Case::Info => info(context, &actor),
+            Case::QueryObservation => {
+                self.prepare_catalog(context, &actor)?;
+                query_observation::run(context, &actor, epoch)
+            }
         };
         if matches!(
             self.case,
-            Case::Session | Case::UpdateType | Case::Completion
+            Case::Session | Case::UpdateType | Case::Completion | Case::QueryObservation
         ) {
             let cleanup = success(&actor, "DROP CATALOG IF EXISTS trc1_catalog");
             match (outcome, cleanup) {
@@ -533,8 +554,79 @@ fn single_statement_admission(actor: &TrinoClient) -> Result<()> {
     Ok(())
 }
 
+fn prepared_session_effects(actor: &TrinoClient) -> Result<()> {
+    let definition = success(actor, "PREPARE p FROM SELECT CAST(? AS BIGINT) AS n")?;
+    let end = terminal(&definition)?;
+    let envelope = end.json()?;
+    ensure!(
+        envelope["updateType"] == "PREPARE",
+        "PREPARE sent wrong update type"
+    );
+    ensure!(
+        envelope["columns"] == json!([]) && envelope.get("updateCount").is_none(),
+        "PREPARE sent wrong completion shape: {envelope}"
+    );
+    let prepared = end
+        .headers
+        .get("x-trino-added-prepare")
+        .context("PREPARE omitted its definition")?
+        .to_str()?;
+    let replay_uri = definition
+        .iter()
+        .rev()
+        .nth(1)
+        .context("PREPARE omitted its poll page")?
+        .next_uri()?
+        .context("PREPARE omitted terminal URI")?;
+    let replay = actor.get(&replay_uri)?;
+    ensure!(
+        replay.headers.get("x-trino-added-prepare") == end.headers.get("x-trino-added-prepare"),
+        "PREPARE terminal replay changed its definition"
+    );
+
+    let original = actor.with_session(&[("x-trino-prepared-statement", prepared)]);
+    let replacement = actor.with_session(&[("x-trino-prepared-statement", "p=SELECT+22")]);
+    let row_pages = success(&original, "EXECUTE p USING 11")?;
+    ensure!(
+        row_pages
+            .iter()
+            .any(|page| page.json().is_ok_and(|page| page["data"] == json!([[11]]))),
+        "original request did not use its own prepared definition"
+    );
+    let replacement_rows = success(&replacement, "EXECUTE p")?;
+    ensure!(
+        replacement_rows
+            .iter()
+            .any(|page| page.json().is_ok_and(|page| page["data"] == json!([[22]]))),
+        "replacement request did not use its own prepared definition"
+    );
+
+    let description = success(&original, "DESCRIBE INPUT p")?;
+    ensure!(
+        description.iter().any(|page| page.json().is_ok_and(|page| {
+            page["data"] == json!([[0, "unknown"]])
+                && page["columns"][0]["type"] == "integer"
+                && page["columns"][1]["type"] == "varchar(7)"
+        })),
+        "DESCRIBE INPUT returned the wrong position, type or column signature"
+    );
+    let removed = success(&original, "DEALLOCATE PREPARE p")?;
+    let end = terminal(&removed)?;
+    ensure!(
+        end.json()?["updateType"] == "DEALLOCATE"
+            && end
+                .headers
+                .get("x-trino-deallocated-prepare")
+                .is_some_and(|name| name == "p"),
+        "DEALLOCATE did not return its original name and shape"
+    );
+    failed_query(actor, "EXECUTE p", (5, "NOT_FOUND", "USER_ERROR"))?;
+    Ok(())
+}
+
 fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     single_statement_admission(actor)?;
+    prepared_session_effects(actor)?;
     context.action("verified one POST cannot apply the first SET or CREATE in a rejected batch");
     let client = actor.with_session(&[
         ("x-trino-catalog", "trc1_catalog"),
@@ -933,7 +1025,6 @@ fn refusals(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     );
     for (name, value) in [
         ("x-trino-transaction-id", "123"),
-        ("x-trino-prepared-statement", "prepared=SELECT+1"),
         ("x-trino-role", "system=ALL"),
         ("x-trino-extra-credential", "key=value"),
         ("x-trino-path", "catalog.schema"),
@@ -944,6 +1035,22 @@ fn refusals(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
             (13, "NOT_SUPPORTED", "USER_ERROR"),
         )?;
     }
+    let invalid = actor
+        .with_session(&[("x-trino-prepared-statement", "p=SELECT+%29")])
+        .submit("SELECT 1")?;
+    ensure!(
+        invalid.status == 400,
+        "invalid prepared definition reached statement registration"
+    );
+    let wrong_arity = failed_query(
+        actor,
+        "EXECUTE IMMEDIATE 'SELECT ?, ?' USING 1",
+        (80, "INVALID_PARAMETER_USAGE", "USER_ERROR"),
+    )?;
+    ensure!(
+        wrong_arity["error"]["errorLocation"].is_object(),
+        "prepared arity diagnostic lost its source"
+    );
     let error = failed_query(
         actor,
         "SELECT CAST(1 AS LARGEINT) AS wide_value",

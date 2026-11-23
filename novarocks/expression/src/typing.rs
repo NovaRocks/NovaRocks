@@ -97,6 +97,14 @@ pub trait ScalarBindingCatalog {
         control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError>;
 
+    /// Select a syntax-owned hidden scalar before converting its arguments.
+    fn select_trusted_scalar(
+        &self,
+        function: &FunctionId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError>;
+
     fn select_exact_scalar(
         &self,
         function: &FunctionId,
@@ -129,12 +137,16 @@ impl ScalarBindingCatalog for EngineFunctionCatalog {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        self.resolve_bound_trusted_by_id(
-            &operator.function_id(),
-            FunctionKind::Scalar,
-            request,
-            control,
-        )
+        self.select_trusted_scalar(&operator.function_id(), request, control)
+    }
+
+    fn select_trusted_scalar(
+        &self,
+        function: &FunctionId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted_by_id(function, FunctionKind::Scalar, request, control)
     }
 
     fn select_exact_scalar(
@@ -453,26 +465,9 @@ pub fn type_node(
             let arguments = arguments(children, work)?;
             let function = FunctionId::try_new("builtin.scalar/__map_subscript/v1")
                 .expect("valid MAP subscript function identity");
-            let Some(child) = children.first() else {
-                return Err(TypingError::InvalidShape(
-                    "MAP subscript needs its collection",
-                ));
-            };
-            // This candidate is selected by the actual uninhabited-key domain,
-            // not by the syntax or a reconstructed probe carrier.
-            let overload = if novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
-                &child.value_type,
-            ) {
-                "builtin.scalar/__map_subscript/(map-with-uninhabited-key<M,V>,any)->any<V>;strict;legacy"
-            } else {
-                "builtin.scalar/__map_subscript/(map<any<K>,any<V>>,any<K>)->any<V>;strict;legacy"
-            };
-            let overload = FunctionOverloadId::try_new(overload)
-                .expect("valid MAP subscript overload identity");
             work.flush()?;
-            let binding = context.catalog.select_exact_scalar(
+            let binding = context.catalog.select_trusted_scalar(
                 &function,
-                &overload,
                 request(&arguments, None),
                 work.control(),
             )?;
@@ -645,11 +640,10 @@ fn type_catalog_call(
 ) -> Result<NodeTyping, TypingError> {
     let arguments = arguments(children, work)?;
     work.flush()?;
-    let binding = context.catalog.select_scalar(
-        name,
-        request(&arguments, expected_result),
-        work.control(),
-    )?;
+    let binding = context
+        .catalog
+        .select_scalar(name, request(&arguments, expected_result), work.control())
+        .map_err(|error| route::unavailable_string_binding(name, children, error))?;
     type_selected_call(context, binding, expected_result, children, work)
 }
 

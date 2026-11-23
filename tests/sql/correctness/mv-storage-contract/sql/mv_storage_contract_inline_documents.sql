@@ -233,7 +233,7 @@ SELECT CASE WHEN COUNT() = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND STRLEFT(wide_value, 4) = k
+    AND SUBSTR(wide_value, 1, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check
@@ -259,7 +259,7 @@ SELECT CASE WHEN COUNT() = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND STRLEFT(wide_value, 4) = k
+    AND SUBSTR(wide_value, 1, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check
@@ -285,7 +285,7 @@ SELECT CASE WHEN COUNT() = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND STRLEFT(wide_value, 4) = k
+    AND SUBSTR(wide_value, 1, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check
@@ -323,7 +323,7 @@ SELECT CASE WHEN COUNT() = 740
   AND SUM(LENGTH(wide_value)) = 35728
   AND SUM(CASE WHEN c01 = k AND c02 = k AND c03 = k AND c04 = k
     AND c05 = k AND c06 = k AND c07 = k AND c08 = k
-    AND STRLEFT(wide_value, 4) = k
+    AND SUBSTR(wide_value, 1, 4) = k
     AND LENGTH(REPLACE(SUBSTR(wide_value, 5), 'x', '')) = 0
     THEN 0 ELSE 1 END) = 0
   THEN 'OVERSIZED_CONTENT_OK' ELSE 'OVERSIZED_CONTENT_BAD' END AS content_check

@@ -748,6 +748,13 @@ pub fn compose_frontend_role_config(
                 config.server.frontend_cleanup_timeout_ms,
             ),
             trino_listener,
+            client_query_history: runtime_config
+                .frontend_workload
+                .query_history
+                .as_ref()
+                .map(|history| history.client_query_history())
+                .transpose()?,
+            memory_authority: std::sync::Arc::clone(&memory_authority),
             native_trust: std::sync::Arc::clone(native_trust.trust()),
             native_transport: frontend_native_transport(native_trust.transport()),
             native_ingress: runtime_config.native_ingress.to_adapter_config(),

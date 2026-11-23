@@ -53,50 +53,6 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
 
-/// Captured at an actual logical GROUP_CONCAT call in its lexical SELECT scope.
-/// The optional raw limit distinguishes missing admission from a real value.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct GroupConcatSourceFacts {
-    pub legacy: bool,
-    pub max_len: Option<i64>,
-}
-impl GroupConcatSourceFacts {
-    /// Original lexical values and sparse identities, shared with lowering.
-    pub(crate) fn parameter_entries(
-        &self,
-    ) -> Option<
-        [(
-            novarocks_type_contract::SemanticParameterId,
-            novarocks_type_contract::SemanticParameterValue,
-        ); 2],
-    > {
-        use novarocks_type_contract::{SemanticParameterId as I, SemanticParameterValue as V};
-        let raw = self.max_len?;
-        Some([
-            (
-                I::new(if self.legacy { 2 } else { 1 }),
-                V::GroupConcatLegacy(self.legacy),
-            ),
-            (I::new(3), V::GroupConcatMaxLen(raw)),
-        ])
-    }
-    pub fn environment(&self) -> [novarocks_type_contract::SemanticParameterRef; 2] {
-        use novarocks_type_contract::{
-            SemanticParameterId as I, SemanticParameterKey as K, SemanticParameterRef as R,
-        };
-        [
-            R {
-                id: I::new(if self.legacy { 2 } else { 1 }),
-                expected_key: K::GroupConcatLegacy,
-            },
-            R {
-                id: I::new(3),
-                expected_key: K::GroupConcatMaxLen,
-            },
-        ]
-    }
-}
-
 /// Positive evidence of the constructor that supplied an exact result target.
 /// It is not inferred from a function name, selected result or source absence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -125,7 +81,7 @@ struct SqlFunctionCallFacts {
     /// A real producer-supplied result target, separate from inferred selection.
     result_constraint: Option<novarocks_functions::FunctionValueType>,
     result_constraint_origin: SqlResultConstraintOrigin,
-    group_concat: Option<GroupConcatSourceFacts>,
+
     statement_start: Option<novarocks_type_contract::StatementStartUtc>,
     time_zone: Option<novarocks_type_contract::TimeZoneKey>,
     aggregate_state_source: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
@@ -141,7 +97,7 @@ impl SqlFunctionBinding {
             decimal_overflow_policy,
             result_constraint: None,
             result_constraint_origin: SqlResultConstraintOrigin::Unconstrained,
-            group_concat: None,
+
             statement_start: None,
             time_zone: None,
             aggregate_state_source: None,
@@ -164,7 +120,7 @@ impl SqlFunctionBinding {
             result_constraint_origin: SqlResultConstraintOrigin::ValueDomainConversion {
                 final_target,
             },
-            group_concat: None,
+
             statement_start: None,
             time_zone: None,
             aggregate_state_source: None,
@@ -195,7 +151,7 @@ impl SqlFunctionBinding {
             decimal_overflow_policy,
             result_constraint: Some(result_constraint),
             result_constraint_origin: SqlResultConstraintOrigin::ArrayCommonCoercion,
-            group_concat: None,
+
             statement_start: None,
             time_zone: None,
             aggregate_state_source: None,
@@ -212,27 +168,13 @@ impl SqlFunctionBinding {
             decimal_overflow_policy,
             result_constraint: Some(result_constraint),
             result_constraint_origin: SqlResultConstraintOrigin::OperatorDecimalFloatCoercion,
-            group_concat: None,
+
             statement_start: None,
             time_zone: None,
             aggregate_state_source: None,
         }))
     }
 
-    pub(crate) fn with_group_concat_source(mut self, facts: GroupConcatSourceFacts) -> Self {
-        let old = &self.0;
-        self.0 = Arc::new(SqlFunctionCallFacts {
-            resolved: old.resolved.clone(),
-            decimal_overflow_policy: old.decimal_overflow_policy,
-            result_constraint: old.result_constraint.clone(),
-            result_constraint_origin: old.result_constraint_origin.clone(),
-            group_concat: Some(facts),
-            statement_start: old.statement_start,
-            time_zone: old.time_zone,
-            aggregate_state_source: old.aggregate_state_source.clone(),
-        });
-        self
-    }
     /// Retain the actual lexical aggregate producer's DISTINCT and ORDER facts.
     /// This receipt is independent of a consuming merge call's execution flags.
     pub(crate) fn with_aggregate_state_source(
@@ -245,7 +187,7 @@ impl SqlFunctionBinding {
             decimal_overflow_policy: old.decimal_overflow_policy,
             result_constraint: old.result_constraint.clone(),
             result_constraint_origin: old.result_constraint_origin.clone(),
-            group_concat: old.group_concat.clone(),
+
             statement_start: old.statement_start,
             time_zone: old.time_zone,
             aggregate_state_source: Some(Arc::new(facts)),
@@ -256,10 +198,6 @@ impl SqlFunctionBinding {
         &self,
     ) -> Option<&novarocks_type_contract::AggregateStateInterpretation> {
         self.0.aggregate_state_source.as_deref()
-    }
-
-    pub(crate) fn group_concat_source(&self) -> Option<&GroupConcatSourceFacts> {
-        self.0.group_concat.as_ref()
     }
 
     /// Attach only the time facts declared by the actual selected overload.

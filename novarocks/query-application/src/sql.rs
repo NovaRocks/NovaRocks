@@ -39,6 +39,9 @@ pub mod session;
 /// Typed session-admission errors and their stable user-error descriptors.
 pub mod session_admit;
 
+/// SQL argument binding for the FE query-management procedure.
+pub mod kill_query;
+
 /// Typed Trino statement admission shared by syntax-specific callers.
 pub mod trino_admission;
 

@@ -696,6 +696,21 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         );
         entry.phase = EntryPhase::Concluded(evidence);
     }
+    /// After the original execution exits, retained data-mutation evidence
+    /// needs passive receipts and dispatch facts, not the preparation scope.
+    pub(crate) fn retire_concluded_preparations(&self) {
+        let retired: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .values_mut()
+            .filter(|entry| matches!(entry.phase, EntryPhase::Concluded(_)))
+            .filter_map(|entry| entry.checked.preparation.take())
+            .collect();
+        drop(retired);
+    }
+
     /// Observes an exact positively-applied entry. This grants no budget or I/O authority.
     pub(crate) fn finalization_activity(
         &self,

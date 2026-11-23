@@ -237,6 +237,8 @@ mod scalar_domain_tests {
             purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
+            statement_relation: None,
+            prepared_parameters: None,
             table_sequence: None,
             constant_policy: crate::constant::test_constant_policy(),
             control,
@@ -578,7 +580,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains("select coalesce(null,null),case when true then null else null end"),
-            vec![None, Some(SqlType::String)]
+            vec![None, None]
         );
     }
 
@@ -648,20 +650,20 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_scalar_nullif_comparator_does_not_supply_the_returned_domain() {
-        let error =
-            super::super::analyze(&query("select nullif(h,b) from t"), &Catalog, "db").unwrap_err();
-        assert!(
-            error.to_string().contains("no matching declared overload"),
-            "{error}"
-        );
+        for sql in [
+            "select nullif(h,b) from t",
+            "select nullif(j,s) from t",
+            "select nullif(s,j) from t",
+        ] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert!(
+                error.to_string().contains("no matching declared overload"),
+                "{sql}: {error}"
+            );
+        }
         assert_eq!(
-            output_domains("select nullif(h,h),nullif(j,s),nullif(s,j),nullif(null,j) from t"),
-            vec![
-                Some(SqlType::Hll),
-                Some(SqlType::String),
-                Some(SqlType::String),
-                Some(SqlType::Json)
-            ]
+            output_domains("select nullif(h,h),nullif(j,j),nullif(null,j) from t"),
+            vec![Some(SqlType::Hll), Some(SqlType::Json), Some(SqlType::Json)]
         );
         let expression = output_expressions("select nullif(null,j) from t").remove(0);
         let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
@@ -792,8 +794,24 @@ mod scalar_domain_tests {
             );
         }
         assert_eq!(
-            output_domains("select cast(j as varchar),cast(h as varbinary) from t"),
-            vec![Some(SqlType::String), Some(SqlType::Binary)]
+            output_domains("select cast(j as varchar),j from t"),
+            vec![Some(SqlType::String), Some(SqlType::Json)]
+        );
+        assert_opaque_binary_cast_rejected("select cast(h as varbinary) from t");
+    }
+
+    fn assert_opaque_binary_cast_rejected(sql: &str) {
+        let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch,
+            "{sql}: {error}"
+        );
+        assert!(
+            error
+                .message()
+                .contains("source and target have no legal Trino conversion"),
+            "{sql}: {error}"
         );
     }
 
@@ -821,7 +839,7 @@ mod scalar_domain_tests {
     fn m07_window_value_domains_follow_all_actual_value_suppliers() {
         assert_eq!(
             output_domains(
-                "select first_value(j) over (),last_value(h) over (),first_value(b) over (),last_value(v) over (),first_value(o) over (),last_value(p) over (),lead(j,1,j) over (),lag(j,1,null) over () from t"
+                "select first_value(j) over (),last_value(h) over (),first_value(b) over (),last_value(v) over (),first_value(o) over (),last_value(p) over (),lead(j,1,j) over (order by 1),lag(j,1,null) over (order by 1) from t"
             ),
             vec![
                 Some(SqlType::Json),
@@ -834,30 +852,26 @@ mod scalar_domain_tests {
                 Some(SqlType::Json)
             ]
         );
-        assert_eq!(
-            output_domains(
-                "select lead(j,1,s) over (),lag(s,1,j) over (),lead(h,1,b) over (),lag(b,1,h) over (),lead(j,1,cast(null as varchar)) over (),first_value(cast(j as varchar)) over (),lag(cast(j as varchar),1,j) over () from t"
-            ),
-            vec![
-                Some(SqlType::Json),
-                Some(SqlType::String),
-                Some(SqlType::Hll),
-                Some(SqlType::Bitmap),
-                Some(SqlType::Json),
-                Some(SqlType::String),
-                Some(SqlType::String)
-            ]
-        );
+        for sql in [
+            "select lead(j,1,s) over (order by 1) from t",
+            "select lead(h,1,b) over (order by 1) from t",
+        ] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+            );
+        }
         // The offset is a control operand, not a supplier of the result value.
         assert_eq!(
-            output_domains("select lead(j,2) over (),lag(h,2) over () from t"),
+            output_domains("select lead(j,2) over (order by 1),lag(h,2) over (order by 1) from t"),
             vec![Some(SqlType::Json), Some(SqlType::Hll)]
         );
     }
 
     #[test]
     fn m07_window_nested_value_identity_preserves_shape_and_null_siblings() {
-        let sql = "with q as (select [b] as b from t) select first_value(b) over (),last_value(b) over (),lead(b,1,b) over (),lag(b,1,null) over () from q";
+        let sql = "with q as (select [b] as b from t) select first_value(b) over (),last_value(b) over (),lead(b,1,b) over (order by 1),lag(b,1,null) over (order by 1) from q";
         assert_eq!(
             output_domains(sql),
             vec![Some(SqlType::Array(Box::new(SqlType::Bitmap))); 4]
@@ -913,7 +927,7 @@ mod scalar_domain_tests {
             output_domains("select first_value(row(null,b)) over () from t"),
             vec![None]
         );
-        let sql = "with q as (select [parse_json('{}')] as j,['plain'] as s) select lead(j,1,s) over () from q";
+        let sql = "with q as (select [parse_json('{}')] as j) select lead(j,1,j) over (order by 1) from q";
         let expression = output_expressions(sql).remove(0);
         let ExprKind::WindowCall { binding, args, .. } = &original_window(&expression).kind else {
             panic!("actual window");
@@ -950,19 +964,19 @@ mod scalar_domain_tests {
     fn m07_window_json_defaults_keep_identity_and_variant_casts_are_rejected() {
         assert_eq!(
             output_domains(
-                "select lead(j,1,cast(null as json)) over (),lag(j,1,cast(null as json)) over () from t"
+                "select lead(j,1,cast(null as json)) over (order by 1),lag(j,1,cast(null as json)) over (order by 1) from t"
             ),
             vec![Some(SqlType::Json); 2]
         );
         assert_eq!(
             output_domains(
-                "select lead(j,1,cast(j as json)) over (),lag(j,1,cast(j as json)) over (),first_value(cast(j as json)) over () from t"
+                "select lead(j,1,cast(j as json)) over (order by 1),lag(j,1,cast(j as json)) over (order by 1),first_value(cast(j as json)) over () from t"
             ),
             vec![Some(SqlType::Json); 3]
         );
         for sql in [
-            "select lead(v,1,cast(null as variant)) over () from t",
-            "select lag(v,1,cast(v as variant)) over () from t",
+            "select lead(v,1,cast(null as variant)) over (order by 1) from t",
+            "select lag(v,1,cast(v as variant)) over (order by 1) from t",
             "select first_value(cast(X'AB01' as variant)) over ()",
             "select first_value(cast(cast(X'AB01' as varbinary) as variant)) over ()",
         ] {
@@ -970,7 +984,7 @@ mod scalar_domain_tests {
         }
         // A NULL default cannot erase a known sibling in a partial Struct or
         // a nested Map value. SqlType has no complete Null-bearing counterpart.
-        let sql = "with q as (select row(null,map(ARRAY['k'],ARRAY[b])) as r from t) select lead(r,1,null) over (),lag(r,1,null) over () from q";
+        let sql = "with q as (select row(null,map(ARRAY['k'],ARRAY[b])) as r from t) select lead(r,1,null) over (order by 1),lag(r,1,null) over (order by 1) from q";
         for expression in output_expressions(sql) {
             let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
                 unreachable!()
@@ -1392,94 +1406,132 @@ mod scalar_domain_tests {
         assert_eq!(args[0].value_type, source);
     }
 
-    #[test]
-    fn m07_window_final_compiler_scalar_proof_matches_the_frozen_output() {
-        // This oracle checks the window output domain and frozen scalar proof, not
-        // to_bitmap or variant_get availability. Installed bitmap_agg and an exact
-        // NULL Variant declaration supply the same opaque/Variant input domains.
-        // Pure LEAD/LAG defaults support only existing numeric/Utf8 profiles:
-        // Json uses a neutral NULL; mixed physical carriers exercise both default
-        // conversions, and Variant uses the installed two-argument source path.
-        // The semantic-only value-supplier and Variant-default tests above retain
-        // the mixed nominal/default rules independently of pure CPU admission.
+    fn compile_scalar_proof(sql: &str, uses_catalog: bool) -> crate::compiler::SqlCompletedPlan {
         use crate::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
             SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
             SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
             builtin_sql_function_catalog,
         };
-        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ResultValueDomain as D};
+        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
+
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([17; 16]).unwrap(),
+            SqlStatementInput::parsed_query(Box::new(query(sql))),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: Some("iceberg".to_owned()),
+                current_database: "db".to_owned(),
+                optimizer_settings: SessionOptimizerSettings {
+                    // This fixture supplies the original catalog, statistics and provider facts.
+                    enable_materialized_view_rewrite: Some(false),
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            crate::constant::test_constant_policy(),
+            SqlCompileControl::unbounded(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        if uses_catalog {
+            return crate::compiler::complete_with_catalog_for_test(
+                request,
+                |need| {
+                    let relation = need.relation();
+                    let mut resolved = Catalog
+                        .resolve_table_for_analysis(
+                            Some(&relation.catalog),
+                            &relation.namespace,
+                            &relation.table,
+                        )
+                        .expect("signed fixture declaration");
+                    // Retain the exact Catalog column types and supply a current
+                    // data scan identity that can reach provider completion.
+                    resolved.planner.source =
+                        crate::compiler::mv_rewrite::test_data_scan_source_for(
+                            &relation.catalog,
+                            &relation.namespace,
+                            &relation.table,
+                        );
+                    resolved
+                },
+                sql,
+            );
+        }
+        let SqlCompileProgress::Complete(completed) =
+            SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control())
+                .unwrap_or_else(|error| panic!("{sql}: {error}"))
+        else {
+            panic!("source-free scalar proof unexpectedly needs observations: {sql}");
+        };
+        completed
+    }
+
+    #[test]
+    fn m07_window_final_compiler_scalar_proof_matches_the_frozen_output() {
+        // Variant comes from the exact fixture catalog declaration. JSON
+        // and unbounded VARCHAR retain their source-free ScalarValueV1 paths.
+        use novarocks_physical_plan::ResultValueDomain as D;
         use novarocks_result_contract::ScalarValueType as V;
-        for (sql, domain, scalar) in [
+        for (sql, uses_catalog, domain, scalar) in [
             (
                 "select first_value(parse_json('{}')) over ()",
+                false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select lead(parse_json('{}'),1,null) over ()",
+                "select lead(parse_json('{}'),1,null) over (order by 1)",
+                false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select lag(parse_json('{}'),1,null) over ()",
+                "select lag(parse_json('{}'),1,null) over (order by 1)",
+                false,
                 D::Json,
                 V::Json,
             ),
             (
-                "select lead('plain',1,cast(7 as bigint)) over ()",
+                "select lead(cast('plain' as varchar),1,'fallback') over (order by 1)",
+                false,
                 D::Plain,
                 V::String,
             ),
             (
-                "select lag(cast(7 as bigint),1,'2') over ()",
+                "select lag(cast(7 as bigint),1,2) over (order by 1)",
+                false,
                 D::Plain,
                 V::SignedInteger(64),
             ),
             (
-                "select first_value(cast(null as variant)) over ()",
+                "select first_value(v) over () from t",
+                true,
                 D::Variant,
                 V::Variant,
             ),
             (
-                "with q as (select cast(null as variant) as v) select lead(v,1) over () from q",
+                "with q as (select v from t) select lead(v,1) over (order by 1) from q",
+                true,
                 D::Variant,
                 V::Variant,
             ),
             (
-                "with q as (select cast(null as variant) as v) select lag(v,1) over () from q",
+                "with q as (select v from t) select lag(v,1) over (order by 1) from q",
+                true,
                 D::Variant,
                 V::Variant,
             ),
         ] {
-            let request = SqlFinalPlanCompileRequest::new(
-                PlanVersionId::try_new([17; 16]).unwrap(),
-                SqlStatementInput::parsed_query(Box::new(query(sql))),
-                SqlCompileIntent::Query,
-                SqlSessionContext {
-                    sql_semantics: Default::default(),
-                    current_catalog: Some("iceberg".to_owned()),
-                    current_database: "db".to_owned(),
-                    optimizer_settings: SessionOptimizerSettings::default(),
-                },
-                SqlPlanningEnvironment::Distributed,
-                builtin_sql_function_catalog().snapshot(),
-                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                crate::constant::test_constant_policy(),
-                SqlCompileControl::unbounded(),
-                PipelineDopDomain {
-                    min: 1,
-                    max: 8,
-                    requires_power_of_two: true,
-                },
-                DEFAULT_COMPLETION_LIMITS,
-            );
-            let SqlCompileProgress::Complete(completed) =
-                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control())
-                    .unwrap()
-            else {
-                panic!("source-free window unexpectedly needs observations: {sql}");
-            };
+            let completed = compile_scalar_proof(sql, uses_catalog);
             let result = completed.plan().result_port().unwrap();
             assert_eq!(result.fields[0].domain, domain, "{sql}");
             let expected_domain = match domain {
@@ -1495,7 +1547,9 @@ mod scalar_domain_tests {
                 expected_domain,
                 "complete frozen Window output: {sql}"
             );
-            let schema = completed.scalar_schema().unwrap();
+            let schema = completed
+                .scalar_schema()
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
             assert_eq!(schema.field().value_type, scalar, "{sql}");
             assert_eq!(
                 schema.field().nullable,
@@ -1509,6 +1563,12 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_projection_occurrences_retain_exact_binary_producer_witnesses() {
+        for sql in [
+            "select cast(b as varbinary) from t",
+            "with q as (select p from t) select cast(p as varbinary) from q",
+        ] {
+            assert_opaque_binary_cast_rejected(sql);
+        }
         for (sql, expected) in [
             (
                 "select p,b,h from t",
@@ -1531,7 +1591,7 @@ mod scalar_domain_tests {
                 vec![Some(SqlType::Percentile); 2],
             ),
             (
-                "select b as b,b as again,cast(b as varbinary) as raw from t",
+                "select b as b,b as again,X'AB01' as raw from t",
                 vec![
                     Some(SqlType::Bitmap),
                     Some(SqlType::Bitmap),
@@ -1539,7 +1599,7 @@ mod scalar_domain_tests {
                 ],
             ),
             (
-                "with q as (select p as p from t) select cast(p as varbinary) as raw,p from q",
+                "with q as (select p as p,X'AB01' as raw from t) select raw,p from q",
                 vec![Some(SqlType::Binary), Some(SqlType::Percentile)],
             ),
         ] {
@@ -2107,20 +2167,20 @@ mod scalar_domain_tests {
         // The semantic transform tests above own flatten/repeat/zip rules.
         // Final compiler proofs use installed suppliers of the same exact
         // domains; declaration-only functions do not imply pure CPU presence.
-        use crate::compiler::{
-            DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
-            SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
-            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-            builtin_sql_function_catalog,
-        };
-        use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ResultValueDomain as D};
+        use novarocks_physical_plan::ResultValueDomain as D;
         use novarocks_result_contract::{
             NamedScalarField as N, ScalarField as F, ScalarOpaqueType as O, ScalarValueType as V,
         };
-        for (sql, domain, scalar) in [
-            ("select element_at([parse_json('{}')],1)", D::Json, V::Json),
+        for (sql, uses_catalog, domain, scalar) in [
+            (
+                "select element_at([parse_json('{}')],1)",
+                false,
+                D::Json,
+                V::Json,
+            ),
             (
                 "select [parse_json('{}')]",
+                false,
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,
@@ -2128,7 +2188,8 @@ mod scalar_domain_tests {
                 })),
             ),
             (
-                "select [cast(null as variant)]",
+                "select [v] from t",
+                true,
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,
@@ -2136,65 +2197,42 @@ mod scalar_domain_tests {
                 })),
             ),
             (
-                "select element_at([cast(null as variant)],1)",
+                "select element_at([v],1) from t",
+                true,
                 D::Variant,
                 V::Variant,
             ),
             (
-                "select [cast(null as ROW(col1 bitmap,col2 json))]",
+                "select [r] from t",
+                true,
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,
                     value_type: V::Struct(vec![
                         N {
-                            name: "col1".to_owned(),
-                            field: F {
-                                nullable: true,
-                                value_type: V::Opaque(O::Bitmap),
-                            },
-                        },
-                        N {
-                            name: "col2".to_owned(),
+                            name: "json".to_owned(),
                             field: F {
                                 nullable: true,
                                 value_type: V::Json,
+                            },
+                        },
+                        N {
+                            name: "bitmap".to_owned(),
+                            field: F {
+                                nullable: true,
+                                value_type: V::Opaque(O::Bitmap),
                             },
                         },
                     ]),
                 })),
             ),
         ] {
-            let request = SqlFinalPlanCompileRequest::new(
-                PlanVersionId::try_new([17; 16]).unwrap(),
-                SqlStatementInput::parsed_query(Box::new(query(sql))),
-                SqlCompileIntent::Query,
-                SqlSessionContext {
-                    sql_semantics: Default::default(),
-                    current_catalog: Some("iceberg".to_owned()),
-                    current_database: "db".to_owned(),
-                    optimizer_settings: SessionOptimizerSettings::default(),
-                },
-                SqlPlanningEnvironment::Distributed,
-                builtin_sql_function_catalog().snapshot(),
-                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                crate::constant::test_constant_policy(),
-                SqlCompileControl::unbounded(),
-                PipelineDopDomain {
-                    min: 1,
-                    max: 8,
-                    requires_power_of_two: true,
-                },
-                DEFAULT_COMPLETION_LIMITS,
-            );
-            let SqlCompileProgress::Complete(completed) =
-                SqlCompiler::start(request.try_into_completion().unwrap(), fixture_control())
-                    .unwrap()
-            else {
-                panic!("source-free transform unexpectedly needs observations: {sql}");
-            };
+            let completed = compile_scalar_proof(sql, uses_catalog);
             let result = completed.plan().result_port().unwrap();
             assert_eq!(result.fields[0].domain, domain, "{sql}");
-            let schema = completed.scalar_schema().unwrap();
+            let schema = completed
+                .scalar_schema()
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
             assert_eq!(schema.field().value_type, scalar, "{sql}");
             assert_eq!(
                 schema.field().nullable,

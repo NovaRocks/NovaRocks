@@ -209,7 +209,14 @@ fn update(
         (None, _) => None,
         (Some(ExtremaValue::Bool(a)), ExtremaValue::Bool(b)) => Some(b.cmp(&a)),
         (Some(ExtremaValue::I64(a)), ExtremaValue::I64(b)) => Some(b.cmp(&a)),
-        (Some(ExtremaValue::F64(a)), ExtremaValue::F64(b)) => Some(b.total_cmp(&a)),
+        (Some(ExtremaValue::F64(a)), ExtremaValue::F64(b)) => {
+            use crate::aggregate_scalar::ExtremaDirection;
+            let direction = match operation {
+                ExtremaOperation::Min => ExtremaDirection::Minimum,
+                ExtremaOperation::Max => ExtremaDirection::Maximum,
+            };
+            Some(direction.compare_float(b, a))
+        }
         (Some(ExtremaValue::I128(a)), ExtremaValue::I128(b)) => Some(b.cmp(&a)),
         (Some(ExtremaValue::I256(a)), ExtremaValue::I256(b)) => Some(b.cmp(&a)),
         (Some(ExtremaValue::Temporal(a)), ExtremaValue::Temporal(b)) => {
@@ -259,6 +266,9 @@ impl ExtremaKernel {
 }
 
 impl PreparedAggregateKernel for ExtremaKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

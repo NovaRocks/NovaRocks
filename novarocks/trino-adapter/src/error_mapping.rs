@@ -30,10 +30,16 @@ use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind, StatementExternalEffectDisposition},
     cancellation::QueryCancellationReason,
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
+    query_control::{
+        ABANDONED_QUERY, ADMINISTRATIVELY_KILLED, ClientQueryFailure,
+        ManagementCancellationReceipt, USER_CANCELED,
+    },
     session_error::{QueryServiceError, QueryServiceErrorKind},
+    session_outcome::{cancellation_failure_input, governed_cancellation_failure_input},
     session_value::StatementSessionError,
 };
-use novarocks_user_error::UserError;
+use novarocks_user_error::{ErrorPhase, UserError};
+use novarocks_workload_control::CancellationReason as WorkCancellationReason;
 use serde::Serialize;
 use std::fmt;
 
@@ -55,6 +61,8 @@ pub(crate) enum TrinoErrorSource<'a> {
         reason: &'a QueryCancellationReason,
         message: &'a str,
     },
+    OriginalCancellation(QueryCancellationReason),
+    ManagementCancellation(&'a ManagementCancellationReceipt),
     Unsupported {
         message: &'a str,
     },
@@ -80,6 +88,16 @@ pub(crate) struct TrinoQueryError {
     pub(crate) failure_info: Option<serde_json::Value>,
 }
 
+impl TrinoQueryError {
+    pub(crate) fn failure(&self) -> ClientQueryFailure {
+        ClientQueryFailure {
+            code: self.error_code,
+            name: self.error_name,
+            error_type: self.error_type,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TrinoErrorLocation {
@@ -99,6 +117,7 @@ enum Code {
     FunctionNotFound,
     AmbiguousFunctionCall,
     InvalidFunctionArgument,
+    ExceededFunctionMemoryLimit,
     DivisionByZero,
     InvalidCastArgument,
     InvalidView,
@@ -128,9 +147,14 @@ enum Code {
     DuplicateNamedQuery,
     DuplicateColumnName,
     MissingColumnName,
+    MissingCatalogName,
+    MissingSchemaName,
     TypeMismatch,
     FunctionNotAggregate,
     ExpressionNotScalar,
+    ExpressionNotInDistinct,
+    MissingOrderBy,
+    InvalidParameterUsage,
     TypeNotFound,
     InvalidLiteral,
     MismatchedColumnAliases,
@@ -174,13 +198,14 @@ impl Code {
         match self {
             GenericUser => (0, "GENERIC_USER_ERROR", "USER_ERROR"),
             Syntax => (1, "SYNTAX_ERROR", "USER_ERROR"),
-            Abandoned => (2, "ABANDONED_QUERY", "USER_ERROR"),
-            UserCanceled => (3, "USER_CANCELED", "USER_ERROR"),
+            Abandoned => failure_fields(ABANDONED_QUERY),
+            UserCanceled => failure_fields(USER_CANCELED),
             PermissionDenied => (4, "PERMISSION_DENIED", "USER_ERROR"),
             NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
             AmbiguousFunctionCall => (32, "AMBIGUOUS_FUNCTION_CALL", "USER_ERROR"),
             InvalidFunctionArgument => (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
+            ExceededFunctionMemoryLimit => (37, "EXCEEDED_FUNCTION_MEMORY_LIMIT", "USER_ERROR"),
             DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
             InvalidCastArgument => (9, "INVALID_CAST_ARGUMENT", "USER_ERROR"),
             InvalidView => (11, "INVALID_VIEW", "USER_ERROR"),
@@ -192,7 +217,7 @@ impl Code {
             ConstraintViolation => (16, "CONSTRAINT_VIOLATION", "USER_ERROR"),
             NumericOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
-            AdministrativelyKilled => (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
+            AdministrativelyKilled => failure_fields(ADMINISTRATIVELY_KILLED),
             InvalidAnalyzeProperty => (42, "INVALID_ANALYZE_PROPERTY", "USER_ERROR"),
             InvalidCatalogProperty => (124, "INVALID_CATALOG_PROPERTY", "USER_ERROR"),
             InvalidDefaultColumnValue => (137, "INVALID_DEFAULT_COLUMN_VALUE", "USER_ERROR"),
@@ -211,9 +236,13 @@ impl Code {
             DuplicateNamedQuery => (53, "DUPLICATE_NAMED_QUERY", "USER_ERROR"),
             DuplicateColumnName => (54, "DUPLICATE_COLUMN_NAME", "USER_ERROR"),
             MissingColumnName => (55, "MISSING_COLUMN_NAME", "USER_ERROR"),
+            MissingCatalogName => (56, "MISSING_CATALOG_NAME", "USER_ERROR"),
+            MissingSchemaName => (57, "MISSING_SCHEMA_NAME", "USER_ERROR"),
             TypeMismatch => (58, "TYPE_MISMATCH", "USER_ERROR"),
             FunctionNotAggregate => (72, "FUNCTION_NOT_AGGREGATE", "USER_ERROR"),
             ExpressionNotScalar => (74, "EXPRESSION_NOT_SCALAR", "USER_ERROR"),
+            ExpressionNotInDistinct => (69, "EXPRESSION_NOT_IN_DISTINCT", "USER_ERROR"),
+            MissingOrderBy => (65, "MISSING_ORDER_BY", "USER_ERROR"),
             TypeNotFound => (43, "TYPE_NOT_FOUND", "USER_ERROR"),
             InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
             MismatchedColumnAliases => (61, "MISMATCHED_COLUMN_ALIASES", "USER_ERROR"),
@@ -223,6 +252,7 @@ impl Code {
             ProcedureNotFound => (29, "PROCEDURE_NOT_FOUND", "USER_ERROR"),
             InvalidProcedureArgument => (30, "INVALID_PROCEDURE_ARGUMENT", "USER_ERROR"),
             DuplicateProperty => (79, "DUPLICATE_PROPERTY", "USER_ERROR"),
+            InvalidParameterUsage => (80, "INVALID_PARAMETER_USAGE", "USER_ERROR"),
             TooManyArguments => (77, "TOO_MANY_ARGUMENTS", "USER_ERROR"),
             ViewIsStale => (81, "VIEW_IS_STALE", "USER_ERROR"),
             ViewIsRecursive => (82, "VIEW_IS_RECURSIVE", "USER_ERROR"),
@@ -256,6 +286,10 @@ impl Code {
     }
 }
 
+fn failure_fields(failure: ClientQueryFailure) -> (i32, &'static str, &'static str) {
+    (failure.code, failure.name, failure.error_type)
+}
+
 /// Pure projection used by mapping tests. Production callers retain their query ID.
 #[cfg(test)]
 pub(crate) fn query_error(source: TrinoErrorSource<'_>) -> TrinoQueryError {
@@ -281,6 +315,7 @@ pub(crate) fn query_error_for_query_with_effect(
 
 enum PublicMessage<'a> {
     Borrowed(&'a str),
+    ManagementCancellation(&'a ManagementCancellationReceipt),
     AddFilesUnknown(&'a str),
     Session(&'a StatementSessionError),
     Execution(&'a ExecutionFailureInput),
@@ -290,6 +325,13 @@ impl fmt::Display for PublicMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Borrowed(message) => formatter.write_str(message),
+            Self::ManagementCancellation(receipt) => {
+                write!(formatter, "Query killed by user '{}'. ", receipt.user())?;
+                match receipt.message().filter(|message| !message.is_empty()) {
+                    Some(message) => write!(formatter, "Message: {message}"),
+                    None => formatter.write_str("No message provided."),
+                }
+            }
             Self::AddFilesUnknown(message) => write!(formatter, "Failed to add files: {message}"),
             Self::Session(error) => fmt::Display::fmt(error, formatter),
             Self::OpenPartitionLimit { limit, opening } => write!(
@@ -360,6 +402,30 @@ fn project_source(
         TrinoErrorSource::Cancellation { reason, message } => (
             cancellation_code(reason),
             PublicMessage::Borrowed(message),
+            None,
+        ),
+        TrinoErrorSource::OriginalCancellation(reason) => {
+            let code = cancellation_code(&reason);
+            let input = match reason {
+                // The drain timeout belongs to the frontend lifecycle.
+                QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => {
+                    governed_cancellation_failure_input(
+                        WorkCancellationReason::FrontendDrainDeadlineExceeded,
+                    )
+                }
+                reason => cancellation_failure_input(reason),
+            };
+            return project_message(
+                query_id,
+                code,
+                PublicMessage::Execution(&input),
+                None,
+                effect,
+            );
+        }
+        TrinoErrorSource::ManagementCancellation(receipt) => (
+            Code::AdministrativelyKilled,
+            PublicMessage::ManagementCancellation(receipt),
             None,
         ),
         TrinoErrorSource::Unsupported { message } => {
@@ -534,7 +600,7 @@ fn service_error(
             query_id,
             code,
             PublicMessage::Borrowed(user.message()),
-            user_location(user, sql),
+            service_location(error, sql),
             StatementExternalEffectDisposition::combine(
                 error.external_effect_disposition(),
                 effect,
@@ -567,12 +633,7 @@ fn service_error(
         }
     }
     let public = error.diagnostic_with_external_effect(effect);
-    project_public_diagnostic(
-        query_id,
-        code,
-        &public,
-        error.user_error().and_then(|user| user_location(user, sql)),
-    )
+    project_public_diagnostic(query_id, code, &public, service_location(error, sql))
 }
 
 fn cancellation_code(reason: &QueryCancellationReason) -> Code {
@@ -583,9 +644,9 @@ fn cancellation_code(reason: &QueryCancellationReason) -> Code {
         QueryCancellationReason::ClientDisconnected => Code::Abandoned,
         QueryCancellationReason::ExplicitKill { .. }
         | QueryCancellationReason::ExplicitKillConnection { .. } => Code::AdministrativelyKilled,
-        QueryCancellationReason::DeadlineExceeded { .. } => Code::ExceededTimeLimit,
-        QueryCancellationReason::FrontendDrainDeadlineExceeded { .. }
-        | QueryCancellationReason::ServerShutdown => Code::ServerShuttingDown,
+        QueryCancellationReason::DeadlineExceeded { .. }
+        | QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => Code::ExceededTimeLimit,
+        QueryCancellationReason::ServerShutdown => Code::ServerShuttingDown,
     }
 }
 
@@ -770,10 +831,21 @@ fn user_code(code: &str) -> Option<Code> {
         | "sql.validate.invalid_structure" => Syntax,
         "sql.validate.duplicate_cte_name" => DuplicateNamedQuery,
         "sql.validate.duplicate_window_name" => DuplicateWindowName,
-        "sql.validate.invalid_window_frame_bounds" => InvalidWindowFrame,
-        "sql.analyze.unknown_catalog" => CatalogNotFound,
-        "sql.analyze.unknown_schema" => SchemaNotFound,
-        "sql.analyze.unknown_table" => TableNotFound,
+        "sql.validate.invalid_window_frame_bounds" | "sql.analyze.invalid_window_frame" => {
+            InvalidWindowFrame
+        }
+        "sql.analyze.unknown_catalog" | "sql.admit.show_catalog_not_found" => CatalogNotFound,
+        "sql.analyze.unknown_schema" | "sql.admit.show_schema_not_found" => SchemaNotFound,
+        "sql.analyze.unknown_table" | "sql.admit.show_table_not_found" => TableNotFound,
+        "sql.admit.show_missing_catalog" => MissingCatalogName,
+        "sql.admit.show_missing_schema" => MissingSchemaName,
+        "sql.admit.show_name_too_long" => Syntax,
+        "sql.admit.kill_query_arguments" => InvalidArguments,
+        "sql.admit.kill_query_argument_type" => TypeMismatch,
+        "sql.admit.kill_query_invalid_argument" => InvalidProcedureArgument,
+        "sql.admit.kill_query_target_not_found" => NotFound,
+        "sql.admit.kill_query_target_not_running" => NotSupported,
+        "sql.admit.kill_query_permission_denied" => PermissionDenied,
         "sql.analyze.unknown_column" => ColumnNotFound,
         "sql.analyze.unknown_function" => FunctionNotFound,
         "sql.analyze.ambiguous_function_call" => AmbiguousFunctionCall,
@@ -784,9 +856,14 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.view_is_stale" => ViewIsStale,
         "sql.analyze.view_is_recursive" => ViewIsRecursive,
         "sql.analyze.type_mismatch" => TypeMismatch,
+        "sql.admit.prepared_statement_not_found" => NotFound,
+        "sql.admit.expression_not_constant" => ExpressionNotConstant,
+        "sql.admit.invalid_parameter_usage" => InvalidParameterUsage,
         "sql.analyze.function_not_aggregate" => FunctionNotAggregate,
         "sql.analyze.expression_not_scalar" => ExpressionNotScalar,
-        "sql.admit.unknown_type" => TypeNotFound,
+        "sql.analyze.expression_not_in_distinct" => ExpressionNotInDistinct,
+        "sql.analyze.missing_order_by" => MissingOrderBy,
+        "sql.admit.unknown_type" | "sql.analyze.unknown_type" => TypeNotFound,
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.numeric_out_of_range" => NumericOutOfRange,
         "sql.analyze.invalid_function_argument" => InvalidFunctionArgument,
@@ -844,6 +921,7 @@ fn user_code(code: &str) -> Option<Code> {
         "query.execution.division_by_zero" => DivisionByZero,
         "query.execution.invalid_cast_argument" => InvalidCastArgument,
         "query.execution.invalid_function_argument" => InvalidFunctionArgument,
+        "query.execution.exceeded_function_memory_limit" => ExceededFunctionMemoryLimit,
         "sql.analyze.too_many_arguments" => TooManyArguments,
         "query.execution.cancelled" => UserCanceled,
         "query.execution.deadline_exceeded" => ExceededTimeLimit,
@@ -855,8 +933,43 @@ fn user_code(code: &str) -> Option<Code> {
     })
 }
 
+fn service_location(error: &QueryServiceError, sql: &str) -> Option<TrinoErrorLocation> {
+    let user = error.user_error()?;
+    let Some(source) = error.trino_statement_source() else {
+        return user_location(user, sql);
+    };
+    let mut location = user_location(user, source.sql())?;
+    if let Some(span) = source.immediate_literal_span() {
+        let anchor = utf16_location(
+            &span.to_user_error_location(source.request_sql()),
+            source.request_sql(),
+        )?;
+        let first_line = if matches!(user.phase(), ErrorPhase::Lex | ErrorPhase::Parse) {
+            // Trino's parser exceptions use the outer line of the literal.
+            anchor.line_number == 1
+        } else {
+            // Analyzed AST locations use the inner line of the reported node.
+            location.line_number == 1
+        };
+        if first_line {
+            location.column_number = location.column_number.checked_add(anchor.column_number)?;
+        }
+        location.line_number = anchor
+            .line_number
+            .checked_sub(1)?
+            .checked_add(location.line_number)?;
+    }
+    Some(location)
+}
+
 fn user_location(error: &UserError, sql: &str) -> Option<TrinoErrorLocation> {
-    let location = error.location()?;
+    utf16_location(error.location()?, sql)
+}
+
+fn utf16_location(
+    location: &novarocks_user_error::UserErrorLocation,
+    sql: &str,
+) -> Option<TrinoErrorLocation> {
     let line = usize::try_from(location.line().checked_sub(1)?).ok()?;
     let column = usize::try_from(location.column().checked_sub(1)?).ok()?;
     let text = sql.split('\n').nth(line)?;

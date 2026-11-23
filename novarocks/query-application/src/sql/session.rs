@@ -34,6 +34,7 @@ use registry::{SessionCatalogPropertyPort, SessionPropertyInputs, SessionPropert
 pub struct SessionSqlState {
     current_catalog: Option<String>,
     current_database: String,
+    explicit_database: bool,
     execution_settings: SessionExecutionSettings,
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
@@ -47,6 +48,7 @@ impl Default for SessionSqlState {
         Self {
             current_catalog: None,
             current_database: DEFAULT_DATABASE.into(),
+            explicit_database: false,
             execution_settings: SessionExecutionSettings::default(),
             optimizer_settings: SessionOptimizerSettings::default(),
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -63,6 +65,9 @@ impl SessionSqlState {
     }
     pub fn current_database(&self) -> &str {
         &self.current_database
+    }
+    pub fn explicit_database(&self) -> Option<&str> {
+        self.explicit_database.then_some(&self.current_database)
     }
     pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
         &self.sql_semantics
@@ -109,10 +114,11 @@ impl SessionSqlState {
             time_zone: value.time_zone,
             ..Self::default()
         };
-        state.assign_session_names(
-            value.catalog,
-            value.schema.unwrap_or_else(|| DEFAULT_DATABASE.into()),
-        );
+        state.current_catalog = value.catalog;
+        if let Some(schema) = value.schema {
+            state.current_database = schema;
+            state.explicit_database = true;
+        }
         inputs
             .project_into(&mut state)
             .map_err(session_property_error)?;
@@ -123,6 +129,7 @@ impl SessionSqlState {
     pub fn assign_session_names(&mut self, catalog: Option<String>, schema: String) {
         self.current_catalog = catalog;
         self.current_database = schema;
+        self.explicit_database = true;
     }
     pub fn set_resolved_database_context(&mut self, catalog: Option<String>, database: String) {
         self.assign_session_names(catalog, database);
@@ -194,14 +201,12 @@ impl SessionSqlState {
         novarocks_sql::sql_mode::SqlSemanticSettings,
         SessionPropertyInputs,
     ) {
-        let group_concat_max_len = self.execution_settings.group_concat_max_len();
         (
             self.current_catalog,
             self.current_database,
             self.execution_settings,
             self.optimizer_settings,
-            self.sql_semantics
-                .with_group_concat_max_len(group_concat_max_len),
+            self.sql_semantics,
             self.property_inputs,
         )
     }
@@ -257,7 +262,7 @@ pub struct SessionExecutionSettings {
     explain_detail: ExplainDetail,
     query_timeout_secs: Option<u64>,
     query_mem_limit_bytes: Option<i64>,
-    group_concat_max_len: i64,
+
     pipeline_dop: Option<i32>,
     enable_parquet_reader_page_index: bool,
     enable_scan_datacache: bool,
@@ -272,7 +277,7 @@ impl Default for SessionExecutionSettings {
             explain_detail: ExplainDetail::default(),
             query_timeout_secs: None,
             query_mem_limit_bytes: None,
-            group_concat_max_len: 1024,
+
             pipeline_dop: None,
             enable_parquet_reader_page_index: false,
             enable_scan_datacache: false,
@@ -305,16 +310,6 @@ impl SessionExecutionSettings {
 
     pub fn set_query_timeout_secs(&mut self, seconds: u64) {
         self.query_timeout_secs = (seconds > 0).then_some(seconds);
-    }
-
-    pub const fn group_concat_max_len(&self) -> i64 {
-        self.group_concat_max_len
-    }
-
-    /// Keep the session value verbatim; aggregate lowering clamps it to the
-    /// supported minimum before execution.
-    pub fn set_group_concat_max_len(&mut self, value: i64) {
-        self.group_concat_max_len = value;
     }
 
     pub const fn pipeline_dop(&self) -> Option<i32> {
@@ -430,12 +425,10 @@ mod tests {
         settings
             .set_runtime_filter_scan_wait_time_ms(0)
             .expect("zero is valid");
-        settings.set_group_concat_max_len(-1);
 
         assert_eq!(settings.query_timeout_secs(), Some(17));
         assert_eq!(settings.pipeline_dop(), Some(4));
         assert_eq!(settings.runtime_filter_scan_wait_time_ms(), Some(0));
-        assert_eq!(settings.group_concat_max_len(), -1);
     }
 
     #[test]
@@ -463,7 +456,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "group_concat_admission_tests.rs"]
-mod group_concat_admission_tests;

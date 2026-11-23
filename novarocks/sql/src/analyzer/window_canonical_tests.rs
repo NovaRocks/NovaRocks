@@ -247,60 +247,37 @@ fn window_canonical_lead_lag_offsets_preserve_original_sources_and_policy() {
 }
 
 #[test]
-fn window_canonical_default_parameter_keeps_independent_domain_and_original_refusal() {
-    let query = analyze("SELECT lead(v,off64,d) OVER (), lag(v,off64,NULL) OVER (), lead(text,off64,v) OVER (), lag(v,off64,CAST(NULL AS BIGINT)) OVER (), d, v FROM source",
-        &SourceCatalog { offset_nullable: false }, crate::functions::builtin_sql_function_catalog()).unwrap();
-    let first = args(projection(&query, 0));
+fn window_canonical_default_parameter_keeps_common_domain_and_original_refusal() {
+    let source = SourceCatalog {
+        offset_nullable: false,
+    };
+    let functions = crate::functions::builtin_sql_function_catalog();
+    let query = analyze("SELECT lead(v,off64,d) OVER (ORDER BY v), lag(v,off64,NULL) OVER (ORDER BY v), lag(v,off64,CAST(NULL AS BIGINT)) OVER (ORDER BY v), d FROM source", &source, functions).unwrap();
+    let default = &args(projection(&query, 0))[2];
     assert_eq!(
-        first[2].value_type,
-        FunctionValueType::new(DataType::Int32, true)
-    );
-    assert!(matches!(first[2].kind, ExprKind::ColumnRef { .. }));
-    assert_eq!(
-        source_column(&first[2]),
-        source_column(projection(&query, 4))
-    );
-    let null = args(projection(&query, 1));
-    assert_eq!(
-        null[2].value_type,
-        FunctionValueType::new(DataType::Null, true)
-    );
-    let text = args(projection(&query, 2));
-    assert_eq!(
-        text[0].value_type,
-        FunctionValueType::new(DataType::Utf8, true)
-    );
-    assert_eq!(
-        text[2].value_type,
-        FunctionValueType::new(DataType::Int64, false)
-    );
-    assert_eq!(
-        source_column(&text[2]),
-        source_column(projection(&query, 5))
-    );
-    let typed_null = args(projection(&query, 3));
-    assert_eq!(
-        typed_null[2].value_type,
+        default.value_type,
         FunctionValueType::new(DataType::Int64, true)
     );
-    for name in ["lead", "lag"] {
-        let sql = format!("SELECT {name}(v,off64,abs(v)) OVER () FROM source");
-        let error = analyze(
-            &sql,
-            &SourceCatalog {
-                offset_nullable: false,
-            },
-            crate::functions::builtin_sql_function_catalog(),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
+    let ExprKind::Cast { expr, .. } = &default.kind else {
+        panic!("INTEGER default must be widened to BIGINT");
+    };
+    assert_eq!(source_column(expr), source_column(projection(&query, 3)));
+    for index in [1, 2] {
+        let default = &args(projection(&query, index))[2];
         assert_eq!(
-            error.message(),
-            "The type of the third parameter of LEAD/LAG not match the type BIGINT."
+            default.value_type,
+            FunctionValueType::new(DataType::Int64, true)
         );
-        assert!(error.span().is_some());
-        assert_eq!(error.control_error(), None);
     }
+    let error = analyze(
+        "SELECT lead(text,off64,v) OVER (ORDER BY v) FROM source",
+        &source,
+        functions,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
+    assert!(error.span().is_some());
+    assert_eq!(error.control_error(), None);
 }
 
 #[test]
@@ -312,7 +289,7 @@ fn window_canonical_arithmetic_default_retains_the_selected_shape_and_refusals()
     };
     let functions = crate::functions::builtin_sql_function_catalog();
     let query = analyze(
-        "SELECT lag(d, 5, 1+2+3) OVER () FROM source",
+        "SELECT lag(d, 5, 1+2+3) OVER (ORDER BY v) FROM source",
         &source,
         functions,
     )
@@ -329,26 +306,20 @@ fn window_canonical_arithmetic_default_retains_the_selected_shape_and_refusals()
         crate::common::binary_operator::typed_operands(left).expect("inner default addition");
     assert_eq!(inner, OperatorFunction::Add);
 
-    for (sql, value_type) in [
-        (
-            "SELECT lag(d, 5, abs(1)) OVER (ORDER BY missing) FROM source",
-            "INT",
-        ),
-        ("SELECT lag(d, 5, abs(1)+2) OVER () FROM source", "INT"),
-        ("SELECT lag(d, 5, d+1) OVER () FROM source", "INT"),
-        (
-            "SELECT lag(CAST(v AS REAL), 5, 1+2+3) OVER () FROM source",
-            "FLOAT",
-        ),
+    for sql in [
+        "SELECT lag(d, 5, abs(1)+2) OVER (ORDER BY v) FROM source",
+        "SELECT lag(d, 5, d+1) OVER (ORDER BY v) FROM source",
+        "SELECT lag(CAST(v AS REAL), 5, 1+2+3) OVER (ORDER BY v) FROM source",
     ] {
-        let error = analyze(sql, &source, functions).unwrap_err();
-        assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch, "{sql}");
-        assert_eq!(
-            error.message(),
-            format!("The type of the third parameter of LEAD/LAG not match the type {value_type}."),
-            "{sql}"
-        );
+        analyze(sql, &source, functions).unwrap_or_else(|error| panic!("{sql}: {error}"));
     }
+    let error = analyze(
+        "SELECT lag(d, 5, abs(1)) OVER (ORDER BY missing) FROM source",
+        &source,
+        functions,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), AnalyzeErrorKind::UnknownColumn);
 }
 
 #[test]
@@ -669,7 +640,7 @@ fn window_canonical_exact_rebind_and_catalog_first_control_cause_never_retry() {
         ] {
             let functions = FaultCatalog::new(WindowFault::Control(at, cause.clone()));
             let error = analyze(
-                "SELECT lead(v,off64) OVER () FROM source",
+                "SELECT lead(v,off64) OVER (ORDER BY v) FROM source",
                 &SourceCatalog {
                     offset_nullable: false,
                 },
@@ -687,7 +658,7 @@ fn window_canonical_exact_rebind_and_catalog_first_control_cause_never_retry() {
     ] {
         let functions = FaultCatalog::new(fault);
         let error = analyze(
-            "SELECT lead(v,off64) OVER () FROM source",
+            "SELECT lead(v,off64) OVER (ORDER BY v) FROM source",
             &SourceCatalog {
                 offset_nullable: false,
             },
@@ -708,7 +679,7 @@ fn window_builtin_narrow_offsets_keep_original_columns_and_nullable_canonical_ca
         ("lag", "off16", DataType::Int16, false),
     ] {
         let query = analyze(
-            &format!("SELECT {name}(v,{offset}) OVER () FROM source"),
+            &format!("SELECT {name}(v,{offset}) OVER (ORDER BY v) FROM source"),
             &SourceCatalog {
                 offset_nullable: true,
             },
@@ -761,7 +732,7 @@ fn window_builtin_narrow_offsets_keep_original_columns_and_nullable_canonical_ca
 #[test]
 fn window_builtin_bare_null_offset_selects_and_materializes_exact_i64_domain() {
     let query = analyze(
-        "SELECT lead(v,NULL) OVER (), lag(v,NULL) OVER () FROM source",
+        "SELECT lead(v,NULL) OVER (ORDER BY v), lag(v,NULL) OVER (ORDER BY v) FROM source",
         &SourceCatalog {
             offset_nullable: false,
         },

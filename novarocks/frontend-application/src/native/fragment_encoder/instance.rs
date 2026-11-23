@@ -72,7 +72,7 @@ pub(crate) fn encode_query_options(src: &QueryOptions) -> wire::QueryOptions {
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
         allow_throw_exception: src.allow_throw_exception,
-        group_concat_max_len: src.group_concat_max_len,
+
         enable_scan_datacache: src.cache.enable_scan_datacache,
         enable_populate_datacache: src.cache.enable_populate_datacache,
         enable_datacache_async_populate_mode: src.cache.enable_datacache_async_populate_mode,

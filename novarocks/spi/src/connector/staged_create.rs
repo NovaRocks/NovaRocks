@@ -1353,6 +1353,21 @@ pub trait ConnectorStagedCreate: Send + Sync {
         ))
     }
 
+    /// Validate the declared target columns and their bindings to already
+    /// evaluated CTAS properties. This operation cannot start a stage.
+    fn validate_ctas_definition(
+        &self,
+        _table: &super::ConnectorTableIdentity,
+        _columns: &[ConnectorColumnDefinition],
+        _storage: &ConnectorStagedCtasProperties,
+        _control: &dyn ConnectorOperationControl,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not validate ordinary CTAS target declarations",
+        ))
+    }
+
     /// Provider declarations exposed by this exact retained generation.
     fn mv_storage_property_declarations(
         &self,
@@ -1607,6 +1622,24 @@ impl ConnectorStagedCreateSession {
             properties,
             comment,
         }))
+    }
+
+    pub fn validate_ctas_definition(
+        &self,
+        table: &super::ConnectorTableIdentity,
+        columns: &[ConnectorColumnDefinition],
+        storage: &ConnectorStagedCtasProperties,
+        control: &dyn ConnectorOperationControl,
+    ) -> Result<(), ConnectorError> {
+        if table.instance_id != *self.instance_id() || storage.owner != self.provider_binding_key {
+            return Err(invalid(
+                "CTAS declaration has a foreign table or property owner",
+            ));
+        }
+        control.check_active()?;
+        self.capability
+            .validate_ctas_definition(table, columns, storage, control)?;
+        control.check_active()
     }
 
     pub fn mv_storage_property_declarations(

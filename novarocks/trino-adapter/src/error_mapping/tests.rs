@@ -49,6 +49,7 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("INVALID_PROCEDURE_ARGUMENT", 30, "USER_ERROR"),
     ("AMBIGUOUS_FUNCTION_CALL", 32, "USER_ERROR"),
     ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
+    ("EXCEEDED_FUNCTION_MEMORY_LIMIT", 37, "USER_ERROR"),
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
     ("INVALID_ANALYZE_PROPERTY", 42, "USER_ERROR"),
     ("INVALID_CATALOG_PROPERTY", 124, "USER_ERROR"),
@@ -68,15 +69,20 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("DUPLICATE_NAMED_QUERY", 53, "USER_ERROR"),
     ("DUPLICATE_COLUMN_NAME", 54, "USER_ERROR"),
     ("MISSING_COLUMN_NAME", 55, "USER_ERROR"),
+    ("MISSING_CATALOG_NAME", 56, "USER_ERROR"),
+    ("MISSING_SCHEMA_NAME", 57, "USER_ERROR"),
     ("TYPE_MISMATCH", 58, "USER_ERROR"),
     ("INVALID_LITERAL", 59, "USER_ERROR"),
     ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
     ("FUNCTION_NOT_AGGREGATE", 72, "USER_ERROR"),
     ("EXPRESSION_NOT_SCALAR", 74, "USER_ERROR"),
+    ("EXPRESSION_NOT_IN_DISTINCT", 69, "USER_ERROR"),
+    ("MISSING_ORDER_BY", 65, "USER_ERROR"),
     ("EXPRESSION_NOT_CONSTANT", 75, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
     ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
     ("DUPLICATE_PROPERTY", 79, "USER_ERROR"),
+    ("INVALID_PARAMETER_USAGE", 80, "USER_ERROR"),
     ("VIEW_IS_STALE", 81, "USER_ERROR"),
     ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
@@ -174,9 +180,18 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.validate.duplicate_cte_name" => "DUPLICATE_NAMED_QUERY",
         "sql.validate.duplicate_window_name" => "DUPLICATE_WINDOW_NAME",
         "sql.validate.invalid_window_frame_bounds" => "INVALID_WINDOW_FRAME",
-        "sql.analyze.unknown_catalog" => "CATALOG_NOT_FOUND",
-        "sql.analyze.unknown_schema" => "SCHEMA_NOT_FOUND",
-        "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
+        "sql.analyze.unknown_catalog" | "sql.admit.show_catalog_not_found" => "CATALOG_NOT_FOUND",
+        "sql.analyze.unknown_schema" | "sql.admit.show_schema_not_found" => "SCHEMA_NOT_FOUND",
+        "sql.analyze.unknown_table" | "sql.admit.show_table_not_found" => "TABLE_NOT_FOUND",
+        "sql.admit.show_missing_catalog" => "MISSING_CATALOG_NAME",
+        "sql.admit.show_missing_schema" => "MISSING_SCHEMA_NAME",
+        "sql.admit.show_name_too_long" => "SYNTAX_ERROR",
+        "sql.admit.kill_query_arguments" => "INVALID_ARGUMENTS",
+        "sql.admit.kill_query_argument_type" => "TYPE_MISMATCH",
+        "sql.admit.kill_query_invalid_argument" => "INVALID_PROCEDURE_ARGUMENT",
+        "sql.admit.kill_query_target_not_found" => "NOT_FOUND",
+        "sql.admit.kill_query_target_not_running" => "NOT_SUPPORTED",
+        "sql.admit.kill_query_permission_denied" => "PERMISSION_DENIED",
         "sql.admit.table_already_exists" => "TABLE_ALREADY_EXISTS",
         "sql.admit.schema_already_exists" => "SCHEMA_ALREADY_EXISTS",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
@@ -189,9 +204,15 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
         "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
+        "sql.admit.prepared_statement_not_found" => "NOT_FOUND",
+        "sql.admit.expression_not_constant" => "EXPRESSION_NOT_CONSTANT",
+        "sql.admit.invalid_parameter_usage" => "INVALID_PARAMETER_USAGE",
         "sql.analyze.function_not_aggregate" => "FUNCTION_NOT_AGGREGATE",
         "sql.analyze.expression_not_scalar" => "EXPRESSION_NOT_SCALAR",
-        "sql.admit.unknown_type" => "TYPE_NOT_FOUND",
+        "sql.analyze.expression_not_in_distinct" => "EXPRESSION_NOT_IN_DISTINCT",
+        "sql.analyze.missing_order_by" => "MISSING_ORDER_BY",
+        "sql.analyze.invalid_window_frame" => "INVALID_WINDOW_FRAME",
+        "sql.admit.unknown_type" | "sql.analyze.unknown_type" => "TYPE_NOT_FOUND",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
@@ -252,6 +273,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "query.execution.division_by_zero" => "DIVISION_BY_ZERO",
         "query.execution.invalid_cast_argument" => "INVALID_CAST_ARGUMENT",
         "query.execution.invalid_function_argument" => "INVALID_FUNCTION_ARGUMENT",
+        "query.execution.exceeded_function_memory_limit" => "EXCEEDED_FUNCTION_MEMORY_LIMIT",
         "query.execution.cancelled" => "USER_CANCELED",
         "query.execution.deadline_exceeded" => "EXCEEDED_TIME_LIMIT",
         "query.execution.resource_exhausted" | "query.execution.representation" => {
@@ -473,7 +495,7 @@ fn cancellations_preserve_the_original_requester_category() {
         (DeadlineExceeded { timeout_ms: 10 }, "EXCEEDED_TIME_LIMIT"),
         (
             FrontendDrainDeadlineExceeded { timeout_ms: 10 },
-            "SERVER_SHUTTING_DOWN",
+            "EXCEEDED_TIME_LIMIT",
         ),
         (ServerShutdown, "SERVER_SHUTTING_DOWN"),
     ] {
@@ -483,6 +505,35 @@ fn cancellations_preserve_the_original_requester_category() {
                 message: "original cancellation detail",
             }),
             expected,
+        );
+        assert_wire(
+            &query_error(TrinoErrorSource::OriginalCancellation(reason)),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn original_deadline_projects_its_typed_detail_and_effect() {
+    use QueryCancellationReason::{DeadlineExceeded, FrontendDrainDeadlineExceeded};
+    let deadline = query_error_for_query_with_effect(
+        "original-query",
+        TrinoErrorSource::OriginalCancellation(DeadlineExceeded { timeout_ms: 1_000 }),
+        Some(StatementExternalEffectDisposition::KnownCommitted),
+    );
+    assert_wire(&deadline, "EXCEEDED_TIME_LIMIT");
+    assert_eq!(
+        deadline.message,
+        "[query.execution.deadline_exceeded] query timed out after 1000 ms (external effect disposition=KnownCommitted do_not_retry=true; do not retry statement)"
+    );
+    for timeout_ms in [0, 500] {
+        let drain = query_error(TrinoErrorSource::OriginalCancellation(
+            FrontendDrainDeadlineExceeded { timeout_ms },
+        ));
+        assert_wire(&drain, "EXCEEDED_TIME_LIMIT");
+        assert_eq!(
+            drain.message,
+            "[query.execution.deadline_exceeded] FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded"
         );
     }
 }
@@ -1055,6 +1106,113 @@ fn location_requires_a_positive_real_utf8_boundary_in_the_original_sql() {
     assert_eq!(
         query_error(TrinoErrorSource::Service { error: &error, sql }).error_location,
         None
+    );
+}
+
+#[test]
+fn prepared_diagnostics_project_their_original_named_immediate_and_using_sources() {
+    use novarocks_query_application::{
+        session_value::{PreparedStatementDefinition, PreparedStatementSnapshot},
+        sql::{parse_single_statement, trino_admission::admit_trino_statement_request},
+    };
+    use std::sync::Arc;
+
+    // The protocol retains NovaRocks' UTF-16 indexing. The captured Trino
+    // reference's ANTLR offsets differ by one for each supplementary scalar.
+    let template = "SELECT '😀',\n  '😀', missing";
+    let snapshot = PreparedStatementSnapshot::new(vec![(
+        "p".into(),
+        PreparedStatementDefinition::new(Arc::from(template)),
+    )])
+    .unwrap();
+    let named = "EXECUTE p";
+    let immediate = "-- 中文😀\nEXECUTE IMMEDIATE 'SELECT ''😀'', missing'";
+    for (request, expected) in [
+        (
+            named,
+            TrinoErrorLocation {
+                line_number: 2,
+                column_number: 9,
+            },
+        ),
+        (
+            immediate,
+            TrinoErrorLocation {
+                line_number: 2,
+                column_number: 33,
+            },
+        ),
+    ] {
+        let admitted = admit_trino_statement_request(
+            Arc::from(request),
+            parse_single_statement(request).unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        let sql = admitted.source.sql();
+        let start = sql.find("missing").unwrap();
+        let span = novarocks_parser::Span::new(start, start + "missing".len());
+        let user =
+            novarocks_sql::analyze_error::AnalyzeError::unknown_column("Unknown column", span)
+                .to_user_error(Some(sql));
+        let service =
+            QueryServiceError::from_user_error(user).with_trino_statement_source(admitted.source);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: request,
+        });
+        assert_wire(&wire, "COLUMN_NOT_FOUND");
+        assert_eq!(wire.error_location, Some(expected), "{request}");
+    }
+
+    for (request, expected) in [
+        (
+            "EXECUTE IMMEDIATE 'SELECT ''😀'',\n)'",
+            TrinoErrorLocation {
+                line_number: 2,
+                column_number: 20,
+            },
+        ),
+        (
+            "-- line 1\nEXECUTE IMMEDIATE 'SELECT ''😀'',\n)'",
+            TrinoErrorLocation {
+                line_number: 3,
+                column_number: 1,
+            },
+        ),
+    ] {
+        let service = admit_trino_statement_request(
+            Arc::from(request),
+            parse_single_statement(request).unwrap(),
+            &snapshot,
+        )
+        .unwrap_err();
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: request,
+        });
+        assert_wire(&wire, "SYNTAX_ERROR");
+        assert_eq!(wire.error_location, Some(expected), "{request}");
+    }
+
+    let request = "-- 🧭\nEXECUTE IMMEDIATE 'SELECT ?, ?'\nUSING '😀', missing";
+    let service = admit_trino_statement_request(
+        Arc::from(request),
+        parse_single_statement(request).unwrap(),
+        &snapshot,
+    )
+    .unwrap_err();
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &service,
+        sql: request,
+    });
+    assert_wire(&wire, "EXPRESSION_NOT_CONSTANT");
+    assert_eq!(
+        wire.error_location,
+        Some(TrinoErrorLocation {
+            line_number: 3,
+            column_number: 13,
+        })
     );
 }
 

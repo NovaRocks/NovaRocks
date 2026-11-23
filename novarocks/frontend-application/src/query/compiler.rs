@@ -38,7 +38,6 @@ use novarocks_spi::connector::{
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlCompileError, SqlCompileIntent, SqlPlanningEnvironment, SqlSessionContext,
-    SqlStatementInput,
 };
 
 /// Application intent is supplied by the caller, never inferred from a
@@ -123,6 +122,7 @@ pub(crate) struct FrontendQueryCompiler {
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
+    runtime_metadata: Option<Arc<crate::system_tables::FrontendRuntimeMetadata>>,
     mv_readiness: Arc<MvReadinessPort>,
     mv_candidate_reader: MvCandidateReader,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -136,6 +136,27 @@ mod async_read;
 pub(crate) use async_explain::{
     ExplainPreparationPorts, PreparedAsyncExplain, PreparedAsyncProfile,
 };
+pub(crate) use async_read::{ReadCompilerInput, ReadStatementInput};
+
+fn observe_plan_timing(
+    control: novarocks_sql::compiler::SqlCompileControl,
+    timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
+) -> novarocks_sql::compiler::SqlCompileControl {
+    let Some(timing) = timing else {
+        return control;
+    };
+    use novarocks_query_application::query_control::{ClientQueryEvent, ClientQueryTime};
+    use novarocks_sql::compiler::SqlFinalPlanEvent;
+    control.with_final_plan_observer(Arc::new(move |event| {
+        let event = match event {
+            SqlFinalPlanEvent::AnalysisStarted => ClientQueryEvent::AnalysisStarted,
+            SqlFinalPlanEvent::AnalysisFinished => ClientQueryEvent::AnalysisFinished,
+            SqlFinalPlanEvent::PlanningStarted => ClientQueryEvent::PlanningStarted,
+            SqlFinalPlanEvent::PlanningFinished => ClientQueryEvent::PlanningFinished,
+        };
+        timing.record(event, ClientQueryTime::now());
+    }))
+}
 
 impl FrontendQueryCompiler {
     pub(crate) fn validate_original_read_runtime(
@@ -175,11 +196,20 @@ impl FrontendQueryCompiler {
             query,
             view,
             system_tables,
+            runtime_metadata: None,
             mv_readiness,
             mv_candidate_reader,
             mv_storage_observation,
             connector_blocking_io,
         }
+    }
+
+    pub(crate) fn with_runtime_metadata(
+        mut self,
+        runtime_metadata: Option<Arc<crate::system_tables::FrontendRuntimeMetadata>>,
+    ) -> Self {
+        self.runtime_metadata = runtime_metadata;
+        self
     }
 
     pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
@@ -279,9 +309,29 @@ impl FrontendQueryCompiler {
             .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))
     }
 
+    pub(super) fn description_functions(
+        &self,
+    ) -> Arc<dyn novarocks_sql::compiler::SqlFunctionCatalog> {
+        novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref())
+    }
+
+    pub(super) fn describe_catalog_qualifications(
+        &self,
+        bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
+        candidates: &[novarocks_spi::connector::ConnectorInstanceId],
+    ) -> Result<
+        novarocks_sql::compiler::CatalogQualifications,
+        novarocks_sql::compiler::SqlCompileError,
+    > {
+        bindings.observe_catalog_qualifications(
+            candidates,
+            self.query.catalog_application().map(Arc::as_ref),
+        )
+    }
+
     /// The owners in this process that can answer what completing a statement
     /// asks, and the lane their synchronous calls are admitted through.
-    fn completion_fact_owners(
+    pub(super) fn completion_fact_owners(
         &self,
     ) -> crate::query_execution::completion_facts::CompletionFactOwners {
         crate::query_execution::completion_facts::CompletionFactOwners::new(
@@ -300,6 +350,7 @@ impl FrontendQueryCompiler {
                 self.constant_policy,
             )),
         )
+        .with_runtime_metadata(self.runtime_metadata.clone())
     }
 
     /// Freeze the same per-instance driver width that request construction

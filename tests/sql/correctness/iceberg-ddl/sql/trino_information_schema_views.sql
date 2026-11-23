@@ -93,6 +93,17 @@ SELECT table_name, table_type
 FROM trc_metadata_${uuid0}.metadata_${uuid0}.metadata_capture ORDER BY table_name;
 
 -- query 13
+SELECT table_name, column_name, ordinal_position, data_type
+FROM information_schema.columns
+WHERE table_schema = 'metadata_${uuid0}' AND table_name IN ('metadata_base', 'metadata_view')
+ORDER BY table_name, ordinal_position;
+
+-- query 14
+SELECT table_name, view_definition IS NOT NULL AS has_definition
+FROM information_schema.views
+WHERE table_schema = 'metadata_${uuid0}' AND table_name LIKE 'metadata\_view' ESCAPE '\';
+
+-- query 15
 -- @cleanup=true
 -- @skip_result_check=true
 DROP VIEW IF EXISTS trc_metadata_${uuid0}.metadata_${uuid0}.metadata_view;

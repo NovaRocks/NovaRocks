@@ -1170,7 +1170,7 @@ impl NativeTaskExecutionHost {
                     ))
                 })?
         {
-            context = context.with_position_shard_test_observer(observer);
+            context = context.with_task_protocol_test_observer(observer);
         }
         if let Some(session) = root_session {
             context = context.with_root_result_session(session);

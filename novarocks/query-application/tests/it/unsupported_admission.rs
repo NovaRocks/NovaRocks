@@ -7,7 +7,10 @@ use novarocks_query_application::{
     session_error::QueryServiceError,
     sql::{
         property_evaluation::table,
-        trino_admission::{TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement},
+        trino_admission::{
+            TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation,
+            admit_trino_statement,
+        },
         trino_table_command,
     },
     view::ViewCommand,
@@ -146,24 +149,12 @@ fn expected_subject(rule: &str, alternative: &str) -> &'static str {
         "60" => "SHOW CREATE SCHEMA",
         "62" => "SHOW CREATE MATERIALIZED VIEW",
         "63" => "SHOW CREATE FUNCTION",
-        "64" => "SHOW TABLES",
-        "65" => "SHOW SCHEMAS",
-        "66" => "SHOW CATALOGS",
-        "67" | "72" | "73" => "SHOW COLUMNS",
         "69" => "SHOW STATS FOR",
         "70" => "SHOW ROLES",
         "71" => "SHOW ROLE GRANTS",
-        "74" => "SHOW FUNCTIONS",
-        "75" => "SHOW SESSION",
         "76" => "SET SESSION AUTHORIZATION",
         "77" => "RESET SESSION AUTHORIZATION",
         "80" => "START TRANSACTION",
-        "83" => "PREPARE",
-        "84" => "DEALLOCATE PREPARE",
-        "85" => "EXECUTE",
-        "86" => "EXECUTE IMMEDIATE",
-        "87" => "DESCRIBE INPUT",
-        "88" | "89" => "DESCRIBE OUTPUT",
         "90" => "SET PATH",
         _ => panic!("missing statement oracle for alternative {alternative}"),
     }
@@ -257,6 +248,32 @@ fn assert_refusal(line: usize, source: &str, owner: Owner, subject: &str) {
 }
 
 #[test]
+fn show_admission_preserves_the_supported_grammar_witnesses() {
+    for line in COVERAGE.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 10
+            || fields[1] != "statement"
+            || fields[6] != "supported"
+            || !matches!(
+                fields[2],
+                "64" | "65" | "66" | "67" | "72" | "73" | "74" | "75"
+            )
+        {
+            continue;
+        }
+        let sql = fields[5];
+        let statement = parse_statement(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert!(
+            matches!(
+                admit_trino_statement(sql, statement),
+                Ok(TrinoStatementAction::Query(TrinoQueryAction::Show(_)))
+            ),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn each_pure_parsed_only_statement_witness_has_its_typed_gate() {
     let mut exercised = 0;
     for (line, rule, alternative, clause, source) in statement_witnesses() {
@@ -270,7 +287,7 @@ fn each_pure_parsed_only_statement_witness_has_its_typed_gate() {
         exercised += 1;
     }
     assert_eq!(
-        exercised, 288,
+        exercised, 227,
         "reconcile the statement gate with the grammar ledger"
     );
 }
@@ -327,4 +344,52 @@ fn commit_and_rollback_have_their_distinct_transaction_result() {
             "sql.admit.not_in_transaction"
         );
     }
+}
+
+#[test]
+fn explain_analyze_delete_does_not_admit_a_write() {
+    let sql = "EXPLAIN ANALYZE DELETE FROM lake.db.t WHERE part = 1";
+    let statement = parse_statement(sql).unwrap();
+    assert!(matches!(statement, TrinoStatement::ExplainAnalyze(_)));
+    let error = admit_trino_statement(sql, statement).unwrap_err();
+    let user = error.user_error().unwrap();
+    assert_eq!(user.code().as_str(), UNSUPPORTED);
+    assert_eq!(
+        user.message(),
+        "EXPLAIN ANALYZE for this statement is not supported"
+    );
+    assert_eq!(
+        user.location().unwrap().column() as usize,
+        sql.find("DELETE").unwrap() + 1
+    );
+}
+
+#[test]
+fn explain_delete_execute_immediate_preserves_body_parameter_positions() {
+    use std::sync::Arc;
+
+    use novarocks_query_application::{
+        session_value::PreparedStatementSnapshot,
+        sql::trino_admission::admit_trino_statement_request,
+    };
+
+    let sql: Arc<str> =
+        "EXECUTE IMMEDIATE 'EXPLAIN DELETE FROM lake.db.t WHERE part > ?' USING 10".into();
+    let statement = parse_statement(&sql).unwrap();
+    let admitted =
+        admit_trino_statement_request(sql, statement, &PreparedStatementSnapshot::default())
+            .unwrap();
+    let parameters = admitted.parameters.unwrap();
+    let [position] = parameters.positions() else {
+        panic!("EXPLAIN DELETE must retain the original positional parameter");
+    };
+    assert_eq!(
+        &admitted.source.sql()[position.start()..position.end()],
+        "?"
+    );
+    assert!(matches!(
+        admitted.action,
+        TrinoStatementAction::Prepare(TrinoStatementPreparation::ExplainDelete(node))
+            if node.predicate.is_some()
+    ));
 }

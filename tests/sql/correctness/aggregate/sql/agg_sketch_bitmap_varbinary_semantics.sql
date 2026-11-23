@@ -27,29 +27,29 @@ CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
-    ROW(1, 1, 'alpha', to_binary('alpha', 'utf8')),
-    ROW(1, 2, 'beta', to_binary('beta', 'utf8')),
-    ROW(1, 2, 'beta-dup', to_binary('beta', 'utf8')),
-    ROW(1, 3, 'gamma', to_binary('gamma', 'utf8')),
-    ROW(2, 3, 'gamma-dup', to_binary('gamma', 'utf8')),
-    ROW(2, 4, 'delta', to_binary('delta', 'utf8')),
-    ROW(2, 5, 'epsilon', to_binary('epsilon', 'utf8')),
+    ROW(1, 1, 'alpha', to_utf8('alpha')),
+    ROW(1, 2, 'beta', to_utf8('beta')),
+    ROW(1, 2, 'beta-dup', to_utf8('beta')),
+    ROW(1, 3, 'gamma', to_utf8('gamma')),
+    ROW(2, 3, 'gamma-dup', to_utf8('gamma')),
+    ROW(2, 4, 'delta', to_utf8('delta')),
+    ROW(2, 5, 'epsilon', to_utf8('epsilon')),
     ROW(2, NULL, 'null-vb', NULL),
-    ROW(3, 6, 'zeta', to_binary('zeta', 'utf8')),
-    ROW(3, 6, 'zeta-dup', to_binary('zeta', 'utf8'));
+    ROW(3, 6, 'zeta', to_utf8('zeta')),
+    ROW(3, 6, 'zeta-dup', to_utf8('zeta'));
 
 SELECT
     COUNT(DISTINCT id_int) AS exact_id,
-    ndv(id_int) AS ndv_id,
-    approx_count_distinct(id_int) AS approx_id
+    approx_distinct(id_int) AS ndv_id,
+    approx_distinct(id_int) AS approx_id
 FROM ${case_db}.t_agg_sketch_bitmap_source;
 
 -- query 2
 SELECT
     grp,
     COUNT(DISTINCT vb) AS exact_vb,
-    ndv(vb) AS ndv_vb,
-    approx_count_distinct(vb) AS approx_vb
+    approx_distinct(vb) AS ndv_vb,
+    approx_distinct(vb) AS approx_vb
 FROM ${case_db}.t_agg_sketch_bitmap_source
 GROUP BY grp
 ORDER BY grp;

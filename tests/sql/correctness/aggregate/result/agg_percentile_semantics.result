@@ -1,9 +1,6 @@
 -- query 1
--- types	integer	integer	array(double)
-approx50	approx90	approx_quartiles
-30	50	[17.5,30.0,42.5]
-
--- query 2
--- types	integer	integer	array(double)
-weighted50	weighted90	weighted_quartiles
-36	50	[23.33333396911621,36.66666793823242,47.5]
+-- types	integer	decimal(9, 3)	array(double)
+g	median	endpoints
+1	16.333	[0.0,30.0]
+2	3.400	[2.0,4.0]
+3	NULL	NULL

@@ -55,12 +55,61 @@ mod tests {
             )
             .chain(collection_lambdas)
             .collect::<BTreeSet<_>>();
-        // The retired registry spelling still has a SQL diagnostic disposition.
-        assert!(declared.insert("negative".to_owned()));
-        assert_eq!(
-            builtin_disposition("negative"),
-            Some(BuiltinDisposition::LoweredOnly)
-        );
+        // TRC-6d6 moved these existing disposition entries to dedicated
+        // temporal owners outside the generic registry and dynamic resolver.
+        for name in [
+            "current_date",
+            "date",
+            "date_add",
+            "date_diff",
+            "date_format",
+            "date_trunc",
+            "day",
+            "day_of_month",
+            "day_of_week",
+            "day_of_year",
+            "dow",
+            "doy",
+            "from_unixtime",
+            "hour",
+            "last_day_of_month",
+            "minute",
+            "month",
+            "now",
+            "quarter",
+            "second",
+            "week",
+            "week_of_year",
+            "year",
+        ] {
+            assert!(declared.insert(name.to_owned()), "{name}");
+            assert!(
+                catalog
+                    .definition(name, FunctionKind::Scalar)
+                    .and_then(|definition| definition.binding_declaration())
+                    .is_some(),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    builtin_disposition(name),
+                    Some(BuiltinDisposition::InstalledScalar(_))
+                ),
+                "{name}"
+            );
+        }
+        // The retired registry spellings retain explicit SQL diagnostics.
+        for (name, expected) in [
+            ("negative", BuiltinDisposition::LoweredOnly),
+            ("to_unix_timestamp", BuiltinDisposition::Unavailable),
+        ] {
+            assert!(declared.insert(name.to_owned()), "{name}");
+            assert_eq!(builtin_disposition(name), Some(expected), "{name}");
+            assert!(
+                catalog.definition(name, FunctionKind::Scalar).is_none(),
+                "{name}"
+            );
+        }
         let admitted = builtin_dispositions()
             .iter()
             .map(|(name, _)| (*name).to_owned())

@@ -21,8 +21,7 @@ use super::{LocalResultBound, QueryResult};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_result_contract::{
-    ClientPresentationFamily, ClientRenderSchema, NativeRenderType, RenderColumn, RenderField,
-    RenderPresentation, RootProfileV1,
+    ClientPresentationFamily, ClientRenderSchema, RenderColumn, RootProfileV1,
 };
 use novarocks_result_render::{
     BoundedClientRowEncoder, ClientRowEncoder, RenderError, RenderTurn, RenderTurnStatus,
@@ -135,7 +134,8 @@ impl OwnedLocalResult {
         let mut wire = 0usize;
         for field in fields {
             match field.value_type().value_type().kind() {
-                novarocks_type_contract::ValueKind::String => {}
+                novarocks_type_contract::ValueKind::String
+                | novarocks_type_contract::ValueKind::BoundedCharacter(_) => {}
                 novarocks_type_contract::ValueKind::Scalar(
                     arrow::datatypes::DataType::Boolean
                     | arrow::datatypes::DataType::Int32
@@ -208,11 +208,9 @@ impl OwnedLocalResult {
                     source_ordinal: ordinal as u32,
                     source_slot: None,
                     name: field.name().to_owned(),
-                    field: RenderField {
-                        presentation: RenderPresentation::TrinoValue,
-                        nullable: field.nullable(),
-                        native_type: native(kind(field.data_type(), false)?),
-                    },
+                    field: novarocks_sql::compiler::render_field_for_declaration(
+                        field.value_type(),
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -277,15 +275,6 @@ fn kind(data_type: &DataType, has_logical_type: bool) -> Result<LocalColumnKind,
         DataType::Int64 => Ok(LocalColumnKind::Int64),
         DataType::Float64 => Ok(LocalColumnKind::Float64),
         _ => Err("Local result has an unsupported declared type".into()),
-    }
-}
-fn native(kind: LocalColumnKind) -> NativeRenderType {
-    match kind {
-        LocalColumnKind::Utf8 => NativeRenderType::String,
-        LocalColumnKind::Boolean => NativeRenderType::Boolean,
-        LocalColumnKind::Int32 => NativeRenderType::SignedInteger(32),
-        LocalColumnKind::Int64 => NativeRenderType::SignedInteger(64),
-        LocalColumnKind::Float64 => NativeRenderType::Float64,
     }
 }
 
@@ -370,6 +359,7 @@ impl LocalRenderCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_result_contract::{NativeRenderType, RenderPresentation};
     use novarocks_workload_control::{
         ResourceConfig, ResultCapacityConfig, WorkClass, WorkRequest, WorkloadConfig,
         WorkloadControl,

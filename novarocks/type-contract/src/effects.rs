@@ -57,6 +57,9 @@ pub enum ArgumentControl {
     If,
     Coalesce,
     Try,
+    /// Demand each regexp argument only after the previous one succeeded and
+    /// produced a non-NULL value. Compile the pattern at argument ordinal 1.
+    OrderedRegexp,
     /// The exact installed owner demands original emitted source occurrences.
     TemporalSource(crate::TemporalSourceKind),
     SimpleCase,
@@ -88,6 +91,7 @@ impl ArgumentControl {
             | (Self::If, ControlShape::If)
             | (Self::Coalesce, ControlShape::Coalesce)
             | (Self::Try, ControlShape::Try)
+            | (Self::OrderedRegexp, ControlShape::OrderedRegexp)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
             | (Self::SearchedCase, ControlShape::Case { simple: false, .. }) => true,
             (
@@ -208,6 +212,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::If
                         | ArgumentControl::Coalesce
                         | ArgumentControl::Try
+                        | ArgumentControl::OrderedRegexp
                         | ArgumentControl::TemporalSource(_)
                         | ArgumentControl::SimpleCase
                         | ArgumentControl::SearchedCase
@@ -238,6 +243,7 @@ impl FunctionEffectDeclaration {
             ArgumentControl::If
                 | ArgumentControl::Coalesce
                 | ArgumentControl::Try
+                | ArgumentControl::OrderedRegexp
                 | ArgumentControl::TemporalSource(_)
                 | ArgumentControl::SimpleCase
                 | ArgumentControl::SearchedCase
@@ -258,15 +264,11 @@ impl FunctionEffectDeclaration {
         let mut statement_start_utc = false;
         let mut time_zone = false;
         let mut allow_throw_exception = false;
-        let mut group_concat_legacy = false;
-        let mut group_concat_max_len = false;
         for key in &self.environment_dependencies {
             let seen = match key {
                 SemanticParameterKey::StatementStartUtc => &mut statement_start_utc,
                 SemanticParameterKey::TimeZone => &mut time_zone,
                 SemanticParameterKey::AllowThrowException => &mut allow_throw_exception,
-                SemanticParameterKey::GroupConcatLegacy => &mut group_concat_legacy,
-                SemanticParameterKey::GroupConcatMaxLen => &mut group_concat_max_len,
             };
             if std::mem::replace(seen, true) {
                 return Err(EffectContractError::DuplicateEnvironmentKey);
@@ -592,6 +594,7 @@ mod tests {
             ArgumentControl::If,
             ArgumentControl::Coalesce,
             ArgumentControl::Try,
+            ArgumentControl::OrderedRegexp,
             ArgumentControl::SimpleCase,
             ArgumentControl::SearchedCase,
             ArgumentControl::HigherOrder {
@@ -612,6 +615,7 @@ mod tests {
             ControlShape::If,
             ControlShape::Coalesce,
             ControlShape::Try,
+            ControlShape::OrderedRegexp,
             ControlShape::Case {
                 simple: true,
                 arms: 1,

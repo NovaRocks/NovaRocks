@@ -16,18 +16,41 @@
 -- under the License.
 
 -- @order_sensitive=true
--- @tags=project,string,regexp,field,unhex
--- Test Objective:
--- 1. Validate regexp_extract no-match behavior returns empty string, not NULL.
--- 3. Validate unhex() returns empty string for invalid/odd-length hex inputs.
--- Test Flow:
--- 1. Evaluate regexp_extract with no-match and NULL input.
--- 2. Evaluate field with NULL first argument.
--- 3. Evaluate unhex invalid/odd inputs and assert empty-string semantics.
-SELECT
-  regexp_extract('foo=123', 'bar=([0-9]+)', 1) AS re_no_match,
-  regexp_extract(NULL, 'x', 1) AS re_null_input,
-  hex(unhex('ZZ')) AS unhex_bad_hex,
-  unhex('ZZ') IS NULL AS unhex_bad_is_null,
-  hex(unhex('F')) AS unhex_odd_hex,
-  unhex('F') IS NULL AS unhex_odd_is_null;
+-- @tags=project,string,regexp
+-- query 1
+SELECT regexp_extract('foo=123', 'bar=([0-9]+)', 1) AS re_no_match,
+       regexp_extract(NULL, 'x', 1) AS re_null_input;
+
+-- query 2
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT from_hex('ZZ');
+
+-- query 3
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT from_hex('F');
+
+-- query 4
+SELECT to_hex(to_utf8(NORMALIZE(U&'e\0301'))) AS nfc_bytes,
+       typeof(chr(128512)) AS chr_type,
+       length(CAST('a' AS CHAR(3))) AS char_length_value,
+       to_hex(to_utf8(CAST('a' AS CHAR(3)))) AS char_bytes;
+
+-- query 5
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT NORMALIZE(U&'e\0301', nfd);
+
+-- query 6
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+SELECT codepoint(CAST('a' AS VARCHAR));
+
+-- query 7
+SELECT typeof(concat(CAST('a' AS CHAR(32768)), CAST('b' AS CHAR(32768)))) AS char_concat_type,
+       typeof(concat(CAST(NULL AS CHAR(32768)), CAST(NULL AS CHAR(32768)))) AS null_char_concat_type;
+
+-- query 8
+-- @expect_trino_error=TYPE_NOT_FOUND,USER_ERROR
+SELECT typeof(concat(CAST('a' AS CHAR(32768)), CAST('b' AS CHAR(32769))));
+
+-- query 9
+-- @expect_trino_error=TYPE_NOT_FOUND,USER_ERROR
+SELECT typeof(concat(CAST(NULL AS CHAR(32768)), CAST(NULL AS CHAR(32769))));

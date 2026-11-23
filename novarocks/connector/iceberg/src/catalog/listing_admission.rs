@@ -147,21 +147,16 @@ fn selected_original_error(original: Option<&dyn ListingOriginalError>) -> Optio
 }
 
 fn cancelled() -> ConnectorError {
-    ConnectorError::new(
-        ConnectorErrorKind::Cancelled,
-        "catalog listing was cancelled",
-    )
+    ConnectorError::observed_cancellation("catalog listing was cancelled")
 }
 fn expired() -> ConnectorError {
-    ConnectorError::new(
-        ConnectorErrorKind::DeadlineExceeded,
-        "catalog listing absolute deadline elapsed",
-    )
+    ConnectorError::observed_deadline("catalog listing absolute deadline elapsed")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_failure_contract::{FailureEvidence, FailureProjection};
     use novarocks_spi::connector::ConnectorStopOwner;
     use std::pin::Pin;
     use std::sync::Mutex as TestMutex;
@@ -358,9 +353,11 @@ mod tests {
         assert!(futures::poll!(call.as_mut()).is_pending());
         assert_eq!(probe.live.load(Ordering::SeqCst), 1);
         assert_eq!(gate.positions.available_permits(), 7);
+        let error = call.await.unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
         assert_eq!(
-            call.await.unwrap_err().kind(),
-            ConnectorErrorKind::DeadlineExceeded
+            error.failure_fact().evidence(),
+            FailureEvidence::StopObservation
         );
         assert_idle(&gate, &probe, 1);
         assert_eq!(*probe.positions_at_drop.lock().unwrap(), [7]);
@@ -375,9 +372,11 @@ mod tests {
         let mut call = Box::pin(gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Pending)));
         assert!(futures::poll!(call.as_mut()).is_pending());
         stop.request_stop();
+        let error = call.await.unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
         assert_eq!(
-            call.await.unwrap_err().kind(),
-            ConnectorErrorKind::Cancelled
+            error.failure_fact().evidence(),
+            FailureEvidence::StopObservation
         );
         assert_idle(&gate, &probe, 1);
         assert_eq!(*probe.positions_at_drop.lock().unwrap(), [7]);

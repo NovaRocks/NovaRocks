@@ -45,6 +45,15 @@ impl FrontendServingState {
             Self::Stopping => "stopping",
         }
     }
+
+    pub const fn node_state_name(self) -> &'static str {
+        match self {
+            Self::Starting => "inactive",
+            Self::Ready => "active",
+            Self::Draining => "draining",
+            Self::Stopping => "shutting_down",
+        }
+    }
 }
 
 /// Typed rejection before a session can mutate query-application state.

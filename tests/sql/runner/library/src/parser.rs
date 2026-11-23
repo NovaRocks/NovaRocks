@@ -83,13 +83,18 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
                 .strip_prefix("--")?
                 .trim_start()
                 .strip_prefix('@')?;
-            if body.trim().eq_ignore_ascii_case("expect_trino_error") {
-                return Some(("expect_trino_error".into(), String::new()));
+            let bare_key = body.trim().to_ascii_lowercase();
+            if matches!(
+                bare_key.as_str(),
+                "expect_trino_error" | "expect_update_count"
+            ) {
+                return Some((bare_key, String::new()));
             }
             let (key, value) = body.split_once('=')?;
             return (matches!(
                 key.trim().to_ascii_lowercase().as_str(),
                 "expect_trino_error"
+                    | "expect_update_count"
                     | "iceberg_scan_layout"
                     | "iceberg_dictionary_output"
                     | "native_observation_attempts"
@@ -542,6 +547,27 @@ fn parse_meta_with_name_binding(
                     statement_ordinal,
                 });
             }
+            "expect_update_count" => {
+                ensure!(
+                    meta.expect_update_count.is_none(),
+                    "@expect_update_count may be specified only once per metadata block"
+                );
+                let expected = if raw_value.eq_ignore_ascii_case("NULL") {
+                    UpdateCountExpectation::NoCount
+                } else {
+                    ensure!(
+                        !raw_value.is_empty()
+                            && raw_value.bytes().all(|byte| byte.is_ascii_digit()),
+                        "@expect_update_count requires a nonnegative integer or NULL"
+                    );
+                    UpdateCountExpectation::Counted(
+                        raw_value
+                            .parse()
+                            .context("invalid @expect_update_count integer")?,
+                    )
+                };
+                meta.expect_update_count = Some(expected);
+            }
             "expect_error" => {
                 meta.expect_error = Some(raw_value);
             }
@@ -962,6 +988,7 @@ fn parse_meta_with_name_binding(
         }
     }
     validate_trino_error_expectation(&meta, None)?;
+    validate_update_count_expectation(&meta, None)?;
     Ok(meta)
 }
 
@@ -1026,6 +1053,27 @@ pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&st
             "@expect_trino_error requires SQL statements, not shell"
         );
         crate::session::split_trino_step_sql(sql, Some(expected))?;
+    }
+    Ok(())
+}
+
+fn validate_update_count_expectation(meta: &QueryMeta, sql: Option<&str>) -> Result<()> {
+    if meta.expect_update_count.is_none() {
+        return Ok(());
+    }
+    ensure!(
+        !meta.has_error_expectation() && meta.expect_error_tier.is_none(),
+        "@expect_update_count cannot be combined with an error expectation"
+    );
+    if let Some(sql) = sql {
+        ensure!(
+            !crate::shell::is_shell_step(sql),
+            "@expect_update_count requires a SQL statement, not shell"
+        );
+        ensure!(
+            crate::session::split_trino_sql_statements(sql)?.len() == 1,
+            "@expect_update_count requires exactly one executable SQL statement"
+        );
     }
     Ok(())
 }
@@ -1105,6 +1153,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .expect_trino_error
             .clone()
             .or_else(|| base.expect_trino_error.clone()),
+        expect_update_count: override_meta
+            .expect_update_count
+            .or(base.expect_update_count),
         expect_error_code: override_meta
             .expect_error_code
             .clone()
@@ -1619,6 +1670,7 @@ fn prepare_sql_case(
         if sql.is_empty() {
             let meta = merge_meta(&file_meta, &section_meta);
             validate_trino_error_expectation(&meta, Some(&sql))?;
+            validate_update_count_expectation(&meta, Some(&sql))?;
             continue;
         }
         let sql = crate::fixture_context::rewrite_metadata_filters(&sql, &namespace_rewrites);
@@ -1649,6 +1701,13 @@ fn prepare_sql_case(
             })?;
         }
         validate_trino_error_expectation(&merged_meta, Some(&sql))?;
+        validate_update_count_expectation(&merged_meta, Some(&sql)).with_context(|| {
+            format!(
+                "{} ({}): invalid update count expectation",
+                sql_path.display(),
+                section_id
+            )
+        })?;
         validate_sql_error_expectations(&merged_meta, production_sql_error_descriptors())
             .with_context(|| {
                 format!(
@@ -1673,6 +1732,7 @@ fn prepare_sql_case(
     }
 
     if steps.is_empty() {
+        validate_update_count_expectation(&file_meta, Some(""))?;
         return Ok(None);
     }
 

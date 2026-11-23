@@ -1219,11 +1219,38 @@ impl Default for StandaloneServerConfig {
     }
 }
 
+/// The recent-query diagnostic budget of a single FE process.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendQueryHistoryRuntimeConfig {
+    pub max_bytes: std::num::NonZeroUsize,
+    pub max_age_ms: std::num::NonZeroU64,
+}
+
+impl FrontendQueryHistoryRuntimeConfig {
+    pub(crate) fn client_query_history(
+        &self,
+    ) -> anyhow::Result<novarocks_query_application::query_control::ClientQueryHistoryConfig> {
+        let max_age = std::time::Duration::from_millis(self.max_age_ms.get());
+        anyhow::ensure!(
+            std::time::Instant::now().checked_add(max_age).is_some(),
+            "runtime.frontend_workload.query_history.max_age_ms exceeds the monotonic clock range"
+        );
+        Ok(
+            novarocks_query_application::query_control::ClientQueryHistoryConfig {
+                max_bytes: self.max_bytes.get(),
+                max_age,
+            },
+        )
+    }
+}
+
 /// Explicit FE-local governance bounds. These are Server configuration facts,
 /// not defaults manufactured by the Frontend application host.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FrontendWorkloadRuntimeConfig {
+    pub query_history: Option<FrontendQueryHistoryRuntimeConfig>,
     /// Warehouse-wide admitted compute queries. This is the Frontend's only
     /// query-load control: it covers planning through protocol terminality.
     pub concurrency_limit: usize,
@@ -1259,6 +1286,11 @@ pub struct FrontendWorkloadRuntimeConfig {
 impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
+            query_history: Some(FrontendQueryHistoryRuntimeConfig {
+                max_bytes: std::num::NonZeroUsize::new(16 * 1024 * 1024)
+                    .expect("positive history byte budget"),
+                max_age_ms: std::num::NonZeroU64::new(60_000).expect("positive history age"),
+            }),
             concurrency_limit: 256,
             client_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
                 .all_objects_bytes[0],
@@ -5144,6 +5176,21 @@ mod frontend_workload_runtime_config_tests {
         assert_eq!(defaults.frontend_workload.scope_records_limit, 8192);
         assert_eq!(defaults.task_backend_max_queued_bytes, 512 * 1024 * 1024);
     }
+    #[test]
+    fn query_history_config_applies_defaults_and_honors_explicit_bounds() {
+        let default: FrontendWorkloadRuntimeConfig = toml::from_str("").expect("default config");
+        let default = default.query_history.expect("default history is enabled");
+        assert_eq!(default.max_bytes.get(), 16 * 1024 * 1024);
+        assert_eq!(default.max_age_ms.get(), 60_000);
+
+        let configured: FrontendWorkloadRuntimeConfig =
+            toml::from_str("[query_history]\nmax_bytes = 2048\nmax_age_ms = 5000")
+                .expect("explicit history config");
+        let configured = configured.query_history.expect("explicit history config");
+        assert_eq!(configured.max_bytes.get(), 2048);
+        assert_eq!(configured.max_age_ms.get(), 5000);
+    }
+
     #[test]
     fn retired_class_and_dependency_quota_tables_are_rejected() {
         for document in [

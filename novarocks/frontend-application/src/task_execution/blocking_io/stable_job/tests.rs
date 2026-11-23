@@ -71,6 +71,68 @@ fn gated_apply(input: &mut ApplyInput, _: &ConnectorSourceCloseResult<'_>) -> Op
     Some(17)
 }
 #[tokio::test]
+async fn delete_withdraws_the_unpublished_blocking_input_and_retention() {
+    use crate::query_execution::native_execution_adapter::source_cohort::tests::{
+        bind, drive, finish, fixture,
+    };
+    use novarocks_workload_control::{ResultWindowClass, WorkClass, WorkRequest};
+
+    let (mut cpu, mut blocking, supervisor) = original_owners();
+    let (control, mut driver, capacity) = fixture();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = root.owner.scope();
+    let window = capacity
+        .try_acquire(&scope, ResultWindowClass::Client)
+        .unwrap();
+    bind(&scope, &mut driver);
+    assert!(matches!(scope.child_inherited(), Err(WorkError::NotReady)));
+    let mut admission =
+        ConnectorBlockingIoResponsibility::request(&scope, &window.retain_alias()).unwrap();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let responsibility = loop {
+        match admission.poll_ready(&mut cx) {
+            Poll::Pending => drive(&mut driver),
+            Poll::Ready(result) => break result.unwrap(),
+        }
+    };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (entered, seen) = mpsc::sync_channel(1);
+    let (_release, released) = mpsc::sync_channel(1);
+    let mut input = Some(ApplyInput {
+        entered,
+        release: released,
+        _probe: Probe(Arc::clone(&drops)),
+    });
+    let mut job = None;
+    supervisor
+        .prepare_blocking_owned_in(&responsibility, &mut input, gated_apply, &mut job)
+        .unwrap();
+    let mut job = job.unwrap();
+    assert!(input.is_none());
+    assert!(job.withdraw_unpublished_blocking());
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        seen.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    assert!(!job.actual_exit_observed());
+    assert!(!job.withdraw_unpublished_blocking());
+    drop(job);
+    drop(responsibility);
+    drop(window);
+    finish(control, root, driver);
+    cpu.shutdown_until(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    blocking
+        .shutdown_until(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn dropped_borrowed_wait_keeps_the_same_real_input_and_receipt() {
     let (mut cpu, mut blocking, supervisor) = original_owners();
     let (control, root, window) = super::super::tests::admitted();

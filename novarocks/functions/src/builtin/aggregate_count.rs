@@ -64,6 +64,9 @@ fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 impl PreparedAggregateKernel for CountKernel {
+    fn supports_local_stages(&self) -> bool {
+        true
+    }
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,

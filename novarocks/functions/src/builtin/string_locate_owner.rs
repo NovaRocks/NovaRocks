@@ -43,6 +43,7 @@ pub(super) fn operation(name: &str) -> Option<StringLocateOp> {
     match name {
         "locate" => Some(StringLocateOp::Locate),
         "instr" => Some(StringLocateOp::Instr),
+        "strpos" => Some(StringLocateOp::Strpos),
         _ => None,
     }
 }
@@ -60,6 +61,14 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),
     }
+}
+
+pub(super) fn strpos_effects(arity: usize) -> FunctionEffectDeclaration {
+    let mut result = effects();
+    if arity == 3 {
+        result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    }
+    result
 }
 
 pub(super) fn definition(
@@ -94,12 +103,21 @@ impl StringLocateOwner {
                 value: name.into(),
             })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let no_error = effects();
+        let may_raise = strpos_effects(3);
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != if name == "locate" { 2 } else { 1 }
+            || declaration.overloads().len()
+                != if matches!(name, "locate" | "strpos") {
+                    2
+                } else {
+                    1
+                }
             || declaration.overloads().iter().any(|overload| {
-                overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
+                overload.aggregate.is_some()
+                    || (overload.effects.as_ref() != Some(&no_error)
+                        && !(operation == StringLocateOp::Strpos
+                            && overload.effects.as_ref() == Some(&may_raise)))
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
@@ -126,8 +144,12 @@ impl StringLocateOwner {
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+    fn call_effects(&self, scope: CallProofScope, arity: usize) -> CallEffects {
+        let base = if self.operation == StringLocateOp::Strpos {
+            strpos_effects(arity)
+        } else {
+            effects()
+        };
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
@@ -392,7 +414,7 @@ impl StringLocateOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            Ok(self.call_effects(input.proof_scope))
+            Ok(self.call_effects(input.proof_scope, input.selected.argument_types.len()))
         })();
         work.finish_result(result, FunctionEffectOwnerError::Control)
     }
@@ -414,7 +436,8 @@ impl StringLocateOwner {
                 || novarocks_type_contract::CallEffectContext::from(contract.context())
                     != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
+                || contract.effects()
+                    != &self.call_effects(input.proof_scope, input.selected.argument_types.len())
                 || !input.environment.is_empty()
             {
                 return Err(invalid(

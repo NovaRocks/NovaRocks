@@ -21,15 +21,39 @@ use crate::{
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{Array, ArrayRef, Int32Array, StringArray, builder::Int32Builder};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray,
+    builder::{Int32Builder, StringBuilder},
+};
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
 use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StringMeasureOp {
     Ascii,
     Bytes,
     Characters,
+    Chr,
+    Codepoint,
+}
+
+/// The selected declaration carries CHAR width independently of its Utf8 storage.
+pub(super) fn fixed_char_width(ty: &crate::FunctionValueType) -> Option<usize> {
+    match ty.value_type().kind() {
+        ValueKind::BoundedCharacter(character) if character.kind() == CharacterKind::Char => {
+            Some(character.length() as usize)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn fixed_char_padding(
+    width: usize,
+    stored_codepoints: usize,
+) -> Result<usize, KernelFailure> {
+    width
+        .checked_sub(stored_codepoints)
+        .ok_or_else(|| internal("CHAR value exceeds its selected width"))
 }
 #[derive(Debug)]
 enum MeasureFailure {
@@ -101,6 +125,11 @@ fn original_value(
                 }
             }
             text.chars().count() as i64
+        }
+        StringMeasureOp::Chr | StringMeasureOp::Codepoint => {
+            return Err(invalid(
+                "legacy string measurement cannot compute a Unicode codepoint",
+            ));
         }
     })
 }
@@ -178,20 +207,201 @@ pub(super) fn check_types(
     source: &crate::FunctionValueType,
     target: &crate::FunctionValueType,
 ) -> Result<(), StaticProfileFailure> {
-    let nullable = if op == StringMeasureOp::Ascii {
-        true
-    } else {
-        source.nullable()
+    let (source_matches, target_carrier, nullable) = match op {
+        StringMeasureOp::Chr => (source.data_type() == &DataType::Int64, DataType::Utf8, true),
+        StringMeasureOp::Codepoint => {
+            (source.data_type() == &DataType::Utf8, DataType::Int32, true)
+        }
+        StringMeasureOp::Bytes if target.data_type() == &DataType::Int64 => (
+            matches!(source.data_type(), DataType::Utf8 | DataType::Binary),
+            DataType::Int64,
+            source.nullable(),
+        ),
+        _ => (
+            source.data_type() == &DataType::Utf8,
+            DataType::Int32,
+            op == StringMeasureOp::Ascii || source.nullable(),
+        ),
     };
     if source.logical_type() != ValueLogicalType::Physical
-        || source.data_type() != &DataType::Utf8
+        || !source_matches
         || target.logical_type() != ValueLogicalType::Physical
-        || target.data_type() != &DataType::Int32
+        || target.data_type() != &target_carrier
         || target.nullable() != nullable
     {
         return Err(StaticProfileFailure::Type);
     }
     Ok(())
+}
+
+fn evaluate_trino_measurement<'a>(
+    op: StringMeasureOp,
+    input: ScalarCallInput<'_, 'a>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    let mut work = EvaluationCheckpoints::new(control);
+    let result = (|| {
+        let argument = &input.arguments()[0];
+        let array = argument.array();
+        let selection = input.selection();
+        let mut errors = Vec::new();
+        let [FunctionArgumentType::Value(source)] =
+            input.contract().selected().argument_types.as_ref()
+        else {
+            return Err(invalid("Trino string measurement lost its checked source"));
+        };
+        let output: ArrayRef = match op {
+            StringMeasureOp::Bytes => {
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(selection.len())
+                    .map_err(|_| KernelFailure::ResourceExhausted)?;
+                match array.data_type() {
+                    DataType::Utf8 => {
+                        let strings = array
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| internal("length selected source is not Utf8"))?;
+                        if let Some(width) = fixed_char_width(source) {
+                            for (ordinal, batch) in selection.iter().enumerate() {
+                                let row = argument.value_row(ordinal, batch);
+                                if row >= strings.len() {
+                                    return Err(internal(
+                                        "length selected CHAR address is out of bounds",
+                                    ));
+                                }
+                                if !source.nullable() && strings.is_null(row) {
+                                    return Err(internal(
+                                        "length non-null CHAR source contains selected SQL NULL",
+                                    ));
+                                }
+                                values.push(strings.is_valid(row).then_some(width as i64));
+                                work.step()?;
+                            }
+                        } else {
+                            let mut observed = Some(EvaluationCheckpoints::new(control));
+                            compute_rows(
+                                StringMeasureOp::Characters,
+                                strings,
+                                |ordinal, batch| argument.value_row(ordinal, batch),
+                                selection,
+                                Some(source.nullable()),
+                                &mut observed,
+                                |value| {
+                                    values.push(value);
+                                    Ok(())
+                                },
+                            )?;
+                            observed.take().unwrap().finish()?;
+                        }
+                    }
+                    DataType::Binary => {
+                        let binaries = array
+                            .as_any()
+                            .downcast_ref::<BinaryArray>()
+                            .ok_or_else(|| internal("length selected source is not Binary"))?;
+                        for (ordinal, batch) in selection.iter().enumerate() {
+                            let row = argument.value_row(ordinal, batch);
+                            if row >= binaries.len() {
+                                return Err(internal(
+                                    "length selected byte address is out of bounds",
+                                ));
+                            }
+                            values.push(
+                                binaries
+                                    .is_valid(row)
+                                    .then(|| binaries.value(row).len() as i64),
+                            );
+                            work.step()?;
+                        }
+                    }
+                    _ => return Err(invalid("length differs from its checked carrier")),
+                }
+                Arc::new(Int64Array::from(values))
+            }
+            StringMeasureOp::Chr => {
+                let positions = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| internal("chr selected source is not Int64"))?;
+                let bytes = selection
+                    .len()
+                    .checked_mul(4)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+                let mut strings = StringBuilder::with_capacity(selection.len(), bytes);
+                for (ordinal, batch) in selection.iter().enumerate() {
+                    let row = argument.value_row(ordinal, batch);
+                    if row >= positions.len() {
+                        return Err(internal("chr selected address is out of bounds"));
+                    }
+                    if positions.is_null(row) {
+                        strings.append_null();
+                    } else if let Some(ch) = unicode_scalar(positions.value(row)) {
+                        let mut encoded = [0u8; 4];
+                        strings.append_value(ch.encode_utf8(&mut encoded));
+                    } else {
+                        errors
+                            .try_reserve(1)
+                            .map_err(|_| KernelFailure::ResourceExhausted)?;
+                        errors.push(crate::RowDataError::with_reason(ordinal,
+                        crate::DataFailureReason::Domain(novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT), "Not a valid Unicode code point"));
+                        strings.append_null();
+                    }
+                    work.step()?;
+                }
+                Arc::new(strings.finish())
+            }
+            StringMeasureOp::Codepoint => {
+                let strings = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| internal("codepoint selected source is not Utf8"))?;
+                output_capacity(selection.len())?;
+                let mut values = Int32Builder::with_capacity(selection.len());
+                for (ordinal, batch) in selection.iter().enumerate() {
+                    let row = argument.value_row(ordinal, batch);
+                    if row >= strings.len() {
+                        return Err(internal("codepoint selected address is out of bounds"));
+                    }
+                    if strings.is_null(row) {
+                        values.append_null();
+                    } else if let Some(value) = single_codepoint(strings.value(row)) {
+                        values.append_value(value);
+                    } else {
+                        errors
+                            .try_reserve(1)
+                            .map_err(|_| KernelFailure::ResourceExhausted)?;
+                        errors.push(crate::RowDataError::with_reason(ordinal,
+                        crate::DataFailureReason::Domain(novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT), "Input string must be a single character string"));
+                        values.append_null();
+                    }
+                    work.step()?;
+                }
+                Arc::new(values.finish())
+            }
+            _ => return Err(invalid("unexpected Trino string measurement operation")),
+        };
+        work.flush()?;
+        SelectedValues::try_new_observed(
+            selection,
+            input.contract().result_type().data_type(),
+            output,
+            errors.into_boxed_slice(),
+            || work.step(),
+        )
+    })();
+    work.finish_result(result)
+}
+
+fn unicode_scalar(value: i64) -> Option<char> {
+    u32::try_from(value).ok().and_then(char::from_u32)
+}
+
+fn single_codepoint(text: &str) -> Option<i32> {
+    let mut characters = text.chars();
+    let first = characters.next()?;
+    characters.next().is_none().then_some(first as i32)
 }
 
 pub(super) fn evaluate_string_measure<'a>(
@@ -208,6 +418,11 @@ pub(super) fn evaluate_string_measure<'a>(
     let argument = &input.arguments()[0];
     let target = input.contract().result_type();
     check_types(op, source, target).map_err(|error| invalid(error.message()))?;
+    if matches!(op, StringMeasureOp::Chr | StringMeasureOp::Codepoint)
+        || (op == StringMeasureOp::Bytes && target.data_type() == &DataType::Int64)
+    {
+        return evaluate_trino_measurement(op, input, control);
+    }
     if argument.array().data_type() != &DataType::Utf8 {
         return Err(internal(
             "string measurement carrier differs from its checked argument",
@@ -316,14 +531,46 @@ mod tests {
         ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionValueType,
         ScalarEvaluationInstance, Selection,
     };
-    use arrow_array::{Int32Array, Int64Array};
+    use arrow_array::Int64Array;
     use novarocks_type_contract::{CompilePhase, DecimalOverflowPolicy};
     use std::{sync::Mutex, time::Duration};
 
-    const FUNCTIONS: [&str; 3] = ["ascii", "length", "char_length"];
+    const FUNCTIONS: [&str; 1] = ["length"];
+
+    #[test]
+    fn string_measure_fixed_width_is_selected_by_character_kind() {
+        use novarocks_type_contract::{
+            CharacterType, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let make_character = |kind, length| {
+            let storage = ValueTypeStorageLifetime::pure();
+            let kind = ValueKind::BoundedCharacter(CharacterType::new(kind, length).unwrap());
+            FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(kind, true, storage.clone()).unwrap(),
+                ValueLayout::try_new(&DataType::Utf8, storage).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            fixed_char_width(&make_character(CharacterKind::Char, 0)),
+            Some(0)
+        );
+        assert_eq!(
+            fixed_char_width(&make_character(CharacterKind::Char, 9)),
+            Some(9)
+        );
+        assert_eq!(
+            fixed_char_width(&make_character(CharacterKind::Varchar, 9)),
+            None
+        );
+        assert_eq!(
+            fixed_char_width(&FunctionValueType::new(DataType::Utf8, false)),
+            None
+        );
+    }
     // Independent expected byte codes, UTF-8 byte lengths and scalar counts.
     // Combining marks and joiners count as scalars, not grapheme clusters.
-    const EXPECTED: [(&str, [i32; 3]); 9] = [
+    const EXPECTED: [(&str, [i64; 3]); 9] = [
         ("", [0, 0, 0]),
         ("A", [65, 1, 1]),
         ("你好", [228, 6, 2]),
@@ -380,11 +627,11 @@ mod tests {
     fn strings(values: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(values))
     }
-    fn output(array: &ArrayRef) -> Vec<Option<i32>> {
-        assert_eq!(array.data_type(), &DataType::Int32);
+    fn output(array: &ArrayRef) -> Vec<Option<i64>> {
+        assert_eq!(array.data_type(), &DataType::Int64);
         array
             .as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
             .iter()
             .collect()
@@ -415,10 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_three_functions_keep_independent_unicode_and_byte_oracles() {
+    fn varchar_length_keeps_independent_unicode_oracles() {
         let array = strings(EXPECTED.iter().map(|(text, _)| Some(*text)).collect());
         let args = [EvaluatedArgument::Column(&array)];
-        for (index, name) in FUNCTIONS.into_iter().enumerate() {
+        for name in FUNCTIONS {
             for nullable in [false, true] {
                 for policy in [
                     DecimalOverflowPolicy::OutputNull,
@@ -435,15 +682,15 @@ mod tests {
                     assert_eq!(kernel.contract().decimal_overflow_policy(), policy);
                     let ty = kernel.contract().result_type();
                     assert_eq!(ty.logical_type(), ValueLogicalType::Physical);
-                    assert_eq!(ty.data_type().clone(), DataType::Int32);
-                    assert_eq!(ty.nullable(), name == "ascii" || nullable);
+                    assert_eq!(ty.data_type().clone(), DataType::Int64);
+                    assert_eq!(ty.nullable(), nullable);
                     let result = kernel
                         .evaluate(Selection::all(EXPECTED.len()), &args, &Control::default())
                         .unwrap();
                     assert!(result.errors().is_empty());
                     assert_eq!(
                         output(result.values()),
-                        EXPECTED.map(|(_, values)| Some(values[index]))
+                        EXPECTED.map(|(_, values)| Some(values[2]))
                     );
                 }
             }
@@ -469,7 +716,7 @@ mod tests {
             Box::default(),
         )
         .unwrap();
-        for (index, name) in FUNCTIONS.into_iter().enumerate() {
+        for name in FUNCTIONS {
             for argument in [
                 EvaluatedArgument::Column(&sliced),
                 EvaluatedArgument::SelectedColumn(&compact),
@@ -482,7 +729,7 @@ mod tests {
                 assert_eq!(result.selection(), selection);
                 assert_eq!(
                     output(result.values()),
-                    [Some([228, 6, 2][index]), Some([240, 4, 1][index])]
+                    [Some([228, 6, 2][2]), Some([240, 4, 1][2])]
                 );
                 assert!(result.errors().is_empty());
             }
@@ -495,7 +742,7 @@ mod tests {
         let constants = pool(strings(vec![None, Some("unselected"), Some("e\u{301}")]));
         let constant = constants.value(2).unwrap();
         assert!(Arc::ptr_eq(constant.pool().array(), constants.array()));
-        for (index, name) in FUNCTIONS.into_iter().enumerate() {
+        for name in FUNCTIONS {
             for argument in [
                 EvaluatedArgument::Scalar(&scalar),
                 EvaluatedArgument::Constant(&constant),
@@ -505,7 +752,7 @@ mod tests {
                 let result = kernel
                     .evaluate(Selection::all(4), &args, &Control::default())
                     .unwrap();
-                assert_eq!(output(result.values()), vec![Some([101, 3, 2][index]); 4]);
+                assert_eq!(output(result.values()), vec![Some([101, 3, 2][2]); 4]);
             }
             let null = constants.value(0).unwrap();
             let args = [EvaluatedArgument::Constant(&null)];
@@ -527,10 +774,7 @@ mod tests {
             let result = nullable
                 .evaluate(Selection::all(3), &args, &Control::default())
                 .unwrap();
-            assert_eq!(
-                output(result.values()),
-                [None, Some(0), Some(1 + i32::from(name == "ascii") * 64)]
-            );
+            assert_eq!(output(result.values()), [None, Some(0), Some(1)]);
             assert!(result.errors().is_empty());
             let mut nonnull = instance(name, false);
             assert!(matches!(
@@ -555,7 +799,6 @@ mod tests {
         for name in FUNCTIONS {
             for bad in [
                 FunctionValueType::new(DataType::LargeUtf8, false),
-                FunctionValueType::new(DataType::Binary, false),
                 FunctionValueType::new(DataType::Int64, false),
                 FunctionValueType::try_with_logical_type(
                     DataType::Utf8,
@@ -620,7 +863,7 @@ mod tests {
         let array = strings(vec![Some(&text)]);
         let args = [EvaluatedArgument::Scalar(&array)];
         let trace = Control::default();
-        let mut kernel = instance("char_length", false);
+        let mut kernel = instance("length", false);
         assert_eq!(
             output(
                 kernel
@@ -641,7 +884,7 @@ mod tests {
         ] {
             for at in 0..calls.len() {
                 let control = Control::refusing(at, error.clone());
-                let mut kernel = instance("char_length", false);
+                let mut kernel = instance("length", false);
                 assert_eq!(
                     kernel
                         .evaluate(Selection::all(1), &args, &control)
@@ -662,25 +905,8 @@ mod tests {
     }
 
     #[test]
-    fn ascii_and_bytes_do_not_scan_text_and_unselected_text_is_not_visited() {
+    fn inactive_text_is_not_visited() {
         let long = "é".repeat(10_000);
-        let long_scalar = strings(vec![Some(&long)]);
-        let short_scalar = strings(vec![Some("é")]);
-        for (name, expected) in [("ascii", 195), ("length", 20_000)] {
-            let mut traces = Vec::new();
-            for array in [&long_scalar, &short_scalar] {
-                let mut kernel = instance(name, false);
-                let trace = Control::default();
-                let args = [EvaluatedArgument::Scalar(array)];
-                let result = kernel.evaluate(Selection::all(1), &args, &trace).unwrap();
-                if Arc::ptr_eq(array, &long_scalar) {
-                    assert_eq!(output(result.values()), [Some(expected)]);
-                }
-                traces.push(trace.calls());
-            }
-            assert_eq!(traces[0], traces[1]);
-            assert!(!traces[0].contains(&256));
-        }
         let wide = strings(vec![Some(&long), Some("A"), None]);
         let short = strings(vec![Some(""), Some("A"), Some("")]);
         let rows = [1];
@@ -692,10 +918,7 @@ mod tests {
                 let args = [EvaluatedArgument::Column(array)];
                 let trace = Control::default();
                 let result = kernel.evaluate(selection, &args, &trace).unwrap();
-                assert_eq!(
-                    output(result.values()),
-                    [Some(if name == "ascii" { 65 } else { 1 })]
-                );
+                assert_eq!(output(result.values()), [Some(1)]);
                 traces.push(trace.calls());
             }
             assert_eq!(traces[0], traces[1]);
@@ -810,7 +1033,7 @@ mod source_properties {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
     #[test]
     fn direct_carrier_and_frozen_return_guards_do_not_retain_arrays_or_field_metadata() {
-        let source: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let weak = Arc::downgrade(&source);
         let failure = evaluate_required_ascii(&source).unwrap_err();
         drop(source);
@@ -820,7 +1043,7 @@ mod source_properties {
         assert_eq!(failure.to_string(), "ascii expects string");
         let field = Arc::new(arrow_schema::Field::new(
             "ResourceExhausted",
-            DataType::Int32,
+            DataType::Int64,
             true,
         ));
         let weak_field = Arc::downgrade(&field);

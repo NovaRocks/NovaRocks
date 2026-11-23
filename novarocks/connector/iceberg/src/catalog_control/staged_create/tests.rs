@@ -1045,6 +1045,16 @@ fn ordinary_typed_ctas_retains_evaluated_values_and_real_output_partition_ids() 
             &original.context,
         )
         .unwrap();
+    lease
+        .validate_ctas_definition(
+            &original.table,
+            &original.columns,
+            &storage,
+            &original.context,
+        )
+        .unwrap();
+    assert!(adapter.operations.lock().unwrap().is_empty());
+    assert!(server.requests().is_empty());
     let request = lease
         .prepare_typed_request(
             original.publication_id,
@@ -1121,6 +1131,15 @@ fn ordinary_typed_ctas_preserves_pre_source_and_bound_schema_failures() {
         let storage = lease
             .prepare_ctas_properties(values.into(), None, &original.context)
             .unwrap();
+        let description_error = lease
+            .validate_ctas_definition(
+                &original.table,
+                &original.columns,
+                &storage,
+                &original.context,
+            )
+            .unwrap_err();
+        assert!(!adapter.operations.lock().unwrap().contains_key(&operation));
         let request = lease
             .prepare_typed_request(
                 original.publication_id,
@@ -1145,6 +1164,11 @@ fn ordinary_typed_ctas_preserves_pre_source_and_bound_schema_failures() {
         let marker =
             InvalidTableProperty::from_connector_error(failure.connector_source().unwrap())
                 .unwrap();
+        let described = InvalidTableProperty::from_connector_error(&description_error).unwrap();
+        assert_eq!(
+            described.source_error().message(),
+            marker.source_error().message()
+        );
         assert!(
             marker
                 .source_error()

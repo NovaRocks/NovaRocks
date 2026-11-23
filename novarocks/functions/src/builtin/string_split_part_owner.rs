@@ -37,7 +37,7 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// Only the installed Utf8, Utf8, Int32 profile has an owner.
+/// The public profile takes two character arguments and a BIGINT field index.
 pub(super) fn operation(name: &str) -> Option<()> {
     (name == "split_part").then_some(())
 }
@@ -57,6 +57,13 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
+pub(super) fn trino_effects() -> FunctionEffectDeclaration {
+    let mut result = effects();
+    result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    result.null_behavior = FunctionNullBehavior::Strict;
+    result
+}
+
 pub(super) fn definition(
     name: &str,
     declaration: FunctionBindingDeclaration,
@@ -72,6 +79,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct StringSplitPartOwner {
+    trino: bool,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -87,7 +95,13 @@ impl StringSplitPartOwner {
             value: name.into(),
         })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let trino = trino_effects();
+        let active = declaration
+            .overloads()
+            .first()
+            .and_then(|overload| overload.effects.as_ref());
+        let uses_trino = active == Some(&trino);
+        let expected = if uses_trino { trino } else { effects() };
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
             || declaration.overloads().len() != 1
@@ -112,6 +126,7 @@ impl StringSplitPartOwner {
             })
             .collect();
         Ok(Self {
+            trino: uses_trino,
             resolver: Arc::new(resolver),
             declaration,
             implementations,
@@ -119,7 +134,11 @@ impl StringSplitPartOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = if self.trino {
+            trino_effects()
+        } else {
+            effects()
+        };
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,

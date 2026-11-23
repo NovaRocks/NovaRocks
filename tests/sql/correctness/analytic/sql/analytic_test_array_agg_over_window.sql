@@ -46,14 +46,14 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over() as arr_basic,
   array_agg(distinct v2) over() as arr_distinct,
-  array_agg(v3 order by v2) over() as arr_order_by
+  array_agg(v3 ORDER BY v2) over() as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 5
@@ -62,14 +62,14 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1) as arr_basic,
   array_agg(distinct v2) over(partition by v1) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 6
@@ -78,14 +78,14 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_basic,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 7
@@ -94,14 +94,14 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(order by v2) as arr_basic,
   array_agg(distinct v2) over(order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 8
@@ -112,8 +112,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 9
@@ -124,20 +124,20 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 10
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over() as arr_order_by
+  array_agg(v3 ORDER BY v2) over() as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 11
@@ -149,9 +149,9 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 12
@@ -159,13 +159,13 @@ USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_basic,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 13
@@ -173,13 +173,13 @@ USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 14
@@ -188,14 +188,14 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_basic,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 15
@@ -204,14 +204,14 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(order by v2) as arr_basic,
   array_agg(distinct v2) over(order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 16
@@ -222,8 +222,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_int, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_int, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 17
@@ -234,8 +234,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_decimal, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_decimal, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 18
@@ -246,8 +246,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct_int, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct_int, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 19
@@ -258,32 +258,32 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct_decimal, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct_decimal, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 20
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v1 order by v2) over(partition by v1 order by v2) as arr_order_by_int
+  array_agg(v1 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by_int
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by_int, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by_int, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 21
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v5,
-  array_agg(v5 order by v2) over(partition by v1 order by v2) as arr_order_by_decimal
+  array_agg(v5 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by_decimal
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by_decimal, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by_decimal, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 22
@@ -294,8 +294,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 23
@@ -306,8 +306,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 24
@@ -318,8 +318,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 25
@@ -330,8 +330,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 26
@@ -342,8 +342,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 27
@@ -354,8 +354,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 28
@@ -366,8 +366,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 29
@@ -378,8 +378,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 30
@@ -390,8 +390,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 31
@@ -402,8 +402,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 32
@@ -414,8 +414,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 33
@@ -428,26 +428,26 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_complex, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_with_null, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_complex, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_with_null, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 34
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_basic,
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_basic,
   array_agg(v1) over(partition by v1 order by v2 range between current row and unbounded following) as arr_complex,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_with_null
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_with_null
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_complex, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_with_null, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_complex, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_with_null, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 35
@@ -456,12 +456,12 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_large,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_large2,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_large3
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_large3
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_large, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_large, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 36
@@ -474,8 +474,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_large, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_large, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 37
@@ -488,8 +488,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 38
@@ -502,8 +502,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 39
@@ -521,8 +521,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 40
@@ -531,14 +531,14 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_basic,
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_basic,
   lead(v1, 1) over(partition by v1 order by v2) as lead_val,
   sum(v1) over(partition by v1 order by v2) as sum_window
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 41
@@ -551,8 +551,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 42
@@ -563,8 +563,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 43
@@ -575,8 +575,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 44
@@ -587,8 +587,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 45
@@ -599,20 +599,20 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 46
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v1 order by v2, v3) over(partition by v1 order by v2) as arr_basic
+  array_agg(v1 ORDER BY v2, v3) over(partition by v1 order by v2) as arr_basic
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 47
@@ -650,8 +650,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 50
@@ -662,20 +662,20 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 51
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over() as arr_order_by
+  array_agg(v3 ORDER BY v2) over() as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 52
@@ -686,8 +686,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_decimal, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_decimal, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 53
@@ -698,8 +698,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 54
@@ -710,20 +710,20 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 55
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 56
@@ -734,8 +734,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 57
@@ -746,20 +746,20 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 58
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 59
@@ -770,8 +770,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_frame, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_frame, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 60
@@ -784,8 +784,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 61
@@ -796,8 +796,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_expr, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_expr, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 62
@@ -808,8 +808,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 63
@@ -821,8 +821,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   where v1 = 1 and v2 = 2
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 64
@@ -833,8 +833,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_coalesce, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_coalesce, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 65
@@ -845,32 +845,32 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 66
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v3) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v3) over(partition by v1) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 67
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2, v3) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v2, v3) over(partition by v1) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 68
@@ -882,8 +882,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   where v1 is null
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 69
@@ -895,8 +895,8 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   where v1 = 2
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 70
@@ -905,14 +905,14 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v3) over(partition by v1 order by v2) as arr_basic,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
-    coalesce(transform(arr_basic, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_distinct, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    coalesce(transform(arr_order_by, x -> murmur_hash3_32(coalesce(x, 0))), CAST(ARRAY[] AS ARRAY<INT>)),
-    ARRAY[CAST(0 AS INT)]
+    coalesce(transform(arr_basic, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_distinct, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    coalesce(transform(arr_order_by, x -> crc32(to_utf8(CAST(coalesce(x, 0) AS VARCHAR)))), CAST(ARRAY[] AS ARRAY<BIGINT>)),
+    ARRAY[CAST(0 AS BIGINT)]
 )) AS fingerprints(fingerprint_value);
 
 -- query 71

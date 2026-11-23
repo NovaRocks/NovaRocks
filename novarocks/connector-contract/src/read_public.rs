@@ -604,7 +604,8 @@ fn value_type_error(error: novarocks_type_contract::ValueTypeError) -> Connector
         }
         ValueTypeError::UnknownLogicalMetadata
         | ValueTypeError::InvalidLogicalCarrier(_)
-        | ValueTypeError::InvalidType(_) => ConnectorErrorKind::InvalidRequest,
+        | ValueTypeError::InvalidType(_)
+        | ValueTypeError::InvalidCharacterWidth { .. } => ConnectorErrorKind::InvalidRequest,
     };
     ConnectorError::new(kind, error.to_string())
 }

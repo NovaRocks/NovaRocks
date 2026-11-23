@@ -31,8 +31,23 @@ use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;
 
-fn unescaped(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+#[derive(Clone, Copy)]
+enum Encoding {
+    Legacy,
+    Form,
+}
+
+impl Encoding {
+    fn unescaped(self, byte: u8) -> Option<u8> {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            return Some(byte);
+        }
+        match (self, byte) {
+            (Self::Legacy, b'~') | (Self::Form, b'*') => Some(byte),
+            (Self::Form, b' ') => Some(b'+'),
+            _ => None,
+        }
+    }
 }
 
 fn output_layout(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
@@ -53,9 +68,17 @@ fn output_layout(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 
-pub(super) fn evaluate_string_url_encode<'a>(
+pub(super) fn evaluate_trino_url_encode<'a>(
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    evaluate_encoding(input, control, Encoding::Form)
+}
+
+fn evaluate_encoding<'a>(
+    input: ScalarCallInput<'_, 'a>,
+    control: &dyn KernelEvaluationControl,
+    encoding: Encoding,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
     let mut work = EvaluationCheckpoints::new(control);
@@ -67,18 +90,19 @@ pub(super) fn evaluate_string_url_encode<'a>(
             return Err(invalid("URL encoding requires one checked value argument"));
         };
         let target = input.contract().result_type();
-        if source.logical_type() != ValueLogicalType::Physical
-            || source.data_type() != &DataType::Utf8
-            || target.logical_type() != ValueLogicalType::Physical
+        if source.data_type() != &DataType::Utf8
             || target.data_type() != &DataType::Utf8
-            || !target.nullable()
+            || matches!(encoding, Encoding::Legacy)
+                && (source.logical_type() != ValueLogicalType::Physical
+                    || target.logical_type() != ValueLogicalType::Physical
+                    || !target.nullable())
         {
             return Err(invalid(
                 "URL encoding differs from its exact installed profile",
             ));
         }
         let selection = input.selection();
-        let array = build_encoded(*argument, selection, source.nullable(), &mut work)?;
+        let array = build_encoded(*argument, selection, source.nullable(), encoding, &mut work)?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
             target.data_type(),
@@ -94,6 +118,7 @@ fn build_encoded(
     argument: EvaluatedArgument<'_>,
     selection: Selection<'_>,
     nullable: bool,
+    encoding: Encoding,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let values = argument
@@ -120,7 +145,11 @@ fn build_encoded(
         let selected = values.value(row);
         let mut value_bytes = 0u128;
         for byte in selected.bytes() {
-            value_bytes += if unescaped(byte) { 1 } else { 3 };
+            value_bytes += if encoding.unescaped(byte).is_some() {
+                1
+            } else {
+                3
+            };
             work.step()?;
         }
         output_offset = crate::aggregate_scalar::checked_utf8_output_offset(
@@ -155,10 +184,8 @@ fn build_encoded(
             if selected.len() > output_bytes - bytes.len() {
                 return Err(internal("URL encoding exceeded its measured output extent"));
             }
-            // The original algorithm percent-encodes UTF-8 bytes using
-            // uppercase hexadecimal. Space, plus and percent are escaped.
             for byte in selected.bytes() {
-                if unescaped(byte) {
+                if let Some(byte) = encoding.unescaped(byte) {
                     if bytes.len() == output_bytes {
                         return Err(internal("URL encoding exceeded its measured output extent"));
                     }
@@ -223,7 +250,13 @@ pub fn evaluate_required(input: &ArrayRef, batch_rows: usize) -> Result<ArrayRef
         EvaluatedArgument::Column(input)
     };
     let mut work = EvaluationCheckpoints::new(&DirectControl);
-    let result = build_encoded(argument, Selection::all(rows), true, &mut work);
+    let result = build_encoded(
+        argument,
+        Selection::all(rows),
+        true,
+        Encoding::Legacy,
+        &mut work,
+    );
     work.finish_result(result)
 }
 struct DirectControl;

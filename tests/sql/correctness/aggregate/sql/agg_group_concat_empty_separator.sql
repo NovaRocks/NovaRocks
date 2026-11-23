@@ -41,11 +41,7 @@ INSERT INTO ${case_db}.t_agg_group_concat_empty_separator VALUES
 
 SELECT
     g,
-    string_agg(s
-,
- ''
-ORDER BY ord
-) AS gc
+    LISTAGG(CAST(s AS VARCHAR), '') WITHIN GROUP (ORDER BY ord) AS gc
 FROM ${case_db}.t_agg_group_concat_empty_separator
 GROUP BY g
 ORDER BY g;

@@ -51,26 +51,24 @@ pub(super) fn is_supported_aggregate_window_function(name: &str) -> bool {
             | "max"
             | "max_by"
             | "min_by"
+            | "variance"
             | "var_samp"
-            | "variance_samp"
+            | "stddev"
             | "stddev_samp"
             | "bool_or"
-            | "boolor_agg"
             | "covar_pop"
             | "covar_samp"
             | "corr"
             | "array_agg"
-            | "array_agg_distinct"
-            | "approx_top_k"
     )
 }
 
 pub(super) fn aggregate_window_supports_distinct(name: &str) -> bool {
-    matches!(name, "array_agg" | "array_agg_distinct")
+    name == "array_agg"
 }
 
 pub(super) fn aggregate_window_supports_function_order_by(name: &str) -> bool {
-    matches!(name, "array_agg" | "array_agg_distinct")
+    name == "array_agg"
 }
 
 fn format_signature_type(data_type: &DataType, map_value_context: bool) -> String {
@@ -174,7 +172,6 @@ fn validate_scalar_function_call_impl(
     let expected_arity = match name {
         "cardinality" | "map_keys" | "map_values" | "array_min" | "array_max" => Some(1usize),
         "__array_struct_subfield" => Some(2usize),
-        "translate" => Some(3usize),
         _ => None,
     };
     if let Some(expected) = expected_arity
@@ -618,13 +615,9 @@ pub(super) fn legacy_scalar_return_type_with_catalog(
 /// details are applied by the function catalog's exact resolver.
 pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> Option<DataType> {
     Some(match name {
-        // String functions
-        "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "reverse" | "replace" | "lpad"
-        | "rpad" | "concat" | "concat_ws" | "substr" | "substring" | "left" | "right"
-        | "repeat" | "hex" | "unhex" | "md5" | "sha2" | "to_base64" | "from_base64"
-        | "url_encode" | "url_decode" | "translate" | "initcap" | "regexp_extract"
-        | "regexp_extract_all" | "regexp_replace" | "bar" | "char" | "format" | "strleft"
-        | "strright" | "group_concat" | "string_agg" | "parse_url" => DataType::Utf8,
+        "repeat" | "hex" | "unhex" | "md5" | "sha2" | "to_base64" | "from_base64"
+        | "url_encode" | "url_decode" | "bar" | "char" | "group_concat" | "string_agg"
+        | "parse_url" => DataType::Utf8,
         "split_to_map" => DataType::Map(
             Arc::new(arrow::datatypes::Field::new(
                 "entries",
@@ -667,10 +660,7 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         | "degress" | "pi" | "e" | "sign" | "rand" | "random" | "positive"
         | "cosine_similarity" | "l2_distance" => DataType::Float64,
 
-        // String length/position -> Int32
-        "length" | "char_length" | "character_length" | "instr" | "locate" | "position"
-        | "ascii" | "regexp_position" => DataType::Int32,
-        "regexp_count" | "equiwidth_bucket" => DataType::Int64,
+        "equiwidth_bucket" => DataType::Int64,
 
         // Conditional functions -> widened type of value args.
         "if" if arg_types.len() >= 2 => {
@@ -710,7 +700,6 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         // Misc
         "version" | "database" | "current_user" | "user" | "uuid" => DataType::Utf8,
         "sleep" => DataType::Boolean,
-        "murmur_hash3_32" => DataType::Int32,
         // Symmetric ciphers / hashes: aes_*/encode_* return BE-style VARCHAR
         // (raw bytes interpreted as latin-1); to_base64 wraps them in tests.
         // Iceberg internal transform functions.
@@ -749,11 +738,6 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         "state_all_zero" => DataType::Boolean,
         "array_position" | "cardinality" => DataType::Int64,
         "grouping" => DataType::Int64,
-        "split" => DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Utf8,
-            true,
-        ))),
         "array_min" | "array_max" => array_item_type(arg_types.first()).unwrap_or(DataType::Null),
         "all_match" | "any_match" | "contains" | "contains_sequence" | "arrays_overlap" => {
             DataType::Boolean

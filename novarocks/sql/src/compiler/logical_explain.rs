@@ -66,6 +66,7 @@ impl SqlLogicalExplainCatalog {
         qualifications: super::CatalogQualifications,
     ) -> Result<Self, SqlCompileError> {
         control.check()?;
+        control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisStarted);
         let (query, root_session_admitted) = match input.kind {
             super::SqlStatementInputKind::ParsedQuery(query) => (*query, false),
             super::SqlStatementInputKind::AdmittedSessionQuery(query) => (*query, true),
@@ -74,12 +75,6 @@ impl SqlLogicalExplainCatalog {
                     "logical EXPLAIN requires a parsed query".into(),
                 ));
             }
-        };
-        let query = if root_session_admitted {
-            crate::sql_mode::normalize_concat_query_with_semantics(query, &session.sql_semantics)
-        } else {
-            crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
-                .map_err(SqlCompileError::from)?
         };
         let catalog = CatalogCompletionState::try_new_with_qualifications(
             query,
@@ -174,9 +169,12 @@ impl SqlLogicalExplainCatalog {
                 self.control.clone(),
             );
             request.table_sequence = Some(pass);
-            SqlCompiler::analyze_with_table_sequence(request)?
-                .map(|output| output.into_complete())
-                .transpose()
+            let analyzed = SqlCompiler::analyze_with_table_sequence(request);
+            if !matches!(analyzed, Ok(None)) {
+                self.control
+                    .observe_final_plan(super::SqlFinalPlanEvent::AnalysisFinished);
+            }
+            analyzed?.map(|output| output.into_complete()).transpose()
         };
         let pass = TableSequencePass::request(
             std::sync::Arc::clone(&sealed_functions),

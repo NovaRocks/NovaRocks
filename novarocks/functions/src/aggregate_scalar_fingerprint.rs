@@ -35,9 +35,27 @@ pub(crate) fn temporal_key(
         .map_err(|_| crate::aggregate_scalar::temporal_scalar_contract())
 }
 
+fn canonical_nan_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+#[cfg(test)]
 pub fn tracked_key_fingerprint<A: ScalarStateAllocator>(
     key: &TrackedAggScalarValue<A>,
     allocator: &A,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<ScalarVec<u8, A>, crate::KernelFailure> {
+    tracked_key_fingerprint_with_float_identity(key, allocator, canonical_nan_bits, work)
+}
+
+pub fn tracked_key_fingerprint_with_float_identity<A: ScalarStateAllocator>(
+    key: &TrackedAggScalarValue<A>,
+    allocator: &A,
+    float_identity: fn(f64) -> u64,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ScalarVec<u8, A>, crate::KernelFailure> {
     work.step()?;
@@ -48,7 +66,7 @@ pub fn tracked_key_fingerprint<A: ScalarStateAllocator>(
         "reserve aggregate scalar fingerprint",
         work,
     )?;
-    encode_tracked_scalar(&mut output, key, work)?;
+    encode_tracked_scalar(&mut output, key, float_identity, work)?;
     debug_assert_eq!(output.len(), encoded_len);
     Ok(output)
 }
@@ -72,7 +90,7 @@ pub fn tracked_optional_key_fingerprint<A: ScalarStateAllocator>(
         "reserve optional aggregate scalar fingerprint",
         work,
     )?;
-    encode_tracked_optional_value(&mut output, value, work)?;
+    encode_tracked_optional_value(&mut output, value, canonical_nan_bits, work)?;
     debug_assert_eq!(output.len(), encoded_len);
     Ok(output)
 }
@@ -132,6 +150,7 @@ fn tracked_scalar_encoded_len<A: ScalarStateAllocator>(
 fn encode_tracked_scalar<A: ScalarStateAllocator>(
     output: &mut ScalarVec<u8, A>,
     value: &TrackedAggScalarValue<A>,
+    float_identity: fn(f64) -> u64,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), crate::KernelFailure> {
     work.step()?;
@@ -146,11 +165,7 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
         }
         TrackedAggScalarValue::Float64(value) => {
             output.push(3);
-            let bits = if value.is_nan() {
-                f64::NAN.to_bits()
-            } else {
-                value.to_bits()
-            };
+            let bits = float_identity(*value);
             output.extend_from_slice(&bits.to_le_bytes());
         }
         TrackedAggScalarValue::Utf8(value) => {
@@ -182,7 +197,7 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
         }
         TrackedAggScalarValue::Struct(values) => {
             output.push(8);
-            encode_tracked_optional_values(output, values, work)?;
+            encode_tracked_optional_values(output, values, float_identity, work)?;
         }
         TrackedAggScalarValue::Map(entries) => {
             output.push(9);
@@ -191,13 +206,13 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
             );
             for (key, value) in entries {
                 work.step()?;
-                encode_tracked_optional_value(output, key, work)?;
-                encode_tracked_optional_value(output, value, work)?;
+                encode_tracked_optional_value(output, key, float_identity, work)?;
+                encode_tracked_optional_value(output, value, float_identity, work)?;
             }
         }
         TrackedAggScalarValue::List(values) => {
             output.push(10);
-            encode_tracked_optional_values(output, values, work)?;
+            encode_tracked_optional_values(output, values, float_identity, work)?;
         }
         TrackedAggScalarValue::Decimal256(value) => {
             output.push(11);
@@ -221,13 +236,14 @@ fn encode_tracked_scalar<A: ScalarStateAllocator>(
 fn encode_tracked_optional_values<A: ScalarStateAllocator>(
     output: &mut ScalarVec<u8, A>,
     values: &[Option<TrackedAggScalarValue<A>>],
+    float_identity: fn(f64) -> u64,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), crate::KernelFailure> {
     work.step()?;
     output.extend_from_slice(&checked_u32_len(LengthKind::Children, values.len())?.to_le_bytes());
     for value in values {
         work.step()?;
-        encode_tracked_optional_value(output, value, work)?;
+        encode_tracked_optional_value(output, value, float_identity, work)?;
     }
     Ok(())
 }
@@ -235,12 +251,13 @@ fn encode_tracked_optional_values<A: ScalarStateAllocator>(
 fn encode_tracked_optional_value<A: ScalarStateAllocator>(
     output: &mut ScalarVec<u8, A>,
     value: &Option<TrackedAggScalarValue<A>>,
+    float_identity: fn(f64) -> u64,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), crate::KernelFailure> {
     work.step()?;
     if let Some(value) = value {
         output.push(1);
-        encode_tracked_scalar(output, value, work)?;
+        encode_tracked_scalar(output, value, float_identity, work)?;
     } else {
         output.push(0);
     }

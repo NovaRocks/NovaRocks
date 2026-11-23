@@ -94,8 +94,14 @@ fn definition_and_current_system_needs_share_declaration_only_lookup() {
         assert_eq!(declaration.binding.catalog_name(), "default_catalog");
         assert_eq!(declaration.schema, "information_schema");
         assert_eq!(declaration.table, "schemata");
-        assert_eq!(declaration.columns.len(), 5);
-        assert_eq!(declaration.columns[0].name, "catalog_name");
+        assert_eq!(
+            declaration
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["catalog_name", "schema_name"]
+        );
         assert_eq!(fact.id(), need.id());
     }
 }

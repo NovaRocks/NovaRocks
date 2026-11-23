@@ -2,14 +2,19 @@
 
 //! Temporary typed statement entrance for Trino compatibility tests.
 
+pub(crate) mod prepared_description;
+
 use super::*;
+
+mod kill_query;
 use crate::query_execution::dml::truncate::{TruncateCommand, TruncateTarget};
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
     session::{QuerySessionStatement, StatementAdmission, StatementOutputShape},
     session_control::{GovernedQueryStatementOwner, StatementCompletionProjection},
     sql::trino_admission::{
-        TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement,
+        AdmittedTrinoStatement, TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation,
+        admit_trino_statement_request_in_namespace,
     },
     statement_kind::StatementKind,
 };
@@ -49,6 +54,8 @@ struct CommandContextInput {
     command: CommandContext,
     statement_started_at: std::time::SystemTime,
     options: QueryOptions,
+    explain_detail: novarocks_query_application::sql::session::ExplainDetail,
+    explain_family: Option<novarocks_result_contract::ClientPresentationFamily>,
     cancellation: QueryCancellationView,
     deadline: Option<Instant>,
     timeout_duration: Option<Duration>,
@@ -78,53 +85,110 @@ impl FrontendQuerySession {
             .map_err(internal_error)?;
         let statement = novarocks_query_application::sql::parse_single_statement(&source)
             .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(&source)))?;
-        match admit_trino_statement(&source, statement)? {
-            TrinoStatementAction::Query(action) => {
-                let kind = match &action {
-                    TrinoQueryAction::Read(_) => StatementKind::Query,
-                    TrinoQueryAction::Explain(_) | TrinoQueryAction::ExplainAnalyze(_) => {
-                        StatementKind::Explain
-                    }
-                };
-                let result = self
-                    .execute_trino_query_family(source, action, statement_time)
-                    .await?;
-                Ok(QuerySessionStatement::output_owned(result, kind))
-            }
-            TrinoStatementAction::Session(action) => {
-                self.execute_trino_session_action(source, action, statement_time)
+        let snapshots =
+            std::mem::take(&mut *self.prepared_statements.lock().map_err(poisoned_state)?);
+        let (catalog, schema) = {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            (
+                state.current_catalog().map(str::to_owned),
+                state.explicit_database().map(str::to_owned),
+            )
+        };
+        let AdmittedTrinoStatement {
+            source: statement_source,
+            parameters,
+            action,
+        } = admit_trino_statement_request_in_namespace(
+            source,
+            statement,
+            &snapshots,
+            catalog.as_deref(),
+            schema.as_deref(),
+        )?;
+        drop(snapshots);
+        let source = statement_source.sql().clone();
+        let result = async {
+            match action {
+                TrinoStatementAction::Query(action) => {
+                    let kind = match &action {
+                        TrinoQueryAction::Read(_) | TrinoQueryAction::Show(_) => {
+                            StatementKind::Query
+                        }
+                        TrinoQueryAction::Explain(_) | TrinoQueryAction::ExplainAnalyze(_) => {
+                            StatementKind::Explain
+                        }
+                    };
+                    let result = self
+                        .execute_trino_query_family(
+                            statement_source.clone(),
+                            parameters,
+                            action,
+                            statement_time,
+                        )
+                        .await?;
+                    Ok(QuerySessionStatement::output_owned(result, kind))
+                }
+                TrinoStatementAction::Session(action) => {
+                    self.execute_trino_session_action(source, action, parameters, statement_time)
+                        .await
+                }
+                TrinoStatementAction::Product(command) => {
+                    let plan = product_plan(&command)?;
+                    let kind = plan.admission.kind;
+                    let result = match self
+                        .start_trino_command(
+                            &source,
+                            plan,
+                            statement_started_at,
+                            statement_time,
+                            parameters,
+                        )
+                        .await?
+                    {
+                        CommandStart::Ready(entry) => {
+                            self.execute_trino_product(command, *entry).await?
+                        }
+                        CommandStart::Error(result) => *result,
+                    };
+                    Ok(QuerySessionStatement::output_owned(result, kind))
+                }
+                TrinoStatementAction::Prepare(preparation) => {
+                    let plan = preparation_plan(&preparation)?;
+                    let kind = plan.admission.kind;
+                    let result = match self
+                        .start_trino_command(
+                            &source,
+                            plan,
+                            statement_started_at,
+                            statement_time,
+                            parameters,
+                        )
+                        .await?
+                    {
+                        CommandStart::Ready(entry) => {
+                            self.execute_trino_preparation(source, preparation, *entry)
+                                .await?
+                        }
+                        CommandStart::Error(result) => *result,
+                    };
+                    Ok(QuerySessionStatement::output_owned(result, kind))
+                }
+                TrinoStatementAction::Describe(description) => {
+                    self.execute_trino_describe(
+                        statement_source.clone(),
+                        description,
+                        parameters,
+                        statement_started_at,
+                        statement_time,
+                    )
                     .await
-            }
-            TrinoStatementAction::Product(command) => {
-                let plan = product_plan(&command)?;
-                let kind = plan.admission.kind;
-                let result = match self
-                    .start_trino_command(&source, plan, statement_started_at, statement_time)
-                    .await?
-                {
-                    CommandStart::Ready(entry) => {
-                        self.execute_trino_product(command, *entry).await?
-                    }
-                    CommandStart::Error(result) => *result,
-                };
-                Ok(QuerySessionStatement::output_owned(result, kind))
-            }
-            TrinoStatementAction::Prepare(preparation) => {
-                let plan = preparation_plan(&preparation)?;
-                let kind = plan.admission.kind;
-                let result = match self
-                    .start_trino_command(&source, plan, statement_started_at, statement_time)
-                    .await?
-                {
-                    CommandStart::Ready(entry) => {
-                        self.execute_trino_preparation(source, preparation, *entry)
-                            .await?
-                    }
-                    CommandStart::Error(result) => *result,
-                };
-                Ok(QuerySessionStatement::output_owned(result, kind))
+                }
             }
         }
+        .await;
+        result
+            .map(|result| result.with_trino_statement_source(statement_source.clone()))
+            .map_err(|error| error.with_trino_statement_source(statement_source))
     }
 
     async fn start_trino_command(
@@ -133,6 +197,7 @@ impl FrontendQuerySession {
         plan: CommandPlan,
         statement_started_at: std::time::SystemTime,
         statement_time: novarocks_type_contract::StatementTimeEnvironment,
+        parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     ) -> Result<CommandStart, QueryServiceError> {
         self.admission.publish(plan.admission);
         *self.output_shape.lock().map_err(poisoned_state)? = Some(plan.admission.shape);
@@ -245,6 +310,7 @@ impl FrontendQuerySession {
                 )
                 .with_session_property_inputs(properties),
             )
+            .with_prepared_parameters(parameters)
             .with_result_capacity(capacity)
             .map_err(|error| internal_error(error.to_string()))?;
             let connector = crate::connector::connector_request_context_for_execution_on_runtime(
@@ -282,6 +348,8 @@ impl FrontendQuerySession {
                 command,
                 statement_started_at,
                 options,
+                explain_detail: settings.explain_detail(),
+                explain_family: presentation,
                 cancellation,
                 deadline,
                 timeout_duration,
@@ -366,13 +434,17 @@ fn preparation_plan(
         Prep::DropBranch(_) => management(DropBranch),
         Prep::FastForwardBranch(_) | Prep::ShowBranches(_) => management(Call),
         Prep::Insert(_) => CommandPlan::write(Insert, true),
-        Prep::Delete(_) => CommandPlan::write(Delete, true),
+        Prep::Delete(node) if node.predicate.is_none() => {
+            CommandPlan::management(Delete, StatementOutputShape::Rows)
+        }
+        Prep::Delete(_) => CommandPlan::write(Delete, false),
         Prep::DeleteEntireBranch { .. } => {
             CommandPlan::management(Delete, StatementOutputShape::Rows)
         }
         Prep::Update(_) => CommandPlan::write(Update, true),
         Prep::Merge(_) => CommandPlan::write(Merge, true),
         Prep::Call(_) => CommandPlan::management(Call, UndeterminedCall),
+        Prep::KillQuery(_) => CommandPlan::management(Call, Empty),
         Prep::CreateView(_) => management(CreateView),
         Prep::DropView(_) => management(DropView),
         Prep::ShowCreateView(_) => CommandPlan::management(ShowCreateView, ResultSet),
@@ -393,6 +465,15 @@ fn preparation_plan(
         Prep::ExplainRefreshMaterializedView(..) => {
             CommandPlan::management(ExplainMaterializedViewRefresh, ResultSet)
         }
+        Prep::ExplainDelete(_) => CommandPlan {
+            admission: StatementAdmission {
+                kind: Explain,
+                shape: ResultSet,
+            },
+            work_class: WorkClass::Query,
+            window_class: ResultWindowClass::Local,
+            waits_for_topology: false,
+        },
         Prep::SetMaterializedViewProperties { properties, .. } => {
             let mut plan = management(AlterMaterializedViewProperties);
             if properties
@@ -498,6 +579,7 @@ impl FrontendQuerySession {
             input.request,
             input.command,
             execution_owner,
+            statement.take_control_timing(),
         )) as TypedCommandWorker;
         self.finish_command_worker(
             statement,
@@ -547,6 +629,7 @@ impl FrontendQuerySession {
             input.cancellation.clone(),
             execution_owner,
             input.command.result_window_alias(),
+            statement.take_control_timing(),
             move || {
                 prepare_dml
                     .prepare_truncate(
@@ -827,6 +910,11 @@ impl FrontendQuerySession {
                     )
                     .await;
             }
+            Prep::KillQuery(call) => {
+                return self
+                    .execute_kill_query(source, call, CommandEntry { statement, input })
+                    .await;
+            }
             Prep::Call(node) => {
                 return self
                     .execute_trino_call(node, CommandEntry { statement, input })
@@ -905,6 +993,11 @@ impl FrontendQuerySession {
                     .map_err(product_command_service_error);
                 return self.run_trino_action(statement, action).await;
             }
+            Prep::ExplainDelete(node) => {
+                return self
+                    .execute_trino_explain_delete(source, node, CommandEntry { statement, input })
+                    .await;
+            }
             Prep::RefreshMaterializedView(node) | Prep::ExplainRefreshMaterializedView(node, _) => {
                 let action = self
                     .service
@@ -954,7 +1047,65 @@ impl FrontendQuerySession {
             delete::DeleteStatementInput, insert::InsertStatementInput,
             mutation::MutationStatementInput,
         };
-        let CommandEntry { statement, input } = entry;
+        let CommandEntry {
+            mut statement,
+            mut input,
+        } = entry;
+        if let TrinoWrite::Insert(node) = &command
+            && let Some(parameters) = input.request.execution().prepared_parameters().cloned()
+            && !parameters.contextual_needs(&node.query).is_empty()
+        {
+            let window = input
+                .command
+                .result_window_alias()
+                .ok_or_else(|| internal_error("Prepared INSERT has no original result window"))?;
+            let control = crate::query_execution::planning::sql_compile_control_from_execution(
+                input.request.execution(),
+            );
+            let state = self.state.lock().map_err(poisoned_state)?.clone();
+            let context = self.service.query_compiler.property_cpu_context(
+                input.request.session().current_database().to_owned(),
+                input.request.execution().sql_semantics().clone(),
+                self.service.required_constant_interpreter.clone(),
+                control,
+                input.command.scope().clone(),
+                window.clone(),
+            );
+            let query = (*node.query).clone();
+            let argument_source = source.clone();
+            let (completed, owner, _window) = execute_synchronous_stage(
+                self.service.query_blocking_executor.clone(),
+                input.cancellation.clone(),
+                statement
+                    .take_execution_owner()
+                    .expect("original INSERT preparation owner"),
+                Some(window),
+                None,
+                move || {
+                    super::session_property_computation::complete_prepared_context(
+                        parameters,
+                        &query,
+                        &state,
+                        &context,
+                        &argument_source,
+                    )
+                    .map_err(RoutedExecutionError::Application)
+                },
+            )
+            .await
+            .map_err(internal_error)?;
+            statement.restore_execution_owner(owner);
+            match completed {
+                Ok(parameters) => {
+                    input.request = input.request.with_prepared_parameters(Some(parameters));
+                }
+                Err(error) => {
+                    return Ok(
+                        self.governed_typed_error(routed_execution_service_error(error), statement)
+                    );
+                }
+            }
+        }
         let dml_error =
             |error| routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err());
         let action = (|| {
@@ -985,6 +1136,7 @@ impl FrontendQuerySession {
                         .prepare_statement_action(DeleteStatementInput {
                             statement,
                             sql,
+                            topology: self.service.topology.clone(),
                             context: input.request,
                             query_options: input.options,
                             launcher,
@@ -1020,6 +1172,45 @@ impl FrontendQuerySession {
 }
 
 impl FrontendQuerySession {
+    async fn execute_trino_explain_delete(
+        &self,
+        source: Arc<str>,
+        node: ast::TrinoDelete,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        use crate::query_execution::dml::delete::DeleteExplainStatementInput;
+
+        let CommandEntry { statement, input } = entry;
+        let Some(family) = input.explain_family else {
+            return Ok(self.governed_typed_error(
+                internal_error("client statement requires an explicit presentation"),
+                statement,
+            ));
+        };
+        let action = crate::dml::prepare_trino_delete_shape(node, &source)
+            .map_err(|error| {
+                routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err())
+            })
+            .and_then(|delete| {
+                self.service
+                    .delete_engine
+                    .prepare_explain_action(DeleteExplainStatementInput {
+                        statement: delete,
+                        sql: source,
+                        context: input.request,
+                        command: input.command,
+                        query_options: input.options,
+                        detail: input.explain_detail,
+                        timing: Some(statement.client_query_timing()),
+                        environment: QueryActionEnvironment::new(&self.service),
+                        family,
+                        #[cfg(novarocks_dev_controls)]
+                        observation: input.observation,
+                    })
+            });
+        self.run_trino_action(statement, action).await
+    }
+
     async fn execute_trino_show_create_mv(
         &self,
         source: Arc<str>,
@@ -1047,7 +1238,13 @@ impl FrontendQuerySession {
             .take_execution_owner()
             .expect("one original materialized view definition owner");
         let context = input.command.connector_context().clone();
+        let timing = statement.take_control_timing();
         let mut worker = Box::pin(async move {
+            if let Some(timing) = timing
+                && input.command.scope().check().is_ok()
+            {
+                timing.start_control();
+            }
             let result =
                 crate::mv::domain::show_create::execute(binding, context, &source, node.span)
                     .await
@@ -1081,6 +1278,7 @@ impl FrontendQuerySession {
             .expect("one original View owner");
         let view = self.service.command_executor.view.clone();
         let executor = self.service.query_blocking_executor.clone();
+        let timing = statement.take_control_timing();
         let mut worker = Box::pin(async move {
             let body = move |request: &RequestContext, context: &CommandContext| {
                 let command = match &command {
@@ -1095,6 +1293,9 @@ impl FrontendQuerySession {
                         ViewCommand::ShowCreate { name: &node.name }
                     }
                 };
+                if let Some(timing) = timing {
+                    timing.start_control();
+                }
                 view.execute_command(
                     command,
                     request.session().current_catalog(),
@@ -1145,7 +1346,13 @@ impl FrontendQuerySession {
             .take_execution_owner()
             .expect("one original CALL owner");
         let specialized = self.service.command_executor.clone();
+        let timing = statement.take_control_timing();
         let mut worker = Box::pin(async move {
+            if let Some(timing) = timing
+                && input.command.scope().check().is_ok()
+            {
+                timing.start_control();
+            }
             let result = specialized
                 .execute_maintenance_call(command, &input.request, &input.command)
                 .await
@@ -1256,6 +1463,7 @@ impl FrontendQuerySession {
             input.cancellation.clone(),
             execution_owner,
             Some(window),
+            statement.take_control_timing(),
             move || {
                 let mut constants = cpu_context.constant_port();
                 engine
@@ -1330,6 +1538,7 @@ impl FrontendQuerySession {
                 .take_execution_owner()
                 .expect("one original table-procedure owner"),
             Some(window),
+            None,
             move || {
                 prepare_trino_table_execute(
                     &maintenance,
@@ -1361,12 +1570,14 @@ impl FrontendQuerySession {
                 let executor = self.service.query_blocking_executor.clone();
                 let cancellation = input.cancellation.clone();
                 let connector = input.command.connector_context().clone();
+                let timing = statement.take_control_timing();
                 let mut worker = Box::pin(async move {
                     execute_synchronous_stage(
                         executor,
                         cancellation,
                         execution_owner,
                         window,
+                        timing,
                         move || prepared.execute(&connector).map_err(product_command_error),
                     )
                     .await
@@ -1390,6 +1601,7 @@ impl FrontendQuerySession {
                     .delete_engine
                     .prepare_statement_action(DeleteStatementInput {
                         statement: prepared,
+                        topology: self.service.topology.clone(),
                         sql: equality_source.to_string(),
                         context: input.request,
                         query_options: input.options,
@@ -1426,6 +1638,7 @@ impl FrontendQuerySession {
                 .take_execution_owner()
                 .expect("same original ADD FILES owner"),
             Some(window),
+            statement.take_control_timing(),
             move || {
                 add_files_dml_result(
                     planner.prepare_resolved_add_files(
@@ -1499,8 +1712,52 @@ mod add_files_control_tests {
 }
 
 #[cfg(test)]
+mod explain_delete_tests {
+    use super::*;
+    use novarocks_query_application::sql::trino_admission::admit_trino_statement;
+
+    #[test]
+    fn explain_delete_uses_original_local_result_without_topology_wait() {
+        let sql = "EXPLAIN DELETE FROM lake.db.t WHERE part >= 10";
+        let parsed = novarocks_parser::parser::parse_statement(sql).unwrap();
+        let TrinoStatementAction::Prepare(preparation) =
+            admit_trino_statement(sql, parsed).unwrap()
+        else {
+            panic!("expected EXPLAIN DELETE preparation");
+        };
+        let plan = preparation_plan(&preparation).unwrap();
+        assert_eq!(plan.admission.kind, StatementKind::Explain);
+        assert_eq!(plan.admission.shape, StatementOutputShape::ResultSet);
+        assert_eq!(plan.work_class, WorkClass::Query);
+        assert_eq!(plan.window_class, ResultWindowClass::Local);
+        assert!(!plan.waits_for_topology);
+    }
+}
+
+#[cfg(test)]
 mod branch_delete_tests {
     use super::*;
+    use novarocks_query_application::sql::trino_admission::admit_trino_statement;
+
+    #[test]
+    fn delete_enters_the_original_root_before_selecting_compute() {
+        for (sql, work_class) in [
+            ("DELETE FROM lake.db.t", WorkClass::Management),
+            ("DELETE FROM lake.db.t WHERE FALSE", WorkClass::Query),
+            ("DELETE FROM lake.db.t WHERE id = 9", WorkClass::Query),
+        ] {
+            let statement = novarocks_parser::parser::parse_statement(sql).unwrap();
+            let TrinoStatementAction::Prepare(preparation) =
+                admit_trino_statement(sql, statement).unwrap()
+            else {
+                panic!("expected typed DELETE preparation");
+            };
+            let plan = preparation_plan(&preparation).unwrap();
+            assert_eq!(plan.admission.kind, StatementKind::Delete);
+            assert_eq!(plan.work_class, work_class);
+            assert!(!plan.waits_for_topology);
+        }
+    }
 
     #[test]
     fn whole_branch_delete_uses_the_same_target_with_delete_completion() {

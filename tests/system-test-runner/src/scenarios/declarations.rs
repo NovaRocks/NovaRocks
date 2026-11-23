@@ -171,6 +171,8 @@ pub(super) fn for_module(
             "novarocks-server/**",
         ],
         "memory_attribution" => &[
+            "novarocks/functions/src/builtin/regexp_count/**",
+            "novarocks/expression/src/evaluator/guarded/regexp.rs",
             "novarocks/trino-adapter/**",
             "tests/system-test-runner/src/actors/sql.rs",
             "novarocks/memory/**",
@@ -693,6 +695,14 @@ pub(super) fn for_module(
         paths.extend([
             "docker/iceberg-rest/**".into(),
             "tests/fixtures/iceberg-rest-publication/**".into(),
+        ]);
+    }
+    if module == "trino_protocol" && name == "trino-protocol/show-metadata-type-signatures" {
+        paths.extend([
+            "novarocks/connector/paimon/**".into(),
+            "novarocks/functions/**".into(),
+            "novarocks/query-application/**".into(),
+            "novarocks/sql/**".into(),
         ]);
     }
     if module == "trino_protocol" && name == "trino-protocol/command-completion-shape" {

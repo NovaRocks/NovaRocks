@@ -15,14 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod aggregate_values;
+mod approximate_aggregates;
 mod assert_true;
 mod cast;
 mod collection_functions;
 mod comparison;
 mod from_binary;
 mod kernel_control;
+mod listagg;
 mod native_between;
 mod native_inlist;
+mod public_function_metadata;
 mod scalar_rows;
 mod synopse;
 mod time_text_cast;

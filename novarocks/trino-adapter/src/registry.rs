@@ -18,9 +18,11 @@
 //! Design: docs/adr/ADR-0203-client-result-presentation-and-trino-paged-delivery.md
 //! Request serialization decides protocol ownership; socket writes never settle statements.
 use crate::{
-    entry::{EntryState, Outcome, Page, Phase, Production, QueryEntry},
+    entry::{EntryState, Outcome, Page, Phase, Production, QueryEntry, RegisteredQueryRequest},
     envelope::{envelope, page_chunks},
-    error_mapping::{TrinoErrorSource, query_error_for_query},
+    error_mapping::{
+        TrinoErrorSource, TrinoQueryError, query_error_for_query, query_error_for_query_with_effect,
+    },
     request::{ParsedStatementRequest, session_effect_headers},
     settlement::Disposition,
     update_type::update_type,
@@ -28,7 +30,13 @@ use crate::{
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use novarocks_query_application::{
-    session::QuerySessionFactory, session_control::QueryControlService,
+    cancellation::QueryCancellationReason,
+    query_control::{
+        ClientQueryCancellation, ClientQueryConclusion, ClientQueryStart, ClientQueryTime,
+    },
+    session::QuerySessionFactory,
+    session_control::QueryControlService,
+    session_error::{QueryServiceError, QueryServiceErrorKind},
 };
 use rand::RngCore;
 use std::{
@@ -82,12 +90,61 @@ impl TrinoQueryRegistry {
         rand::rngs::OsRng.fill_bytes(&mut random);
         let slug = random.iter().map(|v| format!("{v:02x}")).collect();
         let (command, _) = watch::channel(None);
-        tracing::debug!(query_id = %id, observation = ?request.observation(), "Trino query registered");
+        let mut entries = self.entries.lock().expect("query registry");
+        let (registration, rejection) = if self.draining.load(Ordering::Acquire) {
+            (
+                None,
+                Some(query_error_for_query(
+                    id.as_str(),
+                    TrinoErrorSource::FrontendDraining,
+                )),
+            )
+        } else if entries.contains_key(id.as_str()) {
+            (
+                None,
+                Some(registration_error(
+                    id.as_str(),
+                    "client query ID is already registered",
+                )),
+            )
+        } else {
+            match self.control.register_client_query(
+                id.clone(),
+                request.principal(),
+                request.observation().source.as_deref().map(Arc::from),
+                request.original_text(),
+                ClientQueryTime::now(),
+            ) {
+                Ok(registration) => (Some(registration), None),
+                Err(error) => (
+                    None,
+                    Some(registration_error(
+                        id.as_str(),
+                        &format!("register client query: {error:?}"),
+                    )),
+                ),
+            }
+        };
+        if registration.is_some() {
+            tracing::debug!(query_id = %id, observation = ?request.observation(), "Trino query registered");
+        }
+        let original_text = registration
+            .as_ref()
+            .and_then(|_| request.original_text().cloned());
+        if let Some(text) = &original_text {
+            self.observation.observe_original_text(text);
+        }
+        let request = registration.as_ref().map(|_| RegisteredQueryRequest {
+            request,
+            unclaimed: self.observation.unclaimed(),
+        });
         let entry = Arc::new(QueryEntry {
             id,
             slug,
             base,
-            request: Mutex::new(Some(request)),
+            request: Mutex::new(request),
+            registration,
+            original_text: Mutex::new(original_text),
             state: tokio::sync::Mutex::new(EntryState {
                 phase: Phase::Registered,
                 next_token: 0,
@@ -115,26 +172,14 @@ impl TrinoQueryRegistry {
             requests: Notify::new(),
             timer: Mutex::new(None),
         });
-        if self.draining.load(Ordering::Acquire) {
-            return terminal_page(
-                &entry,
-                None,
-                Some(query_error_for_query(
-                    entry.id.as_str(),
-                    TrinoErrorSource::FrontendDraining,
-                )),
-                HeaderMap::new(),
-                None,
-            );
+        if let Some(error) = rejection {
+            return terminal_page(&entry, None, Some(error), HeaderMap::new(), None);
         }
         let page = ordinary_page(&entry, Some(0), "QUEUED", None, None, None, None, None);
-        self.entries
-            .lock()
-            .expect("query registry")
-            .insert(entry.id.to_string(), Arc::clone(&entry));
         let registry = Arc::downgrade(self);
         let timer_entry = Arc::downgrade(&entry);
         let timer = tokio::spawn(async move {
+            let mut watching_cancellation = true;
             loop {
                 let Some(registry) = registry.upgrade() else {
                     break;
@@ -150,37 +195,65 @@ impl TrinoQueryRegistry {
                     break;
                 };
                 let deadline = *entry.touched.lock().expect("query clock") + timeout;
-                tokio::select! {
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {},
+                let expired = tokio::select! {
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => true,
+                    _ = entry.registration().cancellation_requested(), if watching_cancellation => {
+                        watching_cancellation = false;
+                        false
+                    }
                     _ = entry.requests.notified() => continue,
                     _ = &mut shutdown => break,
-                }
-                if entry.touched.lock().expect("query clock").elapsed() < timeout {
+                };
+                let mut state = entry.state.lock().await;
+                if !expired {
+                    if matches!(state.phase, Phase::Registered)
+                        && let Some(error) = original_cancellation_error(&registry.control, &entry)
+                    {
+                        registered_terminal(&registry.control, &entry, &mut state, error);
+                    }
                     continue;
                 }
-                let mut state = entry.state.lock().await;
-                // Recheck under the same request lock: a concurrent request wins by touching first.
+                // Recheck under the same request lock: accepted client
+                // activity wins if it reached the entry before the timer.
                 if entry.touched.lock().expect("query clock").elapsed() < timeout {
                     continue;
                 }
                 match state.phase {
-                    Phase::Registered | Phase::Settled { .. } => {
-                        registry
-                            .entries
-                            .lock()
-                            .expect("query registry")
-                            .remove(entry.id.as_str());
-                        break;
+                    Phase::Registered => {
+                        registry.control.request_unstarted_client_cancel(
+                            entry.registration(),
+                            QueryCancellationReason::ClientDisconnected,
+                        );
+                        let error = protocol_cancellation_error(
+                            &entry,
+                            QueryCancellationReason::ClientDisconnected,
+                        );
+                        // The same entry-state lock excludes first GET while
+                        // settlement releases the original request, including
+                        // its prepared snapshot.
+                        registered_terminal(&registry.control, &entry, &mut state, error);
+                        state.phase = Phase::Expired;
                     }
+                    Phase::Settled { .. } => state.phase = Phase::Expired,
                     Phase::Executing => {
-                        cancel_locked(&entry, &mut state, Disposition::Abandon).await;
+                        cancel_locked(&registry.control, &entry, &mut state, Disposition::Abandon)
+                            .await;
                         entry.touch();
                         tracing::debug!(query_id = %entry.id, "Trino query abandoned");
+                        continue;
                     }
+                    Phase::Expired => break,
                 }
+                registry
+                    .entries
+                    .lock()
+                    .expect("query registry")
+                    .remove(entry.id.as_str());
+                break;
             }
         });
         *entry.timer.lock().expect("query timer") = Some(timer);
+        entries.insert(entry.id.to_string(), Arc::clone(&entry));
         page
     }
     pub(crate) fn lookup(&self, id: &str, slug: &str) -> Option<Arc<QueryEntry>> {
@@ -193,15 +266,33 @@ impl TrinoQueryRegistry {
         if entry.slug != slug {
             return None;
         }
-        entry.touch();
         Some(entry)
     }
+
+    fn client_activity(&self, entry: &QueryEntry) {
+        entry.touch();
+        self.control
+            .touch_client_query(entry.registration(), ClientQueryTime::now());
+    }
+
+    pub(crate) async fn heartbeat(&self, entry: &QueryEntry) -> bool {
+        let state = entry.state.lock().await;
+        if matches!(state.phase, Phase::Expired) {
+            return false;
+        }
+        self.client_activity(entry);
+        true
+    }
+
     pub(crate) async fn get(
         self: &Arc<Self>,
         entry: &Arc<QueryEntry>,
         token: u64,
     ) -> Result<Arc<Page>, StatusCode> {
         let mut state = entry.state.lock().await;
+        if matches!(state.phase, Phase::Expired) {
+            return Err(StatusCode::NOT_FOUND);
+        }
         if let Phase::Settled {
             token: terminal_token,
             page,
@@ -209,6 +300,7 @@ impl TrinoQueryRegistry {
         } = &state.phase
         {
             if token == *terminal_token || *abandoned {
+                self.client_activity(entry);
                 return Ok(Arc::clone(page));
             }
             return Err(if token < *terminal_token {
@@ -219,6 +311,7 @@ impl TrinoQueryRegistry {
         }
         if let Some((last, page)) = &state.retained {
             if token == *last {
+                self.client_activity(entry);
                 return Ok(Arc::clone(page));
             }
             if token < *last {
@@ -228,36 +321,47 @@ impl TrinoQueryRegistry {
         if token != state.next_token {
             return Err(StatusCode::NOT_FOUND);
         }
+        self.client_activity(entry);
         // ACK changes logical retention. In-flight bodies keep their own original backing/window.
         state.retained.take();
         entry.production.lock().expect("query pipeline").retained = false;
         entry.progress.notify_waiters();
         if matches!(state.phase, Phase::Registered) {
             if self.draining.load(Ordering::Acquire) {
-                let page = terminal_page(
-                    entry,
-                    None,
-                    Some(query_error_for_query(
-                        entry.id.as_str(),
-                        TrinoErrorSource::FrontendDraining,
-                    )),
-                    HeaderMap::new(),
-                    None,
-                );
-                entry.request.lock().expect("registered request").take();
-                state.phase = Phase::Settled {
-                    token,
-                    page: Arc::clone(&page),
-                    abandoned: false,
-                };
-                return Ok(page);
+                let error =
+                    query_error_for_query(entry.id.as_str(), TrinoErrorSource::FrontendDraining);
+                return Ok(registered_terminal(&self.control, entry, &mut state, error));
             }
-            let request = entry
+            let claim = match self
+                .control
+                .claim_client_query(entry.registration(), ClientQueryTime::now())
+            {
+                ClientQueryStart::Claimed(claim) => claim,
+                ClientQueryStart::Cancelled => {
+                    let error =
+                        original_cancellation_error(&self.control, entry).unwrap_or_else(|| {
+                            registration_error(
+                                entry.id.as_str(),
+                                "client query lost its original cancellation",
+                            )
+                        });
+                    return Ok(registered_terminal(&self.control, entry, &mut state, error));
+                }
+                ClientQueryStart::Unavailable => {
+                    let error = registration_error(
+                        entry.id.as_str(),
+                        "registered client query could not be claimed",
+                    );
+                    return Ok(registered_terminal(&self.control, entry, &mut state, error));
+                }
+            };
+            let RegisteredQueryRequest { request, unclaimed } = entry
                 .request
                 .lock()
                 .expect("registered request")
                 .take()
                 .expect("first GET owns the original request");
+            drop(unclaimed);
             state.phase = Phase::Executing;
             entry.observation.start();
             *entry.started.lock().expect("query start clock") = Some(Instant::now());
@@ -266,10 +370,12 @@ impl TrinoQueryRegistry {
             let join = tokio::spawn(async move {
                 use futures::FutureExt;
                 let guard_entry = Arc::clone(&task_entry);
-                if std::panic::AssertUnwindSafe(crate::driver::run(task_entry, sessions, request))
-                    .catch_unwind()
-                    .await
-                    .is_err()
+                if std::panic::AssertUnwindSafe(crate::driver::run(
+                    task_entry, sessions, request, claim,
+                ))
+                .catch_unwind()
+                .await
+                .is_err()
                 {
                     tracing::error!(query_id = %guard_entry.id, "Trino query driver panicked");
                     crate::driver::publish_panic(&guard_entry);
@@ -320,7 +426,7 @@ impl TrinoQueryRegistry {
             let columns = production.columns.take();
             production.pipeline.take();
             drop(production);
-            let page = settle_outcome(entry, columns, outcome);
+            let page = settle_outcome(&self.control, entry, columns, outcome);
             state.phase = Phase::Settled {
                 token,
                 page: Arc::clone(&page),
@@ -345,14 +451,45 @@ impl TrinoQueryRegistry {
         state.retained = Some((token, Arc::clone(&page)));
         Ok(page)
     }
-    pub(crate) async fn cancel(&self, entry: &Arc<QueryEntry>) {
+    pub(crate) async fn cancel(&self, entry: &Arc<QueryEntry>) -> bool {
         let mut state = entry.state.lock().await;
+        if matches!(state.phase, Phase::Expired) {
+            return false;
+        }
+        self.client_activity(entry);
         if !matches!(state.phase, Phase::Settled { .. }) {
-            cancel_locked(entry, &mut state, Disposition::ClientCancel).await;
+            cancel_locked(&self.control, entry, &mut state, Disposition::ClientCancel).await;
             tracing::debug!(query_id = %entry.id, "Trino query canceled by DELETE");
         }
+        true
     }
+
+    pub(crate) async fn expire_query_history(&self) {
+        if let Some(mut expiry) = self.control.subscribe_client_query_history() {
+            loop {
+                let deadline = *expiry.borrow_and_update();
+                tokio::select! {
+                    _ = async {
+                        match deadline {
+                            Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.control.evict_client_query_history(Instant::now());
+                    }
+                    changed = expiry.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        std::future::pending().await
+    }
+
     pub(crate) fn begin_drain(&self) {
+        let _entries = self.entries.lock().expect("query registry");
         self.draining.store(true, Ordering::Release);
     }
     pub(crate) async fn finalize(&self) {
@@ -369,8 +506,8 @@ impl TrinoQueryRegistry {
         for entry in entries {
             {
                 let mut state = entry.state.lock().await;
-                if !matches!(state.phase, Phase::Settled { .. }) {
-                    cancel_locked(&entry, &mut state, Disposition::Abandon).await;
+                if !matches!(state.phase, Phase::Settled { .. } | Phase::Expired) {
+                    cancel_locked(&self.control, &entry, &mut state, Disposition::Abandon).await;
                 }
             }
             let timer = entry.timer.lock().expect("query timer").take();
@@ -386,7 +523,12 @@ impl TrinoQueryRegistry {
         }
     }
 }
-fn settle_outcome(entry: &QueryEntry, columns: Option<Bytes>, mut outcome: Outcome) -> Arc<Page> {
+fn settle_outcome(
+    control: &QueryControlService,
+    entry: &QueryEntry,
+    columns: Option<Bytes>,
+    mut outcome: Outcome,
+) -> Arc<Page> {
     let headers =
         if outcome.error.is_none() {
             session_effect_headers(&outcome.effects).unwrap_or_else(|error| {
@@ -410,30 +552,59 @@ fn settle_outcome(entry: &QueryEntry, columns: Option<Bytes>, mut outcome: Outco
     if let Some(settlement) = outcome.settlement.take() {
         settlement.finish(outcome.disposition);
     }
-    entry.observation.settle(true, outcome.disposition);
+    let error = settle_client_result(control, entry, outcome.error);
+    let abandoned = error.as_ref().is_some_and(|error| {
+        error.failure() == novarocks_query_application::query_control::ABANDONED_QUERY
+    });
+    let disposition = if error.as_ref().is_some_and(|error| {
+        error.failure() == novarocks_query_application::query_control::ADMINISTRATIVELY_KILLED
+    }) {
+        Disposition::Cancelled
+    } else if abandoned {
+        Disposition::Abandon
+    } else {
+        outcome.disposition
+    };
+    entry.observation.settle(true, disposition);
     let production = entry.production.lock().expect("query pipeline");
-    let update = if outcome.error.is_none() {
+    let update = if error.is_none() {
         production.admission.and_then(command_update_type)
     } else {
         None
     };
-    let count = if outcome.error.is_none() {
+    let count = if error.is_none() {
         production.update_count
     } else {
         None
     };
     drop(production);
     let empty = Bytes::from_static(b"[]");
-    let columns = if outcome.error.is_some() {
+    let columns = if error.is_some() {
         None
     } else if columns.is_none() && update.is_some() {
         Some(&empty)
     } else {
         columns.as_ref()
     };
-    terminal_page_with_count(entry, columns, outcome.error, headers, update, count)
+    let headers = if error.is_some() {
+        HeaderMap::new()
+    } else {
+        headers
+    };
+    terminal_page_with_count(entry, columns, error, headers, update, count)
 }
-async fn cancel_locked(entry: &QueryEntry, state: &mut EntryState, requested: Disposition) {
+async fn cancel_locked(
+    control: &QueryControlService,
+    entry: &QueryEntry,
+    state: &mut EntryState,
+    requested: Disposition,
+) {
+    let reason = if requested == Disposition::ClientCancel {
+        QueryCancellationReason::ClientCancelRequested
+    } else {
+        QueryCancellationReason::ClientDisconnected
+    };
+    control.request_unstarted_client_cancel(entry.registration(), reason.clone());
     state.retained.take();
     entry.request.lock().expect("registered request").take();
     entry.production.lock().expect("query pipeline").retained = false;
@@ -498,13 +669,15 @@ async fn cancel_locked(entry: &QueryEntry, state: &mut EntryState, requested: Di
             progress.await;
         }
     }
-    let error = selected_error.unwrap_or_else(|| {
-        let reason = if requested == Disposition::ClientCancel {
-            novarocks_query_application::cancellation::QueryCancellationReason::ClientCancelRequested
-        } else { novarocks_query_application::cancellation::QueryCancellationReason::ClientDisconnected };
-        query_error_for_query(entry.id.as_str(), TrinoErrorSource::Cancellation { reason: &reason,
-            message: if requested == Disposition::ClientCancel { "Query canceled by client" } else { "Query abandoned by client" } })
-    });
+    let error = selected_error.unwrap_or_else(|| protocol_cancellation_error(entry, reason));
+    let error =
+        settle_client_result(control, entry, Some(error)).expect("cancel settles as a failure");
+    let failed = error.failure();
+    if failed == novarocks_query_application::query_control::ADMINISTRATIVELY_KILLED {
+        effective = Disposition::Cancelled;
+    } else if failed == novarocks_query_application::query_control::ABANDONED_QUERY {
+        effective = Disposition::Abandon;
+    }
     let page = terminal_page(entry, None, Some(error), HeaderMap::new(), None);
     if executing {
         entry.observation.settle(true, effective);
@@ -516,6 +689,119 @@ async fn cancel_locked(entry: &QueryEntry, state: &mut EntryState, requested: Di
     };
     entry.progress.notify_waiters();
 }
+fn registration_error(id: &str, message: &str) -> TrinoQueryError {
+    query_error_for_query(
+        id,
+        TrinoErrorSource::Service {
+            error: &QueryServiceError::new(QueryServiceErrorKind::Internal, message),
+            sql: "",
+        },
+    )
+}
+
+fn protocol_cancellation_error(
+    entry: &QueryEntry,
+    reason: QueryCancellationReason,
+) -> TrinoQueryError {
+    query_error_for_query_with_effect(
+        entry.id.as_str(),
+        TrinoErrorSource::Cancellation {
+            reason: &reason,
+            message: if reason == QueryCancellationReason::ClientCancelRequested {
+                "Query canceled by client"
+            } else {
+                "Query abandoned by client"
+            },
+        },
+        entry.external_effect_disposition(),
+    )
+}
+
+fn original_cancellation_error(
+    control: &QueryControlService,
+    entry: &QueryEntry,
+) -> Option<TrinoQueryError> {
+    match control.client_query_cancellation(entry.registration())? {
+        ClientQueryCancellation::Management(receipt) => Some(query_error_for_query_with_effect(
+            entry.id.as_str(),
+            TrinoErrorSource::ManagementCancellation(&receipt),
+            entry.external_effect_disposition(),
+        )),
+        ClientQueryCancellation::Protocol(reason) => {
+            Some(protocol_cancellation_error(entry, reason))
+        }
+    }
+}
+
+fn settle_client_result(
+    control: &QueryControlService,
+    entry: &QueryEntry,
+    original_error: Option<TrinoQueryError>,
+) -> Option<TrinoQueryError> {
+    let proposed = original_error
+        .as_ref()
+        .map_or(ClientQueryConclusion::Finished, |error| {
+            ClientQueryConclusion::Failed(error.failure())
+        });
+    let settled =
+        control.settle_client_query(entry.registration(), proposed, ClientQueryTime::now());
+    entry
+        .original_text
+        .lock()
+        .expect("client query text custody")
+        .take();
+    match settled {
+        Some(ClientQueryConclusion::Finished) => None,
+        Some(ClientQueryConclusion::Failed(identity))
+            if original_error
+                .as_ref()
+                .is_some_and(|error| error.failure() == identity) =>
+        {
+            original_error
+        }
+        Some(ClientQueryConclusion::AdministrativelyKilled(receipt)) => {
+            Some(query_error_for_query_with_effect(
+                entry.id.as_str(),
+                TrinoErrorSource::ManagementCancellation(&receipt),
+                entry.external_effect_disposition(),
+            ))
+        }
+        Some(ClientQueryConclusion::Failed(identity)) => {
+            original_cancellation_error(control, entry)
+                .filter(|error| error.failure() == identity)
+                .or_else(|| {
+                    Some(registration_error(
+                        entry.id.as_str(),
+                        "client query conclusion differs from its original protocol error",
+                    ))
+                })
+        }
+        None => Some(registration_error(
+            entry.id.as_str(),
+            "client query lost its original protocol registration",
+        )),
+    }
+}
+
+fn registered_terminal(
+    control: &QueryControlService,
+    entry: &QueryEntry,
+    state: &mut EntryState,
+    error: TrinoQueryError,
+) -> Arc<Page> {
+    entry.request.lock().expect("registered request").take();
+    let error =
+        settle_client_result(control, entry, Some(error)).expect("registered terminal failure");
+    let abandoned = error.failure() == novarocks_query_application::query_control::ABANDONED_QUERY;
+    let page = terminal_page(entry, None, Some(error), HeaderMap::new(), None);
+    state.phase = Phase::Settled {
+        token: state.next_token,
+        page: Arc::clone(&page),
+        abandoned,
+    };
+    page
+}
+
 fn timed_envelope<'a>(
     entry: &'a QueryEntry,
     next: Option<u64>,

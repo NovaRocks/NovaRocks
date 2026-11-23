@@ -37,13 +37,13 @@ const NAMES: [&str; 2] = ["lower", "upper"];
 const ORACLES: [(&str, &str, &str); 11] = [
     ("", "", ""),
     ("AbC\0é", "abc\0é", "ABC\0É"),
-    ("Straße", "straße", "STRASSE"),
-    ("ﬃ", "ﬃ", "FFI"),
-    ("İ", "i\u{307}", "İ"),
-    ("ΟΣ", "ος", "ΟΣ"),
+    ("Straße", "straße", "STRAßE"),
+    ("ﬃ", "ﬃ", "ﬃ"),
+    ("İ", "i", "İ"),
+    ("ΟΣ", "οσ", "ΟΣ"),
     ("ΟΣΑ", "οσα", "ΟΣΑ"),
     ("Σ", "σ", "Σ"),
-    ("ΟΣ\u{301}", "ος\u{301}", "ΟΣ\u{301}"),
+    ("ΟΣ\u{301}", "οσ\u{301}", "ΟΣ\u{301}"),
     ("Ο\u{301}ΣΑ", "ο\u{301}σα", "Ο\u{301}ΣΑ"),
     ("你好👩‍💻", "你好👩‍💻", "你好👩‍💻"),
 ];
@@ -211,9 +211,9 @@ fn string_case_sparse_sliced_compact_scalar_and_selected_constant_addresses_are_
             assert_eq!(
                 output(&result),
                 if op == 0 {
-                    vec![Some("ος".into()), Some("straße".into())]
+                    vec![Some("οσ".into()), Some("straße".into())]
                 } else {
-                    vec![Some("ΟΣ".into()), Some("STRASSE".into())]
+                    vec![Some("ΟΣ".into()), Some("STRAßE".into())]
                 }
             );
         }
@@ -228,7 +228,7 @@ fn string_case_sparse_sliced_compact_scalar_and_selected_constant_addresses_are_
                 .unwrap();
             assert_eq!(
                 output(&result),
-                vec![Some(if op == 0 { "ος" } else { "ΟΣ" }.to_owned()); 2]
+                vec![Some(if op == 0 { "οσ" } else { "ΟΣ" }.to_owned()); 2]
             );
         }
         assert!(Arc::ptr_eq(constant.pool().array(), constants.array()));
@@ -352,7 +352,7 @@ fn string_case_empty_selection_bypasses_body_and_selected_shape_errors_poison_on
 }
 
 #[test]
-fn string_case_output_and_unicode_temporary_layouts_refuse_before_requests() {
+fn string_case_output_layout_refuses_before_requests() {
     assert_eq!(
         output_layout(usize::MAX, 0),
         Err(KernelFailure::ResourceExhausted)
@@ -373,13 +373,7 @@ fn string_case_output_and_unicode_temporary_layouts_refuse_before_requests() {
         assert_eq!(representation.extent_limit, Some(i32::MAX as u64));
         assert_eq!(representation.representable_prefix, None);
     }
-    assert_eq!(
-        temporary_layout(1, usize::MAX),
-        Err(KernelFailure::ResourceExhausted)
-    );
     assert!(output_layout(0, 0).is_ok());
-    assert!(temporary_layout(0, 0).is_ok());
-    assert!(temporary_layout(2, 3).is_ok());
 }
 
 #[test]
@@ -639,7 +633,7 @@ fn direct_case_carrier_failure_is_nominal_and_does_not_retain_the_input() {
 }
 
 #[test]
-fn case_measured_expansion_and_whole_context_use_the_same_output_geometry() {
+fn case_measured_simple_mapping_retains_complete_output_geometry() {
     let expanded = "ΐ".repeat(1025);
     let sigma = "Ο".to_owned() + &"A".repeat(1025) + "Σ";
     let input: ArrayRef = Arc::new(StringArray::from(vec![
@@ -661,9 +655,12 @@ fn case_measured_expansion_and_whole_context_use_the_same_output_geometry() {
                 assert!(values.is_null(row));
                 continue;
             }
-            let expected = match op {
-                StringCaseOp::Lower => source.to_lowercase(),
-                StringCaseOp::Upper => source.to_uppercase(),
+            let expected = match (op, row) {
+                (_, 0) => expanded.clone(),
+                (StringCaseOp::Lower, 2) => format!("ο{}σ", "a".repeat(1025)),
+                (StringCaseOp::Upper, 2) => sigma.clone(),
+                (_, 3) => String::new(),
+                _ => unreachable!(),
             };
             assert_eq!(
                 mapped_length(op, source, &mut work).unwrap(),
@@ -672,4 +669,44 @@ fn case_measured_expansion_and_whole_context_use_the_same_output_geometry() {
             assert_eq!(values.value(row), expected);
         }
     }
+}
+
+#[test]
+fn normalize_private_iteration_observes_input_and_preserves_the_exact_form() {
+    let text = "e\u{301}ﬃ";
+    for (argument, expected) in [
+        ("NFC", "éﬃ"),
+        ("NFD", "e\u{301}ﬃ"),
+        ("NFKC", "éffi"),
+        ("NFKD", "e\u{301}ffi"),
+    ] {
+        let form = NormalizationForm::from_argument(argument).unwrap();
+        let control = Control::default();
+        let mut work = EvaluationCheckpoints::new(&control);
+        let mut output = String::new();
+        form.visit(text, &mut work, |ch, work| {
+            output.push(ch);
+            work.step()
+        })
+        .unwrap();
+        work.finish().unwrap();
+        assert_eq!(output, expected, "{argument}");
+    }
+    assert!(NormalizationForm::from_argument("nfd").is_none());
+
+    let form = NormalizationForm::from_argument("NFKD").unwrap();
+    let control = Control {
+        trace: Mutex::new(Vec::new()),
+        refusal: Some((1, KernelFailure::Cancelled)),
+    };
+    let mut work = EvaluationCheckpoints::new(&control);
+    let mut output = String::new();
+    let failure = form
+        .visit(&"ﬃ".repeat(1024), &mut work, |ch, work| {
+            output.push(ch);
+            work.step()
+        })
+        .unwrap_err();
+    assert_eq!(failure, KernelFailure::Cancelled);
+    assert!(output.is_empty());
 }

@@ -107,6 +107,7 @@ pub(crate) fn commit_failure(
         CommitOperation::CreateTable => "Failed to commit the transaction during create table: ",
         CommitOperation::Optimize => "Failed to commit the transaction during optimize: ",
         CommitOperation::Truncate => "Failed to commit during truncate: ",
+        CommitOperation::Delete => "Failed to commit during delete: ",
         CommitOperation::OptimizeManifests => "Failed to commit during optimize_manifests: ",
         CommitOperation::ExpireSnapshots => "Failed to commit during expire_snapshots: ",
     };

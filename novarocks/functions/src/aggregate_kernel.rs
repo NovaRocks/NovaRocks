@@ -112,6 +112,11 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
         crate::AggregateArgumentEncoding::plain(self.contract().as_ref(), ordinal)
     }
 
+    /// Admit a driver-local Partial/Final lifecycle for this selected Single call.
+    fn supports_local_stages(&self) -> bool {
+        false
+    }
+
     /// Explicit same-owner phase construction. The framework supplies only
     /// its authenticated local-stage contracts; semantic fields stay owned
     /// by this concrete implementation. No old contract pointer is reused.
@@ -526,9 +531,7 @@ fn specialize_aggregate_once_core<
     let aligned = (|| {
         let phase = options.phase;
         let correct = match input.argument_uses {
-            crate::CallArgumentUses::TemporalSources { .. }
-            | crate::CallArgumentUses::RegexpCountPattern { .. }
-            | crate::CallArgumentUses::ToBase64Bytes { .. } => false,
+            crate::CallArgumentUses::TemporalSources { .. } => false,
             crate::CallArgumentUses::SelectedChannels(_)
             | crate::CallArgumentUses::MaterializedInput { .. } => {
                 phase.consumes_logical_arguments() && options.state_input_type.is_none()
@@ -547,9 +550,7 @@ fn specialize_aggregate_once_core<
             ));
         }
         match input.argument_uses {
-            crate::CallArgumentUses::TemporalSources { .. }
-            | crate::CallArgumentUses::RegexpCountPattern { .. }
-            | crate::CallArgumentUses::ToBase64Bytes { .. } => Err(invalid(
+            crate::CallArgumentUses::TemporalSources { .. } => Err(invalid(
                 "aggregate preparation rejects scalar temporal source channels",
             )),
             crate::CallArgumentUses::SelectedChannels(_)

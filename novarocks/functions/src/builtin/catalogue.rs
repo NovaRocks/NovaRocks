@@ -26,8 +26,8 @@ use crate::{
     FunctionBindingError, FunctionBindingRequest, FunctionBindingResolver,
     FunctionBindingSelection, FunctionCatalogError, FunctionDefinition, FunctionFailureBehavior,
     FunctionId, FunctionKind, FunctionOverloadDeclaration, FunctionOverloadId,
-    FunctionResolutionError, FunctionResultType, FunctionSemantics, FunctionValueType,
-    FunctionVisibility, ResolvedAggregateSignature, ResolvedFunctionBinding,
+    FunctionPublicSignature, FunctionResolutionError, FunctionResultType, FunctionSemantics,
+    FunctionValueType, FunctionVisibility, ResolvedAggregateSignature, ResolvedFunctionBinding,
 };
 use arrow_schema::DataType;
 
@@ -39,6 +39,7 @@ use super::scalar_construction::{borrow_creator, with_binding_creation};
 use super::signature::declared_list;
 #[cfg(test)]
 use super::signature::declared_map;
+use super::string_binary::TrinoByteOp;
 use super::{registry, resolver};
 use crate::{FunctionBindingCreationFailure, FunctionVolatility};
 use novarocks_type_contract::{CompileCheckpoints, PureCompileControl, ValueLogicalType};
@@ -139,12 +140,15 @@ pub fn resolve_bound_aggregate(
     result
 }
 
+type AggregatePublicSignatures = &'static [(&'static str, &'static str)];
+
 #[derive(Clone, Copy)]
 struct AggregateDeclaration {
     name: &'static str,
     signature: &'static str,
     min_args: usize,
     max_args: usize,
+    public_signatures: AggregatePublicSignatures,
 }
 
 impl AggregateDeclaration {
@@ -154,7 +158,54 @@ impl AggregateDeclaration {
             signature,
             min_args: args,
             max_args: args,
+            public_signatures: &[],
         }
+    }
+
+    fn for_logical_arity(self, arity: usize) -> Self {
+        if arity == 2 && matches!(self.name, "min" | "max") {
+            Self::exact(self.name, 2, "(any,i64)->list<any>").public(&[("T, bigint", "array(T)")])
+        } else {
+            self
+        }
+    }
+
+    fn is_top_n(self) -> bool {
+        self.min_args == 2 && matches!(self.name, "min" | "max")
+    }
+
+    fn operation(self) -> &'static str {
+        match (self.is_top_n(), self.name) {
+            (true, "min") => "min_n",
+            (true, "max") => "max_n",
+            _ => self.name,
+        }
+    }
+
+    fn overload_suffix(self) -> &'static str {
+        if self.is_top_n() {
+            "/top-n-v1"
+        } else {
+            "/derived-v1"
+        }
+    }
+
+    fn overload(self) -> String {
+        format!("builtin.aggregate/{}{}", self.name, self.overload_suffix())
+    }
+
+    fn state_suffix(self) -> &'static str {
+        if self.is_top_n() {
+            "/top-n-state-v1"
+        } else if self.name == "sum" {
+            "/state-v2"
+        } else {
+            "/state-v1"
+        }
+    }
+
+    fn state_format(self) -> String {
+        format!("novarocks/{}{}", self.name, self.state_suffix())
     }
 
     const fn ranged(
@@ -168,7 +219,13 @@ impl AggregateDeclaration {
             signature,
             min_args,
             max_args,
+            public_signatures: &[],
         }
+    }
+
+    const fn public(mut self, signatures: AggregatePublicSignatures) -> Self {
+        self.public_signatures = signatures;
+        self
     }
 }
 
@@ -181,7 +238,7 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
         &self,
         argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        let declaration = self.declaration;
+        let declaration = self.declaration.for_logical_arity(argument_types.len());
         if !(declaration.min_args..=declaration.max_args).contains(&argument_types.len()) {
             return Err(FunctionResolutionError::NoMatchingSignature {
                 candidates: 1,
@@ -200,13 +257,14 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
         selected_overload: &AggregateOverloadIdentity,
     ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
     {
-        if selected_overload != &builtin_overload_identity(self.declaration)? {
+        let declaration = self.declaration_for_overload(selected_overload)?;
+        if selected_overload != &builtin_overload_identity(declaration)? {
             return Err(FunctionResolutionError::BadSignature(
                 "builtin aggregate state contract references a foreign overload".into(),
             ));
         }
         Ok(builtin_aggregate_state_argument_contract(
-            self.declaration.name,
+            declaration.operation(),
         ))
     }
 
@@ -215,7 +273,7 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
         selected_overload: &AggregateOverloadIdentity,
         update_argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        let declaration = self.declaration;
+        let declaration = self.declaration_for_overload(selected_overload)?;
         let overload = builtin_overload_identity(declaration)?;
         if selected_overload != &overload {
             return Err(FunctionResolutionError::BadSignature(format!(
@@ -233,7 +291,7 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
             )));
         }
         let (output_type, intermediate_type) = crate::aggregate_types::infer_agg_function_types(
-            declaration.name,
+            declaration.operation(),
             update_argument_types,
             false,
         )
@@ -249,10 +307,8 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
             argument_types: update_argument_types.to_vec(),
             intermediate_type,
             output_type,
-            state_format: AggregateStateFormatIdentity::try_new(builtin_aggregate_state_format(
-                declaration.name,
-            ))
-            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
+            state_format: AggregateStateFormatIdentity::try_new(declaration.state_format())
+                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
         })
     }
 }
@@ -288,7 +344,7 @@ impl BuiltinAggregateDecision<'_> {
                 selected.overload.as_str(),
                 "builtin.aggregate/",
                 name,
-                "/derived-v1",
+                self.declaration.overload_suffix(),
                 work,
             )?
         {
@@ -326,19 +382,16 @@ impl BuiltinAggregateDecision<'_> {
         let Some(state) = &selected.aggregate else {
             return Ok(false);
         };
-        if state.state_argument_contract != builtin_aggregate_state_argument_contract(name) {
+        if state.state_argument_contract
+            != builtin_aggregate_state_argument_contract(self.declaration.operation())
+        {
             return Ok(false);
         }
-        let suffix = if name == "sum" {
-            "/state-v2"
-        } else {
-            "/state-v1"
-        };
         if !builtin_identity_matches(
             state.state_format.as_str(),
             "novarocks/",
             name,
-            suffix,
+            self.declaration.state_suffix(),
             work,
         )? {
             return Ok(false);
@@ -370,16 +423,18 @@ impl BuiltinAggregateDecision<'_> {
         binding_control::value_type(&intermediate, work)?;
         Ok(FunctionBindingSelection {
             overload: FunctionOverloadId::try_from_boxed(
-                builtin_aggregate_overload(name).into_boxed_str(),
+                self.declaration.overload().into_boxed_str(),
             )
             .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
             argument_types: binding_control::argument_types(self.request, work)?,
             result_type: FunctionResultType::Scalar(output),
             aggregate: Some(crate::AggregateBindingSelection {
-                state_argument_contract: builtin_aggregate_state_argument_contract(name),
+                state_argument_contract: builtin_aggregate_state_argument_contract(
+                    self.declaration.operation(),
+                ),
                 intermediate_type: intermediate,
                 state_format: AggregateStateFormatIdentity::try_from_boxed(
-                    builtin_aggregate_state_format(name).into_boxed_str(),
+                    self.declaration.state_format().into_boxed_str(),
                 )
                 .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
             }),
@@ -413,6 +468,17 @@ fn builtin_identity_matches(
 }
 
 impl BuiltinAggregateResolver {
+    fn declaration_for_overload(
+        &self,
+        overload: &AggregateOverloadIdentity,
+    ) -> Result<AggregateDeclaration, FunctionResolutionError> {
+        let alternate = self.declaration.for_logical_arity(2);
+        if alternate.is_top_n() && overload == &builtin_overload_identity(alternate)? {
+            return Ok(alternate);
+        }
+        Ok(self.declaration)
+    }
+
     fn value_decision<'a>(
         &self,
         request: FunctionBindingRequest<'a>,
@@ -420,7 +486,9 @@ impl BuiltinAggregateResolver {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<BuiltinAggregateDecision<'a>, FunctionBindingError> {
         request_types_with_constants(request, work)?;
-        let declaration = self.declaration;
+        let declaration = self
+            .declaration
+            .for_logical_arity(request.logical_argument_count);
         let name = declaration.name;
         let arguments = crate::aggregate_types::AggregateTypeArguments::Values(request.arguments);
         for argument in request.arguments {
@@ -438,12 +506,41 @@ impl BuiltinAggregateResolver {
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
+        if name == "listagg" {
+            for (arg, expected) in request.arguments.iter().zip([
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Boolean,
+                DataType::Utf8,
+                DataType::Boolean,
+            ]) {
+                work.step()?;
+                let FunctionArgument::Value { value_type, .. } = arg else {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                };
+                if value_type.data_type() != &expected
+                    || value_type.logical_type() != ValueLogicalType::Physical
+                {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+            }
+        }
+        if declaration.is_top_n()
+            && !matches!(
+                request.arguments[1],
+                FunctionArgument::Value { ref value_type, .. }
+                    if value_type.logical_type() == ValueLogicalType::Physical
+                       && value_type.data_type() == &DataType::Int64
+            )
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
         if let Some(overload) = selected
             && !builtin_identity_matches(
                 overload.as_str(),
                 "builtin.aggregate/",
                 name,
-                "/derived-v1",
+                declaration.overload_suffix(),
                 work,
             )?
         {
@@ -486,7 +583,7 @@ impl BuiltinAggregateResolver {
             }
         }
         let (output, intermediate) =
-            crate::aggregate_types::aggregate_type_recipes(name, arguments)
+            crate::aggregate_types::aggregate_type_recipes(declaration.operation(), arguments)
                 .map_err(|error| FunctionBindingError::InvalidBinding(error.into()))?;
         work.step()?;
         Ok(BuiltinAggregateDecision {
@@ -574,7 +671,7 @@ fn builtin_aggregate_intermediate_nullable(name: &str) -> bool {
 fn builtin_supports_ordered_update_channels(name: &str) -> bool {
     matches!(
         name,
-        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
+        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg" | "listagg"
     )
 }
 
@@ -601,38 +698,13 @@ pub(crate) fn builtin_aggregate_state_format(name: &str) -> String {
 fn builtin_overload_identity(
     declaration: AggregateDeclaration,
 ) -> Result<AggregateOverloadIdentity, FunctionResolutionError> {
-    AggregateOverloadIdentity::try_new(builtin_aggregate_overload(declaration.name))
+    AggregateOverloadIdentity::try_new(declaration.overload())
         .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))
 }
 
-const ONE_ARG_AGGREGATES: &[&str] = &[
-    "any_value",
-    "approx_count_distinct",
-    "array_agg",
-    "array_agg_distinct",
-    "avg",
-    "bool_and",
-    "bool_or",
-    "booland_agg",
-    "boolor_agg",
+const INTERNAL_ONE_ARG_AGGREGATES: &[&str] = &[
     "count_distinct_state",
     "count_distinct_state_merge",
-    "count_if",
-    "max",
-    "min",
-    "multi_distinct_sum",
-    "multi_distinct_avg",
-    "ndv",
-    "sum",
-    "variance",
-    "variance_pop",
-    "variance_samp",
-    "var_pop",
-    "var_samp",
-    "stddev",
-    "stddev_pop",
-    "stddev_samp",
-    "std",
     "approx_count_distinct_state_merge",
     "avg_state_merge",
     "bool_and_state_merge",
@@ -641,6 +713,8 @@ const ONE_ARG_AGGREGATES: &[&str] = &[
     "max_state_merge",
     "min_state_merge",
     "sum_state_merge",
+    "multi_distinct_avg",
+    "multi_distinct_sum",
 ];
 
 const STATE_ONE_ARG_AGGREGATES: &[&str] = &[
@@ -669,7 +743,7 @@ const SIGNED_STATE_ONE_ARG_AGGREGATES: &[&str] = &[
 fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     let mut declarations = Vec::new();
     declarations.extend(
-        ONE_ARG_AGGREGATES
+        INTERNAL_ONE_ARG_AGGREGATES
             .iter()
             .copied()
             .map(|name| AggregateDeclaration::exact(name, 1, "(any)->derived")),
@@ -686,27 +760,100 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
             .copied()
             .map(|name| AggregateDeclaration::exact(name, 1, "(row(value,change_op))->binary")),
     );
+    // These derived binding families retain one stable execution identity
+    // even when the SQL owner offers several concrete call shapes.
+    let simple_families: &[(&[&str], AggregatePublicSignatures)] = &[
+        (&["any_value", "min", "max"], &[("T", "T")]),
+        (&["approx_count_distinct", "ndv"], &[("T", "bigint")]),
+        (&["array_agg", "array_agg_distinct"], &[("T", "array(T)")]),
+        (
+            &["bool_and", "bool_or", "booland_agg", "boolor_agg"],
+            &[("boolean", "boolean")],
+        ),
+        (&["count_if"], &[("boolean", "bigint")]),
+        (
+            &["avg"],
+            &[
+                ("bigint", "double"),
+                ("real", "double"),
+                ("double", "double"),
+                ("decimal(p,s)", "decimal(38,output_scale)"),
+            ],
+        ),
+        (
+            &["sum"],
+            &[
+                ("bigint", "bigint"),
+                ("real", "double"),
+                ("double", "double"),
+                ("decimal(p,s)", "decimal(38,s)"),
+            ],
+        ),
+        (
+            &[
+                "variance",
+                "variance_pop",
+                "variance_samp",
+                "var_pop",
+                "var_samp",
+                "stddev",
+                "stddev_pop",
+                "stddev_samp",
+                "std",
+            ],
+            &[("double", "double")],
+        ),
+    ];
+    for &(names, signatures) in simple_families {
+        declarations.extend(
+            names.iter().map(|name| {
+                AggregateDeclaration::exact(name, 1, "(any)->derived").public(signatures)
+            }),
+        );
+    }
     declarations.extend([
-        AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64"),
+        AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64")
+            .public(&[("", "bigint"), ("T", "bigint")]),
         AggregateDeclaration::ranged("multi_distinct_count", 1, usize::MAX, "(any...)->i64"),
-        AggregateDeclaration::ranged("group_concat", 2, usize::MAX, "(any,utf8...)->utf8"),
-        AggregateDeclaration::ranged("string_agg", 2, usize::MAX, "(any,utf8...)->utf8"),
-        AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
-        AggregateDeclaration::exact("max_by", 2, "(any,any)->any"),
-        AggregateDeclaration::exact("min_by", 2, "(any,any)->any"),
-        AggregateDeclaration::exact("min_n", 2, "(any,i64)->list<any>"),
-        AggregateDeclaration::exact("max_n", 2, "(any,i64)->list<any>"),
-        AggregateDeclaration::exact("corr", 2, "(any,any)->f64"),
-        AggregateDeclaration::exact("covar_pop", 2, "(any,any)->f64"),
-        AggregateDeclaration::exact("covar_samp", 2, "(any,any)->f64"),
-        AggregateDeclaration::ranged("percentile_approx", 2, 3, "(any,f64[,i64])->f64"),
+        AggregateDeclaration::exact("listagg", 5, "(utf8,utf8,bool,utf8,bool)->utf8")
+            .public(&[("varchar, varchar, boolean, varchar, boolean", "varchar")]),
+        AggregateDeclaration::exact("map_agg", 2, "(any,any)->map").public(&[("K, V", "map(K,V)")]),
+        AggregateDeclaration::exact("max_by", 2, "(any,any)->any").public(&[("V, K", "V")]),
+        AggregateDeclaration::exact("min_by", 2, "(any,any)->any").public(&[("V, K", "V")]),
+        AggregateDeclaration::exact("min_n", 2, "(any,i64)->list<any>")
+            .public(&[("T, bigint", "array(T)")]),
+        AggregateDeclaration::exact("max_n", 2, "(any,i64)->list<any>")
+            .public(&[("T, bigint", "array(T)")]),
+        AggregateDeclaration::exact("corr", 2, "(any,any)->f64")
+            .public(&[("double, double", "double")]),
+        AggregateDeclaration::exact("covar_pop", 2, "(any,any)->f64")
+            .public(&[("double, double", "double")]),
+        AggregateDeclaration::exact("covar_samp", 2, "(any,any)->f64")
+            .public(&[("double, double", "double")]),
+        AggregateDeclaration::ranged("percentile_approx", 2, 3, "(any,f64[,i64])->f64").public(&[
+            ("double, double", "double"),
+            ("double, double, bigint", "double"),
+            ("double, array(double)", "array(double)"),
+            ("double, array(double), bigint", "array(double)"),
+        ]),
         AggregateDeclaration::ranged(
             "percentile_approx_weighted",
             3,
             4,
             "(any,i64,f64[,i64])->f64",
-        ),
-        AggregateDeclaration::ranged("approx_top_k", 1, 3, "(any[,i64[,i64]])->list<struct>"),
+        )
+        .public(&[
+            ("double, bigint, double", "double"),
+            ("double, bigint, double, bigint", "double"),
+            ("double, bigint, array(double)", "array(double)"),
+            ("double, bigint, array(double), bigint", "array(double)"),
+        ]),
+        AggregateDeclaration::ranged("approx_top_k", 1, 3, "(any[,i64[,i64]])->list<struct>")
+            .public(&[
+                ("T", "array(row(item T,count bigint))"),
+                ("T, bigint", "array(row(item T,count bigint))"),
+                ("T, bigint, bigint", "array(row(item T,count bigint))"),
+            ]),
     ]);
     declarations.sort_unstable_by_key(|declaration| declaration.name);
     declarations
@@ -988,7 +1135,18 @@ fn scalar_result_nullable_from_types(
         // A function that is total -- one that answers for every value of
         // its declared argument types -- passes its arguments' nullability
         // through. Everything else is nullable.
-        name if TOTAL_SCALAR_FUNCTIONS.contains(&name) => {
+        name if TOTAL_SCALAR_FUNCTIONS.contains(&name)
+            || TrinoByteOp::from_name(name).is_some()
+            || matches!(
+                name,
+                "url_encode"
+                    | "url_decode"
+                    | "regexp_count"
+                    | "regexp_position"
+                    | "regexp_extract_all"
+                    | "regexp_replace"
+            ) =>
+        {
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
         _ => true,
@@ -1017,9 +1175,10 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     "abs",
     "sign",
     // Measuring a string cannot fail.
-    "char_length",
-    "character_length",
     "length",
+    "bar",
+    "width_bucket",
+    "strpos",
     // The join key hashes every non-null pair and propagates null inputs.
     "join_row_key",
     // Case folding is defined for every string.
@@ -1039,6 +1198,7 @@ pub(super) fn binding_resolution_error(error: ResolveError) -> FunctionBindingEr
         ResolveError::AmbiguousSignature { .. } => FunctionBindingError::AmbiguousOverload,
         ResolveError::Control(error) => FunctionBindingError::Control(error),
         ResolveError::BadSignature(message) => FunctionBindingError::InvalidBinding(message.into()),
+        ResolveError::ResultType(error) => FunctionBindingError::ValueType(error),
     }
 }
 
@@ -1210,12 +1370,6 @@ impl BuiltinScalarResolver {
                         return Err(FunctionBindingError::NoMatchingOverload);
                     }
                 }
-            }
-            "bar" => {
-                super::synopse_owner::Recipe::bind(true, request, work)?;
-            }
-            "equiwidth_bucket" => {
-                super::synopse_owner::Recipe::bind(false, request, work)?;
             }
             super::negation_owner::NAME => {
                 // Negation accepts only the original numeric domain and carrier.
@@ -2860,14 +3014,18 @@ fn scalar_overload_effects(
                 super::control_owner::operation(name).expect("matched control operation"),
             ))
         }
-        "crc32" => Some(super::crc32_owner::effects()),
+        name if let Some(operation) = TrinoByteOp::from_name(name) => {
+            Some(super::string_binary::trino_effects(operation, signature))
+        }
         "parse_json" => Some(super::parse_json_owner::effects()),
         "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
         crate::native_like::ESCAPE_FUNCTION_NAME => Some(super::like_escape_owner::effects()),
         "json_object" => Some(super::json_object_owner::effects()),
+        "chr" | "codepoint" => Some(super::string_measure_owner::codepoint_effects()),
         name if super::string_measure_owner::operation(name).is_some() => {
             Some(super::string_measure_owner::effects())
         }
+        "normalize" => Some(super::string_case_owner::normalize_effects()),
         name if super::string_case_owner::operation(name).is_some() => {
             Some(super::string_case_owner::effects())
         }
@@ -2882,43 +3040,31 @@ fn scalar_overload_effects(
         name if super::string_url_encode_owner::operation(name).is_some() => {
             Some(super::string_url_encode_owner::effects())
         }
-        name if super::string_url_decode_owner::operation(name).is_some() => {
-            Some(super::string_url_decode_owner::effects())
+        name if let Some(operation) = super::string_parse_url_owner::operation(name) => {
+            Some(super::string_parse_url_owner::effects(operation))
         }
         name if super::string_substring_owner::operation(name).is_some() => {
             Some(super::string_substring_owner::effects())
         }
-        name if super::string_left_right_owner::operation(name).is_some() => {
-            Some(super::string_left_right_owner::effects())
-        }
-        name if super::string_locate_owner::operation(name).is_some() => {
-            Some(super::string_locate_owner::effects())
-        }
+        "strpos" => Some(super::string_locate_owner::strpos_effects(
+            if signature.contains(",i64)") { 3 } else { 2 },
+        )),
         name if super::string_initcap_owner::operation(name).is_some() => {
             Some(super::string_initcap_owner::effects())
         }
         name if super::string_pad_owner::operation(name).is_some() => {
-            Some(super::string_pad_owner::effects())
+            Some(super::string_pad_owner::trino_effects())
         }
         name if super::string_replace_owner::operation(name).is_some() => {
             Some(super::string_replace_owner::effects())
         }
         name if super::string_split_part_owner::operation(name).is_some() => {
-            Some(super::string_split_part_owner::effects())
-        }
-        name if super::string_sha2_owner::operation(name).is_some() => {
-            Some(super::string_sha2_owner::effects())
+            Some(super::string_split_part_owner::trino_effects())
         }
         name if super::string_concat_ws_owner::operation(name).is_some() => {
-            Some(super::string_concat_ws_owner::effects())
+            Some(super::string_concat_ws_owner::trino_effects())
         }
-        name if super::string_from_base64_owner::operation(name).is_some() => {
-            Some(super::string_from_base64_owner::effects())
-        }
-        name if super::string_hex_owner::operation(name).is_some() => {
-            Some(super::string_hex_owner::effects())
-        }
-        "split" => Some(super::string_split_owner::effects()),
+        "split" => Some(super::string_split_owner::trino_effects()),
         "__map_element_at" | "__map_subscript" | "element_at" => {
             Some(super::map_element_at_owner::effects())
         }
@@ -2926,27 +3072,13 @@ fn scalar_overload_effects(
         super::array_element_at_owner::SUBSCRIPT_NAME => {
             Some(super::array_element_at_owner::subscript_effects())
         }
-        name if super::string_md5_owner::operation(name).is_some() => {
-            Some(super::string_md5_owner::effects())
-        }
         name if super::map_projection_owner::operation(name).is_some() => {
             Some(super::map_projection_owner::effects())
         }
         name if super::collection_cardinality_owner::operation(name).is_some() => {
             Some(super::collection_cardinality_owner::effects())
         }
-        name if super::string_extended_owner::operation(name).is_some() => {
-            Some(super::string_extended_owner::effects(
-                super::string_extended_owner::operation(name).expect("matched operation"),
-            ))
-        }
-        "regexp_count" => Some(super::regexp_count_owner::effects()),
-        "parse_url" => Some(super::string_parse_url_owner::effects()),
-        "to_base64" => Some(super::string_to_base64_owner::effects()),
-        "regexp_position" => Some(super::regexp_position_owner::effects()),
-        "reverse" if signature.starts_with("(utf8)") => {
-            Some(super::string_reverse_owner::effects())
-        }
+        "reverse" => Some(super::string_reverse_owner::effects()),
         "dround" => Some(super::dround_owner::effects()),
         name if super::bit_shift_owner::operation(name).is_some() => {
             Some(super::bit_shift_owner::effects())
@@ -3078,6 +3210,15 @@ pub(super) fn dynamic_definition_parts(
         }
         _ => None,
     };
+    let public_signatures: &[(&str, &str)] = match name {
+        "__array_literal" => &[("T...", "array(T)")],
+        // T is the selected field of the input row, named by the constant VARCHAR.
+        "__array_struct_subfield" => &[("array(row(...)), varchar", "array(T)")],
+        "map_entries" => &[("map(K,V)", "array(row(K,V))")],
+        "greatest" | "least" => &[("T...", "T")],
+        "round" | "truncate" => super::rounding_binding::public_signatures(name),
+        _ => &[],
+    };
     let overload_declaration = if let Some(effects) = pure_effects {
         FunctionOverloadDeclaration::from_effects(
             overload.clone(),
@@ -3122,6 +3263,26 @@ pub(super) fn dynamic_definition_parts(
         subject: "dynamic scalar binding declaration",
         value: error.to_string().into(),
     })?;
+    let declaration = if let Some(empty) = &empty_map_overload {
+        declaration
+            .with_public_signatures([
+                (
+                    overload.clone(),
+                    vec![FunctionPublicSignature::new(
+                        "array(K), array(V)",
+                        "map(K,V)",
+                        "",
+                    )],
+                ),
+                (
+                    empty.clone(),
+                    vec![FunctionPublicSignature::new("", "map(unknown,unknown)", "")],
+                ),
+            ])
+            .map_err(public_signature_error)?
+    } else {
+        attach_public_signatures(declaration, public_signatures)?
+    };
     let resolver = BuiltinDynamicScalarResolver {
         function_id,
         canonical_name: name.into(),
@@ -3129,6 +3290,42 @@ pub(super) fn dynamic_definition_parts(
         empty_map_overload,
     };
     Ok((declaration, resolver))
+}
+
+// A single native binding family can supply several SQL call shapes, like
+// COUNT's zero-argument and one-argument forms. Freeze the display strings
+// under that family's original stable identity.
+fn attach_public_signatures(
+    declaration: FunctionBindingDeclaration,
+    forms: &[(&str, &str)],
+) -> Result<FunctionBindingDeclaration, FunctionCatalogError> {
+    if forms.is_empty() {
+        return Ok(declaration);
+    }
+    let [overload] = declaration.overloads() else {
+        return Err(FunctionCatalogError::InvalidStableIdentity {
+            subject: "builtin family public signatures",
+            value: declaration.function_id().as_str().into(),
+        });
+    };
+    let id = overload.identity.clone();
+    declaration
+        .with_public_signatures([(id, owned_public_signatures(forms))])
+        .map_err(public_signature_error)
+}
+
+fn owned_public_signatures(forms: &[(&str, &str)]) -> Vec<FunctionPublicSignature> {
+    forms
+        .iter()
+        .map(|&(args, result)| FunctionPublicSignature::new(args, result, ""))
+        .collect()
+}
+
+pub(super) fn public_signature_error(error: FunctionBindingError) -> FunctionCatalogError {
+    FunctionCatalogError::InvalidStableIdentity {
+        subject: "builtin public signature",
+        value: error.to_string().into(),
+    }
 }
 
 pub fn contribute_builtin_functions(
@@ -3194,6 +3391,33 @@ pub fn contribute_builtin_functions(
             }
         };
         let (declaration, resolver) = scalar_definition_parts(&name, &signatures, kind)?;
+        let typed_signatures = registry::scalar_signatures(&name).ok_or_else(|| {
+            FunctionCatalogError::InvalidStableIdentity {
+                subject: "builtin scalar registry signature presentation",
+                value: name.clone().into_boxed_str(),
+            }
+        })?;
+        let mut public_signatures = Vec::new();
+        for (canonical, typed) in signatures.iter().zip(typed_signatures) {
+            let id = builtin_scalar_overload_id(&name, canonical, kind)?;
+            if declaration
+                .overloads()
+                .iter()
+                .any(|overload| overload.identity == id)
+            {
+                let shape =
+                    typed.public_signature(builtin_fixed_result_domain(declaration.function_id()));
+                public_signatures.push((id, vec![shape]));
+            }
+        }
+        if name == "array_sort" {
+            let comparator =
+                super::collection_lambda::signature(&name).expect("declared array_sort comparator");
+            public_signatures.push((comparator.overload(), vec![comparator.public_signature()]));
+        }
+        let declaration = declaration
+            .with_public_signatures(public_signatures)
+            .map_err(public_signature_error)?;
         let definition = match name.as_str() {
             name if super::window_ranking_owner::operation(name).is_some() => {
                 super::window_ranking_owner::definition(name, declaration, resolver)?
@@ -3218,7 +3442,9 @@ pub fn contribute_builtin_functions(
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }
-            "crc32" => super::crc32_owner::definition(declaration, resolver)?,
+            name if let Some(operation) = TrinoByteOp::from_name(name) => {
+                super::string_binary::trino_definition(operation, name, declaration, resolver)?
+            }
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
@@ -3245,14 +3471,8 @@ pub fn contribute_builtin_functions(
             name if super::string_url_encode_owner::operation(name).is_some() => {
                 super::string_url_encode_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_url_decode_owner::operation(name).is_some() => {
-                super::string_url_decode_owner::definition(name, declaration, resolver)?
-            }
             name if super::string_substring_owner::operation(name).is_some() => {
                 super::string_substring_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_left_right_owner::operation(name).is_some() => {
-                super::string_left_right_owner::definition(name, declaration, resolver)?
             }
             name if super::string_locate_owner::operation(name).is_some() => {
                 super::string_locate_owner::definition(name, declaration, resolver)?
@@ -3269,17 +3489,8 @@ pub fn contribute_builtin_functions(
             name if super::string_split_part_owner::operation(name).is_some() => {
                 super::string_split_part_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_sha2_owner::operation(name).is_some() => {
-                super::string_sha2_owner::definition(name, declaration, resolver)?
-            }
             name if super::string_concat_ws_owner::operation(name).is_some() => {
                 super::string_concat_ws_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_from_base64_owner::operation(name).is_some() => {
-                super::string_from_base64_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_hex_owner::operation(name).is_some() => {
-                super::string_hex_owner::definition(name, declaration, resolver)?
             }
             "split" => super::string_split_owner::definition(&name, declaration, resolver)?,
             "__map_element_at" | "__map_subscript" | "element_at" => {
@@ -3288,26 +3499,15 @@ pub fn contribute_builtin_functions(
             "__array_element_at" | super::array_element_at_owner::SUBSCRIPT_NAME => {
                 super::array_element_at_owner::definition(&name, declaration, resolver)?
             }
-            name if super::string_md5_owner::operation(name).is_some() => {
-                super::string_md5_owner::definition(name, declaration, resolver)?
-            }
             name if super::map_projection_owner::operation(name).is_some() => {
                 super::map_projection_owner::definition(name, declaration, resolver)?
             }
             name if super::collection_cardinality_owner::operation(name).is_some() => {
                 super::collection_cardinality_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_extended_owner::operation(name).is_some() => {
-                super::string_extended_owner::definition(name, declaration, resolver)?
-            }
-            "regexp_count" => super::regexp_count_owner::definition(&name, declaration, resolver)?,
             name if super::string_parse_url_owner::operation(name).is_some() => {
                 super::string_parse_url_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_to_base64_owner::operation(name).is_some() => {
-                super::string_to_base64_owner::definition(name, declaration, resolver)?
-            }
-            "regexp_position" => super::regexp_position_owner::definition(declaration, resolver)?,
             name if super::string_reverse_owner::operation(name).is_some() => {
                 super::string_reverse_owner::definition(name, declaration, resolver)?
             }
@@ -3342,7 +3542,31 @@ pub fn contribute_builtin_functions(
         };
         builder.register(definition)?;
     }
+    for definition in super::approximate_owner::definitions()? {
+        builder.register(definition)?;
+    }
     for declaration in builtin_aggregate_declarations() {
+        let mut register = |mut definition: FunctionDefinition| {
+            if matches!(
+                declaration.name,
+                "array_agg_distinct"
+                    | "booland_agg"
+                    | "boolor_agg"
+                    | "std"
+                    | "variance_pop"
+                    | "variance_samp"
+                    | "min_n"
+                    | "max_n"
+                    | "ndv"
+                    | "approx_count_distinct"
+                    | "approx_top_k"
+                    | "percentile_approx"
+                    | "percentile_approx_weighted"
+            ) {
+                definition.visibility = FunctionVisibility::Hidden;
+            }
+            builder.register(definition)
+        };
         let function_id = FunctionId::try_new(format!("builtin.aggregate/{}/v1", declaration.name))
             .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
                 subject: "builtin aggregate function",
@@ -3359,76 +3583,113 @@ pub fn contribute_builtin_functions(
                     subject: "builtin aggregate state format",
                     value: error.to_string().into(),
                 })?;
-        let binding_declaration = FunctionBindingDeclaration::try_new(
-            function_id,
-            FunctionKind::Aggregate,
-            [FunctionOverloadDeclaration {
-                effects: match declaration.name {
-                    "group_concat" | "string_agg" => Some(super::aggregate_concat_owner::effects()),
-                    "array_agg" | "array_agg_distinct" => {
-                        Some(super::aggregate_array_owner::effects())
+        let mut public = Vec::new();
+        if !declaration.public_signatures.is_empty() {
+            public.push((
+                overload_id.clone(),
+                owned_public_signatures(declaration.public_signatures),
+            ));
+        }
+        let overload = FunctionOverloadDeclaration {
+            effects: match declaration.name {
+                "listagg" => Some(super::aggregate_concat_owner::effects()),
+                "array_agg" | "array_agg_distinct" => Some(super::aggregate_array_owner::effects()),
+                "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
+                "map_agg" => Some(super::aggregate_map_owner::effects()),
+                "count" => Some(super::aggregate_count_owner::effects()),
+                "multi_distinct_count" => Some(super::aggregate_count_distinct_owner::effects()),
+                "any_value" => Some(super::aggregate_any_value_owner::effects()),
+                "percentile_approx" | "percentile_approx_weighted" => {
+                    Some(super::aggregate_approx_percentile_owner::effects())
+                }
+                "approx_top_k" => Some(super::aggregate_top_k_owner::effects()),
+                "max_by" | "min_by" => Some(super::aggregate_by_owner::effects()),
+                "min_n" | "max_n" => Some(super::aggregate_n_owner::effects()),
+                "sum" => Some(super::aggregate_sum_owner::effects()),
+                name if super::aggregate_distinct_numeric_kernel::operation(name).is_some() => {
+                    Some(super::aggregate_distinct_numeric_owner::effects())
+                }
+                name if super::aggregate_basic::operation(name).is_some() => {
+                    Some(super::aggregate_basic_owner::effects())
+                }
+                name if super::aggregate_extrema_owner::operation(name).is_some() => {
+                    Some(super::aggregate_extrema_owner::effects())
+                }
+                _ => None,
+            },
+            semantics: FunctionSemantics {
+                volatility: FunctionVolatility::Immutable,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+            },
+            identity: overload_id,
+            argument_pattern: declaration.signature.into(),
+            result_pattern: "derived".into(),
+            aggregate: Some(AggregateBindingDeclaration {
+                state_argument_contract: builtin_aggregate_state_argument_contract(
+                    declaration.name,
+                ),
+                intermediate_pattern: "derived".into(),
+                state_format,
+            }),
+        };
+        let mut overloads = vec![overload];
+        let alternate = declaration.for_logical_arity(2);
+        if alternate.is_top_n() {
+            let mut top_n = overloads[0].clone();
+            top_n.identity =
+                FunctionOverloadId::try_new(alternate.overload()).map_err(|error| {
+                    FunctionCatalogError::InvalidStableIdentity {
+                        subject: "builtin Top N overload",
+                        value: error.to_string().into(),
                     }
-                    "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
-                    "map_agg" => Some(super::aggregate_map_owner::effects()),
-                    "count" => Some(super::aggregate_count_owner::effects()),
-                    "multi_distinct_count" => {
-                        Some(super::aggregate_count_distinct_owner::effects())
-                    }
-                    "any_value" => Some(super::aggregate_any_value_owner::effects()),
-                    "percentile_approx" | "percentile_approx_weighted" => {
-                        Some(super::aggregate_approx_percentile_owner::effects())
-                    }
-                    "approx_top_k" => Some(super::aggregate_top_k_owner::effects()),
-                    "max_by" | "min_by" => Some(super::aggregate_by_owner::effects()),
-                    "min_n" | "max_n" => Some(super::aggregate_n_owner::effects()),
-                    "sum" => Some(super::aggregate_sum_owner::effects()),
-                    name if super::aggregate_distinct_numeric_kernel::operation(name).is_some() => {
-                        Some(super::aggregate_distinct_numeric_owner::effects())
-                    }
-                    name if super::aggregate_basic::operation(name).is_some() => {
-                        Some(super::aggregate_basic_owner::effects())
-                    }
-                    name if super::aggregate_extrema_owner::operation(name).is_some() => {
-                        Some(super::aggregate_extrema_owner::effects())
-                    }
-                    _ => None,
-                },
-                semantics: FunctionSemantics {
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
-                },
-                identity: overload_id,
-                argument_pattern: declaration.signature.into(),
-                result_pattern: "derived".into(),
-                aggregate: Some(AggregateBindingDeclaration {
-                    state_argument_contract: builtin_aggregate_state_argument_contract(
-                        declaration.name,
-                    ),
-                    intermediate_pattern: "derived".into(),
-                    state_format,
-                }),
-            }],
-        )
-        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin aggregate binding declaration",
-            value: error.to_string().into(),
-        })?;
+                })?;
+            top_n.argument_pattern = alternate.signature.into();
+            top_n.aggregate = Some(AggregateBindingDeclaration {
+                state_argument_contract: builtin_aggregate_state_argument_contract(
+                    alternate.operation(),
+                ),
+                intermediate_pattern: "derived".into(),
+                state_format: AggregateStateFormatIdentity::try_new(alternate.state_format())
+                    .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+                        subject: "builtin Top N state format",
+                        value: error.to_string().into(),
+                    })?,
+            });
+            public.push((
+                top_n.identity.clone(),
+                owned_public_signatures(alternate.public_signatures),
+            ));
+            overloads.push(top_n);
+        }
+        let binding_declaration =
+            FunctionBindingDeclaration::try_new(function_id, FunctionKind::Aggregate, overloads)
+                .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+                    subject: "builtin aggregate binding declaration",
+                    value: error.to_string().into(),
+                })?;
+        let binding_declaration = if public.is_empty() {
+            binding_declaration
+        } else {
+            binding_declaration
+                .with_public_signatures(public)
+                .map_err(public_signature_error)?
+        };
         // One resolver in both roles: it answers binding questions and it is
         // the typed signature contract an aggregate is resolved through.
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
         if matches!(declaration.name, "array_agg" | "array_agg_distinct") {
-            builder.register(super::aggregate_array_owner::definition(
+            register(super::aggregate_array_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
             )?)?;
             continue;
         }
-        if matches!(declaration.name, "group_concat" | "string_agg") {
-            builder.register(super::aggregate_concat_owner::definition(
+        if declaration.name == "listagg" {
+            register(super::aggregate_concat_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3436,7 +3697,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "approx_top_k" {
-            builder.register(super::aggregate_top_k_owner::definition(
+            register(super::aggregate_top_k_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3444,7 +3705,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if matches!(declaration.name, "min_n" | "max_n") {
-            builder.register(super::aggregate_n_owner::definition(
+            register(super::aggregate_n_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3455,7 +3716,7 @@ pub fn contribute_builtin_functions(
             declaration.name,
             "percentile_approx" | "percentile_approx_weighted"
         ) {
-            builder.register(super::aggregate_approx_percentile_owner::definition(
+            register(super::aggregate_approx_percentile_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3463,7 +3724,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "map_agg" {
-            builder.register(super::aggregate_map_owner::definition(
+            register(super::aggregate_map_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3471,7 +3732,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if matches!(declaration.name, "max_by" | "min_by") {
-            builder.register(super::aggregate_by_owner::definition(
+            register(super::aggregate_by_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3479,7 +3740,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "any_value" {
-            builder.register(super::aggregate_any_value_owner::definition(
+            register(super::aggregate_any_value_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3487,7 +3748,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "multi_distinct_count" {
-            builder.register(super::aggregate_count_distinct_owner::definition(
+            register(super::aggregate_count_distinct_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3495,7 +3756,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if matches!(declaration.name, "ndv" | "approx_count_distinct") {
-            builder.register(super::aggregate_hll_owner::definition(
+            register(super::aggregate_hll_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3503,7 +3764,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "count" {
-            builder.register(super::aggregate_count_owner::definition(
+            register(super::aggregate_count_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3511,7 +3772,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "sum" {
-            builder.register(super::aggregate_sum_owner::definition(
+            register(super::aggregate_sum_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3519,7 +3780,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if super::aggregate_extrema_owner::operation(declaration.name).is_some() {
-            builder.register(super::aggregate_extrema_owner::definition(
+            register(super::aggregate_extrema_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3527,7 +3788,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if super::aggregate_distinct_numeric_kernel::operation(declaration.name).is_some() {
-            builder.register(super::aggregate_distinct_numeric_owner::definition(
+            register(super::aggregate_distinct_numeric_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3535,14 +3796,14 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if super::aggregate_basic::operation(declaration.name).is_some() {
-            builder.register(super::aggregate_basic_owner::definition(
+            register(super::aggregate_basic_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
             )?)?;
             continue;
         }
-        builder.register(FunctionDefinition::bound_with_owner(
+        register(FunctionDefinition::bound_with_owner(
             declaration.name,
             FunctionVisibility::Public,
             binding_declaration,
@@ -3581,6 +3842,11 @@ pub fn contribute_builtin_functions(
         subject: "builtin table function binding declaration",
         value: error.to_string().into(),
     })?;
+    let unnest_signature = FunctionPublicSignature::new("array(T)...", "relation(T...)", "");
+    let unnest_id = unnest_declaration.overloads()[0].identity.clone();
+    let unnest_declaration = unnest_declaration
+        .with_public_signatures([(unnest_id, vec![unnest_signature])])
+        .map_err(public_signature_error)?;
     builder.register(super::table_unnest_owner::definition(
         unnest_declaration,
         BuiltinUnnestResolver,
@@ -4159,8 +4425,8 @@ mod tests {
             &[DataType::Int64],
             false,
             crate::binding_test_control(),
-        )
-        .expect("std alias resolves for user SQL");
+        );
+        assert_eq!(std_user, Err(FunctionResolutionError::HiddenFunction));
         let std_trusted = resolve_bound_aggregate(
             &catalog,
             "std",
@@ -4170,14 +4436,13 @@ mod tests {
             crate::binding_test_control(),
         )
         .expect("std alias resolves for trusted planning");
-        assert_eq!(std_user, std_trusted);
         assert_eq!(
-            std_user.overload.as_str(),
+            std_trusted.overload.as_str(),
             "builtin.aggregate/std/derived-v1"
         );
-        assert_eq!(std_user.intermediate_type, DataType::Binary);
-        assert_eq!(std_user.output_type, DataType::Float64);
-        assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
+        assert_eq!(std_trusted.intermediate_type, DataType::Binary);
+        assert_eq!(std_trusted.output_type, DataType::Float64);
+        assert_eq!(std_trusted.state_format.as_str(), "novarocks/std/state-v1");
     }
 
     #[test]

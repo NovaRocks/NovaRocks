@@ -267,7 +267,10 @@ fn operational_lambda_source_loans_original_parameters_and_actual_body_scope() {
         };
         assert_eq!(parameter_types.len(), 1);
         assert_eq!(parameter_types[0].data_type().clone(), DataType::Utf8);
-        assert_eq!(result_type, &ValueType::new(DataType::Utf8, true));
+        assert_eq!(
+            result_type,
+            &nullable_bounded_character(novarocks_type_contract::CharacterKind::Varchar, 2)
+        );
         let lambda = receipt
             .definitions()
             .definition(receipt.arguments()[0])

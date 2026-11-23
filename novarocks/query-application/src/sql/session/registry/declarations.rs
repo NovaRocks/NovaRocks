@@ -168,16 +168,6 @@ pub(super) fn system_declarations() -> Result<Vec<PropertyDeclaration>, SessionP
         }
     );
     declaration!(
-        "group_concat_max_len",
-        Bigint,
-        Some(V::Bigint(execution.group_concat_max_len())),
-        "Maximum GROUP_CONCAT result length",
-        Any,
-        |state, value| {
-            state.execution_settings.set_group_concat_max_len(*value);
-        }
-    );
-    declaration!(
         "pipeline_dop",
         Integer,
         execution.pipeline_dop().map(V::Integer),

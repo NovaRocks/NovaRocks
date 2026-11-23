@@ -34,7 +34,7 @@ INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${u
  ROW(2,NULL,NULL,NULL,NULL);
 
 -- query 3
-SELECT id,ts AS instant,d,s,hex(raw) AS raw_hex
+SELECT id,ts AS instant,d,s,to_hex(raw) AS raw_hex
 FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ORDER BY id;
 
 -- ADD EQUALITY DELETE currently accepts scalar literals only; hexadecimal

@@ -87,6 +87,7 @@ impl SqlWriteAssignmentSite {
 #[derive(Clone, Debug)]
 pub struct SqlWriteAssignments {
     sites: Box<[SqlWriteAssignmentSite]>,
+    mutation_description: bool,
 }
 impl SqlWriteAssignments {
     pub fn try_new(
@@ -101,8 +102,23 @@ impl SqlWriteAssignments {
                 ));
             }
         }
-        Ok(Self { sites })
+        Ok(Self {
+            sites,
+            mutation_description: false,
+        })
     }
+    /// The original UPDATE/MERGE source projects complete SET/INSERT sites
+    /// alongside unaffected match fields. Its assignment conversion constrains
+    /// a parameter occupying the original root of an assignment.
+    pub fn for_mutation_description(mut self) -> Self {
+        self.mutation_description = true;
+        self
+    }
+
+    pub(crate) const fn is_mutation_description(&self) -> bool {
+        self.mutation_description
+    }
+
     pub fn sites(&self) -> &[SqlWriteAssignmentSite] {
         &self.sites
     }

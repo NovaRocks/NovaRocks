@@ -24,7 +24,7 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | INSERT INTO（VALUES / SELECT） | ✅ | 零行结果跳过提交 |
-| DELETE FROM（V2 position-delete + V3 DV 双路径） | ✅ | |
+| DELETE FROM（元数据删除、V2 位置删除、V3 DV） | ✅ | |
 | UPDATE（MOR + UPDATE FROM source） | ✅ | PR #76 |
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
 | OPTIMIZE TABLE（whole-table 重写） | ✅ | 见 [maintenance](maintenance.md) |
@@ -37,19 +37,22 @@ under the License.
 
 ## 并发提交政策
 
-源输出计算完成后，每次 attempt 仍需验证操作依赖。
+每轮提交按操作验证依赖。有 BE 源计算的写入在该计算就绪后进入提交。
 
 | 操作 | 提交时验证 |
 |---|---|
 | 普通 INSERT（VALUES / SELECT） | 核对同一目标表及写出所用的默认分区规范，可在新 head 上重新准备 |
 | ADD FILES | 候选路径未在准确 `main` 快照存活。快照变化时复核候选，依赖名称映射时同时保护整版 metadata |
-| DELETE / UPDATE / MERGE | 按隔离级别验证准入观察与连续快照窗口 |
-| OPTIMIZE、主分支 TRUNCATE | 按各操作协议在本轮基准核对，见 [lake publication](lake-publication.md#冲突与重新准备) |
-| MV 全量刷新、重分区及其它绑定基线的文档提交 | 目标 ref 与输出基线相同 |
+| 行级 DELETE / UPDATE / MERGE | 按原隔离级别与连续快照窗口核对 |
+| 主分支元数据 DELETE | 每轮核对原字段身份，按当前文件证明整文件匹配 |
+| 显式分支 TRUNCATE | 目标 ref 与源读取基线相同 |
+| 主分支 TRUNCATE | 核对表与分支身份，清空获胜轮基准中的全部文件 |
+| OPTIMIZE | 核对原重写文件、实际输出规范与适用的历史依赖 |
+| 绑定基线的文档或分区演进提交 | 目标 ref 与输出基线相同 |
 | ANALYZE | 测得统计的快照在准备时存在；发布时存在性不受原子条件保护 |
 
-要求目标 ref 不变的语句遇到 head 变化时以确定未提交的冲突结束。仅当 Catalog 已确定拒绝且该操作
-的依赖仍成立时，才允许重新准备。重试表属性、清理结果与 Unknown 核对见 [lake publication](lake-publication.md)。
+确定的 Catalog 竞争可按各操作的原预算重读基准并核对依赖。依赖校验失败时以确定未提交的冲突结束。
+结果未知时保留派发证据与对象，元数据 DELETE 按原请求核对一次。重试表属性、清理结果与人工核对见 [lake-publication](lake-publication.md)。
 
 ## 登记已有 Parquet 文件
 
@@ -101,15 +104,20 @@ INSERT INTO orders (id, user_id, amount) VALUES (2, 1002, 30.00);
 ## ✅ DELETE FROM
 
 ```sql
-DELETE FROM orders WHERE amount < 10.0;
+EXPLAIN DELETE FROM orders WHERE order_day = DATE '2026-11-23';
+DELETE FROM orders WHERE order_day = DATE '2026-11-23';
+DELETE FROM expired_staging;
 ```
 
-V2 / V3 双路径：
+当 `orders` 以 `order_day` 作 identity 分区时，示例中的日期等值条件可走主分支元数据删除。该路径适用于 Iceberg v1、v2 和 v3。无 WHERE 的主分支 DELETE 清空获胜轮基准，保留表与快照历史。没有历史快照时提交首个 `delete` 快照。
 
-- V2 表：写 position-delete 文件
-- V3 表：本次与旧删除位置的并集部分覆盖数据文件时写 Puffin DV；完整覆盖时逻辑移除数据文件及它独占的旧位置删除项，不新增 DV。两种效果均**不分配新 `_row_id`**
+带 WHERE 时，SQL 和 Provider 共同证明完整谓词由原观察中存活数据的分区 spec 保证。其余条件沿行级 DELETE 准入。行级路径要求 v2 或 v3，v2 写位置删除，v3 在并集部分覆盖时写 Puffin DV，完整覆盖时移除数据文件及其独占的旧删除项。v3 行级删除保持原行 ID。只有行级执行等待 BE。能独立证明恒假或原表无快照的带 WHERE 语句返回 0 并保留快照头。HMS 和 MV 存储表沿原守卫拒绝 DELETE。
 
-入口：`novarocks/frontend-application/src/query_execution/dml/delete/`。
+元数据 DELETE 从实际发布的 `delete` 快照计算逻辑删除行数。缺少 `deleted-records` 或差值无法表示为非负 BIGINT 时返回 NULL。元数据路径无命中文件时仍产生快照。确定的 Catalog 竞争按原预算重读基准，以原字段条件复核文件，获胜轮可以一并删除匹配的并发追加。可能部分匹配的数据文件报告 `ICEBERG_COMMIT_ERROR`。
+
+`EXPLAIN DELETE` 显示 `TableDelete`、`Values (0 rows)` 或匹配读及行级删除格式。带约束的 `TableDelete` 显示原快照和约束列。显式分支带 WHERE 沿既有行级路径。整分支 DELETE 沿既有整分支清空契约，当前不支持该形态的 EXPLAIN。
+
+实现参见 [ADR-0260](../../adr/ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md)。
 
 ## ✅ UPDATE 与关联更新（MOR）
 

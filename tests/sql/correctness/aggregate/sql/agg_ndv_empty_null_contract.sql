@@ -30,25 +30,25 @@ INSERT INTO ${case_db}.ndv_null_contract VALUES
     ROW(2, 7, 'a'), ROW(3, 7, 'a'), ROW(3, 8, 'a');
 
 -- query 3
-SELECT ndv(v) AS ndv_empty, approx_count_distinct(v) AS approx_empty,
+SELECT approx_distinct(v) AS ndv_empty, approx_distinct(v) AS approx_empty,
        count(DISTINCT v) AS exact_empty
 FROM ${case_db}.ndv_null_contract WHERE k = 999;
 
 -- query 4
-SELECT ndv(v) AS ndv_null, approx_count_distinct(v) AS approx_null,
+SELECT approx_distinct(v) AS ndv_null, approx_distinct(v) AS approx_null,
        count(DISTINCT v) AS exact_null
 FROM ${case_db}.ndv_null_contract WHERE k = 1;
 
 -- query 5
-SELECT k, ndv(v) AS ndv_count, approx_count_distinct(v) AS approx_count,
+SELECT k, approx_distinct(v) AS ndv_count, approx_distinct(v) AS approx_count,
        count(DISTINCT v) AS exact_count
 FROM ${case_db}.ndv_null_contract GROUP BY k ORDER BY k;
 
 -- query 6
-SELECT ndv(CAST(s AS BIGINT)) AS ndv_cast_null,
-       approx_count_distinct(CAST(s AS BIGINT)) AS approx_cast_null
+SELECT approx_distinct(TRY_CAST(s AS BIGINT)) AS ndv_cast_null,
+       approx_distinct(TRY_CAST(s AS BIGINT)) AS approx_cast_null
 FROM ${case_db}.ndv_null_contract;
 
 -- query 7
 SELECT k FROM ${case_db}.ndv_null_contract GROUP BY k
-HAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;
+HAVING approx_distinct(v) = 0 AND approx_distinct(v) = 0 ORDER BY k;

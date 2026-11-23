@@ -88,6 +88,9 @@ pub(super) fn compiled_unit_can_fold(
             PreparedPureKernel::Scalar(kernel)
                 if kernel.instance_inline_allocation_bytes() == 0 => {}
             PreparedPureKernel::ControlIntrinsic(_) => {}
+            // The optional optimizer has no original evaluation allocator.
+            // Ordered calls with known NULL are simplified before this step.
+            PreparedPureKernel::OrderedRegexp(_) => return Ok(false),
             _ => return Ok(false),
         }
         let effects = call.call_contract().effects();

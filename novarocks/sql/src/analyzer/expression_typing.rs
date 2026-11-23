@@ -67,6 +67,16 @@ impl ScalarBindingCatalog for StatementScalarCatalog<'_> {
             .resolve_scalar_operator_binding(operator, request, control)
     }
 
+    fn select_trusted_scalar(
+        &self,
+        function: &FunctionId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.0
+            .resolve_trusted_scalar_binding(function, request, control)
+    }
+
     fn select_exact_scalar(
         &self,
         function: &FunctionId,
@@ -90,13 +100,58 @@ impl ScalarBindingCatalog for StatementScalarCatalog<'_> {
 }
 
 impl AnalyzerContext<'_> {
+    pub(super) fn described_arguments(&self, args: &[TypedExpr]) -> Option<Vec<Option<usize>>> {
+        let factory = self.factory.borrow();
+        let description = factory.prepared_description.as_ref()?;
+        Some(
+            args.iter()
+                .map(|arg| description.parameter_ordinal(arg))
+                .collect(),
+        )
+    }
+
+    pub(super) fn observe_argument_types<'a>(
+        &self,
+        ordinals: Option<Vec<Option<usize>>>,
+        types: impl IntoIterator<Item = Option<&'a FunctionValueType>>,
+    ) -> Result<(), AnalyzeError> {
+        if let Some(ordinals) = ordinals {
+            let mut factory = self.factory.borrow_mut();
+            let description = factory
+                .prepared_description
+                .as_mut()
+                .expect("original description");
+            for (ordinal, target) in ordinals.into_iter().zip(types) {
+                self.check_control()?;
+                if let (Some(ordinal), Some(target)) = (ordinal, target) {
+                    description.coerce_parameter(ordinal, target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn observe_implicit_type(
+        &self,
+        source: &TypedExpr,
+        target: &FunctionValueType,
+    ) -> Result<(), AnalyzeError> {
+        if let Some(description) = &mut self.factory.borrow_mut().prepared_description
+            && let Some(ordinal) = description.parameter_ordinal(source)
+        {
+            description.coerce_parameter(ordinal, target)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn type_scalar_call(
         &self,
         shape: NodeShape<'_>,
         args: Vec<TypedExpr>,
         span: Span,
     ) -> Result<BoundScalarCall, AnalyzeError> {
-        type_scalar_call_with_environment(
+        let ordinals = self.described_arguments(&args);
+        let result = type_scalar_call_with_environment(
             self.function_catalog,
             shape,
             args,
@@ -106,7 +161,12 @@ impl AnalyzerContext<'_> {
             span,
             self.sql_semantics.statement_time(),
             self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
-        )
+        )?;
+        self.observe_argument_types(
+            ordinals,
+            result.args.iter().map(|arg| Some(&arg.value_type)),
+        )?;
+        Ok(result)
     }
 
     pub(super) fn type_value_node(
@@ -115,7 +175,8 @@ impl AnalyzerContext<'_> {
         args: Vec<TypedExpr>,
         span: Span,
     ) -> Result<(FunctionValueType, Vec<TypedExpr>), AnalyzeError> {
-        self.with_typing(span, |context, work| {
+        let ordinals = self.described_arguments(&args);
+        let (result, converted) = self.with_typing(span, |context, work| {
             let check_branch_constants = matches!(shape, NodeShape::SearchedCase { .. });
             let children = typed_children(context, &args, check_branch_constants, work)?;
             let NodeTyping::Value {
@@ -136,7 +197,9 @@ impl AnalyzerContext<'_> {
                     work,
                 )?,
             ))
-        })
+        })?;
+        self.observe_argument_types(ordinals, converted.iter().map(|arg| Some(&arg.value_type)))?;
+        Ok((result, converted))
     }
 
     pub(super) fn type_extract(
@@ -522,6 +585,9 @@ fn scalar_selection_error(
                 error,
                 FunctionBindingError::UnavailableImplementation(_)
                     | FunctionBindingError::VariantTargetType(_)
+                    | FunctionBindingError::ValueType(
+                        novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. }
+                    )
                     | FunctionBindingError::UnknownFunction
                     | FunctionBindingError::HiddenFunction
                     | FunctionBindingError::NoMatchingOverload

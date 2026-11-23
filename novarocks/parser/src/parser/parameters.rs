@@ -26,7 +26,9 @@ impl Parser<'_> {
     pub(super) fn new_parameter(&mut self, span: Span) -> Parameter {
         let position = self.next_parameter;
         self.next_parameter += 1;
-        self.parameter_events.push(span);
+        if self.track_parameter_events {
+            self.parameter_events.push(span);
+        }
         Parameter { position, span }
     }
 
@@ -34,6 +36,9 @@ impl Parser<'_> {
     /// visits those children. The ranges refer to this invocation's original
     /// contiguous production slots; nested ordering never changes their length.
     pub(super) fn reorder_parameter_groups(&mut self, start: usize, groups: &[Range<usize>]) {
+        if !self.track_parameter_events {
+            return;
+        }
         assert_eq!(self.parameter_events.len(), self.next_parameter);
         let mut partition = groups.to_vec();
         partition.sort_by_key(|range| (range.start, range.end));
@@ -58,6 +63,7 @@ impl Parser<'_> {
     }
 
     pub(super) fn parameter_numbers(&self) -> ParameterNumbers {
+        assert!(self.track_parameter_events);
         assert_eq!(self.parameter_events.len(), self.next_parameter);
         let mut positions = HashMap::with_capacity(self.next_parameter);
         for (position, span) in self.parameter_events.iter().copied().enumerate() {

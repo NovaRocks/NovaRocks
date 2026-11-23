@@ -19,13 +19,14 @@
 //! SQL NULL inputs produce a non-null empty string; no payload is read for NULL.
 //! Layout checks cover requested representability, not formal host memory grants.
 
+use super::string_substring::StringIntegerArray;
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{Array, ArrayRef, Int32Array, StringArray};
-use arrow_buffer::{Buffer, OffsetBuffer};
+use arrow_array::{Array, ArrayRef, StringArray};
+use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
@@ -50,15 +51,15 @@ struct SelectedProjection<'work, 'control> {
 }
 impl<'a> crate::string_split_part_core::SplitProjection<'a> for SelectedProjection<'_, '_> {
     type Error = KernelFailure;
-    type Output = &'a str;
-    fn empty(&mut self) -> Result<&'a str, KernelFailure> {
-        Ok("")
+    type Output = Option<&'a str>;
+    fn empty(&mut self) -> Result<Option<&'a str>, KernelFailure> {
+        Ok(None)
     }
-    fn text(&mut self, text: &'a str) -> Result<&'a str, KernelFailure> {
-        Ok(text)
+    fn text(&mut self, text: &'a str) -> Result<Option<&'a str>, KernelFailure> {
+        Ok(Some(text))
     }
-    fn character(&mut self, tail: &'a str, ch: char) -> Result<&'a str, KernelFailure> {
-        Ok(&tail[..ch.len_utf8()])
+    fn character(&mut self, tail: &'a str, ch: char) -> Result<Option<&'a str>, KernelFailure> {
+        Ok(Some(&tail[..ch.len_utf8()]))
     }
     fn observe_character(&mut self, ch: char) -> Result<(), KernelFailure> {
         for _ in 0..ch.len_utf8() {
@@ -76,15 +77,10 @@ impl<'a> crate::string_split_part_core::SplitProjection<'a> for SelectedProjecti
 fn split_part_span<'a>(
     text: &'a str,
     delimiter: &str,
-    index: i32,
+    index: i64,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<&'a str, KernelFailure> {
-    crate::string_split_part_core::project(
-        text,
-        delimiter,
-        i64::from(index),
-        &mut SelectedProjection { work },
-    )
+) -> Result<Option<&'a str>, KernelFailure> {
+    crate::string_split_part_core::project(text, delimiter, index, &mut SelectedProjection { work })
 }
 pub(super) fn evaluate_string_split_part<'a>(
     input: ScalarCallInput<'_, 'a>,
@@ -104,14 +100,12 @@ pub(super) fn evaluate_string_split_part<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("split_part requires value arguments"));
             };
-            if ty.logical_type() != ValueLogicalType::Physical
-                || *ty.data_type()
-                    != if index < 2 {
-                        DataType::Utf8
-                    } else {
-                        DataType::Int32
-                    }
-            {
+            let expected = if index < 2 {
+                ty.data_type() == &DataType::Utf8
+            } else {
+                matches!(ty.data_type(), DataType::Int32 | DataType::Int64)
+            };
+            if ty.logical_type() != ValueLogicalType::Physical || !expected {
                 return Err(invalid(
                     "split_part differs from its exact installed argument profile",
                 ));
@@ -137,15 +131,12 @@ pub(super) fn evaluate_string_split_part<'a>(
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| internal("split_part selected delimiter is not Utf8"))?;
-        let indices = arguments[2]
-            .array()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or_else(|| internal("split_part selected index is not Int32"))?;
+        let indices = StringIntegerArray::read(arguments[2].array().as_ref())?;
+        let trino = matches!(indices, StringIntegerArray::Bigint(_));
         let row_span = |ordinal,
                         batch_row,
                         work: &mut EvaluationCheckpoints<'_>|
-         -> Result<&str, KernelFailure> {
+         -> Result<Result<Option<&str>, &'static str>, KernelFailure> {
             let mut rows = [0usize; 3];
             let mut is_null = false;
             for (index, argument) in arguments.iter().enumerate() {
@@ -170,23 +161,33 @@ pub(super) fn evaluate_string_split_part<'a>(
                 }
             }
             if is_null {
-                return Ok("");
+                return Ok(Ok(if trino { None } else { Some("") }));
             }
-            split_part_span(
+            let index = indices.value(rows[2]);
+            if trino && index <= 0 {
+                return Ok(Err("Index must be greater than zero"));
+            }
+            let span = split_part_span(
                 strings.value(rows[0]),
                 delimiters.value(rows[1]),
-                indices.value(rows[2]),
+                index,
                 work,
-            )
+            )?;
+            Ok(Ok(if trino {
+                span
+            } else {
+                Some(span.unwrap_or(""))
+            }))
         };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            let span = row_span(ordinal, batch_row, &mut work)?;
-            total = total
-                .checked_add(span.len())
-                .ok_or(KernelFailure::ResourceExhausted)?;
+            if let Ok(Some(span)) = row_span(ordinal, batch_row, &mut work)? {
+                total = total
+                    .checked_add(span.len())
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+            }
         }
         output_capacity(selection.len(), total)?;
         work.flush()?;
@@ -201,14 +202,38 @@ pub(super) fn evaluate_string_split_part<'a>(
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         work.flush()?;
         offsets.push(0i32);
+        let mut validity = trino.then(|| BooleanBufferBuilder::new(selection.len()));
+        let mut has_null = false;
+        let mut errors = Vec::new();
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            let span = row_span(ordinal, batch_row, &mut work)?;
-            if span.len() > total - bytes.len() {
-                return Err(internal("split_part exceeded its measured output extent"));
+            let span = match row_span(ordinal, batch_row, &mut work)? {
+                Ok(span) => span,
+                Err(message) => {
+                    errors
+                        .try_reserve(1)
+                        .map_err(|_| KernelFailure::ResourceExhausted)?;
+                    errors.push(crate::RowDataError::with_reason(
+                        ordinal,
+                        crate::DataFailureReason::Domain(
+                            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                        ),
+                        message,
+                    ));
+                    None
+                }
+            };
+            if let Some(validity) = &mut validity {
+                validity.append(span.is_some());
+                has_null |= span.is_none();
             }
-            for byte in span.bytes() {
-                bytes.push(byte);
-                work.step()?;
+            if let Some(span) = span {
+                if span.len() > total - bytes.len() {
+                    return Err(internal("split_part exceeded its measured output extent"));
+                }
+                for byte in span.bytes() {
+                    bytes.push(byte);
+                    work.step()?;
+                }
             }
             offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
             work.step()?;
@@ -222,14 +247,16 @@ pub(super) fn evaluate_string_split_part<'a>(
         let array = Arc::new(StringArray::new(
             OffsetBuffer::new(offsets.into()),
             Buffer::from(bytes),
-            None,
+            validity
+                .filter(|_| has_null)
+                .map(|mut validity| NullBuffer::new(validity.finish())),
         )) as ArrayRef;
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
             target.data_type(),
             array,
-            Box::default(),
+            errors.into_boxed_slice(),
             || work.step(),
         )
     })();

@@ -28,31 +28,53 @@ pub enum ConcatObservation {
     PartEnd,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConcatLength {
+    Null,
+    TooLong,
+    Value(usize),
+}
+
+impl ConcatLength {
+    pub(super) fn data_error(self, ordinal: usize) -> Option<crate::RowDataError> {
+        (self == Self::TooLong).then(|| {
+            crate::RowDataError::with_reason(
+                ordinal,
+                crate::DataFailureReason::Domain(
+                    novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                ),
+                "Concatenated string is too large",
+            )
+        })
+    }
+}
+
 /// Measure CONCAT, stopping row reads at the first NULL or exceeded byte cap.
-pub fn concat_length_observed<'s, C, E>(
+pub fn concat_length_observed<'s, T: AsRef<[u8]> + ?Sized + 's, C, E>(
     arguments: usize,
     context: &mut C,
-    mut read: impl FnMut(&mut C, usize) -> Result<Option<&'s str>, E>,
-) -> Result<Option<usize>, E> {
+    mut read: impl FnMut(&mut C, usize) -> Result<Option<&'s T>, E>,
+) -> Result<ConcatLength, E> {
     let mut length = 0;
     for index in 0..arguments {
         let Some(text) = read(context, index)? else {
-            return Ok(None);
+            return Ok(ConcatLength::Null);
         };
+        let text = text.as_ref();
         if text.len() > MAX_ROW_BYTES - length {
-            return Ok(None);
+            return Ok(ConcatLength::TooLong);
         }
         length += text.len();
     }
-    Ok(Some(length))
+    Ok(ConcatLength::Value(length))
 }
 
 /// Emit the already measured, successful CONCAT row without another probe.
-pub fn emit_concat_observed<'s, C, E>(
+pub fn emit_concat_observed<'s, T: ?Sized + 's, C, E>(
     arguments: usize,
     context: &mut C,
-    mut read: impl FnMut(&mut C, usize) -> Result<&'s str, E>,
-    mut emit: impl FnMut(&mut C, &'s str) -> Result<(), E>,
+    mut read: impl FnMut(&mut C, usize) -> Result<&'s T, E>,
+    mut emit: impl FnMut(&mut C, &'s T) -> Result<(), E>,
     mut observe: impl FnMut(&mut C, ConcatObservation) -> Result<(), E>,
 ) -> Result<(), E> {
     for index in 0..arguments {
@@ -70,7 +92,7 @@ pub fn concat_ws_length_observed<'s, C, E>(
     mut read: impl FnMut(&mut C, usize) -> Result<Option<&'s str>, E>,
     mut visit_masked: impl FnMut(&mut C, usize) -> Result<(), E>,
     mut observe: impl FnMut(&mut C, ConcatObservation) -> Result<(), E>,
-) -> Result<Option<usize>, E> {
+) -> Result<ConcatLength, E> {
     let separator = read(context, 0)?;
     let mut length = 0;
     let mut has_value = false;
@@ -101,7 +123,13 @@ pub fn concat_ws_length_observed<'s, C, E>(
         }
         observe(context, ConcatObservation::PartEnd)?;
     }
-    Ok((separator.is_some() && !oversize).then_some(length))
+    Ok(if separator.is_none() {
+        ConcatLength::Null
+    } else if oversize {
+        ConcatLength::TooLong
+    } else {
+        ConcatLength::Value(length)
+    })
 }
 
 /// Emit a successful CONCAT_WS row, including separators between empty parts.
@@ -148,7 +176,10 @@ mod string_concat_core_tests {
             let length = never(concat_length_observed(values.len(), &mut (), |_, i| {
                 Ok(values[i])
             }));
-            assert_eq!(length, expected.map(str::len));
+            assert_eq!(
+                length,
+                expected.map_or(ConcatLength::Null, |s| ConcatLength::Value(s.len()))
+            );
             if let Some(expected) = expected {
                 let mut out = String::new();
                 never(emit_concat_observed(
@@ -180,7 +211,10 @@ mod string_concat_core_tests {
                 |_, _| Ok(()),
                 |_, _| Ok(()),
             ));
-            assert_eq!(length, expected.map(str::len));
+            assert_eq!(
+                length,
+                expected.map_or(ConcatLength::Null, |s| ConcatLength::Value(s.len()))
+            );
             if let Some(expected) = expected {
                 let mut out = String::new();
                 never(emit_concat_ws_observed(
@@ -206,7 +240,7 @@ mod string_concat_core_tests {
             never(concat_length_observed(1, &mut (), |_, _| Ok(Some(
                 exact.as_str()
             )))),
-            Some(1_048_576)
+            ConcatLength::Value(1_048_576)
         );
         assert_eq!(
             never(concat_length_observed(2, &mut (), |_, i| if i == 0 {
@@ -214,7 +248,7 @@ mod string_concat_core_tests {
             } else {
                 panic!("read after exceeded cap")
             })),
-            None
+            ConcatLength::TooLong
         );
         assert_eq!(
             never(concat_ws_length_observed(
@@ -228,7 +262,7 @@ mod string_concat_core_tests {
                 |_, _| Ok(()),
                 |_, _| Ok(())
             )),
-            Some(4)
+            ConcatLength::Value(4)
         );
         let mut visits = vec![];
         let refused = concat_ws_length_observed(

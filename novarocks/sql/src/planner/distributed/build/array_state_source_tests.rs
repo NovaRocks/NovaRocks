@@ -84,13 +84,6 @@ fn array_state_source_real_ordered_distinct_single_receipt_without_split_capabil
                 nulls_first
             }]
         );
-        assert!(
-            single_entry
-                .captured()
-                .binding()
-                .group_concat_source()
-                .is_none()
-        );
         assert_eq!(
             single_entry.source().binding.state_interpretation.as_ref(),
             Some(original)

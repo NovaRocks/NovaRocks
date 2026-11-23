@@ -53,7 +53,9 @@ pub(super) struct Checkpoint {
 
 impl Parser<'_> {
     pub(super) fn checkpoint(&self) -> Checkpoint {
-        assert_eq!(self.parameter_events.len(), self.next_parameter);
+        if self.track_parameter_events {
+            assert_eq!(self.parameter_events.len(), self.next_parameter);
+        }
         Checkpoint {
             position: self.position,
             parameter_count: self.next_parameter,

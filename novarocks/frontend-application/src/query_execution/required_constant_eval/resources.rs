@@ -161,9 +161,21 @@ pub(super) struct RootFactory<'a> {
 }
 pub(super) struct RootScope<'a> {
     backing: Arc<Backing>,
+    window: &'a ResultWindowAlias,
     control: &'a dyn PureCompileControl,
 }
 impl RootScope<'_> {
+    fn reserve(&self, bytes: usize) -> Result<(), CompileControlError> {
+        self.backing.reserve(bytes).inspect_err(|_| {
+            tracing::debug!(
+                requested_bytes = bytes,
+                retained_bytes = self.window.retained_payload_bytes(),
+                capacity_bytes = self.window.payload_capacity_bytes(),
+                "Statement value layout request refused by the original window"
+            );
+        })
+    }
+
     pub(super) fn with_creation<T>(
         &self,
         body: impl FnOnce(
@@ -172,11 +184,11 @@ impl RootScope<'_> {
     ) -> T {
         let mut request = |layout: Layout| {
             self.control.checkpoint(CompilePhase::LowerProgram, 0)?;
-            self.backing.reserve(layout.size())
+            self.reserve(layout.size())
         };
         let mut opaque = |bytes: usize| {
             self.control.checkpoint(CompilePhase::LowerProgram, 0)?;
-            self.backing.reserve(bytes)
+            self.reserve(bytes)
         };
         let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
             self.backing.storage(),
@@ -192,11 +204,11 @@ impl ValueSchemaCreationScope<CompileControlError> for RootScope<'_> {
     }
     fn request_layout(&mut self, layout: Layout) -> Result<(), CompileControlError> {
         self.control.checkpoint(CompilePhase::LowerProgram, 0)?;
-        self.backing.reserve(layout.size())
+        self.reserve(layout.size())
     }
     fn observe_opaque_upper_bound(&mut self, bytes: usize) -> Result<(), CompileControlError> {
         self.control.checkpoint(CompilePhase::LowerProgram, 0)?;
-        self.backing.reserve(bytes)
+        self.reserve(bytes)
     }
 }
 /// Reuse the original statement-window author for pure planning construction.
@@ -233,6 +245,7 @@ impl ValueSchemaCreationFactory<CompileControlError> for RootFactory<'_> {
         self.control.checkpoint(CompilePhase::LowerProgram, 0)?;
         Ok(RootScope {
             backing: Backing::new(self.window, 0)?,
+            window: self.window,
             control: self.control,
         })
     }

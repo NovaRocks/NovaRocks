@@ -24,7 +24,6 @@ use novarocks_sql::compiler::{
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, SemanticParameterRef,
-    SemanticParameterValue,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 /// Borrow the actual emitted aggregate's original logical request, including separator.
@@ -74,26 +73,14 @@ fn e08s1_environment_same_original_concat_source_and_parameters_pass_without_pre
         let scoped = original.snapshot_for_scalar_presence();
         let binding = original_concat_binding(&source, &c);
         let parameters = source.plan().parameters();
-        let refs = parameters
-            .entries()
-            .iter()
-            .filter(|(_, value)| {
-                matches!(
-                    value,
-                    SemanticParameterValue::GroupConcatLegacy(_)
-                        | SemanticParameterValue::GroupConcatMaxLen(_)
-                )
-            })
-            .map(|(id, value)| SemanticParameterRef {
-                id: *id,
-                expected_key: value.key(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(refs.len(), 2);
+        let unrelated = SemanticParameterRef {
+            id: novarocks_type_contract::SemanticParameterId::new(0),
+            expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+        };
         scoped
-            .admit_bound_environment_observed(&binding, &refs, parameters, &c)
+            .admit_bound_environment_observed(&binding, &[], parameters, &c)
             .unwrap();
-        for invalid in [Vec::new(), vec![refs[0]], vec![refs[0], refs[0]]] {
+        for invalid in [vec![unrelated], vec![unrelated, unrelated]] {
             assert!(
                 matches!(scoped.admit_bound_environment_observed(&binding,&invalid,parameters,&c),Err(FunctionBindingError::UnavailableImplementation(id)) if id==binding.selected.overload)
             );

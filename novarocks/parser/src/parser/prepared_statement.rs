@@ -69,10 +69,11 @@ impl Parser<'_> {
             )
         {
             self.bump();
-            let (statement_text, _) = self.parse_string()?;
+            let (statement_text, statement_text_span) = self.parse_string()?;
             let parameters = self.parse_execute_parameters()?;
             Ok(TrinoStatement::ExecuteImmediate(TrinoExecuteImmediate {
                 statement_text,
+                statement_text_span,
                 parameters,
                 span: self.span_since(start),
             }))

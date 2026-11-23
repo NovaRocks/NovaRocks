@@ -65,8 +65,7 @@ impl AnalyzerContext<'_> {
         })?;
         crate::sql_mode::validate_persisted_query_semantics_typed(&query, &self.sql_semantics)
             .map_err(|error| stored_body_error(view, error, span))?;
-        let query = crate::sql_mode::normalize_concat_query(query, &self.sql_semantics)
-            .and_then(super::query_prepass::preanalyze)
+        let query = super::query_prepass::preanalyze(query)
             .map_err(|error| stored_body_error(view, error, span))?;
         let catalog = SavedViewCatalog {
             inner: self.catalog,
@@ -78,6 +77,8 @@ impl AnalyzerContext<'_> {
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: None,
+            statement_relation: None,
+            prepared_parameters: None,
             table_sequence: self.table_sequence,
             catalog: &catalog,
             current_database: &view.default_database,
@@ -240,6 +241,7 @@ impl AnalyzerContext<'_> {
                     output_column_id: id,
                 });
                 output_columns.push(AnalyzedOutputField {
+                    aliased: false,
                     column_id: id,
                     name: field.name.clone(),
                     field_name: Some(declared.name.to_string()),
@@ -277,6 +279,10 @@ impl AnalyzerContext<'_> {
         let mut fields = resolved.output_columns.clone();
         if let Some(alias) = alias {
             crate::analysis::schema::apply_column_aliases(&mut fields, alias.columns, alias.span)?;
+        }
+        if self.factory.borrow().prepared_description.is_some() {
+            let ids: Vec<_> = fields.iter().map(|field| field.column_id).collect();
+            self.describe_table_origin(&ids, &view.identity);
         }
         let mut scope = self.new_scope();
         for field in &fields {
@@ -782,10 +788,7 @@ mod tests {
 
     #[test]
     fn stored_replay_keeps_the_existing_uncaptured_semantics_refusals() {
-        for (hint, feature) in [
-            ("sql_mode='GROUP_CONCAT_LEGACY'", "GROUP_CONCAT_LEGACY"),
-            ("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW"),
-        ] {
+        for (hint, feature) in [("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW")] {
             let catalog = catalog(declaration(
                 &format!("WITH SESSION {hint} SELECT 1 AS x"),
                 "x",

@@ -28,8 +28,9 @@ use crate::{
 use bytes::Bytes;
 use novarocks_query_application::{
     api::{ResultDelivery, StatementExternalEffectDisposition},
-    cancellation::QueryCancellationReason,
+    cancellation::{QueryCancellationReason, QueryCancellationView},
     protocol_delivery::QuerySessionOutput,
+    query_control::ClientQueryClaim,
     session::{
         QuerySession, QuerySessionFactory, StatementAdmission, StatementOutputShape,
         StatementSessionRequest,
@@ -46,6 +47,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 enum DriverFailure {
+    OriginalCancellation(QueryCancellationReason),
     Originating(TrinoQueryError),
     ProtocolCommand(Disposition),
 }
@@ -138,7 +140,8 @@ impl Drop for SessionClose {
 pub(crate) async fn run(
     entry: Arc<QueryEntry>,
     sessions: Arc<dyn QuerySessionFactory>,
-    request: crate::request::ParsedStatementRequest,
+    mut request: crate::request::ParsedStatementRequest,
+    claim: ClientQueryClaim,
 ) {
     let mut commands = entry.command.subscribe();
     let initial_command = *commands.borrow();
@@ -171,7 +174,8 @@ pub(crate) async fn run(
         }
     };
     let session_request =
-        StatementSessionRequest::new(entry.id.clone(), request.principal(), value);
+        StatementSessionRequest::new(entry.id.clone(), request.principal(), value)
+            .with_client_query_claim(claim);
     let mut admission = session_request.admission().subscribe();
     let mut session = match sessions.open_statement_session(session_request) {
         Ok(session) => SessionClose(Some(session)),
@@ -195,7 +199,11 @@ pub(crate) async fn run(
         return;
     }
     let executing_session = Arc::clone(session.0.as_ref().expect("original session"));
-    let execute = executing_session.execute_statement(request.sql());
+    // Session construction has consumed its use of the original headers and
+    // properties. Keep the same text backing only for execution diagnostics.
+    let text = request.into_original_text();
+    let sql = text.as_ref().map_or("", |text| text.as_str());
+    let execute = executing_session.execute_statement(sql);
     tokio::pin!(execute);
     let mut observing_admission = true;
     let statement = loop {
@@ -221,10 +229,7 @@ pub(crate) async fn run(
                 &entry,
                 failed(query_error_for_query(
                     entry.id.as_str(),
-                    TrinoErrorSource::Service {
-                        error: &error,
-                        sql: request.sql(),
-                    },
+                    TrinoErrorSource::Service { error: &error, sql },
                 )),
             );
             return;
@@ -279,6 +284,7 @@ pub(crate) async fn run(
     };
     let (mut owner, produced) = match output {
         QuerySessionOutput::StreamingQuery(mut result) => {
+            let original_stop = result.cancellation();
             let produced = async {
                 let schema = result.begin_schema().ok_or_else(|| internal(entry.id.as_str(), "stream has no original schema"))?;
                 tracing::info!(
@@ -292,13 +298,14 @@ pub(crate) async fn run(
                 loop {
                     if let Some(disposition) = *commands.borrow() { return Err(DriverFailure::ProtocolCommand(disposition)); }
                     let delivery = tokio::select! {
-                        delivery = result.next_delivery() => delivery.map_err(|error| query_error_for_query(entry.id.as_str(), TrinoErrorSource::Execution { error: &error, sql: request.sql() }))?,
+                        delivery = result.next_delivery() => delivery.map_err(|error| query_error_for_query(entry.id.as_str(), TrinoErrorSource::Execution { error: &error, sql }))?,
                         _ = commands.changed() => return Err(DriverFailure::ProtocolCommand((*commands.borrow()).unwrap_or(Disposition::Abandon))),
+                        reason = original_stop.cancelled() => return Err(DriverFailure::OriginalCancellation(reason)),
                     };
                     match delivery {
                         Some(ResultDelivery::Segment(segment)) => {
                             let rows = segment.client_rows().ok_or_else(|| internal(entry.id.as_str(), "stream is not a client-row carrier"))?;
-                            for span in rows.payload_spans() { append(&entry, span, &mut commands, external_effect).await?; }
+                            for span in rows.payload_spans() { append(&entry, span, &mut commands, &original_stop, external_effect).await?; }
                             segment.complete();
                         }
                         Some(ResultDelivery::End(end)) => {
@@ -322,7 +329,7 @@ pub(crate) async fn run(
         }
         QuerySessionOutput::GovernedQuery(result) => {
             let (local, owner) = result.into_parts();
-            let produced = produce_local(&entry, local, &owner, request.sql(), &mut commands).await;
+            let produced = produce_local(&entry, local, &owner, sql, &mut commands).await;
             (SettlementOwner::Governed(Box::new(owner)), produced)
         }
         QuerySessionOutput::GovernedCompletion(result) => {
@@ -343,7 +350,7 @@ pub(crate) async fn run(
                         .lock()
                         .expect("query pipeline")
                         .selected_count = completion.count();
-                    produce_local(&entry, local, &protocol, request.sql(), &mut commands).await
+                    produce_local(&entry, local, &protocol, sql, &mut commands).await
                 }
                 _ => Err(internal(
                     entry.id.as_str(),
@@ -359,10 +366,7 @@ pub(crate) async fn run(
                 SettlementOwner::Governed(Box::new(owner)),
                 Err(DriverFailure::Originating(query_error_for_query(
                     entry.id.as_str(),
-                    TrinoErrorSource::Service {
-                        error: &error,
-                        sql: request.sql(),
-                    },
+                    TrinoErrorSource::Service { error: &error, sql },
                 ))),
             )
         }
@@ -376,6 +380,12 @@ pub(crate) async fn run(
         ),
     };
     let pending = *commands.borrow();
+    let original_failure_disposition =
+        if matches!(&produced, Err(DriverFailure::OriginalCancellation(_))) {
+            Disposition::Cancelled
+        } else {
+            Disposition::Fail
+        };
     let produced = match produced {
         Err(DriverFailure::ProtocolCommand(disposition)) => {
             finish_command(
@@ -403,6 +413,10 @@ pub(crate) async fn run(
         }
         Ok(()) => Ok(()),
         Err(DriverFailure::Originating(error)) => Err(error),
+        Err(DriverFailure::OriginalCancellation(reason)) => Err(query_error_for_query(
+            entry.id.as_str(),
+            TrinoErrorSource::OriginalCancellation(reason),
+        )),
     };
     let produced = produced.and_then(|()| {
         let production = entry.production.lock().expect("query pipeline");
@@ -420,7 +434,7 @@ pub(crate) async fn run(
         }
     });
     let (error, disposition) = match produced {
-        Err(error) => (Some(error), Disposition::Fail),
+        Err(error) => (Some(error), original_failure_disposition),
         Ok(()) => match owner.seal() {
             GovernedStatementVisibilitySealOutcome::Sealed => (None, Disposition::Complete),
             GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
@@ -428,10 +442,7 @@ pub(crate) async fn run(
                 let error = match owner.cancellation_reason() {
                     Some(reason) => query_error_for_query(
                         entry.id.as_str(),
-                        TrinoErrorSource::Cancellation {
-                            reason: &reason,
-                            message: "Statement canceled before success visibility",
-                        },
+                        TrinoErrorSource::OriginalCancellation(reason),
                     ),
                     None => internal(
                         entry.id.as_str(),
@@ -535,6 +546,7 @@ async fn append(
     entry: &QueryEntry,
     span: BorrowedPayloadSpan<'_>,
     commands: &mut watch::Receiver<Option<Disposition>>,
+    original_stop: &QueryCancellationView,
     effect: Option<StatementExternalEffectDisposition>,
 ) -> Result<(), DriverFailure> {
     let internal = |id: &str, message: &str| internal_with_effect(id, message, effect);
@@ -544,6 +556,9 @@ async fn append(
     loop {
         if let Some(disposition) = *commands.borrow() {
             return Err(DriverFailure::ProtocolCommand(disposition));
+        }
+        if let Some(reason) = original_stop.reason() {
+            return Err(DriverFailure::OriginalCancellation(reason));
         }
         {
             let mut production = entry.production.lock().expect("query pipeline");
@@ -576,6 +591,7 @@ async fn append(
             _ = notified => {},
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}, // actual body aliases may exit after ACK
             _ = commands.changed() => {},
+            reason = original_stop.cancelled() => return Err(DriverFailure::OriginalCancellation(reason)),
         }
     }
 }
@@ -623,13 +639,7 @@ pub(crate) fn command_receipt(
                 };
                 (
                     disposition,
-                    query_error_for_query(
-                        query_id,
-                        TrinoErrorSource::Cancellation {
-                            reason: &reason,
-                            message: "Statement canceled by its original accepted cause",
-                        },
-                    ),
+                    query_error_for_query(query_id, TrinoErrorSource::OriginalCancellation(reason)),
                 )
             }
             None => (
@@ -712,6 +722,10 @@ async fn produce_local(
     sql: &str,
     commands: &mut watch::Receiver<Option<Disposition>>,
 ) -> Result<(), DriverFailure> {
+    let original_stop = owner.cancellation();
+    if let Some(reason) = original_stop.reason() {
+        return Err(DriverFailure::OriginalCancellation(reason));
+    }
     let effect = owner.external_effect_disposition();
     let internal = |id: &str, message: &str| internal_with_effect(id, message, effect);
     let mut cursor = local.into_cursor();
@@ -739,6 +753,9 @@ async fn produce_local(
         if let Some(disposition) = *commands.borrow() {
             return Err(DriverFailure::ProtocolCommand(disposition));
         }
+        if let Some(reason) = original_stop.reason() {
+            return Err(DriverFailure::OriginalCancellation(reason));
+        }
         let turn = cursor
             .step(&mut bytes)
             .map_err(|error| local_render_error(entry, sql, &error, effect))?;
@@ -747,7 +764,7 @@ async fn produce_local(
                 .validate_body(profile, &bytes[..turn.emitted_bytes])
                 .map_err(|_| internal(entry.id.as_str(), "local row framing is invalid"))?;
             for span in body.payload_spans() {
-                append(entry, span, commands, effect).await?;
+                append(entry, span, commands, &original_stop, effect).await?;
             }
             frontier = body.after();
         }

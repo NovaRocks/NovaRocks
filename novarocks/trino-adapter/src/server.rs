@@ -91,7 +91,12 @@ impl TrinoListener {
                 task_registry.observation.clone(),
             );
             tokio::pin!(serving);
+            // Expiry borrows the same FE-owned listener lifecycle. Either
+            // listener exit or shutdown drops this wake future before join.
+            let expiry = task_registry.expire_query_history();
+            tokio::pin!(expiry);
             tokio::select! {
+                _ = &mut expiry => unreachable!("query history wake is listener-scoped"),
                 result = &mut serving => { task_registry.finalize().await; result }
                 _ = async {
                     while !*receiver.borrow() {

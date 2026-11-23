@@ -52,23 +52,9 @@ pub(crate) async fn prepare_mutation_facts_async(
     connector_context: &ConnectorRequestContext,
     operation_id: ConnectorWriteOperationId,
 ) -> Result<PreparedMutationFacts, crate::dml::error::DmlExecutionError> {
-    let mutation = match statement {
-        OwnedMutationStatement::Update(_) => {
-            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Update
-        }
-        OwnedMutationStatement::Merge(_) => {
-            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge
-        }
-    };
-    let binding = load_row_mutation_target(target, planning_pin, connector_context).await?;
-    crate::mv::domain::iceberg_guard::reject_from_admitted_iceberg_table(
-        binding.planning_pin(),
-        state.mv_readiness().as_ref(),
-        target,
-        mutation,
-        binding.metadata(),
-        connector_context.clone(),
-    )?;
+    let binding =
+        load_authorized_mutation_target(state, statement, target, planning_pin, connector_context)
+            .await?;
     // The same pure signers own strategy, base, complete target types and
     // assignment/partition admission. No second preparation or lease is minted.
     match statement {
@@ -97,6 +83,33 @@ pub(crate) async fn prepare_mutation_facts_async(
         .map(Box::new)
         .map(PreparedMutationFacts::Merge),
     }
+}
+
+pub(super) async fn load_authorized_mutation_target(
+    state: &DmlExecutionKernel,
+    statement: &OwnedMutationStatement,
+    target: &Target,
+    planning_pin: ConnectorControlPlanningPin,
+    connector_context: &ConnectorRequestContext,
+) -> Result<crate::connector::write_target::ConnectorWriteTargetBinding, DmlError> {
+    let mutation = match statement {
+        OwnedMutationStatement::Update(_) => {
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Update
+        }
+        OwnedMutationStatement::Merge(_) => {
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge
+        }
+    };
+    let binding = load_row_mutation_target(target, planning_pin, connector_context).await?;
+    crate::mv::domain::iceberg_guard::reject_from_admitted_iceberg_table(
+        binding.planning_pin(),
+        state.mv_readiness().as_ref(),
+        target,
+        mutation,
+        binding.metadata(),
+        connector_context.clone(),
+    )?;
+    Ok(binding)
 }
 
 impl PreparedMutationFacts {
@@ -371,7 +384,7 @@ pub(crate) async fn compile_routed_mutation_write(
     .map_err(DmlError::from_compile)?;
     let mut preparation =
         novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
-            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+            execution.sql_statement_input(Box::new(query), false),
             novarocks_sql::compiler::SqlSessionContext {
                 sql_semantics: execution.sql_semantics().clone(),
                 // The old analyzer materializer supplied this effective catalog
@@ -529,22 +542,9 @@ fn mutation_write_assignments(
     Option<Arc<novarocks_sql::compiler::SqlWriteAssignments>>,
     novarocks_sql::compiler::SqlCompileError,
 > {
-    use novarocks_sql::compiler::{SqlCompileError, SqlWriteAssignmentSite, SqlWriteAssignments};
+    use novarocks_sql::compiler::SqlCompileError;
     use novarocks_type_contract::PureCompileControl;
-    let (columns, old_start, wildcard) = match kind {
-        DmlChangeStreamKind::Delete { .. } => return Ok(None),
-        DmlChangeStreamKind::Update { target_columns, .. } => (target_columns, 6, true),
-        DmlChangeStreamKind::Merge {
-            matched_update: false,
-            not_matched_insert: false,
-            ..
-        } => return Ok(None),
-        DmlChangeStreamKind::Merge { target_columns, .. } => (target_columns, 7, false),
-    };
     let invalid = |detail: &str| SqlCompileError::InvalidRequest(detail.into());
-    let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Err(invalid("generated mutation lost its exact SELECT source"));
-    };
     let declaration = |column: &novarocks_types::schema::ColumnDef| -> Result<_, SqlCompileError> {
         let mut declared = None;
         for route in routes {
@@ -573,15 +573,83 @@ fn mutation_write_assignments(
             invalid("mutation target is absent from its original routed write declarations")
         })
     };
+    bind_mutation_write_assignments(query, kind, control, false, declaration)
+}
+
+pub(crate) fn describe_mutation_write_assignments(
+    query: &ast::Query,
+    kind: &DmlChangeStreamKind,
+    signed: &novarocks_spi::connector::ConnectorMutationMatchContract,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<
+    Option<Arc<novarocks_sql::compiler::SqlWriteAssignments>>,
+    novarocks_sql::compiler::SqlCompileError,
+> {
+    use novarocks_sql::compiler::SqlCompileError;
+    use novarocks_type_contract::{CompilePhase, PureCompileControl};
+    bind_mutation_write_assignments(query, kind, control, true, |column| {
+        for field in signed.after_fields() {
+            control.checkpoint(CompilePhase::Validate, 1)?;
+            if field.field().name() == &column.name {
+                let input = field.execution_type().ok_or_else(|| {
+                    SqlCompileError::InvalidRequest(
+                        "Mutation target field has no signed write type".into(),
+                    )
+                })?;
+                return Ok((input.clone(), field.storage_type().cloned()));
+            }
+        }
+        Err(SqlCompileError::InvalidRequest(
+            "Mutation assignment has no signed target declaration".into(),
+        ))
+    })
+}
+
+fn bind_mutation_write_assignments(
+    query: &ast::Query,
+    kind: &DmlChangeStreamKind,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+    describe: bool,
+    mut declaration: impl FnMut(
+        &novarocks_types::schema::ColumnDef,
+    ) -> Result<
+        (
+            novarocks_type_contract::FunctionValueType,
+            Option<novarocks_type_contract::FunctionValueType>,
+        ),
+        novarocks_sql::compiler::SqlCompileError,
+    >,
+) -> Result<
+    Option<Arc<novarocks_sql::compiler::SqlWriteAssignments>>,
+    novarocks_sql::compiler::SqlCompileError,
+> {
+    use novarocks_sql::compiler::{SqlCompileError, SqlWriteAssignmentSite, SqlWriteAssignments};
+    use novarocks_type_contract::PureCompileControl;
+    let (columns, old_start, wildcard) = match kind {
+        DmlChangeStreamKind::Delete { .. } => return Ok(None),
+        DmlChangeStreamKind::Update { target_columns, .. } => (target_columns, 6, true),
+        DmlChangeStreamKind::Merge {
+            matched_update: false,
+            not_matched_insert: false,
+            ..
+        } => return Ok(None),
+        DmlChangeStreamKind::Merge { target_columns, .. } => (target_columns, 7, false),
+    };
+    let invalid = |detail: &str| SqlCompileError::InvalidRequest(detail.into());
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(invalid("generated mutation lost its exact SELECT source"));
+    };
     let mut sites = Vec::new();
-    for (ordinal, column) in columns.iter().enumerate() {
-        let (input, storage) = declaration(column)?;
-        sites.push(SqlWriteAssignmentSite::try_new(
-            old_start + ordinal,
-            input,
-            storage,
-            control,
-        )?);
+    if !describe {
+        for (ordinal, column) in columns.iter().enumerate() {
+            let (input, storage) = declaration(column)?;
+            sites.push(SqlWriteAssignmentSite::try_new(
+                old_start + ordinal,
+                input,
+                storage,
+                control,
+            )?);
+        }
     }
     let first_assignment = if wildcard {
         7
@@ -642,10 +710,13 @@ fn mutation_write_assignments(
                 .with_source_span(expr.span()),
         );
     }
-    Ok(Some(Arc::new(SqlWriteAssignments::try_new(
-        sites.into_boxed_slice(),
-        control,
-    )?)))
+    let assignments = SqlWriteAssignments::try_new(sites.into_boxed_slice(), control)?;
+    let assignments = if describe {
+        assignments.for_mutation_description()
+    } else {
+        assignments
+    };
+    Ok(Some(Arc::new(assignments)))
 }
 
 #[cfg(test)]

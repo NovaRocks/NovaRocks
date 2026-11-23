@@ -154,6 +154,32 @@ impl CatalogCompletionState {
         semantics: &crate::sql_mode::SqlSemanticSettings,
         qualifications: CatalogQualifications,
     ) -> Result<Self, SqlCompileError> {
+        Self::try_new_with_qualifications_and_statement_relation(
+            query,
+            additional_queries,
+            additional_relations,
+            current_catalog,
+            current_database,
+            lookup_mode,
+            first_need_ordinal,
+            semantics,
+            qualifications,
+            false,
+        )
+    }
+
+    pub(super) fn try_new_with_qualifications_and_statement_relation(
+        query: ast::Query,
+        additional_queries: &[ast::Query],
+        additional_relations: &[TableIdentity],
+        current_catalog: Option<&str>,
+        current_database: &str,
+        lookup_mode: TableLookupMode,
+        first_need_ordinal: u32,
+        semantics: &crate::sql_mode::SqlSemanticSettings,
+        qualifications: CatalogQualifications,
+        statement_relation: bool,
+    ) -> Result<Self, SqlCompileError> {
         let query = crate::analyzer::query_prepass::preanalyze_with_semantics(query, semantics)
             .map_err(SqlCompileError::Analyze)?;
         let current_catalog = current_catalog
@@ -171,6 +197,9 @@ impl CatalogCompletionState {
             first_need_ordinal,
         );
         collector.qualifications = Some(&qualifications);
+        if statement_relation {
+            collector.statement_relation = Some(super::statement_system_relation_site(&query)?);
+        }
         collector.collect_query(&query, &CteScope::default())?;
         for additional in additional_queries {
             // Optional definitions do not acquire the root query's session depth.
@@ -346,6 +375,7 @@ impl CatalogCompletionState {
                     &view.default_database,
                     control,
                     true,
+                    false,
                 )?;
                 if !qualifications
                     .entries()
@@ -507,6 +537,7 @@ struct CatalogNeedCollector<'a> {
     needs: Vec<CatalogRelationNeed>,
     qualification_requests: Option<BTreeSet<ConnectorInstanceId>>,
     qualifications: Option<&'a CatalogQualifications>,
+    statement_relation: Option<&'a ast::Table>,
 }
 
 impl<'a> CatalogNeedCollector<'a> {
@@ -528,6 +559,7 @@ impl<'a> CatalogNeedCollector<'a> {
             needs: Vec::new(),
             qualification_requests: None,
             qualifications: None,
+            statement_relation: None,
         }
     }
 
@@ -802,6 +834,12 @@ impl<'a> CatalogNeedCollector<'a> {
         node: &ast::Table,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
+        if self
+            .statement_relation
+            .is_some_and(|table| std::ptr::eq(table, node))
+        {
+            return Ok(());
+        }
         let name = &node.name;
         let version = node.query_period.as_ref();
         if node.branch.is_some() {
@@ -1098,7 +1136,30 @@ pub fn quoted_metadata_catalogs(
     current_database: &str,
     control: &super::SqlCompileControl,
 ) -> Result<Vec<ConnectorInstanceId>, SqlCompileError> {
-    quoted_metadata_catalogs_in_context(query, current_catalog, current_database, control, false)
+    quoted_metadata_catalogs_in_context(
+        query,
+        current_catalog,
+        current_database,
+        control,
+        false,
+        false,
+    )
+}
+
+pub(super) fn quoted_metadata_catalogs_with_statement_relation(
+    query: &ast::Query,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    control: &super::SqlCompileControl,
+) -> Result<Vec<ConnectorInstanceId>, SqlCompileError> {
+    quoted_metadata_catalogs_in_context(
+        query,
+        current_catalog,
+        current_database,
+        control,
+        false,
+        true,
+    )
 }
 
 pub fn quoted_metadata_catalogs_for_view(
@@ -1117,6 +1178,7 @@ pub fn quoted_metadata_catalogs_for_view(
         &definition.default_database,
         control,
         true,
+        false,
     )
 }
 
@@ -1126,6 +1188,7 @@ fn quoted_metadata_catalogs_in_context(
     current_database: &str,
     control: &super::SqlCompileControl,
     saved_definition: bool,
+    statement_relation: bool,
 ) -> Result<Vec<ConnectorInstanceId>, SqlCompileError> {
     let mut collector = CatalogNeedCollector::new(
         current_catalog,
@@ -1137,6 +1200,9 @@ fn quoted_metadata_catalogs_in_context(
     collector.defer_semantic_refusals = saved_definition;
     collector.exact_catalog = saved_definition;
     collector.qualification_requests = Some(BTreeSet::new());
+    if statement_relation {
+        collector.statement_relation = Some(super::statement_system_relation_site(query)?);
+    }
     match collector.collect_query(query, &CteScope::default()) {
         Ok(()) | Err(SqlCompileError::Analyze(_) | SqlCompileError::Compilation(_)) => {}
         Err(error) => return Err(error),

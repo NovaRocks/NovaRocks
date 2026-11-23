@@ -63,6 +63,7 @@ pub mod bit_array;
 pub mod bit_numeric;
 pub mod bitmap_value;
 pub mod builtin;
+pub use builtin::regexp_count::f10::{PreparedRegexp, RegexpArgument, RegexpBatch, RegexpRow};
 pub mod calendar_julian;
 pub mod calendar_numeric;
 mod call_contract;
@@ -479,6 +480,7 @@ pub enum FunctionResolutionError {
         candidates: usize,
     },
     BadSignature(String),
+    ResultType(novarocks_type_contract::ValueTypeError),
 }
 
 impl fmt::Display for FunctionResolutionError {
@@ -496,11 +498,19 @@ impl fmt::Display for FunctionResolutionError {
                 "could not choose among {candidates} applicable overloads"
             ),
             Self::BadSignature(message) => write!(formatter, "bad signature: {message}"),
+            Self::ResultType(cause) => cause.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for FunctionResolutionError {}
+impl std::error::Error for FunctionResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultType(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
 
 impl From<novarocks_type_contract::CompileControlError> for FunctionResolutionError {
     fn from(error: novarocks_type_contract::CompileControlError) -> Self {
@@ -2841,8 +2851,6 @@ pub use invocation_scope::{
     EvaluatedSourceLoan, InvocationInputDomainPolicy, ScalarInvocationScope,
     ScalarInvocationSource, ScopedScalarCallInput,
 };
-
-pub mod string_left_right_core;
 
 pub mod string_split_part_core;
 

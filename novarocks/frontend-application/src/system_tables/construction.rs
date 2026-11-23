@@ -25,7 +25,7 @@ use novarocks_sql::{compiler::SqlCompileControl, system_table::SystemTableDeclar
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError, CompilePhase};
 use novarocks_workload_control::{ResultPayloadBytes, ResultWindowAlias, WorkError, WorkScope};
-use std::{alloc::Layout, sync::Arc};
+use std::{alloc::Layout, fmt, sync::Arc};
 
 pub(crate) fn control_error(cause: CompileControlError) -> SystemTableError {
     let kind = match cause.failure_fact().class() {
@@ -38,7 +38,7 @@ pub(crate) fn control_error(cause: CompileControlError) -> SystemTableError {
     };
     ConnectorError::from_domain_static(kind, cause, "System table construction refused").into()
 }
-fn work_error(error: WorkError) -> SystemTableError {
+pub(super) fn work_error(error: WorkError) -> SystemTableError {
     control_error(CompileControlError::Source(
         novarocks_failure_contract::SharedFailureCause::new(error),
     ))
@@ -80,12 +80,13 @@ pub(super) fn validate_value(
     use arrow::datatypes::{DataType, TimeUnit};
     let valid = match value {
         SystemValueRef::Null => nullable,
-        SystemValueRef::Utf8(_) => *ty == DataType::Utf8,
+        SystemValueRef::Utf8(_) | SystemValueRef::FormattedText(_) => *ty == DataType::Utf8,
         SystemValueRef::Int64(_) => *ty == DataType::Int64,
         SystemValueRef::Boolean(_) => *ty == DataType::Boolean,
         SystemValueRef::TimestampMillis(_) => {
             matches!(ty, DataType::Timestamp(TimeUnit::Millisecond, _))
         }
+        SystemValueRef::ZonedTimestamp(_) => *ty == DataType::FixedSizeBinary(14),
         SystemValueRef::Utf8List(_) => {
             matches!(ty, DataType::List(child) if *child.data_type() == DataType::Utf8 && !child.is_nullable())
         }
@@ -101,6 +102,10 @@ pub(super) fn validate_value(
 fn value_extent(value: SystemValueRef<'_>) -> Result<(usize, usize, usize), SystemTableError> {
     match value {
         SystemValueRef::Utf8(value) => Ok((value.len(), 0, value.len())),
+        SystemValueRef::FormattedText(value) => {
+            let len = formatted_extent(value)?;
+            Ok((len, 0, len))
+        }
         SystemValueRef::Utf8List(values) => {
             let payload = values
                 .iter()
@@ -114,6 +119,59 @@ fn value_extent(value: SystemValueRef<'_>) -> Result<(usize, usize, usize), Syst
         _ => Ok((0, 0, 0)),
     }
 }
+struct TextExtent(Option<usize>);
+
+impl fmt::Write for TextExtent {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.and_then(|len| len.checked_add(text.len()));
+        self.0.ok_or(fmt::Error).map(|_| ())
+    }
+}
+
+fn formatted_extent(value: &dyn fmt::Display) -> Result<usize, SystemTableError> {
+    let mut extent = TextExtent(Some(0));
+    let result = fmt::write(&mut extent, format_args!("{value}"));
+    let len = extent.0.ok_or_else(overflow)?;
+    result.map_err(|_| metadata_format_error())?;
+    Ok(len)
+}
+
+fn metadata_format_error() -> SystemTableError {
+    SystemTableError::Internal("system-table metadata value has no valid rendering".into())
+}
+
+struct ExactTextWriter<'a> {
+    output: &'a mut String,
+    limit: usize,
+}
+
+impl fmt::Write for ExactTextWriter<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if text.len() > self.limit - self.output.len() {
+            return Err(fmt::Error);
+        }
+        self.output.push_str(text);
+        Ok(())
+    }
+}
+
+fn copy_formatted(value: &dyn fmt::Display) -> Result<String, SystemTableError> {
+    let extent = formatted_extent(value)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(extent)
+        .map_err(|_| control_error(CompileControlError::ResourceExhausted))?;
+    let mut writer = ExactTextWriter {
+        output: &mut output,
+        limit: extent,
+    };
+    fmt::write(&mut writer, format_args!("{value}")).map_err(|_| metadata_format_error())?;
+    if output.len() != extent {
+        return Err(metadata_format_error());
+    }
+    Ok(output)
+}
+
 fn copy_text(value: &str) -> Result<String, SystemTableError> {
     let mut owned = String::new();
     owned
@@ -126,9 +184,11 @@ pub(super) fn copy_value(value: SystemValueRef<'_>) -> Result<SystemValue, Syste
     Ok(match value {
         SystemValueRef::Null => SystemValue::Null,
         SystemValueRef::Utf8(value) => SystemValue::Utf8(copy_text(value)?),
+        SystemValueRef::FormattedText(value) => SystemValue::Utf8(copy_formatted(value)?),
         SystemValueRef::Int64(value) => SystemValue::Int64(value),
         SystemValueRef::Boolean(value) => SystemValue::Boolean(value),
         SystemValueRef::TimestampMillis(value) => SystemValue::TimestampMillis(value),
+        SystemValueRef::ZonedTimestamp(value) => SystemValue::ZonedTimestamp(value),
         SystemValueRef::Utf8List(values) => {
             let mut copied = Vec::new();
             copied
@@ -257,7 +317,17 @@ impl SystemTableCpuStaging {
         } else {
             0
         };
-        reserve(&mut self.input_bytes, extent_add(row_bytes, top_bytes)?)?;
+        let requested = extent_add(row_bytes, top_bytes)?;
+        reserve(&mut self.input_bytes, requested).inspect_err(|_| {
+            tracing::debug!(
+                schema = %self.declaration.schema,
+                table = %self.declaration.table,
+                requested_bytes = requested,
+                retained_bytes = self.window.retained_payload_bytes(),
+                capacity_bytes = self.window.payload_capacity_bytes(),
+                "System-table row staging refused by the original window"
+            );
+        })?;
         if grow {
             self.rows
                 .try_reserve_exact(next_capacity - self.rows.len())
@@ -273,8 +343,8 @@ impl SystemTableCpuStaging {
         for &ordinal in &self.required_columns {
             row.push(copy_value(values[ordinal])?);
         }
-        for (column, &ordinal) in self.required_columns.iter().enumerate() {
-            let (payload, items, _) = value_extent(values[ordinal])?;
+        for (column, value) in row.iter().enumerate() {
+            let (payload, items, _) = value_extent(value.as_ref())?;
             self.column_bytes[column].0 += payload;
             self.column_bytes[column].1 += items;
         }
@@ -313,6 +383,17 @@ impl SystemTableCpuStaging {
                     creation,
                     &self.control,
                 )
+                .inspect_err(|_| {
+                    tracing::debug!(
+                        schema = %self.declaration.schema,
+                        table = %self.declaration.table,
+                        rows = self.rows.len(),
+                        staged_row_bytes = self.live_row_bytes,
+                        retained_bytes = self.window.retained_payload_bytes(),
+                        capacity_bytes = self.window.payload_capacity_bytes(),
+                        "System-table Arrow batch construction refused"
+                    );
+                })
                 .map(|batch| MaterializedSystemTableBatch {
                     batch,
                     storage: creation.storage_lifetime(),
@@ -320,6 +401,15 @@ impl SystemTableCpuStaging {
             },
         )
         .map_err(control_error)??;
+        tracing::debug!(
+            schema = %self.declaration.schema,
+            table = %self.declaration.table,
+            rows = self.rows.len(),
+            staged_row_bytes = self.live_row_bytes,
+            retained_bytes = self.window.retained_payload_bytes(),
+            capacity_bytes = self.window.payload_capacity_bytes(),
+            "System-table batch and staged rows coexist in the original window"
+        );
         self.batches.push(batch);
         self.rows.clear();
         release(&mut self.input_bytes, self.live_row_bytes);

@@ -437,6 +437,7 @@ fn definition(
     }
     let mut overloads = Vec::new();
     let mut implementations = Vec::new();
+    let mut display = Vec::new();
     for &syntax in operations {
         let overload = FunctionOverloadId::try_new(syntax.identity()).map_err(invalid_catalog)?;
         overloads.push(FunctionOverloadDeclaration::from_effects(
@@ -450,6 +451,23 @@ fn definition(
             None,
             syntax.effects(),
         ));
+        if public {
+            let arguments = match syntax {
+                TemporalSyntax::AtTimezoneInterval => {
+                    "timestamp(p) with time zone, interval day to second".to_owned()
+                }
+                TemporalSyntax::Now | TemporalSyntax::QuotedCurrentDate => String::new(),
+                _ => syntax.argument_pattern().replace(',', ", "),
+            };
+            display.push((
+                overload.clone(),
+                vec![crate::FunctionPublicSignature::new(
+                    arguments,
+                    syntax.public_result_pattern(),
+                    "",
+                )],
+            ));
+        }
         implementations.push(PureImplementationDeclaration {
             overload,
             implementation: PureImplementationId::try_new(syntax.identity())?,
@@ -462,6 +480,13 @@ fn definition(
         overloads,
     )
     .map_err(invalid_catalog)?;
+    let declaration = if public {
+        declaration
+            .with_public_signatures(display)
+            .map_err(super::catalogue::public_signature_error)?
+    } else {
+        declaration
+    };
     FunctionDefinition::try_new_pure_scalar(
         name,
         if public {

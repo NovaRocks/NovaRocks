@@ -43,7 +43,6 @@ use crate::{
 pub(super) enum Operation {
     AssertTrue,
     Uuid,
-    FromBinary,
     Bar,
     Bucket,
     Vector(super::vector_distance_owner::Operation),
@@ -53,9 +52,8 @@ pub(super) fn operation(name: &str) -> Option<Operation> {
     Some(match name {
         "assert_true" => Operation::AssertTrue,
         "uuid" => Operation::Uuid,
-        "from_binary" => Operation::FromBinary,
         "bar" => Operation::Bar,
-        "equiwidth_bucket" => Operation::Bucket,
+        "width_bucket" => Operation::Bucket,
         name => Operation::Vector(super::vector_distance_owner::operation(name)?),
     })
 }
@@ -69,7 +67,7 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
             FunctionVolatility::Immutable
         },
         own_row_error: match operation {
-            Operation::AssertTrue | Operation::Bar | Operation::Bucket | Operation::Vector(_) => {
+            Operation::AssertTrue | Operation::Bucket | Operation::Vector(_) => {
                 FunctionIntrinsicRowError::MayRaise
             }
             _ => FunctionIntrinsicRowError::NoRowError,
@@ -279,7 +277,7 @@ impl PureScalarImplementation for ScalarRowsOwner {
 
 #[derive(Debug)]
 struct PreparedScalarRows {
-    recipe: Recipe,
+    operation: Operation,
     contract: Arc<ScalarCallContract>,
 }
 impl PreparedScalarKernel for PreparedScalarRows {
@@ -288,46 +286,36 @@ impl PreparedScalarKernel for PreparedScalarRows {
     }
 
     fn instance_retained_upper_bound(&self) -> usize {
-        match self.recipe {
-            Recipe::Operation(Operation::Uuid) => {
-                std::mem::size_of::<super::uuid_owner::Instance>()
-            }
+        match self.operation {
+            Operation::Uuid => std::mem::size_of::<super::uuid_owner::Instance>(),
             _ => std::mem::size_of::<ScalarRowsInstance>(),
         }
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        if matches!(self.recipe, Recipe::Operation(Operation::Uuid)) {
+        if self.operation == Operation::Uuid {
             return Ok(Box::new(super::uuid_owner::Instance::default()));
         }
-        Ok(Box::new(ScalarRowsInstance(self.recipe)))
+        Ok(Box::new(ScalarRowsInstance(self.operation)))
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Recipe {
-    Operation(Operation),
-    Histogram(super::synopse_owner::Recipe),
-}
-
-struct ScalarRowsInstance(Recipe);
+struct ScalarRowsInstance(Operation);
 impl ScalarKernelInstance for ScalarRowsInstance {
     fn evaluate<'a>(
         &mut self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        use super::{assert_true_owner, from_binary_owner, vector_distance_owner};
+        use super::{assert_true_owner, synopse_owner::TrinoSynopse, vector_distance_owner};
         match self.0 {
-            Recipe::Operation(Operation::AssertTrue) => assert_true_owner::evaluate(input, control),
-            Recipe::Operation(Operation::FromBinary) => from_binary_owner::evaluate(input, control),
-            Recipe::Operation(Operation::Vector(operation)) => {
+            Operation::AssertTrue => assert_true_owner::evaluate(input, control),
+            Operation::Vector(operation) => {
                 vector_distance_owner::evaluate(operation, input, control)
             }
-            Recipe::Histogram(recipe) => recipe.evaluate(input, control),
-            Recipe::Operation(Operation::Uuid | Operation::Bar | Operation::Bucket) => {
-                Err(invalid("scalar row recipe does not match its instance"))
-            }
+            Operation::Bar => TrinoSynopse::Bar.evaluate(input, control),
+            Operation::Bucket => TrinoSynopse::WidthBucket.evaluate(input, control),
+            Operation::Uuid => Err(invalid("scalar row operation does not match its instance")),
         }
     }
 
@@ -407,7 +395,7 @@ impl ScalarRowsOwner {
             })?;
             let result_type = match self.operation {
                 Operation::AssertTrue => DataType::Boolean,
-                Operation::Uuid | Operation::FromBinary | Operation::Bar => DataType::Utf8,
+                Operation::Uuid | Operation::Bar => DataType::Utf8,
                 Operation::Bucket => DataType::Int64,
                 Operation::Vector(_) => DataType::Float64,
             };
@@ -419,21 +407,10 @@ impl ScalarRowsOwner {
                     "scalar row result differs from its selected carrier",
                 ));
             }
-            let recipe = match self.operation {
-                Operation::Bar | Operation::Bucket => Recipe::Histogram(
-                    super::synopse_owner::Recipe::bind(
-                        self.operation == Operation::Bar,
-                        input.request,
-                        &mut work,
-                    )
-                    .map_err(|error| match error {
-                        FunctionBindingError::Control(error) => compile_failure(error),
-                        _ => invalid("histogram constants differ from the selected call"),
-                    })?,
-                ),
-                operation => Recipe::Operation(operation),
-            };
-            Ok(Arc::new(PreparedScalarRows { contract, recipe }) as Arc<dyn PreparedScalarKernel>)
+            Ok(Arc::new(PreparedScalarRows {
+                contract,
+                operation: self.operation,
+            }) as Arc<dyn PreparedScalarKernel>)
         })();
         if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;

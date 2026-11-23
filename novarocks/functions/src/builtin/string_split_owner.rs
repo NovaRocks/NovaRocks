@@ -55,6 +55,12 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
+pub(super) fn trino_effects() -> FunctionEffectDeclaration {
+    let mut result = effects();
+    result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    result
+}
+
 pub(super) fn definition(
     name: &str,
     declaration: FunctionBindingDeclaration,
@@ -70,6 +76,7 @@ pub(super) fn definition(
 }
 
 struct StringSplitOwner {
+    trino: bool,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -87,10 +94,16 @@ impl StringSplitOwner {
             });
         }
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let trino = trino_effects();
+        let uses_trino = declaration
+            .overloads()
+            .first()
+            .and_then(|overload| overload.effects.as_ref())
+            == Some(&trino);
+        let expected = if uses_trino { trino } else { effects() };
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
+            || declaration.overloads().len() != if uses_trino { 2 } else { 1 }
             || declaration.overloads().iter().any(|overload| {
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
@@ -112,6 +125,7 @@ impl StringSplitOwner {
             })
             .collect();
         Ok(Self {
+            trino: uses_trino,
             resolver: Arc::new(resolver),
             declaration,
             implementations,
@@ -119,7 +133,11 @@ impl StringSplitOwner {
     }
 
     fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+        let base = if self.trino {
+            trino_effects()
+        } else {
+            effects()
+        };
         CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,

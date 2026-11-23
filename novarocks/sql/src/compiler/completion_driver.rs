@@ -171,6 +171,7 @@ impl SqlFinalPlanCompileRequest {
         validate_dop_domain(dop_domain)?;
         let display_intent = display_intent(&intent);
         let root_session_admitted = statement.root_session_admitted();
+        control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisStarted);
         let query = super::parse_query(&statement)?;
         let query_semantics;
         let effective = if root_session_admitted {
@@ -180,12 +181,18 @@ impl SqlFinalPlanCompileRequest {
                 .map_err(SqlCompileError::from)?;
             &query_semantics
         };
-        let query = crate::sql_mode::normalize_concat_query_with_semantics(query, effective);
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
         // Retain the producer's actual checked constants across discovery and
-        // catalog rounds. The loan is rebuilt against this normalized query;
+        // catalog rounds. The loan is rebuilt against the admitted query;
         // syntax transformations must validate the original structural sites.
+        let statement_relation = match &statement.kind {
+            super::SqlStatementInputKind::StatementSystemRelationQuery { source, .. } => {
+                Some(source.clone())
+            }
+            _ => None,
+        };
+        let prepared_parameters = statement.prepared_parameters;
         let materialized_source = match statement.kind {
             super::SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
                 source.loan(&query, &control)?;
@@ -205,7 +212,9 @@ impl SqlFinalPlanCompileRequest {
             dop_domain,
             display_intent,
             materialized_source,
+            prepared_parameters,
             root_session_admitted,
+            statement_relation,
             catalog_qualifications,
         };
 
@@ -214,17 +223,19 @@ impl SqlFinalPlanCompileRequest {
         // catalog needs so an unrelated candidate cannot fail the base query.
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
-        let initial_catalog = CatalogCompletionState::try_new_with_qualifications(
-            query.clone(),
-            &[],
-            &[],
-            common.session.current_catalog.as_deref(),
-            &common.session.current_database,
-            TableLookupMode::SchemaOnly,
-            if mv_enabled { 1 } else { 0 },
-            &common.session.sql_semantics,
-            common.catalog_qualifications.clone(),
-        )?;
+        let initial_catalog =
+            CatalogCompletionState::try_new_with_qualifications_and_statement_relation(
+                query.clone(),
+                &[],
+                &[],
+                common.session.current_catalog.as_deref(),
+                &common.session.current_database,
+                TableLookupMode::SchemaOnly,
+                if mv_enabled { 1 } else { 0 },
+                &common.session.sql_semantics,
+                common.catalog_qualifications.clone(),
+                common.statement_relation.is_some(),
+            )?;
         let mut seen_relations = HashSet::new();
         let referenced_relations = initial_catalog
             .needs()
@@ -307,6 +318,8 @@ struct FinalPlanCommon {
     // Both variants hold Arc-backed constant collections. Cloning this source
     // for analysis preserves original pool/ordinal facts, not AST pointers.
     materialized_source: Option<super::materialized_values::MaterializedValues>,
+    statement_relation: Option<super::StatementSystemRelationSource>,
+    prepared_parameters: Option<Arc<super::SqlPreparedParameters>>,
     root_session_admitted: bool,
     catalog_qualifications: super::CatalogQualifications,
 }
@@ -485,7 +498,7 @@ pub(super) fn resume_materialized_view(
         .collect::<Vec<_>>();
     let mv_definitions = MvRewriteDefinitionIndex::try_new(definitions)
         .map_err(|error| SqlCompileError::Compilation(format!("MV completion facts: {error}")))?;
-    let catalog = CatalogCompletionState::try_new_with_qualifications(
+    let catalog = CatalogCompletionState::try_new_with_qualifications_and_statement_relation(
         *state.query,
         &[],
         &additional_relations,
@@ -495,6 +508,7 @@ pub(super) fn resume_materialized_view(
         1,
         &state.common.session.sql_semantics,
         state.common.catalog_qualifications.clone(),
+        state.common.statement_relation.is_some(),
     )?;
     catalog_or_analyze_step(state.common, catalog, Some(mv_definitions), control)
 }
@@ -617,8 +631,15 @@ fn analyze_with_catalog(
 ) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
     let catalog = SqlPlannerTableSnapshot::new(catalog);
     let query = Box::new(query);
-    let statement = match &common.materialized_source {
-        Some(source) => {
+    let mut statement = match (&common.statement_relation, &common.materialized_source) {
+        (Some(source), _) => SqlStatementInput {
+            kind: super::SqlStatementInputKind::StatementSystemRelationQuery {
+                query,
+                source: source.clone(),
+            },
+            prepared_parameters: None,
+        },
+        (None, Some(source)) => {
             // Resolve a fresh loan only over the actual query entering this
             // analysis round, under the original request control. No pointer
             // map or inferred literal is carried through AST cloning.
@@ -628,13 +649,15 @@ fn analyze_with_catalog(
                     query,
                     source: source.clone(),
                 },
+                prepared_parameters: None,
             }
         }
-        None if common.root_session_admitted => {
+        (None, None) if common.root_session_admitted => {
             SqlStatementInput::query_with_admitted_session(query)
         }
-        None => SqlStatementInput::parsed_query(query),
+        (None, None) => SqlStatementInput::parsed_query(query),
     };
+    statement.prepared_parameters = common.prepared_parameters.clone();
     let mut request = SqlAnalyzeRequest::new(
         statement,
         common.intent.clone(),
@@ -648,7 +671,11 @@ fn analyze_with_catalog(
         control.clone(),
     );
     request.table_sequence = table_sequence;
-    match SqlCompiler::analyze_with_table_sequence(request)? {
+    let analyzed = SqlCompiler::analyze_with_table_sequence(request);
+    if !matches!(analyzed, Ok(None)) {
+        control.observe_final_plan(super::SqlFinalPlanEvent::AnalysisFinished);
+    }
+    match analyzed? {
         None => Ok(None),
         Some(SqlAnalyzeOutput::Pending(analyzed)) => Ok(Some(analyzed)),
         Some(SqlAnalyzeOutput::Complete(_)) => Err(SqlCompileError::InvalidRequest(
@@ -663,6 +690,7 @@ fn statistics_or_optimize_step(
     first_need_ordinal: u32,
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
+    control.observe_final_plan(super::SqlFinalPlanEvent::PlanningStarted);
     let (needs, next_need_ordinal) = collect_statistics_needs(&analyzed, first_need_ordinal)?;
     if needs.is_empty() {
         return optimize_and_prepare_provider(
@@ -1006,6 +1034,7 @@ fn provider_or_ready_step(
         )
         .map_err(SqlCompileError::from)?;
     query_statistics.annotate_final_plan(&mut draft);
+    control.observe_final_plan(super::SqlFinalPlanEvent::PlanningFinished);
     Ok(CompilerStep::ready(
         common.version,
         draft,
@@ -1221,7 +1250,7 @@ impl ProviderColumnProjectionError {
     }
 }
 
-type ProviderColumnProjection = (
+pub(super) type ProviderColumnProjection = (
     Box<[ProviderReadColumnNeed]>,
     BTreeMap<crate::column_id::ColumnId, ProviderPredicateColumn>,
 );
@@ -1241,7 +1270,7 @@ fn preflight_provider_value_type(
     })
 }
 
-fn provider_columns(
+pub(super) fn provider_columns(
     output_columns: &[crate::analysis::OutputColumn],
     scan: &crate::planner::payload::PlanScanNode,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
@@ -1428,6 +1457,7 @@ pub(super) fn resume_provider_read(
         )
         .map_err(SqlCompileError::from)?;
     state.query_statistics.annotate_final_plan(&mut draft);
+    control.observe_final_plan(super::SqlFinalPlanEvent::PlanningFinished);
     Ok(CompilerStep::ready(
         state.common.version,
         draft,
@@ -1513,6 +1543,39 @@ mod tests {
             },
             DEFAULT_COMPLETION_LIMITS,
         )
+    }
+
+    #[test]
+    fn query_observation_timing_reports_only_stages_the_original_compiler_enters() {
+        use super::super::SqlFinalPlanEvent::*;
+        use std::sync::Mutex;
+
+        for (sql, expected) in [
+            (
+                "SELECT 1",
+                &[
+                    AnalysisStarted,
+                    AnalysisFinished,
+                    PlanningStarted,
+                    PlanningFinished,
+                ][..],
+            ),
+            (
+                "SELECT unbound_column",
+                &[AnalysisStarted, AnalysisFinished][..],
+            ),
+        ] {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let events = Arc::clone(&observed);
+            let control =
+                SqlCompileControl::unbounded().with_final_plan_observer(Arc::new(move |event| {
+                    events.lock().unwrap().push(event);
+                }));
+            let result = request_with_control(sql, SqlCompileIntent::Query, false, control)
+                .try_into_completion();
+            assert_eq!(result.is_ok(), expected.len() == 4, "{sql}");
+            assert_eq!(observed.lock().unwrap().as_slice(), expected, "{sql}");
+        }
     }
 
     #[test]
@@ -2067,18 +2130,48 @@ mod tests {
     }
 
     fn catalog_facts(compilation: &SqlCompilation) -> SqlFactBatch {
+        catalog_facts_with(compilation, resolved_table)
+    }
+
+    fn catalog_facts_with(
+        compilation: &SqlCompilation,
+        resolve: fn(&CatalogRelationNeed) -> ResolvedAnalyzerTable,
+    ) -> SqlFactBatch {
         let needs = match compilation.needs() {
-            SqlNeedBatch::CatalogRelations(needs) => needs.to_vec(),
+            SqlNeedBatch::CatalogRelations(needs) => needs,
             other => panic!("expected catalog needs, got {other:?}"),
         };
         let facts = needs
             .iter()
-            .map(|need| {
-                CatalogRelationFact::resolved(need, resolved_table(need))
-                    .expect("resolved catalog fact")
-            })
+            .map(|need| CatalogRelationFact::resolved(need, resolve(need)).expect("catalog fact"))
             .collect::<Vec<_>>();
         SqlFactBatch::CatalogRelations(facts.into_boxed_slice())
+    }
+
+    pub(crate) fn complete_with_catalog_for_test(
+        request: SqlFinalPlanCompileRequest,
+        resolve: fn(&CatalogRelationNeed) -> ResolvedAnalyzerTable,
+        sql: &str,
+    ) -> super::super::SqlCompletedPlan {
+        let control = SqlCompileControl::unbounded();
+        let progress = SqlCompiler::start(request.try_into_completion().unwrap(), &control)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let compilation = incomplete(progress);
+        let facts = catalog_facts_with(&compilation, resolve);
+        let mut progress = SqlCompiler::finish(compilation, facts, &control)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        loop {
+            match progress {
+                SqlCompileProgress::Complete(completed) => return completed,
+                SqlCompileProgress::Incomplete(compilation) => {
+                    progress = match compilation.needs() {
+                        SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
+                        SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
+                        other => panic!("unexpected observation for {sql}: {other:?}"),
+                    };
+                }
+            }
+        }
     }
 
     pub(super) fn answer_catalog(compilation: SqlCompilation) -> SqlCompileProgress {
@@ -2641,18 +2734,18 @@ mod tests {
     fn unsupported_caller_never_discovers_optional_mv_definitions() {
         use crate::sql_mode::SqlMode;
         for (sql, connection_mode) in [
-            ("SELECT order_key FROM orders", "GROUP_CONCAT_LEGACY"),
+            ("SELECT order_key FROM orders", "ERROR_IF_OVERFLOW"),
             (
-                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
                 "32",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM (SELECT order_key FROM orders) d",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
@@ -2685,7 +2778,7 @@ mod tests {
         for (sql, connection_mode) in [
             (
                 "WITH SESSION sql_mode = 32 SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
@@ -2745,7 +2838,7 @@ mod tests {
             table: "orders".to_string(),
         };
         let query = novarocks_parser::parser::parse_query(
-            "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
         )
         .unwrap();
         let definition = SqlMvRewriteDefinitionFacts::try_new(
@@ -3276,12 +3369,6 @@ mod tests {
                 .disabled_rules
                 .push("PushDownTopNToPreAgg".into());
         }
-        // Original compressed_key query 132 admits this value before 137.
-        input.session.sql_semantics = input
-            .session
-            .sql_semantics
-            .clone()
-            .with_group_concat_max_len(65_535);
         input.dop_domain = PipelineDopDomain {
             min: 2,
             max: 2,
@@ -3538,8 +3625,8 @@ mod tests {
                 "SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100",
             ),
             (
-                "original-137",
-                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result",
+                "ordered-listagg",
+                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, LOWER(TO_HEX(MD5(TO_UTF8(LISTAGG(CAST(c1 AS VARCHAR), ':') WITHIN GROUP (ORDER BY c1, c2, c3))))) AS result_hash FROM result",
             ),
         ];
         let mut failures = Vec::new();
@@ -3547,8 +3634,10 @@ mod tests {
             match grouped_state_topn_sequence_fixture(sql) {
                 Ok(SqlCompileProgress::Complete(completed)) => {
                     let owner = completed.into_plan();
-                    {
+                    if label == "inner" {
                         assert_grouped_state_topn_sources(&owner);
+                    } else {
+                        assert_complete_group_topn_sources(&owner);
                     }
                 }
                 Ok(SqlCompileProgress::Incomplete(_)) => {
@@ -4272,6 +4361,9 @@ mod tests {
         assert!(completed.scalar_schema().is_err());
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::complete_with_catalog_for_test;
 
 #[cfg(test)]
 pub(crate) fn compile_authored_aggregate_for_test(sql: &str) -> super::SqlAuthoredPhysicalPlan {

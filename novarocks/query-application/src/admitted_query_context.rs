@@ -711,6 +711,7 @@ impl QueryResultCapacityBinding {
 #[derive(Clone)]
 pub struct QueryExecutionContext {
     session_properties: Arc<crate::sql::session::registry::SessionPropertyInputs>,
+    prepared_parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
     #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
@@ -767,6 +768,7 @@ impl QueryExecutionContext {
             test_statement_nomination: None,
             result_capacity: None,
             session_properties: Arc::default(),
+            prepared_parameters: None,
             role,
             topology,
             deadline,
@@ -849,12 +851,59 @@ impl QueryExecutionContext {
         Ok(execution)
     }
 
+    pub fn prepared_parameters(
+        &self,
+    ) -> Option<&Arc<novarocks_sql::compiler::SqlPreparedParameters>> {
+        self.prepared_parameters.as_ref()
+    }
+
+    pub fn sql_statement_input(
+        &self,
+        query: Box<novarocks_parser::ast::Query>,
+        session_admitted: bool,
+    ) -> novarocks_sql::compiler::SqlStatementInput {
+        use novarocks_sql::compiler::SqlStatementInput;
+        let statement = if session_admitted {
+            SqlStatementInput::query_with_admitted_session(query)
+        } else {
+            SqlStatementInput::parsed_query(query)
+        };
+        match self.prepared_parameters() {
+            Some(parameters) => statement.with_prepared_parameters(parameters.clone()),
+            None => statement,
+        }
+    }
+
     pub fn result_capacity(&self) -> Option<&QueryResultCapacityBinding> {
         self.result_capacity.as_ref()
     }
 
     pub const fn role(&self) -> ClusterRole {
         self.role
+    }
+
+    /// Select the first eligible compute topology after an FE-only
+    /// predicate decision, preserving the original statement's capacity.
+    pub fn with_first_compute_topology(
+        mut self,
+        topology: BackendTopologySnapshot,
+    ) -> Result<Self, WorkError> {
+        if !self.topology.targets().is_empty() || topology.targets().is_empty() {
+            return Err(WorkError::Conflict);
+        }
+        if let Some(capacity) = &self.result_capacity {
+            capacity.scope().check()?;
+        }
+        if self
+            .optimizer_settings
+            .cbo_broadcast_backend_count
+            .is_none()
+            && self.optimizer_settings.effective_backend_count.is_none()
+        {
+            self.optimizer_settings.effective_backend_count = Some(topology.targets().len() as f64);
+        }
+        self.topology = topology;
+        Ok(self)
     }
 
     pub fn topology(&self) -> &BackendTopologySnapshot {
@@ -961,6 +1010,14 @@ impl RequestContext {
     ) -> Result<Self, WorkError> {
         self.execution = self.execution.with_result_capacity(binding)?;
         Ok(self)
+    }
+
+    pub fn with_prepared_parameters(
+        mut self,
+        parameters: Option<Arc<novarocks_sql::compiler::SqlPreparedParameters>>,
+    ) -> Self {
+        self.execution.prepared_parameters = parameters;
+        self
     }
 
     pub fn session(&self) -> &RequestSessionContext {
@@ -1318,6 +1375,62 @@ mod tests {
         assert!(context.execution().topology().targets().is_empty());
     }
 
+    #[test]
+    fn delete_first_compute_topology_keeps_the_original_capacity() {
+        use novarocks_workload_control::{WorkClass, WorkRequest};
+
+        let (control, _) = capacity_control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let binding =
+            QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias())
+                .unwrap();
+        let initial = QueryExecutionContext::new(
+            ClusterRole::Fe,
+            topology(7, 0),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .with_result_capacity(binding)
+        .unwrap();
+        let admitted = initial
+            .clone()
+            .with_first_compute_topology(topology(8, 3))
+            .unwrap();
+        assert_eq!(admitted.topology().targets().len(), 3);
+        assert_eq!(
+            admitted.optimizer_settings().effective_backend_count,
+            Some(3.0)
+        );
+        assert!(
+            admitted
+                .result_capacity()
+                .unwrap()
+                .window_alias()
+                .is_for_scope(&root.owner.scope())
+        );
+        assert!(Arc::ptr_eq(
+            initial.session_property_inputs(),
+            admitted.session_property_inputs()
+        ));
+        assert!(
+            admitted
+                .with_first_compute_topology(topology(9, 1))
+                .is_err()
+        );
+        drop(initial);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+    }
+
     /// Load-bearing for the sealed-description rebind: a replacement round
     /// reuses the first round's plan, so the count that shaped that plan must
     /// not be re-derived from the new topology. `effective_backend_count` is
@@ -1557,7 +1670,7 @@ mod tests {
     fn sql_mode_is_frozen_in_both_request_projections_and_topology_retries() {
         let mode = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
             novarocks_sql::sql_mode::SqlMode::from_assignment(
-                "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
             ),
         );
         let first = RequestContext::admit(RequestAdmission::new(

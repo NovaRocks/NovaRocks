@@ -100,7 +100,7 @@ impl Fixture {
         // its exact existing Utf8 binder stays real, while missing effect and
         // CPU attachments are explicit test inputs rather than claimed installs.
         let mut metadata_only = original
-            .definition("initcap", FunctionKind::Scalar)
+            .definition("title_case", FunctionKind::Scalar)
             .unwrap()
             .clone();
         metadata_only.canonical_name = METADATA_ONLY.into();

@@ -74,12 +74,34 @@ SELECT
 
 -- query 10
 -- @skip_result_check=true
-DROP BRANCH backup IN TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0};
+PREPARE tt_prepared FROM SELECT id, v FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0} FOR VERSION AS OF ? ORDER BY id;
 
 -- query 11
+EXECUTE tt_prepared USING 'backup';
+
+-- query 12
+EXECUTE tt_prepared USING 'main';
+
+-- query 13
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+DESCRIBE OUTPUT tt_prepared;
+
+-- query 14
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+DESCRIBE INPUT tt_prepared;
+
+-- query 15
+-- @skip_result_check=true
+DEALLOCATE PREPARE tt_prepared;
+
+-- query 16
+-- @skip_result_check=true
+DROP BRANCH backup IN TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0};
+
+-- query 17
 -- @skip_result_check=true
 DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0};
 
--- query 12
+-- query 18
 -- @skip_result_check=true
 DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0};

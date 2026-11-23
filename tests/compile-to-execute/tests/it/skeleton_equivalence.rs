@@ -526,16 +526,13 @@ fn actual_cast_modes_are_checked() {
 }
 
 #[test]
-fn legacy_trim_remains_on_the_sql_path() {
+fn trim_shares_the_catalogue_binding_and_result_type() {
     let fixture = Fixture::new();
     let columns = [column("input_text", 34, DataType::Utf8, false)];
-    let source = "TRIM(input_text)";
-    let sql = fixture
-        .sql(source, &columns)
-        .expect("catalogue binds VARCHAR TRIM");
-    let root = sql
+    let text = fixture.equivalent("TRIM(input_text)", &columns);
+    let root = text
         .unit()
-        .definition(sql.unit().root(sql.root()).unwrap().definition)
+        .definition(text.unit().roots()[0].definition)
         .unwrap();
     assert!(matches!(
         &root.kind,
@@ -543,10 +540,6 @@ fn legacy_trim_remains_on_the_sql_path() {
     ));
     // The original TRIM signature declares a conservatively nullable result.
     assert_eq!(root.ty, FunctionValueType::new(DataType::Utf8, true));
-    assert!(matches!(
-        fixture.text(source, &columns),
-        Err(TextError::NotTypedByLayer { construct, .. }) if construct == "trim"
-    ));
 }
 
 #[test]
@@ -568,5 +561,20 @@ fn row_syntax_reaches_catalogue_admission_without_an_installed_owner() {
             cause: TypingError::Binding(FunctionBindingError::UnknownFunction),
             ..
         })
+    ));
+}
+
+#[test]
+fn derived_char_concat_width_keeps_the_catalogue_type_error() {
+    let fixture = Fixture::new();
+    let result = fixture.sql(
+        "typeof(concat(CAST('a' AS CHAR(32768)), CAST('b' AS CHAR(32769))))",
+        &[],
+    );
+    assert!(matches!(
+        result,
+        Err(SqlCompileError::Analyze(error))
+            if error.kind() == AnalyzeErrorKind::UnknownType
+                && error.message() == "Unknown type: char(65537)"
     ));
 }

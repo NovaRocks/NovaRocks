@@ -221,6 +221,10 @@ SQL client
   DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
   `truncate.rs`, `add_files.rs`, `ctas.rs` / `iceberg_ctas.rs`,
   `iceberg_writer.rs` (INSERT INTO).
+  主分支 DELETE 由 `delete/absorption.rs::select_delete_path` 复用原读观察和 Provider 吸收证明，
+  在原 Root 选择空结果、元数据提交或行级执行。`query/delete_action/choice.rs` 仅在行级分支等待 BE。
+  `query/delete_action/metadata_commit.rs` 沿原数据变更会话消费实际发布快照的计数并核对一次未知结果。
+  见 [ADR-0260](docs/adr/ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md)。
 
 - `novarocks/frontend-application/src/query/{statement_action,read_action,write_action,mutation_action,ctas_action}.rs`
   当前 governed 语句接缝：普通 Read 保留 Client 窗口与流式 handle；Internal 写入由稳定 Action
@@ -613,7 +617,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
     `commit/conflict_scope.rs` 消费读侧签发的被改写目标谓词事实与写出分区，
     `commit/dependency/window.rs` 为行级核对与 OPTIMIZE 共用连续窗口的 manifest 读取。行级规则见 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)。
   - `novarocks/connector/iceberg/src/commit/model/protocol.rs` 由操作声明窗口核对、提交前提与提交样式。
-    `novarocks/connector/iceberg/src/commit/filter_delete.rs` 在本轮基准逐 manifest 应用过滤，供主分支 TRUNCATE 使用。
+    `novarocks/connector/iceberg/src/commit/filter_delete.rs` 在本轮基准逐 manifest 应用过滤，供主分支 TRUNCATE 和元数据 DELETE 使用。
     `novarocks/connector/iceberg/src/catalog_control/maintenance_error.rs` 撰写公开提交失败消息。见 [ADR-0251](docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
@@ -1380,7 +1384,7 @@ the guide differ.
   `novarocks/connector/iceberg/src/commit/new_manifests.rs` 的 stage 持有、滚动写出和沿用。
   普通行级提交按 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md) 核对准入观察、
   `commit/conflict_scope.rs` 的冲突范围及 `commit/dependency/window.rs` 的共用窗口输入。
-  `commit/model/protocol.rs` 声明按操作的校验与条件，`commit/filter_delete.rs` 为 main TRUNCATE 准备按过滤删除。
+  `commit/model/protocol.rs` 声明按操作的校验与条件，`commit/filter_delete.rs` 为 main TRUNCATE 和元数据 DELETE 准备按过滤删除。
   核对通过后在实际提交基准上定位移除条目。确定的 Catalog 竞争按原 operation 预算重试并沿用新增产物。见
   [ADR-0251](docs/adr/ADR-0251-iceberg-maintenance-commits-by-operation.md)。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、

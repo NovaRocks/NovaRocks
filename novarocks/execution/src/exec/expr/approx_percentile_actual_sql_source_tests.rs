@@ -24,8 +24,8 @@ fn check_actual_approx() {
     };
     use novarocks_type_contract::FunctionValueType;
     let statements = [
-        "SELECT CAST(percentile_approx(v, 0.5) AS INT) AS approx50, CAST(percentile_approx(v, 0.9, 2048) AS INT) AS approx90, percentile_approx(v, CAST([0.25, 0.5, 0.75] AS ARRAY<double>), 2048) AS approx_quartiles FROM fixture.t_agg_percentile_semantics",
-        "SELECT CAST(percentile_approx_weighted(v, w, 0.5, 2048) AS INT) AS weighted50, CAST(percentile_approx_weighted(v, w, 0.9, 2048) AS INT) AS weighted90, percentile_approx_weighted(v, w, CAST([0.25, 0.5, 0.75] AS ARRAY<double>), 2048) AS weighted_quartiles FROM fixture.t_agg_percentile_semantics",
+        "SELECT CAST(approx_percentile(v, 0.5) AS INT) AS approx50, CAST(approx_percentile(v, 0.9) AS INT) AS approx90, approx_percentile(v, ARRAY[DOUBLE '0.25', DOUBLE '0.5', DOUBLE '0.75']) AS approx_quartiles FROM fixture.t_agg_percentile_semantics",
+        "SELECT CAST(approx_percentile(v, w, 0.5) AS INT) AS weighted50, CAST(approx_percentile(v, w, 0.9) AS INT) AS weighted90, approx_percentile(v, w, ARRAY[DOUBLE '0.25', DOUBLE '0.5', DOUBLE '0.75']) AS weighted_quartiles FROM fixture.t_agg_percentile_semantics",
     ];
     for sql in statements {
         let source = approx_sql_source(sql);
@@ -37,11 +37,7 @@ fn check_actual_approx() {
                 };
                 for (ordinal, call) in calls.iter().enumerate() {
                     let name = call.binding.function.function_id.as_str();
-                    if !matches!(
-                        name,
-                        "builtin.aggregate/percentile_approx/v1"
-                            | "builtin.aggregate/percentile_approx_weighted/v1"
-                    ) {
+                    if name != "builtin.aggregate/approx_percentile/v1" {
                         continue;
                     }
                     let site = PhysicalCallSite::Aggregate {
@@ -69,20 +65,16 @@ fn check_actual_approx() {
                         };
                         assert_eq!(actual, selected);
                     }
-                    let role = if name == "builtin.aggregate/percentile_approx/v1" {
-                        1
-                    } else {
-                        2
-                    };
+                    let role = request.logical_argument_count - 1;
                     let FunctionArgumentType::Value(rate) =
                         &call.binding.function.argument_types[role]
                     else {
                         panic!("actual rate")
                     };
                     let expected = if matches!(rate.data_type(), DataType::List(_)) {
-                        DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
+                        DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
                     } else {
-                        DataType::Float64
+                        DataType::Int64
                     };
                     assert_eq!(
                         call.binding.function.result_type,
@@ -90,13 +82,10 @@ fn check_actual_approx() {
                     );
                     assert_eq!(
                         call.binding.intermediate_type,
-                        FunctionValueType::new(DataType::Binary, true)
+                        FunctionValueType::new(DataType::Binary, false)
                     );
                     assert!(
-                        matches!(
-                            rate.data_type(),
-                            DataType::Decimal128(..) | DataType::List(_)
-                        ),
+                        matches!(rate.data_type(), DataType::Float64 | DataType::List(_)),
                         "native statements original authored rates"
                     );
                     eprintln!(

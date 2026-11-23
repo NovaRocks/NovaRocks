@@ -21,12 +21,14 @@
 //! the statement owner with its original catalog, CPU and I/O capabilities.
 
 mod error;
+mod metadata_declarations;
 mod provider;
 mod registry;
 mod request;
 mod snapshot;
 
 pub use error::{SystemTableError, SystemTableRegistryError};
+pub use metadata_declarations::QUERY_OBSERVATION_TIME;
 pub use provider::SystemTableProvider;
 pub use registry::{
     SystemTableLookup, SystemTableRegistration, SystemTableRegistry, SystemTableScope,

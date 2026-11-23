@@ -33,13 +33,21 @@ const INTEGER_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/project/sql/project_string_int_argument_semantics.sql"
 ));
-// These two members share the complete existing measurement family. They are
-// explicit source probes, not additional owners or inferred corpus coverage.
-const REMAINING_MEASUREMENT: &str = "SELECT ascii('A') AS a, char_length('é') AS n";
-pub(super) const NAMES: [&str; 5] = ["ascii", "length", "char_length", "lpad", "rpad"];
+// These explicit probes exercise the code-point conversions and the fixed
+// character and binary LENGTH overloads.
+const REMAINING_MEASUREMENT: &str = "SELECT codepoint('A') AS a, chr(BIGINT '65') AS letter, \
+    length(CAST('é' AS CHAR(3))) AS char_count, length(X'C3A9') AS byte_count";
+pub(super) const NAMES: [&str; 5] = ["chr", "codepoint", "length", "lpad", "rpad"];
+
+pub(super) fn first_corpus_query(sql: &str) -> &str {
+    let frames = novarocks_parser::parser::frame_statements(sql).expect("frame string SQL corpus");
+    let first = frames.first().expect("positive first string query").source;
+    &sql[first.start()..first.end()]
+}
+
 pub(super) fn calls(index: usize) -> Vec<(String, ResolvedFunctionBinding)> {
     let sql = [LENGTH_SQL, INTEGER_SQL, REMAINING_MEASUREMENT][index];
-    let owner = sql_source(sql, DataType::Int64);
+    let owner = sql_source(first_corpus_query(sql), DataType::Int64);
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut out = Vec::new();

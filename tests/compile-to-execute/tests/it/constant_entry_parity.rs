@@ -46,7 +46,8 @@ use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ExpressionUseId, OperatorFunction, PureCompileControl,
+    CharacterKind, CharacterType, CompileControlError, CompilePhase, ExpressionUseId,
+    OperatorFunction, PureCompileControl, ValueKind,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -473,7 +474,9 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             if matches!(family, Family::Call("builtin.scalar/upper/v1")) {
                 assert_eq!(
                     fixture.ty(at).value_type().kind(),
-                    &novarocks_type_contract::ValueKind::String
+                    &ValueKind::BoundedCharacter(
+                        CharacterType::new(CharacterKind::Varchar, 3).unwrap()
+                    )
                 );
             }
         }

@@ -66,7 +66,7 @@ fn f3_any_value_first_non_null_has_handwritten_value_and_empty_oracles() {
 #[test]
 fn f3_n_physical_integer_limits_duplicates_and_nulls_have_handwritten_oracles() {
     // Derivation: sort [-2,7,7,9], retain two minima/maxima, preserve duplicates;
-    // N's final presentation is ascending even for max_n.
+    // The result presents the selected values strongest first in either direction.
     use crate::builtin::aggregate_n_core::NState;
     let source: ArrayRef = Arc::new(Int64Array::from(vec![
         Some(7),
@@ -76,7 +76,7 @@ fn f3_n_physical_integer_limits_duplicates_and_nulls_have_handwritten_oracles() 
         Some(7),
     ]));
     let limits: ArrayRef = Arc::new(Int32Array::from(vec![2]));
-    for (smallest, expected) in [(true, [-2, 7]), (false, [7, 9])] {
+    for (smallest, expected) in [(true, [-2, 7]), (false, [9, 7])] {
         let mut state = NState::new(TestAllocator);
         let mut work = ScalarWork::new(None);
         for row in 0..source.len() {
@@ -84,7 +84,7 @@ fn f3_n_physical_integer_limits_duplicates_and_nulls_have_handwritten_oracles() 
                 .update_from_arrays(&source, row, &limits, 0, smallest, &mut work)
                 .unwrap();
         }
-        let V::List(values) = state.output(&mut work).unwrap() else {
+        let Some(V::List(values)) = state.output(&mut work).unwrap() else {
             panic!("N output must be a list")
         };
         let values = values

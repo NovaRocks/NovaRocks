@@ -42,8 +42,8 @@ INSERT INTO ${case_db}.t_agg_collection_string_dict VALUES
     ROW(3, 7, 'Zoe', 70, [70], ['n'], 'nanjing', 'nanjing', ['nanjing'], ['nanjing']);
 SELECT
     g,
-    ARRAY_AGG(name ORDER BY id) AS names_all,
-    ARRAY_AGG(DISTINCT name ORDER BY name) AS names_distinct
+    array_agg(name ORDER BY id) AS names_all,
+    array_agg(DISTINCT name ORDER BY name) AS names_distinct
 FROM ${case_db}.t_agg_collection_string_dict
 WHERE name IS NOT NULL
 GROUP BY g
@@ -52,8 +52,8 @@ ORDER BY g;
 -- query 2
 SELECT
     g,
-    STRING_AGG(name, '|' ORDER BY id) AS names_concat,
-    STRING_AGG(DISTINCT CAST(score AS VARCHAR), ',' ORDER BY 1) AS distinct_scores
+    LISTAGG(CAST(name AS VARCHAR), '|') WITHIN GROUP (ORDER BY id) AS names_concat,
+    LISTAGG(DISTINCT CAST(score AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(score AS VARCHAR)) AS distinct_scores
 FROM ${case_db}.t_agg_collection_string_dict
 WHERE name IS NOT NULL
 GROUP BY g

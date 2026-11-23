@@ -643,6 +643,7 @@ impl IcebergMetadataContext {
                                     collection,
                                     Some(request),
                                     crate::catalog::SnapshotLoading::All,
+                                    false,
                                 )
                                 .await?
                             }
@@ -948,6 +949,27 @@ impl IcebergMetadataContext {
                 request_context.vended_credential_lease_collection(),
                 Some(request_context),
                 snapshots,
+                false,
+            )
+            .await?;
+        self.scope_original_observed_table(loaded, request_context)
+    }
+
+    pub(crate) async fn observe_discovery_table(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        ConnectorOperationControl::check_active(request_context)?;
+        let loaded = self
+            .observe_table_original_with_snapshots_async(
+                namespace,
+                table,
+                request_context.vended_credential_lease_collection(),
+                Some(request_context),
+                crate::catalog::SnapshotLoading::Refs,
+                true,
             )
             .await?;
         self.scope_original_observed_table(loaded, request_context)
@@ -1594,6 +1616,7 @@ impl IcebergMetadataContext {
             credential_lease_collection,
             request_context,
             snapshots,
+            false,
         )
         .await
         .map_err(classified_original_error)
@@ -1606,6 +1629,7 @@ impl IcebergMetadataContext {
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
         snapshots: crate::catalog::SnapshotLoading,
+        exact_discovery: bool,
     ) -> Result<IcebergPhysicalTable, ConnectorError> {
         let ident = TableIdent::from_strs([namespace, table]).map_err(|error| {
             ConnectorError::new(
@@ -1614,8 +1638,11 @@ impl IcebergMetadataContext {
             )
         })?;
         let owner = Arc::clone(self.novarocks_catalog());
-        let target =
-            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let target = if exact_discovery {
+            crate::catalog::CatalogTableName::discovery(namespace, table)
+        } else {
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name())
+        };
         let read_binding = request_context.map(|request| {
             self.resources
                 .planning_binding()
@@ -1968,11 +1995,9 @@ impl IcebergMetadataContext {
         request: &ConnectorRequestContext,
         bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
-        let namespace =
-            NamespaceIdent::new(normalize_identifier(namespace).map_err(invalid_request)?);
-        let namespace_label = namespace.to_string();
+        let namespace_label = namespace;
         let owner = Arc::clone(self.novarocks_catalog());
-        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        let target = crate::catalog::CatalogNamespaceName::discovery(namespace);
         let binding = self
             .resources
             .planning_binding()

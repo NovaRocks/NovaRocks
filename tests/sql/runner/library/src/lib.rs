@@ -2773,6 +2773,70 @@ fn retain_domain_oracle_failure(
     }));
 }
 
+fn verify_update_count(
+    step: &SqlStep,
+    outcome: Option<&SqlExecutionOutcome>,
+    evidence: &mut results_record::CaseEvidence,
+) -> Result<(), String> {
+    let Some(expectation) = step.meta.expect_update_count else {
+        return Ok(());
+    };
+    let expected = match expectation {
+        UpdateCountExpectation::Counted(count) => Some(count),
+        UpdateCountExpectation::NoCount => None,
+    };
+    let actual = outcome
+        .filter(|outcome| outcome.0)
+        .and_then(|outcome| outcome.3.last())
+        .and_then(|attempt| match attempt.statements.as_slice() {
+            [statement]
+                if attempt.succeeded
+                    && attempt.statement_count == 1
+                    && statement.completed
+                    && statement.failures.is_empty() =>
+            {
+                statement.result.as_ref()
+            }
+            _ => None,
+        });
+    let update_type = actual.and_then(|actual| actual.update_type.as_deref());
+    let observed = actual.and_then(|actual| actual.update_count);
+    let display =
+        |count: Option<u64>| count.map_or_else(|| "NULL".to_owned(), |count| count.to_string());
+    let result = if actual.is_none() {
+        Err("@expect_update_count requires exactly one completed Trino SQL statement".into())
+    } else if update_type.is_none_or(str::is_empty) {
+        Err("@expect_update_count requires a command result with updateType".into())
+    } else if observed != expected {
+        Err(format!(
+            "@expect_update_count expected {}, observed {}",
+            display(expected),
+            display(observed)
+        ))
+    } else {
+        Ok(())
+    };
+    evidence.record(
+        step,
+        "update_count",
+        result.is_ok(),
+        serde_json::json!({
+            "query_id": actual.map(|actual| actual.query_id.as_str()),
+            "update_type": update_type,
+            "expected_update_count": expected,
+            "actual_update_count": observed,
+        }),
+    );
+    if let Err(reason) = &result {
+        evidence.record_failure(serde_json::json!({
+            "class": "error",
+            "error": reason,
+            "statement_index": step.query_number,
+        }));
+    }
+    result
+}
+
 fn run_successful_step_domain_oracles(
     step: &SqlStep,
     context_and_case: (&SuiteRunContext, &SqlCase),
@@ -3930,6 +3994,14 @@ fn run_case_observed(
                         let Some(execution) = execution else {
                             unreachable!("checked above");
                         };
+                        if let Err(reason) =
+                            verify_update_count(step, sql_outcome.as_ref(), evidence)
+                        {
+                            last_failure = format!("VERIFY FAILED: {reason}");
+                            // The statement already succeeded. Repeating it could
+                            // change both the data and the observed completion.
+                            break;
+                        }
                         let (assertions_ok, assertions_reason) =
                             verify_text_assertions(step, &execution);
                         if results_record::required(step).contains(&"text_assertions") {
@@ -4496,6 +4568,14 @@ fn run_case_observed(
                         let Some(execution) = execution else {
                             unreachable!("checked above");
                         };
+                        if let Err(reason) =
+                            verify_update_count(step, sql_outcome.as_ref(), evidence)
+                        {
+                            last_failure = format!("VERIFY FAILED: {reason}");
+                            // The statement already succeeded. Repeating it could
+                            // change both the data and the observed completion.
+                            break;
+                        }
                         let (assertions_ok, assertions_reason) =
                             verify_text_assertions(step, &execution);
                         if results_record::required(step).contains(&"text_assertions") {

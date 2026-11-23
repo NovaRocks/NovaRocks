@@ -1,14 +1,14 @@
 -- query 1
--- types	array(row(item integer, count bigint))
+-- types	map(bigint, bigint)
 top_items
-[[10,3],[20,3],[40,2]]
+{"10":3,"20":3,"40":2}
 
 -- query 2
--- types	integer	array(row(item integer, count bigint))
+-- types	integer	map(bigint, bigint)
 grp	top_items
-1	[[10,1],[20,2]]
-2	[[null,1],[10,2]]
-3	[[40,2]]
+1	{"10":1,"20":2,"30":1}
+2	{"10":2,"20":1}
+3	{"40":2}
 
 -- query 3
 -- types	array(integer)	array(varchar)

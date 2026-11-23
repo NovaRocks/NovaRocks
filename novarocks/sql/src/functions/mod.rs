@@ -298,12 +298,16 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         request: FunctionBindingRequest<'_>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        self.resolve_bound_trusted_by_id(
-            &operator.function_id(),
-            FunctionKind::Scalar,
-            request,
-            control,
-        )
+        self.resolve_trusted_scalar_binding(&operator.function_id(), request, control)
+    }
+
+    fn resolve_trusted_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted_by_id(function, FunctionKind::Scalar, request, control)
     }
 
     fn finish_scalar_binding(
@@ -472,8 +476,6 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 "builtin.aggregate/sum/v1" | "builtin.aggregate/avg/v1" => Some(DataType::Float64),
                 "builtin.aggregate/bool_or/v1"
                 | "builtin.aggregate/bool_and/v1"
-                | "builtin.aggregate/boolor_agg/v1"
-                | "builtin.aggregate/booland_agg/v1"
                 | "builtin.aggregate/every/v1"
                 | "builtin.aggregate/count_if/v1" => Some(DataType::Boolean),
                 _ => None,
@@ -608,7 +610,7 @@ pub(crate) fn resolve_sql_aggregate_call(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
-        match public_aggregate_target(name, distinct) {
+        let bound = match public_aggregate_target(name, distinct) {
             PublicAggregateTarget::Named(executable) => catalog.resolve_aggregate_binding(
                 executable,
                 request.logical_argument_count,
@@ -618,7 +620,19 @@ pub(crate) fn resolve_sql_aggregate_call(
             PublicAggregateTarget::Distinct(aggregate) => {
                 catalog.resolve_distinct_aggregate(aggregate, request, control)
             }
+        }?;
+        if distinct
+            && matches!(
+                bound.function_id.as_str(),
+                "builtin.aggregate/approx_percentile/v1"
+                    | "builtin.aggregate/approx_most_frequent/v1"
+            )
+        {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                bound.selected.overload,
+            ));
         }
+        Ok(bound)
     })
 }
 
@@ -633,7 +647,6 @@ fn public_aggregate_target(name: &str, distinct: bool) -> PublicAggregateTarget<
         (true, "count") => PublicAggregateTarget::Distinct(DistinctAggregate::Count),
         (true, "sum") => PublicAggregateTarget::Distinct(DistinctAggregate::Sum),
         (true, "avg") => PublicAggregateTarget::Distinct(DistinctAggregate::Avg),
-        (true, "array_agg") => PublicAggregateTarget::Named("array_agg_distinct"),
         _ => PublicAggregateTarget::Named(name),
     }
 }
@@ -1076,8 +1089,9 @@ mod tests {
     }
 
     #[test]
-    fn sqlx1_function_builtin_snapshot_has_canonical_volatility_set() {
-        use novarocks_type_contract::SemanticParameterKey::{StatementStartUtc, TimeZone};
+    fn builtin_snapshot_distinguishes_volatile_calls_and_frozen_statement_clocks() {
+        use novarocks_functions::builtin::temporal_context::{FUNCTION_NAME, TemporalSyntax};
+        use novarocks_type_contract::SemanticParameterKey as Key;
 
         let catalog = builtin_sql_function_catalog();
         for name in ["rand", "random", "uuid", "sleep"] {
@@ -1089,36 +1103,38 @@ mod tests {
         }
         assert_eq!(catalog.volatility("lower"), FunctionVolatility::Immutable);
 
-        let definitions = builtin_engine_function_catalog();
-        for name in ["now", "current_date"] {
-            assert_eq!(catalog.volatility(name), FunctionVolatility::Immutable);
-            let declaration = definitions
+        let engine = builtin_engine_function_catalog();
+        for (name, clock) in [
+            ("now", TemporalSyntax::Now),
+            ("current_date", TemporalSyntax::QuotedCurrentDate),
+            (FUNCTION_NAME, TemporalSyntax::CurrentDate),
+            (FUNCTION_NAME, TemporalSyntax::CurrentTime),
+            (FUNCTION_NAME, TemporalSyntax::CurrentTimestamp),
+            (FUNCTION_NAME, TemporalSyntax::LocalTime),
+            (FUNCTION_NAME, TemporalSyntax::LocalTimestamp),
+        ] {
+            let declaration = engine
                 .definition(name, FunctionKind::Scalar)
                 .unwrap()
                 .binding_declaration()
                 .unwrap();
-            let [overload] = declaration.overloads() else {
-                panic!("{name} has one clock overload");
-            };
-            let effects = declaration.effect_declaration(&overload.identity).unwrap();
+            let overload = FunctionOverloadId::try_new(clock.identity()).unwrap();
+            let effects = declaration.effect_declaration(&overload).unwrap();
+            assert_eq!(
+                effects.value_stability,
+                FunctionVolatility::Immutable,
+                "{overload:?}"
+            );
             assert_eq!(
                 effects.environment_dependencies.as_ref(),
-                &[StatementStartUtc, TimeZone],
-                "{name}"
+                &[Key::StatementStartUtc, Key::TimeZone],
+                "{overload:?}"
             );
         }
-
-        for name in [
-            "current_timestamp",
-            "current_time",
-            "localtime",
-            "localtimestamp",
-            "curdate",
-            "curtime",
-        ] {
+        for retired in ["curdate", "curtime"] {
             assert!(
-                definitions.definition(name, FunctionKind::Scalar).is_none(),
-                "{name}"
+                engine.definition(retired, FunctionKind::Scalar).is_none(),
+                "{retired}"
             );
         }
     }
@@ -1486,8 +1502,8 @@ mod tests {
             &[DataType::Int64],
             false,
             &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("std alias resolves for user SQL");
+        );
+        assert_eq!(std_user, Err(FunctionResolutionError::HiddenFunction));
         let std_trusted = resolve_bound_aggregate(
             &catalog,
             "std",
@@ -1497,14 +1513,13 @@ mod tests {
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("std alias resolves for trusted planning");
-        assert_eq!(std_user, std_trusted);
         assert_eq!(
-            std_user.overload.as_str(),
+            std_trusted.overload.as_str(),
             "builtin.aggregate/std/derived-v1"
         );
-        assert_eq!(std_user.intermediate_type, DataType::Binary);
-        assert_eq!(std_user.output_type, DataType::Float64);
-        assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
+        assert_eq!(std_trusted.intermediate_type, DataType::Binary);
+        assert_eq!(std_trusted.output_type, DataType::Float64);
+        assert_eq!(std_trusted.state_format.as_str(), "novarocks/std/state-v1");
     }
 
     #[test]

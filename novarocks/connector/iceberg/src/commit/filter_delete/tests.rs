@@ -15,25 +15,507 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::error::Error as _;
 use std::sync::Mutex;
 
 use novarocks_spi::connector::ConnectorMutationFailure;
+use novarocks_spi::connector::read_stack::{
+    Bound, ConnectorValue, ConnectorValueType, Domain, Range, TupleDomain, ValueSet,
+};
 
 use super::*;
-use crate::commit::model::{AddedContent, ArtifactWriter, FrozenRequest};
+use crate::commit::delete_condition::DeleteCondition;
+use crate::commit::model::{AddedContent, ArtifactWriter, CommitOperation, FrozenRequest};
 use crate::commit::overwrite::preparer_tests::{Fixture, data, raw_entries};
 use crate::commit::staging::{ManifestEntryWrite, StagingBase, StagingEngine, write_manifest};
 use crate::iceberg::spec::{
-    DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
-    ManifestList, ManifestStatus, Operation, Struct,
+    DataFile, DataFileBuilder, DataFileFormat, Datum, FieldSummary, FormatVersion,
+    ManifestContentType, ManifestEntry, ManifestList, ManifestStatus, NestedField, Operation,
+    PrimitiveType, Schema, SortOrder, Struct, TableMetadataBuilder, Transform,
+    UnboundPartitionSpecBuilder,
 };
+use crate::typed_read::IcebergColumnHandle;
 
 const A: &str = "file:///a.parquet";
 const B: &str = "file:///b.parquet";
 const DV: &str = "file:///dv.puffin";
 const POSITION: &str = "file:///position.parquet";
 const EQUALITY: &str = "file:///equality.parquet";
+
+fn conditional_metadata(primitive: PrimitiveType, transform: Option<Transform>) -> TableMetadata {
+    let schema = Schema::builder()
+        .with_fields([
+            Arc::new(NestedField::optional(
+                1,
+                "other",
+                PrimitiveType::Long.into(),
+            )),
+            Arc::new(NestedField::optional(2, "part", primitive.into())),
+        ])
+        .build()
+        .unwrap();
+    let mut spec = UnboundPartitionSpecBuilder::new();
+    if let Some(transform) = transform {
+        spec = spec
+            .add_partition_field(2, "part_partition", transform)
+            .unwrap();
+    }
+    TableMetadataBuilder::new(
+        schema,
+        spec.build(),
+        SortOrder::unsorted_order(),
+        "memory://unit/delete".to_owned(),
+        FormatVersion::V3,
+        HashMap::new(),
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .metadata
+}
+
+fn frozen_condition(metadata: &TableMetadata, domain: Domain) -> DeleteCondition {
+    let schema = metadata.current_schema();
+    let handle = IcebergColumnHandle::base_column(schema.field_by_id(2).unwrap()).unwrap();
+    let domains =
+        TupleDomain::with_column_domains([(handle, domain)].into_iter().collect()).unwrap();
+    DeleteCondition::from_enforced(schema, &domains).unwrap()
+}
+
+fn range(low: Bound, high: Bound, value_type: ConnectorValueType) -> Domain {
+    let range = Range::try_new(value_type, low, high).unwrap();
+    Domain::new(ValueSet::of_ranges(value_type, vec![range]).unwrap(), false)
+}
+
+fn judge<'a>(condition: &'a DeleteCondition, metadata: &TableMetadata) -> ConditionJudge<'a> {
+    let mut judge = ConditionJudge::bind(condition, metadata, CommitOperation::Delete).unwrap();
+    judge
+        .prepare_specs(
+            metadata,
+            metadata.partition_specs_iter().map(|spec| spec.spec_id()),
+            &|| Ok(()),
+        )
+        .unwrap();
+    judge
+}
+
+fn candidate(
+    partition: Struct,
+    records: u64,
+    bounds: (Option<Datum>, Option<Datum>),
+    nulls: Vec<(i32, u64)>,
+    nans: Option<u64>,
+) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(A.to_owned())
+        .file_format(DataFileFormat::Parquet)
+        .partition(partition)
+        .record_count(records)
+        .file_size_in_bytes(100)
+        .lower_bounds(bounds.0.map(|datum| (2, datum)).into_iter().collect())
+        .upper_bounds(bounds.1.map(|datum| (2, datum)).into_iter().collect())
+        .null_value_counts(nulls.into_iter().collect())
+        .nan_value_counts(nans.map(|count| (2, count)).into_iter().collect())
+        .build()
+        .unwrap()
+}
+
+fn verdict(
+    judge: &ConditionJudge<'_>,
+    metadata: &TableMetadata,
+    spec_id: i32,
+    file: &DataFile,
+) -> FileVerdict {
+    judge
+        .file_verdict(&CandidateFile {
+            metadata,
+            spec_id,
+            file,
+        })
+        .unwrap()
+}
+
+#[test]
+fn base_binding_preserves_original_id_through_rename_reuse_and_int_promotion() {
+    let source = conditional_metadata(PrimitiveType::Int, Some(Transform::Identity));
+    let condition = frozen_condition(
+        &source,
+        Domain::single_value(ConnectorValue::Integer(10)).unwrap(),
+    );
+    let evolved = Schema::builder()
+        .with_fields([
+            Arc::new(NestedField::optional(
+                1,
+                "other",
+                PrimitiveType::Long.into(),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "renamed",
+                PrimitiveType::Long.into(),
+            )),
+            Arc::new(NestedField::optional(3, "part", PrimitiveType::Int.into())),
+        ])
+        .build()
+        .unwrap();
+    let base = source
+        .clone()
+        .into_builder(None)
+        .add_schema(evolved)
+        .unwrap()
+        .set_current_schema(-1)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    let spec = base.default_partition_spec_id();
+    let judge = judge(&condition, &base);
+    for partition in [Datum::int(10), Datum::long(10)] {
+        let file = candidate(
+            Struct::from_iter([Some(partition.into())]),
+            2,
+            (None, None),
+            vec![],
+            None,
+        );
+        assert_eq!(verdict(&judge, &base, spec, &file), FileVerdict::All);
+    }
+    let incompatible = Schema::builder()
+        .with_fields([
+            Arc::new(NestedField::optional(
+                1,
+                "other",
+                PrimitiveType::Long.into(),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "renamed",
+                PrimitiveType::String.into(),
+            )),
+            Arc::new(NestedField::optional(3, "part", PrimitiveType::Int.into())),
+        ])
+        .build()
+        .unwrap();
+    let removed = Schema::builder()
+        .with_fields([
+            Arc::new(NestedField::optional(
+                1,
+                "other",
+                PrimitiveType::Long.into(),
+            )),
+            Arc::new(NestedField::optional(3, "part", PrimitiveType::Int.into())),
+        ])
+        .build()
+        .unwrap();
+    let unpartitioned = conditional_metadata(PrimitiveType::Int, None);
+    for schema in [incompatible, removed] {
+        let base = unpartitioned
+            .clone()
+            .into_builder(None)
+            .add_schema(schema)
+            .unwrap()
+            .set_current_schema(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let error = ConditionJudge::bind(&condition, &base, CommitOperation::Delete)
+            .err()
+            .unwrap();
+        assert!(error.message().contains("field 2"));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<ConnectorMutationFailure>()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn bucket_evolution_requires_positive_null_stats_for_strict_range() {
+    let source = conditional_metadata(PrimitiveType::Int, Some(Transform::Identity));
+    let condition = frozen_condition(
+        &source,
+        range(
+            Bound::Unbounded,
+            Bound::Exclusive(ConnectorValue::Integer(20)),
+            ConnectorValueType::Integer,
+        ),
+    );
+    let prior_spec = source.default_partition_spec_id();
+    let bucket = UnboundPartitionSpecBuilder::new()
+        .add_partition_field(2, "part_bucket", Transform::Bucket(16))
+        .unwrap();
+    let base = source
+        .into_builder(None)
+        .add_partition_spec(bucket.build())
+        .unwrap()
+        .set_default_partition_spec(-1)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    let judge = judge(&condition, &base);
+    let bucket_spec = base.default_partition_spec_id();
+    for (nulls, expected) in [
+        (vec![], FileVerdict::Partial),
+        (vec![(1, 0)], FileVerdict::Partial),
+        (vec![(2, 1)], FileVerdict::Partial),
+        (vec![(2, 0)], FileVerdict::All),
+    ] {
+        let file = candidate(
+            Struct::from_iter([Some(Datum::int(3).into())]),
+            2,
+            (None, Some(Datum::int(10))),
+            nulls,
+            None,
+        );
+        assert_eq!(verdict(&judge, &base, bucket_spec, &file), expected);
+    }
+    let identity_file = candidate(
+        Struct::from_iter([Some(Datum::int(10).into())]),
+        2,
+        (None, None),
+        vec![],
+        None,
+    );
+    assert_eq!(
+        verdict(&judge, &base, prior_spec, &identity_file),
+        FileVerdict::All
+    );
+    let null_partition = candidate(Struct::from_iter([None]), 2, (None, None), vec![], None);
+    assert_eq!(
+        verdict(&judge, &base, prior_spec, &null_partition),
+        FileVerdict::None
+    );
+    assert_eq!(
+        verdict(&judge, &base, bucket_spec, &null_partition),
+        FileVerdict::None
+    );
+    let zero = candidate(Struct::from_iter([None]), 0, (None, None), vec![], None);
+    assert_eq!(verdict(&judge, &base, prior_spec, &zero), FileVerdict::All);
+}
+
+#[test]
+fn date_day_is_exact_and_only_null_matches_the_null_partition() {
+    let base = conditional_metadata(PrimitiveType::Date, Some(Transform::Day));
+    let spec = base.default_partition_spec_id();
+    let points = frozen_condition(
+        &base,
+        Domain::single_value(ConnectorValue::Date(-1)).unwrap(),
+    );
+    let null = frozen_condition(&base, Domain::only_null(ConnectorValueType::Date));
+    let partition = candidate(
+        Struct::from_iter([Some(Datum::date(-1).into())]),
+        2,
+        (None, None),
+        vec![],
+        None,
+    );
+    let null_partition = candidate(Struct::from_iter([None]), 2, (None, None), vec![], None);
+    assert_eq!(
+        verdict(&judge(&points, &base), &base, spec, &partition),
+        FileVerdict::All
+    );
+    assert_eq!(
+        verdict(&judge(&points, &base), &base, spec, &null_partition),
+        FileVerdict::None
+    );
+    assert_eq!(
+        verdict(&judge(&null, &base), &base, spec, &null_partition),
+        FileVerdict::All
+    );
+    assert_eq!(
+        verdict(&judge(&null, &base), &base, spec, &partition),
+        FileVerdict::None
+    );
+    let malformed = candidate(Struct::empty(), 2, (None, None), vec![], None);
+    assert!(
+        judge(&null, &base)
+            .file_verdict(&CandidateFile {
+                metadata: &base,
+                spec_id: spec,
+                file: &malformed,
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn shifted_legacy_time_partition_is_inclusive_but_not_a_strict_proof() {
+    for (primitive, value, transform) in [
+        (
+            PrimitiveType::Timestamptz,
+            ConnectorValue::TimestampTzMicros(0),
+            Transform::Hour,
+        ),
+        (
+            PrimitiveType::TimestampNs,
+            ConnectorValue::TimestampNanos(0),
+            Transform::Day,
+        ),
+    ] {
+        let base = conditional_metadata(primitive, Some(transform));
+        let spec = base.default_partition_spec_id();
+        let value_type = value.value_type();
+        let before = frozen_condition(
+            &base,
+            range(
+                Bound::Unbounded,
+                Bound::Exclusive(value.clone()),
+                value_type,
+            ),
+        );
+        let from = frozen_condition(
+            &base,
+            range(Bound::Inclusive(value), Bound::Unbounded, value_type),
+        );
+        let bound: fn(i32) -> Datum = if transform == Transform::Day {
+            Datum::date
+        } else {
+            Datum::int
+        };
+        for (partition, before_verdict, from_verdict) in [
+            (-1, FileVerdict::All, FileVerdict::None),
+            (0, FileVerdict::Partial, FileVerdict::Partial),
+            (1, FileVerdict::None, FileVerdict::All),
+        ] {
+            let file = candidate(
+                Struct::from_iter([Some(bound(partition).into())]),
+                2,
+                (None, None),
+                vec![],
+                None,
+            );
+            assert_eq!(
+                verdict(&judge(&before, &base), &base, spec, &file),
+                before_verdict
+            );
+            assert_eq!(
+                verdict(&judge(&from, &base), &base, spec, &file),
+                from_verdict
+            );
+        }
+    }
+}
+
+#[test]
+fn projection_hour_overflow_keeps_file_unproven() {
+    let base = conditional_metadata(PrimitiveType::Timestamp, Some(Transform::Hour));
+    let spec = base.default_partition_spec_id();
+    let condition = frozen_condition(
+        &base,
+        Domain::single_value(ConnectorValue::TimestampMicros(i64::MAX)).unwrap(),
+    );
+    let file = candidate(
+        Struct::from_iter([Some(Datum::int(0).into())]),
+        2,
+        (None, None),
+        vec![],
+        None,
+    );
+    assert_eq!(
+        verdict(&judge(&condition, &base), &base, spec, &file),
+        FileVerdict::Partial
+    );
+}
+
+#[test]
+fn absent_nan_count_and_large_in_keep_files_when_metrics_cannot_prove_verdict() {
+    let base = conditional_metadata(PrimitiveType::Float, None);
+    let spec = base.default_partition_spec_id();
+    let condition = frozen_condition(
+        &base,
+        range(
+            Bound::Unbounded,
+            Bound::Exclusive(ConnectorValue::Real(20.0)),
+            ConnectorValueType::Real,
+        ),
+    );
+    let prepared = judge(&condition, &base);
+    for (nans, expected) in [(None, FileVerdict::Partial), (Some(0), FileVerdict::All)] {
+        let file = candidate(
+            Struct::empty(),
+            2,
+            (None, Some(Datum::float(10.0_f32))),
+            vec![(2, 0)],
+            nans,
+        );
+        assert_eq!(verdict(&prepared, &base, spec, &file), expected);
+    }
+
+    let base = conditional_metadata(PrimitiveType::Int, None);
+    let spec = base.default_partition_spec_id();
+    let in_values = |size| {
+        frozen_condition(
+            &base,
+            Domain::new(
+                ValueSet::of_values(
+                    ConnectorValueType::Integer,
+                    (0..size).map(ConnectorValue::Integer).collect(),
+                )
+                .unwrap(),
+                false,
+            ),
+        )
+    };
+    let file = candidate(
+        Struct::empty(),
+        2,
+        (Some(Datum::int(1000)), None),
+        vec![],
+        None,
+    );
+    assert_eq!(
+        verdict(&judge(&in_values(200), &base), &base, spec, &file),
+        FileVerdict::None
+    );
+    assert_eq!(
+        verdict(&judge(&in_values(201), &base), &base, spec, &file),
+        FileVerdict::Partial
+    );
+}
+
+#[test]
+fn manifest_absent_summary_keeps_a_candidate() {
+    let base = conditional_metadata(PrimitiveType::Int, Some(Transform::Identity));
+    let spec = base.default_partition_spec_id();
+    let condition = frozen_condition(
+        &base,
+        Domain::single_value(ConnectorValue::Integer(10)).unwrap(),
+    );
+    let judge = judge(&condition, &base);
+    let mut manifest = ManifestFile {
+        manifest_path: "memory://unit/manifest".to_owned(),
+        manifest_length: 100,
+        partition_spec_id: spec,
+        content: ManifestContentType::Data,
+        sequence_number: 1,
+        min_sequence_number: 1,
+        added_snapshot_id: 7,
+        added_files_count: Some(1),
+        existing_files_count: Some(0),
+        deleted_files_count: Some(0),
+        added_rows_count: Some(2),
+        existing_rows_count: Some(0),
+        deleted_rows_count: Some(0),
+        partitions: None,
+        key_metadata: None,
+        first_row_id: None,
+    };
+    assert!(judge.manifest_may_match(&manifest));
+    manifest.partitions = Some(vec![FieldSummary::default()]);
+    assert!(judge.manifest_may_match(&manifest));
+    manifest.partitions = Some(vec![FieldSummary {
+        lower_bound: Some(Datum::int(20).to_bytes().unwrap()),
+        ..FieldSummary::default()
+    }]);
+    assert!(!judge.manifest_may_match(&manifest));
+}
 
 fn delete_file(path: &str, content: DataContentType) -> DataFile {
     DataFileBuilder::default()

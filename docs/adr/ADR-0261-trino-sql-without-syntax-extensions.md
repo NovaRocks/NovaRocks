@@ -44,8 +44,8 @@ Trino 语法和原子性边界。
    `SYNTAX_ERROR`，Trino 错误类型为 `USER_ERROR`。作为普通表名的 `overwrite` 仍按标识符处理。
 2. **能力归属。** 已解析的 AST 由 Query Application 和对应业务层准入。尚无产品能力的合法语句由该层
    返回 `NOT_SUPPORTED`。属性、过程和系统表继续由原声明作者约束。
-3. **写入语义归属。** 删除覆盖写专属的 AST 模式、FE 写入意图与 Provider 路由。普通 `DELETE` 缺少谓词时
-   保持原有拒绝，并引导调用者使用 `TRUNCATE TABLE`。
+3. **写入语义归属。** 删除覆盖写专属的 AST 模式、FE 写入意图与 Provider 路由。普通 `DELETE` 的元数据与行级分流由
+   [ADR-0260](ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md) 约束。
 
 ## 接受的妥协
 

@@ -82,6 +82,10 @@ pub enum StatementKind {
     Update,
     Merge,
     AddEqualityDelete,
+    Prepare,
+    DeallocatePrepare,
+    DescribeInput,
+    DescribeOutput,
     SetSession,
     SetTimeZone,
     ResetSession,
@@ -110,7 +114,9 @@ impl StatementKind {
             | Self::ShowCreateTable
             | Self::ExplainMaterializedViewRefresh
             | Self::ShowCreateView
-            | Self::ShowCreateMaterializedView => true,
+            | Self::ShowCreateMaterializedView
+            | Self::DescribeInput
+            | Self::DescribeOutput => true,
             Self::Empty
             | Self::Analyze
             | Self::CreateCatalog
@@ -158,6 +164,8 @@ impl StatementKind {
             | Self::Update
             | Self::Merge
             | Self::AddEqualityDelete
+            | Self::Prepare
+            | Self::DeallocatePrepare
             | Self::SetSession
             | Self::SetTimeZone
             | Self::ResetSession

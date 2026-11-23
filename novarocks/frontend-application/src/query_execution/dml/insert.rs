@@ -45,7 +45,32 @@ pub struct InsertStatementInput {
 
 /// Iceberg write port used by frontend-owned native INSERT orchestration.
 // Design: ADR-0021 (docs/adr/ADR-0021-native-frontend-insert-is-iceberg-only.md)
+pub struct InsertDescriptionInput {
+    pub command: crate::dml::insert::command::InsertCommand,
+    pub reference: crate::dml::insert::InsertTargetRef,
+    pub request: novarocks_query_application::admitted_query_context::RequestContext,
+    pub connector: novarocks_spi::connector::ConnectorRequestContext,
+    pub control: novarocks_sql::compiler::SqlCompileControl,
+    pub source: Arc<str>,
+    pub target_span: novarocks_parser::Span,
+}
+
+pub struct PreparedInsertDescription {
+    pub query: novarocks_parser::ast::Query,
+    pub assignments: novarocks_sql::compiler::SqlWriteAssignments,
+    pub constants: Option<novarocks_sql::compiler::SqlExpressionConstants>,
+}
+
+#[async_trait::async_trait]
 pub trait InsertEngine: Send + Sync {
+    async fn describe_insert(
+        &self,
+        input: InsertDescriptionInput,
+    ) -> Result<
+        PreparedInsertDescription,
+        novarocks_query_application::session_error::QueryServiceError,
+    >;
+
     fn prepare_statement_action(
         &self,
         input: InsertStatementInput,
@@ -55,7 +80,18 @@ pub trait InsertEngine: Send + Sync {
     >;
 }
 
+#[async_trait::async_trait]
 impl InsertEngine for DmlExecutionKernel {
+    async fn describe_insert(
+        &self,
+        input: InsertDescriptionInput,
+    ) -> Result<
+        PreparedInsertDescription,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
+        crate::query::insert_action::describe(self, input).await
+    }
+
     fn prepare_statement_action(
         &self,
         input: InsertStatementInput,

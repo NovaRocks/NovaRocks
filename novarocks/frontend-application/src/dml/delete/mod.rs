@@ -38,23 +38,8 @@ pub(crate) fn prepare_trino_delete_shape(
     let delete = PreparedPredicateDelete {
         target: RowMutationTarget::from_trino(statement.table.name, statement.table.branch),
         selection: statement.predicate,
-        span: statement.span,
     };
-    admit_predicate_delete(&delete, source)?;
     Ok(OwnedDeleteStatement::Predicate(delete))
-}
-
-fn admit_predicate_delete(delete: &PreparedPredicateDelete, source: &str) -> Result<(), DmlError> {
-    if delete.selection.is_none() {
-        return Err(DmlError::admit(
-            DmlAdmissionError::DeleteRequiresWhere.to_user_error(
-                source,
-                delete.span,
-                "DELETE requires a WHERE clause; to delete all rows use TRUNCATE TABLE",
-            ),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -112,14 +97,11 @@ mod trino_tests {
         let TrinoStatement::Delete(delete) = parser::parse_statement(sql).unwrap() else {
             panic!("expected DELETE");
         };
-        let error = prepare_trino_delete_shape(delete, sql).unwrap_err();
-        let error = error.user_error().unwrap();
-        assert_eq!(error.code().as_str(), "sql.admit.delete_requires_where");
-        assert!(
-            error
-                .message()
-                .starts_with("DELETE requires a WHERE clause")
-        );
-        assert_eq!(error.location().unwrap().column(), 1);
+        let OwnedDeleteStatement::Predicate(delete) =
+            prepare_trino_delete_shape(delete, sql).unwrap()
+        else {
+            panic!("expected DELETE");
+        };
+        assert!(delete.selection.is_none());
     }
 }

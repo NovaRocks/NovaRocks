@@ -47,6 +47,7 @@ impl Length {
 #[derive(Debug)]
 enum NStateFailure {
     Value(BoundedDetail),
+    Argument(BoundedDetail),
     Malformed(BoundedDetail),
     Contract(BoundedDetail),
     NumericConversion(TryFromIntError),
@@ -67,7 +68,10 @@ enum NStateFailure {
 impl fmt::Display for NStateFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Value(detail) | Self::Malformed(detail) | Self::Contract(detail) => detail.fmt(f),
+            Self::Value(detail)
+            | Self::Argument(detail)
+            | Self::Malformed(detail)
+            | Self::Contract(detail) => detail.fmt(f),
             Self::NumericConversion(_) => f.write_str("min_n/max_n limit overflow"),
             Self::Utf8 { carrier, source } => {
                 write!(f, "min_n/max_n {carrier} decode failed: {source}")
@@ -94,6 +98,10 @@ impl FailureProjection for NStateFailure {
     fn failure_fact(&self) -> FailureFact {
         match self {
             Self::Value(_) => crate::DataFailureReason::InvalidValue.failure_fact(),
+            Self::Argument(_) => FailureFact::new(
+                FailureClass::Data,
+                novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+            ),
             Self::Malformed(_) | Self::Utf8 { .. } => {
                 crate::DataFailureReason::InvalidEncoding.failure_fact()
             }
@@ -128,6 +136,11 @@ impl FailureProjection for NStateFailure {
 impl OuterFailureProjection for NStateFailure {}
 pub(super) fn value(detail: impl fmt::Display) -> KernelFailure {
     KernelFailure::from_domain(NStateFailure::Value(BoundedDetail::truncating_display(
+        detail,
+    )))
+}
+pub(super) fn argument(detail: impl fmt::Display) -> KernelFailure {
+    KernelFailure::from_domain(NStateFailure::Argument(BoundedDetail::truncating_display(
         detail,
     )))
 }

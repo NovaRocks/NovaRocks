@@ -35,26 +35,32 @@ use novarocks_spi::connector::{
     ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorDataMutation,
     ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
-    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
+    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest, ConnectorDeleteCondition,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
     ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorOperationControl,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorProcessLocalPayload, ConnectorProviderBindingKey, ConnectorRequestContext,
+    DELETE_KIND, ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use super::add_files::procedure_error;
 use crate::catalog::CatalogTableName;
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
-use crate::commit::model::{OperationToken, StartSnapshot};
+use crate::commit::attempt::RetryPolicy;
+use crate::commit::commit_failure::{
+    CommitFailureKind, original_commit_failure, validation_failure,
+};
+use crate::commit::delete_condition::IcebergDeleteConditionFact;
+use crate::commit::model::{CommitOperation, OperationToken, StartSnapshot};
 use crate::commit::recovery::FrozenPublicationFacts;
 use crate::iceberg::spec::TableMetadata;
-use crate::metadata::IcebergMetadata;
+use crate::metadata::{IcebergMetadata, IcebergTablePayload};
 use crate::metadata_context::IcebergMetadataContext;
-use novarocks_failure_contract::{FailureClass, connector_reason};
+use novarocks_failure_contract::{FailureClass, FailureProjection, connector_reason};
 
 mod publication;
 
 const PLAN_PAYLOAD_VERSION: u16 = 2;
+const DELETE_PLAN_PAYLOAD_VERSION: u16 = 1;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;
 const EVIDENCE_PAYLOAD_VERSION: u16 = 3;
 const MARKER_VALUE_VERSION: u16 = 1;
@@ -66,6 +72,7 @@ const MAX_DURABLE_ICEBERG_TRUNCATE_RECEIPT_PROVIDER_PAYLOAD_BYTES: usize = 64;
 const MARKER_PROPERTY: &str = "novarocks.connector.data-mutation.v1";
 const IDENTITY_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.data-mutation.identity.v1\0";
 const TRUNCATE_STATE_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.data-mutation.truncate-state.v1\0";
+const DELETE_STATE_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.data-mutation.delete-state.v1\0";
 const METADATA_VERSION_DIGEST_DOMAIN: &[u8] =
     b"novarocks.iceberg.data-mutation.metadata-version.v1\0";
 
@@ -82,6 +89,50 @@ struct IcebergDataMutationPlanPayloadV2 {
     schema_id: i32,
     default_spec_id: i32,
     metadata_version_digest_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IcebergDeletePlanPayloadV1 {
+    version: u16,
+    namespace: String,
+    table: String,
+    table_uuid: String,
+    base_snapshot_id: Option<i64>,
+    base_sequence_number: Option<i64>,
+    metadata_identity: String,
+    condition: FrozenDeleteCondition,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FrozenDeleteCondition {
+    AllRows,
+    SealedPredicate {
+        digest: [u8; 32],
+        partition_proof_digest: [u8; 32],
+    },
+}
+
+impl IcebergDeletePlanPayloadV1 {
+    fn validate_fact(&self, fact: &IcebergDeleteConditionFact) -> Result<(), ConnectorError> {
+        if self.table_uuid != fact.table_uuid.to_string()
+            || self.base_snapshot_id != Some(fact.snapshot_id)
+            || self.metadata_identity != fact.metadata_identity
+        {
+            return Err(invalid(
+                "Iceberg DELETE proof differs from the original target observation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn delete_fact<'a>(
+    payload: &'a ConnectorProcessLocalPayload,
+    key: &ConnectorProviderBindingKey,
+) -> Result<&'a Arc<IcebergDeleteConditionFact>, ConnectorError> {
+    payload.validate_owner(key)?;
+    payload.value::<IcebergDeleteConditionFact>(key.instance_id.as_str())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -166,6 +217,11 @@ enum PlannedIcebergMutation {
         payload: IcebergDataMutationPlanPayloadV2,
         source_metadata: Arc<TableMetadata>,
     },
+    Delete {
+        payload: Box<IcebergDeletePlanPayloadV1>,
+        table_location: String,
+        policy: RetryPolicy,
+    },
 }
 
 impl PlannedIcebergMutation {
@@ -175,6 +231,7 @@ impl PlannedIcebergMutation {
                 canonical_json(payload, "Iceberg registration plan")
             }
             Self::Truncate { payload, .. } => canonical_json(payload, "Iceberg truncate plan"),
+            Self::Delete { payload, .. } => canonical_json(payload, "Iceberg DELETE plan"),
         }
     }
 
@@ -195,7 +252,78 @@ impl PlannedIcebergMutation {
                 source_metadata,
                 ..
             } => Some((payload, source_metadata)),
+            Self::RegisterExistingFiles { .. } | Self::Delete { .. } => None,
+        }
+    }
+
+    fn recovery_source(&self) -> Option<MutationRecoverySource> {
+        match self {
+            Self::Truncate { payload, .. } => Some(payload.into()),
+            Self::Delete { payload, .. } => Some(MutationRecoverySource {
+                target: DataFinalizationFacts {
+                    namespace: payload.namespace.clone(),
+                    table: payload.table.clone(),
+                    table_uuid: payload.table_uuid.clone(),
+                },
+                target_ref: "main".into(),
+                base_snapshot_id: payload.base_snapshot_id,
+                base_sequence_number: payload.base_sequence_number,
+            }),
             Self::RegisterExistingFiles { .. } => None,
+        }
+    }
+
+    fn main_update_operation(&self) -> Option<CommitOperation> {
+        match self {
+            Self::Delete { .. } => Some(CommitOperation::Delete),
+            Self::Truncate {
+                mode: TruncateMode::Main,
+                ..
+            } => Some(CommitOperation::Truncate),
+            _ => None,
+        }
+    }
+
+    fn execution_delete_fact(
+        &self,
+        request: &ConnectorDataMutationExecuteRequest,
+        key: &ConnectorProviderBindingKey,
+    ) -> Result<Option<Arc<IcebergDeleteConditionFact>>, ConnectorError> {
+        let presented = request.delete_condition();
+        match (self, presented) {
+            (Self::Delete { payload, .. }, Some(presented)) => {
+                let FrozenDeleteCondition::SealedPredicate {
+                    digest,
+                    partition_proof_digest,
+                } = payload.condition
+                else {
+                    return Err(invalid(
+                        "Whole-table Iceberg DELETE cannot carry a sealed predicate",
+                    ));
+                };
+                let fact = delete_fact(presented, key)?;
+                payload.validate_fact(fact)?;
+                if fact.digest != digest || fact.partition_proof_digest != partition_proof_digest {
+                    return Err(invalid(
+                        "Iceberg DELETE predicate differs from its planned proof",
+                    ));
+                }
+                Ok(Some(Arc::clone(fact)))
+            }
+            (Self::Delete { payload, .. }, None)
+                if matches!(
+                    payload.condition,
+                    FrozenDeleteCondition::SealedPredicate { .. }
+                ) =>
+            {
+                Err(invalid(
+                    "Iceberg DELETE requires its original sealed predicate",
+                ))
+            }
+            (_, Some(_)) => Err(invalid(
+                "Sealed DELETE predicate requires an Iceberg DELETE plan",
+            )),
+            (_, None) => Ok(None),
         }
     }
 }
@@ -485,6 +613,7 @@ trait IcebergDataMutationBackend: Send + Sync {
     fn execute(
         &self,
         planned: &PlannedIcebergMutation,
+        condition: Option<Arc<IcebergDeleteConditionFact>>,
         marker: &IcebergDataMutationMarkerV1,
         recovery: &MutationRecoveryTemplate,
         context: &ConnectorRequestContext,
@@ -565,6 +694,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             ));
         }
         let operation = match request.operation() {
+            ConnectorDataMutationOperation::DeleteByCondition { .. } => CatalogOperation::Delete,
             ConnectorDataMutationOperation::TruncateMain { .. }
             | ConnectorDataMutationOperation::Truncate { .. } => CatalogOperation::Truncate,
             ConnectorDataMutationOperation::RegisterExistingFiles { .. } => {
@@ -622,6 +752,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             return Err(invalid(
                 "Iceberg data mutation requires a base table handle",
             ));
+        }
+        if let ConnectorDataMutationOperation::DeleteByCondition { condition, .. } =
+            request.operation()
+        {
+            return plan_delete(table_payload, *condition, request);
         }
         let namespace = table_payload.namespace;
         let table_name = table_payload.table;
@@ -682,7 +817,8 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     ConnectorDataMutationOperation::Truncate { target_ref, .. } => {
                         (TruncateMode::WholeBranch, target_ref.as_ref())
                     }
-                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => unreachable!(),
+                    ConnectorDataMutationOperation::RegisterExistingFiles { .. }
+                    | ConnectorDataMutationOperation::DeleteByCondition { .. } => unreachable!(),
                 };
                 if mode == TruncateMode::Main {
                     crate::commit::model::validate_target_branch(metadata, target_ref)
@@ -725,11 +861,12 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
     fn execute(
         &self,
         planned: &PlannedIcebergMutation,
+        condition: Option<Arc<IcebergDeleteConditionFact>>,
         marker: &IcebergDataMutationMarkerV1,
         recovery: &MutationRecoveryTemplate,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
-        self.execute_publication(planned, marker, recovery, context)
+        self.execute_publication(planned, condition, marker, recovery, context)
     }
 
     fn execute_registration(
@@ -776,6 +913,106 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             identity_digest_hex,
         )
     }
+}
+
+fn plan_delete(
+    table: IcebergTablePayload,
+    condition: ConnectorDeleteCondition,
+    request: &ConnectorDataMutationPlanningRequest,
+) -> Result<
+    (
+        PlannedIcebergMutation,
+        [u8; 32],
+        ConnectorDataMutationPlanSummary,
+    ),
+    ConnectorError,
+> {
+    request.context.check_active()?;
+    if table.metadata_table_type.is_some()
+        || table.explicit_files.is_some()
+        || !table.prepared_files.is_empty()
+        || table.metadata_location.is_none()
+    {
+        return Err(invalid(
+            "Iceberg DELETE requires the original current base-table handle",
+        ));
+    }
+    let info = table
+        .table_info
+        .as_ref()
+        .ok_or_else(|| invalid("Iceberg DELETE target has no table descriptor"))?;
+    let serialized = info
+        .serialized_metadata
+        .as_deref()
+        .ok_or_else(|| invalid("Iceberg DELETE target has no original metadata"))?;
+    let source: TableMetadata = crate::metadata_json::from_metadata_str(serialized)
+        .map_err(|error| corrupt(format!("Decode original Iceberg DELETE metadata: {error}")))?;
+    let table_uuid = source.uuid().to_string();
+    if info.table_uuid.as_deref() != Some(table_uuid.as_str())
+        || info.current_snapshot_id != source.current_snapshot_id()
+        || info.schema_id != source.current_schema_id()
+        || info.location != source.location()
+        || info.namespace != table.namespace
+        || info.table != table.table
+        || info.catalog != request.owner().instance_id.as_str()
+    {
+        return Err(invalid(
+            "Iceberg DELETE target differs from its original metadata",
+        ));
+    }
+    crate::commit::model::validate_target_branch(&source, "main").map_err(invalid)?;
+    let start = source_snapshot(&source, "main")?;
+    let metadata_identity = crate::read_snapshot::metadata_identity(&source).map_err(corrupt)?;
+    let mut payload = IcebergDeletePlanPayloadV1 {
+        version: DELETE_PLAN_PAYLOAD_VERSION,
+        namespace: table.namespace,
+        table: table.table,
+        table_uuid,
+        base_snapshot_id: start.map(|snapshot| snapshot.snapshot_id),
+        base_sequence_number: start.map(|snapshot| snapshot.sequence_number),
+        metadata_identity,
+        condition: FrozenDeleteCondition::AllRows,
+    };
+    if let ConnectorDeleteCondition::SealedPredicate { digest } = condition {
+        let fact = delete_fact(
+            request
+                .process_local()
+                .ok_or_else(|| invalid("Iceberg DELETE requires its original sealed predicate"))?,
+            request.owner(),
+        )?;
+        payload.validate_fact(fact)?;
+        if fact.digest != digest
+            || fact
+                .condition
+                .digest()
+                .map_err(|error| corrupt(error.to_string()))?
+                != digest
+        {
+            return Err(invalid(
+                "Iceberg DELETE predicate differs from its sealed digest",
+            ));
+        }
+        payload.condition = FrozenDeleteCondition::SealedPredicate {
+            digest,
+            partition_proof_digest: fact.partition_proof_digest,
+        };
+    }
+    let policy = RetryPolicy::from_properties(source.properties())
+        .map_err(|error| invalid(error.to_string()))?;
+    let state = canonical_json(&payload, "Iceberg DELETE plan state")?;
+    let mut digest = Sha256::new();
+    digest.update(DELETE_STATE_DIGEST_DOMAIN);
+    digest_bytes(&mut digest, state.as_ref());
+    request.context.check_active()?;
+    Ok((
+        PlannedIcebergMutation::Delete {
+            payload: Box::new(payload),
+            table_location: source.location().into(),
+            policy,
+        },
+        digest.finalize().into(),
+        ConnectorDataMutationPlanSummary::default(),
+    ))
 }
 
 fn find_marker(
@@ -985,7 +1222,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                         let recovered = publication::project_for_operation(
                             journal.catalog_entry_outcome(entry), request.plan.operation_kind(),
                         );
-                        return Ok(project_truncate_unknown(&cached.private, recovered));
+                        return Ok(project_update_outcome(&cached.private, recovered));
                     }
                 return Ok(record.outcome);
             }
@@ -993,17 +1230,26 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 "Iceberg data mutation operation was executed with a different plan",
             ));
         }
-        let outcome = if let Some((payload, _)) = cached.private.truncate_parts() {
+        let condition = match cached.private.execution_delete_fact(&request, &self.key) {
+            Ok(condition) => condition,
+            Err(error) => {
+                return Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::from_connector(error),
+                    cleanup: ExternalMutationFinalization::Complete,
+                });
+            }
+        };
+        let outcome = if let Some(source) = cached.private.recovery_source() {
             let template = MutationRecoveryTemplate::new(
                 self.descriptor.clone(),
                 self.key.clone(),
                 request.plan.clone(),
-                payload.into(),
+                source,
             );
             let marker = template.marker();
             match self.backend.lookup_marker(
-                &payload.namespace,
-                &payload.table,
+                &template.source.target.namespace,
+                &template.source.target.table,
                 &marker.target_ref,
                 &marker.operation_id_hex,
                 &marker.identity_digest_hex,
@@ -1014,27 +1260,27 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                         ConnectorMutationFailureKind::Unavailable,
                         "An existing data mutation marker has no original local dispatch journal",
                     ),
-                    evidence: self.evidence(&request.plan, payload)?,
+                    evidence: template.evidence(RecoveryPublication::MarkerOnly {})?,
                 },
                 Ok(MarkerLookup::Conflicting) => ExternalMutationOutcome::CommitUnknown {
                     failure: failure(
                         ConnectorMutationFailureKind::Conflict,
                         "Iceberg data mutation marker conflicts with this operation",
                     ),
-                    evidence: self.evidence(&request.plan, payload)?,
+                    evidence: template.evidence(RecoveryPublication::MarkerOnly {})?,
                 },
-                Ok(MarkerLookup::Missing) => {
-                    self.backend
-                        .execute(&cached.private, &marker, &template, &request.context)?
-                }
+                Ok(MarkerLookup::Missing) => self.backend.execute(
+                    &cached.private,
+                    condition,
+                    &marker,
+                    &template,
+                    &request.context,
+                )?,
                 Err(error) => {
-                    let failure = if cached.private.is_main_truncate()
-                        && error.kind() == ConnectorErrorKind::NotFound
+                    let failure = if error.kind() == ConnectorErrorKind::NotFound
+                        && let Some(operation) = cached.private.main_update_operation()
                     {
-                        crate::commit::commit_failure::validation_failure(
-                            crate::commit::model::CommitOperation::Truncate,
-                            "Iceberg commit target table does not exist",
-                        )
+                        validation_failure(operation, "Iceberg commit target table does not exist")
                     } else {
                         crate::commit::attempt::before_dispatch_failure(&publication::format_error(
                             error,
@@ -1054,7 +1300,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 &self.key,
             )?
         };
-        let outcome = project_truncate_unknown(&cached.private, outcome);
+        let outcome = project_update_outcome(&cached.private, outcome);
         self.terminal
             .lock()
             .map_err(|error| internal(format!("Iceberg data mutation terminal lock: {error}")))?
@@ -1100,22 +1346,37 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             ));
         }
         let fresh_context;
-        let observation_context = if request.operation_kind.as_ref()
-            == novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND
-        {
+        let observation_context = if matches!(
+            request.operation_kind.as_ref(),
+            novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND | DELETE_KIND
+        ) {
             fresh_context = request.context.clone().after_external_effect();
             &fresh_context
         } else {
             &request.context
         };
-        match self.backend.lookup_marker(
+        let observed = self.backend.lookup_marker(
             &evidence.namespace,
             &evidence.table,
             &evidence.target_ref,
             &evidence.operation_id_hex,
             &evidence.identity_digest_hex,
             observation_context,
-        )? {
+        );
+        let observed = match observed {
+            Err(error) if request.operation_kind.as_ref() == DELETE_KIND => {
+                return Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: original_commit_failure(
+                        CommitOperation::Delete,
+                        CommitFailureKind::Unknown,
+                        ConnectorMutationFailure::from_connector(error),
+                    ),
+                    evidence: request.evidence,
+                });
+            }
+            other => other?,
+        };
+        match observed {
             MarkerLookup::Matching { observation } => {
                 let descriptor = journal
                     .entry_descriptor(entry)
@@ -1191,25 +1452,28 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
     }
 }
 
-fn project_truncate_unknown(
+fn project_update_outcome(
     planned: &PlannedIcebergMutation,
     outcome: ExternalMutationOutcome<ConnectorDataMutationReceipt>,
 ) -> ExternalMutationOutcome<ConnectorDataMutationReceipt> {
-    if !planned.is_main_truncate() {
+    let Some(operation) = planned.main_update_operation() else {
         return outcome;
-    }
+    };
     match outcome {
         ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
-            use crate::commit::commit_failure::{CommitFailureKind, original_commit_failure};
-            use crate::commit::model::CommitOperation;
-
             ExternalMutationOutcome::CommitUnknown {
-                failure: original_commit_failure(
-                    CommitOperation::Truncate,
-                    CommitFailureKind::Unknown,
-                    failure,
-                ),
+                failure: original_commit_failure(operation, CommitFailureKind::Unknown, failure),
                 evidence,
+            }
+        }
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup }
+            if operation == CommitOperation::Delete
+                && failure.kind() == ConnectorMutationFailureKind::Unavailable
+                && failure.failure_fact().reason() != connector_reason::ICEBERG_COMMIT_ERROR =>
+        {
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: original_commit_failure(operation, CommitFailureKind::Rejected, failure),
+                cleanup,
             }
         }
         other => other,
@@ -1221,10 +1485,16 @@ fn unknown_reconciliation_failure(
     kind: ConnectorMutationFailureKind,
     detail: &'static str,
 ) -> ConnectorMutationFailure {
-    if request.operation_kind.as_ref() == novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND {
-        publication::registration_unknown(detail)
-    } else {
-        failure(kind, detail)
+    match request.operation_kind.as_ref() {
+        novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND => {
+            publication::registration_unknown(detail)
+        }
+        DELETE_KIND => original_commit_failure(
+            CommitOperation::Delete,
+            CommitFailureKind::Unknown,
+            failure(kind, detail),
+        ),
+        _ => failure(kind, detail),
     }
 }
 

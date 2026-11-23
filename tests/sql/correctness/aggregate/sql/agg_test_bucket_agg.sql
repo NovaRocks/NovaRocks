@@ -170,7 +170,7 @@ CREATE TABLE "t2" (
 -- query 33
 -- @skip_result_check=true
 USE ${case_db};
-insert into t2 select * from t1 where crc32(c0) % 96 = 95;
+insert into t2 select * from t1 where crc32(to_utf8(c0)) % 96 = 95;
 
 -- query 34
 USE ${case_db};
