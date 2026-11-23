@@ -1437,39 +1437,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_date_add_interval_spelled_as_a_float_targets_int64() {
-        let resolved =
-            resolve_scalar_function_signature("date_add", &[DataType::Utf8, DataType::Float64])
-                .expect("an interval opted in to coercion reads a float as a number");
-
-        assert_eq!(
-            resolved.argument_types,
-            vec![DataType::Utf8, DataType::Int64]
-        );
-        assert_eq!(
-            resolved.return_type,
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-    }
-
-    #[test]
-    fn resolve_date_add_keeps_a_datetime_first_argument_over_the_string_overload() {
-        let resolved = resolve_scalar_function_signature(
-            "date_add",
-            &[
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                DataType::Utf8,
-            ],
-        )
-        .expect("coercion applies to the interval, not to the shifted value");
-
-        assert_eq!(
-            resolved.argument_types,
+    fn legacy_resolver_does_not_bind_date_add() {
+        for arguments in [
+            vec![DataType::Utf8, DataType::Float64],
             vec![
+                DataType::Utf8,
+                DataType::Int64,
                 DataType::Timestamp(TimeUnit::Microsecond, None),
-                DataType::Int64
-            ]
-        );
+            ],
+        ] {
+            assert!(matches!(
+                resolve_scalar_function_signature("date_add", &arguments),
+                Err(ResolveError::UnknownFunction)
+            ));
+        }
     }
 
     #[test]
