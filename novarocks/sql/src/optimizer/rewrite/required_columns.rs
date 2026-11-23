@@ -222,7 +222,15 @@ fn collect_scalar_column_id_refs_inner(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             collect_scalar_column_id_refs_inner(arena, *body, out);
         }
-        ScalarNode::AggregateCall { args, order_by, .. } => {
+        ScalarNode::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                collect_scalar_column_id_refs_inner(arena, *predicate, out);
+            }
             for arg in args {
                 collect_scalar_column_id_refs_inner(arena, *arg, out);
             }
@@ -429,11 +437,20 @@ fn tag_aggregate(
         }
         for agg in &node.aggregates {
             if needed.contains(&agg.output_column_id) {
-                for &arg in agg.source.arguments() {
-                    required_inputs.extend(collect_scalar_column_id_refs(arena, arg));
+                required_inputs.extend(agg.source.filter_input());
+                for (ordinal, &arg) in agg.source.arguments().iter().enumerate() {
+                    if let Some(column) = agg.source.projected_argument(ordinal) {
+                        required_inputs.insert(column);
+                    } else {
+                        required_inputs.extend(collect_scalar_column_id_refs(arena, arg));
+                    }
                 }
-                for item in agg.source.order_by() {
-                    required_inputs.extend(collect_scalar_column_id_refs(arena, item.expr));
+                for (ordinal, item) in agg.source.order_by().iter().enumerate() {
+                    if let Some(column) = agg.source.projected_order_key(ordinal) {
+                        required_inputs.insert(column);
+                    } else {
+                        required_inputs.extend(collect_scalar_column_id_refs(arena, item.expr));
+                    }
                 }
             }
         }

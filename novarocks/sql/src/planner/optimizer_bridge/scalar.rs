@@ -929,12 +929,19 @@ pub(crate) fn intern_typed(
             body: intern_typed(arena, body, control)?,
         },
         ExprKind::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ScalarNode::AggregateCall {
+            occurrence: Some(occurrence.clone()),
+            filter: filter
+                .as_deref()
+                .map(|expr| intern_typed(arena, expr, control))
+                .transpose()?,
             name: name.clone(),
             args: args
                 .iter()
@@ -1128,12 +1135,18 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             body: novarocks_parser::ast::AstBox::new(materialize(arena, *body)),
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => ExprKind::AggregateCall {
+            occurrence: occurrence
+                .clone()
+                .unwrap_or_else(crate::analysis::AggregateOccurrence::new),
+            filter: filter.map(|id| novarocks_parser::ast::AstBox::new(materialize(arena, id))),
             name: name.clone(),
             args: args.iter().map(|a| materialize(arena, *a)).collect(),
             distinct: *distinct,

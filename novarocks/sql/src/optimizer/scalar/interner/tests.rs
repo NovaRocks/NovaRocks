@@ -432,6 +432,8 @@ fn forced_collisions_preserve_scalar_aggregate_and_window_call_policies() {
                     volatility: super::super::FunctionVolatility::Immutable,
                 },
                 1 => ScalarNode::AggregateCall {
+                    occurrence: None,
+                    filter: None,
                     name: "sum".into(),
                     args: vec![argument],
                     distinct: false,

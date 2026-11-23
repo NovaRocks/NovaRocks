@@ -157,12 +157,17 @@ fn rewrite_children(
             volatility,
         },
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
             order_by,
             resolved,
         } => {
+            if filter.is_some() {
+                return Ok(None);
+            }
             let args = mapped!(
                 args.into_iter()
                     .map(|arg| rewrite(arena, arg))
@@ -180,6 +185,8 @@ fn rewrite_children(
                 mapped_order_by.push(key);
             }
             ScalarNode::AggregateCall {
+                occurrence,
+                filter,
                 name,
                 args,
                 distinct,
@@ -455,6 +462,8 @@ mod tests {
         let nm = names(&[(1, "a")]);
         let agg = |distinct: bool| TypedExpr {
             kind: ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "count".to_string(),
                 args: (vec![col_ref(&a)]).into(),
                 distinct,
@@ -801,6 +810,8 @@ mod tests {
         TypedExpr {
             value_type: value_type.clone(),
             kind: ExprKind::AggregateCall {
+                occurrence: crate::analysis::AggregateOccurrence::new(),
+                filter: None,
                 name: "array_agg".into(),
                 args: (args).into(),
                 distinct: false,

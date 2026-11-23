@@ -345,6 +345,23 @@ pub(crate) struct ResolvedValues {
 // Typed expressions (all nodes carry resolved DataType)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+pub struct AggregateOccurrence(std::sync::Arc<()>);
+
+impl AggregateOccurrence {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(()))
+    }
+
+    pub(crate) fn identity(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0).addr()
+    }
+
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Debug)]
 pub struct TypedExpr {
     pub kind: ExprKind,
@@ -636,6 +653,8 @@ pub enum ExprKind {
     },
     /// Aggregate function call.
     AggregateCall {
+        occurrence: AggregateOccurrence,
+        filter: Option<AstBox<TypedExpr>>,
         name: String,
         args: AstVec<TypedExpr>,
         distinct: bool,

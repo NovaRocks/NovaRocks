@@ -1,0 +1,35 @@
+-- query 2
+-- types	integer	bigint	bigint	bigint	bigint
+g	n	p_rows	p_values	q_sum
+1	4	2	1	70
+2	2	0	0	NULL
+
+-- query 3
+-- types	bigint	bigint
+n	total
+0	NULL
+
+-- query 4
+-- types	integer	bigint
+x	n
+
+-- query 5
+-- types	bigint	array(integer)
+distinct_x	ordered_x
+2	[8,null,7]
+
+-- query 6
+-- types	bigint	bigint
+untyped_null	boolean_null
+0	0
+
+-- query 7
+-- types	integer	bigint
+g	large_rows
+1	2
+2	1
+
+-- query 18
+-- types	bigint
+total
+5

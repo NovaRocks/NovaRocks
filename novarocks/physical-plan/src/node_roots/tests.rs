@@ -127,6 +127,7 @@ fn function(kind: FunctionKind) -> BoundFunction {
 }
 fn aggregate() -> AggregateCall {
     AggregateCall {
+        filter_root: None,
         id: AggregateCallId::new(0),
         binding: AggregateBinding {
             state_interpretation: None,

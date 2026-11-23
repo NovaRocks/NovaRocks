@@ -3077,9 +3077,10 @@ fn render_node_contract(
             ));
             lines.push(format_args!(
                 "{pad}  calls=[{}]",
-                joined(calls, "; ", |call: &novarocks_physical_plan::AggregateCall, formatter: &mut fmt::Formatter<'_>| write!(
+                joined(calls, "; ", |call: &novarocks_physical_plan::AggregateCall, formatter: &mut fmt::Formatter<'_>| {
+                    write!(
                         formatter,
-                        "a{}:{}@{} phase={} args=[{}] distinct={} order-by=[{}] ->v{}",
+                        "a{}:{}@{} phase={} args=[{}] distinct={} order-by=[{}]",
                         call.id.get(),
                         call.binding.function.function_id.as_str(),
                         call.binding.function.overload.as_str(),
@@ -3087,8 +3088,16 @@ fn render_node_contract(
                         joined(&call.arguments, ", ", |expression: &RootOrdinal, output: &mut fmt::Formatter<'_>| format_root(plan, fragment_id, fragment, node.id, *expression).fmt(output)),
                         call.distinct,
                         format_sort_exprs(plan, fragment_id, fragment, node.id, &call.order_by),
-                        context.value_name(fragment_id, call.output)
-                    ))
+                    )?;
+                    if let Some(predicate) = call.filter_root {
+                        write!(
+                            formatter,
+                            " filter=[{}]",
+                            format_root(plan, fragment_id, fragment, node.id, predicate),
+                        )?;
+                    }
+                    write!(formatter, " ->v{}", context.value_name(fragment_id, call.output))
+                })
             ));
         }
         NodeKind::ExchangeSource { edge, imports } => lines.push(format_args!(

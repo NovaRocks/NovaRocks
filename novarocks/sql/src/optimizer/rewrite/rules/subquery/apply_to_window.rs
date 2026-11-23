@@ -389,7 +389,7 @@ fn check_preconditions_opt(
         return None;
     }
     let inner_agg = agg.aggregates[0].clone();
-    if inner_agg.distinct {
+    if inner_agg.distinct || inner_agg.source.has_projected_inputs() {
         return None;
     }
     if !WHITELIST.contains(&inner_agg.name.as_str()) {

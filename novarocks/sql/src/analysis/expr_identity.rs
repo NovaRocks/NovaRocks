@@ -41,6 +41,100 @@ pub(crate) fn typed_expr_semantically_eq(
     result
 }
 
+/// Whether a separately written occurrence can share evaluation in the same row domain.
+#[recursive::recursive]
+pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
+    use super::{BinOp, UnOp};
+    let share = expression_can_share_evaluation;
+    let result_type = &expr.value_type;
+    match &expr.kind {
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::Constant(_) => true,
+        ExprKind::FunctionCall { binding, args, .. } => {
+            binding.semantics.volatility.is_replica_deterministic()
+                && !crate::optimizer::scalar_expr::scalar_call_can_fail(binding)
+                && args.iter().all(share)
+        }
+        ExprKind::BinaryOp {
+            left, op, right, ..
+        } => {
+            matches!(
+                op,
+                BinOp::And
+                    | BinOp::Or
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+            ) && share(left)
+                && share(right)
+        }
+        ExprKind::UnaryOp {
+            op: UnOp::Not,
+            expr,
+        }
+        | ExprKind::Nested(expr)
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::LambdaFunction { body: expr, .. }
+        | ExprKind::Lambda { body: expr, .. } => share(expr),
+        ExprKind::Cast {
+            expr,
+            decimal_overflow_policy,
+            cast_mode,
+            ..
+        } => {
+            !crate::optimizer::scalar_expr::scalar_cast_can_fail(
+                &expr.value_type,
+                result_type,
+                *decimal_overflow_policy,
+                *cast_mode,
+            ) && share(expr)
+        }
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => aggregate_inputs_can_share_evaluation(args, order_by, filter.as_deref()),
+        ExprKind::InList { expr, list, .. } => share(expr) && list.iter().all(share),
+        ExprKind::Between {
+            expr, low, high, ..
+        } => share(expr) && share(low) && share(high),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_none_or(share)
+                && else_expr.as_deref().is_none_or(share)
+                && when_then
+                    .iter()
+                    .all(|(when, then)| share(when) && share(then))
+        }
+        ExprKind::Like { .. }
+        | ExprKind::WindowCall { .. }
+        | ExprKind::SubqueryPlaceholder { .. } => false,
+    }
+}
+
+pub(crate) fn aggregate_inputs_can_share_evaluation(
+    args: &[TypedExpr],
+    order_by: &[SortItem],
+    filter: Option<&TypedExpr>,
+) -> bool {
+    args.iter().all(expression_can_share_evaluation)
+        && order_by
+            .iter()
+            .all(|item| expression_can_share_evaluation(&item.expr))
+        && filter.is_none_or(expression_can_share_evaluation)
+}
+
 #[recursive::recursive]
 fn typed_expr_semantically_eq_with(
     left: &TypedExpr,
@@ -178,6 +272,8 @@ fn typed_expr_semantically_eq_with(
                 distinct: left_distinct,
                 order_by: left_order_by,
                 resolved: left_resolved,
+                filter: left_filter,
+                occurrence: left_occurrence,
             },
             ExprKind::AggregateCall {
                 name: right_name,
@@ -185,9 +281,23 @@ fn typed_expr_semantically_eq_with(
                 distinct: right_distinct,
                 order_by: right_order_by,
                 resolved: right_resolved,
+                filter: right_filter,
+                occurrence: right_occurrence,
             },
         ) => {
-            left_resolved == right_resolved
+            let same_filter = match (left_filter.as_deref(), right_filter.as_deref()) {
+                (None, None) => true,
+                (Some(left), Some(right)) => typed_expr_semantically_eq_with(left, right, work)?,
+                _ => false,
+            };
+            same_filter
+                && (left_occurrence.same(right_occurrence)
+                    || aggregate_inputs_can_share_evaluation(
+                        left_args,
+                        left_order_by,
+                        left_filter.as_deref(),
+                    ))
+                && left_resolved == right_resolved
                 && left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
                 && typed_expr_slices_semantically_eq_with(left_args, right_args, work)?

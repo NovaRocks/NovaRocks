@@ -355,6 +355,7 @@ pub(crate) fn add_aggregate(
             .unwrap();
         columns.push(output);
         physical_calls.push(AggregateCall {
+            filter_root: None,
             id: call.id,
             binding: call.bound.binding(call.phase),
             arguments: arguments.into_boxed_slice(),

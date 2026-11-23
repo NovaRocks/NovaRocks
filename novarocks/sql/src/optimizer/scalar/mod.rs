@@ -118,6 +118,8 @@ pub(crate) enum ScalarNode {
         body: ScalarId,
     },
     AggregateCall {
+        occurrence: Option<crate::analysis::AggregateOccurrence>,
+        filter: Option<ScalarId>,
         name: String,
         args: Vec<ScalarId>,
         distinct: bool,
@@ -1488,6 +1490,8 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::AggregateCall {
+                    occurrence: crate::analysis::AggregateOccurrence::new(),
+                    filter: None,
                     name: "sum".to_string(),
                     args: (vec![col(5, DataType::Int64)]).into(),
                     distinct: true,

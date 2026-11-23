@@ -1249,7 +1249,11 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
             if usage.exhausted() {
                 return Ok(());
             }
-            usage.add_item_counts([call.arguments.len(), call.order_by.len()]);
+            usage.add_item_counts([
+                call.arguments.len(),
+                call.order_by.len(),
+                usize::from(call.filter_root.is_some()),
+            ]);
             add_aggregate_binding_usage_core(
                 &call.binding,
                 &format!("{path}.calls[{index}].binding"),

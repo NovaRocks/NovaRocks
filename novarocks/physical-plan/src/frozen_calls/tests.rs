@@ -658,6 +658,7 @@ fn special_fixture_with_rows(
             .unwrap();
         outputs.push(output);
         aggregate_calls.push(AggregateCall {
+            filter_root: None,
             id,
             binding: AggregateBinding {
                 state_interpretation: None,
@@ -848,6 +849,7 @@ fn wide_relation_fixture(count: usize) -> Fixture {
             .unwrap();
         outputs.push(output);
         specifications.push(AggregateCall {
+            filter_root: None,
             id: call,
             binding: AggregateBinding {
                 state_interpretation: None,

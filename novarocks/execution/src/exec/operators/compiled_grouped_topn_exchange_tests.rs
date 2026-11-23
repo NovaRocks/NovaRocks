@@ -142,6 +142,7 @@ fn grouped_stage(
             .unwrap();
         output.push(value);
         calls.push(AggregateCall {
+            filter_root: None,
             id,
             binding: bound.binding(phase),
             arguments: Box::from([argument]),

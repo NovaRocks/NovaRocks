@@ -70,11 +70,10 @@ impl Rule for SplitDistinctAgg {
         // aggregates like `array_agg(distinct x order by y)` lose `y` in the
         // GLOBAL phase. Fall back to the single-stage aggregate for semantic
         // correctness until multi-phase ordered DISTINCT is implemented.
-        if agg
-            .aggregates
-            .iter()
-            .any(|call| !call.source.order_by().is_empty())
-        {
+        if agg.aggregates.iter().any(|call| {
+            !call.source.order_by().is_empty()
+                || (call.distinct && call.source.has_projected_inputs())
+        }) {
             return Ok(vec![]);
         }
 

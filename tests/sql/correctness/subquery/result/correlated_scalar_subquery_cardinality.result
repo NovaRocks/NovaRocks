@@ -2,3 +2,8 @@
 -- types	integer	integer
 id	v
 1	100
+
+-- query 5
+-- types	bigint
+qualifying_rows
+1

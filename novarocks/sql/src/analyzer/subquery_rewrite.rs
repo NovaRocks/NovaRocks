@@ -130,6 +130,8 @@ fn value_form_marker_query(
                 field_name: Some(marker_col_name.clone()),
                 expr: TypedExpr {
                     kind: ExprKind::AggregateCall {
+                        occurrence: crate::analysis::AggregateOccurrence::new(),
+                        filter: None,
                         name: "max".to_string(),
                         args: (vec![TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -2613,6 +2615,8 @@ impl<'a> AnalyzerContext<'a> {
                     field_name: Some(name.clone()),
                     expr: TypedExpr {
                         kind: ExprKind::AggregateCall {
+                            occurrence: crate::analysis::AggregateOccurrence::new(),
+                            filter: None,
                             name: "array_agg".to_string(),
                             args: (vec![argument]).into(),
                             distinct: false,
@@ -3094,16 +3098,17 @@ impl<'a> AnalyzerContext<'a> {
             ast::SetExpr::Select(s) => {
                 let (sel, cols, inner_scope) =
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
-                let body = QueryBody::Select(sel);
+                let mut body = QueryBody::Select(sel);
 
-                let order_by = ctx.analyze_order_by(
+                let mut order_by = ctx.analyze_order_by(
                     modifiers.order_by.as_ref(),
                     select,
                     query.span,
                     &cols,
                     &body,
                 )?;
-                if let QueryBody::Select(select) = &body {
+                if let QueryBody::Select(select) = &mut body {
+                    ctx.rewrite_order_aggregate_subqueries(select, &mut order_by)?;
                     ctx.validate_grouping_calls(&select.group_by)?;
                 }
                 let limit = super::helpers::extract_limit(modifiers)?;
@@ -3262,7 +3267,12 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- Detect aggregation ---
         let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
-        let has_aggregation = !group_by.is_empty() || has_agg_in_select;
+        let has_aggregation = !group_by.is_empty()
+            || has_agg_in_select
+            || select
+                .having
+                .as_ref()
+                .is_some_and(|expr| self.expr_contains_aggregate(expr));
 
         if let Some(state) = self.grouping_scope.borrow().as_ref() {
             state.enabled.set(true);
@@ -3270,6 +3280,7 @@ impl<'a> AnalyzerContext<'a> {
         // --- HAVING ---
         let having = match &select.having {
             Some(expr) => {
+                let prior_subqueries = self.collected_subqueries.borrow().len();
                 let analyzed = self.analyze_expr(expr, &merged_scope);
                 match analyzed {
                     Ok(h) => Some(qualify_inner_shadowing_column_refs(
@@ -3279,6 +3290,9 @@ impl<'a> AnalyzerContext<'a> {
                     )),
                     Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
+                        self.collected_subqueries
+                            .borrow_mut()
+                            .truncate(prior_subqueries);
                         let mut alias_scope = merged_scope.clone();
                         for item in &projection {
                             self.check_control()?;
@@ -3329,6 +3343,17 @@ impl<'a> AnalyzerContext<'a> {
             let mut mutable_inner = inner_scope.clone();
             for sq_info in nested_sqs {
                 self.check_control()?;
+                if matches!(sq_info.kind, SubqueryKind::Scalar)
+                    && locate_scalar_placeholder_clause(&resolved_select, sq_info.id)
+                        == Some(crate::analysis::ApplyClause::AggregateInput)
+                    && self.collect_scalar_apply_spec(
+                        &mut resolved_select,
+                        &mut merged_scope.clone(),
+                        &sq_info,
+                    )?
+                {
+                    continue;
+                }
                 self.rewrite_single_subquery(&mut resolved_select, &mut mutable_inner, sq_info)?;
             }
         }
@@ -3622,6 +3647,8 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
@@ -3631,6 +3658,14 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::AggregateCall {
+                occurrence,
+                filter: filter.map(|value| {
+                    ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                        value.into_inner(),
+                        inner_scope,
+                        outer_scope,
+                    ))
+                }),
                 name,
                 args: args
                     .into_iter()
@@ -3941,7 +3976,15 @@ fn collect_outer_ref_column_ids(
                 collect_outer_ref_column_ids(arg, inner_scope, outer_scope, out);
             }
         }
-        ExprKind::AggregateCall { args, order_by, .. } => {
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                collect_outer_ref_column_ids(predicate, inner_scope, outer_scope, out);
+            }
             for arg in args {
                 collect_outer_ref_column_ids(arg, inner_scope, outer_scope, out);
             }
@@ -4236,7 +4279,15 @@ fn walk_for_outer_ref(
                 walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
             }
         }
-        ExprKind::AggregateCall { args, order_by, .. } => {
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let Some(predicate) = filter {
+                walk_for_outer_ref(predicate, inner_scope, outer_scope, saw_outer);
+            }
             for a in args {
                 walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
             }
@@ -4699,6 +4750,17 @@ fn locate_scalar_placeholder_clause(
     if select
         .having
         .as_ref()
+        .is_some_and(|f| placeholder_is_aggregate_input(f, placeholder_id))
+        || select
+            .projection
+            .iter()
+            .any(|p| placeholder_is_aggregate_input(&p.expr, placeholder_id))
+    {
+        return Some(crate::analysis::ApplyClause::AggregateInput);
+    }
+    if select
+        .having
+        .as_ref()
         .map(|f| expr_contains_placeholder(f, placeholder_id))
         .unwrap_or(false)
     {
@@ -4709,13 +4771,6 @@ fn locate_scalar_placeholder_clause(
         .iter()
         .any(|p| expr_contains_placeholder(&p.expr, placeholder_id))
     {
-        if select
-            .projection
-            .iter()
-            .any(|p| placeholder_is_aggregate_input(&p.expr, placeholder_id))
-        {
-            return Some(crate::analysis::ApplyClause::AggregateInput);
-        }
         return Some(crate::analysis::ApplyClause::Projection);
     }
     None
@@ -4727,11 +4782,20 @@ fn locate_scalar_placeholder_clause(
 /// subquery used as an aggregate argument instead has to be evaluated on the
 /// aggregate input, otherwise the Aggregate references a column its child does
 /// not produce.
-fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bool {
+pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bool {
     match &expr.kind {
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            args.iter()
-                .any(|arg| expr_contains_placeholder(arg, placeholder_id))
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            filter
+                .as_ref()
+                .is_some_and(|value| expr_contains_placeholder(value, placeholder_id))
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_placeholder(arg, placeholder_id))
                 || order_by
                     .iter()
                     .any(|item| expr_contains_placeholder(&item.expr, placeholder_id))
@@ -4930,7 +4994,7 @@ fn collect_column_ids_in_expr(expr: &TypedExpr, out: &mut Vec<crate::column_id::
 
 /// Recursively walk a TypedExpr looking for any `SubqueryPlaceholder` whose
 /// id matches `placeholder_id`.
-fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
+pub(super) fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
     if is_placeholder(expr, placeholder_id) {
         return true;
     }
@@ -4943,9 +5007,19 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
         ExprKind::IsNull { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::Cast { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::Nested(inner) => expr_contains_placeholder(inner, placeholder_id),
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => args
+        ExprKind::FunctionCall { args, .. } => args
             .iter()
-            .any(|a| expr_contains_placeholder(a, placeholder_id)),
+            .any(|arg| expr_contains_placeholder(arg, placeholder_id)),
+        ExprKind::AggregateCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => args
+            .iter()
+            .chain(order_by.iter().map(|item| &item.expr))
+            .chain(filter.as_deref())
+            .any(|value| expr_contains_placeholder(value, placeholder_id)),
         ExprKind::InList {
             expr: inner, list, ..
         } => {
@@ -5392,6 +5466,8 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
@@ -5401,13 +5477,28 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::AggregateCall {
+                occurrence: occurrence.clone(),
+                filter: filter.as_ref().map(|value| {
+                    ast::AstBox::new(replace_placeholder_in_expr(
+                        value,
+                        placeholder_id,
+                        replacement,
+                    ))
+                }),
                 name: name.clone(),
                 args: args
                     .iter()
                     .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
                     .collect(),
                 distinct: *distinct,
-                order_by: order_by.clone(),
+                order_by: order_by
+                    .iter()
+                    .map(|item| SortItem {
+                        expr: replace_placeholder_in_expr(&item.expr, placeholder_id, replacement),
+                        asc: item.asc,
+                        nulls_first: item.nulls_first,
+                    })
+                    .collect(),
                 resolved: resolved.clone(),
             },
         },

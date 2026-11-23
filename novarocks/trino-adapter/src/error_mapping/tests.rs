@@ -71,6 +71,8 @@ const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("TYPE_MISMATCH", 58, "USER_ERROR"),
     ("INVALID_LITERAL", 59, "USER_ERROR"),
     ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
+    ("FUNCTION_NOT_AGGREGATE", 72, "USER_ERROR"),
+    ("EXPRESSION_NOT_SCALAR", 74, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
     ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
     ("DUPLICATE_PROPERTY", 79, "USER_ERROR"),
@@ -185,6 +187,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
         "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
+        "sql.analyze.function_not_aggregate" => "FUNCTION_NOT_AGGREGATE",
+        "sql.analyze.expression_not_scalar" => "EXPRESSION_NOT_SCALAR",
         "sql.admit.unknown_type" => "TYPE_NOT_FOUND",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
@@ -302,6 +306,22 @@ fn column_and_view_analysis_errors_preserve_their_trino_wire_identity() {
             wire.message,
             format!("[{}] {detail} at line 1 column 1", analysis.code())
         );
+    }
+}
+
+#[test]
+fn aggregate_filter_errors_keep_trino_codes() {
+    for (source, expected) in [
+        (
+            "sql.analyze.function_not_aggregate",
+            (72, "FUNCTION_NOT_AGGREGATE", "USER_ERROR"),
+        ),
+        (
+            "sql.analyze.expression_not_scalar",
+            (74, "EXPRESSION_NOT_SCALAR", "USER_ERROR"),
+        ),
+    ] {
+        assert_eq!(user_code(source).unwrap().fields(), expected);
     }
 }
 

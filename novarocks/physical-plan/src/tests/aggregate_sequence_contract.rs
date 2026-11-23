@@ -347,6 +347,7 @@ fn add_aggregate_with_grouping(
             kind: NodeKind::Aggregate {
                 group_by: group_by.into_boxed_slice(),
                 calls: Box::from([AggregateCall {
+                    filter_root: None,
                     id: call_id,
                     binding,
                     arguments: Box::from([argument_expression]),
@@ -632,6 +633,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
                 )
                 .unwrap();
             AggregateCall {
+                filter_root: None,
                 id: call_id,
                 binding: aggregate_binding(
                     AggregatePhase::Final { sequence: SEQUENCE },
@@ -1244,6 +1246,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
             )
         });
     let call = AggregateCall {
+        filter_root: None,
         id: call_id,
         binding: aggregate_binding(phase, BindingDrift::None),
         arguments: state_root.into_iter().collect(),

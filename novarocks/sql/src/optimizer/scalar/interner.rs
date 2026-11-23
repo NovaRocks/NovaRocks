@@ -277,6 +277,8 @@ fn node_fields<'a>(
             f.id(*body)?;
         }
         ScalarNode::AggregateCall {
+            occurrence,
+            filter,
             name,
             args,
             distinct,
@@ -284,6 +286,11 @@ fn node_fields<'a>(
             resolved,
         } => {
             f.number(7)?;
+            f.boolean(occurrence.is_some())?;
+            if let Some(occurrence) = occurrence {
+                f.number(occurrence.identity() as u128)?;
+            }
+            f.optional_id(*filter)?;
             f.text(name)?;
             f.ids(args)?;
             f.boolean(*distinct)?;

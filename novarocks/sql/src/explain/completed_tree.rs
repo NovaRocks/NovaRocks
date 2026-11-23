@@ -1377,7 +1377,15 @@ impl TreeContext<'_> {
                             function_text(&call.binding.function.function_id),
                             if call.distinct { "DISTINCT " } else { "" },
                             self.expressions(fragment, node.id, &call.arguments, ", ")
-                        )
+                        )?;
+                        if let Some(predicate) = call.filter_root {
+                            write!(
+                                f,
+                                " FILTER (WHERE {})",
+                                self.expr(fragment, node.id, predicate)
+                            )?;
+                        }
+                        Ok(())
                     });
                     out.push(format_args!("{pad}  aggregations: {aggregates}"))?;
                 }

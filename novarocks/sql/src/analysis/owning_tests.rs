@@ -170,6 +170,8 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             volatility: crate::functions::FunctionVolatility::Immutable,
         },
         18 => ExprKind::AggregateCall {
+            occurrence: crate::analysis::AggregateOccurrence::new(),
+            filter: None,
             name: "owning".into(),
             args: vec![marker(), child].into(),
             distinct: true,
@@ -177,6 +179,8 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             resolved: binding(),
         },
         19 => ExprKind::AggregateCall {
+            occurrence: crate::analysis::AggregateOccurrence::new(),
+            filter: None,
             name: "owning".into(),
             args: vec![marker()].into(),
             distinct: true,

@@ -32,8 +32,8 @@ use {
 };
 
 use super::{
-    AggregateRuntimeDemand, ContractLoweringError, LoweredAggregateSourceEntry,
-    LoweredExpressionSourceEntry, ScalarSourceSite, SqlLogicalSourceJournal,
+    ContractLoweringError, LoweredAggregateSourceEntry, LoweredExpressionSourceEntry,
+    ScalarSourceSite, SqlLogicalSourceJournal,
 };
 
 /// Construction-only routing. Scalar requests move straight into their actual
@@ -268,7 +268,7 @@ fn aggregate_request<'a>(
         detail: "neutral aggregate request has no authenticated logical source",
     })?;
     let update = entry.phase.consumes_logical_arguments();
-    let same_runtime = update == matches!(entry.runtime, AggregateRuntimeDemand::Update);
+    let same_runtime = update == entry.runtime.updates_rows();
     work.step()?;
     if !same_runtime {
         return Err(ContractLoweringError::InvalidAggregate {

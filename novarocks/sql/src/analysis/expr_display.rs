@@ -278,8 +278,17 @@ fn expression(
             args,
             distinct,
             order_by,
+            filter,
             ..
-        } => aggregate(name, args, *distinct, order_by, out),
+        } => {
+            aggregate(name, args, *distinct, order_by, out)?;
+            if let Some(predicate) = filter {
+                out.append(" FILTER (WHERE ")?;
+                expression(predicate, false, out)?;
+                out.append(")")?;
+            }
+            Ok(())
+        }
         ExprKind::Cast {
             expr: inner,
             target,

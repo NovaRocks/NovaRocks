@@ -44,3 +44,16 @@ g	negated
 0	-2
 0	-1
 1	NULL
+
+-- query 9
+-- types	integer	integer	bigint	bigint	bigint	bigint
+g	a	original_nulls	positive_keys	none_count	none_sum
+0	NULL	1	NULL	0	NULL
+0	1	0	30	0	NULL
+0	2	0	30	0	NULL
+1	NULL	1	60	0	NULL
+
+-- query 10
+-- types	bigint	bigint	bigint
+groups_seen	nonnull_values	distinct_values
+2	2	1

@@ -724,6 +724,7 @@ fn eliminated_count_value(
     if !aggregate.name.eq_ignore_ascii_case("count")
         || !is_builtin_count_binding(aggregate.source.binding())
         || aggregate.distinct
+        || aggregate.source.has_projected_inputs()
         || !aggregate.source.order_by().is_empty()
     {
         return Ok(None);
@@ -790,7 +791,10 @@ fn rewrite_eliminated_aggregate_expr(
             order_by,
             args,
             resolved,
-        } if name.eq_ignore_ascii_case("count")
+            filter,
+            ..
+        } if filter.is_none()
+            && name.eq_ignore_ascii_case("count")
             && is_builtin_count_binding(&resolved)
             && !distinct
             && order_by.is_empty() =>
@@ -1512,6 +1516,8 @@ mod tests {
             );
             let direct = arena.borrow_mut().intern(
                 ScalarNode::AggregateCall {
+                    occurrence: None,
+                    filter: None,
                     name: spec.name.clone(),
                     args: spec.source.arguments().to_vec(),
                     distinct: false,
@@ -1573,6 +1579,8 @@ mod tests {
         let spec = &aggregate.aggregates[0];
         let direct = arena.borrow_mut().intern(
             ScalarNode::AggregateCall {
+                occurrence: None,
+                filter: None,
                 name: spec.name.clone(),
                 args: spec.source.arguments().to_vec(),
                 distinct: false,

@@ -408,7 +408,19 @@ pub(crate) fn lower_call<H>(
         work.step()?;
     }
     let frozen = freeze_binding_with_creation(binding, work, creation)?;
+    let filter_root = call
+        .filter_root
+        .map(|root| {
+            expressions
+                .get(&root)
+                .copied()
+                .ok_or(FragmentCompileError::Invalid(
+                    "missing lowered aggregate filter input",
+                ))
+        })
+        .transpose()?;
     Ok(StaticAggregateCall {
+        filter_root,
         frozen: Some(frozen),
         state_interpretation: binding
             .state_interpretation

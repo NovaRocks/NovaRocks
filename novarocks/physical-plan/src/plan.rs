@@ -538,6 +538,7 @@ pub enum NestLoopJoinDistribution {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregateCall {
+    pub filter_root: Option<RootOrdinal>,
     pub id: AggregateCallId,
     pub binding: AggregateBinding,
     pub arguments: Box<[RootOrdinal]>,

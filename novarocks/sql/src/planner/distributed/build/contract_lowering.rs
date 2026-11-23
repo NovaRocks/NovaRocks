@@ -1906,6 +1906,21 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(LoweredAggregateLogicalSource::Captured(captured))
     }
 
+    fn lower_projected_aggregate_input(
+        &mut self,
+        node: NodeId,
+        column: ColumnId,
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<(ExprId, ValueId), ContractLoweringError> {
+        let value = visible
+            .get(&column)
+            .copied()
+            .ok_or(ContractLoweringError::UnknownColumnReference(column))?;
+        let ty = self.value_declared_type(value)?;
+        let definition = self.add_unscoped_expression(node, ty, ContractExprKind::Value(value))?;
+        Ok((definition, value))
+    }
+
     fn lower_captured_aggregate_argument(
         &mut self,
         owner: NodeId,
@@ -7213,20 +7228,33 @@ impl<'a> ContractLoweringVisitor<'a> {
             let mut order_by = Vec::new();
             let mut state_input = None;
             let mut state_definition = None;
+            let mut filter_root = None;
+            let mut filter_demand = None;
             if phase.consumes_logical_arguments() {
+                if call.source.filter().is_some() != call.source.filter_input().is_some() {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "aggregate FILTER differs from its projected input",
+                    });
+                }
                 arguments = call
                     .source
                     .arguments()
                     .iter()
                     .enumerate()
                     .map(|(ordinal, argument)| {
-                        let emitted = self.lower_captured_aggregate_argument(
-                            node,
-                            argument,
-                            ordinal,
-                            &logical_source,
-                            &child.columns,
-                        )?;
+                        let emitted = if let Some(column) = call.source.projected_argument(ordinal)
+                        {
+                            self.lower_projected_aggregate_input(node, column, &child.columns)?
+                                .0
+                        } else {
+                            self.lower_captured_aggregate_argument(
+                                node,
+                                argument,
+                                ordinal,
+                                &logical_source,
+                                &child.columns,
+                            )?
+                        };
                         if let Some(channels) = &mut channels {
                             channels.push(
                                 self.aggregate_operational_channel(
@@ -7255,14 +7283,24 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .map(|(ordinal, item)| {
                         Ok(SortExpr {
                             expr: {
+                                let projected = call.source.projected_order_key(ordinal);
                                 let ordinal = call.source.arguments().len() + ordinal;
-                                let emitted = self.lower_captured_aggregate_argument(
-                                    node,
-                                    &item.expr,
-                                    ordinal,
-                                    &logical_source,
-                                    &child.columns,
-                                )?;
+                                let emitted = if let Some(column) = projected {
+                                    self.lower_projected_aggregate_input(
+                                        node,
+                                        column,
+                                        &child.columns,
+                                    )?
+                                    .0
+                                } else {
+                                    self.lower_captured_aggregate_argument(
+                                        node,
+                                        &item.expr,
+                                        ordinal,
+                                        &logical_source,
+                                        &child.columns,
+                                    )?
+                                };
                                 if let Some(channels) = &mut channels {
                                     channels.push(
                                         self.aggregate_operational_channel(
@@ -7295,6 +7333,18 @@ impl<'a> ContractLoweringVisitor<'a> {
                         })
                     })
                     .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+                if let Some(column) = call.source.filter_input() {
+                    let (predicate, input) =
+                        self.lower_projected_aggregate_input(node, column, &child.columns)?;
+                    let root = self.root_definition(
+                        node,
+                        predicate,
+                        EvaluationDemand::TruthOnly,
+                        RootScope::Port(0),
+                    )?;
+                    filter_root = Some(root);
+                    filter_demand = Some(AggregateRuntimeDemand::FilteredUpdate { root, input });
+                }
             } else {
                 // A state-consuming phase reads what the phase before it
                 // produced, not the arguments that phase was given: the
@@ -7428,7 +7478,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .map_err(|_| CompileControlError::ResourceExhausted)?,
             };
             let runtime = if phase.consumes_logical_arguments() {
-                AggregateRuntimeDemand::Update
+                filter_demand.unwrap_or(AggregateRuntimeDemand::Update)
             } else {
                 AggregateRuntimeDemand::ExpressionState(
                     state_definition.expect("state phase emitted its original source definition"),
@@ -7458,6 +7508,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .map_err(Self::state_source_error)?;
             }
             calls.push(ContractAggregateCall {
+                filter_root,
                 id: call_id,
                 binding,
                 arguments: arguments.into_boxed_slice(),

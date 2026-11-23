@@ -79,6 +79,9 @@ pub(crate) fn visit_node_roots(
             for key in &call.order_by {
                 add(key.expr, Value, Port(0), false, work)?;
             }
+            if let Some(root) = call.filter_root {
+                add(root, TruthOnly, Port(0), false, work)?;
+            }
         }
         Ok(())
     }

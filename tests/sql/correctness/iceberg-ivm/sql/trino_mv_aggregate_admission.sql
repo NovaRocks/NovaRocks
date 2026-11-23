@@ -48,10 +48,37 @@ CREATE MATERIALIZED VIEW ${case_db}.trc_l7_retired_call AS
 SELECT md5sum(s) AS v FROM ${case_db}.trc_l7_measurements;
 
 -- query 6
+-- @skip_result_check=true
+INSERT INTO ${case_db}.trc_l7_measurements (k, v) VALUES ROW(1, 10);
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_count_control AS
+SELECT k, count(*) AS n FROM ${case_db}.trc_l7_measurements GROUP BY k;
+
+-- query 7
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_count_filtered AS
+SELECT k, count(*) FILTER (WHERE v > 0) AS n
+FROM ${case_db}.trc_l7_measurements GROUP BY k;
+
+-- query 8
+SELECT table_name
+FROM iceberg_ivm_cat_${suite_uuid0}.information_schema.tables
+WHERE table_schema = '${case_db}'
+  AND table_name IN ('trc_l7_count_control', 'trc_l7_count_filtered');
+
+-- query 9
+SELECT name
+FROM system.runtime.materialized_view_states
+WHERE catalog_name = 'iceberg_ivm_cat_${suite_uuid0}'
+  AND schema_name = '${case_db}'
+  AND name IN ('trc_l7_count_control', 'trc_l7_count_filtered');
+
+-- query 10
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_star;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_string;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_min_star;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_retired_call;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_filtered;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_control;
 DROP TABLE IF EXISTS ${case_db}.trc_l7_measurements;

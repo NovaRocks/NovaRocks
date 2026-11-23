@@ -451,8 +451,12 @@ fn rewrite_window_calls(
             distinct,
             order_by,
             resolved,
+            occurrence,
+            filter,
         } => TypedExpr {
             kind: ExprKind::AggregateCall {
+                occurrence: occurrence.clone(),
+                filter: filter.clone(),
                 name: name.clone(),
                 args: args
                     .iter()

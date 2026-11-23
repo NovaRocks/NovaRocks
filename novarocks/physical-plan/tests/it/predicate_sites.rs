@@ -89,6 +89,202 @@ fn filter(demand: EvaluationDemand, scope: RootScope) -> (FragmentBuilder, NodeI
         .unwrap();
     (builder, node, value)
 }
+
+#[derive(Clone, Copy)]
+enum AggregateFilterDefinition {
+    BooleanInput,
+    ComputedBoolean,
+    IntegerInput,
+    WrongScope,
+}
+
+fn aggregate_filter(
+    phase: AggregatePhase,
+    predicate: AggregateFilterDefinition,
+) -> Result<Fragment, FragmentStructureError> {
+    use novarocks_expression_contract::BoundFunction;
+    use novarocks_type_contract::{AggregateStateArgumentContract, TypedFactSlice};
+
+    let mut builder = FragmentBuilder::new(FragmentId::new(773));
+    let input = builder.reserve_node_id().unwrap();
+    let value_type = ValueType::new(DataType::Int64, false);
+    let state_type = ValueType::new(DataType::Binary, false);
+    let argument_type = if phase.consumes_logical_arguments() {
+        value_type.clone()
+    } else {
+        state_type.clone()
+    };
+    let filter_type = match predicate {
+        AggregateFilterDefinition::IntegerInput => value_type.clone(),
+        _ => boolean(true),
+    };
+    let input_values = source(
+        &mut builder,
+        input,
+        &[filter_type.clone(), argument_type.clone()],
+    );
+    let node = builder.reserve_node_id().unwrap();
+    let draft = builder.unit(node).unwrap();
+    let filter_input = draft
+        .add(None, filter_type.clone(), ExprKind::Value(input_values[0]))
+        .unwrap();
+    let filter_definition = match predicate {
+        AggregateFilterDefinition::ComputedBoolean => draft
+            .add(
+                None,
+                filter_type,
+                ExprKind::Unary {
+                    op: UnaryOperator::Not,
+                    expr: filter_input,
+                },
+            )
+            .unwrap(),
+        _ => filter_input,
+    };
+    let filter_demand = match predicate {
+        // The unit itself rejects non-Boolean TruthOnly roots. Seal a valid
+        // Value root here so the aggregate field checks the wrong source.
+        AggregateFilterDefinition::IntegerInput => EvaluationDemand::Value,
+        _ => EvaluationDemand::TruthOnly,
+    };
+    let filter_scope = match predicate {
+        AggregateFilterDefinition::WrongScope => RootScope::AllPorts,
+        _ => RootScope::Port(0),
+    };
+    let filter_root = draft
+        .root(filter_definition, filter_demand, filter_scope)
+        .unwrap();
+    let argument = draft
+        .add(None, argument_type, ExprKind::Value(input_values[1]))
+        .unwrap();
+    let argument_root = draft
+        .root(argument, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let call = AggregateCallId::new(0);
+    let (output_type, origin, grouping) = if phase.produces_final_result() {
+        (
+            value_type.clone(),
+            ValueOrigin::AggregateResult { call },
+            AggregateGrouping::Complete,
+        )
+    } else {
+        (
+            state_type.clone(),
+            ValueOrigin::AggregateState { call, phase },
+            AggregateGrouping::Partial,
+        )
+    };
+    let output = builder.add_value(output_type, origin).unwrap();
+    let properties = builder.node_output_properties(input).unwrap().clone();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::new([input]),
+            required_inputs: Box::new([properties.clone()]),
+            output_properties: properties,
+            output: OutputPort {
+                node,
+                columns: Box::new([output]),
+            },
+            kind: NodeKind::Aggregate {
+                group_by: Box::default(),
+                calls: Box::new([AggregateCall {
+                    id: call,
+                    binding: AggregateBinding {
+                        function: BoundFunction::from_exact_signature(
+                            FunctionId::try_new("fixture/aggregate/count").unwrap(),
+                            FunctionOverloadId::try_new("fixture/aggregate/count/i64").unwrap(),
+                            FunctionKind::Aggregate,
+                            TypedFactSlice::from_pure_boxed(Box::new([
+                                FunctionArgumentType::Value(value_type.clone()),
+                            ])),
+                            value_type,
+                        ),
+                        phase,
+                        logical_argument_count: 1,
+                        intermediate_type: state_type,
+                        state_format: AggregateStateFormatId::try_new("fixture/aggregate/state")
+                            .unwrap(),
+                        state_argument_contract: AggregateStateArgumentContract::ExactSignature,
+                        state_interpretation: None,
+                    },
+                    arguments: Box::new([argument_root]),
+                    distinct: false,
+                    order_by: Box::default(),
+                    filter_root: Some(filter_root),
+                    output,
+                }]),
+                grouping,
+            },
+            expressions: None,
+        })
+        .unwrap();
+    let ports = builder.node_ports(node).unwrap();
+    install(&mut builder, node, ports);
+    builder.finish_structure(
+        node,
+        FragmentSink::Result,
+        PipelineDopDomain {
+            min: 1,
+            max: 1,
+            requires_power_of_two: false,
+        },
+        PlanLimits::FROZEN,
+        &Control,
+        StagePlacementPolicy::Singleton,
+    )
+}
+
+#[test]
+fn aggregate_filter_root_reads_the_original_boolean_input_only_on_update() {
+    let sequence = AggregateSequenceId::new(0);
+    for phase in [AggregatePhase::Single, AggregatePhase::Partial { sequence }] {
+        let fragment = aggregate_filter(phase, AggregateFilterDefinition::BooleanInput).unwrap();
+        let node = &fragment.nodes()[&fragment.root()];
+        let NodeKind::Aggregate { calls, .. } = &node.kind else {
+            panic!("expected aggregate update");
+        };
+        let root = calls[0].filter_root.unwrap();
+        assert_eq!(root.get(), 0);
+        let expression = fragment.root_expression(node.id, root).unwrap();
+        let filter_value = fragment.nodes()[&node.inputs[0]].output.columns[0];
+        assert!(matches!(expression.kind, ExprKind::Value(value) if value == filter_value));
+        assert_eq!(expression.ty, boolean(true));
+    }
+    for phase in [
+        AggregatePhase::Intermediate { sequence },
+        AggregatePhase::Final { sequence },
+    ] {
+        let error = aggregate_filter(phase, AggregateFilterDefinition::BooleanInput).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("state-consuming aggregate phase cannot apply FILTER")
+        );
+    }
+}
+
+#[test]
+fn aggregate_filter_field_rejects_computed_nonboolean_and_out_of_scope_roots() {
+    for (predicate, diagnostic) in [
+        (
+            AggregateFilterDefinition::ComputedBoolean,
+            "aggregate FILTER must directly reference a BOOLEAN input value",
+        ),
+        (
+            AggregateFilterDefinition::IntegerInput,
+            "aggregate FILTER must directly reference a BOOLEAN input value",
+        ),
+        (
+            AggregateFilterDefinition::WrongScope,
+            "unit root demand or scope differs from its node field",
+        ),
+    ] {
+        let error = aggregate_filter(AggregatePhase::Single, predicate).unwrap_err();
+        assert!(error.to_string().contains(diagnostic), "{error}");
+    }
+}
+
 // Public predicate responsibilities use the actual immutable node unit.
 use novarocks_type_contract::{ValueTypeStorageHold, ValueTypeStorageLifetime};
 use std::sync::Mutex;

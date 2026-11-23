@@ -216,6 +216,7 @@ pub struct StaticAggregateOrder {
 
 #[derive(Clone, Debug)]
 pub struct StaticAggregateCall {
+    pub filter_root: Option<ProgramRootRef>,
     pub frozen: Option<Arc<crate::FrozenAggregateSelection>>,
     pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub name: Arc<str>,
@@ -2324,6 +2325,7 @@ fn validate_shape(
                 work.step()?;
                 if function.name.is_empty()
                     || !function.input_is_intermediate
+                    || function.filter_root.is_some()
                     || function.inputs.len() != 1
                     || function.order.is_distinct
                     || !function.order.is_asc_order.is_empty()
@@ -2341,6 +2343,7 @@ fn validate_shape(
         } => {
             for function in functions {
                 let bad = function.name.is_empty()
+                    || (function.input_is_intermediate && function.filter_root.is_some())
                     || function.order.is_asc_order.len() != function.order.nulls_first.len();
                 work.step()?;
                 if bad {
