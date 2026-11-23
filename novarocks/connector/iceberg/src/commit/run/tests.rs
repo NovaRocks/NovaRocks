@@ -721,7 +721,7 @@ async fn compact_row_delta_publishes_equality_files_with_inherited_sequence() {
     assert_exact_target_mutation(
         &fixture,
         before.metadata().current_snapshot_id(),
-        &["AddSnapshot", "SetSnapshotRef"],
+        &["add-snapshot", "set-snapshot-ref"],
         snapshot.snapshot_id(),
     );
 }
