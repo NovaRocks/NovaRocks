@@ -613,8 +613,8 @@ impl BasicComputation<'_> {
     ) -> Result<(), KernelFailure> {
         let mut next = *state;
         if self.operation.boolean() {
-            next.seen = true;
             if let Some(BasicValue::Boolean(v)) = first {
+                next.seen = true;
                 next.boolean = if self.operation == BasicOperation::Or {
                     next.boolean || v
                 } else {

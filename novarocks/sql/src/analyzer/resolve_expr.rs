@@ -2028,7 +2028,7 @@ impl<'a> super::AnalyzerContext<'a> {
         let original_input = if func.filter.is_some()
             && func.window.is_none()
             && (is_aggregate_function(self.function_catalog, &original_name)
-                || is_analyzer_aggregate_syntax(&original_name))
+                || analyzer_aggregate_alias(&original_name).is_some())
         {
             self.grouping_scope
                 .borrow()
@@ -2122,7 +2122,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         call.window.is_some()
                             || name == "grouping"
                             || is_aggregate_function(self.analyzer.function_catalog, &name)
-                            || is_analyzer_aggregate_syntax(&name)
+                            || analyzer_aggregate_alias(&name).is_some()
                     }
                     _ => false,
                 };
@@ -2193,12 +2193,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 func.span,
             ));
         }
-        let name = match original_name.as_str() {
-            "every" => "bool_and".to_string(),
-            "\"listagg\"" => "listagg".to_string(),
-            _ => original_name,
-        };
-        let mut name = name;
+        let mut name = analyzer_aggregate_alias(&original_name)
+            .map(str::to_owned)
+            .unwrap_or(original_name);
 
         // Reject a function-local ordering with no arguments.
         if original_arguments.is_empty() && func.order_by.is_some() {
@@ -3195,7 +3192,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 let name = print_object_name(&f.name).to_ascii_lowercase();
                 if is_aggregate_function(self.function_catalog, &name)
-                    || is_analyzer_aggregate_syntax(&name)
+                    || analyzer_aggregate_alias(&name).is_some()
                 {
                     return true;
                 }
@@ -4310,8 +4307,12 @@ fn resolve_aggregate_function_call_with_order(
     })
 }
 
-fn is_analyzer_aggregate_syntax(name: &str) -> bool {
-    name == "every"
+fn analyzer_aggregate_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "every" => Some("bool_and"),
+        "\"listagg\"" => Some("listagg"),
+        _ => None,
+    }
 }
 
 fn arrow_type_to_starrocks_name(dt: &DataType) -> String {

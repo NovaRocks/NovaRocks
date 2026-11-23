@@ -25,7 +25,7 @@ SELECT approx_most_frequent(3, x, 100001) AS counts FROM (VALUES BIGINT '7', BIG
 SELECT approx_most_frequent(5, x, 1) AS counts FROM (VALUES BIGINT '7', BIGINT '7', BIGINT '7') t(x);
 
 -- query 3
-SELECT approx_most_frequent(2, x, 10) AS counts FROM (VALUES 'x', 'x', 'z') t(x);
+SELECT approx_most_frequent(2, CAST(x AS VARCHAR), 10) AS counts FROM (VALUES 'x', 'x', 'z') t(x);
 
 -- query 4
 -- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR

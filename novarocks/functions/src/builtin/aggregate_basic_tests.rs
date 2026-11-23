@@ -275,7 +275,7 @@ fn basic_window_average_frames_have_independent_expected_values() {
     assert_eq!(output.as_ref(), &expected);
 }
 #[test]
-fn basic_window_boolean_frames_distinguish_no_rows_from_null_rows() {
+fn basic_window_boolean_frames_skip_null_inputs() {
     let values: ArrayRef = Arc::new(BooleanArray::from(vec![
         None,
         Some(true),
@@ -286,11 +286,11 @@ fn basic_window_boolean_frames_distinguish_no_rows_from_null_rows() {
     for (name, expected) in [
         (
             "bool_or",
-            BooleanArray::from(vec![None, Some(false), Some(true), Some(true)]),
+            BooleanArray::from(vec![None, None, Some(true), Some(true)]),
         ),
         (
             "bool_and",
-            BooleanArray::from(vec![None, Some(true), Some(true), Some(false)]),
+            BooleanArray::from(vec![None, None, Some(true), Some(false)]),
         ),
     ] {
         let fixture = Fixture::new(

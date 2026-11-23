@@ -28,7 +28,12 @@ SELECT approx_percentile(x, DOUBLE '0.5') AS median, approx_percentile(x, ARRAY[
 SELECT approx_percentile(x, DOUBLE '0.5') AS median, approx_percentile(x, ARRAY[DOUBLE '0', DOUBLE '1']) AS bounds FROM (VALUES DOUBLE '2', DOUBLE '4', DOUBLE '8') t(x);
 
 -- query 4
-SELECT cardinality(approx_percentile(x, repeat(DOUBLE '0.5', BIGINT '4097'))) AS targets FROM (VALUES DOUBLE '2', DOUBLE '4', DOUBLE '8') t(x);
+WITH requests AS (
+    SELECT array_agg(DOUBLE '0.5') AS p FROM TABLE(sequence(1, 4097))
+)
+SELECT cardinality(approx_percentile(x, p)) AS targets
+FROM (VALUES DOUBLE '2', DOUBLE '4', DOUBLE '8') AS samples(x)
+CROSS JOIN requests;
 
 -- query 5
 -- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR

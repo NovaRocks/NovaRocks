@@ -379,8 +379,9 @@ fn single_only_aggregate_keeps_original_update_channels_with_a_mergeable_peer() 
     use novarocks_local_program::{ProgramCallSite, ProgramStateTemplate};
 
     let source = sql_source(
-        "SELECT approx_distinct(k), listagg(CAST(k AS VARCHAR)) WITHIN GROUP (ORDER BY k), \
-         approx_percentile(k, DOUBLE '0.5'), max(k, BIGINT '2') FROM fixture.source",
+        r#"SELECT approx_distinct(k),
+                "listagg"(DISTINCT CAST(k AS VARCHAR), '|', true, '...', false ORDER BY '|'),
+                approx_percentile(k, DOUBLE '0.5'), max(k, BIGINT '2') FROM fixture.source"#,
         DataType::Int64,
     );
     let programs = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
