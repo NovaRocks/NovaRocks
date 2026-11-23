@@ -98,6 +98,16 @@ impl KernelEvaluationControl for ObservedControl<'_> {
         }
         result
     }
+    fn regexp_search_progress(&self, offset: usize) -> Result<(), KernelFailure> {
+        let result = self.original.regexp_search_progress(offset);
+        if result.is_err() {
+            self.refused.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+    fn regexp_search_stopped(&self, offset: usize) {
+        self.original.regexp_search_stopped(offset);
+    }
 }
 struct Work<'a, 'scope, R = std::convert::Infallible> {
     control: &'a ObservedControl<'a>,
@@ -1077,6 +1087,10 @@ fn admit_call_protocol(
             | ControlShape::TemporalSource(_),
             PreparedPureKernel::ControlIntrinsic(_),
         ) => {
+            call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
+                && guarded::supports_result(result)
+        }
+        (ControlShape::OrderedRegexp, PreparedPureKernel::OrderedRegexp(_)) => {
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
                 && guarded::supports_result(result)
         }

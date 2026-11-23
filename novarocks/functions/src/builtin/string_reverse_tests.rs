@@ -55,6 +55,29 @@ struct Control {
     trace: Mutex<Vec<u32>>,
     refusal: Option<(usize, KernelFailure)>,
 }
+
+#[test]
+fn string_reverse_char_projection_moves_padding_and_omits_reversed_trailing_spaces() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    for (input, width, expected_text, expected_spaces) in [
+        ("  é中", 6, "é中", 2),
+        ("\t中", 3, "\t中", 1),
+        ("", 5, "", 0),
+        ("", 0, "", 0),
+    ] {
+        let ReverseRow::Text {
+            text,
+            leading_spaces,
+        } = fixed_reverse_span(input, width, &mut work).unwrap()
+        else {
+            panic!("fixed CHAR must have a text projection");
+        };
+        assert_eq!(text, expected_text);
+        assert_eq!(leading_spaces, expected_spaces);
+    }
+    work.finish().unwrap();
+}
 impl KernelEvaluationControl for Control {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
         assert!(units <= 256);
@@ -560,7 +583,7 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
             owner.binding_declaration().function_id().as_str(),
             "builtin.scalar/reverse/v1"
         );
-        assert_eq!(owner.implementation_declarations().len(), 1);
+        assert_eq!(owner.implementation_declarations().len(), 2);
         assert_eq!(
             owner.implementation_declarations()[0]
                 .implementation
@@ -621,7 +644,7 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
         );
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
-            FunctionValueType::new(DataType::Binary, true),
+            FunctionValueType::new(DataType::Int64, true),
             FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
@@ -643,7 +666,7 @@ fn string_reverse_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
 
 #[test]
 fn string_reverse_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
-    for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
+    for ty in [source(true), FunctionValueType::new(DataType::Int64, true)] {
         let good = CompileControl::default();
         let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(

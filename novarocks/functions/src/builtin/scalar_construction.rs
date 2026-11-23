@@ -19,7 +19,8 @@ use crate::FunctionValueType;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::owned_resources::{layout, vec};
 use novarocks_type_contract::{
-    ValueConstructionFailure, ValueConstructionRequest, ValueLogicalType, ValueTypeStorageLifetime,
+    CharacterType, ValueConstructionFailure, ValueConstructionRequest, ValueKind, ValueLayout,
+    ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
 };
 use std::{alloc::Layout, sync::Arc};
 pub(super) type Failure<E> = ValueConstructionFailure<E>;
@@ -195,6 +196,22 @@ impl<'a, E> ScalarConstruction<'a, E> {
             self.observer(),
         )
     }
+    pub(super) fn character(
+        &mut self,
+        character: CharacterType,
+        nullable: bool,
+    ) -> Result<FunctionValueType, Failure<E>> {
+        let storage = self.storage();
+        let value = ValueTypeRef::try_new_with_construction(
+            ValueKind::BoundedCharacter(character),
+            nullable,
+            storage.clone(),
+            self.observer(),
+        )?;
+        let layout =
+            ValueLayout::try_new_with_construction(&DataType::Utf8, storage, self.observer())?;
+        Ok(FunctionValueType::try_from_value(value, layout)?)
+    }
     pub(super) fn nullable(
         &mut self,
         source: &FunctionValueType,
@@ -360,9 +377,15 @@ impl<H> ScopedFailure<H> for ResolutionFailure<H> {
         Self::Creator(error)
     }
     fn source(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
-        Self::Resolution(crate::FunctionResolutionError::BadSignature(
-            novarocks_type_contract::ValueTypeError::from(error).to_string(),
-        ))
+        use novarocks_type_contract::ValueTypeError;
+
+        let error = ValueTypeError::from(error);
+        Self::Resolution(match error {
+            ValueTypeError::InvalidCharacterWidth { .. } => {
+                crate::FunctionResolutionError::ResultType(error)
+            }
+            error => crate::FunctionResolutionError::BadSignature(error.to_string()),
+        })
     }
     fn rule(error: String) -> Self {
         Self::Resolution(crate::FunctionResolutionError::BadSignature(error))

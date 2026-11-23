@@ -40,3 +40,5 @@ pub const UNSUPPORTED_ARITHMETIC: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(604).unwrap());
 pub const UNSUPPORTED_CAST: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(606).unwrap());
+pub const UNSUPPORTED_REGEXP_PATTERN: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(608).unwrap());

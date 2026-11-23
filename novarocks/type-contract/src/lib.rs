@@ -136,7 +136,7 @@ pub use function::{
     AggregateStateArgumentContract, AggregateStateFormatId, FunctionArgumentEvaluation,
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIdentityError,
     FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionValueType,
-    FunctionVolatility,
+    FunctionVolatility, NonCanonicalNativeV1FunctionName, native_v1_function_name,
 };
 pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use logical::{
@@ -199,15 +199,6 @@ pub use window::{WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnit
 
 #[cfg(test)]
 mod temporal_source_control_tests;
-
-mod regexp_count_source;
-pub use regexp_count_source::RegexpCountPatternSource;
-
-mod to_base64_source;
-pub use to_base64_source::{
-    NATIVE_V1_ENCRYPTION_FUNCTIONS, NonCanonicalNativeV1FunctionName, ToBase64ByteSource,
-    native_v1_function_name,
-};
 
 pub mod result_render_type;
 pub mod result_scalar_type;

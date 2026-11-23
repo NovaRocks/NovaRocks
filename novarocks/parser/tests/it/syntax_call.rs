@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_parser::{Span, ast::Expr, canonical_call, parser::parse_expression};
+use novarocks_parser::{
+    Span,
+    ast::{Expr, LiteralKind, SyntaxEq},
+    canonical_call,
+    parser::parse_expression,
+    printer::print_expression,
+};
 
 #[test]
 fn dedicated_syntax_maps_to_canonical_name_and_ordered_source_children() {
@@ -25,10 +31,33 @@ fn dedicated_syntax_maps_to_canonical_name_and_ordered_source_children() {
         ("IF(predicate, yes, no)", "if", &["predicate", "yes", "no"]),
         ("NULLIF(a, b)", "nullif", &["a", "b"]),
         ("COALESCE(a, b, c)", "coalesce", &["a", "b", "c"]),
+        ("FORMAT(pattern, a, b)", "format", &["pattern", "a", "b"]),
         ("TRIM(text_value)", "trim", &["text_value"]),
         ("TRIM(BOTH FROM text_value)", "trim", &["text_value"]),
         ("TRIM(LEADING FROM text_value)", "ltrim", &["text_value"]),
         ("TRIM(TRAILING FROM text_value)", "rtrim", &["text_value"]),
+        (
+            "TRIM(BOTH chars FROM text_value)",
+            "trim",
+            &["text_value", "chars"],
+        ),
+        (
+            "TRIM(LEADING chars FROM text_value)",
+            "ltrim",
+            &["text_value", "chars"],
+        ),
+        (
+            "TRIM(TRAILING chars FROM text_value)",
+            "rtrim",
+            &["text_value", "chars"],
+        ),
+        ("TRIM(text_value, chars)", "trim", &["text_value", "chars"]),
+        ("OVERLAY(s PLACING r FROM p)", "$overlay", &["s", "r", "p"]),
+        (
+            "OVERLAY(s PLACING r FROM p FOR n)",
+            "$overlay",
+            &["s", "r", "p", "n"],
+        ),
         ("EXTRACT(YEAR FROM x)", "year", &["x"]),
         ("EXTRACT(MONTH FROM x)", "month", &["x"]),
         ("EXTRACT(DAY FROM x)", "day", &["x"]),
@@ -89,11 +118,6 @@ fn canonical_call_borrows_original_nested_nodes() {
 fn syntax_without_a_canonical_call_preserves_the_rejection() {
     for (source, message) in [
         (
-            "TRIM(BOTH 'x' FROM t)",
-            "explicit TRIM characters are not supported",
-        ),
-        ("TRIM(t, 'x')", "explicit TRIM characters are not supported"),
-        (
             "ROW(a, b AS named_field)",
             "named ROW fields are not supported",
         ),
@@ -116,5 +140,57 @@ fn ordinary_calls_and_other_expressions_do_not_map() {
     for source in ["abs(a)", "ltrim(a)", "\"rtrim\"(a)", "x", "a + b"] {
         let expr = parse_expression(source).unwrap();
         assert!(canonical_call(&expr).unwrap().is_none(), "{source}");
+    }
+}
+
+#[test]
+fn position_round_trips_source_parameter_order_through_reversed_call_arguments() {
+    let source = "POSITION(concat(?, ?) IN concat(?, ?))";
+    let expression = parse_expression(source).unwrap();
+    let Expr::FunctionCall(position) = &expression else {
+        panic!("expected POSITION's canonical call");
+    };
+    assert_eq!(position.name.parts[0].value, "strpos");
+    for (argument, positions) in position.arguments.iter().zip([[2, 3], [0, 1]]) {
+        let Expr::FunctionCall(concat) = &argument.value else {
+            panic!("expected concat");
+        };
+        for (child, index) in concat.arguments.iter().zip(positions) {
+            assert!(matches!(&child.value, Expr::Parameter(p) if p.position == index));
+            assert_eq!(&source[child.span.start()..child.span.end()], "?");
+        }
+    }
+    let printed = print_expression(&expression).unwrap();
+    assert!(expression.syntax_eq(&parse_expression(&printed).unwrap()));
+}
+
+#[test]
+fn normalize_projects_each_form_to_the_original_call_without_folding_case() {
+    for (source, form) in [
+        ("NORMALIZE(?)", "NFC"),
+        ("NORMALIZE(?, NFC)", "NFC"),
+        ("NORMALIZE(?, NFD)", "NFD"),
+        ("NORMALIZE(?, NFKC)", "NFKC"),
+        ("NORMALIZE(?, NFKD)", "NFKD"),
+        ("NORMALIZE(?, nfd)", "nfd"),
+    ] {
+        let expression = parse_expression(source).unwrap();
+        let Expr::FunctionCall(call) = &expression else {
+            panic!("expected NORMALIZE's canonical call");
+        };
+        assert!(call.name.parts[0].quoted);
+        assert_eq!(call.name.parts[0].value, "normalize");
+        assert_eq!(call.span, Span::new(0, source.len()));
+        assert!(matches!(&call.arguments[0].value, Expr::Parameter(p) if p.position == 0));
+        assert_eq!(
+            &source[call.arguments[0].span.start()..call.arguments[0].span.end()],
+            "?"
+        );
+        assert!(matches!(
+            &call.arguments[1].value,
+            Expr::Literal(literal) if literal.kind == LiteralKind::String(form.into())
+        ));
+        let printed = print_expression(&expression).unwrap();
+        assert!(expression.syntax_eq(&parse_expression(&printed).unwrap()));
     }
 }

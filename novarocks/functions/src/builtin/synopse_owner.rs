@@ -15,189 +15,289 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::{fmt::Write, sync::Arc};
 
-use arrow_array::{
-    Array, ArrayRef, Int64Array,
-    builder::{Int64Builder, StringBuilder},
-};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
-
-use super::catalogue::constant_source;
 use crate::{
-    DataFailureReason, FunctionBindingError, FunctionBindingRequest, KernelEvaluationControl,
-    KernelFailure, RowDataError, ScalarCallInput, SelectedValues,
-    aggregate_scalar::checked_utf8_output_offset, kernel_control::internal,
+    DataFailureReason, KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallInput,
+    SelectedValues, aggregate_scalar::checked_utf8_output_offset, kernel_control::internal,
     kernel_input::EvaluationCheckpoints,
 };
+use arrow_array::{
+    Array, ArrayRef, Float64Array, Int64Array,
+    builder::{Int64Builder, StringBuilder},
+};
+use novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT;
 
+/// The Trino overloads accept ordinary row arguments, including the bounds.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Recipe {
-    bar: bool,
-    min: i64,
-    max: i64,
-    count: i64,
+pub(super) enum TrinoSynopse {
+    Bar,
+    WidthBucket,
 }
 
-impl Recipe {
-    pub(super) fn bind(
-        bar: bool,
-        request: FunctionBindingRequest<'_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Self, FunctionBindingError> {
-        let name = if bar { "bar" } else { "equiwidth_bucket" };
-        let mut get = |index, parameter| {
-            let missing = || {
-                FunctionBindingError::InvalidBinding(
-                    format!("{name}: argument[{parameter}] must be constant").into(),
-                )
-            };
-            let value = constant_source(request.arguments.get(index), work)?.ok_or_else(missing)?;
-            work.flush()?;
-            value
-                .signed_integer_observed(CompilePhase::FunctionSpecialization, work.control())?
-                .ok_or_else(missing)
-        };
-        Ok(Self {
-            bar,
-            min: get(1, "min")?,
-            max: get(2, "max")?,
-            count: get(3, if bar { "width" } else { "buckets" })?,
-        })
-    }
-
-    fn check(self, value: i64) -> Result<(), String> {
-        let name = if self.bar { "bar" } else { "equiwidth_bucket" };
-        if self.min >= self.max {
-            return Err(if self.bar {
-                format!("bar requirement: min < max ({} >= {})", self.min, self.max)
-            } else {
-                "equiwidth_bucket requirement: min < max".into()
-            });
-        }
-        if self.count <= 0 {
-            return Err(if self.bar {
-                format!("bar requirement: width > 0 ({})", self.count)
-            } else {
-                "equiwidth_bucket requirement: buckets > 0".into()
-            });
-        }
-        if value < self.min {
-            return Err(if self.bar {
-                format!("bar requirement: size >= min ({value} < {})", self.min)
-            } else {
-                format!("{name} requirement: size >= min")
-            });
-        }
-        if value > self.max {
-            return Err(if self.bar {
-                format!("bar requirement: size <= max ({value} > {})", self.max)
-            } else {
-                format!("{name} requirement: size <= max")
-            });
-        }
-        Ok(())
-    }
-
+impl TrinoSynopse {
     pub(super) fn evaluate<'a>(
         self,
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        let selection = input.selection();
-        let argument = input.arguments()[0];
-        let values = argument
-            .array()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| internal("histogram selected input is not Int64"))?;
         let mut work = EvaluationCheckpoints::new(control);
         work.flush()?;
-        let mut errors = Vec::new();
-        let mut result = if self.bar {
-            Output::Bar(StringBuilder::new(), 0, String::new())
-        } else {
-            Output::Bucket(Int64Builder::with_capacity(selection.len()))
-        };
-        for (ordinal, batch_row) in selection.iter().enumerate() {
-            work.step()?;
-            let row = argument.value_row(ordinal, batch_row);
-            if values.is_null(row) {
-                result.append_null();
-                continue;
-            }
-            let value = values.value(row);
-            if let Err(message) = self.check(value) {
-                errors.push(RowDataError::new(ordinal, &message));
-                result.append_null();
-                continue;
-            }
-            let numerator = i128::from(value) - i128::from(self.min);
-            let range = i128::from(self.max) - i128::from(self.min);
-            match &mut result {
-                Output::Bar(builder, offset, rendered) => {
-                    let width =
-                        ((numerator as f64 / range as f64).min(1.0) * self.count as f64) as usize;
-                    let bytes = width
-                        .checked_mul('▓'.len_utf8())
-                        .ok_or(KernelFailure::ResourceExhausted)?;
-                    *offset = checked_utf8_output_offset(*offset, bytes)?;
-                    rendered.clear();
-                    work.flush()?;
-                    rendered
-                        .try_reserve(bytes)
-                        .map_err(|_| KernelFailure::ResourceExhausted)?;
-                    for _ in 0..width {
-                        work.step()?;
-                        rendered.push('▓');
+        let arguments = input.arguments();
+        let selection = input.selection();
+        let output = match (self, arguments) {
+            (Self::Bar, [percent, width]) => {
+                let percentages = float64(percent.array())?;
+                let widths = bigint(width.array())?;
+                let mut builder = StringBuilder::new();
+                let mut offset = 0;
+                for (ordinal, batch_row) in selection.iter().enumerate() {
+                    work.step()?;
+                    let percent_row = percent.value_row(ordinal, batch_row);
+                    let width_row = width.value_row(ordinal, batch_row);
+                    if percentages.is_null(percent_row) || widths.is_null(width_row) {
+                        builder.append_null();
+                        continue;
                     }
-                    work.flush()?;
-                    builder.append_value(rendered.as_str());
+                    render_bar(
+                        percentages.value(percent_row),
+                        widths.value(width_row),
+                        &mut builder,
+                        &mut offset,
+                        &mut work,
+                    )?;
+                    builder.append_value("");
                 }
-                Output::Bucket(builder) => {
-                    let bucket = numerator / (range / i128::from(self.count)).max(1);
-                    match i64::try_from(bucket) {
-                        Ok(value) => builder.append_value(value),
-                        Err(_) => {
-                            errors.push(RowDataError::with_reason(
-                                ordinal,
-                                DataFailureReason::NumericOutOfRange,
-                                "equiwidth_bucket result exceeds BIGINT",
-                            ));
+                (Arc::new(builder.finish()) as ArrayRef, Vec::new())
+            }
+            (Self::WidthBucket, [value, bound1, bound2, count]) => {
+                let values = float64(value.array())?;
+                let bounds1 = float64(bound1.array())?;
+                let bounds2 = float64(bound2.array())?;
+                let counts = bigint(count.array())?;
+                let mut builder = Int64Builder::with_capacity(selection.len());
+                let mut errors = Vec::new();
+                for (ordinal, batch_row) in selection.iter().enumerate() {
+                    work.step()?;
+                    let value_row = value.value_row(ordinal, batch_row);
+                    let bound1_row = bound1.value_row(ordinal, batch_row);
+                    let bound2_row = bound2.value_row(ordinal, batch_row);
+                    let count_row = count.value_row(ordinal, batch_row);
+                    if values.is_null(value_row)
+                        || bounds1.is_null(bound1_row)
+                        || bounds2.is_null(bound2_row)
+                        || counts.is_null(count_row)
+                    {
+                        builder.append_null();
+                        continue;
+                    }
+                    match width_bucket(
+                        values.value(value_row),
+                        bounds1.value(bound1_row),
+                        bounds2.value(bound2_row),
+                        counts.value(count_row),
+                    ) {
+                        Ok(bucket) => builder.append_value(bucket),
+                        Err((reason, message)) => {
+                            errors.push(RowDataError::with_reason(ordinal, reason, message));
                             builder.append_null();
                         }
                     }
                 }
+                (Arc::new(builder.finish()) as ArrayRef, errors)
             }
-        }
-        work.flush()?;
-        let output = SelectedValues::try_new_observed(
+            _ => {
+                return Err(internal(
+                    "histogram arguments differ from the selected overload",
+                ));
+            }
+        };
+        let result = SelectedValues::try_new_observed(
             selection,
             input.contract().result_type().data_type(),
-            result.finish(),
-            errors.into_boxed_slice(),
+            output.0,
+            output.1.into_boxed_slice(),
             || work.step(),
         );
-        work.finish_result(output)
+        work.finish_result(result)
     }
 }
 
-enum Output {
-    Bar(StringBuilder, i32, String),
-    Bucket(Int64Builder),
+fn float64(array: &ArrayRef) -> Result<&Float64Array, KernelFailure> {
+    array
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| internal("histogram selected input is not Float64"))
 }
-impl Output {
-    fn append_null(&mut self) {
-        match self {
-            Self::Bar(builder, ..) => builder.append_null(),
-            Self::Bucket(builder) => builder.append_null(),
+
+fn bigint(array: &ArrayRef) -> Result<&Int64Array, KernelFailure> {
+    array
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| internal("histogram selected input is not Int64"))
+}
+
+fn width_bucket(
+    operand: f64,
+    bound1: f64,
+    bound2: f64,
+    count: i64,
+) -> Result<i64, (DataFailureReason, &'static str)> {
+    let invalid = |message| {
+        (
+            DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT),
+            message,
+        )
+    };
+    if count <= 0 {
+        return Err(invalid("bucketCount must be greater than 0"));
+    }
+    if operand.is_nan() {
+        return Err(invalid("operand must not be NaN"));
+    }
+    if !bound1.is_finite() {
+        return Err(invalid("first bound must be finite"));
+    }
+    if !bound2.is_finite() {
+        return Err(invalid("second bound must be finite"));
+    }
+    if bound1 == bound2 {
+        return Err(invalid("bounds cannot equal each other"));
+    }
+    let lower = bound1.min(bound2);
+    let upper = bound1.max(bound2);
+    let bucket = if operand < lower {
+        0
+    } else if operand >= upper {
+        count.checked_add(1).ok_or((
+            DataFailureReason::NumericOutOfRange,
+            "width_bucket result exceeds BIGINT",
+        ))?
+    } else {
+        (count as f64 * (operand - lower) / (upper - lower) + 1.0) as i64
+    };
+    Ok(if bound1 > bound2 {
+        // Trino performs the descending transformation with Java long arithmetic.
+        count.wrapping_sub(bucket).wrapping_add(1)
+    } else {
+        bucket
+    })
+}
+
+fn render_bar(
+    percent: f64,
+    width: i64,
+    output: &mut impl Write,
+    offset: &mut i32,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<(), KernelFailure> {
+    const RESET: &str = "\x1b[0m";
+    let filled = i64::from((percent * width as f64) as i32).min(width).max(0);
+    let spaces =
+        usize::try_from((width - filled).max(0)).map_err(|_| KernelFailure::ResourceExhausted)?;
+    let mut extent = checked_utf8_output_offset(*offset, RESET.len())?;
+    extent = checked_utf8_output_offset(extent, spaces)?;
+    for index in 0..filled {
+        work.step()?;
+        let color = bar_ansi_color(index, width);
+        let color_digits = if color >= 100 { 3 } else { 2 };
+        extent = checked_utf8_output_offset(extent, "\x1b[38;5;m█".len() + color_digits)?;
+    }
+    for index in 0..filled {
+        work.step()?;
+        write!(output, "\x1b[38;5;{}m█", bar_ansi_color(index, width))
+            .map_err(|_| internal("cannot write ANSI bar color"))?;
+    }
+    output
+        .write_str(RESET)
+        .map_err(|_| internal("cannot write ANSI reset"))?;
+    for _ in 0..spaces {
+        work.step()?;
+        output
+            .write_char(' ')
+            .map_err(|_| internal("cannot write ANSI bar padding"))?;
+    }
+    *offset = extent;
+    Ok(())
+}
+
+fn bar_ansi_color(index: i64, width: i64) -> u16 {
+    // Trino interpolates hue from Java AWT's red (0) to green (1/3), at full
+    // saturation and brightness, before converting to the ANSI 6×6×6 cube.
+    if width == 1 {
+        return 16;
+    }
+    let hue = (index as f64 / (width - 1) as f64) as f32 * (2.0 / 6.0);
+    let angle = hue * 6.0;
+    let sector = angle as i32;
+    let fraction = angle - angle.floor();
+    let (red, green) = match sector {
+        0 => (255, ((1.0 - (1.0 - fraction)) * 255.0 + 0.5) as u16),
+        1 => (((1.0 - fraction) * 255.0 + 0.5) as u16, 255),
+        _ => (0, 255),
+    };
+    16 + red * 6 / 256 * 36 + green * 6 / 256 * 6
+}
+
+#[cfg(test)]
+mod trino_tests {
+    use super::*;
+    use crate::KernelDiagnostic;
+
+    struct Control;
+
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            Err(KernelFailure::Internal(KernelDiagnostic::new(
+                "unexpected wait",
+            )))
         }
     }
 
-    fn finish(self) -> ArrayRef {
-        match self {
-            Self::Bar(mut builder, ..) => Arc::new(builder.finish()),
-            Self::Bucket(mut builder) => Arc::new(builder.finish()),
+    #[test]
+    fn bar_matches_trino_terminal_bytes() {
+        let mut work = EvaluationCheckpoints::new(&Control);
+        let mut rendered = String::new();
+        let mut offset = 0;
+        render_bar(0.5, 6, &mut rendered, &mut offset, &mut work).unwrap();
+        assert_eq!(
+            rendered,
+            "\x1b[38;5;196m█\x1b[38;5;208m█\x1b[38;5;220m█\x1b[0m   "
+        );
+        assert_eq!(offset as usize, rendered.len());
+        rendered.clear();
+        render_bar(1.0, 1, &mut rendered, &mut offset, &mut work).unwrap();
+        assert_eq!(rendered, "\x1b[38;5;16m█\x1b[0m");
+        rendered.clear();
+        render_bar(1.0, -1, &mut rendered, &mut offset, &mut work).unwrap();
+        assert_eq!(rendered, "\x1b[0m");
+        assert_eq!(bar_ansi_color(28_301, 168_814), 208);
+    }
+
+    #[test]
+    fn width_bucket_matches_trino_descending_and_overflow_rules() {
+        for (value, rising, falling) in [
+            (-1.0, 0, 6),
+            (0.0, 1, 5),
+            (2.0, 2, 4),
+            (9.999, 5, 1),
+            (10.0, 6, 0),
+        ] {
+            assert_eq!(width_bucket(value, 0.0, 10.0, 5), Ok(rising));
+            assert_eq!(width_bucket(value, 10.0, 0.0, 5), Ok(falling));
         }
+        assert_eq!(width_bucket(-1.0, 10.0, 0.0, i64::MAX), Ok(i64::MIN));
+        assert!(matches!(
+            width_bucket(10.0, 0.0, 10.0, i64::MAX),
+            Err((DataFailureReason::NumericOutOfRange, _))
+        ));
+        assert!(matches!(
+            width_bucket(f64::NAN, 0.0, 10.0, 5),
+            Err((DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT), _))
+        ));
     }
 }

@@ -238,8 +238,6 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
             effects: authored.call_contract().effects().clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             temporal_source: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
         },
     )]);
     let bound_unit = sealed.finish(claims, &mut work).unwrap();

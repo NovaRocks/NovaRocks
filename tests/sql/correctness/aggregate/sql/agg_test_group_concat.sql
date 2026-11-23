@@ -1055,7 +1055,7 @@ select group_concat('中国',name order by 2, '第一', id) from ss;
 
 -- query 243
 USE ${case_db};
-select instr(gc, U&'\000A') > 0 as has_lf_separator
+select strpos(gc, U&'\000A') > 0 as has_lf_separator
 from (
   select string_agg('中国',name
 ,

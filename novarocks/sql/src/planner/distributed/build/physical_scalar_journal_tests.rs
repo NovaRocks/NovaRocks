@@ -22,7 +22,7 @@ use crate::{
     planner::distributed::build::{
         SqlSourceJournalError,
         contract_lowering::lowered_scalar_source_tests::{
-            authored, lower_call as lower,
+            authored, lower_call as lower, nullable_bounded_character,
             operational_tests::selected_source_owner as selected_owner, policy, text,
         },
     },
@@ -353,7 +353,7 @@ fn scalar_journal_canonical_null_loans_actual_typed_cv_without_retagging_origina
     );
     assert_eq!(
         actual.value_type(),
-        &FunctionValueType::new(DataType::Utf8, true)
+        &nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0)
     );
     assert_eq!(actual.try_utf8().unwrap(), None);
     assert_ne!(

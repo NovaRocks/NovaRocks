@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::{
-    array::{ArrayRef, Int32Array, StringArray},
+    array::{ArrayRef, BinaryArray, Int32Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -165,7 +165,7 @@ fn allocation_host() -> (Arc<CountingAllocator>, Arc<dyn AggregateStateAllocator
 
 #[test]
 fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
-    let ty = FunctionValueType::new(DataType::Utf8, true);
+    let ty = FunctionValueType::new(DataType::Binary, true);
     let (unit, [root], schema) = compile_unit(
         "v",
         ty.clone(),
@@ -174,22 +174,20 @@ fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
             let input = draft
                 .add(None, ty.clone(), ExprKind::Value(column))
                 .unwrap();
-            let author = ClaimAuthor::with_legacy_binding(
+            let author = ClaimAuthor::with_exact_eager_binding(
                 functions,
                 "md5",
                 vec![FunctionArgument::Value {
                     value_type: ty,
                     constant: None,
                 }],
-                ControlShape::Eager,
-                None,
                 POLICY,
                 &HarnessControl,
             )
             .with_decimal_policy(DecimalOverflowPolicy::OutputNull);
             assert_eq!(
                 author.result(),
-                FunctionValueType::new(DataType::Utf8, true)
+                FunctionValueType::new(DataType::Binary, true)
             );
             [add_call(draft, authors, author, vec![input])]
         },
@@ -219,11 +217,14 @@ fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
         contract.effects().value_stability,
         FunctionVolatility::Immutable
     );
-    let input = StringArray::from(
-        (0..321)
-            .map(|i| (i % 3 != 1).then(|| (i + 17).to_string()))
-            .collect::<Vec<_>>(),
-    );
+    let bytes = (0..321)
+        .map(|i| match i {
+            0 => Some(vec![0xff, 0]),
+            _ if i % 3 == 1 => None,
+            _ => Some((i + 17).to_string().into_bytes()),
+        })
+        .collect::<Vec<_>>();
+    let input = BinaryArray::from_iter(bytes.iter().map(|value| value.as_deref()));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(input)]).unwrap();
     let control = Callback::new(usize::MAX, KernelFailure::Cancelled);
     let (tracker, host) = allocation_host();
@@ -246,6 +247,16 @@ fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
             &mut PassThroughCallHost,
         )
         .unwrap();
+    let digests = out.values().as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(
+        digests.value(0),
+        &[
+            0xe0, 0xe8, 0xbf, 0xaf, 0xbb, 0x06, 0x89, 0x56, 0x3b, 0x2f, 0xba, 0x78, 0x9c, 0x97,
+            0xb3, 0xcc
+        ],
+    );
+    assert_eq!(digests.iter().nth(1), Some(None));
+    assert!(out.errors().is_empty());
     drop(out);
     drop(frame);
     assert_eq!(tracker.outstanding(), 0);

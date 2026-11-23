@@ -16,8 +16,8 @@
 // under the License.
 
 use super::super::string_split_part_owner::{
-    effects, operation, owner_for_test, prepared_for_test_with_control,
-    prepared_for_test_with_policy,
+    operation, owner_for_test, prepared_for_test_with_control, prepared_for_test_with_policy,
+    trino_effects,
 };
 use super::*;
 use crate::{
@@ -26,6 +26,7 @@ use crate::{
     PureFunctionMetadataOwner, PureScalarImplementation, ScalarEvaluationInstance,
     ScopedExpressionEffects, Selection, specialize_frozen_scalar, specialize_scalar,
 };
+use arrow_array::Int64Array;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
@@ -139,94 +140,69 @@ fn sources(arity: usize) -> Vec<FunctionValueType> {
                 if i < 2 {
                     DataType::Utf8
                 } else {
-                    DataType::Int32
+                    DataType::Int64
                 },
                 true,
             )
         })
         .collect()
 }
-fn integers(values: Vec<Option<i32>>) -> ArrayRef {
-    Arc::new(Int32Array::from(values))
+fn integers(values: Vec<Option<i64>>) -> ArrayRef {
+    Arc::new(Int64Array::from(values))
 }
 
 #[test]
-fn string_split_part_exact_profile_preserves_direction_empty_delimiter_and_unicode_oracles() {
+fn split_part_exact_profile_preserves_empty_delimiter_unicode_and_row_errors() {
     let cases = [
-        ("a,b,c", ",", 1, "a"),
-        ("a,b,c", ",", 2, "b"),
-        ("a,b,c", ",", 3, "c"),
-        ("a,b,c", ",", 4, ""),
-        ("a,b,c", ",", -1, "c"),
-        ("a,b,c", ",", -2, "b"),
-        ("a,b,c", ",", -3, "a"),
-        ("a,b,c", ",", -4, ""),
-        ("abc", ",", 1, "abc"),
-        ("abc", ",", -1, "abc"),
-        ("abc", ",", 2, ""),
-        (",a,,", ",", 2, "a"),
-        (",a,,", ",", -2, ""),
-        ("aaa", "aa", 1, ""),
-        ("aaa", "aa", 2, "a"),
-        ("aaa", "aa", -1, ""),
-        ("aaa", "aa", -2, "a"),
-        ("é中👩‍💻", "", 1, "é"),
-        ("é中👩‍💻", "", 2, "中"),
-        ("é中👩‍💻", "", 4, "‍"),
-        ("é中👩‍💻", "", 6, ""),
-        ("é中👩‍💻", "", -1, "é"),
-        ("é中👩‍💻", "", -99, "é"),
-        ("é中👩‍💻", "", i32::MIN, "é"),
-        ("é中", "", i32::MAX, ""),
-        ("a\u{301}", "", 2, "\u{301}"),
-        ("a\0b\0c", "\0", -2, "b"),
-        ("你好::世界", "::", -1, "世界"),
-        ("", "", -1, ""),
-        ("abc", "", 0, ""),
-        ("abc", ",", i32::MIN, ""),
-        ("abc", ",", i32::MAX, ""),
+        ("a,b,c", ",", 1, Some("a")),
+        ("a,b,c", ",", 2, Some("b")),
+        ("a,b,c", ",", 3, Some("c")),
+        ("a,b,c", ",", 4, None),
+        (",a,,", ",", 3, Some("")),
+        ("aaa", "aa", 1, Some("")),
+        ("aaa", "aa", 2, Some("a")),
+        ("é中👩‍💻", "", 1, Some("é")),
+        ("é中👩‍💻", "", 4, Some("‍")),
+        ("é中👩‍💻", "", 6, None),
+        ("a\u{301}", "", 2, Some("\u{301}")),
+        ("a\0b\0c", "\0", 2, Some("b")),
+        ("你好::世界", "::", 2, Some("世界")),
+        ("abc", ",", i64::MAX, None),
+        ("abc", "", 0, None),
+        ("abc", ",", i64::MIN, None),
     ];
-    let text = strings(cases.iter().map(|c| Some(c.0)).collect());
-    let delim = strings(cases.iter().map(|c| Some(c.1)).collect());
-    let index = integers(cases.iter().map(|c| Some(c.2)).collect());
+    let text = strings(cases.iter().map(|case| Some(case.0)).collect());
+    let delim = strings(cases.iter().map(|case| Some(case.1)).collect());
+    let index = integers(cases.iter().map(|case| Some(case.2)).collect());
     let arguments = [
         EvaluatedArgument::Column(&text),
         EvaluatedArgument::Column(&delim),
         EvaluatedArgument::Column(&index),
     ];
-    for nullable in [false, true] {
-        let types: Vec<_> = sources(3)
-            .into_iter()
-            .map(|mut ty| {
-                ty = ty
-                    .with_nullable(nullable)
-                    .expect("valid function nullability declaration");
-                ty
-            })
-            .collect();
-        for policy in [
-            DecimalOverflowPolicy::OutputNull,
-            DecimalOverflowPolicy::ReportError,
-        ] {
-            let prepared = prepared_for_test_with_policy("split_part", &types, policy).unwrap();
-            assert_eq!(prepared.contract().result_type(), &source(true));
-            assert_eq!(prepared.instance_retained_upper_bound(), 0);
-            assert_eq!(prepared.contract().decimal_overflow_policy(), policy);
-            let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
-            for _ in 0..2 {
-                let result = kernel
-                    .evaluate(Selection::all(cases.len()), &arguments, &Control::default())
-                    .unwrap();
-                assert_eq!(
-                    output(&result),
-                    cases
-                        .iter()
-                        .map(|c| Some(c.3.to_string()))
-                        .collect::<Vec<_>>()
-                );
-            }
-        }
-    }
+    let mut kernel = instance("split_part", 3);
+    let result = kernel
+        .evaluate(Selection::all(cases.len()), &arguments, &Control::default())
+        .unwrap();
+    let values = result
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        cases.iter().map(|case| case.3).collect::<Vec<_>>()
+    );
+    let reason = crate::DataFailureReason::Domain(
+        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+    );
+    assert_eq!(
+        result
+            .errors()
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.reason()))
+            .collect::<Vec<_>>(),
+        [(14, reason), (15, reason)]
+    );
 }
 
 #[test]
@@ -248,7 +224,7 @@ fn string_split_part_each_argument_has_its_own_sparse_compact_scalar_and_constan
         Box::default(),
     )
     .unwrap();
-    let indices = pool(integers(vec![Some(i32::MIN), None, Some(2)]));
+    let indices = pool(integers(vec![Some(i64::MIN), None, Some(2)]));
     let index = indices.value(2).unwrap();
     let arguments = [
         EvaluatedArgument::Column(&text),
@@ -273,8 +249,8 @@ fn string_split_part_each_argument_has_its_own_sparse_compact_scalar_and_constan
     let delim = delims.value(2).unwrap();
     let selected_indices = SelectedValues::try_new(
         selection,
-        &DataType::Int32,
-        integers(vec![Some(-1), Some(1)]),
+        &DataType::Int64,
+        integers(vec![Some(3), Some(1)]),
         Box::default(),
     )
     .unwrap();
@@ -293,7 +269,7 @@ fn string_split_part_each_argument_has_its_own_sparse_compact_scalar_and_constan
     );
     let text = strings(vec![Some("α|β")]);
     let delim = strings(vec![Some("|")]);
-    let index = integers(vec![Some(-1)]);
+    let index = integers(vec![Some(2)]);
     let arguments = [
         EvaluatedArgument::Scalar(&text),
         EvaluatedArgument::Scalar(&delim),
@@ -310,7 +286,7 @@ fn string_split_part_each_argument_has_its_own_sparse_compact_scalar_and_constan
 }
 
 #[test]
-fn string_split_part_null_is_called_on_null_empty_without_reading_hidden_or_other_payloads() {
+fn string_split_part_null_propagates_without_reading_hidden_or_other_payloads() {
     use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
     let huge = "a".repeat(320 * 1024);
     let mut bytes = huge.as_bytes().to_vec();
@@ -339,13 +315,13 @@ fn string_split_part_null_is_called_on_null_empty_without_reading_hidden_or_othe
                 .evaluate(Selection::all(2), &arguments, &control)
                 .unwrap()
         ),
-        vec![Some("".into()), Some("b".into())]
+        vec![None, Some("b".into())]
     );
     assert!(!control.trace.lock().unwrap().contains(&256));
     for null_arg in 0..3 {
         let text = strings(vec![Some(&huge)]);
         let delimiter = strings(vec![Some("z")]);
-        let indices = integers(vec![Some(i32::MAX)]);
+        let indices = integers(vec![Some(i64::MAX)]);
         let null_text = strings(vec![None]);
         let null_index = integers(vec![None]);
         let arguments = [
@@ -364,13 +340,13 @@ fn string_split_part_null_is_called_on_null_empty_without_reading_hidden_or_othe
                     .evaluate(Selection::all(1), &arguments, &control)
                     .unwrap()
             ),
-            vec![Some("".into())]
+            vec![None]
         );
         assert!(!control.trace.lock().unwrap().contains(&256));
     }
     let text = strings(vec![Some(&huge), Some("a,b")]);
     let delim = strings(vec![Some("z"), Some(",")]);
-    let index = integers(vec![Some(i32::MAX), Some(2)]);
+    let index = integers(vec![Some(i64::MAX), Some(2)]);
     let rows = [1];
     let selection = Selection::try_sparse(2, &rows).unwrap();
     let arguments = [
@@ -409,7 +385,7 @@ fn string_split_part_required_child_errors_and_wrong_canonical_shapes_fail_and_l
         let data_type = if failed < 2 {
             DataType::Utf8
         } else {
-            DataType::Int32
+            DataType::Int64
         };
         let values = if failed < 2 {
             strings(vec![None])
@@ -441,7 +417,7 @@ fn string_split_part_required_child_errors_and_wrong_canonical_shapes_fail_and_l
         );
         assert!(after.trace.lock().unwrap().is_empty());
     }
-    let wrong = Arc::new(arrow_array::Int64Array::from(vec![2])) as ArrayRef;
+    let wrong = Arc::new(arrow_array::Int32Array::from(vec![2])) as ArrayRef;
     let arguments = [
         EvaluatedArgument::Column(&text),
         EvaluatedArgument::Column(&delimiter),
@@ -501,7 +477,7 @@ fn string_split_part_runtime_all_seven_causes_keep_small_prefix_and_actual_searc
         (
             strings(vec![Some("a,b")]),
             strings(vec![Some(",")]),
-            Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef,
+            Arc::new(arrow_array::Int32Array::from(vec![1])) as ArrayRef,
             false,
             true,
         ),
@@ -656,12 +632,12 @@ fn string_split_part_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
         );
         assert_eq!(
             canonical.effects().null_behavior,
-            FunctionNullBehavior::CalledOnNull
+            FunctionNullBehavior::Strict
         );
         assert!(canonical.effects().observable_effects.is_empty());
         assert_eq!(
             canonical.effects().own_row_error,
-            crate::FunctionIntrinsicRowError::NoRowError
+            crate::FunctionIntrinsicRowError::MayRaise
         );
         assert_eq!(
             canonical.effects().argument_control,
@@ -685,7 +661,7 @@ fn string_split_part_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
         );
         assert_eq!(
             owner.binding_declaration().overloads()[0].effects.as_ref(),
-            Some(&effects())
+            Some(&trino_effects())
         );
         assert_eq!(owner.binding_declaration().overloads().len(), 1);
         for count in [0, 2, 4] {
@@ -753,11 +729,7 @@ fn string_split_part_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
                 .prepare_scalar(stale, canonical, crate::binding_test_control())
                 .is_err()
         );
-        let raw_types = [
-            source(true),
-            source(true),
-            FunctionValueType::new(DataType::Int64, true),
-        ];
+        let raw_types = [source(true), source(true), source(true)];
         let raw_arguments: Vec<_> = raw_types
             .iter()
             .cloned()
@@ -801,7 +773,7 @@ fn string_split_part_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
                     &[
                         source,
                         FunctionValueType::new(DataType::Utf8, true),
-                        FunctionValueType::new(DataType::Int32, true)
+                        FunctionValueType::new(DataType::Int64, true)
                     ],
                     DecimalOverflowPolicy::OutputNull
                 )
@@ -822,7 +794,7 @@ fn string_split_part_compile_success_and_ordinary_tail_preserve_all_callback_cau
                 &[
                     ty.clone(),
                     source(true),
-                    FunctionValueType::new(DataType::Int32, true)
+                    FunctionValueType::new(DataType::Int64, true)
                 ],
                 DecimalOverflowPolicy::OutputNull,
                 &good
@@ -847,7 +819,7 @@ fn string_split_part_compile_success_and_ordinary_tail_preserve_all_callback_cau
                     &[
                         ty.clone(),
                         source(true),
-                        FunctionValueType::new(DataType::Int32, true),
+                        FunctionValueType::new(DataType::Int64, true),
                     ],
                     DecimalOverflowPolicy::OutputNull,
                     &control,
@@ -959,7 +931,7 @@ fn string_split_part_constant_null_is_deferred_and_no_unrelated_string_size_cap_
                 .evaluate(Selection::all(3), &evaluated, &Control::default())
                 .unwrap()
         ),
-        vec![Some("".into()); 3]
+        vec![None; 3]
     );
     assert_eq!(constant.ordinal(), 1);
     assert!(Arc::ptr_eq(constant.pool().array(), constants.array()));

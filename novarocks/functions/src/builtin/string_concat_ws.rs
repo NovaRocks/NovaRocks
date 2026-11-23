@@ -25,13 +25,13 @@ use crate::{
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{Array, ArrayRef, StringArray};
+use arrow_array::{Array, ArrayRef, ListArray, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{FunctionIntrinsicRowError, ValueLogicalType};
 use std::{alloc::Layout, sync::Arc};
 
-use super::string_concat_core::{concat_ws_length_observed, emit_concat_ws_observed};
+use super::string_concat_core::{ConcatLength, concat_ws_length_observed, emit_concat_ws_observed};
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -102,18 +102,93 @@ fn row_length(
     ordinal: usize,
     batch_row: usize,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<usize>, KernelFailure> {
+) -> Result<ConcatLength, KernelFailure> {
+    let Some(pieces) = Pieces::at_row(input, ordinal, batch_row)? else {
+        return Ok(ConcatLength::Null);
+    };
     let mut context = (input, ordinal, batch_row, work);
     concat_ws_length_observed(
-        input.arguments().len(),
+        pieces.count(input),
         &mut context,
-        |context, index| selected_text(context.0, index, context.1, context.2, context.3),
+        |context, index| pieces.read(context.0, index, context.1, context.2, context.3),
         |context, index| {
-            selected_text(context.0, index, context.1, context.2, context.3)?;
+            pieces.read(context.0, index, context.1, context.2, context.3)?;
             Ok(())
         },
         |context, _| context.3.step(),
     )
+}
+
+enum Pieces<'a> {
+    Arguments,
+    Array {
+        values: &'a StringArray,
+        start: usize,
+        count: usize,
+    },
+}
+
+impl<'a> Pieces<'a> {
+    fn at_row(
+        input: &ScalarCallInput<'_, 'a>,
+        ordinal: usize,
+        batch_row: usize,
+    ) -> Result<Option<Self>, KernelFailure> {
+        let [_, argument] = input.arguments() else {
+            return Ok(Some(Self::Arguments));
+        };
+        let Some(list) = argument.array().as_any().downcast_ref::<ListArray>() else {
+            return Ok(Some(Self::Arguments));
+        };
+        let row = argument.value_row(ordinal, batch_row);
+        if row >= list.len() {
+            return Err(internal("concat_ws selected list row is out of bounds"));
+        }
+        if list.is_null(row) {
+            return Ok(None);
+        }
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| internal("concat_ws selected list elements are not Utf8"))?;
+        let offsets = list.value_offsets();
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        if start > end || end > values.len() {
+            return Err(internal("concat_ws selected list range is out of bounds"));
+        }
+        Ok(Some(Self::Array {
+            values,
+            start,
+            count: end - start,
+        }))
+    }
+
+    fn count(&self, input: &ScalarCallInput<'_, 'a>) -> usize {
+        match self {
+            Self::Arguments => input.arguments().len(),
+            Self::Array { count, .. } => 1 + count,
+        }
+    }
+
+    fn read(
+        &self,
+        input: &ScalarCallInput<'_, 'a>,
+        index: usize,
+        ordinal: usize,
+        batch_row: usize,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Option<&'a str>, KernelFailure> {
+        match (self, index) {
+            (Self::Array { values, start, .. }, 1..) => {
+                let row = start + index - 1;
+                work.step()?;
+                Ok(values.is_valid(row).then(|| values.value(row)))
+            }
+            _ => selected_text(input, index, ordinal, batch_row, work),
+        }
+    }
 }
 
 fn copy_span(
@@ -137,6 +212,7 @@ pub(super) fn evaluate_string_concat_ws<'a>(
     let result = (|| {
         let selected = input.contract().selected();
         let target = input.contract().result_type();
+        let trino = input.contract().effects().own_row_error == FunctionIntrinsicRowError::MayRaise;
         if input.arguments().len() < 2
             || selected.argument_types.len() != input.arguments().len()
             || target.logical_type() != ValueLogicalType::Physical
@@ -147,19 +223,37 @@ pub(super) fn evaluate_string_concat_ws<'a>(
                 "concat_ws differs from its installed variadic Utf8 profile",
             ));
         }
-        for (argument, ty) in input.arguments().iter().zip(selected.argument_types.iter()) {
+        for (index, (argument, ty)) in input
+            .arguments()
+            .iter()
+            .zip(selected.argument_types.iter())
+            .enumerate()
+        {
             let FunctionArgumentType::Value(source) = ty else {
                 return Err(invalid("concat_ws requires only checked value arguments"));
             };
+            let list = trino
+                && index == 1
+                && input.arguments().len() == 2
+                && matches!(source.data_type(), DataType::List(child) if child.data_type() == &DataType::Utf8);
             let exact = source.logical_type() == ValueLogicalType::Physical
-                && source.data_type() == &DataType::Utf8;
+                && (source.data_type() == &DataType::Utf8 || list);
             work.step()?;
             if !exact {
                 return Err(invalid(
                     "concat_ws selected source is outside its installed profile",
                 ));
             }
-            let checked = carrier(*argument);
+            let checked = if list {
+                argument
+                    .array()
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .map(|_| ())
+                    .ok_or_else(|| internal("concat_ws selected carrier is not a List"))
+            } else {
+                carrier(*argument).map(|_| ())
+            };
             work.step()?;
             checked?;
         }
@@ -167,7 +261,7 @@ pub(super) fn evaluate_string_concat_ws<'a>(
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;
         for (ordinal, row) in selection.iter().enumerate() {
-            if let Some(length) = row_length(&input, ordinal, row, &mut work)? {
+            if let ConcatLength::Value(length) = row_length(&input, ordinal, row, &mut work)? {
                 total = total
                     .checked_add(length)
                     .ok_or(KernelFailure::ResourceExhausted)?;
@@ -190,13 +284,20 @@ pub(super) fn evaluate_string_concat_ws<'a>(
         work.flush()?;
         offsets.push(0i32);
         let mut has_null = false;
+        let mut errors = Vec::new();
         for (ordinal, row) in selection.iter().enumerate() {
             match row_length(&input, ordinal, row, &mut work)? {
-                None => {
+                length @ (ConcatLength::Null | ConcatLength::TooLong) => {
+                    if trino && let Some(error) = length.data_error(ordinal) {
+                        errors
+                            .try_reserve(1)
+                            .map_err(|_| KernelFailure::ResourceExhausted)?;
+                        errors.push(error);
+                    }
                     has_null = true;
                     validity.append(false);
                 }
-                Some(length) => {
+                ConcatLength::Value(length) => {
                     let available = total.checked_sub(bytes.len()).ok_or_else(|| {
                         internal("concat_ws destination exceeds its measured extent")
                     })?;
@@ -204,9 +305,11 @@ pub(super) fn evaluate_string_concat_ws<'a>(
                         return Err(internal("concat_ws exceeded its measured output extent"));
                     }
                     let start = bytes.len();
+                    let pieces = Pieces::at_row(&input, ordinal, row)?
+                        .ok_or_else(|| internal("concat_ws changed its measured source NULL"))?;
                     let mut context = (&input, ordinal, row, &mut bytes, &mut work);
                     emit_concat_ws_observed(
-                        input.arguments().len(),
+                        pieces.count(&input),
                         &mut context,
                         |context| {
                             selected_text(context.0, 0, context.1, context.2, context.4)?
@@ -215,7 +318,7 @@ pub(super) fn evaluate_string_concat_ws<'a>(
                                 })
                         },
                         |context, index| {
-                            selected_text(context.0, index, context.1, context.2, context.4)
+                            pieces.read(context.0, index, context.1, context.2, context.4)
                         },
                         |context, text| copy_span(text, context.3, context.4),
                         |context, _| context.4.step(),
@@ -245,7 +348,7 @@ pub(super) fn evaluate_string_concat_ws<'a>(
             selection,
             target.data_type(),
             array,
-            Box::default(),
+            errors.into_boxed_slice(),
             || work.step(),
         )
     })();

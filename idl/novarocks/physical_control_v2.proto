@@ -43,6 +43,8 @@ message RegionGuard {
     uint32 temporal_after_source_ordinal = 6;
     uint32 between_after_source_ordinal = 7;
     uint32 membership_after_source_ordinal = 8;
+    // Zero-based preceding argument in the ordered regexp call.
+    uint32 ordered_regexp_after_argument_ordinal = 9;
   }
 }
 enum SimpleGuard {
@@ -89,6 +91,8 @@ enum SimpleControl {
   SIMPLE_CONTROL_COALESCE = 7;
   SIMPLE_CONTROL_NO_ARGUMENTS = 8;
   SIMPLE_CONTROL_TRY = 9;
+  // Source is argument 0 and the pattern conversion occurs at argument 1.
+  SIMPLE_CONTROL_ORDERED_REGEXP = 10;
 }
 message CaseControl {
   bool simple = 1;

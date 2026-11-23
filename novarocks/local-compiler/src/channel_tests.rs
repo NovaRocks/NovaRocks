@@ -463,8 +463,6 @@ fn package_with_outputs(
                         effects: authored.call_contract().effects().clone(),
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                         temporal_source: None,
-                        regexp_count_pattern_source: None,
-                        to_base64_byte_source: None,
                     },
                 );
             }

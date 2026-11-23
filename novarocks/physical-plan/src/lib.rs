@@ -117,7 +117,9 @@ pub fn grouped_state_topn_key_supported(
 /// Revision 38 adds exact temporal declarations, statement-time facts, and
 /// capability-dependent temporal result schemas.
 /// Revision 39 admits composite predicate LeftMark over the full right relation.
-pub const PLAN_CONTRACT_REVISION: u32 = 39;
+/// Revision 40 freezes ordered regexp argument demand and pattern conversion,
+/// and reserves the retired regexp and Base64 source claim fields.
+pub const PLAN_CONTRACT_REVISION: u32 = 40;
 
 #[cfg(test)]
 mod tests;

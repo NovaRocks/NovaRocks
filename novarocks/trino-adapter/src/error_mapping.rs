@@ -771,7 +771,7 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.type_mismatch" => TypeMismatch,
         "sql.analyze.function_not_aggregate" => FunctionNotAggregate,
         "sql.analyze.expression_not_scalar" => ExpressionNotScalar,
-        "sql.admit.unknown_type" => TypeNotFound,
+        "sql.admit.unknown_type" | "sql.analyze.unknown_type" => TypeNotFound,
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.numeric_out_of_range" => NumericOutOfRange,
         "sql.analyze.invalid_function_argument" => InvalidFunctionArgument,

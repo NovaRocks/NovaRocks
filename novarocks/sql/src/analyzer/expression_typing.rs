@@ -522,6 +522,9 @@ fn scalar_selection_error(
                 error,
                 FunctionBindingError::UnavailableImplementation(_)
                     | FunctionBindingError::VariantTargetType(_)
+                    | FunctionBindingError::ValueType(
+                        novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. }
+                    )
                     | FunctionBindingError::UnknownFunction
                     | FunctionBindingError::HiddenFunction
                     | FunctionBindingError::NoMatchingOverload

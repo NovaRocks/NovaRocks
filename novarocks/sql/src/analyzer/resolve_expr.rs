@@ -28,7 +28,8 @@ use novarocks_parser::printer::print_object_name;
 use crate::analysis::*;
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
 use novarocks_type_contract::{
-    ArithmeticOperator, TemporalType, ValueTypeRef, arithmetic_result_value_type_with_op,
+    ArithmeticOperator, CharacterKind, TemporalType, ValueKind, ValueTypeRef,
+    arithmetic_result_value_type_with_op,
 };
 
 use super::functions::*;
@@ -197,14 +198,13 @@ struct FunctionMetadata<'a> {
 fn unsupported_remaining_root(expr: &ast::Expr) -> bool {
     matches!(
         expr,
-        ast::Expr::Overlay(_)
-            | ast::Expr::MethodCall(_)
+        ast::Expr::MethodCall(_)
             | ast::Expr::StaticMethodCall(_)
             | ast::Expr::CurrentCatalog(_)
             | ast::Expr::CurrentPath(_)
             | ast::Expr::CurrentSchema(_)
             | ast::Expr::CurrentUser(_)
-    ) || matches!(expr, ast::Expr::Trim(node) if node.trim_character.is_some())
+    )
 }
 
 impl<'a> super::AnalyzerContext<'a> {
@@ -285,6 +285,8 @@ impl<'a> super::AnalyzerContext<'a> {
             | ast::Expr::NullIf(_)
             | ast::Expr::Coalesce(_)
             | ast::Expr::Try(_)
+            | ast::Expr::Format(_)
+            | ast::Expr::Overlay(_)
             | ast::Expr::Extract(_) => unreachable!("canonical syntax call was already mapped"),
             ast::Expr::JsonQuery(node) => self.analyze_json_query_syntax(node, scope),
             ast::Expr::JsonObject(node) => self.analyze_json_object_syntax(node, scope),
@@ -354,8 +356,7 @@ impl<'a> super::AnalyzerContext<'a> {
             | ast::Expr::CurrentTimestamp(_)
             | ast::Expr::LocalTime(_)
             | ast::Expr::LocalTimestamp(_) => self.type_clock(expr),
-            ast::Expr::Overlay(_)
-            | ast::Expr::MethodCall(_)
+            ast::Expr::MethodCall(_)
             | ast::Expr::StaticMethodCall(_)
             | ast::Expr::CurrentCatalog(_)
             | ast::Expr::CurrentPath(_)
@@ -454,11 +455,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 scope,
                 case.span,
             ),
-
-            ast::Expr::Format(node) => Err(AnalyzeError::unsupported_expression(
-                "FORMAT expressions are not supported",
-                node.span,
-            )),
 
             // Function call
             ast::Expr::FunctionCall(func) => self.analyze_function(func, scope),
@@ -2009,22 +2005,10 @@ impl<'a> super::AnalyzerContext<'a> {
         if let Some(reason) = unsupported_call_facts(func) {
             return Err(AnalyzeError::unsupported_expression(reason, func.span));
         }
-        // These exact canonical Trino calls have no selected implementation.
-        // Keep this direct capability refusal after the original metadata guard;
-        // qualified and differently quoted ordinary names retain their lookup.
-        if let [name] = func.name.parts.as_slice()
-            && ((!name.quoted && name.value.eq_ignore_ascii_case("strpos"))
-                || (name.quoted && name.value == "normalize"))
-        {
-            return Err(AnalyzeError::unsupported_expression(
-                format!(
-                    "builtin function `{}` has no admitted selected scalar implementation",
-                    name.value.to_ascii_lowercase()
-                ),
-                func.span,
-            ));
-        }
-        let original_name = print_object_name(&func.name).to_ascii_lowercase();
+        let original_name = match func.name.parts.as_slice() {
+            [name] if name.value.eq_ignore_ascii_case("normalize") => "normalize".to_owned(),
+            _ => print_object_name(&func.name).to_ascii_lowercase(),
+        };
         let original_input = if func.filter.is_some()
             && func.window.is_none()
             && (is_aggregate_function(self.function_catalog, &original_name)
@@ -2711,7 +2695,7 @@ impl<'a> super::AnalyzerContext<'a> {
             };
             // Legacy declarations are type-inspection facts, not installed selected bindings.
             // A custom contribution of the same name is resolved by its own catalog identity.
-            if unknown {
+            if unknown && !matches!(name.as_str(), "format" | "$overlay") {
                 if matches!(
                     crate::functions::builtin_disposition(&name),
                     Some(
@@ -3950,21 +3934,6 @@ fn timestamp_unit_cast_can_return_null(source: &DataType, target: &DataType) -> 
     )
 }
 
-#[cfg(test)]
-fn bind_scalar_function_call(
-    name: &str,
-    args: Vec<TypedExpr>,
-) -> Result<BoundScalarCall, AnalyzeError> {
-    bind_scalar_function_call_with_catalog(
-        crate::functions::builtin_sql_function_catalog(),
-        name,
-        args,
-        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        crate::constant::test_constant_policy(),
-        &crate::compiler::SqlCompileControl::unbounded(),
-    )
-}
-
 // FIELD chooses one comparison family before ordinary argument binding. The
 // frozen signature must contain this common type for every value and candidate.
 
@@ -4786,6 +4755,13 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
 }
 
 fn typeof_name(dt: &DataType, declared: Option<&ValueTypeRef>) -> String {
+    if let Some(ValueKind::BoundedCharacter(character)) = declared.map(ValueTypeRef::kind) {
+        let name = match character.kind() {
+            CharacterKind::Char => "char",
+            CharacterKind::Varchar => "varchar",
+        };
+        return format!("{name}({})", character.length());
+    }
     fn contains_temporal(ty: &ValueTypeRef) -> bool {
         ty.temporal().is_some()
             || (0..ty.child_count())
@@ -4798,6 +4774,18 @@ fn typeof_cast_name(
     syntax: &ast::TypeName,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<String>, AnalyzeError> {
+    if let ast::TypeKind::Generic(generic) = &syntax.kind
+        && !generic.arguments.is_empty()
+        && (generic.name.value.eq_ignore_ascii_case("char")
+            || generic.name.value.eq_ignore_ascii_case("varchar"))
+    {
+        let declared = super::helpers::sql_type_to_value_type(syntax, false, control)?;
+        return Ok(Some(typeof_name(
+            declared.data_type(),
+            Some(declared.value_type()),
+        )));
+    }
+
     struct ContainsTemporal(bool);
 
     impl ast::Visit for ContainsTemporal {
@@ -5281,7 +5269,7 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_trim_profiles_keep_original_binding_and_refuse_explicit_characters() {
+    fn dedicated_trim_profiles_keep_original_binding_and_name_unavailable_overloads() {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let ctx = logical_context(&control);
         let scope = ctx.new_scope();
@@ -5314,14 +5302,18 @@ mod tests {
             };
             assert_eq!(actual.selected.overload, expected.selected.overload);
             let mut node = node;
-            node.trim_source =
-                ast::Expr::Identifier(novarocks_parser::build::ident("must_not_resolve", false));
             node.trim_character = Some(string_literal_expr("x".into(), node.span));
+            let error = ctx
+                .analyze_expr(&ast::Expr::Trim(ast::AstBox::new(node)), &scope)
+                .unwrap_err();
             assert_eq!(
-                ctx.analyze_expr(&ast::Expr::Trim(ast::AstBox::new(node)), &scope)
-                    .unwrap_err()
-                    .kind(),
-                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+            );
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("/{name}/trino-varchar-codepoints-v1"))
             );
         }
         let leaf = ast::Expr::CurrentTimestamp(ast::CurrentTimestamp {
@@ -5623,6 +5615,24 @@ mod tests {
                 panic!("expected a type name: {source}");
             };
             assert_eq!(actual, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn typeof_preserves_the_width_of_bounded_character_values() {
+        for (expression, expected) in [
+            ("''", "varchar(0)"),
+            ("'é中'", "varchar(2)"),
+            ("CAST(only_missing_child AS CHAR(3))", "char(3)"),
+            ("CAST(only_missing_child AS VARCHAR(5))", "varchar(5)"),
+            ("CAST(only_missing_child AS VARCHAR(2147483647))", "varchar"),
+        ] {
+            let sql = format!("SELECT typeof({expression})");
+            let actual = analyze_projection_expr(&sql).expect("character type should resolve");
+            let ExprKind::Literal(LiteralValue::String(actual)) = actual.kind else {
+                panic!("expected a type name: {sql}");
+            };
+            assert_eq!(actual, expected, "{sql}");
         }
     }
 
@@ -6290,7 +6300,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_missing_specials_refuse_before_children_but_keep_metadata_and_opaque_casts() {
+    fn canonical_string_calls_keep_metadata_and_opaque_casts() {
         use crate::analyze_error::AnalyzeErrorKind;
         use novarocks_parser::build;
         let control = crate::compiler::SqlCompileControl::unbounded();
@@ -6304,9 +6314,9 @@ mod tests {
                 vec![missing.clone(), build::string("NFC")],
             );
             let error = ctx.analyze_expr(&expression, &scope).unwrap_err();
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-            assert!(error.message().contains(name), "{error}");
-            assert_eq!(error.span(), Some(expression.span()));
+            assert_eq!(error.kind(), missing_kind);
+            assert!(error.message().contains("only_missing_child"), "{error}");
+            assert_eq!(error.span(), Some(missing.span()));
 
             let ast::Expr::FunctionCall(call) = &mut expression else {
                 panic!("call");
@@ -6377,7 +6387,136 @@ mod tests {
             assert_eq!(
                 ctx.analyze_expr(&expression, &scope).unwrap_err().kind(),
                 missing_kind,
-                "noncanonical names must still analyze their original child before catalog lookup"
+                "calls must analyze their original child before catalog lookup"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_position_and_normalize_share_the_ordinary_catalogue_binding() {
+        for (syntax, ordinary, result_type) in [
+            (
+                "POSITION('é' IN ' aé')",
+                "strpos(' aé', 'é')",
+                DataType::Int64,
+            ),
+            (
+                "NORMALIZE('é')",
+                "\"normalize\"('é', 'NFC')",
+                DataType::Utf8,
+            ),
+            (
+                "NORMALIZE('é', NFD)",
+                "\"normalize\"('é', 'NFD')",
+                DataType::Utf8,
+            ),
+        ] {
+            let selected = |source| {
+                let typed = analyze_projection_expr(&format!("SELECT {source}")).unwrap();
+                assert_eq!(typed.value_type.data_type(), &result_type);
+                let ExprKind::FunctionCall { binding, .. } = typed.kind else {
+                    panic!("expected catalogue binding: {source}");
+                };
+                binding
+            };
+            let syntax = selected(syntax);
+            let ordinary = selected(ordinary);
+            assert_eq!(syntax.function_id, ordinary.function_id);
+            assert_eq!(syntax.selected, ordinary.selected);
+        }
+    }
+
+    #[test]
+    fn derived_char_concat_width_preserves_type_resolution_failure() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_type_contract::{CharacterKind, ValueTypeError};
+
+        for (left, right) in [("'a'", "'b'"), ("NULL", "NULL")] {
+            let query = format!(
+                "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32768))))"
+            );
+            let expression = analyze_projection_expr(&query).unwrap();
+            assert!(matches!(
+                expression.kind,
+                ExprKind::Literal(LiteralValue::String(value)) if value == "char(65536)"
+            ));
+
+            let query = novarocks_parser::parser::parse_query(&format!(
+                "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32769))))"
+            ))
+            .unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnknownType);
+            assert_eq!(error.code().as_str(), "sql.analyze.unknown_type");
+            assert_eq!(error.message(), "Unknown type: char(65537)");
+            assert_eq!(
+                error
+                    .source_failure()
+                    .unwrap()
+                    .downcast_ref::<ValueTypeError>(),
+                Some(&ValueTypeError::InvalidCharacterWidth {
+                    kind: CharacterKind::Char,
+                    length: 65537,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn recognized_unsupported_string_profiles_report_named_capability() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        for (expression, overload) in [
+            ("format('%s', 7)", "/format/trino-variadic-v1"),
+            (
+                "overlay('abcd' PLACING 'xy' FROM 2)",
+                "/$overlay/trino-varchar-three-v1",
+            ),
+            (
+                "overlay('abcd' PLACING 'xy' FROM 2 FOR 1)",
+                "/$overlay/trino-varchar-four-v1",
+            ),
+            ("ltrim('abcd', 'a')", "/ltrim/trino-varchar-codepoints-v1"),
+            (
+                "TRIM(TRAILING 'd' FROM CAST('abcd' AS CHAR(4)))",
+                "/rtrim/trino-char-codepoints-v1",
+            ),
+        ] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT {expression}")).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+            assert!(error.message().contains(overload), "{error}");
+        }
+        for expression in [
+            "overlay('abcd' PLACING 'xy' FROM 'not a number')",
+            "overlay('abcd' PLACING 7 FROM 1)",
+            "\"$overlay\"('abcd', 'xy', 2)",
+            "ltrim('abcd', 7)",
+            "trim(7 FROM 'abcd')",
+            "translate('x', 'y')",
+            "lower(7)",
+            "length(7)",
+            "substring('x', '1')",
+            "char_length('xyz')",
+            "initcap('xyz')",
+        ] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT {expression}")).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::UnknownFunction,
+                "{expression}: {error}"
+            );
+        }
+        for expression in ["format(7, 'text')", "format(CAST('x' AS CHAR(1)), 'text')"] {
+            let query =
+                novarocks_parser::parser::parse_query(&format!("SELECT {expression}")).unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::TypeMismatch,
+                "{expression}: {error}"
             );
         }
     }
@@ -8198,7 +8337,7 @@ mod tests {
             .ok_or_else(|| "expected projection".to_string())
     }
 
-    fn assert_substring_int32_arguments(sql: &str, expected_name: &str, expected_arity: usize) {
+    fn assert_substring_bigint_arguments(sql: &str, expected_name: &str, expected_arity: usize) {
         let expr = analyze_projection_expr(sql).expect("substring should analyze");
         let crate::analysis::ExprKind::FunctionCall { name, args, .. } = expr.kind else {
             panic!("expected FunctionCall, got {:?}", expr.kind);
@@ -8207,16 +8346,44 @@ mod tests {
         assert_eq!(args.len(), expected_arity);
         assert_eq!(args[0].value_type.data_type().clone(), DataType::Utf8);
         for arg in &args[1..] {
-            assert_eq!(arg.value_type.data_type().clone(), DataType::Int32);
+            assert_eq!(arg.value_type.data_type(), &DataType::Int64);
         }
     }
 
+    fn assert_substring_bigint_literal(argument: &TypedExpr, expected: i64) {
+        use novarocks_type_contract::TrinoCastMode;
+
+        assert_eq!(argument.value_type.data_type(), &DataType::Int64);
+        assert!(!argument.value_type.nullable());
+        let original = if i32::try_from(expected).is_ok() {
+            let ExprKind::Cast {
+                expr,
+                target: DataType::Int64,
+                cast_mode: Some(TrinoCastMode::Implicit),
+                ..
+            } = &argument.kind
+            else {
+                panic!("expected implicit widening of the INTEGER literal {expected}");
+            };
+            assert_eq!(expr.value_type.data_type(), &DataType::Int32);
+            assert!(!expr.value_type.nullable());
+            expr.as_ref()
+        } else {
+            argument
+        };
+        assert_eq!(super::signed_int_literal_value(original), Some(expected));
+    }
+
     #[test]
-    fn substring_function_syntax_binds_integer_literals_to_int32() {
+    fn substring_function_syntax_binds_integer_literals_to_bigint() {
         for (sql, values) in [
             ("select substring('STARROCKS', 2, 3)", &[2, 3][..]),
             ("select substring('x', 2147483647)", &[2147483647][..]),
             ("select substring('x', -2147483648)", &[-2147483648][..]),
+            (
+                "select substring('x', 9223372036854775807)",
+                &[i64::MAX][..],
+            ),
         ] {
             let expr = analyze_projection_expr(sql).expect("in-range literals should analyze");
             let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
@@ -8224,21 +8391,14 @@ mod tests {
             };
             assert_eq!(args.len(), values.len() + 1);
             for (arg, expected) in args.iter().skip(1).zip(values) {
-                assert_eq!(arg.value_type.data_type().clone(), DataType::Int32);
-                assert!(!arg.value_type.nullable());
-                assert!(matches!(
-                    arg.kind,
-                    crate::analysis::ExprKind::Literal(
-                        crate::analysis::LiteralValue::Int(value)
-                    ) if value == *expected
-                ));
+                assert_substring_bigint_literal(arg, *expected);
             }
         }
     }
 
     #[test]
     fn substring_normal_and_special_syntax_bind_identical_arguments() {
-        use novarocks_type_contract::ValueKind;
+        use novarocks_type_contract::{CharacterKind, ValueKind};
 
         let ordinary = analyze_projection_expr("SELECT substring('x', 2, 3)").unwrap();
         let special = analyze_projection_expr("SELECT substring('x' FROM 2 FOR 3)").unwrap();
@@ -8249,9 +8409,12 @@ mod tests {
             };
             assert_eq!(name, expected_name);
             assert_eq!(args.len(), 3);
-            assert_eq!(
-                args[0].value_type.value_type().kind(),
-                &ValueKind::String,
+            assert!(
+                matches!(
+                    args[0].value_type.value_type().kind(),
+                    ValueKind::BoundedCharacter(character)
+                        if character.kind() == CharacterKind::Varchar && character.length() == 1
+                ),
                 "{name}"
             );
             assert!(!args[0].value_type.nullable());
@@ -8259,19 +8422,19 @@ mod tests {
                 matches!(&args[0].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "x")
             );
             for (argument, expected) in args.iter().skip(1).zip([2, 3]) {
-                assert_eq!(argument.value_type.data_type(), &DataType::Int32);
-                assert!(!argument.value_type.nullable());
-                assert!(
-                    matches!(argument.kind, ExprKind::Literal(LiteralValue::Int(value)) if value == expected)
-                );
+                assert_substring_bigint_literal(argument, expected);
             }
         }
     }
 
     #[test]
     fn substring_special_syntax_uses_the_same_binding() {
-        assert_substring_int32_arguments("select substring('STARROCKS' from 2 for 3)", "substr", 3);
-        assert_substring_int32_arguments("select substring('STARROCKS' from 2)", "substr", 2);
+        assert_substring_bigint_arguments(
+            "select substring('STARROCKS' from 2 for 3)",
+            "substr",
+            3,
+        );
+        assert_substring_bigint_arguments("select substring('STARROCKS' from 2)", "substr", 2);
     }
 
     #[test]
@@ -8326,11 +8489,19 @@ mod tests {
                 panic!("expected substring: {sql}");
             };
             let ExprKind::Cast {
+                expr: integer,
+                target: DataType::Int64,
+                ..
+            } = &args[1].kind
+            else {
+                panic!("expected the BIGINT parameter to widen its INTEGER input: {sql}");
+            };
+            let ExprKind::Cast {
                 expr: original,
                 cast_mode: Some(TrinoCastMode::Explicit),
                 target: DataType::Int32,
                 ..
-            } = &args[1].kind
+            } = &integer.kind
             else {
                 panic!("expected explicit CAST to INTEGER: {sql}");
             };
@@ -8343,31 +8514,18 @@ mod tests {
     }
 
     #[test]
-    fn scalar_binder_never_inserts_implicit_narrowing_for_substring() {
-        use crate::analyze_error::AnalyzeErrorKind;
-        use novarocks_type_contract::FunctionValueType;
-
-        let error = super::bind_scalar_function_call(
-            "substring",
-            vec![
-                TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
-                    value_type: FunctionValueType::new(DataType::Utf8, false),
-                },
-                TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: crate::column_id::ColumnId(42),
-                        qualifier: None,
-                        column: "offset".to_string(),
-                    },
-                    value_type: FunctionValueType::new(DataType::Int64, false),
-                },
-            ],
+    fn substring_keeps_bigint_columns_as_the_selected_argument() {
+        let expression = analyze_projection_expr_with_catalog(
+            "SELECT substring('x', offset) FROM offsets",
+            &BigintOffsetCatalog,
+            crate::functions::builtin_sql_function_catalog(),
         )
-        .err()
-        .expect("the declared INTEGER overload must not implicitly narrow BIGINT");
-        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownFunction);
-        assert_eq!(error.message(), "no matching declared overload");
+        .unwrap();
+        let ExprKind::FunctionCall { args, .. } = expression.kind else {
+            panic!("expected substring");
+        };
+        assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
+        assert!(matches!(args[1].kind, ExprKind::ColumnRef { .. }));
     }
 
     #[test]
@@ -8377,7 +8535,7 @@ mod tests {
         )
         .expect("substring query should parse");
         let (resolved, _registry, _factory) = analyze(query, &BigintOffsetCatalog, "default")
-            .expect("the explicit CAST supplies the declared INTEGER parameter");
+            .expect("the explicit CAST supplies the INTEGER expression for the BIGINT parameter");
         let QueryBody::Select(select) = resolved.body else {
             panic!("expected select");
         };
@@ -8391,14 +8549,22 @@ mod tests {
             panic!("expected FunctionCall, got {:?}", expr.kind);
         };
         let offset = args.into_iter().nth(1).expect("expected offset argument");
-        assert_eq!(offset.value_type.data_type().clone(), DataType::Int32);
+        assert_eq!(offset.value_type.data_type(), &DataType::Int64);
         assert!(!offset.value_type.nullable());
+        let ExprKind::Cast {
+            expr: integer,
+            target: DataType::Int64,
+            ..
+        } = offset.kind
+        else {
+            panic!("expected the original INTEGER expression to be widened");
+        };
         let crate::analysis::ExprKind::Cast {
             expr,
             target: DataType::Int32,
             cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
             ..
-        } = offset.kind
+        } = &integer.kind
         else {
             panic!("expected BIGINT offset runtime cast");
         };
@@ -8641,9 +8807,18 @@ mod tests {
         let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
             panic!("expected FunctionCall, got {:?}", expr.kind);
         };
-        assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
+        assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
+        let ExprKind::Cast {
+            expr: arithmetic,
+            target: DataType::Int64,
+            ..
+        } = &args[1].kind
+        else {
+            panic!("expected the original INTEGER expression to be widened");
+        };
+        assert_eq!(arithmetic.value_type.data_type(), &DataType::Int32);
         let (operator, [left, right]) =
-            crate::common::binary_operator::typed_operands(&args[1]).expect("runtime arithmetic");
+            crate::common::binary_operator::typed_operands(arithmetic).expect("runtime arithmetic");
         assert_eq!(operator, novarocks_type_contract::OperatorFunction::Add);
         assert_eq!(left.value_type.data_type(), &DataType::Int32);
         assert_eq!(right.value_type.data_type(), &DataType::Int32);
@@ -8658,7 +8833,7 @@ mod tests {
     }
 
     #[test]
-    fn substring_null_offset_binds_to_nullable_int32() {
+    fn substring_null_offset_binds_to_nullable_bigint() {
         for sql in [
             "select substring('x', NULL)",
             "select substring('x' FROM NULL)",
@@ -8668,7 +8843,7 @@ mod tests {
             let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
                 panic!("expected FunctionCall, got {:?}", expr.kind);
             };
-            assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
+            assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
             assert!(args[1].value_type.nullable());
         }
     }

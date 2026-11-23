@@ -74,6 +74,26 @@ impl<'a> EvaluationCheckpoints<'a> {
         self.pending = 0;
         Ok(())
     }
+    pub(crate) fn regexp_search_progress(&mut self, offset: usize) -> Result<(), KernelFailure> {
+        self.flush()?;
+        if let Err(cause) = self.control.regexp_search_progress(offset) {
+            self.refusal = Some(cause.clone());
+            return Err(cause);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn regexp_search_stopped(&self, offset: usize) {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        if self
+            .refusal
+            .as_ref()
+            .is_some_and(|cause| cause.failure_fact().class() == FailureClass::Control)
+        {
+            self.control.regexp_search_stopped(offset);
+        }
+    }
+
     pub fn finish(self) -> Result<(), KernelFailure> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);

@@ -112,8 +112,6 @@ fn upper_call_is_eager_and_carries_no_source_fact() {
         claim.decimal_overflow_policy,
         DecimalOverflowPolicy::ReportError
     );
-    assert!(claim.regexp_count_pattern_source.is_none());
-    assert!(claim.to_base64_byte_source.is_none());
     assert!(claim.temporal_source.is_none());
     assert_eq!(authored.summaries.len(), sealed.uses().len());
 }
@@ -654,54 +652,70 @@ fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals
 }
 
 #[test]
-fn call_author_keeps_the_installed_regexp_and_base64_sources() {
-    use arrow::array::StringArray;
-    use novarocks_type_contract::{RegexpCountPatternSource, ToBase64ByteSource};
-    use std::sync::Arc;
+fn ordered_regexp_authorship_guards_each_argument_after_its_predecessor() {
+    use novarocks_expression::testkit::expression_text::{TextContext, type_expression_text};
+    use novarocks_type_contract::{
+        ArgumentControl, FunctionIntrinsicRowError, GuardKind, RegionGuard, SemanticParameterId,
+        SemanticParameterKey, SemanticParameterRef,
+    };
 
-    let mut fixture = AuthorFixture::new();
-    let text = fixture.constant(Arc::new(StringArray::from(vec!["x"])), utf8());
-    let pattern = fixture.constant(Arc::new(StringArray::from(vec!["."])), utf8());
-    let dynamic = fixture.call("lower", &[pattern], DecimalOverflowPolicy::OutputNull);
-    let literal_regex = fixture.call(
-        "regexp_count",
-        &[text, pattern],
-        DecimalOverflowPolicy::OutputNull,
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let parameters = SemanticParameters::default();
+    let context = TextContext {
+        functions: &functions,
+        constant_policy: POLICY,
+        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        parameters: &parameters,
+        allow_throw_exception: SemanticParameterRef {
+            id: SemanticParameterId::new(0),
+            expected_key: SemanticParameterKey::AllowThrowException,
+        },
+    };
+    let typed = type_expression_text(
+        "regexp_replace('é', '[é]', 'x')",
+        &[],
+        &context,
+        &HarnessControl,
+    )
+    .unwrap();
+    let unit = typed.unit();
+    let flow = unit.control_flow();
+    let &[root] = unit.root_use_ids() else {
+        panic!("one ordered regexp root");
+    };
+    let call = &flow.uses()[&root];
+    assert_eq!(call.control, ControlShape::OrderedRegexp);
+    let claim = &unit.claims()[&root];
+    assert_eq!(
+        claim.effects.argument_control,
+        ArgumentControl::OrderedRegexp
     );
-    let dynamic_regex = fixture.call(
-        "regexp_count",
-        &[text, dynamic],
-        DecimalOverflowPolicy::OutputNull,
+    assert_eq!(
+        claim.effects.own_row_error,
+        FunctionIntrinsicRowError::MayRaise
     );
-    let ordinary = fixture.call("to_base64", &[text], DecimalOverflowPolicy::OutputNull);
-    // FROM_BASE64 is an installed source with the same immediate Latin-1
-    // receipt used by native encryption byte producers.
-    let bytes = fixture.call("from_base64", &[text], DecimalOverflowPolicy::OutputNull);
-    let latin1 = fixture.call("to_base64", &[bytes], DecimalOverflowPolicy::OutputNull);
-    for root in [literal_regex, dynamic_regex, ordinary, latin1] {
-        fixture.root(root, EvaluationDemand::Value);
+    let parent = call.context.region;
+    let mut guarded_regions = std::collections::BTreeSet::new();
+    for (ordinal, argument) in call.arguments.iter().enumerate() {
+        let context = flow.uses()[argument].context;
+        assert_eq!(context.demand, EvaluationDemand::Value);
+        if ordinal == 0 {
+            assert_eq!(context.region, parent);
+        } else {
+            let region = flow.regions()[&context.region];
+            assert_eq!(region.parent, Some(parent));
+            assert!(guarded_regions.insert(region.id));
+            assert_eq!(
+                region.guard,
+                Some(RegionGuard {
+                    owner: root,
+                    kind: GuardKind::OrderedRegexpAfterArgument {
+                        ordinal: u32::try_from(ordinal - 1).unwrap(),
+                    },
+                })
+            );
+        }
     }
-    let sealed = fixture.seal();
-    let authored = fixture
-        .author(&sealed, &SemanticParameters::default(), &HarnessControl)
-        .unwrap();
-    let roots = sealed.root_use_ids();
-    assert_eq!(
-        authored.claims[&roots[0]].regexp_count_pattern_source,
-        Some(RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent)
-    );
-    assert_eq!(
-        authored.claims[&roots[1]].regexp_count_pattern_source,
-        Some(RegexpCountPatternSource::Dynamic)
-    );
-    assert_eq!(
-        authored.claims[&roots[2]].to_base64_byte_source,
-        Some(ToBase64ByteSource::Ordinary)
-    );
-    assert_eq!(
-        authored.claims[&roots[3]].to_base64_byte_source,
-        Some(ToBase64ByteSource::NativeV1EncryptionLatin1)
-    );
 }
 
 #[test]

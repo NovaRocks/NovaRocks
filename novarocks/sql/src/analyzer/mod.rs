@@ -8059,8 +8059,7 @@ mod tests {
     #[test]
     fn length_requires_an_explicit_varchar_cast_for_numeric_input() {
         let error = parse_and_analyze("select length(o_orderkey) from orders")
-            .err()
-            .expect("length requires a character argument");
+            .expect_err("length requires a character argument");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze("select length(CAST(o_orderkey AS VARCHAR)) from orders")
             .expect("length accepts the explicit text value");
@@ -8114,6 +8113,7 @@ mod tests {
             );
         };
         assert_eq!(name, "substring");
+        assert_eq!(args.len(), 3);
         let ExprKind::Cast {
             target,
             expr,
@@ -8132,10 +8132,34 @@ mod tests {
             expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64
         );
-        for position in &args[1..] {
+        for (position, expected) in args[1..].iter().zip(["1", "6"]) {
             assert_eq!(
                 position.value_type.data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            let ExprKind::Cast {
+                expr,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                ..
+            } = &position.kind
+            else {
+                panic!("expected the original INTEGER position widened to BIGINT");
+            };
+            assert_eq!(
+                expr.value_type.data_type(),
                 &arrow::datatypes::DataType::Int32
+            );
+            let ExprKind::Cast {
+                expr: literal,
+                target: arrow::datatypes::DataType::Int32,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                ..
+            } = &expr.kind
+            else {
+                panic!("expected the original INTEGER typed string cast");
+            };
+            assert!(
+                matches!(&literal.kind, ExprKind::Literal(LiteralValue::String(value)) if value == expected)
             );
         }
     }
@@ -8175,8 +8199,7 @@ mod tests {
     #[test]
     fn split_returns_varchar_array_after_explicit_argument_casts() {
         let error = parse_and_analyze("select split(o_orderkey, 1) from orders")
-            .err()
-            .expect("split requires character arguments");
+            .expect_err("split requires character arguments");
         assert!(error.contains("no matching declared overload"), "{error}");
         let resolved = parse_and_analyze(
             "select split(CAST(o_orderkey AS VARCHAR), CAST(1 AS VARCHAR)) from orders",

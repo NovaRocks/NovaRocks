@@ -17,19 +17,20 @@
 //! The actual SQL case with folding disabled retains the original emitted call and request authors.
 //! Prior native PASS alone does not establish that a call survived real constant folding.
 use super::sql_test_source::sql_source;
+use super::string_batch_sql_source_tests::first_corpus_query;
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::ExprKind;
 use novarocks_physical_plan::FunctionArgumentType;
 use novarocks_physical_plan::StaticFunctionArgument;
 
-use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
 const SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/project/sql/project_string_int_argument_semantics.sql"
 ));
 fn check() {
-    let owner = sql_source(SQL, DataType::Int64);
-    let mut count = 0;
+    let owner = sql_source(first_corpus_query(SQL), DataType::Int64);
+    let mut text_widths = Vec::new();
     for fragment in owner.plan().fragments().values() {
         for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment) {
             let ExprKind::FunctionCall { function, args } = &node.kind else {
@@ -43,6 +44,7 @@ fn check() {
             assert_eq!(request.logical_argument_count, 3);
             assert_eq!(request.arguments.len(), 3);
             assert_eq!(function.argument_types.len(), 3);
+            let mut widths = [0; 2];
             for (index, ((argument, selected), child)) in request
                 .arguments
                 .iter()
@@ -58,30 +60,40 @@ fn check() {
                 };
                 assert_eq!(value_type, bound);
                 assert_eq!(bound.logical_type(), ValueLogicalType::Physical);
-                assert_eq!(
-                    bound.data_type().clone(),
-                    if index < 2 {
-                        DataType::Utf8
-                    } else {
-                        DataType::Int32
-                    }
-                );
+                if let Some(width) = widths.get_mut(index) {
+                    assert_eq!(bound.data_type(), &DataType::Utf8);
+                    let ValueKind::BoundedCharacter(character) = bound.value_type().kind() else {
+                        panic!("SPLIT_PART text arguments retain their VARCHAR declarations");
+                    };
+                    assert_eq!(character.kind(), CharacterKind::Varchar);
+                    *width = character.length();
+                } else {
+                    assert_eq!(bound.data_type(), &DataType::Int64);
+                }
                 assert_eq!(&unit.definition(*child).unwrap().ty, bound);
             }
             assert_eq!(node.ty, function.result_type);
-            assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
+            let FunctionArgumentType::Value(source) = &function.argument_types[0] else {
+                unreachable!("SPLIT_PART source was checked above");
+            };
+            assert_eq!(node.ty, source.with_nullable(true).unwrap());
             eprintln!(
                 "split_part actual retained source mode=compiled fragment={:?} definition={id:?} signature={function:?} original_request={request:?} ordered_children={args:?}",
                 fragment.id()
             );
-            count += 1;
+            text_widths.push(widths);
         }
     }
-    assert!(
-        count == 4,
-        "actual corpus SQL keeps a real function call with folding disabled"
+    text_widths.sort_unstable();
+    assert_eq!(
+        text_widths,
+        [[3, 0], [3, 0], [5, 1]],
+        "actual corpus SQL keeps the three real function calls with folding disabled"
     );
-    eprintln!("split_part actual retained call count mode=compiled count={count}");
+    eprintln!(
+        "split_part actual retained call count mode=compiled count={}",
+        text_widths.len()
+    );
 }
 
 #[test]

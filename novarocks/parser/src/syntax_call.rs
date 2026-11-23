@@ -52,7 +52,7 @@ impl fmt::Display for UnsupportedCallSyntax {
 
 impl std::error::Error for UnsupportedCallSyntax {}
 
-/// Map supported dedicated syntax to the canonical call spelling. Ordinary
+/// Map dedicated syntax to the canonical call spelling. Ordinary
 /// calls and expressions outside the mapped syntax return `Ok(None)`.
 pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, UnsupportedCallSyntax> {
     let span = expr.span();
@@ -81,19 +81,26 @@ pub fn canonical_call(expr: &Expr) -> Result<Option<CanonicalCall<'_>>, Unsuppor
         Expr::NullIf(node) => ("nullif", vec![&node.first, &node.second]),
         Expr::Coalesce(node) => ("coalesce", node.operands.iter().collect()),
         Expr::Try(node) => ("try", vec![&node.inner]),
+        Expr::Format(node) => ("format", node.arguments.iter().collect()),
         Expr::Trim(node) => {
-            if node.trim_character.is_some() {
-                return Err(UnsupportedCallSyntax::new(
-                    "explicit TRIM characters are not supported",
-                    span,
-                ));
-            }
             let name = match node.specification {
                 TrimSpecification::Both => "trim",
                 TrimSpecification::Leading => "ltrim",
                 TrimSpecification::Trailing => "rtrim",
             };
-            (name, vec![&node.trim_source])
+            (
+                name,
+                std::iter::once(&node.trim_source)
+                    .chain(node.trim_character.iter())
+                    .collect(),
+            )
+        }
+        Expr::Overlay(node) => {
+            let arguments = [&node.value, &node.replacement, &node.start]
+                .into_iter()
+                .chain(node.length.iter())
+                .collect();
+            ("$overlay", arguments)
         }
         Expr::Extract(node) => (extract_call_name(node.field), vec![&node.expression]),
         _ => return Ok(None),

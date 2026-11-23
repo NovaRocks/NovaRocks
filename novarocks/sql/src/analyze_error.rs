@@ -50,6 +50,11 @@ const UNKNOWN_FUNCTION: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const UNKNOWN_TYPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.unknown_type"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const AMBIGUOUS_FUNCTION_CALL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.ambiguous_function_call"),
     phase: ErrorPhase::Analyze,
@@ -179,6 +184,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_SCHEMA,
     UNKNOWN_COLUMN,
     UNKNOWN_FUNCTION,
+    UNKNOWN_TYPE,
     AMBIGUOUS_FUNCTION_CALL,
     TYPE_MISMATCH,
     FUNCTION_NOT_AGGREGATE,
@@ -213,6 +219,7 @@ pub enum AnalyzeErrorKind {
     UnknownSchema,
     UnknownColumn,
     UnknownFunction,
+    UnknownType,
     AmbiguousFunctionCall,
     TypeMismatch,
     FunctionNotAggregate,
@@ -249,6 +256,7 @@ impl AnalyzeErrorKind {
             Self::UnknownSchema => UNKNOWN_SCHEMA,
             Self::UnknownColumn => UNKNOWN_COLUMN,
             Self::UnknownFunction => UNKNOWN_FUNCTION,
+            Self::UnknownType => UNKNOWN_TYPE,
             Self::AmbiguousFunctionCall => AMBIGUOUS_FUNCTION_CALL,
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::FunctionNotAggregate => FUNCTION_NOT_AGGREGATE,
@@ -739,6 +747,13 @@ impl AnalyzeError {
                     view_cause: None,
                 }
             }
+            novarocks_functions::FunctionBindingError::ValueType(
+                source @ novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. },
+            ) => {
+                let mut error = Self::domain_source(source);
+                error.kind = AnalyzeErrorKind::UnknownType;
+                error
+            }
             novarocks_functions::FunctionBindingError::VariantTargetType(source) => {
                 let mut error = Self::domain_source(source);
                 error.kind = AnalyzeErrorKind::InvalidLiteral;
@@ -776,6 +791,9 @@ impl AnalyzeError {
     pub(crate) fn function_resolution(error: novarocks_functions::FunctionResolutionError) -> Self {
         match error {
             novarocks_functions::FunctionResolutionError::Control(error) => Self::control(error),
+            novarocks_functions::FunctionResolutionError::ResultType(source) => {
+                Self::function_binding(source.into())
+            }
             error => Self::internal(error.to_string()),
         }
     }
@@ -790,6 +808,7 @@ impl AnalyzeError {
             AnalyzeErrorKind::UnavailableImplementation
                 | AnalyzeErrorKind::UnsupportedExpression
                 | AnalyzeErrorKind::UnknownFunction
+                | AnalyzeErrorKind::UnknownType
                 | AnalyzeErrorKind::AmbiguousFunctionCall
         ) {
             Self {
@@ -970,6 +989,7 @@ mod tests {
                 "sql.analyze.unknown_schema",
                 "sql.analyze.unknown_column",
                 "sql.analyze.unknown_function",
+                "sql.analyze.unknown_type",
                 "sql.analyze.ambiguous_function_call",
                 "sql.analyze.type_mismatch",
                 "sql.analyze.function_not_aggregate",

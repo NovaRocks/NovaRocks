@@ -288,7 +288,7 @@ struct PositionShard {
     layout: StaticLayout,
     driver_ordinal: i64,
     #[cfg(novarocks_dev_controls)]
-    observation: Option<crate::runtime::runtime_state::PositionShardTestObservation>,
+    observation: Option<crate::runtime::runtime_state::TaskProtocolTestObservation>,
     #[cfg(novarocks_dev_controls)]
     emitted_rows: u64,
     control: RuntimeKernelControl,
@@ -531,7 +531,7 @@ impl OperatorLifecycle for PositionShard {
 
     #[cfg(novarocks_dev_controls)]
     fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        self.observation = state.position_shard_observation.clone();
+        self.observation = state.task_protocol_observation.clone();
         self.observe(
             novarocks_failpoint::observation_marker::POSITION_SHARD_DRIVER_OPENED,
             false,
