@@ -1030,9 +1030,9 @@ mod tests {
         .unwrap()
     }
 
-    fn test_i64_constant(value: i64) -> novarocks_functions::ConstantValue {
-        let ty = FunctionValueType::new(DataType::Int64, false);
-        novarocks_functions::ConstantValue::from_i64(
+    fn test_i32_constant(value: i32) -> novarocks_functions::ConstantValue {
+        let ty = FunctionValueType::new(DataType::Int32, false);
+        novarocks_functions::ConstantValue::from_i32(
             Arc::new(ty.try_to_field("literal").unwrap()),
             ty,
             value,
@@ -1399,7 +1399,7 @@ mod tests {
             "round",
             &[
                 value_argument(DataType::Decimal128(18, 6), false, None),
-                value_argument(DataType::Int32, false, None),
+                value_argument(DataType::Int32, false, Some(test_i32_constant(2))),
             ],
         );
         assert_eq!(
