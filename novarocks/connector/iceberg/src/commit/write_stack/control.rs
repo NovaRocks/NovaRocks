@@ -2269,9 +2269,11 @@ impl IcebergWriteSessionControl {
         let operation = match &request.flavor {
             ConnectorWriteSessionFlavor::Ordinary => match request.intent {
                 novarocks_spi::connector::ConnectorWriteIntent::Append => CatalogOperation::Append,
-                novarocks_spi::connector::ConnectorWriteIntent::Overwrite
-                | novarocks_spi::connector::ConnectorWriteIntent::PartitionOverwrite => {
-                    CatalogOperation::Overwrite
+                novarocks_spi::connector::ConnectorWriteIntent::Overwrite => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "Iceberg ordinary write does not support the overwrite intent",
+                    ));
                 }
                 novarocks_spi::connector::ConnectorWriteIntent::RowDelta => {
                     CatalogOperation::RowDelta
@@ -2978,12 +2980,6 @@ fn flavor_for(request: &ConnectorWriteBeginRequest) -> Result<IcebergWriteFlavor
             } else {
                 IcebergWriteFlavor::Append
             }
-        }
-        (ConnectorWriteIntent::Overwrite, ConnectorWriteInputRequest::Data { .. }) => {
-            IcebergWriteFlavor::Overwrite
-        }
-        (ConnectorWriteIntent::PartitionOverwrite, ConnectorWriteInputRequest::Data { .. }) => {
-            IcebergWriteFlavor::PartitionOverwrite
         }
         (ConnectorWriteIntent::RowDelta, ConnectorWriteInputRequest::EqualityDelete { .. }) => {
             IcebergWriteFlavor::EqualityDelete

@@ -182,8 +182,7 @@ pub(crate) fn prepare_write(
 /// Two independent scopings, because the two guard families answer to two
 /// different callers:
 ///
-/// - The INSERT-shaped guards run for `Append` / `Overwrite` /
-///   `PartitionOverwrite` only. `RowDelta` is deliberately excluded:
+/// - The data-write guards run for `Append` and `Overwrite`. `RowDelta` is deliberately excluded:
 ///   row-mutation admission runs its own guards through
 ///   `row_mutation_strategy_from_metadata`, and widening this family *by intent*
 ///   would newly reject tables that position-delete and deletion-vector writes
@@ -211,9 +210,7 @@ fn write_support_denial(
 
     let insert_shaped = matches!(
         request.intent,
-        ConnectorWriteIntent::Append
-            | ConnectorWriteIntent::Overwrite
-            | ConnectorWriteIntent::PartitionOverwrite
+        ConnectorWriteIntent::Append | ConnectorWriteIntent::Overwrite
     );
     if !insert_shaped {
         return None;
@@ -263,9 +260,7 @@ pub(crate) fn insert_intent_support_denial(
 ) -> Option<ConnectorError> {
     if !matches!(
         intent,
-        ConnectorWriteIntent::Append
-            | ConnectorWriteIntent::Overwrite
-            | ConnectorWriteIntent::PartitionOverwrite
+        ConnectorWriteIntent::Append | ConnectorWriteIntent::Overwrite
     ) {
         return None;
     }
@@ -284,27 +279,6 @@ pub(crate) fn insert_intent_support_denial(
         if let Err(error) = ensure_no_equality_deletes_from_metadata(metadata) {
             return Some(invalid(error));
         }
-    }
-
-    if matches!(intent, ConnectorWriteIntent::PartitionOverwrite)
-        && metadata.default_partition_spec().is_unpartitioned()
-    {
-        return Some(invalid(format!(
-            "INSERT OVERWRITE PARTITIONS requires a partitioned table; \
-             table {} is unpartitioned (use OVERWRITE without PARTITIONS)",
-            target_fqn,
-        )));
-    }
-
-    if matches!(intent, ConnectorWriteIntent::PartitionOverwrite)
-        && metadata.format_version() != FormatVersion::V3
-    {
-        return Some(invalid(format!(
-            "INSERT OVERWRITE PARTITIONS requires an Iceberg v3 row-lineage table; \
-             table {} is v{}",
-            target_fqn,
-            metadata.format_version() as u8,
-        )));
     }
 
     // Branch writes carry row-lineage semantics, which are Iceberg v3 only.
@@ -1177,7 +1151,6 @@ mod tests {
             for intent in [
                 ConnectorWriteIntent::Append,
                 ConnectorWriteIntent::Overwrite,
-                ConnectorWriteIntent::PartitionOverwrite,
             ] {
                 let denied = insert_intent_support_denial(&metadata, intent, "main", "ice.db.t")
                     .expect("data-file writes are denied");
@@ -1231,50 +1204,6 @@ mod tests {
             "InvalidRequest: iceberg ref: branch writes require Iceberg v3 tables \
              (table ice.db.t is v2)",
             "the relocated guard must reproduce the message the SQL layer used to emit"
-        );
-    }
-
-    #[test]
-    fn spi5m_partition_overwrite_on_an_unpartitioned_table_is_denied_by_write_preparation() {
-        let owner = owner();
-        let metadata = metadata(); // unpartition_spec
-        let payload = table_payload(Some(table_info(&metadata)));
-        let mut request = data_request(
-            &owner,
-            &payload,
-            ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        );
-        request.intent = ConnectorWriteIntent::PartitionOverwrite;
-
-        let error =
-            expect_denied(prepare_write(request, &owner).expect("prepare partition overwrite"));
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert_eq!(
-            error.to_string(),
-            "InvalidRequest: INSERT OVERWRITE PARTITIONS requires a partitioned table; \
-             table ice.db.t is unpartitioned (use OVERWRITE without PARTITIONS)",
-        );
-    }
-
-    #[test]
-    fn partition_overwrite_on_a_pre_v3_partitioned_table_is_denied_before_commit() {
-        let owner = owner();
-        let metadata = partitioned_metadata(false); // FormatVersion::V2
-        let payload = table_payload(Some(table_info(&metadata)));
-        let mut request = data_request(
-            &owner,
-            &payload,
-            ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        );
-        request.intent = ConnectorWriteIntent::PartitionOverwrite;
-
-        let error =
-            expect_denied(prepare_write(request, &owner).expect("prepare v2 partition overwrite"));
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert_eq!(
-            error.to_string(),
-            "InvalidRequest: INSERT OVERWRITE PARTITIONS requires an Iceberg v3 row-lineage table; \
-             table ice.db.t is v2",
         );
     }
 

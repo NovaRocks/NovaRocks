@@ -589,8 +589,6 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
     let mut seen: BTreeMap<IcebergWriteFlavor, usize> = BTreeMap::new();
     for flavor in [
         IcebergWriteFlavor::Append,
-        IcebergWriteFlavor::Overwrite,
-        IcebergWriteFlavor::PartitionOverwrite,
         IcebergWriteFlavor::StagedCreate,
         IcebergWriteFlavor::ManagedPublication,
         IcebergWriteFlavor::DistributedRewrite,
@@ -643,7 +641,7 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
         assert_eq!(handle.branch_of(ordinal(1)), Some(branch));
         seen.insert(flavor, plans.len());
     }
-    assert_eq!(seen.len(), 9, "every flavor must be covered");
+    assert_eq!(seen.len(), 7, "every flavor must be covered");
 }
 
 // -------------------------------------------------------------------------
@@ -1151,8 +1149,6 @@ fn a_rewrite_is_not_gated_by_the_external_write_fence() {
     // write fence. Every other flavor below keeps the fence.
     for flavor in [
         IcebergWriteFlavor::Append,
-        IcebergWriteFlavor::Overwrite,
-        IcebergWriteFlavor::PartitionOverwrite,
         IcebergWriteFlavor::RowMutationPositionDelete,
         IcebergWriteFlavor::RowMutationDeletionVector,
         IcebergWriteFlavor::StagedCreate,
@@ -2682,11 +2678,6 @@ fn all_write_admission_requests(
     };
     let mut requests = [
         ("append", ConnectorWriteIntent::Append),
-        ("overwrite", ConnectorWriteIntent::Overwrite),
-        (
-            "partition overwrite",
-            ConnectorWriteIntent::PartitionOverwrite,
-        ),
         ("row delta", ConnectorWriteIntent::RowDelta),
     ]
     .into_iter()
@@ -4789,11 +4780,7 @@ fn empty_insert_settles_without_contacting_the_catalog() {
 
 #[test]
 fn empty_data_replacements_and_managed_publications_keep_their_own_decision() {
-    for flavor in [
-        IcebergWriteFlavor::Overwrite,
-        IcebergWriteFlavor::PartitionOverwrite,
-        IcebergWriteFlavor::TableMaintenance,
-    ] {
+    for flavor in [IcebergWriteFlavor::TableMaintenance] {
         let (handle, _) = flavor_session(
             plan_ordinary_branches(flavor, &session_material(data_input_shape())).unwrap(),
         );

@@ -465,7 +465,6 @@ mod tests {
             ReplaceView,
             DropView,
             Append,
-            Overwrite,
             RowDelta,
             RowMutation,
             Truncate,

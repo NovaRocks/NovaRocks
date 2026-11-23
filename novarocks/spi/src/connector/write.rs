@@ -135,7 +135,6 @@ impl ConnectorWriteCohortId {
 pub enum ConnectorWriteIntent {
     Append,
     Overwrite,
-    PartitionOverwrite,
     RowDelta,
 }
 
@@ -2330,7 +2329,6 @@ const fn write_intent_tag(intent: ConnectorWriteIntent) -> u8 {
     match intent {
         ConnectorWriteIntent::Append => 1,
         ConnectorWriteIntent::Overwrite => 2,
-        ConnectorWriteIntent::PartitionOverwrite => 3,
         ConnectorWriteIntent::RowDelta => 4,
     }
 }

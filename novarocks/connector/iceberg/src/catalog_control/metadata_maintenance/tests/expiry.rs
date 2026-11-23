@@ -474,7 +474,7 @@ fn gc_disabled_real_lease_refuses_before_dispatch_and_preserves_shared_source_ro
             base.descriptor.clone(),
             key.incarnation,
             frozen,
-            CatalogOperation::Overwrite,
+            CatalogOperation::Append,
             preparation,
             None,
         )

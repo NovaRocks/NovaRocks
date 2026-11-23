@@ -45,7 +45,6 @@ mod new_manifests;
 pub(crate) use new_manifests::{RegisteredFile, RegisteredNewFiles, RegisteredPaths};
 pub(crate) mod operation;
 pub(crate) mod overwrite;
-mod overwrite_partitions;
 pub(crate) mod partition_key;
 pub mod position_delete_writer;
 pub(crate) mod preparation;

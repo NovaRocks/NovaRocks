@@ -40,7 +40,6 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::CatalogPublisher;
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::dependency::ValidationInputs;
-use crate::commit::model::EntryIdentity;
 use crate::commit::model::{
     AddedContent, BaseIdentity, CleanupScope, CommitProtocol, FileChanges, FrozenRequest,
     ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken, RequestShape,
@@ -517,64 +516,17 @@ impl<'a> WriteRecipe<'a> {
                     operation.request_context(),
                 )
                 .await?;
-        } else if !self.fixed_mutation
-            && !matches!(
-                self.op_kind,
-                CommitOpKind::FastAppend
-                    | CommitOpKind::Overwrite
-                    | CommitOpKind::RowDelta
-                    | CommitOpKind::MaterializedRowDelta
-                    | CommitOpKind::SelectedRewrite
-            )
-        {
+        } else if !self.fixed_mutation && self.op_kind == CommitOpKind::Truncate {
             let source_io = operation.begin_attempt()?;
             let inputs =
                 ValidationInputs::new(&self.source, self.start.map(|s| s.snapshot_id), &source_io);
-            let live = inputs.compact_live_entries().await?;
-            let mut identities: BTreeSet<_> = match self.op_kind {
-                CommitOpKind::Truncate => live.keys().cloned().collect(),
-                CommitOpKind::OverwritePartitions => live
-                    .iter()
-                    .filter(|(_, entry)| {
-                        added.iter().any(|a| {
-                            a.partition_spec_id() == entry.frozen.facts().partition_spec_id
-                                && a.file().partition() == &entry.frozen.facts().partition
-                        })
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect(),
-                _ => BTreeSet::new(),
-            };
-            if matches!(self.op_kind, CommitOpKind::OverwritePartitions) {
-                // Deletion vectors follow their exact data file, including when
-                // their stored partition differs. Removing one blob grants no
-                // authority to delete a shared Puffin container.
-                let data_paths: BTreeSet<_> = identities
-                    .iter()
-                    .filter_map(|id| match id {
-                        EntryIdentity::DataFile { path } => Some(path.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                identities.extend(
-                    live.keys()
-                        .filter(|id| {
-                            matches!(id,
-                                EntryIdentity::DeletionVector { referenced_data_file, .. }
-                                    if data_paths.contains(referenced_data_file)
-                            )
-                        })
-                        .cloned(),
-                );
-            }
-            for identity in identities {
-                let entry = live.get(&identity).ok_or_else(|| {
-                    format_error(corrupt(format!(
-                        "Frozen source entry is absent: {identity:?}"
-                    )))
-                })?;
-                removed.push(entry.frozen.clone());
-            }
+            removed.extend(
+                inputs
+                    .compact_live_entries()
+                    .await?
+                    .into_values()
+                    .map(|entry| entry.frozen),
+            );
         }
         let (dependencies, protocol) = match self.session_protocol {
             WriteSessionCommitProtocol::Legacy => {
@@ -685,9 +637,6 @@ impl<'a> WriteRecipe<'a> {
                     ));
                 }
                 Box::new(crate::commit::fast_append::FastAppendPreparer)
-            }
-            CommitOpKind::OverwritePartitions => {
-                Box::new(crate::commit::overwrite_partitions::OverwritePartitionsPreparer)
             }
             CommitOpKind::Truncate => Box::new(crate::commit::truncate::TruncatePreparer),
             CommitOpKind::SelectedRewrite => {

@@ -29,7 +29,6 @@ pub enum CommitOpKind {
     MaterializedRowDelta,
     SelectedRewrite,
     Truncate,
-    OverwritePartitions,
 }
 
 /// Physical metadata for one staged Iceberg artifact. This stays provider

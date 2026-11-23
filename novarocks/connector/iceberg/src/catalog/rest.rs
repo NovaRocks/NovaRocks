@@ -1653,79 +1653,27 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_insert_session_denies_partition_overwrite_on_unpartitioned_and_pre_v3_tables() {
+    fn ordinary_insert_session_keeps_supported_v2_append_admissible() {
         use crate::iceberg::spec::FormatVersion;
         use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        for (version, partitioned, expected) in [
-            (
-                FormatVersion::V3,
-                false,
-                "INSERT OVERWRITE PARTITIONS requires a partitioned table; table ice.db.t is unpartitioned (use OVERWRITE without PARTITIONS)",
-            ),
-            (
-                FormatVersion::V2,
-                true,
-                "INSERT OVERWRITE PARTITIONS requires an Iceberg v3 row-lineage table; table ice.db.t is v2",
-            ),
-        ] {
-            let error = begin_insert_admission(
-                insert_admission_metadata(version, partitioned),
-                ConnectorWriteIntent::PartitionOverwrite,
-                "main",
-                ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            )
-            .expect_err("partition overwrite must be denied before a writer is admitted");
-            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-            assert_eq!(error.message(), expected);
-        }
-    }
 
-    #[test]
-    fn ordinary_insert_session_keeps_supported_v2_append_and_v3_partition_overwrite_admissible() {
-        use crate::iceberg::spec::FormatVersion;
-        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        for (version, partitioned, intent) in [
-            (FormatVersion::V2, false, ConnectorWriteIntent::Append),
-            (
-                FormatVersion::V3,
-                true,
-                ConnectorWriteIntent::PartitionOverwrite,
-            ),
-        ] {
-            let plan = begin_insert_admission(
-                insert_admission_metadata(version, partitioned),
-                intent,
-                "main",
-                ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            )
-            .expect("a supported ordinary INSERT must remain admissible");
-            assert_eq!(plan.expected_targets().len(), 1);
-        }
-    }
-
-    #[test]
-    fn ordinary_session_materialized_view_purpose_does_not_acquire_insert_only_denials() {
-        use crate::iceberg::spec::FormatVersion;
-        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        // Same table, intent and input as the unpartitioned INSERT denial above.
-        // The existing purpose path remains independent of the new INSERT gate.
         let plan = begin_insert_admission(
-            insert_admission_metadata(FormatVersion::V3, false),
-            ConnectorWriteIntent::PartitionOverwrite,
+            insert_admission_metadata(FormatVersion::V2, false),
+            ConnectorWriteIntent::Append,
             "main",
-            ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
         )
-        .expect("the existing MV-purpose admission must retain its own policy");
+        .expect("a supported v2 INSERT must remain admissible");
         assert_eq!(plan.expected_targets().len(), 1);
     }
+
     #[test]
     fn ordinary_insert_session_keeps_generic_support_error_kind_and_precedence() {
         use crate::iceberg::spec::FormatVersion;
         use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-        // This protocol-valid metadata names a sort source absent from its schema.
-        // It also fails the unpartitioned INSERT-only gate. The existing generic
-        // support error must retain its kind and precedence.
-        let mut json = serde_json::to_value(insert_admission_metadata(FormatVersion::V3, false))
+        // The v2 target also requests a branch write. The generic support
+        // error for the unresolved sort source must retain its precedence.
+        let mut json = serde_json::to_value(insert_admission_metadata(FormatVersion::V2, false))
             .expect("metadata JSON");
         json["default-sort-order-id"] = serde_json::json!(1);
         json["sort-orders"] = serde_json::json!([{
@@ -1738,8 +1686,8 @@ mod tests {
         let metadata = serde_json::from_value(json).expect("metadata with unresolved sort source");
         let error = begin_insert_admission(
             metadata,
-            ConnectorWriteIntent::PartitionOverwrite,
-            "main",
+            ConnectorWriteIntent::Append,
+            "nightly",
             ConnectorWriteAdmissionPurpose::OrdinaryDml,
         )
         .expect_err("generic support must fail before the INSERT-only gate");

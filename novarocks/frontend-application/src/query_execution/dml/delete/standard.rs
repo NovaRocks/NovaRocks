@@ -80,9 +80,7 @@ fn delete_where_expr<'a>(
     target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
 ) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
-        "DELETE requires a WHERE clause; for full table replacement use \
-         INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
-            .to_string()
+        "DELETE requires a WHERE clause; to delete all rows use TRUNCATE TABLE".to_string()
     })?;
     validate_where(where_clause, &target_binding.dml_target_columns()?)?;
     Ok(where_clause)

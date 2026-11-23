@@ -81,24 +81,12 @@ impl WriteStatementFamily for InsertFamily {
                 &table,
             )?,
         };
-        let mode = match input.command.overwrite_mode {
-            crate::query_execution::dml::insert::InsertOverwriteMode::Append => {
-                iceberg_writer::IcebergWriteMode::Append
-            }
-            crate::query_execution::dml::insert::InsertOverwriteMode::FullTable => {
-                iceberg_writer::IcebergWriteMode::FullTableOverwrite
-            }
-            crate::query_execution::dml::insert::InsertOverwriteMode::DynamicPartitions => {
-                iceberg_writer::IcebergWriteMode::DynamicPartitionOverwrite
-            }
-        };
         iceberg_writer::prepare_iceberg_write_async(
             &input.kernel,
             &input.target,
             &resolved,
             &input.command.columns,
             &input.command.source,
-            mode,
             &input.reference,
             input.execution.clone(),
             &context,

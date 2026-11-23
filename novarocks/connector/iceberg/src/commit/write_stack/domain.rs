@@ -135,16 +135,11 @@ impl IcebergWriteBranch {
 /// Every SQL-level write shape Iceberg supports, mapped onto one commit op.
 ///
 /// This enum is provider-private on purpose: the neutral write stack never
-/// learns that Iceberg distinguishes a dynamic partition overwrite from a
-/// static one, or a row mutation from a distributed rewrite.
+/// learns how Iceberg represents row mutations or distributed rewrites.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IcebergWriteFlavor {
     /// `INSERT INTO`.
     Append,
-    /// `INSERT OVERWRITE` replacing the whole target.
-    Overwrite,
-    /// `INSERT OVERWRITE` replacing only the touched partitions.
-    PartitionOverwrite,
     /// Merge-on-read row mutation staging Parquet position deletes.
     RowMutationPositionDelete,
     /// Merge-on-read row mutation staging Puffin deletion vectors.
@@ -176,7 +171,6 @@ impl IcebergWriteFlavor {
         use crate::catalog::admission::CatalogOperation;
         match self {
             Self::Append => CatalogOperation::Append,
-            Self::Overwrite | Self::PartitionOverwrite => CatalogOperation::Overwrite,
             Self::RowMutationPositionDelete | Self::RowMutationDeletionVector => {
                 CatalogOperation::RowMutation
             }
@@ -201,8 +195,6 @@ impl IcebergWriteFlavor {
             Self::Append | Self::StagedCreate | Self::ManagedPublication => {
                 CommitOpKind::FastAppend
             }
-            Self::Overwrite => CommitOpKind::Overwrite,
-            Self::PartitionOverwrite => CommitOpKind::OverwritePartitions,
             Self::RowMutationPositionDelete => CommitOpKind::RowDelta,
             Self::RowMutationDeletionVector => CommitOpKind::MaterializedRowDelta,
             // The same op a Parquet position-delete row mutation commits: the
@@ -237,8 +229,6 @@ impl IcebergWriteFlavor {
     pub fn branches(self) -> &'static [IcebergWriteBranch] {
         match self {
             Self::Append
-            | Self::Overwrite
-            | Self::PartitionOverwrite
             | Self::StagedCreate
             | Self::ManagedPublication
             | Self::DistributedRewrite
@@ -481,8 +471,6 @@ impl IcebergWriteFlavor {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Append => "append",
-            Self::Overwrite => "overwrite",
-            Self::PartitionOverwrite => "partition-overwrite",
             Self::RowMutationPositionDelete => "row-mutation-position-delete",
             Self::RowMutationDeletionVector => "row-mutation-deletion-vector",
             Self::StagedCreate => "staged-create",
@@ -499,10 +487,7 @@ impl IcebergWriteFlavor {
             Self::Append | Self::StagedCreate | Self::ManagedPublication => {
                 ConnectorWriteIntent::Append
             }
-            Self::Overwrite | Self::DistributedRewrite | Self::TableMaintenance => {
-                ConnectorWriteIntent::Overwrite
-            }
-            Self::PartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
+            Self::DistributedRewrite | Self::TableMaintenance => ConnectorWriteIntent::Overwrite,
             Self::RowMutationPositionDelete
             | Self::RowMutationDeletionVector
             | Self::EqualityDelete => ConnectorWriteIntent::RowDelta,
@@ -3398,8 +3383,6 @@ mod tests {
     fn every_flavor_maps_to_one_commit_op_and_owns_its_branches() {
         for flavor in [
             IcebergWriteFlavor::Append,
-            IcebergWriteFlavor::Overwrite,
-            IcebergWriteFlavor::PartitionOverwrite,
             IcebergWriteFlavor::RowMutationPositionDelete,
             IcebergWriteFlavor::RowMutationDeletionVector,
             IcebergWriteFlavor::StagedCreate,

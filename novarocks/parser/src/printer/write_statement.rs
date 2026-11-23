@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{PrintResult, Writer, unsupported};
-use crate::ast::{Expr, Table, TrinoDelete, TrinoInsert, TrinoInsertMode, TrinoUpdate};
+use crate::ast::{Expr, Table, TrinoDelete, TrinoInsert, TrinoUpdate};
 
 impl Writer {
     pub(super) fn insert_statement(&mut self, node: &TrinoInsert) -> PrintResult {
         if !node.query.session_properties.is_empty() {
             return Err(unsupported("WITH SESSION in an INSERT query"));
         }
-        self.text(match node.mode {
-            TrinoInsertMode::Into => "INSERT INTO ",
-            TrinoInsertMode::Overwrite => "INSERT OVERWRITE INTO ",
-            TrinoInsertMode::OverwritePartitions => "INSERT OVERWRITE PARTITIONS INTO ",
-        });
+        self.text("INSERT INTO ");
         self.write_statement_target(&node.table)?;
         if let Some(columns) = &node.columns {
             if columns.is_empty() {

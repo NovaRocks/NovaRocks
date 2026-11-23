@@ -46,11 +46,13 @@ pub(crate) fn prepare_trino_delete_shape(
 
 fn admit_predicate_delete(delete: &PreparedPredicateDelete, source: &str) -> Result<(), DmlError> {
     if delete.selection.is_none() {
-        return Err(DmlError::admit(DmlAdmissionError::DeleteRequiresWhere.to_user_error(
-            source,
-            delete.span,
-            "DELETE requires a WHERE clause; for full table replacement use INSERT OVERWRITE t SELECT * FROM t WHERE FALSE",
-        )));
+        return Err(DmlError::admit(
+            DmlAdmissionError::DeleteRequiresWhere.to_user_error(
+                source,
+                delete.span,
+                "DELETE requires a WHERE clause; to delete all rows use TRUNCATE TABLE",
+            ),
+        ));
     }
     Ok(())
 }
