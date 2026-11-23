@@ -193,6 +193,7 @@ impl QueryViewService {
                 target: &target,
                 query: create_view.query,
                 local_views: &local_views,
+                statement_session: context.statement_session,
             },
             connector_context,
         )?;

@@ -163,6 +163,7 @@ fn context<'a>(catalog: Option<&'a str>, database: &'a str) -> ViewRequestContex
     ViewRequestContext {
         current_catalog: catalog,
         current_database: database,
+        statement_session: None,
         connector_context: Some(connector_context()),
     }
 }

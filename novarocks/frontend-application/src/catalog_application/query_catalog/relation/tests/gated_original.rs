@@ -523,6 +523,7 @@ async fn original_system_gate_resolves_declarations_without_provider_data_work()
                     novarocks_sql::compiler::builtin_sql_function_catalog(),
                     novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     crate::application::test_constant_policy(),
+                    None,
                 )
                 .unwrap();
             assert_eq!(

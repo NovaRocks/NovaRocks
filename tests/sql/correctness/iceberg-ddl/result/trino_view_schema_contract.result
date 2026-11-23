@@ -73,3 +73,8 @@ aaa	["one"]
 -- types	varchar	array(varchar)
 s	items
 aaa	["one"]
+
+-- query 85
+-- types	integer	boolean	boolean	boolean
+v	same_user	same_catalog	uses_caller_schema
+11	true	true	true

@@ -377,6 +377,7 @@ fn definition_capture_freezes_exact_context_and_recognizes_replacement_before_ol
         crate::functions::builtin_sql_function_catalog(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         crate::constant::test_constant_policy(),
+        None,
     );
     assert!(matches!(result, Err(SqlCompileError::Analyze(error))
         if error.kind() == crate::analyze_error::AnalyzeErrorKind::ViewIsRecursive));

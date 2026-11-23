@@ -37,6 +37,7 @@ impl ViewCommandExecutor {
         command: ViewCommand<'_>,
         current_catalog: Option<&str>,
         current_database: &str,
+        statement_session: Option<&novarocks_sql::sql_mode::StatementSessionEnvironment>,
         connector_context: &ConnectorRequestContext,
     ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
         self.kernel
@@ -47,6 +48,7 @@ impl ViewCommandExecutor {
                 ViewRequestContext {
                     current_catalog,
                     current_database,
+                    statement_session,
                     connector_context: Some(connector_context),
                 },
             )

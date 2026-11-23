@@ -1298,6 +1298,7 @@ impl FrontendQuerySession {
                     command,
                     request.session().current_catalog(),
                     request.session().current_database(),
+                    request.session().sql_semantics().statement_session(),
                     context.connector_context(),
                 )
                 .map_err(|error| error.with_analysis_source(&source))

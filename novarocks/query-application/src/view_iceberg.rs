@@ -109,6 +109,7 @@ pub(crate) fn create_external_view(
             target: &target,
             query: statement.query,
             local_views,
+            statement_session: context.statement_session,
         },
         connector_context,
     )?;

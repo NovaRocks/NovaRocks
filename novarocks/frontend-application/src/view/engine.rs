@@ -296,6 +296,7 @@ impl ViewEngine for FrontendViewEngine {
                 self.function_catalog(),
                 Arc::clone(self.kernel.sealed_functions()),
                 self.kernel.constant_policy(),
+                request.statement_session,
             )
             .map(|columns| columns.into_vec())
     }
@@ -410,6 +411,7 @@ mod tests {
         let context = ViewRequestContext {
             current_catalog: Some("rest"),
             current_database: "analytics",
+            statement_session: None,
             connector_context: None,
         };
 
@@ -425,6 +427,7 @@ mod tests {
         let ctx = ViewRequestContext {
             current_catalog: None,
             current_database: "db",
+            statement_session: None,
             connector_context: None,
         };
         let sql = "CREATE VIEW v AS SELECT 1";

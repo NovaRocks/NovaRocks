@@ -35,6 +35,7 @@ pub use crate::view_service::{LocalViewSnapshot, QueryViewService};
 pub struct ViewRequestContext<'a> {
     pub current_catalog: Option<&'a str>,
     pub current_database: &'a str,
+    pub statement_session: Option<&'a novarocks_sql::sql_mode::StatementSessionEnvironment>,
     /// Query-owned context used by connector reads and external view mutations.
     pub connector_context: Option<&'a ConnectorRequestContext>,
 }
@@ -60,6 +61,7 @@ pub struct ViewDefinitionAnalysisRequest<'a> {
     pub target: &'a ViewTarget,
     pub query: &'a Query,
     pub local_views: &'a LocalViewSnapshot,
+    pub statement_session: Option<&'a novarocks_sql::sql_mode::StatementSessionEnvironment>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -271,11 +271,13 @@ impl SqlCapturedCatalogPreparation {
         functions: &dyn super::SqlFunctionCatalog,
         sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
         policy: super::ConstantPolicy,
+        statement_session: Option<&crate::sql_mode::StatementSessionEnvironment>,
     ) -> Result<Box<[crate::catalog::SqlViewColumn]>, SqlCompileError> {
         let database = self.catalog.definition_database()?;
         self.control.check()?;
         let catalog = self.catalog.completed_catalog()?;
-        let semantics = crate::sql_mode::SqlSemanticSettings::default();
+        let semantics = crate::sql_mode::SqlSemanticSettings::default()
+            .with_statement_session(statement_session.cloned());
         crate::sql_mode::validate_persisted_query_semantics_typed(self.catalog.query(), &semantics)
             .map_err(SqlCompileError::from)?;
         let query = self.catalog.query().clone();
@@ -462,6 +464,7 @@ mod view_definition_tests {
             crate::functions::builtin_sql_function_catalog(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
+            None,
         )
     }
 
@@ -585,7 +588,8 @@ mod view_definition_tests {
             source.analyze_view_definition(
                 crate::functions::builtin_sql_function_catalog(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                crate::constant::test_constant_policy()
+                crate::constant::test_constant_policy(),
+                None,
             ),
             Err(SqlCompileError::InvalidRequest(_))
         ));

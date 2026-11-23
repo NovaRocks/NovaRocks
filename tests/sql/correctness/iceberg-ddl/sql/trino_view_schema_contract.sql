@@ -293,6 +293,23 @@ CREATE OR REPLACE VIEW trc_views_${uuid0}.views_${uuid0}.bounded_characters AS S
 SELECT * FROM trc_views_${uuid0}.views_${uuid0}.bounded_characters;
 
 -- query 83
+-- @skip_result_check=true
+USE saved_${uuid0};
+CREATE VIEW trc_views_${uuid0}.saved_${uuid0}.caller_context_view AS
+SELECT v, CURRENT_USER AS caller_user, CURRENT_CATALOG AS caller_catalog, CURRENT_SCHEMA AS caller_schema
+FROM context_source;
+
+-- query 84
+-- @skip_result_check=true
+USE caller_${uuid0};
+
+-- query 85
+SELECT v, caller_user = CURRENT_USER AS same_user,
+       caller_catalog = 'trc_views_${uuid0}' AS same_catalog,
+       caller_schema = 'caller_${uuid0}' AS uses_caller_schema
+FROM trc_views_${uuid0}.saved_${uuid0}.caller_context_view;
+
+-- query 86
 -- @cleanup=true
 -- @skip_result_check=true
 DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.bounded_characters;
@@ -313,6 +330,7 @@ DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.depth_5;
 DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.depth_6;
 DROP VIEW IF EXISTS trc_views_${uuid0}.views_${uuid0}.depth_7;
 DROP VIEW IF EXISTS default_catalog.default.trc_local_header_${uuid0};
+DROP VIEW IF EXISTS trc_views_${uuid0}.saved_${uuid0}.caller_context_view;
 DROP VIEW IF EXISTS trc_views_${uuid0}.saved_${uuid0}.context_view;
 DROP VIEW IF EXISTS trc_views_${uuid0}.saved_${uuid0}.context_exists;
 DROP VIEW IF EXISTS default_catalog.default.trc_local_context_${uuid0};
@@ -325,7 +343,7 @@ DROP TABLE IF EXISTS trc_views_${uuid0}.caller_${uuid0}.context_source;
 DROP SCHEMA IF EXISTS trc_views_${uuid0}.saved_${uuid0};
 DROP SCHEMA IF EXISTS trc_views_${uuid0}.caller_${uuid0};
 
--- query 84
+-- query 87
 -- @cleanup=true
 -- @skip_result_check=true
 
