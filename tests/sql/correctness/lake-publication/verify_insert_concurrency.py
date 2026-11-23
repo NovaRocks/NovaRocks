@@ -18,6 +18,7 @@
 """Check exact INSERT effects against the held REST commit and Spark."""
 
 import json
+import os
 import re
 import sys
 
@@ -166,16 +167,21 @@ def main():
     check_table_name(table)
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", token) or mode not in MODES:
         raise SystemExit("invalid INSERT acceptance run or mode")
-    if table != f"ns_{token}.insert_{mode}":
-        raise SystemExit("INSERT acceptance action must use its exact run-owned table")
+    namespace, name = table.split(".")
+    run_id = json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"])["identity"]["run_id"]
+    # The runner rewrites the declared namespace independently of the case token.
+    if name != f"insert_{mode}" or not re.fullmatch(re.escape(run_id) + r"_d[a-z0-9]{3}[0-9]", namespace):
+        raise SystemExit("INSERT acceptance action must use its run-owned table")
     root = WORKSPACE / "logs/rwm17a/sql-insert-concurrency" / token / mode
     baseline = root / "baseline.json"
     if action == "baseline":
         root.mkdir(parents=True, exist_ok=True)
-        write(baseline, {"table": load_metadata(uri, table), "traffic": traffic(uri)})
+        write(baseline, {"target": table, "table": load_metadata(uri, table), "traffic": traffic(uri)})
         print("RWM17A_INSERT_BASE_READY")
         return
     facts = json.loads(baseline.read_text())
+    if facts["target"] != table:
+        raise SystemExit("INSERT acceptance target differs from the recorded table")
     if action == "companion":
         companion(uri, table, mode, root, facts["table"])
     elif action == "verify":
