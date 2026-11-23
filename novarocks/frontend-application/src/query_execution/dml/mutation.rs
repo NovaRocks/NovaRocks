@@ -44,6 +44,10 @@ impl RowMutationTarget {
         }
     }
 
+    pub(crate) fn branch_is_explicit(&self) -> bool {
+        self.reference.is_some()
+    }
+
     pub(crate) fn table_and_reference(&self) -> Result<(&ObjectName, &str), String> {
         let reference = match &self.reference {
             None => "main",

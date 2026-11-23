@@ -409,6 +409,10 @@ fn select_trino_statement_owner(
         Statement::ShowBranches(node) => Prepare(Preparation::ShowBranches(node)),
         Statement::Insert(node) => Prepare(Preparation::Insert(node)),
         Statement::Delete(node) => {
+            if let Some(predicate) = &node.predicate {
+                super::dml_admission::admit_delete_predicate(source, predicate)
+                    .map_err(QueryServiceError::from_user_error)?;
+            }
             if node.predicate.is_none()
                 && node.table.query_period.is_none()
                 && let Some(branch) = &node.table.branch

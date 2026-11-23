@@ -29,7 +29,7 @@ use novarocks_user_error::{
 const DELETE_REQUIRES_WHERE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.delete_requires_where"),
     phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
+    status: ErrorCodeStatus::Deprecated,
 };
 const DELETE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.delete_unsupported_form"),
@@ -89,7 +89,6 @@ pub const DML_ADMISSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmlAdmissionError {
-    DeleteRequiresWhere,
     DeleteUnsupportedForm,
     UpdateUnsupportedForm,
     MergeUnsupportedForm,
@@ -103,7 +102,6 @@ pub enum DmlAdmissionError {
 impl DmlAdmissionError {
     const fn descriptor(self) -> ErrorCodeDescriptor {
         match self {
-            Self::DeleteRequiresWhere => DELETE_REQUIRES_WHERE,
             Self::DeleteUnsupportedForm => DELETE_UNSUPPORTED_FORM,
             Self::UpdateUnsupportedForm => UPDATE_UNSUPPORTED_FORM,
             Self::MergeUnsupportedForm => MERGE_UNSUPPORTED_FORM,
@@ -123,6 +121,54 @@ impl DmlAdmissionError {
             RetryClass::Never,
         )
     }
+}
+
+/// Validate DELETE-specific statement capabilities before any connector work.
+pub(super) fn admit_delete_predicate(
+    source: &str,
+    predicate: &novarocks_parser::ast::Expr,
+) -> Result<(), UserError> {
+    use novarocks_parser::ast::{self, Expr, Predicate, Visit};
+
+    #[derive(Default)]
+    struct WhereShape {
+        subquery: bool,
+        unsupported: Option<Span>,
+    }
+    impl Visit for WhereShape {
+        fn visit_query(&mut self, _: &ast::Query) {
+            self.subquery = true;
+        }
+
+        fn visit_expr(&mut self, expression: &Expr) {
+            if let Expr::Predicated(node) = expression
+                && !matches!(
+                    node.predicate,
+                    Predicate::Comparison(_) | Predicate::In(_) | Predicate::IsNull(_)
+                )
+            {
+                self.unsupported.get_or_insert(expression.span());
+            }
+            ast::walk_expr(self, expression);
+        }
+    }
+    let mut shape = WhereShape::default();
+    shape.visit_expr(predicate);
+    if shape.subquery {
+        return Err(DmlAdmissionError::DeleteUnsupportedForm.to_user_error(
+            source,
+            predicate.span(),
+            "subqueries are unsupported in DELETE predicates",
+        ));
+    }
+    if let Some(span) = shape.unsupported {
+        return Err(DmlAdmissionError::DeleteUnsupportedForm.to_user_error(
+            source,
+            span,
+            "phase 1 DELETE WHERE does not support this predicate form",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -882,6 +882,30 @@ impl QueryExecutionContext {
         self.role
     }
 
+    /// Select the first eligible compute topology after an FE-only
+    /// predicate decision, preserving the original statement's capacity.
+    pub fn with_first_compute_topology(
+        mut self,
+        topology: BackendTopologySnapshot,
+    ) -> Result<Self, WorkError> {
+        if !self.topology.targets().is_empty() || topology.targets().is_empty() {
+            return Err(WorkError::Conflict);
+        }
+        if let Some(capacity) = &self.result_capacity {
+            capacity.scope().check()?;
+        }
+        if self
+            .optimizer_settings
+            .cbo_broadcast_backend_count
+            .is_none()
+            && self.optimizer_settings.effective_backend_count.is_none()
+        {
+            self.optimizer_settings.effective_backend_count = Some(topology.targets().len() as f64);
+        }
+        self.topology = topology;
+        Ok(self)
+    }
+
     pub fn topology(&self) -> &BackendTopologySnapshot {
         &self.topology
     }
@@ -1349,6 +1373,62 @@ mod tests {
         );
         assert_eq!(context.execution().deadline(), Some(deadline));
         assert!(context.execution().topology().targets().is_empty());
+    }
+
+    #[test]
+    fn delete_first_compute_topology_keeps_the_original_capacity() {
+        use novarocks_workload_control::{WorkClass, WorkRequest};
+
+        let (control, _) = capacity_control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let binding =
+            QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias())
+                .unwrap();
+        let initial = QueryExecutionContext::new(
+            ClusterRole::Fe,
+            topology(7, 0),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .with_result_capacity(binding)
+        .unwrap();
+        let admitted = initial
+            .clone()
+            .with_first_compute_topology(topology(8, 3))
+            .unwrap();
+        assert_eq!(admitted.topology().targets().len(), 3);
+        assert_eq!(
+            admitted.optimizer_settings().effective_backend_count,
+            Some(3.0)
+        );
+        assert!(
+            admitted
+                .result_capacity()
+                .unwrap()
+                .window_alias()
+                .is_for_scope(&root.owner.scope())
+        );
+        assert!(Arc::ptr_eq(
+            initial.session_property_inputs(),
+            admitted.session_property_inputs()
+        ));
+        assert!(
+            admitted
+                .with_first_compute_topology(topology(9, 1))
+                .is_err()
+        );
+        drop(initial);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
     }
 
     /// Load-bearing for the sealed-description rebind: a replacement round

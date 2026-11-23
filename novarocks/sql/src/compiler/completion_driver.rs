@@ -1226,7 +1226,7 @@ impl ProviderColumnProjectionError {
     }
 }
 
-type ProviderColumnProjection = (
+pub(super) type ProviderColumnProjection = (
     Box<[ProviderReadColumnNeed]>,
     BTreeMap<crate::column_id::ColumnId, ProviderPredicateColumn>,
 );
@@ -1246,7 +1246,7 @@ fn preflight_provider_value_type(
     })
 }
 
-fn provider_columns(
+pub(super) fn provider_columns(
     output_columns: &[crate::analysis::OutputColumn],
     scan: &crate::planner::payload::PlanScanNode,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,

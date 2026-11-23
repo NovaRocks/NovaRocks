@@ -17,9 +17,11 @@
 
 //! Typed DELETE input and preparation for the supervised write action.
 
+pub(crate) mod absorption;
 #[cfg(any(test, novarocks_dev_controls))]
 pub(crate) mod equality;
-pub(crate) mod standard;
+mod standard;
+pub(crate) use absorption::{DeletePath, select_delete_path};
 
 use std::sync::Arc;
 
@@ -32,7 +34,6 @@ use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 pub(crate) struct PreparedPredicateDelete {
     pub(crate) target: super::mutation::RowMutationTarget,
     pub(crate) selection: Option<novarocks_parser::ast::Expr>,
-    pub(crate) span: novarocks_parser::Span,
 }
 
 /// The admitted statement retained by the supervised write action.
@@ -193,6 +194,7 @@ pub(crate) async fn prepare_delete_write_async(
     target: &crate::catalog_application::resolver::TargetBackend,
     target_ref: &str,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    retained_target: Option<crate::connector::write_target::ConnectorWriteTargetBinding>,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
@@ -205,7 +207,8 @@ pub(crate) async fn prepare_delete_write_async(
                 statement,
                 target,
                 target_ref,
-                planning_pin,
+                retained_target
+                    .ok_or_else(|| "DELETE writer lost its original target".to_owned())?,
                 execution,
                 connector_context,
                 operation_id,
@@ -286,6 +289,7 @@ pub struct DeleteStatementInput {
     pub(crate) sql: String,
     pub(crate) context: novarocks_query_application::admitted_query_context::RequestContext,
     pub(crate) query_options: QueryOptions,
+    pub(crate) topology: novarocks_query_application::api::BackendTopologyService,
     pub(crate) launcher:
         Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
     #[cfg(novarocks_dev_controls)]

@@ -429,7 +429,10 @@ fn preparation_plan(
         Prep::DropBranch(_) => management(DropBranch),
         Prep::FastForwardBranch(_) | Prep::ShowBranches(_) => management(Call),
         Prep::Insert(_) => CommandPlan::write(Insert, true),
-        Prep::Delete(_) => CommandPlan::write(Delete, true),
+        Prep::Delete(node) if node.predicate.is_none() => {
+            CommandPlan::management(Delete, StatementOutputShape::Rows, true)
+        }
+        Prep::Delete(_) => CommandPlan::write(Delete, false),
         Prep::DeleteEntireBranch { .. } => {
             CommandPlan::management(Delete, StatementOutputShape::Rows, true)
         }
@@ -1108,6 +1111,7 @@ impl FrontendQuerySession {
                         .prepare_statement_action(DeleteStatementInput {
                             statement,
                             sql,
+                            topology: self.service.topology.clone(),
                             context: input.request,
                             query_options: input.options,
                             launcher,
@@ -1513,6 +1517,7 @@ impl FrontendQuerySession {
                     .delete_engine
                     .prepare_statement_action(DeleteStatementInput {
                         statement: prepared,
+                        topology: self.service.topology.clone(),
                         sql: equality_source.to_string(),
                         context: input.request,
                         query_options: input.options,
@@ -1625,6 +1630,26 @@ mod add_files_control_tests {
 mod branch_delete_tests {
     use super::*;
     use novarocks_query_application::sql::trino_admission::admit_trino_statement;
+
+    #[test]
+    fn delete_enters_the_original_root_before_selecting_compute() {
+        for (sql, work_class) in [
+            ("DELETE FROM lake.db.t", WorkClass::Management),
+            ("DELETE FROM lake.db.t WHERE FALSE", WorkClass::Query),
+            ("DELETE FROM lake.db.t WHERE id = 9", WorkClass::Query),
+        ] {
+            let statement = novarocks_parser::parser::parse_statement(sql).unwrap();
+            let TrinoStatementAction::Prepare(preparation) =
+                admit_trino_statement(sql, statement).unwrap()
+            else {
+                panic!("expected typed DELETE preparation");
+            };
+            let plan = preparation_plan(&preparation).unwrap();
+            assert_eq!(plan.admission.kind, StatementKind::Delete);
+            assert_eq!(plan.work_class, work_class);
+            assert!(!plan.waits_for_topology);
+        }
+    }
 
     #[test]
     fn whole_branch_delete_uses_the_same_target_with_delete_completion() {

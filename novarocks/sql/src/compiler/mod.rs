@@ -53,7 +53,9 @@ pub use required_constant::{
 pub use table_sequence::{TableSequenceArgumentFact, TableSequenceArgumentNeed};
 
 mod captured_catalog;
+mod delete_absorption;
 mod dml_catalog;
+pub use delete_absorption::DeleteAbsorption;
 mod write_assignment;
 pub use write_assignment::{SqlWriteAssignmentSite, SqlWriteAssignments};
 mod logical_explain;

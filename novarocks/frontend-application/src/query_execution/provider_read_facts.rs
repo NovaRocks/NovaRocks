@@ -966,6 +966,104 @@ async fn prepare_observation(
     Ok(())
 }
 
+/// Resolve the exact original DELETE read without producing a plan or split
+/// capability. The caller retains the original metadata admission throughout.
+pub(crate) async fn probe_delete_filter(
+    need: &ProviderReadNeed,
+    control: &ConnectorControlHost,
+    bindings: &QueryTableBindingStore,
+    context: &ConnectorRequestContext,
+    original: &novarocks_spi::connector::ConnectorTableMetadata,
+    session: &ConnectorSession,
+) -> Result<novarocks_spi::connector::read_stack::ConnectorDeleteConditionOutcome, ProviderReadError>
+{
+    use novarocks_spi::connector::read_stack::{
+        ConnectorDeleteConditionOutcome as Outcome, ConnectorReadOriginalTableObservation,
+        ConnectorReadRelationPreparationKind as Kind,
+        ConnectorReadRelationPreparationRequest as Request,
+    };
+
+    let opening = prepare_read_opening(need, control, bindings, context)?;
+    let Some(source) = original.source_read_facts() else {
+        return Ok(Outcome::Refused {
+            reason: "DELETE target has no original provider read facts".into(),
+        });
+    };
+    let request = Request::new(
+        opening.table.clone(),
+        Kind::Table {
+            version: relation_version(ProviderReadVersionNeed::Current),
+            reference: None,
+        },
+    )
+    .with_filter_offer(true)
+    .with_original_table(ConnectorReadOriginalTableObservation {
+        table: original.table.clone(),
+        source: source.clone(),
+    });
+    let metadata = opening.request_control.metadata();
+    let prepared = metadata
+        .prepare_relation(session, &request)
+        .await
+        .map_err(|error| relation_open_error(need.relation(), &opening, error))?
+        .ok_or_else(|| relation_open_missing(need.relation(), &opening))?;
+    let opened = metadata
+        .create_prepared_relation(prepared)
+        .map_err(|error| relation_open_error(need.relation(), &opening, error))?
+        .ok_or_else(|| relation_open_missing(need.relation(), &opening))?;
+    let (handle, _) = opened.into_parts();
+    let columns = metadata.get_column_bindings(session, &handle)?;
+    let assignments = assignments_for(need.columns(), &columns, &opening.name)?;
+    if assignments.iter().any(|assignment| {
+        columns
+            .iter()
+            .any(|column| column.is_hidden() && column.column() == assignment.column())
+    }) {
+        return Ok(Outcome::Refused {
+            reason: "DELETE predicate depends on a metadata column".into(),
+        });
+    }
+    let offer = offered_ops(need, &assignments, &column_ordinals(&assignments))?;
+    let operation = ReadNegotiation {
+        handle,
+        ops: offer.ops.clone(),
+    };
+    let negotiated = metadata.negotiate(session, &operation)?;
+    negotiated.verify_shape(operation.ops.len())?;
+    if !entire_filter_exact(need, &offer, &negotiated.outcomes) {
+        return Ok(Outcome::Refused {
+            reason: "Provider did not absorb the complete DELETE predicate".into(),
+        });
+    }
+    opening
+        .request_control
+        .seal_delete_condition(&negotiated.handle)
+        .await
+        .map_err(ProviderReadError::from)
+}
+
+pub(crate) fn observe_delete_target(
+    control: &ConnectorControlHost,
+    original: &crate::connector::write_target::ConnectorWriteTargetBinding,
+    context: &ConnectorRequestContext,
+) -> Result<
+    Option<novarocks_spi::connector::read_stack::ConnectorDeleteTargetFacts>,
+    ProviderReadError,
+> {
+    use novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation;
+    let Some(source) = original.metadata().source_read_facts() else {
+        return Ok(None);
+    };
+    let read = control.typed_read_for_planning_pin(original.planning_pin())?;
+    let request = request_control_for(&read, context)?;
+    request
+        .observe_delete_target(&ConnectorReadOriginalTableObservation {
+            table: original.handle().clone(),
+            source: source.clone(),
+        })
+        .map_err(ProviderReadError::from)
+}
+
 fn relation_open_error(
     relation: &ProviderReadRelationNeed,
     opening: &ReadOpening,

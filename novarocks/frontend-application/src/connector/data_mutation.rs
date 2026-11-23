@@ -45,10 +45,6 @@ pub enum DataMutationIntent {
         format: Option<ConnectorAddFilesFormat>,
         recursion: ConnectorAddFilesRecursion,
     },
-    #[expect(
-        dead_code,
-        reason = "The DELETE path provides the original target observation"
-    )]
     DeleteByCondition {
         original_table: ConnectorTableHandle,
         condition: ConnectorDeleteCondition,
