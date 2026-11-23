@@ -1,157 +1,21 @@
--- query 6
--- legacy
-_col0
-["1","2"]
-["1","2"]
-["a","b"]
-NULL
-
--- query 7
--- legacy
-_col0
-["1","2"]
-NULL
-["a","b"]
-NULL
-
--- query 8
--- legacy
-_col0
-{1:"1"}
-{1:"1"}
-{1:null}
-NULL
-
--- query 9
--- legacy
-_col0
-{1:"1"}
-NULL
-{1:null}
-NULL
-
--- query 10
--- legacy
-_col0
-["1","2"]
-NULL
-["a","b"]
-NULL
-
--- query 11
--- legacy
-_col0
-["1","2"]
-["1","2"]
-["a","b"]
-NULL
-
--- query 12
--- legacy
-_col0
-{1:"1"}
-NULL
-{1:null}
-NULL
-
--- query 13
--- legacy
-_col0
-{1:"1"}
-{1:"b"}
-{1:null}
-NULL
-
--- query 14
--- legacy
-_col0
-["1","2"]
-["1","2"]
-["a","b"]
-NULL
-
--- query 15
--- legacy
-_col0
-{1:"1"}
-{1:"1"}
-{1:null}
-NULL
-
--- query 16
--- legacy
-_col0
-{1:"1"}
-{1:"b"}
-{1:null}
-NULL
-
--- query 17
--- legacy
-_col0	ms	mi
-{1:"1"}	NULL	{1:1}
-{1:"b"}	{1:"b"}	{1:1}
-{1:null}	{1:null}	NULL
-NULL	NULL	NULL
-
--- query 18
--- legacy
-_col0	ass	ai
-["1","2"]	NULL	[1,2]
-["a","b"]	["a","b"]	[1,2]
-["a","b"]	["a","b"]	NULL
-NULL	NULL	NULL
-
 -- query 19
--- legacy
+-- types	array(integer)
 _col0
 [1,2]
 [1,2]
 NULL
-NULL
-
--- query 20
--- legacy
-_col0
-{1:"1"}
-{1:"1"}
-{1:null}
-NULL
-
--- query 21
--- legacy
-_col0
-["1","2"]
-["1","2"]
-["a","b"]
 NULL
 
 -- query 22
--- legacy
+-- types	map(varchar(1), integer)
 _col0
 {"a":1,"b":2}
 {"a":1,"b":2}
 NULL
 NULL
 
--- query 23
--- legacy
-_col0	ai	ass
-["1","2"]	[1,2]	NULL
-["1","2"]	[1,2]	["a","b"]
-NULL	NULL	["a","b"]
-NULL	NULL	NULL
-
--- query 24
--- legacy
-_col0	ms	mi
-NULL	NULL	{1:1}
-{1:"b"}	{1:"b"}	{1:1}
-{1:null}	{1:null}	NULL
-NULL	NULL	NULL
-
 -- query 25
--- legacy
+-- types	integer
 _col0
 NULL
 NULL
@@ -159,15 +23,15 @@ NULL
 NULL
 
 -- query 26
--- legacy
+-- types	integer	map(integer, integer)	map(integer, varchar)	boolean	boolean
 i	mi	ms	mi_parent_null	ms_parent_null
-1	{1:1}	NULL	0	1
-2	{1:1}	{1:"b"}	0	0
-3	NULL	{1:null}	1	0
-4	NULL	NULL	1	1
+1	{"1":1}	NULL	false	true
+2	{"1":1}	{"1":"b"}	false	false
+3	NULL	{"1":null}	true	false
+4	NULL	NULL	true	true
 
 -- query 27
--- legacy
+-- types	bigint	bigint	bigint	bigint
 rows_total	mi_present	ms_present	ms_nonnull_values
 4	2	2	1
 
