@@ -19,6 +19,7 @@
 
 pub(super) mod unicode;
 
+use super::string_measure::fixed_char_width;
 use crate::{
     EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
     ScalarCallInput, SelectedValues, Selection,
@@ -314,6 +315,7 @@ pub(super) fn evaluate_string_case<'a>(
             || target.logical_type() != ValueLogicalType::Physical
             || target.data_type() != &DataType::Utf8
             || target.nullable() != source.nullable()
+            || fixed_char_width(source) != fixed_char_width(target)
         {
             return Err(invalid(
                 "string case conversion differs from its exact installed profile",

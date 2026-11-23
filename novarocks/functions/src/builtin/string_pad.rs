@@ -19,6 +19,7 @@
 //! Two output passes measure and directly write without row String/char buffers.
 //! Layout gates are representational facts, not formal host memory grants.
 
+use super::string_measure::{fixed_char_padding, fixed_char_width};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -28,7 +29,7 @@ use crate::{
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_type_contract::{FunctionIntrinsicRowError, ValueLogicalType};
+use novarocks_type_contract::{FunctionIntrinsicRowError, ValueKind, ValueLogicalType};
 use std::{alloc::Layout, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,13 +67,16 @@ const MAX_PAD_LENGTH: usize = string_repeat_pad_core::MAX_STRING_BYTES;
 struct BorrowedCharacters<'a> {
     text: &'a str,
     len: usize,
+    spaces: usize,
 }
 impl SourceCharacters for BorrowedCharacters<'_> {
     fn len(&self) -> usize {
         self.len
     }
     fn iter(&self) -> impl Iterator<Item = char> {
-        self.text.chars()
+        self.text
+            .chars()
+            .chain(std::iter::repeat_n(' ', self.spaces))
     }
 }
 struct BorrowedCycle<'a> {
@@ -110,6 +114,8 @@ struct CompactPadProjection<'a, 'control> {
     bytes: Option<&'a mut Vec<u8>>,
     total: usize,
     extent: usize,
+    char_width: Option<usize>,
+    source_spaces: usize,
     work: &'a mut EvaluationCheckpoints<'control>,
 }
 impl CompactPadProjection<'_, '_> {
@@ -130,6 +136,9 @@ impl CompactPadProjection<'_, '_> {
         for byte in source.bytes() {
             self.push(byte)?;
         }
+        for _ in 0..self.source_spaces {
+            self.push(b' ')?;
+        }
         Ok(())
     }
     fn characters(&mut self, text: &str) -> Result<usize, KernelFailure> {
@@ -149,9 +158,13 @@ impl<'source> PadProjection<'source> for CompactPadProjection<'_, '_> {
     type Output = usize;
     type Emission = Option<usize>;
     fn source(&mut self, text: &'source str) -> Result<Self::Source, KernelFailure> {
+        let stored = self.characters(text)?;
+        let len = self.char_width.unwrap_or(stored);
+        self.source_spaces = fixed_char_padding(len, stored)?;
         Ok(BorrowedCharacters {
             text,
-            len: self.characters(text)?,
+            len,
+            spaces: self.source_spaces,
         })
     }
     fn pad(&mut self, text: &'source str) -> Result<Self::Pad, KernelFailure> {
@@ -253,9 +266,43 @@ pub(super) fn check_result(target: &crate::FunctionValueType) -> Result<(), Stat
     Ok(())
 }
 
+pub(super) fn check_character_profile(
+    op: StringPadOp,
+    types: &[FunctionArgumentType],
+    target: &crate::FunctionValueType,
+    trino: bool,
+) -> Result<Option<usize>, StaticProfileFailure> {
+    let [
+        FunctionArgumentType::Value(source),
+        _,
+        FunctionArgumentType::Value(fill),
+    ] = types
+    else {
+        return Err(StaticProfileFailure::Value);
+    };
+    let width = fixed_char_width(source);
+    if fixed_char_width(fill).is_some() || (width.is_some() && (op != StringPadOp::Left || !trino))
+    {
+        return Err(StaticProfileFailure::Source);
+    }
+    if fixed_char_width(target).is_some()
+        || width.is_some() && target.value_type().kind() != &ValueKind::String
+    {
+        return Err(StaticProfileFailure::Result);
+    }
+    Ok(width)
+}
+
 enum PadRow<'a> {
-    Text { source: &'a str, fill: &'a str },
-    Binary { source: &'a [u8], fill: &'a [u8] },
+    Text {
+        source: &'a str,
+        fill: &'a str,
+        char_width: Option<usize>,
+    },
+    Binary {
+        source: &'a [u8],
+        fill: &'a [u8],
+    },
 }
 
 impl PadRow<'_> {
@@ -274,14 +321,21 @@ impl PadRow<'_> {
         mut projection: CompactPadProjection<'_, '_>,
     ) -> Result<Option<usize>, KernelFailure> {
         match *self {
-            Self::Text { source, fill } => string_repeat_pad_core::pad_into_with_limit(
+            Self::Text {
                 source,
-                length,
-                || fill,
-                left,
-                (!trino).then_some(string_repeat_pad_core::MAX_STRING_BYTES),
-                projection,
-            ),
+                fill,
+                char_width,
+            } => {
+                projection.char_width = char_width;
+                string_repeat_pad_core::pad_into_with_limit(
+                    source,
+                    length,
+                    || fill,
+                    left,
+                    (!trino).then_some(string_repeat_pad_core::MAX_STRING_BYTES),
+                    projection,
+                )
+            }
             Self::Binary { source, fill } => {
                 let length = usize::try_from(length)
                     .map_err(|_| internal("binary padding received an invalid checked length"))?;
@@ -326,6 +380,8 @@ pub(super) fn evaluate_string_pad<'a>(
             work.step()?;
         }
         let trino = input.contract().effects().own_row_error == FunctionIntrinsicRowError::MayRaise;
+        let char_width = check_character_profile(op, types, target, trino)
+            .map_err(|error| invalid(error.message()))?;
         let binary = target.data_type() == &DataType::Binary;
         let lengths = arguments[1]
             .array()
@@ -380,6 +436,7 @@ pub(super) fn evaluate_string_pad<'a>(
                     PadRow::Text {
                         source: strings.value(rows[0]),
                         fill: pads.value(rows[2]),
+                        char_width,
                     }
                 } else if let Some((binaries, pads)) = binaries {
                     PadRow::Binary {
@@ -412,6 +469,8 @@ pub(super) fn evaluate_string_pad<'a>(
                         bytes: None,
                         total: 0,
                         extent: 0,
+                        char_width: None,
+                        source_spaces: 0,
                         work: &mut work,
                     },
                 )?
@@ -463,6 +522,8 @@ pub(super) fn evaluate_string_pad<'a>(
                             bytes: None,
                             total: 0,
                             extent: 0,
+                            char_width: None,
+                            source_spaces: 0,
                             work: &mut work,
                         },
                     )?
@@ -482,6 +543,8 @@ pub(super) fn evaluate_string_pad<'a>(
                             bytes: Some(&mut bytes),
                             total,
                             extent: 0,
+                            char_width: None,
+                            source_spaces: 0,
                             work: &mut work,
                         },
                     )?;

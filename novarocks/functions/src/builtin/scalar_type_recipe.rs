@@ -20,7 +20,8 @@ use super::signature::{Bindings, TypeSpec, realize};
 use crate::{FunctionBindingError, FunctionValueType};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    BorrowedTypedValueBinding, CompileCheckpoints, ValueKind, ValueLogicalType,
+    BorrowedTypedValueBinding, CharacterKind, CharacterType, CompileCheckpoints, ValueKind,
+    ValueLogicalType,
 };
 
 #[derive(Clone, Copy)]
@@ -33,6 +34,7 @@ pub(super) struct ScalarTypeRecipe<'a> {
 enum RealizationRule<'a> {
     Source(&'a FunctionValueType),
     Scalar(DataType, ValueLogicalType),
+    Character(CharacterType),
     List(&'a TypeSpec),
     Map(&'a TypeSpec, &'a TypeSpec),
 }
@@ -60,6 +62,30 @@ impl<'a> ScalarTypeRecipe<'a> {
             TypeSpec::AnyType | TypeSpec::AnyDecimal128 => {
                 return Err("wildcard has no intrinsic result type".into());
             }
+            TypeSpec::Character(kind, width) => {
+                let width = self.bindings.character_width(*width)?;
+                match (kind, width) {
+                    (CharacterKind::Varchar, None) => {
+                        RealizationRule::Scalar(DataType::Utf8, ValueLogicalType::Physical)
+                    }
+                    (CharacterKind::Varchar, Some(width))
+                        if width > u64::from(CharacterType::MAX_VARCHAR_LENGTH) =>
+                    {
+                        // Trino's width ceiling denotes unbounded VARCHAR.
+                        RealizationRule::Scalar(DataType::Utf8, ValueLogicalType::Physical)
+                    }
+                    (kind, Some(width)) => {
+                        let character = u32::try_from(width)
+                            .ok()
+                            .and_then(|width| CharacterType::new(*kind, width))
+                            .ok_or_else(|| "character result width is out of range".to_owned())?;
+                        RealizationRule::Character(character)
+                    }
+                    (CharacterKind::Char, None) => {
+                        return Err("CHAR requires a finite width".into());
+                    }
+                }
+            }
             TypeSpec::List(item) => RealizationRule::List(item),
             TypeSpec::Map(key, value) => RealizationRule::Map(key, value),
             spec => RealizationRule::Scalar(
@@ -84,6 +110,9 @@ impl<'a> ScalarTypeRecipe<'a> {
             RealizationRule::Source(source) => source.clone(),
             RealizationRule::Scalar(carrier, domain) => {
                 creation.value(carrier, self.nullable, domain)?
+            }
+            RealizationRule::Character(character) => {
+                creation.character(character, self.nullable)?
             }
             RealizationRule::List(item) => super::signature::declared_list_with_construction(
                 &self
@@ -129,6 +158,9 @@ impl<'a> ScalarTypeRecipe<'a> {
             RealizationRule::Scalar(carrier, domain) => {
                 Self::matches_scalar(actual, &carrier, domain, work)
             }
+            RealizationRule::Character(character) => Ok(actual.value_type().kind()
+                == &ValueKind::BoundedCharacter(character)
+                && actual.data_type() == &DataType::Utf8),
             RealizationRule::List(item) => {
                 if !matches!(actual.value_type().kind(), ValueKind::List(_))
                     || !matches!(actual.data_type(), DataType::List(_))

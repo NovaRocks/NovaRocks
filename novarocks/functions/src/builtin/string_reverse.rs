@@ -19,6 +19,7 @@
 //! Checks cover requested-layout representability. Arrow construction and
 //! allocator internals remain opaque; this is not a formal host memory grant.
 
+use super::string_measure::{fixed_char_padding, fixed_char_width};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -56,6 +57,56 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 
+enum ReverseRow<'a> {
+    Text {
+        text: &'a str,
+        leading_spaces: usize,
+    },
+    Binary(&'a [u8]),
+}
+
+impl ReverseRow<'_> {
+    fn byte_count(&self) -> usize {
+        match self {
+            Self::Text {
+                text,
+                leading_spaces,
+            } => text.len() + leading_spaces,
+            Self::Binary(bytes) => bytes.len(),
+        }
+    }
+}
+
+fn fixed_reverse_span<'a>(
+    text: &'a str,
+    width: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ReverseRow<'a>, KernelFailure> {
+    let mut chars = 0;
+    let mut start = 0;
+    for character in text.chars() {
+        if character == ' ' && start == chars {
+            start += 1;
+        }
+        chars += 1;
+        work.step()?;
+    }
+    let padding = fixed_char_padding(width, chars)?;
+    // Reversal moves storage padding to the front and the original leading
+    // ASCII spaces to the trailing CHAR storage suffix, which is omitted.
+    if start == chars {
+        Ok(ReverseRow::Text {
+            text: "",
+            leading_spaces: 0,
+        })
+    } else {
+        Ok(ReverseRow::Text {
+            text: &text[start..],
+            leading_spaces: padding,
+        })
+    }
+}
+
 pub(super) fn evaluate_string_reverse<'a>(
     _op: StringReverseOp,
     input: ScalarCallInput<'_, 'a>,
@@ -77,6 +128,7 @@ pub(super) fn evaluate_string_reverse<'a>(
             || !matches!(source.data_type(), DataType::Utf8 | DataType::Binary)
             || target.logical_type() != ValueLogicalType::Physical
             || target.data_type() != source.data_type()
+            || fixed_char_width(source) != fixed_char_width(target)
         {
             return Err(invalid(
                 "string reversal differs from its exact installed profile",
@@ -91,11 +143,23 @@ pub(super) fn evaluate_string_reverse<'a>(
                 "reversal selected carrier differs from its checked type",
             ));
         }
-        let value_bytes = |row| {
-            strings
-                .map(|strings| strings.value(row).as_bytes())
-                .or_else(|| binaries.map(|binaries| binaries.value(row)))
-                .ok_or_else(|| internal("reversal has no selected carrier"))
+        let width = fixed_char_width(source);
+        let reverse_row = |row, work: &mut EvaluationCheckpoints<'_>| {
+            if let Some(strings) = strings {
+                let text = strings.value(row);
+                if let Some(width) = width {
+                    fixed_reverse_span(text, width, work)
+                } else {
+                    Ok(ReverseRow::Text {
+                        text,
+                        leading_spaces: 0,
+                    })
+                }
+            } else if let Some(binaries) = binaries {
+                Ok(ReverseRow::Binary(binaries.value(row)))
+            } else {
+                Err(internal("reversal has no selected carrier"))
+            }
         };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
@@ -116,9 +180,9 @@ pub(super) fn evaluate_string_reverse<'a>(
                 }
                 continue;
             }
-            let selected = value_bytes(row)?;
+            let selected = reverse_row(row, &mut work)?;
             output_bytes = output_bytes
-                .checked_add(selected.len())
+                .checked_add(selected.byte_count())
                 .ok_or(KernelFailure::ResourceExhausted)?;
         }
         output_capacity(selection.len(), output_bytes)?;
@@ -143,24 +207,34 @@ pub(super) fn evaluate_string_reverse<'a>(
                 has_null = true;
                 validity.append(false);
             } else {
-                let selected = value_bytes(row)?;
-                if selected.len() > output_bytes - bytes.len() {
+                let selected = reverse_row(row, &mut work)?;
+                if selected.byte_count() > output_bytes - bytes.len() {
                     return Err(internal(
                         "string reversal exceeded its measured output extent",
                     ));
                 }
-                if let Some(strings) = strings {
-                    for character in strings.value(row).chars().rev() {
-                        let mut encoded = [0; 4];
-                        for byte in character.encode_utf8(&mut encoded).bytes() {
-                            bytes.push(byte);
+                match selected {
+                    ReverseRow::Text {
+                        text,
+                        leading_spaces,
+                    } => {
+                        for _ in 0..leading_spaces {
+                            bytes.push(b' ');
                             work.step()?;
                         }
+                        for character in text.chars().rev() {
+                            let mut encoded = [0; 4];
+                            for byte in character.encode_utf8(&mut encoded).bytes() {
+                                bytes.push(byte);
+                                work.step()?;
+                            }
+                        }
                     }
-                } else {
-                    for byte in selected.iter().rev() {
-                        bytes.push(*byte);
-                        work.step()?;
+                    ReverseRow::Binary(value) => {
+                        for byte in value.iter().rev() {
+                            bytes.push(*byte);
+                            work.step()?;
+                        }
                     }
                 }
                 validity.append(true);

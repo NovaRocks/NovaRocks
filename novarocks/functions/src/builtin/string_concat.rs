@@ -28,7 +28,9 @@ use crate::{
 use arrow_array::{Array, ArrayRef, BinaryArray, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_type_contract::{FunctionIntrinsicRowError, ValueLogicalType};
+use novarocks_type_contract::{
+    CharacterKind, FunctionIntrinsicRowError, ValueKind, ValueLogicalType,
+};
 use std::{alloc::Layout, sync::Arc};
 
 use super::string_concat_core::{ConcatLength, concat_length_observed, emit_concat_observed};
@@ -69,33 +71,99 @@ fn row_length(
     input: &ScalarCallInput<'_, '_>,
     ordinal: usize,
     batch_row: usize,
+    left_char_width: Option<usize>,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<ConcatLength, KernelFailure> {
+) -> Result<(ConcatLength, usize), KernelFailure> {
     let mut context = (input, ordinal, batch_row, work);
-    concat_length_observed(input.arguments().len(), &mut context, |context, index| {
-        let argument = context.0.arguments()[index];
-        let FunctionArgumentType::Value(source) =
-            &context.0.contract().selected().argument_types[index]
-        else {
-            return Err(invalid("concat requires only checked value arguments"));
-        };
-        let values = argument.array();
-        let row = argument.value_row(context.1, context.2);
-        context.3.step()?;
-        if row >= values.len() {
-            return Err(internal("concat selected row is outside its carrier"));
-        }
-        if values.is_null(row) {
-            if !source.nullable() {
-                return Err(internal(
-                    "concat non-null source contains selected SQL NULL",
-                ));
+    let length =
+        concat_length_observed(input.arguments().len(), &mut context, |context, index| {
+            let argument = context.0.arguments()[index];
+            let FunctionArgumentType::Value(source) =
+                &context.0.contract().selected().argument_types[index]
+            else {
+                return Err(invalid("concat requires only checked value arguments"));
+            };
+            let values = argument.array();
+            let row = argument.value_row(context.1, context.2);
+            context.3.step()?;
+            if row >= values.len() {
+                return Err(internal("concat selected row is outside its carrier"));
             }
-            Ok(None)
-        } else {
-            value_bytes(argument, row).map(Some)
+            if values.is_null(row) {
+                if !source.nullable() {
+                    return Err(internal(
+                        "concat non-null source contains selected SQL NULL",
+                    ));
+                }
+                Ok(None)
+            } else {
+                value_bytes(argument, row).map(Some)
+            }
+        })?;
+    let (ConcatLength::Value(length), Some(width), [left, right]) =
+        (&length, left_char_width, input.arguments())
+    else {
+        return Ok((length, 0));
+    };
+    let left = value_bytes(*left, left.value_row(ordinal, batch_row))?;
+    let right = value_bytes(*right, right.value_row(ordinal, batch_row))?;
+    let padding = char_concat_padding(left, right, width, context.3)?;
+    let padded = length
+        .checked_add(padding)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    Ok((ConcatLength::Value(padded), padding))
+}
+
+fn char_concat_padding(
+    left: &[u8],
+    right: &[u8],
+    width: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<usize, KernelFailure> {
+    if right.is_empty() {
+        return Ok(0);
+    }
+    // The StringArray carrier has validated UTF-8. Count code points while
+    // observing each traversed byte, including continuation bytes.
+    let mut code_points = 0;
+    for byte in left {
+        work.step()?;
+        if byte & 0b1100_0000 != 0b1000_0000 {
+            code_points += 1;
         }
-    })
+    }
+    width
+        .checked_sub(code_points)
+        .ok_or_else(|| internal("concat CHAR source exceeds its declared width"))
+}
+
+fn left_char_width(input: ScalarCallInput<'_, '_>) -> Result<Option<usize>, KernelFailure> {
+    let ValueKind::BoundedCharacter(result) = input.contract().result_type().value_type().kind()
+    else {
+        return Ok(None);
+    };
+    if result.kind() != CharacterKind::Char {
+        return Ok(None);
+    }
+    let [
+        FunctionArgumentType::Value(left),
+        FunctionArgumentType::Value(right),
+    ] = input.contract().selected().argument_types.as_ref()
+    else {
+        return Err(invalid("CHAR concat requires two checked CHAR arguments"));
+    };
+    let (ValueKind::BoundedCharacter(left), ValueKind::BoundedCharacter(right)) =
+        (left.value_type().kind(), right.value_type().kind())
+    else {
+        return Err(invalid("CHAR concat requires two checked CHAR arguments"));
+    };
+    if left.kind() != CharacterKind::Char
+        || right.kind() != CharacterKind::Char
+        || left.length() + right.length() != result.length()
+    {
+        return Err(invalid("CHAR concat differs from its checked widths"));
+    }
+    Ok(Some(left.length() as usize))
 }
 
 pub(super) fn evaluate_string_concat<'a>(
@@ -108,12 +176,13 @@ pub(super) fn evaluate_string_concat<'a>(
         let selected = input.contract().selected();
         let target = input.contract().result_type();
         let trino = input.contract().effects().own_row_error == FunctionIntrinsicRowError::MayRaise;
+        let left_char_width = left_char_width(input)?;
         let min_arity = if trino { 2 } else { 1 };
         if input.arguments().len() < min_arity
             || selected.argument_types.len() != input.arguments().len()
             || target.logical_type() != ValueLogicalType::Physical
             || !matches!(target.data_type(), DataType::Utf8 | DataType::Binary)
-            || !target.nullable()
+            || (!target.nullable() && left_char_width.is_none())
         {
             return Err(invalid(
                 "concat differs from its installed variadic Utf8 profile",
@@ -141,7 +210,8 @@ pub(super) fn evaluate_string_concat<'a>(
         output_capacity(selection.len(), 0)?;
         let mut output_bytes = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            if let ConcatLength::Value(length) = row_length(&input, ordinal, batch_row, &mut work)?
+            if let (ConcatLength::Value(length), _) =
+                row_length(&input, ordinal, batch_row, left_char_width, &mut work)?
             {
                 output_bytes = output_bytes
                     .checked_add(length)
@@ -167,7 +237,9 @@ pub(super) fn evaluate_string_concat<'a>(
         let mut has_null = false;
         let mut errors = Vec::new();
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            match row_length(&input, ordinal, batch_row, &mut work)? {
+            let (length, padding) =
+                row_length(&input, ordinal, batch_row, left_char_width, &mut work)?;
+            match length {
                 length @ (ConcatLength::Null | ConcatLength::TooLong) => {
                     if trino && let Some(error) = length.data_error(ordinal) {
                         errors
@@ -182,7 +254,7 @@ pub(super) fn evaluate_string_concat<'a>(
                     if length > output_bytes - bytes.len() {
                         return Err(internal("concat exceeded its measured output extent"));
                     }
-                    let mut context = (&input, ordinal, batch_row, &mut bytes, &mut work);
+                    let mut context = (&input, ordinal, batch_row, &mut bytes, &mut work, padding);
                     emit_concat_observed(
                         input.arguments().len(),
                         &mut context,
@@ -193,6 +265,10 @@ pub(super) fn evaluate_string_concat<'a>(
                         |context, text| {
                             for byte in text {
                                 context.3.push(*byte);
+                                context.4.step()?;
+                            }
+                            for _ in 0..std::mem::take(&mut context.5) {
+                                context.3.push(b' ');
                                 context.4.step()?;
                             }
                             Ok(())

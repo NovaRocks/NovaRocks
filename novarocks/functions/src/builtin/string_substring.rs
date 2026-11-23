@@ -18,6 +18,7 @@
 //! Selected Unicode scalar substring over the original borrowed UTF-8 values.
 //! Layout checks cover requested representability, not formal host memory grants.
 
+use super::string_measure::{fixed_char_padding, fixed_char_width};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -26,8 +27,8 @@ use crate::{
 use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
-use std::{alloc::Layout, sync::Arc};
+use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
+use std::{alloc::Layout, ops::Range, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StringSubstringOp {
@@ -103,21 +104,70 @@ fn substring_span<'a>(
 }
 
 fn binary_span(bytes: &[u8], position: i64, length: Option<i64>) -> &[u8] {
+    value_range(bytes.len(), position, length).map_or(&[], |range| &bytes[range])
+}
+
+fn value_range(width: usize, position: i64, length: Option<i64>) -> Option<Range<usize>> {
     if position == 0 || length.is_some_and(|n| n <= 0) {
-        return &[];
+        return None;
     }
     let start = if position > 0 {
-        (position - 1) as usize
-    } else if let Some(index) = bytes.len().checked_sub(position.unsigned_abs() as usize) {
-        index
+        usize::try_from(position - 1).ok()?
     } else {
-        return &[];
+        width.checked_sub(usize::try_from(position.unsigned_abs()).ok()?)?
     };
-    let Some(suffix) = bytes.get(start..) else {
-        return &[];
+    let available = width.checked_sub(start)?;
+    let count = length.map_or(available, |length| {
+        usize::try_from(length).unwrap_or(available).min(available)
+    });
+    Some(start..start + count)
+}
+
+struct SubstringSpan<'a> {
+    bytes: &'a [u8],
+    spaces: usize,
+}
+
+impl<'a> SubstringSpan<'a> {
+    fn borrowed(bytes: &'a [u8]) -> Self {
+        Self { bytes, spaces: 0 }
+    }
+
+    fn byte_count(&self) -> usize {
+        // CHAR spaces are bounded by the declared maximum CHAR width and a
+        // borrowed Arrow value is bounded by i32 offsets.
+        self.bytes.len() + self.spaces
+    }
+}
+
+fn fixed_substring_span<'a>(
+    text: &'a str,
+    width: usize,
+    position: i64,
+    length: Option<i64>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<SubstringSpan<'a>, KernelFailure> {
+    let Some(range) = value_range(width, position, length) else {
+        return Ok(SubstringSpan::borrowed(&[]));
     };
-    let count = length.map_or(suffix.len(), |length| (length as usize).min(suffix.len()));
-    &suffix[..count]
+    let mut stored = 0;
+    let mut start_byte = text.len();
+    let mut end_byte = text.len();
+    for (ordinal, (byte, character)) in text.char_indices().enumerate() {
+        if ordinal == range.start {
+            start_byte = byte;
+        }
+        if ordinal == range.end {
+            end_byte = byte;
+        }
+        stored += 1;
+        observe_char(character, work)?;
+    }
+    fixed_char_padding(width, stored)?;
+    Ok(SubstringSpan {
+        bytes: &text.as_bytes()[start_byte..end_byte],
+        spaces: range.end.saturating_sub(range.start.max(stored)),
+    })
 }
 
 pub(super) enum StringIntegerArray<'a> {
@@ -171,9 +221,10 @@ pub(super) fn evaluate_string_substring<'a>(
             return Err(invalid("substring requires checked source and position"));
         };
         let binary = source.data_type() == &DataType::Binary;
+        let char_width = fixed_char_width(source);
         let index_type = start.data_type();
         if !matches!(index_type, DataType::Int32 | DataType::Int64)
-            || (binary && index_type != &DataType::Int64)
+            || ((binary || char_width.is_some()) && index_type != &DataType::Int64)
         {
             return Err(invalid(
                 "substring position must match the selected integer profile",
@@ -202,6 +253,14 @@ pub(super) fn evaluate_string_substring<'a>(
         let target = input.contract().result_type();
         if target.logical_type() != ValueLogicalType::Physical
             || target.data_type() != source.data_type()
+            || match char_width {
+                Some(width) => !matches!(
+                    target.value_type().kind(),
+                    ValueKind::BoundedCharacter(ty)
+                        if ty.kind() == CharacterKind::Varchar && ty.length() as usize == width
+                ),
+                None => fixed_char_width(target).is_some(),
+            }
         {
             return Err(invalid(
                 "substring differs from its exact installed result profile",
@@ -234,7 +293,7 @@ pub(super) fn evaluate_string_substring<'a>(
         let row_span = |ordinal,
                         batch_row,
                         work: &mut EvaluationCheckpoints<'_>|
-         -> Result<Option<&[u8]>, KernelFailure> {
+         -> Result<Option<SubstringSpan<'_>>, KernelFailure> {
             let mut rows = [0usize; 3];
             let mut is_null = false;
             for (index, argument) in arguments.iter().enumerate() {
@@ -262,10 +321,19 @@ pub(super) fn evaluate_string_substring<'a>(
             let start = starts.value(rows[1]);
             let length = lengths.as_ref().map(|array| array.value(rows[2]));
             if let Some(strings) = strings {
-                substring_span(strings.value(rows[0]), start, length, work)
-                    .map(|text| Some(text.as_bytes()))
+                let source = strings.value(rows[0]);
+                if let Some(width) = char_width {
+                    fixed_substring_span(source, width, start, length, work).map(Some)
+                } else {
+                    substring_span(source, start, length, work)
+                        .map(|text| Some(SubstringSpan::borrowed(text.as_bytes())))
+                }
             } else if let Some(binaries) = binaries {
-                Ok(Some(binary_span(binaries.value(rows[0]), start, length)))
+                Ok(Some(SubstringSpan::borrowed(binary_span(
+                    binaries.value(rows[0]),
+                    start,
+                    length,
+                ))))
             } else {
                 Err(internal("substring has no prepared source carrier"))
             }
@@ -276,7 +344,7 @@ pub(super) fn evaluate_string_substring<'a>(
         for (ordinal, batch_row) in selection.iter().enumerate() {
             if let Some(span) = row_span(ordinal, batch_row, &mut work)? {
                 total = total
-                    .checked_add(span.len())
+                    .checked_add(span.byte_count())
                     .ok_or(KernelFailure::ResourceExhausted)?;
             }
         }
@@ -303,11 +371,16 @@ pub(super) fn evaluate_string_substring<'a>(
                     validity.append(false);
                 }
                 Some(span) => {
-                    if span.len() > total - bytes.len() {
+                    if span.byte_count() > total - bytes.len() {
                         return Err(internal("substring exceeded its measured output extent"));
                     }
-                    for byte in span {
-                        bytes.push(*byte);
+                    for byte in span
+                        .bytes
+                        .iter()
+                        .copied()
+                        .chain(std::iter::repeat_n(b' ', span.spaces))
+                    {
+                        bytes.push(byte);
                         work.step()?;
                     }
                     validity.append(true);

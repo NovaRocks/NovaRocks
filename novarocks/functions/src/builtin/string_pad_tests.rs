@@ -38,6 +38,38 @@ struct Control {
     trace: Mutex<Vec<u32>>,
     refusal: Option<(usize, KernelFailure)>,
 }
+
+#[test]
+fn string_pad_char_projection_writes_declared_spaces_without_a_padded_source() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    let row = PadRow::Text {
+        source: "é中",
+        fill: "xé",
+        char_width: Some(4),
+    };
+    for (length, expected) in [(1, "é"), (3, "é中 "), (4, "é中  "), (6, "xéé中  ")] {
+        let mut output = Vec::new();
+        let bytes = row
+            .render(
+                length,
+                true,
+                true,
+                CompactPadProjection {
+                    bytes: Some(&mut output),
+                    total: expected.len(),
+                    extent: 0,
+                    char_width: None,
+                    source_spaces: 0,
+                    work: &mut work,
+                },
+            )
+            .unwrap();
+        assert_eq!(bytes, Some(expected.len()));
+        assert_eq!(output, expected.as_bytes());
+    }
+    work.finish().unwrap();
+}
 impl KernelEvaluationControl for Control {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
         assert!(units <= 256);

@@ -19,6 +19,7 @@
 //! Two passes measure and write into one output backing; no row String is built.
 //! Layout checks prove representation only, not a formal host memory grant.
 
+use super::string_measure::fixed_char_width;
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -119,11 +120,13 @@ pub(super) fn evaluate_string_initcap<'a>(
             return Err(invalid("initcap requires one checked value argument"));
         };
         let target = input.contract().result_type();
+        let source_width = fixed_char_width(source);
         if source.logical_type() != ValueLogicalType::Physical
             || source.data_type() != &DataType::Utf8
             || target.logical_type() != ValueLogicalType::Physical
             || target.data_type() != &DataType::Utf8
-            || (op == StringInitcapOp::Initcap && !target.nullable())
+            || source_width != fixed_char_width(target)
+            || (op == StringInitcapOp::Initcap && (!target.nullable() || source_width.is_some()))
         {
             return Err(invalid("initcap differs from its exact installed profile"));
         }

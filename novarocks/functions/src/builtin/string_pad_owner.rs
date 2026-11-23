@@ -227,6 +227,13 @@ impl PureFunctionMetadataOwner for StringPadOwner {
                 work.step()?;
             }
             super::string_pad::check_result(target).map_err(|_| unavailable())?;
+            super::string_pad::check_character_profile(
+                self.operation,
+                &selected.argument_types,
+                target,
+                self.trino,
+            )
+            .map_err(|_| unavailable())?;
             Ok(())
         })();
         if matches!(&result, Err(FunctionBindingError::Control(_))) {

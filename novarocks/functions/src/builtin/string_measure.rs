@@ -26,7 +26,7 @@ use arrow_array::{
     builder::{Int32Builder, StringBuilder},
 };
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
 use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StringMeasureOp {
@@ -35,6 +35,25 @@ pub(super) enum StringMeasureOp {
     Characters,
     Chr,
     Codepoint,
+}
+
+/// The selected declaration carries CHAR width independently of its Utf8 storage.
+pub(super) fn fixed_char_width(ty: &crate::FunctionValueType) -> Option<usize> {
+    match ty.value_type().kind() {
+        ValueKind::BoundedCharacter(character) if character.kind() == CharacterKind::Char => {
+            Some(character.length() as usize)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn fixed_char_padding(
+    width: usize,
+    stored_codepoints: usize,
+) -> Result<usize, KernelFailure> {
+    width
+        .checked_sub(stored_codepoints)
+        .ok_or_else(|| internal("CHAR value exceeds its selected width"))
 }
 #[derive(Debug)]
 enum MeasureFailure {
@@ -226,6 +245,11 @@ fn evaluate_trino_measurement<'a>(
         let array = argument.array();
         let selection = input.selection();
         let mut errors = Vec::new();
+        let [FunctionArgumentType::Value(source)] =
+            input.contract().selected().argument_types.as_ref()
+        else {
+            return Err(invalid("Trino string measurement lost its checked source"));
+        };
         let output: ArrayRef = match op {
             StringMeasureOp::Bytes => {
                 let mut values = Vec::new();
@@ -238,20 +262,38 @@ fn evaluate_trino_measurement<'a>(
                             .as_any()
                             .downcast_ref::<StringArray>()
                             .ok_or_else(|| internal("length selected source is not Utf8"))?;
-                        let mut observed = Some(EvaluationCheckpoints::new(control));
-                        compute_rows(
-                            StringMeasureOp::Characters,
-                            strings,
-                            |ordinal, batch| argument.value_row(ordinal, batch),
-                            selection,
-                            Some(true),
-                            &mut observed,
-                            |value| {
-                                values.push(value);
-                                Ok(())
-                            },
-                        )?;
-                        observed.take().unwrap().finish()?;
+                        if let Some(width) = fixed_char_width(source) {
+                            for (ordinal, batch) in selection.iter().enumerate() {
+                                let row = argument.value_row(ordinal, batch);
+                                if row >= strings.len() {
+                                    return Err(internal(
+                                        "length selected CHAR address is out of bounds",
+                                    ));
+                                }
+                                if !source.nullable() && strings.is_null(row) {
+                                    return Err(internal(
+                                        "length non-null CHAR source contains selected SQL NULL",
+                                    ));
+                                }
+                                values.push(strings.is_valid(row).then_some(width as i64));
+                                work.step()?;
+                            }
+                        } else {
+                            let mut observed = Some(EvaluationCheckpoints::new(control));
+                            compute_rows(
+                                StringMeasureOp::Characters,
+                                strings,
+                                |ordinal, batch| argument.value_row(ordinal, batch),
+                                selection,
+                                Some(source.nullable()),
+                                &mut observed,
+                                |value| {
+                                    values.push(value);
+                                    Ok(())
+                                },
+                            )?;
+                            observed.take().unwrap().finish()?;
+                        }
                     }
                     DataType::Binary => {
                         let binaries = array
@@ -494,6 +536,38 @@ mod tests {
     use std::{sync::Mutex, time::Duration};
 
     const FUNCTIONS: [&str; 3] = ["ascii", "length", "char_length"];
+
+    #[test]
+    fn string_measure_fixed_width_is_selected_by_character_kind() {
+        use novarocks_type_contract::{
+            CharacterType, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let make_character = |kind, length| {
+            let storage = ValueTypeStorageLifetime::pure();
+            let kind = ValueKind::BoundedCharacter(CharacterType::new(kind, length).unwrap());
+            FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(kind, true, storage.clone()).unwrap(),
+                ValueLayout::try_new(&DataType::Utf8, storage).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            fixed_char_width(&make_character(CharacterKind::Char, 0)),
+            Some(0)
+        );
+        assert_eq!(
+            fixed_char_width(&make_character(CharacterKind::Char, 9)),
+            Some(9)
+        );
+        assert_eq!(
+            fixed_char_width(&make_character(CharacterKind::Varchar, 9)),
+            None
+        );
+        assert_eq!(
+            fixed_char_width(&FunctionValueType::new(DataType::Utf8, false)),
+            None
+        );
+    }
     // Independent expected byte codes, UTF-8 byte lengths and scalar counts.
     // Combining marks and joiners count as scalars, not grapheme clusters.
     const EXPECTED: [(&str, [i32; 3]); 9] = [

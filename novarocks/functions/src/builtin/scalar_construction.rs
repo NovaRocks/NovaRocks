@@ -19,7 +19,8 @@ use crate::FunctionValueType;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::owned_resources::{layout, vec};
 use novarocks_type_contract::{
-    ValueConstructionFailure, ValueConstructionRequest, ValueLogicalType, ValueTypeStorageLifetime,
+    CharacterType, ValueConstructionFailure, ValueConstructionRequest, ValueKind, ValueLayout,
+    ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
 };
 use std::{alloc::Layout, sync::Arc};
 pub(super) type Failure<E> = ValueConstructionFailure<E>;
@@ -194,6 +195,22 @@ impl<'a, E> ScalarConstruction<'a, E> {
             storage,
             self.observer(),
         )
+    }
+    pub(super) fn character(
+        &mut self,
+        character: CharacterType,
+        nullable: bool,
+    ) -> Result<FunctionValueType, Failure<E>> {
+        let storage = self.storage();
+        let value = ValueTypeRef::try_new_with_construction(
+            ValueKind::BoundedCharacter(character),
+            nullable,
+            storage.clone(),
+            self.observer(),
+        )?;
+        let layout =
+            ValueLayout::try_new_with_construction(&DataType::Utf8, storage, self.observer())?;
+        Ok(FunctionValueType::try_from_value(value, layout)?)
     }
     pub(super) fn nullable(
         &mut self,

@@ -79,6 +79,23 @@ impl PureCompileControl for CompileControl {
 fn source(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Utf8, nullable)
 }
+
+#[test]
+fn string_concat_char_padding_uses_code_points_only_before_nonempty_right() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    assert_eq!(
+        char_concat_padding("é中".as_bytes(), b"x", 4, &mut work).unwrap(),
+        2
+    );
+    assert_eq!(
+        char_concat_padding("é中".as_bytes(), b"", 4, &mut work).unwrap(),
+        0
+    );
+    assert_eq!(char_concat_padding(b"", b"x", 4, &mut work).unwrap(), 4);
+    assert!(char_concat_padding(b"two", b"x", 2, &mut work).is_err());
+}
+
 fn instance(sources: &[FunctionValueType]) -> ScalarEvaluationInstance {
     ScalarEvaluationInstance::instantiate(
         prepared_for_test_with_policy("concat", sources, DecimalOverflowPolicy::OutputNull)

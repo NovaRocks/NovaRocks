@@ -39,7 +39,7 @@ use crate::{
     PureImplementationId, PureKernelAbi, PureScalarImplementation, ScalarCallContract,
     ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
 
 pub(in crate::builtin) fn effects(
     operation: TrinoByteOp,
@@ -402,7 +402,8 @@ impl TrinoByteOwner {
             })?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
-            let accepted = match contract.selected().argument_types.as_ref() {
+            let arguments = contract.selected().argument_types.as_ref();
+            let accepted = match arguments {
                 [FunctionArgumentType::Value(source)] => {
                     source.logical_type() == ValueLogicalType::Physical
                         && self.operation.accepts(&[source.data_type()])
@@ -427,10 +428,23 @@ impl TrinoByteOwner {
                     "Trino byte contract differs from its installed profile",
                 ));
             }
+            let char_width = match (self.operation, arguments) {
+                (TrinoByteOp::ToUtf8, [FunctionArgumentType::Value(source)]) => {
+                    match source.value_type().kind() {
+                        ValueKind::BoundedCharacter(character)
+                            if character.kind() == CharacterKind::Char =>
+                        {
+                            Some(character.length() as usize)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
             Ok(Arc::new(PreparedTrinoBytes {
                 contract,
                 operation: self.operation,
-                char_width: None,
+                char_width,
             }) as Arc<dyn PreparedScalarKernel>)
         })();
         if result.as_ref().is_err_and(KernelFailure::is_interruption) {

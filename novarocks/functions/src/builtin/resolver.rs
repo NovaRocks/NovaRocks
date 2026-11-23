@@ -958,13 +958,182 @@ fn signature_spec_at(sig: &Signature, idx: usize) -> &super::signature::TypeSpec
 
 #[cfg(test)]
 mod tests {
+    use super::super::signature::CharacterWidth;
     use super::*;
+    use novarocks_type_contract::{
+        CharacterKind, CharacterType, ValueKind, ValueLayout, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
     use std::sync::Arc;
 
     use arrow_schema::{Field, TimeUnit};
 
     fn list_of(item: DataType) -> DataType {
         DataType::List(Arc::new(Field::new("item", item, true)))
+    }
+
+    fn character(kind: CharacterKind, width: u32, nullable: bool) -> FunctionValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        let value = ValueTypeRef::try_new(
+            ValueKind::BoundedCharacter(CharacterType::new(kind, width).unwrap()),
+            nullable,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = ValueLayout::try_new(&DataType::Utf8, storage).unwrap();
+        FunctionValueType::try_from_value(value, layout).unwrap()
+    }
+
+    #[test]
+    fn character_width_recipe_replays_the_exact_bounded_or_unbounded_result() {
+        let kind = CharacterKind::Varchar;
+        let signature = Signature::new(
+            vec![TypeSpec::Character(kind, CharacterWidth::Argument("x"))],
+            TypeSpec::Character(kind, CharacterWidth::UrlEncode("x")),
+        )
+        .with_argument_coercion();
+        let candidates = [
+            (
+                character(kind, 3, false),
+                character(kind, 36, true),
+                character(kind, 35, true),
+            ),
+            (
+                character(kind, CharacterType::MAX_VARCHAR_LENGTH, false),
+                FunctionValueType::new(DataType::Utf8, true),
+                character(kind, CharacterType::MAX_VARCHAR_LENGTH, true),
+            ),
+            (
+                FunctionValueType::new(DataType::Utf8, false),
+                FunctionValueType::new(DataType::Utf8, true),
+                character(kind, 36, true),
+            ),
+        ];
+        for (input, expected, wrong_width) in candidates.into_iter().chain([(
+            FunctionValueType::new(DataType::Null, true),
+            character(kind, 0, true),
+            FunctionValueType::new(DataType::Utf8, true),
+        )]) {
+            value_resolution_scope(crate::binding_test_control(), |work| {
+                let unknown = input.data_type() == &DataType::Null;
+                let argument = if unknown {
+                    character(kind, 0, true)
+                } else {
+                    input.clone()
+                };
+                let inputs = [input];
+                let decision = value_signature_decision_in_pass(
+                    &signature,
+                    ScalarTypes::from_values(&inputs),
+                    if unknown {
+                        MatchPass::Coercion
+                    } else {
+                        MatchPass::Generic
+                    },
+                    work,
+                )?
+                .expect("VARCHAR width is admitted");
+                assert_eq!(decision.argument_types, [argument]);
+                let recipe = decision.result_recipe(true);
+                assert_eq!(decision.diagnostic_return_type(), expected);
+                assert!(
+                    recipe
+                        .matches_value_observed(expected.typed_binding().borrowed(), work)
+                        .map_err(binding_to_resolution)?
+                );
+                assert!(
+                    !recipe
+                        .matches_value_observed(wrong_width.typed_binding().borrowed(), work)
+                        .map_err(binding_to_resolution)?
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn character_width_variables_follow_the_selected_kind_and_target() {
+        let varchar = |width| TypeSpec::Character(CharacterKind::Varchar, width);
+        let fixed = |width| TypeSpec::Character(CharacterKind::Char, width);
+        let x = CharacterWidth::Argument("x");
+        let y = CharacterWidth::Argument("y");
+        let substring = Signature::new(vec![fixed(x)], varchar(x)).with_argument_coercion();
+        let encode = Signature::new(vec![varchar(x)], varchar(x)).with_argument_coercion();
+        let codepoint = Signature::new(vec![varchar(CharacterWidth::Fixed(1))], TypeSpec::Int32)
+            .with_argument_coercion();
+        let concat = Signature::new(
+            vec![fixed(x), fixed(y)],
+            fixed(CharacterWidth::Sum("x", "y")),
+        )
+        .with_argument_coercion();
+        let replace = Signature::new(
+            vec![varchar(x), varchar(y)],
+            varchar(CharacterWidth::Replace {
+                source: "x",
+                replacement: "y",
+            }),
+        )
+        .with_argument_coercion();
+        let make_char = |width| character(CharacterKind::Char, width, false);
+        let make_varchar = |width| character(CharacterKind::Varchar, width, false);
+        value_resolution_scope(crate::binding_test_control(), |work| {
+            for (signature, inputs, pass, expected) in [
+                (
+                    &substring,
+                    vec![make_char(3)],
+                    MatchPass::Generic,
+                    Some((CharacterKind::Varchar, 3)),
+                ),
+                (&substring, vec![make_varchar(3)], MatchPass::Coercion, None),
+                (&encode, vec![make_char(3)], MatchPass::Generic, None),
+                (
+                    &encode,
+                    vec![make_char(3)],
+                    MatchPass::Coercion,
+                    Some((CharacterKind::Varchar, 3)),
+                ),
+                (
+                    &concat,
+                    vec![make_char(2), make_char(3)],
+                    MatchPass::Generic,
+                    Some((CharacterKind::Char, 5)),
+                ),
+                (
+                    &replace,
+                    vec![make_varchar(3), make_varchar(2)],
+                    MatchPass::Generic,
+                    Some((CharacterKind::Varchar, 11)),
+                ),
+            ] {
+                let decision = value_signature_decision_in_pass(
+                    signature,
+                    ScalarTypes::from_values(&inputs),
+                    pass,
+                    work,
+                )?;
+                assert_eq!(
+                    decision.map(|decision| decision.diagnostic_return_type()),
+                    expected.map(|(kind, width)| character(kind, width, true))
+                );
+            }
+            for (input, expected) in [
+                (make_varchar(0), true),
+                (make_varchar(2), false),
+                (FunctionValueType::new(DataType::Utf8, false), false),
+            ] {
+                let inputs = [input];
+                let decision = value_signature_decision_in_pass(
+                    &codepoint,
+                    ScalarTypes::from_values(&inputs),
+                    MatchPass::Coercion,
+                    work,
+                )?;
+                assert_eq!(decision.is_some(), expected);
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

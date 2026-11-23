@@ -132,6 +132,26 @@ fn pool(array: ArrayRef) -> ConstantPool {
 }
 
 const NAMES: [&str; 2] = ["substr", "substring"];
+
+#[test]
+fn string_substring_char_projection_borrows_utf8_and_counts_only_selected_spaces() {
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    for (position, length, stored_bytes, spaces) in [
+        (1, None, "é中", 2),
+        (2, Some(2), "中", 1),
+        (-3, None, "中", 2),
+        (-1, None, "", 1),
+        (5, None, "", 0),
+        (0, Some(3), "", 0),
+        (i64::MIN, None, "", 0),
+    ] {
+        let span = fixed_substring_span("é中", 4, position, length, &mut work).unwrap();
+        assert_eq!(span.bytes, stored_bytes.as_bytes());
+        assert_eq!(span.spaces, spaces);
+    }
+    work.finish().unwrap();
+}
 fn sources(arity: usize) -> Vec<FunctionValueType> {
     (0..arity)
         .map(|i| {

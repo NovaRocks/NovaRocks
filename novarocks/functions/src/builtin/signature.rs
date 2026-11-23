@@ -27,7 +27,21 @@ use std::sync::Arc;
 
 use crate::FunctionValueType;
 use arrow_schema::{DataType, Field};
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{CharacterKind, ValueKind, ValueLogicalType};
+
+/// Literal parameters of a Trino character declaration. Widths are SQL
+/// type facts, independent of the Utf8 carrier and the current value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CharacterWidth {
+    Fixed(u32),
+    Argument(&'static str),
+    Sum(&'static str, &'static str),
+    UrlEncode(&'static str),
+    Replace {
+        source: &'static str,
+        replacement: &'static str,
+    },
+}
 
 /// Structural type used in registered function signatures.
 ///
@@ -53,6 +67,7 @@ pub enum TypeSpec {
     Float32,
     Float64,
     Utf8,
+    Character(CharacterKind, CharacterWidth),
     /// Explicit JSON semantics; Utf8 is its canonical storage, not its identity.
     Json,
     Binary,
@@ -208,6 +223,7 @@ impl TypeSpec {
             | Self::Decimal128Of(_)
             | Self::Decimal256Of(_)
             | Self::AnyDecimal128
+            | Self::Character(_, CharacterWidth::Argument(_))
             | Self::MapWithUninhabitedKey { .. } => true,
             Self::List(item) => item.is_generic(),
             Self::Map(key, value) => key.is_generic() || value.is_generic(),
@@ -225,6 +241,26 @@ impl TypeSpec {
             Self::Float32 => output.push_str("f32"),
             Self::Float64 => output.push_str("f64"),
             Self::Utf8 => output.push_str("utf8"),
+            Self::Character(kind, width) => {
+                use std::fmt::Write;
+                output.push_str(match kind {
+                    CharacterKind::Char => "char",
+                    CharacterKind::Varchar => "varchar",
+                });
+                match width {
+                    CharacterWidth::Fixed(width) => write!(output, "({width})"),
+                    CharacterWidth::Argument(name) => write!(output, "({name})"),
+                    CharacterWidth::Sum(left, right) => write!(output, "({left}+{right})"),
+                    CharacterWidth::UrlEncode(name) => write!(output, "({name}*12)"),
+                    CharacterWidth::Replace {
+                        source,
+                        replacement,
+                    } => {
+                        write!(output, "({source}+{replacement}*({source}+1))")
+                    }
+                }
+                .expect("writing to a String cannot fail");
+            }
             Self::Json => output.push_str("json"),
             Self::Binary => output.push_str("binary"),
             Self::Bitmap => output.push_str("bitmap"),
@@ -341,6 +377,9 @@ fn bind_nothing_with_construction<E>(
         TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => {
             bindings.bind_null_with_construction(name, creation)?
         }
+        TypeSpec::Character(_, CharacterWidth::Argument(name)) => {
+            bindings.bind_character_width(name, Some(0), BindMode::TrinoCoercion, creation)?;
+        }
         TypeSpec::List(inner) => bind_nothing_with_construction(inner, bindings, creation)?,
         TypeSpec::Map(key, value) => {
             bind_nothing_with_construction(key, bindings, creation)?;
@@ -354,7 +393,9 @@ fn bind_nothing_with_construction<E>(
 /// Whether this spec names a concrete type rather than standing for one.
 fn names_a_type(spec: &TypeSpec) -> bool {
     match spec {
-        TypeSpec::Any(_) | TypeSpec::MapWithUninhabitedKey { .. } => false,
+        TypeSpec::Any(_) | TypeSpec::MapWithUninhabitedKey { .. } | TypeSpec::Character(..) => {
+            false
+        }
         // A wildcard stands for no type in particular, so a NULL literal at
         // this position decides nothing either.
         TypeSpec::AnyType => false,
@@ -382,6 +423,9 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Float32 => DataType::Float32,
         TypeSpec::Float64 => DataType::Float64,
         TypeSpec::Utf8 | TypeSpec::Json => DataType::Utf8,
+        TypeSpec::Character(..) => {
+            return Err("character declarations require complete SQL value types".into());
+        }
         TypeSpec::Binary | TypeSpec::Bitmap => DataType::Binary,
         TypeSpec::Date => DataType::Date32,
         TypeSpec::Datetime => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
@@ -458,9 +502,53 @@ pub(crate) enum BindMode {
 #[derive(Default, Debug)]
 pub(crate) struct Bindings {
     entries: Vec<(&'static str, FunctionValueType)>,
+    character_widths: Vec<(&'static str, Option<u32>)>,
 }
 
 impl Bindings {
+    fn bind_character_width<E>(
+        &mut self,
+        name: &'static str,
+        width: Option<u32>,
+        mode: BindMode,
+        creation: &mut ScalarConstruction<'_, E>,
+    ) -> Result<bool, ConstructionFailure<E>> {
+        if let Some((_, bound)) = self.character_widths.iter_mut().find(|(n, _)| *n == name) {
+            if matches!(mode, BindMode::TrinoCoercion) {
+                *bound = bound.zip(width).map(|(left, right)| left.max(right));
+                return Ok(true);
+            }
+            return Ok(*bound == width);
+        }
+        creation.push(&self.character_widths)?;
+        self.character_widths.push((name, width));
+        Ok(true)
+    }
+
+    pub(super) fn character_width(&self, width: CharacterWidth) -> Result<Option<u64>, String> {
+        let lookup = |name: &str| {
+            self.character_widths
+                .iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, width)| width.map(u64::from))
+                .ok_or_else(|| format!("character width variable {name} is unbound"))
+        };
+        Ok(match width {
+            CharacterWidth::Fixed(width) => Some(u64::from(width)),
+            CharacterWidth::Argument(name) => lookup(name)?,
+            CharacterWidth::Sum(left, right) => lookup(left)?
+                .zip(lookup(right)?)
+                .map(|(left, right)| left + right),
+            CharacterWidth::UrlEncode(name) => lookup(name)?.map(|width| width * 12),
+            CharacterWidth::Replace {
+                source,
+                replacement,
+            } => lookup(source)?
+                .zip(lookup(replacement)?)
+                .map(|(x, z)| x + z * (x + 1)),
+        })
+    }
+
     pub(crate) fn lookup_value_borrowed(&self, name: &str) -> Option<&FunctionValueType> {
         self.entries
             .iter()
@@ -1075,6 +1163,33 @@ pub(super) fn unify_value_with_construction<E>(
         return Ok(false);
     }
     Ok(match spec {
+        TypeSpec::Character(kind, width) => {
+            let actual_width = match ty.value_type().kind() {
+                ValueKind::BoundedCharacter(actual)
+                    if *kind == actual.kind()
+                        || *kind == CharacterKind::Varchar
+                            && matches!(mode, BindMode::TrinoCoercion) =>
+                {
+                    Some(actual.length())
+                }
+                ValueKind::String if *kind == CharacterKind::Varchar => None,
+                ValueKind::Scalar(DataType::Null) if matches!(mode, BindMode::TrinoCoercion) => {
+                    Some(0)
+                }
+                _ => return Ok(false),
+            };
+            match width {
+                CharacterWidth::Argument(name) => {
+                    bindings.bind_character_width(name, actual_width, mode, creation)?
+                }
+                CharacterWidth::Fixed(_) => true,
+                _ => {
+                    return Err(ConstructionFailure::Rule(
+                        "derived character widths are only valid for results".into(),
+                    ));
+                }
+            }
+        }
         TypeSpec::Any(name) => bindings.bind_value_with_construction(name, ty, mode, creation)?,
         TypeSpec::AnyType => true,
         TypeSpec::MapWithUninhabitedKey { map, value } => {
