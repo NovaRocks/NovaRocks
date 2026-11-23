@@ -74,16 +74,16 @@ SELECT GREATEST(BIGINT '9007199254740993', BIGINT '9007199254740992') AS exact_i
        GREATEST(TRUE, FALSE) AS boolean_greatest, LEAST(TRUE, FALSE) AS boolean_least;
 
 -- query 16
-SELECT GREATEST(nan(), infinity()) AS positive_limit,
-       LEAST(nan(), -infinity()) AS negative_limit,
+SELECT GREATEST(DOUBLE 'NaN', DOUBLE 'Infinity') AS positive_limit,
+       LEAST(DOUBLE 'NaN', DOUBLE '-Infinity') AS negative_limit,
        GREATEST(DOUBLE '-0.0', DOUBLE '0.0') AS first_negative_zero,
        LEAST(DOUBLE '0.0', DOUBLE '-0.0') AS first_positive_zero,
        TYPEOF(GREATEST(NULL, NULL)) AS unknown_type,
        GREATEST(CAST(NULL AS DOUBLE), 1e0) AS strict_null;
 
 -- query 17
-SELECT GREATEST(ARRAY[nan()], ARRAY[1e0]) AS array_greatest,
-       LEAST(ARRAY[nan()], ARRAY[1e0]) AS array_least,
+SELECT GREATEST(ARRAY[DOUBLE 'NaN'], ARRAY[1e0]) AS array_greatest,
+       LEAST(ARRAY[DOUBLE 'NaN'], ARRAY[1e0]) AS array_least,
        GREATEST(ARRAY[CAST(NULL AS DOUBLE)], ARRAY[1e0]) AS array_nested_null;
 
 -- query 18
