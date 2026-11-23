@@ -46,7 +46,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over() as arr_basic,
   array_agg(distinct v2) over() as arr_distinct,
-  array_agg(v3 order by v2) over() as arr_order_by
+  array_agg(v3 ORDER BY v2) over() as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -62,7 +62,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1) as arr_basic,
   array_agg(distinct v2) over(partition by v1) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -78,7 +78,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_basic,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -94,7 +94,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(order by v2) as arr_basic,
   array_agg(distinct v2) over(order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -132,7 +132,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over() as arr_order_by
+  array_agg(v3 ORDER BY v2) over() as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -159,7 +159,7 @@ USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_basic,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -173,7 +173,7 @@ USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -188,7 +188,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_basic,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -204,7 +204,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(order by v2) as arr_basic,
   array_agg(distinct v2) over(order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(order by v2) as arr_order_by
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -266,7 +266,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v1 order by v2) over(partition by v1 order by v2) as arr_order_by_int
+  array_agg(v1 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by_int
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -278,7 +278,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v5,
-  array_agg(v5 order by v2) over(partition by v1 order by v2) as arr_order_by_decimal
+  array_agg(v5 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by_decimal
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -438,9 +438,9 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_basic,
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_basic,
   array_agg(v1) over(partition by v1 order by v2 range between current row and unbounded following) as arr_complex,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_with_null
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_with_null
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -456,7 +456,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_large,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_large2,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_large3
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_large3
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -531,7 +531,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_basic,
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_basic,
   lead(v1, 1) over(partition by v1 order by v2) as lead_val,
   sum(v1) over(partition by v1 order by v2) as sum_window
   from t0
@@ -607,7 +607,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v1 order by v2, v3) over(partition by v1 order by v2) as arr_basic
+  array_agg(v1 ORDER BY v2, v3) over(partition by v1 order by v2) as arr_basic
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -670,7 +670,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over() as arr_order_by
+  array_agg(v3 ORDER BY v2) over() as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -718,7 +718,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -754,7 +754,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -853,7 +853,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v3) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v3) over(partition by v1) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -865,7 +865,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(v3 order by v2, v3) over(partition by v1) as arr_order_by
+  array_agg(v3 ORDER BY v2, v3) over(partition by v1) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -905,7 +905,7 @@ SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
   array_agg(v3) over(partition by v1 order by v2) as arr_basic,
   array_agg(distinct v2) over(partition by v1 order by v2) as arr_distinct,
-  array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
+  array_agg(v3 ORDER BY v2) over(partition by v1 order by v2) as arr_order_by
   from t1
 ) as t
 CROSS JOIN UNNEST(concat(

@@ -23,13 +23,30 @@
 CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
   (id BIGINT, payload VARCHAR);
--- Each repeat fits the scalar function's 1 MiB limit. The aggregate produces
--- one string of 17 * 1048576 - (1 + ... + 17) bytes for a single input row.
-SET SESSION group_concat_max_len = 17825792;
+-- Each pad fits its 1 MiB limit. CONCAT produces one payload of
+-- 17 * 1048576 - (1 + ... + 17) bytes for the single input row.
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
-SELECT CAST(1 AS BIGINT),
-       string_agg(rpad('', 1048576 - generate_series, 'x'), '')
-FROM TABLE(sequence(1, 17)) AS generate_series(generate_series);
+SELECT BIGINT '1',
+       concat(
+           rpad('', 1048576 - n, 'x'),
+           rpad('', 1048575 - n, 'x'),
+           rpad('', 1048574 - n, 'x'),
+           rpad('', 1048573 - n, 'x'),
+           rpad('', 1048572 - n, 'x'),
+           rpad('', 1048571 - n, 'x'),
+           rpad('', 1048570 - n, 'x'),
+           rpad('', 1048569 - n, 'x'),
+           rpad('', 1048568 - n, 'x'),
+           rpad('', 1048567 - n, 'x'),
+           rpad('', 1048566 - n, 'x'),
+           rpad('', 1048565 - n, 'x'),
+           rpad('', 1048564 - n, 'x'),
+           rpad('', 1048563 - n, 'x'),
+           rpad('', 1048562 - n, 'x'),
+           rpad('', 1048561 - n, 'x'),
+           rpad('', 1048560 - n, 'x')
+       )
+FROM TABLE(sequence(1, 1)) AS offsets(n);
 
 -- query 2
 -- Spark reads the stored value independently of NovaRocks' scan batch budget.

@@ -40,11 +40,7 @@ INSERT INTO ${case_db}.t_agg_group_concat_distinct_all_null_group VALUES
 
 SELECT
     g,
-    string_agg(DISTINCT s
-,
- '|'
-ORDER BY s DESC
-) AS gc
+    LISTAGG(DISTINCT CAST(s AS VARCHAR), '|') WITHIN GROUP (ORDER BY CAST(s AS VARCHAR) DESC) AS gc
 FROM ${case_db}.t_agg_group_concat_distinct_all_null_group
 GROUP BY g
 ORDER BY g;

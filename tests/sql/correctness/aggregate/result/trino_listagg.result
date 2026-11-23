@@ -1,0 +1,44 @@
+-- query 3
+-- types	varchar
+value
+NULL
+
+-- query 4
+-- types	varchar
+value
+a|a
+
+-- query 5
+-- types	varchar
+value
+b|a
+
+-- query 6
+-- types	varchar
+value
+b|c
+
+-- query 7
+-- types	varchar
+value
+b
+
+-- query 8
+-- types	varchar
+value
+a
+
+-- query 11
+-- types	bigint	varchar
+characters	suffix
+524293	|!(2)
+
+-- query 13
+-- types	varchar
+value
+|!(1)
+
+-- query 14
+-- types	varchar
+value
+NULL

@@ -68,7 +68,7 @@ FROM (
 -- query 4
 SELECT
     ROUND(var_samp(x), 3) AS var_samp_v,
-    ROUND(variance_samp(x), 3) AS variance_samp_v,
+    ROUND(var_samp(x), 3) AS variance_samp_v,
     ROUND(stddev_samp(x), 3) AS stddev_samp_v
 FROM (
     SELECT 1 AS x
@@ -81,7 +81,7 @@ FROM (
 -- query 5
 SELECT
     ROUND(var_samp(x), 3) IS NULL AS var_samp_is_null,
-    ROUND(variance_samp(x), 3) IS NULL AS variance_samp_is_null,
+    ROUND(var_samp(x), 3) IS NULL AS variance_samp_is_null,
     ROUND(stddev_samp(x), 3) IS NULL AS stddev_samp_is_null
 FROM (
     SELECT 1 AS x

@@ -70,11 +70,11 @@ select sum(distinct c0), c2 from skew_agg group by c2;
 
 -- query 11
 USE ${case_db};
-select sum(distinct c0), APPROX_COUNT_DISTINCT(c3) from skew_agg group by c2;
+select sum(distinct c0), approx_distinct(c3) from skew_agg group by c2;
 
 -- query 12
 USE ${case_db};
-select sum(distinct c0), APPROX_COUNT_DISTINCT(c3) from skew_agg group by c1, c2;
+select sum(distinct c0), approx_distinct(c3) from skew_agg group by c1, c2;
 
 -- query 13
 USE ${case_db};
@@ -106,11 +106,11 @@ select sum(distinct c0), min(c2) from skew_agg group by 'abc';
 
 -- query 20
 USE ${case_db};
-select sum(distinct c0), APPROX_COUNT_DISTINCT(c3) from skew_agg group by 'abc';
+select sum(distinct c0), approx_distinct(c3) from skew_agg group by 'abc';
 
 -- query 21
 USE ${case_db};
-select sum(distinct c0), APPROX_COUNT_DISTINCT(c3) from skew_agg group by 'abc';
+select sum(distinct c0), approx_distinct(c3) from skew_agg group by 'abc';
 
 -- query 22
 USE ${case_db};
@@ -142,11 +142,11 @@ select sum(distinct c0), min(c2) from skew_agg;
 
 -- query 29
 USE ${case_db};
-select sum(distinct c0), APPROX_COUNT_DISTINCT(c3) from skew_agg;
+select sum(distinct c0), approx_distinct(c3) from skew_agg;
 
 -- query 30
 USE ${case_db};
-select sum(distinct c0), APPROX_COUNT_DISTINCT(c3) from skew_agg;
+select sum(distinct c0), approx_distinct(c3) from skew_agg;
 
 -- query 31
 USE ${case_db};
@@ -163,41 +163,41 @@ select avg(distinct c1), count(c2) from skew_agg;
 -- query 34
 USE ${case_db};
 select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))) as week,             c0, (cardinality(array_agg(c1))) as __col_0,
-(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
+(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c3 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c3 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 35
 USE ${case_db};
 select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))) as week,             c0, (cardinality(array_agg(c1))) as __col_0,
-(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
+(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c3 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c3 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 36
 USE ${case_db};
 select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))) as week,             c0, (cardinality(array_agg(c1))) as __col_0,
-(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
+(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c3 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c3 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 37
 USE ${case_db};
 select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))) as week,             c0, (cardinality(array_agg(c1))) as __col_0,
-(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
+(sum(distinct length(CAST(c2 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c3 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c3 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', TRY_CAST(c4 AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 38
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (ndv(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c1 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c1 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (approx_distinct(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
       skew_agg         group by             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 39
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (ndv(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c1 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c1 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (approx_distinct(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
       skew_agg         group by             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 40
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (ndv(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c1 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c1 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (approx_distinct(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
       skew_agg         group by             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 41
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (ndv(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(CAST(c0 AS VARCHAR)))) as __col_1, (length(LISTAGG(CAST(cast(c1 as VARCHAR) AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(cast(c1 as VARCHAR) AS VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(CAST(variance(c1) AS VARCHAR), 6)) as __col_4, (count(DISTINCT length(CAST(c2 AS VARCHAR)))) as __col_5, (approx_distinct(TRY_CAST(c4 AS BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(CAST(c1 AS VARCHAR)))) as __col_8         from
       skew_agg         group by             date_trunc('week', TRY_CAST(CAST(c2 AS VARCHAR) AS TIMESTAMP(6))),             c0     ) as t;
 
 -- query 42
@@ -238,211 +238,211 @@ select count(distinct t1.c1, if(t2.c3 is null, 1, 0)), sum(t1.c2 + if(t2.c3 is n
 
 -- query 51
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 52
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 53
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 54
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 55
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 56
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 57
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 58
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 59
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(1 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(1 AS VARCHAR)), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 60
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 61
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 62
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 63
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 64
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 65
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 66
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 67
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 68
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 69
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 70
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 71
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 72
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(1 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(1 AS VARCHAR)), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 73
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 74
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 75
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 76
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 77
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 78
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 79
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 80
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 81
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 82
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 83
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 84
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 85
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(1 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(1 AS VARCHAR)), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 86
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 87
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 88
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 89
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 90
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 91
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 92
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 93
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 94
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 95
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 96
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 97
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 98
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(1 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(1 AS VARCHAR)), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 99
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 100
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 101
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 102
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 103
 USE ${case_db};
@@ -450,195 +450,195 @@ select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group b
 
 -- query 104
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 105
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 106
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 107
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 108
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 109
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 110
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 111
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 112
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 113
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 114
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 115
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 116
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 117
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 118
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 119
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 120
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 121
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 122
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 123
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 124
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 125
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 126
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 127
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 128
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 129
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 130
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 131
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 132
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 133
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 134
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 135
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 136
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 137
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 138
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 139
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 140
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 141
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 142
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 143
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 144
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 145
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 146
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 147
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 148
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 149
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 150
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 151
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 152
 USE ${case_db};
@@ -646,195 +646,195 @@ select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group b
 
 -- query 153
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 154
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 155
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 156
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 157
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 158
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 159
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 160
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 161
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 162
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 163
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 164
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 165
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 166
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 167
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 168
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 169
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 170
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 171
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 172
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 173
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 174
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 175
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 176
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 177
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 178
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 179
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 180
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 181
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 182
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 183
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 184
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 185
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 186
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 187
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 188
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 189
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 190
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 191
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 192
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(c3 ORDER BY c3, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 193
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 194
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 195
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 196
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(c2 AS VARCHAR), CAST(upper(c4) AS VARCHAR))), array_agg(distinct c3 ORDER BY c3, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 197
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 198
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 199
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 200
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select LISTAGG(DISTINCT CAST(c2 AS VARCHAR), ',') WITHIN GROUP (ORDER BY CAST(c2 AS VARCHAR)), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 201
 USE ${case_db};
@@ -878,4 +878,4 @@ select sum(c0), count(distinct c2, c3) from skew_agg where c0 = 480816 and c1 = 
 
 -- query 211
 USE ${case_db};
-select count(distinct 1, 2), count(distinct 1), count(distinct null), group_concat(distinct 'a', 'b'), count(distinct c2) from skew_agg;
+select count(distinct 1, 2), count(distinct 1), count(distinct null), LISTAGG(DISTINCT concat(CAST('a' AS VARCHAR), CAST('b' AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST('a' AS VARCHAR), CAST('b' AS VARCHAR))), count(distinct c2) from skew_agg;

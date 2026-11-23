@@ -22,3 +22,18 @@ g	n	kept	discarded
 -- types	integer	bigint	bigint
 g	dc	total
 7	6	642
+
+-- query 8
+-- types	integer	bigint	bigint	bigint
+g	kept	kept_boolean	empty_count
+7	6	2	0
+
+-- query 9
+-- types	integer	bigint	bigint	bigint
+g	kept	kept_boolean	empty_count
+7	6	2	0
+
+-- query 10
+-- types	integer	bigint	bigint	bigint
+g	kept	kept_boolean	empty_count
+7	6	2	0

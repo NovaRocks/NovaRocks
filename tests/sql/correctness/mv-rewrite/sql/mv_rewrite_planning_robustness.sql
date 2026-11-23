@@ -95,7 +95,7 @@ SELECT
 
 -- query 11
 -- APPROX_COUNT_DISTINCT over the base with the candidate present
-SELECT APPROX_COUNT_DISTINCT(customer_id) AS acd FROM sales_data;
+SELECT approx_distinct(customer_id) AS acd FROM sales_data;
 
 -- query 12
 -- self-join: each branch may rewrite independently; result must be exact

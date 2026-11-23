@@ -69,6 +69,39 @@ SELECT g, count(DISTINCT x) FILTER (WHERE keep_row) AS dc, sum(x) AS total
 FROM ${case_db}.filter_two_phase GROUP BY g;
 
 -- query 7
+-- @result_contains=HASH AGGREGATE (LOCAL,
+-- @result_contains=HASH AGGREGATE (GLOBAL,
+-- @result_contains=HASH EXCHANGE
+-- @result_contains=SCAN ${case_db}.filter_two_phase
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
+       approx_distinct(x) FILTER (WHERE false) AS empty_count
+FROM ${case_db}.filter_two_phase GROUP BY g;
+
+-- query 8
+-- @be_log_be_count_at_least=NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK,2
+SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
+       approx_distinct(x) FILTER (WHERE false) AS empty_count
+FROM ${case_db}.filter_two_phase GROUP BY g;
+
+-- query 9
+-- @explain_contains=HASH AGGREGATE (SINGLE,
+-- @explain_not_contains=HASH AGGREGATE (LOCAL,
+WITH SESSION disable_optimizer_rules = 'SplitAggregateRule'
+SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
+       approx_distinct(x) FILTER (WHERE false) AS empty_count
+FROM ${case_db}.filter_two_phase GROUP BY g;
+
+-- query 10
+SELECT g, count(DISTINCT x) FILTER (WHERE keep_row) AS kept,
+       count(DISTINCT (x % 2 = 0)) FILTER (WHERE keep_row) AS kept_boolean,
+       count(DISTINCT x) FILTER (WHERE false) AS empty_count
+FROM ${case_db}.filter_two_phase GROUP BY g;
+
+-- query 11
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.filter_two_phase;

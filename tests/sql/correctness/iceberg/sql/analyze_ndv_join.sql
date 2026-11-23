@@ -31,7 +31,7 @@ CREATE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0} (k INT, paylo
 -- @skip_result_check=true
 CREATE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0} (k INT, flag INT);
 
--- l: k in [0,99] over 1000 rows -> NDV(k)=100 ; r: k in [0,79] over 800 -> NDV(k)=80
+-- l: k in [0,99] over 1000 rows -> approx_distinct(k)=100 ; r: k in [0,79] over 800 -> approx_distinct(k)=80
 -- @skip_result_check=true
 INSERT INTO iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0}
   SELECT generate_series % 100, generate_series FROM TABLE(sequence(1, 1000)) AS generate_series(generate_series);

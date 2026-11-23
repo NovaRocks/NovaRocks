@@ -40,16 +40,16 @@ INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
 
 SELECT
     COUNT(DISTINCT id_int) AS exact_id,
-    ndv(id_int) AS ndv_id,
-    approx_count_distinct(id_int) AS approx_id
+    approx_distinct(id_int) AS ndv_id,
+    approx_distinct(id_int) AS approx_id
 FROM ${case_db}.t_agg_sketch_bitmap_source;
 
 -- query 2
 SELECT
     grp,
     COUNT(DISTINCT vb) AS exact_vb,
-    ndv(vb) AS ndv_vb,
-    approx_count_distinct(vb) AS approx_vb
+    approx_distinct(vb) AS ndv_vb,
+    approx_distinct(vb) AS approx_vb
 FROM ${case_db}.t_agg_sketch_bitmap_source
 GROUP BY grp
 ORDER BY grp;

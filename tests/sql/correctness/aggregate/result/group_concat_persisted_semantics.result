@@ -17,3 +17,8 @@ value
 -- types	integer
 value
 7
+
+-- query 16
+-- types	varchar
+value
+a|b

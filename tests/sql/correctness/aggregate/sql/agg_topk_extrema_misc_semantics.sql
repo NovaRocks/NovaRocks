@@ -46,33 +46,19 @@ INSERT INTO ${case_db}.t_agg_topk_extrema_misc VALUES
     ROW(8, 2, NULL, NULL, NULL, NULL, NULL),
     ROW(9, 3, 40, 'iota', TRUE, 10000000, 3),
     ROW(10, 3, 40, 'kappa', FALSE, 40000000, 5);
-WITH w1 AS (
-    SELECT approx_top_k(v, 3) AS x FROM ${case_db}.t_agg_topk_extrema_misc
-), entries AS (
-    SELECT ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
-    FROM w1 CROSS JOIN (VALUES (1), (2), (3)) AS positions(ordinal)
-    WHERE ordinal <= cardinality(x)
-)
-SELECT array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS top_items
-FROM entries;
+SELECT approx_most_frequent(3, CAST(v AS BIGINT), 10) AS top_items
+FROM ${case_db}.t_agg_topk_extrema_misc;
 
 -- query 2
-WITH w1 AS (
-    SELECT grp, approx_top_k(v, 2) AS x FROM ${case_db}.t_agg_topk_extrema_misc GROUP BY grp
-), entries AS (
-    SELECT grp, ordinal, x[ordinal] AS entry, __array_struct_subfield(x, 'item')[ordinal] AS item
-    FROM w1 CROSS JOIN (VALUES (1), (2)) AS positions(ordinal)
-    WHERE ordinal <= cardinality(x)
-)
-SELECT grp, array_agg(entry ORDER BY item NULLS FIRST, ordinal) AS top_items
-FROM entries
+SELECT grp, approx_most_frequent(3, CAST(v AS BIGINT), 10) AS top_items
+FROM ${case_db}.t_agg_topk_extrema_misc
 GROUP BY grp
 ORDER BY grp;
 
 -- query 3
 SELECT
-    min_n(v, 3) AS min_three_values,
-    min_n(txt, 2) AS min_two_texts
+    min(v, 3) AS min_three_values,
+    min(txt, 2) AS min_two_texts
 FROM ${case_db}.t_agg_topk_extrema_misc
 WHERE v IS NOT NULL
   AND txt IS NOT NULL;

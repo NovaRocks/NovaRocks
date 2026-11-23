@@ -22,7 +22,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT 7 AS value;
-SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
+SET SESSION sql_mode = 'ERROR_IF_OVERFLOW';
 
 -- query 2
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
@@ -31,14 +31,14 @@ SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
 CREATE VIEW default_catalog.${case_db}.v_forbidden_mode AS SELECT 1;
 
 -- query 3
--- @expect_error=GROUP_CONCAT_LEGACY is not captured
+-- @expect_error=ERROR_IF_OVERFLOW is not captured
 SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 4
 WITH SESSION sql_mode = '32' SELECT /*+ SET_VAR(sql_mode='32') */ value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 5
--- @expect_error=GROUP_CONCAT_LEGACY is not captured
+-- @expect_error=ERROR_IF_OVERFLOW is not captured
 EXPLAIN SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 6
@@ -54,7 +54,7 @@ CREATE MATERIALIZED VIEW ${case_db}.mv_forbidden_mode AS SELECT k FROM definitel
 REFRESH MATERIALIZED VIEW ${case_db}.definitely_missing_mv;
 
 -- query 8
-SELECT group_concat('a','b') AS value;
+SELECT LISTAGG('ab', ',') WITHIN GROUP (ORDER BY 1) AS value;
 
 -- query 9
 -- @skip_result_check=true
@@ -64,16 +64,16 @@ SET SESSION sql_mode = '32';
 SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 11
--- @expect_error=GROUP_CONCAT_LEGACY is not captured
+-- @expect_error=ERROR_IF_OVERFLOW is not captured
 -- The root policy reaches VIEW replay; SELECT-local overrides are retired.
-WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM (SELECT * FROM default_catalog.${case_db}.v_persisted_mode) d;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ * FROM (SELECT * FROM default_catalog.${case_db}.v_persisted_mode) d;
 
 -- query 12
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
 -- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
-SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
-CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value;
+SET SESSION sql_mode = 'ERROR_IF_OVERFLOW';
+CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 9 AS value;
 
 -- query 13
 SET SESSION sql_mode = '32';
@@ -82,3 +82,18 @@ SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 -- query 14
 -- @skip_result_check=true
 DROP VIEW default_catalog.${case_db}.v_persisted_mode;
+
+
+-- query 15
+-- @skip_result_check=true
+CREATE VIEW default_catalog.${case_db}.v_listagg AS
+SELECT LISTAGG(v, '|') WITHIN GROUP (ORDER BY v) AS value
+FROM (VALUES ('b'), ('a')) t(v);
+
+-- query 16
+SELECT value FROM default_catalog.${case_db}.v_listagg;
+
+-- query 17
+-- @cleanup=true
+-- @skip_result_check=true
+DROP VIEW default_catalog.${case_db}.v_listagg;

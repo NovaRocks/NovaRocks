@@ -43,16 +43,20 @@ SET SESSION pipeline_dop = 1;
 
 -- query 5
 USE ${case_db};
-select ndv(c1) from t1;
+SELECT count(DISTINCT c1) AS exact_count,
+       abs(approx_distinct(c1) - count(DISTINCT c1)) <= 46 AS within_error
+FROM t1;
 
 -- query 6
 USE ${case_db};
-select c2, ndv(c1) from t1 group by c2 order by c2 limit 10;
+select c2, approx_distinct(c1) from t1 group by c2 order by c2 limit 10;
 
 -- query 7
 USE ${case_db};
-select approx_count_distinct(c1) from t1;
+SELECT count(DISTINCT c1) AS exact_count,
+       abs(approx_distinct(c1) - count(DISTINCT c1)) <= 46 AS within_error
+FROM t1;
 
 -- query 8
 USE ${case_db};
-select c2,approx_count_distinct(c1) from t1 group by c2 order by c2 limit 10;
+select c2,approx_distinct(c1) from t1 group by c2 order by c2 limit 10;

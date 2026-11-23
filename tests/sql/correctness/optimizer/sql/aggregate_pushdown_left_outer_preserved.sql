@@ -19,7 +19,7 @@
 -- Test Objective:
 -- LEFT OUTER JOIN with aggregate on the preserved (left) side: the
 -- rule must still push to the left side.
--- Data design: 20 000 rows on the left, NDV(k) = 100. ANALYZE TABLE
+-- Data design: 20 000 rows on the left, approx_distinct(k) = 100. ANALYZE TABLE
 -- ensures the cost gate fires.
 -- Golden derivation: contract_lowering::append_exchange retains the sender's
 -- frozen display name, so the old v3 import is b.k in the join and its sink.

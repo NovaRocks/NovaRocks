@@ -106,56 +106,56 @@ select count(distinct 1, v2) from test_cc;
 
 -- query 18
 USE ${case_db};
-select count(distinct 1, 2, 3, 4), sum(distinct 1), avg(distinct 1), group_concat(distinct 1, 2 order by 1), array_agg(distinct 1.3 order by null) from test_cc;
+select count(distinct 1, 2, 3, 4), sum(distinct 1), avg(distinct 1), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3) from test_cc;
 
 -- query 19
 USE ${case_db};
-select count(distinct 1, 2, 3, 4), sum(distinct 1), avg(distinct 1), group_concat(distinct 1, 2 order by 1), array_agg(distinct 1.3 order by null) from test_cc group by v2 order by v2;
+select count(distinct 1, 2, 3, 4), sum(distinct 1), avg(distinct 1), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3) from test_cc group by v2 order by v2;
 
 -- query 20
 USE ${case_db};
-select v2, count(distinct v1), sum(distinct v1), avg(distinct v1), group_concat(distinct 1, 2), array_agg(distinct 1.3 order by null)  from test_cc group by v2 order by v2;
+select v2, count(distinct v1), sum(distinct v1), avg(distinct v1), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3)  from test_cc group by v2 order by v2;
 
 -- query 21
 USE ${case_db};
-select v2, count(distinct v4), sum(distinct v4), avg(distinct v4), group_concat(distinct 1, 2), array_agg(distinct 1.3 order by null) from test_cc group by v2 order by v2;
+select v2, count(distinct v4), sum(distinct v4), avg(distinct v4), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3) from test_cc group by v2 order by v2;
 
 -- query 22
 USE ${case_db};
-select v2, count(distinct v5), sum(distinct v5), avg(distinct v5), group_concat(distinct 1, 2), array_agg(distinct 1.3 order by null) from test_cc group by v2 order by v2;
+select v2, count(distinct v5), sum(distinct v5), avg(distinct v5), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3) from test_cc group by v2 order by v2;
 
 -- query 23
 USE ${case_db};
-select v2, count(distinct v6), array_agg(distinct v6 order by 1), group_concat(distinct 1, 2), array_agg(distinct 1.3 order by null) from test_cc group by v2 order by v2;
+select v2, count(distinct v6), array_agg(distinct v6 ORDER BY v6), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3) from test_cc group by v2 order by v2;
 
 -- query 24
 USE ${case_db};
-select v2, count(distinct v7), array_agg(distinct v7 order by 1), group_concat(distinct 1, 2 order by 1), array_agg(distinct 1.3 order by null) from test_cc group by v2 order by v2;
+select v2, count(distinct v7), array_agg(distinct v7 ORDER BY v7), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3) from test_cc group by v2 order by v2;
 
 -- query 25
 USE ${case_db};
-select v2, count(distinct v1, v3, v6), sum(distinct v1), avg(distinct v1), array_agg(v5 order by 1), group_concat(distinct 1, 2), array_agg(distinct 1.3 order by null)  from test_cc group by v2 order by v2;
+select v2, count(distinct v1, v3, v6), sum(distinct v1), avg(distinct v1), array_agg(v5 ORDER BY v5), LISTAGG(DISTINCT concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(1 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.3)  from test_cc group by v2 order by v2;
 
 -- query 26
 USE ${case_db};
-select count(distinct v4, v5), sum(distinct v4), avg(distinct v4), group_concat(distinct v4, v5, 2 order by 1,2), array_agg(distinct 1.456 order by 1) from test_cc;
+select count(distinct v4, v5), sum(distinct v4), avg(distinct v4), LISTAGG(DISTINCT concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.456 ORDER BY 1.456) from test_cc;
 
 -- query 27
 USE ${case_db};
-select v2, count(distinct v4, v5), sum(distinct v5), avg(distinct v5), group_concat(distinct v4, v5, 2 order by 1,2), array_agg(distinct 1.456 order by 1) from test_cc group by v2 order by v2;
+select v2, count(distinct v4, v5), sum(distinct v5), avg(distinct v5), LISTAGG(DISTINCT concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.456 ORDER BY 1.456) from test_cc group by v2 order by v2;
 
 -- query 28
 USE ${case_db};
-select v2, count(distinct v3, v5), sum(distinct v4), avg(distinct v5), group_concat(distinct v4, v5, 2 order by 1,2), array_agg(distinct 1.456 order by 1) from test_cc group by v2, v3 order by v2, v3;
+select v2, count(distinct v3, v5), sum(distinct v4), avg(distinct v5), LISTAGG(DISTINCT concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct 1.456 ORDER BY 1.456) from test_cc group by v2, v3 order by v2, v3;
 
 -- query 29
 USE ${case_db};
-select count(distinct v4, v5), sum(distinct v4), avg(distinct v4), group_concat(distinct v4, v5, 2 order by 1,2), array_agg(distinct v4 order by 1) from test_cc;
+select count(distinct v4, v5), sum(distinct v4), avg(distinct v4), LISTAGG(DISTINCT concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct v4 ORDER BY v4) from test_cc;
 
 -- query 30
 USE ${case_db};
-select v2, count(distinct v4, v5), sum(distinct v5), avg(distinct v5), group_concat(distinct v4, v5, 2 order by 1,2), array_agg(distinct v5 order by 1) from test_cc group by v2 order by v2;
+select v2, count(distinct v4, v5), sum(distinct v5), avg(distinct v5), LISTAGG(DISTINCT concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct v5 ORDER BY v5) from test_cc group by v2 order by v2;
 
 -- query 31
 USE ${case_db};
-select v2, count(distinct v3, v5), sum(distinct v4), avg(distinct v5), group_concat(distinct v4, v5, 2 order by 1,2), array_agg(distinct v5 order by 1) from test_cc group by v2, v3 order by v2, v3;
+select v2, count(distinct v3, v5), sum(distinct v4), avg(distinct v5), LISTAGG(DISTINCT concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR)), ',') WITHIN GROUP (ORDER BY concat(CAST(v4 AS VARCHAR), CAST(v5 AS VARCHAR), CAST(2 AS VARCHAR))), array_agg(distinct v5 ORDER BY v5) from test_cc group by v2, v3 order by v2, v3;

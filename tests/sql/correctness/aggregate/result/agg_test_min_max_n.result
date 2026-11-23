@@ -20,7 +20,7 @@ _col0
 
 -- query 8
 -- types	varchar
-min_n(c_largeint, 3)
+min(c_decimal_wide, 3)
 [11111,11111,11111]
 
 -- query 9

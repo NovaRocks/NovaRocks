@@ -36,9 +36,5 @@ INSERT INTO ${case_db}.t_agg_group_concat_ordered VALUES
     ROW(4, NULL),
     ROW(5, 'c');
 
-SELECT string_agg(s
-,
- '|'
-ORDER BY s
-) AS gc
+SELECT LISTAGG(CAST(s AS VARCHAR), '|') WITHIN GROUP (ORDER BY s) AS gc
 FROM ${case_db}.t_agg_group_concat_ordered;
