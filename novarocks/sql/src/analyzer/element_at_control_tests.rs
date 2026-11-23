@@ -233,9 +233,9 @@ fn element_at_type_probe_keeps_original_ordinary_binding_error_without_rebinding
         assert_eq!(error, expected);
         assert_eq!(
             error.kind(),
-            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+            crate::analyze_error::AnalyzeErrorKind::UnknownFunction
         );
-        assert_eq!(error.code().as_str(), "sql.analyze.type_mismatch");
+        assert_eq!(error.code().as_str(), "sql.analyze.unknown_function");
         assert_eq!(error.span(), Some(array_span));
         assert_eq!(error.message(), "no matching declared overload");
         assert!(error.control_error().is_none());

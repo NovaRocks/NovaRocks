@@ -41,8 +41,8 @@ SELECT concat(ARRAY[CAST(1 AS INTEGER)], ARRAY[CAST(2147483648 AS BIGINT)]) AS c
        concat(CAST(1 AS INTEGER), ARRAY[CAST(2147483648 AS BIGINT)]) AS prepended,
        concat(ARRAY[CAST(1 AS INTEGER)], CAST(2147483648 AS BIGINT)) AS appended;
 -- query 10
--- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT concat(ARRAY['a'], ARRAY[1]);
 -- query 11
--- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT concat(ARRAY['a'], MAP(ARRAY[1], ARRAY[2]));

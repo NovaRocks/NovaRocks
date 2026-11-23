@@ -150,6 +150,23 @@ pub(super) fn prepare_common(
             Some(ArrayCastFailureMode::ReportError),
         ));
     }
+    if source.data_type() == &DataType::Utf8
+        && result.data_type() == &DataType::Utf8
+        && source.logical_type() == ValueLogicalType::Physical
+        && result.logical_type() == ValueLogicalType::Physical
+    {
+        // The checked common relation admits only compatible text. A
+        // widened VARCHAR declaration changes no bytes or row validity.
+        return Ok(recipe(
+            source,
+            result,
+            CastBody::Identity,
+            None,
+            policy,
+            false,
+            None,
+        ));
+    }
     if source.logical_type() == ValueLogicalType::Physical
         && result.logical_type() == ValueLogicalType::Physical
         && let Some(leaf) =

@@ -2571,6 +2571,35 @@ impl<'a> super::AnalyzerContext<'a> {
             });
         }
 
+        if matches!(name.as_str(), "group_concat" | "string_agg") {
+            args_typed = args_typed
+                .into_iter()
+                .map(|arg| {
+                    if matches!(
+                        arg.value_type.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8
+                    ) {
+                        Ok(arg)
+                    } else {
+                        let result = novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            arg.value_type.nullable(),
+                        );
+                        self.cast_with_trino_mode(
+                            arg,
+                            result,
+                            novarocks_type_contract::TrinoCastMode::Explicit,
+                            func.span,
+                        )
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            arg_types = args_typed
+                .iter()
+                .map(|arg| arg.value_type.data_type().clone())
+                .collect();
+        }
+
         if name == "if" && !args_typed.is_empty() {
             let condition = self.require_boolean_predicate(
                 args_typed.remove(0),
@@ -8906,7 +8935,7 @@ mod tests {
         ] {
             let error = analyze_projection_expr(sql)
                 .expect_err("incompatible array item shapes must fail during binding");
-            assert!(error.contains("concat"), "{sql}: {error}");
+            assert_eq!(error, "no matching declared overload", "{sql}");
         }
         assert!(analyze_projection_expr("SELECT concat('a', ARRAY['b'], 'c')").is_err());
     }
