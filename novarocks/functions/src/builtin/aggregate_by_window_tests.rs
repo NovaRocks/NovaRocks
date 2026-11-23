@@ -218,7 +218,7 @@ fn by_window_tracked_actual_null_winner_sparse_slice_empty_and_both_directions()
     }
 }
 #[test]
-fn by_window_tracked_actual_nan_whole_data_full_text_call_phase_no_footer_and_drop() {
+fn by_window_tracked_nan_is_disfavored_in_both_directions() {
     for name in ["min_by", "max_by"] {
         let prepared = prepared(
             name,
@@ -239,38 +239,18 @@ fn by_window_tracked_actual_nan_whole_data_full_text_call_phase_no_footer_and_dr
         let input = input(prepared.contract(), &args, &peers, &frames);
         let host = Arc::new(WindowHost::default());
         let control = Control::default();
-        let error = match begin(Arc::clone(&prepared), input, Arc::clone(&host), &control) {
-            Ok(_) => panic!("original NaN update must fail before output demand"),
-            Err(error) => error,
-        };
-        let WindowEvaluationFailure::InvocationData(data) = &error else {
-            panic!("lossless original whole-window Data");
-        };
-        assert_eq!(
-            data.message(),
-            "window function #0: update aggregate state: float comparison is not ordered"
-        );
-        {
-            use novarocks_failure_contract::FailureProjection;
-            let source = data.original_source().expect("original typed NaN cause");
-            assert_eq!(
-                source.failure_fact(),
-                crate::DataFailureReason::InvalidValue.failure_fact()
-            );
-            assert_eq!(data.failure_fact(), source.failure_fact());
-        }
-        assert_eq!(data.partition_rows(), Some(2));
-        assert_eq!(data.frame_ordinal(), Some(1));
-        assert_eq!(data.input_row(), Some(1));
-        assert_eq!(data.phase(), WindowInvocationPhase::FrameUpdate);
-        assert_eq!(data.call_ordinal(), 0);
-        let clone = error.clone();
-        drop(error);
-        assert!(
-            host.gate.lock().unwrap().opaque > 0,
-            "original diagnostic lives in a real pre-granted scope"
-        );
-        drop(clone);
+        let mut partition =
+            begin(Arc::clone(&prepared), input, Arc::clone(&host), &control).unwrap();
+        let output = partition
+            .evaluate_evaluated(Selection::all(2), 2, &control)
+            .unwrap();
+        let (_, array, errors) = output.into_parts();
+        assert!(errors.is_empty());
+        let values = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.values(), &[7, 7]);
+        partition.finish_evaluated(&control).unwrap();
+        drop(partition);
+        drop(array);
         host.zero();
     }
 }
@@ -758,7 +738,7 @@ fn invocation_input<'a>(
     crate::WindowInvocationInput::try_new(full, partitions, peers, frames, &control).unwrap()
 }
 #[test]
-fn by_window_whole_invocation_nan_preserves_actual_partition_frame_and_global_row_source() {
+fn by_window_whole_invocation_nan_keeps_the_best_key_in_its_partition() {
     let prepared = prepared(
         "max_by",
         FunctionValueType::new(DataType::Int32, true),
@@ -789,45 +769,28 @@ fn by_window_whole_invocation_nan_preserves_actual_partition_frame_and_global_ro
     let source = invocation_input(prepared.contract(), &args, &parts, &peers, &frames);
     let host = Arc::new(WindowHost::default());
     let control = Control::default();
-    let cause = match crate::WindowEvaluationInvocation::begin(
+    let mut invocation = crate::WindowEvaluationInvocation::begin(
         Arc::clone(&prepared),
         source,
         WindowInvocationContext::complete_invocation(0),
         Some(host.clone()),
         &control,
-    ) {
-        Err(WindowEvaluationFailure::InvocationData(data)) => data,
-        _ => panic!("actual original NaN whole invocation Data"),
-    };
+    )
+    .unwrap();
+    let carrier = invocation.complete_carrier(&control).unwrap();
     assert_eq!(
-        cause.message(),
-        "window function #0: update aggregate state: float comparison is not ordered"
+        carrier.source_context(),
+        WindowInvocationContext::complete_invocation(0)
     );
-    assert_eq!(
-        cause.scope(),
-        crate::WindowInvocationScope::CompleteInvocation
-    );
-    {
-        use novarocks_failure_contract::FailureProjection;
-        let source = cause.original_source().expect("original typed NaN cause");
-        assert_eq!(
-            source.failure_fact(),
-            crate::DataFailureReason::InvalidValue.failure_fact()
-        );
-        assert_eq!(cause.failure_fact(), source.failure_fact());
-    }
-    assert_eq!(cause.invocation_rows(), 4);
-    assert_eq!(cause.partition_ordinal(), Some(1));
-    assert_eq!(cause.partition_rows(), Some(2));
-    assert_eq!(cause.frame_ordinal(), Some(3));
-    assert_eq!(cause.partition_frame_ordinal(), Some(1));
-    assert_eq!(cause.input_row(), Some(3));
-    assert_eq!(cause.phase(), WindowInvocationPhase::FrameUpdate);
-    assert!(
-        host.gate.lock().unwrap().opaque > 0,
-        "original diagnostic admission survives its returned Data"
-    );
-    drop(cause);
+    let values = carrier
+        .values()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(values.values(), &[10, 11, 20, 20]);
+    invocation.finish(&control).unwrap();
+    drop(invocation);
+    drop(carrier);
     host.zero();
 }
 #[test]

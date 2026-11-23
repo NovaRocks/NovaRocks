@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod aggregate_values;
 mod assert_true;
 mod cast;
 mod collection_functions;

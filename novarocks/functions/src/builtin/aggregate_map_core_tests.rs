@@ -508,3 +508,53 @@ fn map_agg_core_uses_map_identity_in_update_and_partial_merge() {
     drop((first, second, allocator));
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
+
+#[test]
+fn empty_group_emits_a_null_map() {
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let state = MapAggState::new(allocator);
+    let result = build_array(
+        &target(),
+        std::iter::once(&state),
+        &mut ScalarWork::new(None),
+    )
+    .unwrap();
+    let map = result.as_any().downcast_ref::<MapArray>().unwrap();
+    assert!(map.is_null(0));
+    assert_eq!(map.value_offsets(), &[0, 0]);
+    drop(state);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}
+
+#[test]
+fn nested_float_key_uses_the_map_identity_and_keeps_the_observed_key() {
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut work = ScalarWork::new(None);
+    {
+        let mut state = MapAggState::new(allocator.clone());
+        for signed_zero in [-0.0, 0.0] {
+            let mut key = ScalarVec::new_in(allocator.clone());
+            key.push(Some(TrackedAggScalarValue::Float64(signed_zero)));
+            key.push(None);
+            append_entry(
+                &mut state,
+                TrackedAggScalarValue::List(key),
+                None,
+                &mut work,
+            )
+            .unwrap();
+        }
+        assert_eq!(state.entries.len(), 1);
+        let TrackedAggScalarValue::List(key) = &state.entries[0].0 else {
+            panic!("LIST key required")
+        };
+        assert!(matches!(
+            key.as_slice(),
+            [Some(TrackedAggScalarValue::Float64(value)), None] if value.is_sign_negative()
+        ));
+    }
+    drop(allocator);
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}

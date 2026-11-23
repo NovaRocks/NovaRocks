@@ -324,7 +324,7 @@ fn public_n_state_column_runs_selected_single_and_partial_final_with_last_alias_
                 };
                 let list = output.as_any().downcast_ref::<ListArray>().unwrap();
                 assert!(!list.is_null(0));
-                assert!(!list.is_null(1));
+                assert!(list.is_null(1));
                 assert_eq!(list.value_length(0), 2);
                 assert_eq!(list.value_length(1), 0);
                 let child = list
@@ -332,8 +332,13 @@ fn public_n_state_column_runs_selected_single_and_partial_final_with_last_alias_
                     .as_any()
                     .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
                     .unwrap();
-                assert_eq!(i128::from_be_bytes(child.value(0).try_into().unwrap()), -7);
-                assert_eq!(i128::from_be_bytes(child.value(1).try_into().unwrap()), 3);
+                let expected = if name == "min_n" { [-7, 3] } else { [3, -7] };
+                for (index, expected) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        i128::from_be_bytes(child.value(index).try_into().unwrap()),
+                        expected
+                    );
+                }
                 let DataType::List(field) = output.data_type() else {
                     panic!("List result")
                 };

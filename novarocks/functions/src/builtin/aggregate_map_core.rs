@@ -22,10 +22,10 @@ use crate::aggregate_scalar::{
     AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
     build_typed_scalar_array, tracked_scalar_from_typed_array, tracked_scalar_to_output,
 };
-use crate::aggregate_scalar_fingerprint::tracked_key_fingerprint;
+use crate::aggregate_scalar_fingerprint::tracked_key_fingerprint_with_float_identity;
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::{Array, ArrayRef, MapArray, StructArray};
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Fields};
 use hashbrown::{HashSet, hash_map::DefaultHashBuilder};
@@ -63,15 +63,10 @@ pub fn append_entry_observed<A: ScalarStateAllocator>(
     work: &mut ScalarWork<'_, '_>,
     inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
 ) -> Result<(), KernelFailure> {
-    let map_identity = match &key {
-        TrackedAggScalarValue::Float64(value) => Some(TrackedAggScalarValue::Float64(
-            f64::from_bits(super::map_lookup_core::map_float_identity(*value)),
-        )),
-        _ => None,
-    };
-    let key_fp = tracked_key_fingerprint(
-        map_identity.as_ref().unwrap_or(&key),
+    let key_fp = tracked_key_fingerprint_with_float_identity(
+        &key,
         &state.allocator,
+        super::map_lookup_core::map_float_identity,
         work,
     )?;
     work.flush()?;
@@ -248,11 +243,13 @@ where
     let mut value_values = Vec::<Option<AggScalarValue>>::new();
     let mut offsets = Vec::with_capacity(group_states.len() + 1);
     work.flush()?;
+    let mut validity = NullBufferBuilder::new(group_states.len());
     offsets.push(0_i32);
     let mut current: i32 = 0;
     for state in group_states {
         let state = state?;
         work.step()?;
+        validity.append(!state.entries.is_empty());
         let next = checked_map_output_offset(current, state.entries.len())?;
         for (key, value) in &state.entries {
             work.step()?;
@@ -296,7 +293,7 @@ where
         map_field,
         OffsetBuffer::new(offsets.into()),
         entries,
-        None,
+        validity.finish(),
         ordered,
     )
     .map_err(failure::constructor)?;

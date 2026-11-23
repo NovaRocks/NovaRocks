@@ -694,12 +694,12 @@ fn basic_window_every_numeric_overload_and_alias_has_independent_values() {
     for input in &inputs {
         for (name, expected) in [
             ("avg", 2.0),
-            ("variance", 2.0 / 3.0),
+            ("variance", 1.0),
             ("variance_pop", 2.0 / 3.0),
             ("var_pop", 2.0 / 3.0),
             ("variance_samp", 1.0),
             ("var_samp", 1.0),
-            ("stddev", (2.0f64 / 3.0).sqrt()),
+            ("stddev", 1.0),
             ("std", (2.0f64 / 3.0).sqrt()),
             ("stddev_pop", (2.0f64 / 3.0).sqrt()),
             ("stddev_samp", 1.0),

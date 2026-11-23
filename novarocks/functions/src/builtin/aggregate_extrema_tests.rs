@@ -611,8 +611,11 @@ fn aggregate_extrema_independent_fixed_width_and_signed_largeint_oracles() {
 }
 
 #[test]
-fn aggregate_extrema_float_total_order_zero_nan_payload_and_f32_native_roundtrip() {
-    for (name, expected) in [("min", 0xfff8000000000007u64), ("max", 0x7ff8000000000005)] {
+fn aggregate_extrema_float_nan_unordered_zero_ties_and_f32_native_roundtrip() {
+    for (name, expected) in [
+        ("min", f64::NEG_INFINITY.to_bits()),
+        ("max", f64::INFINITY.to_bits()),
+    ] {
         let source: ArrayRef = Arc::new(Float64Array::from(vec![
             None,
             Some(f64::from_bits(0x7ff8000000000005)),
@@ -645,7 +648,7 @@ fn aggregate_extrema_float_total_order_zero_nan_payload_and_f32_native_roundtrip
             expected
         );
     }
-    for (name, expected) in [("min", 0x80000000u32), ("max", 0u32)] {
+    for (name, expected) in [("min", (-0.0f32).to_bits()), ("max", (-0.0f32).to_bits())] {
         let source: ArrayRef = Arc::new(Float32Array::from(vec![-0.0, 0.0]));
         let kernel = Fixture::new(
             name,

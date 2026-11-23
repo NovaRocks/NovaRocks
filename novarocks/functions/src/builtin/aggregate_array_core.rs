@@ -1225,6 +1225,7 @@ pub fn build_array<
     match target_type {
         DataType::List(list_field) => {
             let mut flattened = Vec::<Option<ArrayAggValue>>::new();
+            let mut validity = NullBufferBuilder::new(states.len());
             let mut out_offsets = Vec::with_capacity(states.len() + 1);
             out_offsets.push(0_i32);
             let mut current: i32 = 0;
@@ -1247,6 +1248,7 @@ pub fn build_array<
                 };
                 current = checked_list_output_offset(current, values.len())?;
                 out_offsets.push(current);
+                validity.append(output_intermediate || !values.is_empty());
                 flattened.extend(values);
             }
             let values = build_scalar_array(list_field.data_type(), flattened, work)?;
@@ -1260,7 +1262,7 @@ pub fn build_array<
                 output_list_field,
                 OffsetBuffer::new(out_offsets.into()),
                 values,
-                None,
+                validity.finish(),
             )
             .map_err(failure::constructor)?;
             Ok(Arc::new(list_out) as ArrayRef)

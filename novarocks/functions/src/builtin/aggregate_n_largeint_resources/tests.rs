@@ -785,12 +785,12 @@ fn production_n_sort_admits_library_work_without_grants_for_discarded_comparison
             let ledger = host.ledger.lock().unwrap();
             assert_eq!(
                 ledger.attempts - before,
-                2,
-                "one real scope per reached sort; comparisons create no discarded diagnostic allocation"
+                1,
+                "one real scope for the directional sort; comparisons create no discarded diagnostic allocation"
             );
             assert!(
                 ledger.loans.is_empty(),
-                "both library sort scopes actually ended"
+                "the library sort scope actually ended"
             );
             assert_eq!(state.values.len(), 17);
         }

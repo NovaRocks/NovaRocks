@@ -74,7 +74,11 @@ impl<A: ScalarStateAllocator> ByState<A> {
         let should_update = match self.key.as_ref() {
             None => true,
             Some(current) => {
-                let ordering = scalar::compare_tracked_scalar_values(&key, current, work)?;
+                let extrema = match direction {
+                    ByDirection::Maximum => scalar::ExtremaDirection::Maximum,
+                    ByDirection::Minimum => scalar::ExtremaDirection::Minimum,
+                };
+                let ordering = extrema.compare_tracked(&key, current, work)?;
                 match direction {
                     ByDirection::Maximum => ordering == Ordering::Greater,
                     ByDirection::Minimum => ordering == Ordering::Less,
