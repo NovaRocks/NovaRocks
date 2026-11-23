@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0260
+  - id: ADR-0262
     scope: "The whole-set receiving path and its use by remaining write flavors."
-    link: "ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md"
+    link: "ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md"
   - id: ADR-0246
     scope: "Rule 5 coverage for registered ADD FILES entries without receiving receipts"
     link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"

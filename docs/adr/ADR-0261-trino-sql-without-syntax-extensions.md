@@ -1,5 +1,5 @@
 ---
-id: ADR-0259
+id: ADR-0261
 title: "Trino SQL has no NovaRocks syntax extensions"
 domain: [sql-language]
 status: active

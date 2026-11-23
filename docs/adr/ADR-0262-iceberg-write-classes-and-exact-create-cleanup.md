@@ -1,5 +1,5 @@
 ---
-id: ADR-0260
+id: ADR-0262
 title: "Iceberg write classes share compact receiving and exact create cleanup"
 domain: [provider-spi, frontend-dml, frontend-mv, table-maintenance]
 status: active

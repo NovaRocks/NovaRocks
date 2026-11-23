@@ -181,7 +181,7 @@ S3 兼容存储递归列举，本地文件系统和 HDFS 逐层列举。后端�
 Spark 风格旧 `CALL` 保留其各自的参数与结果形状，其中适用的旧入口继续接收 `older_than`。
 本页的 EXECUTE 参数和显式扫描授权只适用于对应的 ALTER TABLE 过程。其它入口按各自的原删除授权工作。
 无表锚 CTAS 根扫描已退役，CTAS 改由原写会话和建表 operation 按准确对象清单清理。见
-[ADR-0260](../../adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)。
+[ADR-0262](../../adr/ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md)。
 
 ### 与提交、必要 finalize 和精确清理的关系
 

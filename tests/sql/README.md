@@ -66,7 +66,7 @@ LNP-3A/LNP-3D 与 `mv-storage-contract` 保留原 SQL、`.result` 和独立文�
 ## SQL 方言与用例作者
 
 正向用例使用 Trino SQL。具名属性、过程参数和系统表由消费层核对。单一文法及能力准入见
-[ADR-0259](../../docs/adr/ADR-0259-trino-sql-without-syntax-extensions.md)。
+[ADR-0261](../../docs/adr/ADR-0261-trino-sql-without-syntax-extensions.md)。
 
 步骤内的 `;` 用于分隔 SQL。runner 分句后逐条提交。文法拒绝用例保留触发错误的原文，并声明
 `SYNTAX_ERROR,USER_ERROR`。文法已接收、能力尚未支持的构造声明 `NOT_SUPPORTED,USER_ERROR`。

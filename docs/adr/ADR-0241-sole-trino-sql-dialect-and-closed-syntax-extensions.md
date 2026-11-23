@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0259
+  - id: ADR-0261
     scope: "The two overwrite forms, their AST and printer modes, and the closed extension list that admitted them."
-    link: "ADR-0259-trino-sql-without-syntax-extensions.md"
+    link: "ADR-0261-trino-sql-without-syntax-extensions.md"
 date: 2026-11-20
 provenance:
   - "discussion: 2026-11-15 TRC-5e approved syntax cutover and EXPLAIN ANALYZE session behavior"

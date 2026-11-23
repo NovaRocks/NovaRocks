@@ -196,7 +196,7 @@ SQL client
 - `novarocks/parser/src/**`
   拥有 NovaRocks 唯一的 Trino SQL 词法、文法、带位置 AST 和 printer。
   生产语法采用 Trino 文法。AST、printer 与能力准入的分工见
-  [ADR-0259](docs/adr/ADR-0259-trino-sql-without-syntax-extensions.md)。
+  [ADR-0261](docs/adr/ADR-0261-trino-sql-without-syntax-extensions.md)。
 
 - `novarocks/sql/src/{analysis,analyzer,semantic}/**`
   Name and expression resolution, type rules and semantic validation.
@@ -237,7 +237,7 @@ SQL client
   解码并交给 Provider。完整写集仍须通过根 EOF、参与方成功与取消/期限检查才交给原发布方。
   Provider 持有计量的紧凑条目并在原 operation 中滚动写出 manifest。CTAS 的有界回执与进程内附件
   一起交给原建表发布，附件保留紧凑条目和准确计数。见
-  [ADR-0260](docs/adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)。
+  [ADR-0262](docs/adr/ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md)。
 
 - `novarocks/frontend-application/src/statistics/{application,attempt_executor,service,read,publication}.rs`
   ANALYZE 在原语句的 Internal Root、冻结会话设置与 query permit 下完成 capture、计算与发布，
@@ -601,7 +601,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
   Iceberg 意图、依赖与字段契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)，产物责任、复用与有界发布事实见 [ADR-0234](docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)。
   所有 Iceberg 写会话共用紧凑接收、滚动写出与条目覆盖。收敛后的接收与提交规则见
-  [ADR-0260](docs/adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)。
+  [ADR-0262](docs/adr/ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md)。
   - `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 保管所有 flavor 的接收状态。
     `novarocks/connector/iceberg/src/commit/write_stack/receiving/validation.rs` 核对片段的准确身份与归属。
     逐记录核对索引和删除效果，完整接收前没有新增 manifest。
@@ -843,7 +843,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   使用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
   `mysql_port` 与旧 MySQL 载体配置明确拒绝，不转换为 Trino 配置。
   此入口使用 Trino HTTP 协议和 Trino SQL 文法。见
-  [ADR-0259](docs/adr/ADR-0259-trino-sql-without-syntax-extensions.md)。
+  [ADR-0261](docs/adr/ADR-0261-trino-sql-without-syntax-extensions.md)。
   客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
@@ -1375,7 +1375,7 @@ the guide differ.
 
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
-  紧凑接收先读 [ADR-0260](docs/adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)，
+  紧凑接收先读 [ADR-0262](docs/adr/ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md)，
   对照 `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 的交接与
   `novarocks/connector/iceberg/src/commit/new_manifests.rs` 的 stage 持有、滚动写出和沿用。
   普通行级提交按 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md) 核对准入观察、

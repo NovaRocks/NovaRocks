@@ -51,7 +51,7 @@ Connector 请求从现有查询选项获得有限期限，缺省为 300 秒。�
 CTAS 按 [REST 建表位置规则](dml.md) 直接在最终位置暂存。初始化、数据及已启用的写时统计使用
 目标不存在的条件派发一次。零行 CTAS 发布一个空 append 快照。若同名表在分析后抢先创建，发布
 返回 `TABLE_ALREADY_EXISTS`，包括使用 `IF NOT EXISTS` 的语句。见
-[ADR-0260](../../adr/ADR-0260-iceberg-write-classes-and-exact-create-cleanup.md)。
+[ADR-0262](../../adr/ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md)。
 
 ANALYZE 只在准备时检查测得统计的快照存在，发布统计时不做目标 ref CAS。检查后快照被并发过期，
 统计仍可成功，留下的条目不参与不存在快照的读取。
