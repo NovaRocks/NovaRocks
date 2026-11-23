@@ -32,10 +32,11 @@ use novarocks_query_application::{
         ManagementCancellationReceipt, USER_CANCELED,
     },
     session_error::{QueryServiceError, QueryServiceErrorKind},
-    session_outcome::cancellation_failure_input,
+    session_outcome::{cancellation_failure_input, governed_cancellation_failure_input},
     session_value::StatementSessionError,
 };
 use novarocks_user_error::UserError;
+use novarocks_workload_control::CancellationReason as WorkCancellationReason;
 use serde::Serialize;
 use std::fmt;
 
@@ -390,7 +391,15 @@ fn project_source(
         ),
         TrinoErrorSource::OriginalCancellation(reason) => {
             let code = cancellation_code(&reason);
-            let input = cancellation_failure_input(reason);
+            let input = match reason {
+                // The drain timeout belongs to the frontend lifecycle.
+                QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => {
+                    governed_cancellation_failure_input(
+                        WorkCancellationReason::FrontendDrainDeadlineExceeded,
+                    )
+                }
+                reason => cancellation_failure_input(reason),
+            };
             return project_message(
                 query_id,
                 code,
@@ -617,9 +626,9 @@ fn cancellation_code(reason: &QueryCancellationReason) -> Code {
         QueryCancellationReason::ClientDisconnected => Code::Abandoned,
         QueryCancellationReason::ExplicitKill { .. }
         | QueryCancellationReason::ExplicitKillConnection { .. } => Code::AdministrativelyKilled,
-        QueryCancellationReason::DeadlineExceeded { .. } => Code::ExceededTimeLimit,
-        QueryCancellationReason::FrontendDrainDeadlineExceeded { .. }
-        | QueryCancellationReason::ServerShutdown => Code::ServerShuttingDown,
+        QueryCancellationReason::DeadlineExceeded { .. }
+        | QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => Code::ExceededTimeLimit,
+        QueryCancellationReason::ServerShutdown => Code::ServerShuttingDown,
     }
 }
 

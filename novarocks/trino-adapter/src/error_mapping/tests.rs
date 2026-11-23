@@ -476,7 +476,7 @@ fn cancellations_preserve_the_original_requester_category() {
         (DeadlineExceeded { timeout_ms: 10 }, "EXCEEDED_TIME_LIMIT"),
         (
             FrontendDrainDeadlineExceeded { timeout_ms: 10 },
-            "SERVER_SHUTTING_DOWN",
+            "EXCEEDED_TIME_LIMIT",
         ),
         (ServerShutdown, "SERVER_SHUTTING_DOWN"),
     ] {
@@ -507,14 +507,16 @@ fn original_deadline_projects_its_typed_detail_and_effect() {
         deadline.message,
         "[query.execution.deadline_exceeded] query timed out after 1000 ms (external effect disposition=KnownCommitted do_not_retry=true; do not retry statement)"
     );
-    let drain = query_error(TrinoErrorSource::OriginalCancellation(
-        FrontendDrainDeadlineExceeded { timeout_ms: 500 },
-    ));
-    assert_wire(&drain, "SERVER_SHUTTING_DOWN");
-    assert_eq!(
-        drain.message,
-        "[query.execution.deadline_exceeded] FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after 500 ms"
-    );
+    for timeout_ms in [0, 500] {
+        let drain = query_error(TrinoErrorSource::OriginalCancellation(
+            FrontendDrainDeadlineExceeded { timeout_ms },
+        ));
+        assert_wire(&drain, "EXCEEDED_TIME_LIMIT");
+        assert_eq!(
+            drain.message,
+            "[query.execution.deadline_exceeded] FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded"
+        );
+    }
 }
 
 fn execution(reason: QueryFailureReason) -> QueryExecutionError {
