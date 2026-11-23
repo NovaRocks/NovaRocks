@@ -1707,7 +1707,7 @@ mod tests {
                 constant: None,
             }];
             let resolved = crate::functions::builtin_sql_function_catalog()
-                .resolve_aggregate_binding(
+                .resolve_aggregate_binding_trusted(
                     name,
                     1,
                     &arguments,

@@ -1080,22 +1080,12 @@ mod tests {
     }
 
     #[test]
-    fn sqlx1_function_builtin_snapshot_has_canonical_volatility_set() {
+    fn builtin_snapshot_distinguishes_volatile_calls_and_frozen_statement_clocks() {
+        use novarocks_functions::builtin::temporal_context::{FUNCTION_NAME, TemporalSyntax};
+        use novarocks_type_contract::SemanticParameterKey as Key;
+
         let catalog = builtin_sql_function_catalog();
-        for name in [
-            "rand",
-            "random",
-            "uuid",
-            "sleep",
-            "now",
-            "current_timestamp",
-            "current_date",
-            "curdate",
-            "current_time",
-            "curtime",
-            "localtime",
-            "localtimestamp",
-        ] {
+        for name in ["rand", "random", "uuid", "sleep"] {
             assert_eq!(
                 catalog.volatility(name),
                 FunctionVolatility::Volatile,
@@ -1103,6 +1093,41 @@ mod tests {
             );
         }
         assert_eq!(catalog.volatility("lower"), FunctionVolatility::Immutable);
+
+        let engine = builtin_engine_function_catalog();
+        for (name, clock) in [
+            ("now", TemporalSyntax::Now),
+            ("current_date", TemporalSyntax::QuotedCurrentDate),
+            (FUNCTION_NAME, TemporalSyntax::CurrentDate),
+            (FUNCTION_NAME, TemporalSyntax::CurrentTime),
+            (FUNCTION_NAME, TemporalSyntax::CurrentTimestamp),
+            (FUNCTION_NAME, TemporalSyntax::LocalTime),
+            (FUNCTION_NAME, TemporalSyntax::LocalTimestamp),
+        ] {
+            let declaration = engine
+                .definition(name, FunctionKind::Scalar)
+                .unwrap()
+                .binding_declaration()
+                .unwrap();
+            let overload = FunctionOverloadId::try_new(clock.identity()).unwrap();
+            let effects = declaration.effect_declaration(&overload).unwrap();
+            assert_eq!(
+                effects.value_stability,
+                FunctionVolatility::Immutable,
+                "{overload}"
+            );
+            assert_eq!(
+                effects.environment_dependencies.as_ref(),
+                &[Key::StatementStartUtc, Key::TimeZone],
+                "{overload}"
+            );
+        }
+        for retired in ["curdate", "curtime"] {
+            assert!(
+                engine.definition(retired, FunctionKind::Scalar).is_none(),
+                "{retired}"
+            );
+        }
     }
 
     #[test]
