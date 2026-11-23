@@ -3921,9 +3921,26 @@ fn coerce_selected_function_argument(
             control,
         );
     }
-    // Equal Arrow carriers can have different SQL declarations. Preserve the
-    // original expression and let the cast publish the selected declaration.
-    if expr.value_type.data_type() == value_type.data_type() {
+    // ARRAY child declarations, such as VARCHAR widths, can change without
+    // changing the Arrow carrier. A bound call must keep its declared result.
+    if matches!(&expr.kind, ExprKind::FunctionCall { .. })
+        && matches!(
+            expr.value_type.value_type().kind(),
+            novarocks_type_contract::ValueKind::List(_)
+        )
+        && expr.value_type.data_type() == value_type.data_type()
+        && !expr
+            .value_type
+            .same_semantics_ignoring_nullability_observed::<novarocks_functions::FunctionBindingError>(
+                &value_type,
+                || {
+                    control
+                        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                        .map_err(Into::into)
+                },
+            )
+            .map_err(AnalyzeError::function_binding)?
+    {
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
                 cast_mode: None,
