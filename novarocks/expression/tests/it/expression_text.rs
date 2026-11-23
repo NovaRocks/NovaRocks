@@ -384,7 +384,10 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     let conditional = type_text("CASE WHEN TRUE THEN x ELSE x END").unwrap();
     let values = Arc::new(StringArray::from(vec!["original value"]));
     let result = evaluate(&conditional, &batch(&columns, vec![values.clone()]));
-    assert_eq!(result.batch.result_type, columns[0].value_type);
+    assert_eq!(
+        result.batch.result_type,
+        columns[0].value_type.with_nullable(true).unwrap()
+    );
     assert_eq!(result.batch.values.to_data(), values.to_data());
 
     let trim = type_text("TRIM(x)").unwrap();
