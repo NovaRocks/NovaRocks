@@ -39,6 +39,7 @@ use super::scalar_construction::{borrow_creator, with_binding_creation};
 use super::signature::declared_list;
 #[cfg(test)]
 use super::signature::declared_map;
+use super::string_binary::TrinoByteOp;
 use super::{registry, resolver};
 use crate::{FunctionBindingCreationFailure, FunctionVolatility};
 use novarocks_type_contract::{CompileCheckpoints, PureCompileControl, ValueLogicalType};
@@ -988,7 +989,10 @@ fn scalar_result_nullable_from_types(
         // A function that is total -- one that answers for every value of
         // its declared argument types -- passes its arguments' nullability
         // through. Everything else is nullable.
-        name if TOTAL_SCALAR_FUNCTIONS.contains(&name) => {
+        name if TOTAL_SCALAR_FUNCTIONS.contains(&name)
+            || TrinoByteOp::from_name(name).is_some()
+            || matches!(name, "url_encode" | "url_decode") =>
+        {
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
         _ => true,
@@ -2860,7 +2864,9 @@ fn scalar_overload_effects(
                 super::control_owner::operation(name).expect("matched control operation"),
             ))
         }
-        "crc32" => Some(super::crc32_owner::effects()),
+        name if let Some(operation) = TrinoByteOp::from_name(name) => {
+            Some(super::string_binary::trino_effects(operation, signature))
+        }
         "parse_json" => Some(super::parse_json_owner::effects()),
         "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
         crate::native_like::ESCAPE_FUNCTION_NAME => Some(super::like_escape_owner::effects()),
@@ -2882,8 +2888,8 @@ fn scalar_overload_effects(
         name if super::string_url_encode_owner::operation(name).is_some() => {
             Some(super::string_url_encode_owner::effects())
         }
-        name if super::string_url_decode_owner::operation(name).is_some() => {
-            Some(super::string_url_decode_owner::effects())
+        name if let Some(operation) = super::string_parse_url_owner::operation(name) => {
+            Some(super::string_parse_url_owner::effects(operation))
         }
         name if super::string_substring_owner::operation(name).is_some() => {
             Some(super::string_substring_owner::effects())
@@ -2959,8 +2965,6 @@ fn scalar_overload_effects(
         }
         name if super::date_owner::operation(name).is_some() => Some(super::date_owner::effects()),
         "regexp_count" => Some(super::regexp_count_owner::effects()),
-        "parse_url" => Some(super::string_parse_url_owner::effects()),
-        "to_base64" => Some(super::string_to_base64_owner::effects()),
         "regexp_position" => Some(super::regexp_position_owner::effects()),
         "reverse" if signature.starts_with("(utf8)") => {
             Some(super::string_reverse_owner::effects())
@@ -3233,7 +3237,9 @@ pub fn contribute_builtin_functions(
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }
-            "crc32" => super::crc32_owner::definition(declaration, resolver)?,
+            name if let Some(operation) = TrinoByteOp::from_name(name) => {
+                super::string_binary::trino_definition(operation, name, declaration, resolver)?
+            }
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
@@ -3259,9 +3265,6 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_url_encode_owner::operation(name).is_some() => {
                 super::string_url_encode_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_url_decode_owner::operation(name).is_some() => {
-                super::string_url_decode_owner::definition(name, declaration, resolver)?
             }
             name if super::string_substring_owner::operation(name).is_some() => {
                 super::string_substring_owner::definition(name, declaration, resolver)?
@@ -3336,9 +3339,6 @@ pub fn contribute_builtin_functions(
             "regexp_count" => super::regexp_count_owner::definition(&name, declaration, resolver)?,
             name if super::string_parse_url_owner::operation(name).is_some() => {
                 super::string_parse_url_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_to_base64_owner::operation(name).is_some() => {
-                super::string_to_base64_owner::definition(name, declaration, resolver)?
             }
             "regexp_position" => super::regexp_position_owner::definition(declaration, resolver)?,
             name if super::string_reverse_owner::operation(name).is_some() => {

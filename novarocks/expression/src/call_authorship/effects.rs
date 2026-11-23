@@ -445,8 +445,7 @@ fn author_call(
         }
         work.step()?;
     }
-    let (regexp_count_pattern_source, to_base64_byte_source) =
-        source_facts(function, args, unit, work)?;
+    let regexp_count_pattern_source = regexp_count_source(function, args, unit, work)?;
     let argument_uses = match temporal {
         Some(source) => CallArgumentUses::TemporalSources {
             facts: &source.facts,
@@ -457,13 +456,7 @@ fn author_call(
                 source,
                 channels: &argument_uses,
             },
-            None => match to_base64_byte_source {
-                Some(source) => CallArgumentUses::ToBase64Bytes {
-                    source,
-                    channels: &argument_uses,
-                },
-                None => CallArgumentUses::SelectedChannels(&argument_uses),
-            },
+            None => CallArgumentUses::SelectedChannels(&argument_uses),
         },
     };
     let preparation = if matches!(
@@ -534,7 +527,7 @@ fn author_call(
         effects: prepared.call_contract().effects().clone(),
         decimal_overflow_policy: decimal,
         regexp_count_pattern_source,
-        to_base64_byte_source,
+        to_base64_byte_source: None,
         temporal_source: temporal.cloned(),
     };
     if claims.insert(use_id, claim).is_some() {
@@ -548,18 +541,12 @@ fn author_call(
     ))
 }
 
-fn source_facts(
+fn regexp_count_source(
     function: &novarocks_expression_contract::BoundFunction,
     args: &[ExprId],
     unit: &SealedUnit,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<
-    (
-        Option<novarocks_type_contract::RegexpCountPatternSource>,
-        Option<novarocks_type_contract::ToBase64ByteSource>,
-    ),
-    CallAuthorError,
-> {
+) -> Result<Option<novarocks_type_contract::RegexpCountPatternSource>, CallAuthorError> {
     let name = function.function_id.as_str();
     if name == "builtin.scalar/regexp_count/v1" {
         return match novarocks_expression_contract::regexp_count_pattern_source_observed(
@@ -567,7 +554,7 @@ fn source_facts(
             args,
             work,
         ) {
-            Ok(source) => Ok((Some(source), None)),
+            Ok(source) => Ok(Some(source)),
             Err(TemporalSourceProjectionError::Control(cause)) => {
                 Err(CallAuthorError::Control(cause))
             }
@@ -576,22 +563,7 @@ fn source_facts(
             }
         };
     }
-    if name == "builtin.scalar/to_base64/v1" {
-        return match novarocks_expression_contract::to_base64_byte_source_observed(
-            unit.definitions(),
-            args,
-            work,
-        ) {
-            Ok(source) => Ok((None, Some(source))),
-            Err(TemporalSourceProjectionError::Control(cause)) => {
-                Err(CallAuthorError::Control(cause))
-            }
-            Err(TemporalSourceProjectionError::Invalid(message)) => {
-                Err(CallAuthorError::scalar_invalid(message))
-            }
-        };
-    }
-    Ok((None, None))
+    Ok(None)
 }
 
 fn author_primitive(

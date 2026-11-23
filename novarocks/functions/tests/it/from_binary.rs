@@ -17,13 +17,14 @@
 
 use std::{sync::Arc, time::Duration};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray};
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, EvaluatedArgument, FunctionArgument, FunctionBindingRequest,
-    FunctionKind, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
-    PreparedPureKernel, PureCallPreparation, ScalarEvaluationInstance, ScopedExpressionEffects,
-    Selection, builtin::catalogue::build_builtin_engine_function_catalog,
+    CallArgumentUses, CallEffectInput, DataFailureReason, EvaluatedArgument, FunctionArgument,
+    FunctionBindingRequest, FunctionKind, KernelEvaluationControl, KernelFailure,
+    MAX_UNOBSERVED_KERNEL_WORK, PreparedPureKernel, PureCallPreparation, RowDataError,
+    ScalarEvaluationInstance, ScopedExpressionEffects, Selection,
+    builtin::catalogue::build_builtin_engine_function_catalog,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
@@ -51,11 +52,24 @@ impl KernelEvaluationControl for Control {
 }
 
 fn evaluate(bytes: Vec<Option<&[u8]>>, formats: Option<Vec<Option<&str>>>) -> Vec<Option<String>> {
-    let rows = bytes.len();
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(BinaryArray::from(bytes))];
     if let Some(formats) = formats {
         arrays.push(Arc::new(StringArray::from(formats)));
     }
+    let (values, errors) = evaluate_call("from_binary", arrays);
+    assert_eq!(values.data_type(), &DataType::Utf8);
+    assert!(errors.is_empty());
+    values
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect()
+}
+
+fn evaluate_call(name: &str, arrays: Vec<ArrayRef>) -> (ArrayRef, Box<[RowDataError]>) {
+    let rows = arrays[0].len();
     let arguments = arrays
         .iter()
         .map(|array| FunctionArgument::Value {
@@ -70,7 +84,7 @@ fn evaluate(bytes: Vec<Option<&[u8]>>, formats: Option<Vec<Option<&str>>>) -> Ve
     };
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let bound = catalog
-        .resolve_bound_user("from_binary", FunctionKind::Scalar, request, &Control)
+        .resolve_bound_user(name, FunctionKind::Scalar, request, &Control)
         .unwrap();
     let selected = Arc::new(bound.selected);
     let uses = [Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))];
@@ -102,7 +116,7 @@ fn evaluate(bytes: Vec<Option<&[u8]>>, formats: Option<Vec<Option<&str>>>) -> Ve
         )
         .unwrap();
     let PreparedPureKernel::Scalar(prepared) = specialized.into_prepared() else {
-        panic!("FROM_BINARY must prepare a scalar");
+        panic!("{name} must prepare a scalar");
     };
     let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
     let arguments = arrays
@@ -112,16 +126,65 @@ fn evaluate(bytes: Vec<Option<&[u8]>>, formats: Option<Vec<Option<&str>>>) -> Ve
     let output = instance
         .evaluate(Selection::all(rows), &arguments, &Control)
         .unwrap();
-    assert_eq!(output.values().data_type(), &DataType::Utf8);
-    assert!(output.errors().is_empty());
-    output
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
-        .iter()
-        .map(|value| value.map(str::to_owned))
-        .collect()
+    let (_, values, errors) = output.into_parts();
+    (values, errors)
+}
+
+#[test]
+fn trino_byte_overloads_preserve_raw_bytes_and_typed_selected_errors() {
+    let raw = BinaryArray::from(vec![Some(&[0xff, 0x00][..]), None, Some(&[][..])]);
+    let (values, errors) = evaluate_call("crc32", vec![Arc::new(raw)]);
+    assert!(errors.is_empty());
+    let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [Some(3_539_857_293), None, Some(0)]
+    );
+
+    let text = StringArray::from(vec![Some("/wA="), Some("=a"), None, Some("")]);
+    let (values, errors) = evaluate_call("from_base64", vec![Arc::new(text)]);
+    let values = values.as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [Some(&[0xff, 0x00][..]), None, None, Some(&[][..])]
+    );
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].selected_ordinal(), 1);
+    assert_eq!(
+        errors[0].reason(),
+        DataFailureReason::Domain(
+            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
+        )
+    );
+}
+
+#[test]
+fn trino_uri_overloads_decode_values_after_matching_raw_parameter_names() {
+    let sources = Arc::new(StringArray::from(vec![
+        Some("/a?%71=first+name&q=second%26name"),
+        Some("/a?%71=first+name&q=second%26name"),
+        None,
+    ]));
+    let keys = Arc::new(StringArray::from(vec![Some("q"), Some("%71"), Some("q")]));
+    let (values, errors) = evaluate_call("url_extract_parameter", vec![sources, keys]);
+    assert!(errors.is_empty());
+    let values = values.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [Some("second&name"), Some("first name"), None]
+    );
+
+    let (values, errors) =
+        evaluate_call("url_encode", vec![Arc::new(StringArray::from(vec!["a ~"]))]);
+    assert!(errors.is_empty());
+    assert_eq!(
+        values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "a+%7E"
+    );
 }
 
 #[test]

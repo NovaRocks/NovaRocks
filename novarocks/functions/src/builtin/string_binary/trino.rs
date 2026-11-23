@@ -215,7 +215,13 @@ pub(super) fn evaluate<'a>(
                             Ok(()) => valid = true,
                             Err(message) => {
                                 payload.truncate(start);
-                                errors.push(RowDataError::new(ordinal, message));
+                                errors.push(RowDataError::with_reason(
+                                    ordinal,
+                                    crate::DataFailureReason::Domain(
+                                        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                                    ),
+                                    message,
+                                ));
                             }
                         }
                     }

@@ -138,19 +138,7 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
     // (Utf8) -> Utf8 — single-arg string transforms.
     for name in [
-        "upper",
-        "lower",
-        "trim",
-        "ltrim",
-        "rtrim",
-        "reverse",
-        "initcap",
-        "md5",
-        "to_base64",
-        "from_base64",
-        "url_encode",
-        "url_decode",
-        "char",
+        "upper", "lower", "trim", "ltrim", "rtrim", "reverse", "initcap", "char",
     ] {
         add(
             m,
@@ -158,6 +146,75 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
         );
     }
+
+    use super::signature::CharacterWidth;
+    use novarocks_type_contract::CharacterKind;
+    let varchar = TypeSpec::Character(CharacterKind::Varchar, CharacterWidth::Argument("x"));
+    let fixed_char = TypeSpec::Character(CharacterKind::Char, CharacterWidth::Argument("x"));
+    for (name, arguments, result) in [
+        ("to_utf8", vec![varchar.clone()], TypeSpec::Binary),
+        ("to_utf8", vec![fixed_char], TypeSpec::Binary),
+        ("from_utf8", vec![TypeSpec::Binary], TypeSpec::Utf8),
+        (
+            "from_utf8",
+            vec![TypeSpec::Binary, varchar.clone()],
+            TypeSpec::Utf8,
+        ),
+        (
+            "from_utf8",
+            vec![TypeSpec::Binary, TypeSpec::Int64],
+            TypeSpec::Utf8,
+        ),
+        ("to_big_endian_64", vec![TypeSpec::Int64], TypeSpec::Binary),
+        ("to_hex", vec![TypeSpec::Binary], TypeSpec::Utf8),
+        ("from_hex", vec![varchar.clone()], TypeSpec::Binary),
+        ("from_hex", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("to_base64", vec![TypeSpec::Binary], TypeSpec::Utf8),
+        ("from_base64", vec![varchar.clone()], TypeSpec::Binary),
+        ("from_base64", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("md5", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("sha256", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("sha512", vec![TypeSpec::Binary], TypeSpec::Binary),
+        ("crc32", vec![TypeSpec::Binary], TypeSpec::Int64),
+    ] {
+        add(
+            m,
+            name,
+            Signature::new(arguments, result).with_argument_coercion(),
+        );
+    }
+
+    for (name, result) in [
+        ("url_extract_protocol", varchar.clone()),
+        ("url_extract_host", varchar.clone()),
+        ("url_extract_port", TypeSpec::Int64),
+        ("url_extract_path", varchar.clone()),
+        ("url_extract_query", varchar.clone()),
+        ("url_extract_fragment", varchar.clone()),
+        ("url_decode", varchar.clone()),
+        (
+            "url_encode",
+            TypeSpec::Character(CharacterKind::Varchar, CharacterWidth::UrlEncode("x")),
+        ),
+    ] {
+        add(
+            m,
+            name,
+            Signature::new(vec![varchar.clone()], result).with_argument_coercion(),
+        );
+    }
+    add(
+        m,
+        "url_extract_parameter",
+        Signature::new(
+            vec![
+                varchar.clone(),
+                TypeSpec::Character(CharacterKind::Varchar, CharacterWidth::Argument("y")),
+            ],
+            varchar,
+        )
+        .with_argument_coercion(),
+    );
 
     add(
         m,
@@ -537,13 +594,6 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ),
         );
     }
-
-    // crc32 returns Int64.
-    add(
-        m,
-        "crc32",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int64),
-    );
 
     // `greatest` / `least` are intentionally NOT registered: StarRocks
     // widens pure Date32 inputs to Datetime (because the BE only ships

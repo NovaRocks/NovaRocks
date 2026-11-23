@@ -211,26 +211,11 @@ pub(crate) fn validate_core<'a, H>(
                     "unrelated call carries regexp_count source",
                 ));
             }
-            if function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
-                if invocation.control != ControlShape::Eager
-                    || claim.to_base64_byte_source
-                        != Some(crate::to_base64_byte_source_observed(
-                            &parts.definitions,
-                            args,
-                            work,
-                        )?)
-                {
-                    return Err(ValidationFailure::invalid(
-                        Some(node.id),
-                        None,
-                        "to_base64 source claim differs from actual emitted source",
-                    ));
-                }
-            } else if claim.to_base64_byte_source.is_some() {
+            if claim.to_base64_byte_source.is_some() {
                 return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
-                    "unrelated call carries to_base64 source",
+                    "retired to_base64 source claim",
                 ));
             }
             match (invocation.control, &claim.temporal_source) {

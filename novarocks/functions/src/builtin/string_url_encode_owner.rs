@@ -264,7 +264,7 @@ impl ScalarKernelInstance for StringUrlEncodeInstance {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::string_url_encode::evaluate_string_url_encode(input, control)
+        super::string_url_encode::evaluate_trino_url_encode(input, control)
     }
 
     fn retained_bytes(&self) -> usize {
