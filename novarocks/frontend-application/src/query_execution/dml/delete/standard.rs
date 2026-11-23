@@ -46,6 +46,7 @@ use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
+use novarocks_sql::compiler::SqlPreparedParameters;
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_type_contract::TemporalType;
@@ -78,13 +79,18 @@ pub(super) fn resolve_target(
 fn delete_where_expr<'a>(
     stmt: &'a PreparedPredicateDelete,
     target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
+    parameters: Option<&SqlPreparedParameters>,
 ) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
         "DELETE requires a WHERE clause; for full table replacement use \
          INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
             .to_string()
     })?;
-    validate_where(where_clause, &target_binding.dml_target_columns()?)?;
+    validate_bound_where(
+        where_clause,
+        &target_binding.dml_target_columns()?,
+        parameters,
+    )?;
     Ok(where_clause)
 }
 
@@ -113,7 +119,11 @@ pub(super) async fn prepare_delete_statement_async(
         target_binding.metadata(),
         connector_context.clone(),
     )?;
-    let where_expr = delete_where_expr(stmt, &target_binding)?;
+    let where_expr = delete_where_expr(
+        stmt,
+        &target_binding,
+        execution.prepared_parameters().map(Arc::as_ref),
+    )?;
     // This provider author is pure over the frozen table metadata. It keeps
     // the original operation identity and signs strategy, base and routing.
     let (write_lease, mutation) = target_binding.prepare_row_mutation(
@@ -372,6 +382,14 @@ fn write_input_columns(
         .collect()
 }
 
+#[cfg(test)]
+fn validate_where(
+    expr: &Expr,
+    columns: &[ColumnDef],
+) -> Result<(), crate::dml::error::DmlExecutionError> {
+    validate_bound_where(expr, columns, None)
+}
+
 /// Check that a DELETE `WHERE` clause is inside the subset this engine supports.
 ///
 /// Nothing is produced: the distributed SELECT planner owns the actual filtering
@@ -381,9 +399,10 @@ fn write_input_columns(
 /// Phase 1 supports the following node shapes; everything else is rejected
 /// with an explicit error pointing at the unsupported construct so the caller
 /// can rewrite the WHERE clause.
-fn validate_where(
+fn validate_bound_where(
     expr: &Expr,
     columns: &[ColumnDef],
+    parameters: Option<&SqlPreparedParameters>,
 ) -> Result<(), crate::dml::error::DmlExecutionError> {
     struct QueryOccurrence(bool);
     impl ast::Visit for QueryOccurrence {
@@ -412,17 +431,18 @@ fn validate_where(
             ),
         ));
     }
-    validate_where_predicate(expr, columns)
+    validate_where_predicate(expr, columns, parameters)
 }
 
 fn validate_where_predicate(
     expr: &Expr,
     columns: &[ColumnDef],
+    parameters: Option<&SqlPreparedParameters>,
 ) -> Result<(), crate::dml::error::DmlExecutionError> {
     match expr {
         Expr::Logical(logical) => {
             for term in &logical.terms {
-                validate_where_predicate(term, columns)?;
+                validate_where_predicate(term, columns, parameters)?;
             }
             Ok(())
         }
@@ -433,15 +453,20 @@ fn validate_where_predicate(
                 // statistics (the function obscures the underlying column value),
                 // so we return AlwaysTrue here to scan all files and leave
                 // correctness to the per-row evaluator in evaluate_where_at_row.
-                if extract_scalar_fn_comparison(&expression.value, &comparison.right).is_some()
-                    || extract_variant_get_comparison(&expression.value, &comparison.right)
-                        .is_some()
+                if extract_scalar_fn_comparison(&expression.value, &comparison.right, parameters)
+                    .is_some()
+                    || extract_variant_get_comparison(
+                        &expression.value,
+                        &comparison.right,
+                        parameters,
+                    )
+                    .is_some()
                 {
                     return Ok(());
                 }
                 let (col_name, value_expr, _flipped) =
                     extract_comparison(&expression.value, &comparison.right)?;
-                validate_literal_for_column(value_expr, columns, &col_name)
+                validate_value_for_column(value_expr, columns, &col_name, parameters)
             }
             Predicate::In(predicate) => {
                 let Expr::InList(list) = &predicate.value_list else {
@@ -452,7 +477,7 @@ fn validate_where_predicate(
                 }
                 let col_name = expr_to_column_name(&expression.value)?;
                 for literal in &list.values {
-                    validate_literal_for_column(literal, columns, &col_name)?;
+                    validate_value_for_column(literal, columns, &col_name, parameters)?;
                 }
                 Ok(())
             }
@@ -503,14 +528,15 @@ fn extract_comparison<'a>(
 fn extract_scalar_fn_comparison<'a>(
     left: &'a Expr,
     right: &'a Expr,
+    parameters: Option<&SqlPreparedParameters>,
 ) -> Option<(String, String, &'a Expr, bool)> {
     if let Some((fn_name, col_name)) = expr_as_supported_scalar_fn_on_col(left)
-        && is_literal_expr(right)
+        && is_supported_value(right, parameters)
     {
         return Some((fn_name, col_name, right, false));
     }
     if let Some((fn_name, col_name)) = expr_as_supported_scalar_fn_on_col(right)
-        && is_literal_expr(left)
+        && is_supported_value(left, parameters)
     {
         return Some((fn_name, col_name, left, true));
     }
@@ -527,14 +553,15 @@ fn extract_scalar_fn_comparison<'a>(
 fn extract_variant_get_comparison<'a>(
     left: &'a Expr,
     right: &'a Expr,
+    parameters: Option<&SqlPreparedParameters>,
 ) -> Option<(String, &'a Expr, bool)> {
     if let Some(col_name) = expr_as_variant_get_on_col(left)
-        && is_literal_expr(right)
+        && is_supported_value(right, parameters)
     {
         return Some((col_name, right, false));
     }
     if let Some(col_name) = expr_as_variant_get_on_col(right)
-        && is_literal_expr(left)
+        && is_supported_value(left, parameters)
     {
         return Some((col_name, left, true));
     }
@@ -621,11 +648,16 @@ fn is_supported_scalar_fn(name: &str) -> bool {
     )
 }
 
-/// Returns `true` when `expr` is a value literal (or a nested/negated literal)
-/// that `literal_to_datum` can parse.
-fn is_literal_expr(expr: &Expr) -> bool {
+/// The positional binding has already proved that a supplied value is independent
+/// of DELETE's input rows. The original SQL planner checks its expression type.
+fn is_bound_parameter(expr: &Expr, parameters: Option<&SqlPreparedParameters>) -> bool {
+    matches!(expr, Expr::Parameter(place) if parameters.is_some_and(|bindings| bindings.argument_at(place.span).is_some()))
+}
+
+fn is_supported_value(expr: &Expr, parameters: Option<&SqlPreparedParameters>) -> bool {
     match expr {
         Expr::Literal(_) => true,
+        Expr::Parameter(_) => is_bound_parameter(expr, parameters),
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
             matches!(unary.expression.as_ref(), Expr::Literal(_))
         }
@@ -648,10 +680,11 @@ fn expr_to_column_name(expr: &Expr) -> Result<String, String> {
 /// The value itself is not retained: the caller only needs to know whether the
 /// clause is inside the supported subset. Actual filtering belongs to the
 /// distributed SELECT planner.
-fn validate_literal_for_column(
+fn validate_value_for_column(
     expr: &Expr,
     columns: &[ColumnDef],
     column_name: &str,
+    parameters: Option<&SqlPreparedParameters>,
 ) -> Result<(), crate::dml::error::DmlExecutionError> {
     let column = columns
         .iter()
@@ -668,6 +701,22 @@ fn validate_literal_for_column(
         }
         other => other,
     };
+    if is_bound_parameter(expr, parameters) {
+        return match column_type {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Boolean
+            | DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(()),
+            other => Err(format!(
+                "phase 1 DELETE WHERE primitive type {other:?} not yet supported (column `{column_name}`)"
+            )
+            .into()),
+        };
+    }
     let lit_value = match expr {
         Expr::Literal(literal) => literal,
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
@@ -835,6 +884,29 @@ mod tests {
             column("id", DataType::Int32),
             column("v", DataType::LargeBinary),
         ]
+    }
+
+    #[test]
+    fn prepared_statement_delete_accepts_only_original_bound_value_positions() {
+        use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
+
+        let target = parse_statement("DELETE FROM orders WHERE n IN (?, 2)").unwrap();
+        let using = "EXECUTE d USING CAST(1 AS INTEGER)";
+        let TrinoStatement::Execute(execute) = parse_statement(using).unwrap() else {
+            panic!("expected EXECUTE");
+        };
+        let binding =
+            super::SqlPreparedParameters::bind(&target, execute.parameters, using.into()).unwrap();
+        let TrinoStatement::Delete(delete) = target else {
+            panic!("expected DELETE");
+        };
+        let predicate = delete.predicate.unwrap();
+        let columns = [column("n", DataType::Int32)];
+        super::validate_bound_where(&predicate, &columns, Some(&binding)).unwrap();
+        assert!(super::validate_bound_where(&predicate, &columns, None).is_err());
+        assert!(
+            super::validate_bound_where(&where_expr("n = ?"), &columns, Some(&binding)).is_err()
+        );
     }
 
     #[test]
@@ -1257,7 +1329,7 @@ mod tests {
             kind: LiteralKind::String("2020-01-01T00:00:00".to_string()),
             span: Span::new(0, 21),
         });
-        let error = super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
+        let error = super::validate_value_for_column(&expr, &columns_with_timestamp(), "ts", None)
             .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");
         let crate::dml::error::DmlExecutionError::Engine(error) = error else {
             panic!("expected the original DATETIME validation error");

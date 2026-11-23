@@ -274,9 +274,17 @@ async fn run_description(
         .connector_context()
         .clone()
         .with_io_admission(io);
-    let (mut query, assignments, constants) = match *job.description.target {
-        TrinoStatementAction::Query(TrinoQueryAction::Read(query)) => (query, None, None),
-        TrinoStatementAction::Prepare(TrinoStatementPreparation::Insert(node)) => {
+    let (mut query, write) = match *job.description.target {
+        TrinoStatementAction::Query(TrinoQueryAction::Read(query)) => (query, None),
+        TrinoStatementAction::Prepare(preparation @ TrinoStatementPreparation::Insert(_)) => {
+            let result_field = preparation_plan(&preparation)?
+                .admission
+                .shape
+                .command_row_field()
+                .ok_or_else(|| internal_error("INSERT has no command row declaration"))?;
+            let TrinoStatementPreparation::Insert(node) = preparation else {
+                unreachable!("already matched INSERT preparation");
+            };
             let target_span = node.table.span;
             let (command, reference) =
                 dml_result(crate::dml::insert::prepare_trino_insert_shape(node, source))
@@ -297,8 +305,11 @@ async fn run_description(
                 .await?;
             (
                 prepared.query,
-                Some(prepared.assignments),
-                prepared.constants,
+                Some(DescriptionWrite {
+                    assignments: prepared.assignments,
+                    constants: prepared.constants,
+                    result_field,
+                }),
             )
         }
         _ => {
@@ -433,8 +444,7 @@ async fn run_description(
         session: sql_session,
         functions: job.compiler.description_functions(),
         policy: job.compiler.constant_policy(),
-        assignments,
-        constants,
+        write,
         family,
         producer,
     })
@@ -459,14 +469,21 @@ pub(crate) struct DescriptionCpuInput {
     session: SqlSessionContext,
     functions: Arc<dyn SqlFunctionCatalog>,
     policy: ConstantPolicy,
-    assignments: Option<SqlWriteAssignments>,
-    constants: Option<SqlExpressionConstants>,
+    write: Option<DescriptionWrite>,
     family: ClientPresentationFamily,
     producer: LocalResultProducer,
 }
 
+struct DescriptionWrite {
+    assignments: SqlWriteAssignments,
+    constants: Option<SqlExpressionConstants>,
+    result_field: ResultField,
+}
+
 impl DescriptionCpuInput {
     pub(crate) fn run(self) -> Result<OwnedLocalResult, QueryServiceError> {
+        let mut write = self.write;
+        let constants = write.as_mut().and_then(|write| write.constants.take());
         let mut described = self
             .preparation
             .describe(
@@ -474,8 +491,8 @@ impl DescriptionCpuInput {
                 &self.session,
                 self.functions.as_ref(),
                 self.policy,
-                self.assignments.as_ref(),
-                self.constants,
+                write.as_ref().map(|write| &write.assignments),
+                constants,
             )
             .map_err(|error| {
                 routed_execution_service_error(routed_compiler_failure(
@@ -483,11 +500,11 @@ impl DescriptionCpuInput {
                     self.source.sql(),
                 ))
             })?;
-        if self.assignments.is_some() {
+        if let Some(write) = write {
             described.columns = vec![SqlDescribedColumn {
-                name: "rows".to_owned(),
+                name: write.result_field.name().to_owned(),
                 origin: None,
-                value_type: FunctionValueType::new(DataType::Int64, false),
+                value_type: write.result_field.value_type().clone(),
                 aliased: false,
             }];
         }

@@ -110,6 +110,21 @@ pub enum StatementOutputShape {
     Rows,
     UndeterminedCall,
 }
+
+impl StatementOutputShape {
+    pub fn command_row_field(self) -> Option<crate::api::ResultField> {
+        (self == Self::Rows).then(|| {
+            crate::api::ResultField::new(
+                "rows",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+            )
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatementAdmission {
     pub kind: StatementKind,

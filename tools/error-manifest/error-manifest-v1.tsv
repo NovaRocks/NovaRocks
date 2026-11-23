@@ -24,12 +24,14 @@ sql.admit.create_table_unsupported_form	Admit
 sql.admit.delete_requires_where	Admit
 sql.admit.delete_unsupported_form	Admit
 sql.admit.duplicate_table_procedure_argument	Admit
+sql.admit.expression_not_constant	Admit
 sql.admit.insert_unsupported_form	Admit
 sql.admit.invalid_analyze_property	Admit
 sql.admit.invalid_branch_property	Admit
 sql.admit.invalid_catalog_property	Admit
 sql.admit.invalid_default_column_value	Admit
 sql.admit.invalid_materialized_view_property	Admit
+sql.admit.invalid_parameter_usage	Admit
 sql.admit.invalid_schema_property	Admit
 sql.admit.invalid_session_property	Admit
 sql.admit.invalid_table_procedure_argument	Admit
@@ -40,6 +42,7 @@ sql.admit.kill_denied	Admit
 sql.admit.merge_unsupported_form	Admit
 sql.admit.not_in_transaction	Admit
 sql.admit.persisted_definition_semantics_unsupported	Admit
+sql.admit.prepared_statement_not_found	Admit
 sql.admit.procedure_not_found	Admit
 sql.admit.schema_already_exists	Admit
 sql.admit.session_catalog_not_found	Admit
@@ -63,6 +66,7 @@ sql.analyze.invalid_type_argument	Analyze
 sql.analyze.invalid_view	Analyze
 sql.analyze.mismatched_column_aliases	Analyze
 sql.analyze.missing_column_name	Analyze
+sql.analyze.numeric_value_out_of_range	Analyze
 sql.analyze.too_many_arguments	Analyze
 sql.analyze.type_mismatch	Analyze
 sql.analyze.unavailable_implementation	Analyze
