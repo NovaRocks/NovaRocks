@@ -14,10 +14,6 @@ DELETE FROM;
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 CREATE OR REPLACE TABLE sqlp5_duplicate_column (id INT, id BIGINT);
 
--- query 3
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-DELETE FROM sqlp5_reject_target;
-
 -- query 4
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 UPDATE sqlp5_reject_target SET target.id = 1;
@@ -55,3 +51,20 @@ CREATE TABLE reject_table (id integer) DISTRIBUTED BY HASH(id) BUCKETS 1;
 -- query 12
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 CREATE TABLE reject_table LIKE stable_source;
+
+-- query 13
+-- @skip_result_check=true
+CREATE CATALOG IF NOT EXISTS "sqlp5_delete_${uuid0}" USING iceberg WITH ("iceberg.catalog.type" = '${iceberg_catalog_type}', "iceberg.catalog.warehouse" = '${iceberg_catalog_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA "sqlp5_delete_${uuid0}".reject_ns;
+CREATE TABLE "sqlp5_delete_${uuid0}".reject_ns.target (id INT);
+
+-- query 14
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+DELETE FROM "sqlp5_delete_${uuid0}".reject_ns.target
+WHERE id IN (SELECT id FROM "sqlp5_delete_${uuid0}".reject_ns.target);
+
+-- query 15
+-- @cleanup=true
+-- @skip_result_check=true
+DROP SCHEMA IF EXISTS "sqlp5_delete_${uuid0}".reject_ns CASCADE;
+DROP CATALOG IF EXISTS "sqlp5_delete_${uuid0}";
