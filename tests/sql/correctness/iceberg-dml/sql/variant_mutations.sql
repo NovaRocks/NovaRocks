@@ -66,7 +66,7 @@ SELECT COUNT(*) AS remaining_rows FROM iru9_variant_mutations_${uuid0}.iru9_${uu
 ALTER TABLE iru9_variant_mutations_${uuid0}.iru9_${uuid0}.t_v3_variant_mut EXECUTE add_equality_delete(columns => ARRAY['v'], rows => ARRAY[ROW(NULL)]);
 
 -- query 10
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_error=SQL type variant is not supported
 CREATE TABLE ${case_db}.t_v3_variant_partition_bad (id BIGINT,v VARIANT) WITH (partitioning = ARRAY['v'], format_version = 3);
 
 -- query 11
