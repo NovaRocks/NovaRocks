@@ -44,8 +44,7 @@ impl ExpressionUseId {
     }
 }
 
-/// Exact argument control, after signature binding. NULLIF evaluates both
-/// operands; it is not the IF or COALESCE control protocol.
+/// Exact argument control after signature binding.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ArgumentControl {
     Eager,
@@ -56,6 +55,8 @@ pub enum ArgumentControl {
     TypeOnly,
     If,
     Coalesce,
+    /// Keep the original left value and compare only its non-NULL rows.
+    NullIf,
     Try,
     /// Demand each regexp argument only after the previous one succeeded and
     /// produced a non-NULL value. Compile the pattern at argument ordinal 1.
@@ -90,6 +91,7 @@ impl ArgumentControl {
             | (Self::NoArguments, ControlShape::NoArguments)
             | (Self::If, ControlShape::If)
             | (Self::Coalesce, ControlShape::Coalesce)
+            | (Self::NullIf, ControlShape::NullIf)
             | (Self::Try, ControlShape::Try)
             | (Self::OrderedRegexp, ControlShape::OrderedRegexp)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
@@ -211,6 +213,7 @@ impl FunctionEffectDeclaration {
                         | ArgumentControl::TypeOnly
                         | ArgumentControl::If
                         | ArgumentControl::Coalesce
+                        | ArgumentControl::NullIf
                         | ArgumentControl::Try
                         | ArgumentControl::OrderedRegexp
                         | ArgumentControl::TemporalSource(_)
@@ -242,6 +245,7 @@ impl FunctionEffectDeclaration {
             self.argument_control,
             ArgumentControl::If
                 | ArgumentControl::Coalesce
+                | ArgumentControl::NullIf
                 | ArgumentControl::Try
                 | ArgumentControl::OrderedRegexp
                 | ArgumentControl::TemporalSource(_)
@@ -593,6 +597,7 @@ mod tests {
             ArgumentControl::TypeOnly,
             ArgumentControl::If,
             ArgumentControl::Coalesce,
+            ArgumentControl::NullIf,
             ArgumentControl::Try,
             ArgumentControl::OrderedRegexp,
             ArgumentControl::SimpleCase,
@@ -614,6 +619,7 @@ mod tests {
             ControlShape::TypeOnly,
             ControlShape::If,
             ControlShape::Coalesce,
+            ControlShape::NullIf,
             ControlShape::Try,
             ControlShape::OrderedRegexp,
             ControlShape::Case {

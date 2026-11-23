@@ -5022,6 +5022,10 @@ impl MarkDemand<'_, '_> {
                         let condition = self.bind_condition(&mut args[0], &guard);
                         Self::extend_guard(guard, self.truth_test(condition, true, position == 2)?)
                     }
+                    ArgumentControl::NullIf if position == 1 => {
+                        let left = self.bind_condition(&mut args[0], &guard);
+                        Self::extend_guard(guard, is_null_expr(left, true))
+                    }
                     ArgumentControl::Coalesce => {
                         let mut guard = guard;
                         for earlier in &mut args[..position] {
@@ -5033,7 +5037,7 @@ impl MarkDemand<'_, '_> {
                     ArgumentControl::NoArguments | ArgumentControl::TypeOnly => {
                         Some(bool_literal(false))
                     }
-                    ArgumentControl::If | ArgumentControl::Eager => guard,
+                    ArgumentControl::If | ArgumentControl::NullIf | ArgumentControl::Eager => guard,
                     _ => return Err(self.error(
                         "Composite IN inside this function requires its original argument demand",
                     )),

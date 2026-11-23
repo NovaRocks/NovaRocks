@@ -64,6 +64,8 @@ pub enum ControlShape {
     Disjunction,
     If,
     Coalesce,
+    /// Evaluate the left exactly once; only its present rows enter comparison.
+    NullIf,
     /// Evaluate one value expression in its own row-error catch scope.
     Try,
     /// Demand source and pattern in order, compile the non-NULL pattern at
@@ -104,6 +106,8 @@ pub enum GuardKind {
     },
     CaseElse,
     TryBody,
+    /// A successful, non-NULL left value is retained by this invocation.
+    NullIfAfterLeft,
     LambdaInvocation,
     /// The previous source phase completed successfully for this row.
     TemporalAfterSource {
@@ -788,6 +792,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::Conjunction | ControlShape::Disjunction => count > 0,
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
+        ControlShape::NullIf => count == 2,
         ControlShape::Try => count == 1,
         ControlShape::OrderedRegexp => (2..=4).contains(&count),
         ControlShape::Between { .. } => count == 4,
@@ -827,6 +832,7 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
         ControlShape::Coalesce => (ordinal > 0).then_some(GuardKind::CoalesceAfterNull {
             ordinal: ordinal as u32,
         }),
+        ControlShape::NullIf => (ordinal == 1).then_some(GuardKind::NullIfAfterLeft),
         ControlShape::Try => Some(GuardKind::TryBody),
         ControlShape::OrderedRegexp => {
             (ordinal > 0).then(|| GuardKind::OrderedRegexpAfterArgument {
@@ -887,6 +893,7 @@ fn control_argument_demand(
         | ControlShape::TypeOnly
         | ControlShape::NoArguments
         | ControlShape::Coalesce
+        | ControlShape::NullIf
         | ControlShape::Try
         | ControlShape::OrderedRegexp
         | ControlShape::TemporalSource(_)

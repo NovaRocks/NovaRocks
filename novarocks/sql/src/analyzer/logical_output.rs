@@ -654,6 +654,9 @@ mod scalar_domain_tests {
             "select nullif(h,b) from t",
             "select nullif(j,s) from t",
             "select nullif(s,j) from t",
+            "select nullif(h,h) from t",
+            "select nullif(j,j) from t",
+            "select nullif(null,j) from t",
         ] {
             let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
             assert!(
@@ -661,11 +664,7 @@ mod scalar_domain_tests {
                 "{sql}: {error}"
             );
         }
-        assert_eq!(
-            output_domains("select nullif(h,h),nullif(j,j),nullif(null,j) from t"),
-            vec![Some(SqlType::Hll), Some(SqlType::Json), Some(SqlType::Json)]
-        );
-        let expression = output_expressions("select nullif(null,j) from t").remove(0);
+        let expression = output_expressions("select nullif(null,bigint '1')").remove(0);
         let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
             panic!("actual nullif owner");
         };
@@ -674,10 +673,7 @@ mod scalar_domain_tests {
             panic!("scalar");
         };
         assert_eq!(result, &expression.value_type);
-        assert_eq!(
-            result.logical_type(),
-            novarocks_type_contract::ValueLogicalType::Json
-        );
+        assert_eq!(result.data_type(), &DataType::Null);
         assert!(args[0].value_type.nullable());
         assert!(
             super::super::value_conversion::constant_is_null(
@@ -687,10 +683,7 @@ mod scalar_domain_tests {
             )
             .unwrap()
         );
-        assert_eq!(
-            args[1].value_type.logical_type(),
-            novarocks_type_contract::ValueLogicalType::Json
-        );
+        assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
     }
 
     #[test]

@@ -588,7 +588,7 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ("ntile", BuiltinDisposition::WindowBoundary),
     (
         "nullif",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     ("nvl", BuiltinDisposition::Unavailable),
     (

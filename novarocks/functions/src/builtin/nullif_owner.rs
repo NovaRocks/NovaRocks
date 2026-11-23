@@ -25,30 +25,23 @@ use novarocks_type_contract::{
     PureCompileControl,
 };
 
-use super::catalogue::BuiltinScalarResolver;
-use crate::kernel_control::{compile_failure, invalid};
+use super::catalogue::BuiltinDynamicScalarResolver;
 use crate::{
     CallEffectInput, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
     FunctionBindingResolver, FunctionBindingSelection, FunctionCatalogError, FunctionDefinition,
     FunctionEffectOwner, FunctionEffectOwnerError, FunctionFailureBehavior, FunctionId,
     FunctionIntrinsicRowError, FunctionKind, FunctionVisibility, FunctionVolatility,
-    KernelEvaluationControl, KernelFailure, PreparedScalarKernel, PureFunctionMetadataOwner,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PureScalarImplementation,
-    ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
+    PureFunctionMetadataOwner, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 
-pub(super) fn operation(name: &str) -> bool {
-    name == "nullif"
-}
-
-/// The implementation is called on NULL: a NULL right operand preserves left.
+/// A present left value enters the comparison region.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        own_row_error: FunctionIntrinsicRowError::MayRaise,
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: FunctionNullBehavior::CalledOnNull,
-        argument_control: ArgumentControl::Eager,
+        null_behavior: FunctionNullBehavior::ControlDefined,
+        argument_control: ArgumentControl::NullIf,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),
@@ -56,12 +49,11 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
 }
 
 pub(super) fn definition(
-    name: &str,
     declaration: FunctionBindingDeclaration,
-    resolver: BuiltinScalarResolver,
+    resolver: BuiltinDynamicScalarResolver,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
-    let owner = Arc::new(NullifOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
+    let owner = Arc::new(NullifOwner::new(declaration, resolver)?);
+    FunctionDefinition::try_new_pure_control("nullif", FunctionVisibility::Public, owner).map_err(
         |error| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin nullif pure owner",
             value: error.to_string().into(),
@@ -70,23 +62,16 @@ pub(super) fn definition(
 }
 
 struct NullifOwner {
-    resolver: Arc<BuiltinScalarResolver>,
+    resolver: Arc<BuiltinDynamicScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
 impl NullifOwner {
     fn new(
-        name: &str,
         declaration: FunctionBindingDeclaration,
-        resolver: BuiltinScalarResolver,
+        resolver: BuiltinDynamicScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        if !operation(name) {
-            return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "builtin nullif name",
-                value: name.into(),
-            });
-        }
-        let function = format!("builtin.scalar/{name}/v1");
+        let function = "builtin.scalar/nullif/v1";
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
@@ -100,15 +85,14 @@ impl NullifOwner {
                 value: declaration.function_id().as_str().into(),
             });
         }
-        let implementation =
-            PureImplementationId::try_new(format!("builtin.scalar/{name}/selected-v1"))?;
+        let implementation = PureImplementationId::try_new("builtin.scalar/nullif/selected-v2")?;
         let implementations = declaration
             .overloads()
             .iter()
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
-                abi: PureKernelAbi::ScalarV1,
+                abi: PureKernelAbi::ControlIntrinsicV1,
             })
             .collect();
         Ok(Self {
@@ -165,7 +149,7 @@ impl FunctionBindingResolver for NullifOwner {
 
 impl PureFunctionMetadataOwner for NullifOwner {
     fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
-        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+        crate::FunctionBindingResolverOwner::dynamic_scalar(Arc::clone(&self.resolver))
     }
 
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
@@ -208,67 +192,9 @@ impl FunctionEffectOwner for NullifOwner {
     ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
     {
         self.refine_selected_core(input, control, || {
-            checked.require_fixed_author(self.resolver.as_ref(), input)
+            checked.require_binding_author(self.resolver.as_ref(), input)
         })
         .map_err(crate::CheckedOwnerFailure::Original)
-    }
-}
-
-impl PureScalarImplementation for NullifOwner {
-    fn prepare_scalar(
-        &self,
-        input: CallEffectInput<'_>,
-        contract: Arc<ScalarCallContract>,
-        control: &dyn PureCompileControl,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        self.prepare_selected_core(input, contract, control, || {
-            self.validate_selected(input.selected, input.request, control)
-        })
-    }
-    fn prepare_scalar_checked(
-        &self,
-        input: CallEffectInput<'_>,
-        checked: &crate::CheckedCallEffectInput<'_>,
-        contract: Arc<ScalarCallContract>,
-        control: &dyn PureCompileControl,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
-        self.prepare_selected_core(input, contract, control, || {
-            checked.require_fixed_author(self.resolver.as_ref(), input)
-        })
-        .map_err(crate::CheckedOwnerFailure::Original)
-    }
-}
-
-#[derive(Debug)]
-struct PreparedNullif {
-    contract: Arc<ScalarCallContract>,
-}
-impl PreparedScalarKernel for PreparedNullif {
-    fn contract(&self) -> &Arc<ScalarCallContract> {
-        &self.contract
-    }
-
-    fn instance_retained_upper_bound(&self) -> usize {
-        std::mem::size_of::<NullifInstance>()
-    }
-
-    fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(NullifInstance))
-    }
-}
-
-struct NullifInstance;
-impl ScalarKernelInstance for NullifInstance {
-    fn evaluate<'a>(
-        &mut self,
-        input: ScalarCallInput<'_, 'a>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, KernelFailure> {
-        super::nullif::evaluate(input, control)
-    }
-
-    fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
     }
 }
 
@@ -312,49 +238,4 @@ impl NullifOwner {
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         result
     }
-    fn prepare_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        contract: Arc<ScalarCallContract>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
-            work.step().map_err(compile_failure)?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-                || contract.function_id() != input.function_id
-                || !std::ptr::eq(contract.selected(), input.selected)
-                || novarocks_type_contract::CallEffectContext::from(contract.context())
-                    != input.context
-                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
-                || !input.environment.is_empty()
-            {
-                return Err(invalid(
-                    "nullif preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
-            validate().map_err(|error| match error {
-                FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("nullif preparation has a stale selected binding"),
-            })?;
-            super::nullif::validate_profile(&contract)?;
-            work.step().map_err(compile_failure)?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            Ok(Arc::new(PreparedNullif { contract }) as Arc<dyn PreparedScalarKernel>)
-        })();
-        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
-    }
 }
-
-#[cfg(test)]
-mod tests;

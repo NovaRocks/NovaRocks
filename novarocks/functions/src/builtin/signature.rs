@@ -149,7 +149,7 @@ impl ArgumentBindingPolicy {
 ///
 /// `widening` opts the signature into the resolver's widening-cast match
 /// pass. Default-off: only the `coalesce` / `if` / `ifnull` / `case` /
-/// `nvl` / `nullif` family — whose return type is the wider type of all
+/// `nvl` family — whose return type is the wider type of all
 /// argument types — should enable this. Structural polymorphic
 /// signatures like `array_append(List<T>, T) -> List<T>` must stay
 /// `widening: false` so a call like `array_append(List<Int64>, Utf8)`

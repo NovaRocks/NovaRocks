@@ -142,6 +142,7 @@ pub fn installed_scalar_control_shape(
         ArgumentControl::If => ControlShape::If,
         ArgumentControl::Coalesce => ControlShape::Coalesce,
         ArgumentControl::Try => ControlShape::Try,
+        ArgumentControl::NullIf => ControlShape::NullIf,
         ArgumentControl::OrderedRegexp => ControlShape::OrderedRegexp,
         ArgumentControl::SimpleCase | ArgumentControl::SearchedCase => {
             let simple = control == ArgumentControl::SimpleCase;

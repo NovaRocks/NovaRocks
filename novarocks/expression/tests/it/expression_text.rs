@@ -502,6 +502,82 @@ fn two_argument_if_preserves_the_selected_type_and_null_branch() {
 }
 
 #[test]
+fn nullif_preserves_left_type_and_demands_only_present_rows() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [
+        column("x", 1, DataType::Int32, true),
+        column("d", 2, DataType::Int64, true),
+    ];
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(Int32Array::from(vec![
+                None,
+                Some(7),
+                Some(5),
+                Some(7),
+                Some(9),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(0),
+                Some(0),
+                Some(2),
+                Some(2),
+                None,
+            ])),
+        ],
+    );
+    let checked = evaluate(&compile("NULLIF(x, 10 / d)", &columns, &context), &input);
+    assert_eq!(
+        checked.batch.result_type,
+        FunctionValueType::new(DataType::Int32, true)
+    );
+    assert_eq!(
+        checked.batch.values.to_data(),
+        Int32Array::from(vec![None, None, None, Some(7), Some(9)]).to_data()
+    );
+    let [error] = checked.batch.errors.as_ref() else {
+        panic!("only the present left row with zero divisor fails");
+    };
+    assert_eq!(error.selected_ordinal(), 1);
+    assert_eq!(error.reason(), DataFailureReason::DivisionByZero);
+    let caught = evaluate(
+        &compile("TRY(NULLIF(x, 10 / d))", &columns, &context),
+        &input,
+    );
+    assert!(caught.batch.errors.is_empty());
+    assert_eq!(
+        caught.batch.values.to_data(),
+        checked.batch.values.to_data()
+    );
+}
+
+#[test]
+fn nullif_nested_unknown_keeps_the_original_array() {
+    use arrow::array::{ListArray, types};
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let left: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int32Type, _, _>([
+        Some(vec![Some(1), None]),
+    ]));
+    let right: ArrayRef = Arc::new(ListArray::from_iter_primitive::<types::Int64Type, _, _>([
+        Some(vec![Some(1), None]),
+    ]));
+    let columns = [
+        column("x", 1, left.data_type().clone(), false),
+        column("y", 2, right.data_type().clone(), false),
+    ];
+    let input = batch(&columns, vec![left.clone(), right]);
+    let checked = evaluate(&compile("NULLIF(x, y)", &columns, &context), &input);
+    assert!(checked.batch.errors.is_empty());
+    assert_eq!(checked.batch.values.to_data(), left.to_data());
+}
+
+#[test]
 fn extrema_keep_selected_values_with_exact_width_and_nested_null_order() {
     let functions = fixture();
     let parameters = parameters();

@@ -1884,6 +1884,7 @@ const DYNAMIC_SCALAR_FUNCTIONS: &[&str] = &[
     "zip",
     "greatest",
     "least",
+    "nullif",
     "map",
     "map_concat",
     "map_entries",
@@ -2831,6 +2832,57 @@ impl BuiltinDynamicScalarResolver {
                 aggregate: None,
             });
         }
+        if self.canonical_name.as_ref() == "nullif" {
+            let [
+                FunctionArgument::Value {
+                    value_type: left, ..
+                },
+                FunctionArgument::Value {
+                    value_type: right, ..
+                },
+            ] = request.arguments
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            };
+            let common = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.trino_common(left, right)
+            })?
+            .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            let left_comparison = dynamic_nullable(
+                &common,
+                left.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            let right = dynamic_nullable(
+                &common,
+                right.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            work.flush()?;
+            super::operator_kernel::comparison_recipe(
+                novarocks_type_contract::OperatorFunction::Equal,
+                [&left_comparison, &right],
+                work.control(),
+            )?;
+            let result = dynamic_nullable(left, true, work, borrow_creator(&mut creation))?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.array::<FunctionArgumentType>(2)
+            })?;
+            let argument_types = with_binding_creation(creation, work, |cx| {
+                cx.publish_arguments(vec![
+                    FunctionArgumentType::Value(left.clone()),
+                    FunctionArgumentType::Value(right),
+                ])
+            })?;
+            return Ok(FunctionBindingSelection {
+                overload: overload.clone(),
+                argument_types,
+                result_type: FunctionResultType::Scalar(result),
+                aggregate: None,
+            });
+        }
         let result = bind_dynamic_scalar_result_with_creation(
             &self.function_id,
             overload,
@@ -3014,7 +3066,6 @@ fn scalar_overload_effects(
         name if super::scalar_rows_owner::operation(name).is_some() => {
             super::scalar_rows_owner::operation(name).map(super::scalar_rows_owner::effects)
         }
-        "nullif" => Some(super::nullif_owner::effects()),
         name if super::control_owner::operation(name).is_some() => {
             Some(super::control_owner::effects(
                 super::control_owner::operation(name).expect("matched control operation"),
@@ -3186,7 +3237,7 @@ pub(super) fn dynamic_definition_parts(
         })?;
     let overload_identity = if name == "map" {
         "builtin.scalar/map/array-keys-array-values-v1".to_string()
-    } else if super::scalar_extrema_owner::operation(name) {
+    } else if super::scalar_extrema_owner::operation(name) || name == "nullif" {
         format!("builtin.scalar/{name}/dynamic-v2")
     } else {
         format!("builtin.scalar/{name}/dynamic-v1")
@@ -3211,6 +3262,7 @@ pub(super) fn dynamic_definition_parts(
         "__array_literal" => Some(super::array_literal_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
         "round" => Some(super::round_owner::effects()),
+        "nullif" => Some(super::nullif_owner::effects()),
         name if super::scalar_extrema_owner::operation(name) => {
             Some(super::scalar_extrema_owner::effects())
         }
@@ -3223,6 +3275,7 @@ pub(super) fn dynamic_definition_parts(
         "map_entries" => &[("map(K,V)", "array(row(K,V))")],
         "greatest" | "least" => &[("T...", "T")],
         "round" | "truncate" => super::rounding_binding::public_signatures(name),
+        "nullif" => &[("T, T", "T")],
         _ => &[],
     };
     let overload_declaration = if let Some(effects) = pure_effects {
@@ -3364,6 +3417,7 @@ pub fn contribute_builtin_functions(
             }
             "truncate" => super::truncate_owner::definition(declaration, resolver)?,
             "round" => super::round_owner::definition(declaration, resolver)?,
+            "nullif" => super::nullif_owner::definition(declaration, resolver)?,
             name if super::scalar_extrema_owner::operation(name) => {
                 super::scalar_extrema_owner::definition(name, declaration, resolver)?
             }
@@ -3450,7 +3504,6 @@ pub fn contribute_builtin_functions(
             name if super::scalar_rows_owner::operation(name).is_some() => {
                 super::scalar_rows_owner::definition(name, declaration, resolver)?
             }
-            "nullif" => super::nullif_owner::definition(&name, declaration, resolver)?,
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }

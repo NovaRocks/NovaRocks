@@ -55,6 +55,7 @@ enum SimpleGuard {
   SIMPLE_GUARD_LAMBDA_INVOCATION = 4;
   SIMPLE_GUARD_TEMPORAL_INVOCATION_NULL = 5;
   SIMPLE_GUARD_TRY_BODY = 6;
+  SIMPLE_GUARD_NULL_IF_AFTER_LEFT = 7;
 }
 enum EvaluationDemand {
   EVALUATION_DEMAND_UNSPECIFIED = 0;
@@ -78,6 +79,7 @@ message ControlShape {
     TemporalSourceShape temporal_source = 4;
     bool between_negated = 5;
     bool membership_negated = 6;
+    NullIfControl null_if = 7;
   }
 }
 enum SimpleControl {
@@ -93,6 +95,11 @@ enum SimpleControl {
   SIMPLE_CONTROL_TRY = 9;
   // Source is argument 0 and the pattern conversion occurs at argument 1.
   SIMPLE_CONTROL_ORDERED_REGEXP = 10;
+}
+// Argument 0 is the retained value. Argument 1 belongs to its non-NULL region;
+// the comparison consumes the exact catalogue equality identity.
+message NullIfControl {
+  string equality_function = 1;
 }
 message CaseControl {
   bool simple = 1;

@@ -574,12 +574,11 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // because the two `T` slots disagree concretely.
     //
     //   ifnull(a, b)     -> wider_type(a, b)
-    //   nullif(a, b)     -> wider_type(a, b)
     //   nvl(a, b)        -> wider_type(a, b)
     //   coalesce(...)    -> wider_type over all args
     //   case(...)        -> wider_type over all args
     //   if(cond, t, e)   -> wider_type(t, e) — first arg is Boolean
-    for name in ["ifnull", "nullif", "nvl"] {
+    for name in ["ifnull", "nvl"] {
         add(
             m,
             name,

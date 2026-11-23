@@ -69,6 +69,10 @@ pub fn state_template(
         PreparedPureKernel::ControlIntrinsic(call) => {
             Some(UnitStateTemplate::ControlIntrinsic { scope, call })
         }
+        PreparedPureKernel::NullIf(prepared) => Some(UnitStateTemplate::ControlIntrinsic {
+            scope,
+            call: prepared.call(),
+        }),
         _ => None,
     }
 }
