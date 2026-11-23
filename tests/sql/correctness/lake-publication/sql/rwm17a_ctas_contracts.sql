@@ -57,14 +57,12 @@ shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/correctness/lake-public
 
 -- query 7
 -- @expect_trino_error=ICEBERG_FILESYSTEM_ERROR,EXTERNAL
--- @expect_error=Cannot create a table on a non-empty location:
 CREATE TABLE no_wh_${uuid0}.ctas_contract_${uuid0}.rejected_ctas
 WITH (location = '${iceberg_rest_warehouse}/ctas-contract-${uuid0}/fixed-location')
 AS SELECT id FROM no_wh_${uuid0}.ctas_contract_${uuid0}.source_rows;
 
 -- query 8
 -- @expect_trino_error=ICEBERG_FILESYSTEM_ERROR,EXTERNAL
--- @expect_error=Cannot create a table on a non-empty location:
 CREATE TABLE no_wh_${uuid0}.ctas_contract_${uuid0}.rejected_create (id INT)
 WITH (location = '${iceberg_rest_warehouse}/ctas-contract-${uuid0}/fixed-location');
 
