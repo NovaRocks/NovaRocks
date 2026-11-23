@@ -191,7 +191,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
         "sql.analyze.function_not_aggregate" => "FUNCTION_NOT_AGGREGATE",
         "sql.analyze.expression_not_scalar" => "EXPRESSION_NOT_SCALAR",
-        "sql.admit.unknown_type" => "TYPE_NOT_FOUND",
+        "sql.admit.unknown_type" | "sql.analyze.unknown_type" => "TYPE_NOT_FOUND",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
         "sql.analyze.invalid_type_argument" => "INVALID_FUNCTION_ARGUMENT",

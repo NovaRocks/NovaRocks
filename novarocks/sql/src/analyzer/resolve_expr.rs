@@ -6532,6 +6532,42 @@ mod tests {
     }
 
     #[test]
+    fn derived_char_concat_width_preserves_type_resolution_failure() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_type_contract::{CharacterKind, ValueTypeError};
+
+        for (left, right) in [("'a'", "'b'"), ("NULL", "NULL")] {
+            let query = format!(
+                "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32768))))"
+            );
+            let expression = analyze_projection_expr(&query).unwrap();
+            assert!(matches!(
+                expression.kind,
+                ExprKind::Literal(LiteralValue::String(value)) if value == "char(65536)"
+            ));
+
+            let query = novarocks_parser::parser::parse_query(&format!(
+                "SELECT typeof(concat(CAST({left} AS CHAR(32768)), CAST({right} AS CHAR(32769))))"
+            ))
+            .unwrap();
+            let error = analyze(&query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnknownType);
+            assert_eq!(error.code().as_str(), "sql.analyze.unknown_type");
+            assert_eq!(error.message(), "Unknown type: char(65537)");
+            assert_eq!(
+                error
+                    .source_failure()
+                    .unwrap()
+                    .downcast_ref::<ValueTypeError>(),
+                Some(&ValueTypeError::InvalidCharacterWidth {
+                    kind: CharacterKind::Char,
+                    length: 65537,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn recognized_unsupported_string_profiles_report_named_capability() {
         use crate::analyze_error::AnalyzeErrorKind;
         for (expression, overload) in [
@@ -8419,6 +8455,30 @@ mod tests {
         }
     }
 
+    fn assert_substring_bigint_literal(argument: &TypedExpr, expected: i64) {
+        use novarocks_type_contract::TrinoCastMode;
+
+        assert_eq!(argument.value_type.data_type(), &DataType::Int64);
+        assert!(!argument.value_type.nullable());
+        let original = if i32::try_from(expected).is_ok() {
+            let ExprKind::Cast {
+                expr,
+                target: DataType::Int64,
+                cast_mode: Some(TrinoCastMode::Implicit),
+                ..
+            } = &argument.kind
+            else {
+                panic!("expected implicit widening of the INTEGER literal {expected}");
+            };
+            assert_eq!(expr.value_type.data_type(), &DataType::Int32);
+            assert!(!expr.value_type.nullable());
+            expr.as_ref()
+        } else {
+            argument
+        };
+        assert_eq!(super::signed_int_literal_value(original), Some(expected));
+    }
+
     #[test]
     fn substring_function_syntax_binds_integer_literals_to_bigint() {
         for (sql, values) in [
@@ -8436,14 +8496,7 @@ mod tests {
             };
             assert_eq!(args.len(), values.len() + 1);
             for (arg, expected) in args.iter().skip(1).zip(values) {
-                assert_eq!(arg.value_type.data_type(), &DataType::Int64);
-                assert!(!arg.value_type.nullable());
-                assert!(matches!(
-                    arg.kind,
-                    crate::analysis::ExprKind::Literal(
-                        crate::analysis::LiteralValue::Int(value)
-                    ) if value == *expected
-                ));
+                assert_substring_bigint_literal(arg, *expected);
             }
         }
     }
@@ -8474,11 +8527,7 @@ mod tests {
                 matches!(&args[0].kind, ExprKind::Literal(LiteralValue::String(value)) if value == "x")
             );
             for (argument, expected) in args.iter().skip(1).zip([2, 3]) {
-                assert_eq!(argument.value_type.data_type(), &DataType::Int64);
-                assert!(!argument.value_type.nullable());
-                assert!(
-                    matches!(argument.kind, ExprKind::Literal(LiteralValue::Int(value)) if value == expected)
-                );
+                assert_substring_bigint_literal(argument, expected);
             }
         }
     }

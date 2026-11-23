@@ -361,6 +361,8 @@ impl PadRow<'_> {
     }
 }
 
+type SelectedPadRow<'a> = Result<Option<(PadRow<'a>, i64)>, &'static str>;
+
 pub(super) fn evaluate_string_pad<'a>(
     op: StringPadOp,
     input: ScalarCallInput<'_, 'a>,
@@ -402,60 +404,59 @@ pub(super) fn evaluate_string_pad<'a>(
             ));
         }
         let left = op == StringPadOp::Left;
-        let selected_plan =
-            |ordinal,
-             batch_row,
-             work: &mut EvaluationCheckpoints<'_>|
-             -> Result<Result<Option<(PadRow<'_>, i64)>, &'static str>, KernelFailure> {
-                let mut rows = [0usize; 3];
-                let mut is_null = false;
-                for (index, argument) in arguments.iter().enumerate() {
-                    let row = argument.value_row(ordinal, batch_row);
-                    rows[index] = row;
-                    work.step()?;
-                    if row >= argument.array().len() {
-                        return Err(internal("lpad/rpad selected argument row is out of bounds"));
-                    }
-                    if argument.array().is_null(row) {
-                        let FunctionArgumentType::Value(ty) = &types[index] else {
-                            return Err(invalid("lpad/rpad requires value arguments"));
-                        };
-                        if !ty.nullable() {
-                            return Err(internal(
-                                "lpad/rpad non-null argument contains selected SQL NULL",
-                            ));
-                        }
-                        is_null = true;
-                    }
+        let selected_plan = |ordinal,
+                             batch_row,
+                             work: &mut EvaluationCheckpoints<'_>|
+         -> Result<SelectedPadRow<'_>, KernelFailure> {
+            let mut rows = [0usize; 3];
+            let mut is_null = false;
+            for (index, argument) in arguments.iter().enumerate() {
+                let row = argument.value_row(ordinal, batch_row);
+                rows[index] = row;
+                work.step()?;
+                if row >= argument.array().len() {
+                    return Err(internal("lpad/rpad selected argument row is out of bounds"));
                 }
-                if is_null {
-                    return Ok(Ok(None));
+                if argument.array().is_null(row) {
+                    let FunctionArgumentType::Value(ty) = &types[index] else {
+                        return Err(invalid("lpad/rpad requires value arguments"));
+                    };
+                    if !ty.nullable() {
+                        return Err(internal(
+                            "lpad/rpad non-null argument contains selected SQL NULL",
+                        ));
+                    }
+                    is_null = true;
                 }
-                let length = lengths.value(rows[1]);
-                let row = if let Some((strings, pads)) = texts {
-                    PadRow::Text {
-                        source: strings.value(rows[0]),
-                        fill: pads.value(rows[2]),
-                        char_width,
-                    }
-                } else if let Some((binaries, pads)) = binaries {
-                    PadRow::Binary {
-                        source: binaries.value(rows[0]),
-                        fill: pads.value(rows[2]),
-                    }
-                } else {
-                    return Err(internal("lpad/rpad did not prepare a value carrier"));
-                };
-                if trino {
-                    if !(0..=i64::from(i32::MAX)).contains(&length) {
-                        return Ok(Err("Target length must be in the range [0..2147483647]"));
-                    }
-                    if row.empty_fill() {
-                        return Ok(Err("Padding must not be empty"));
-                    }
+            }
+            if is_null {
+                return Ok(Ok(None));
+            }
+            let length = lengths.value(rows[1]);
+            let row = if let Some((strings, pads)) = texts {
+                PadRow::Text {
+                    source: strings.value(rows[0]),
+                    fill: pads.value(rows[2]),
+                    char_width,
                 }
-                Ok(Ok(Some((row, length))))
+            } else if let Some((binaries, pads)) = binaries {
+                PadRow::Binary {
+                    source: binaries.value(rows[0]),
+                    fill: pads.value(rows[2]),
+                }
+            } else {
+                return Err(internal("lpad/rpad did not prepare a value carrier"));
             };
+            if trino {
+                if !(0..=i64::from(i32::MAX)).contains(&length) {
+                    return Ok(Err("Target length must be in the range [0..2147483647]"));
+                }
+                if row.empty_fill() {
+                    return Ok(Err("Padding must not be empty"));
+                }
+            }
+            Ok(Ok(Some((row, length))))
+        };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;

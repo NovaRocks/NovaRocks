@@ -6,11 +6,16 @@ id	f_text	d_text	n_text	f_crc32	d_crc32	n_crc32
 3	NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 3
--- types	bigint	bigint	bigint	bigint
-float_zero	double_integral	null_crc32	largeint_min
-1895675758	443688442	NULL	1844565061
+-- types	bigint	bigint	bigint	varchar	bigint
+float_zero	double_integral	null_crc32	decimal_text	decimal_crc32
+1895675758	443688442	NULL	-99999999999999999999999999999999999999	2945294312
 
 -- query 4
--- types	varchar	bigint	bigint
-double_text	double_crc32	exact_crc32
-1.2345678901234568E29	2675941984	720457058
+-- types	varchar	bigint	varchar	bigint
+double_text	double_crc32	exact_text	exact_crc32
+1.2345678901234568E29	2675941984	123456789012345678901234567890.12345678	2433517284
+
+-- query 5
+-- types	varchar	bigint	varchar	bigint
+i128_min_text	i128_min_crc32	wide_decimal_text	wide_decimal_crc32
+-170141183460469231731687303715884105728	1844565061	123456789012345678901234567890.123456789	720457058

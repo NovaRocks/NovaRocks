@@ -41,7 +41,7 @@ const OBSERVATION_QUERIES: [&str; 2] = [
 ];
 const CANCELLATION_QUERY: &str =
     "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
-const REGEXP_CANCELLATION_QUERY: &str = "SELECT sum(regexp_count(rpad('', 8192, chr(97 + mod(i, 2))), 'a+a+a+a+a+a+z')) FROM TABLE(sequence(1, 100000)) AS t(i)";
+const REGEXP_CANCELLATION_QUERY: &str = "SELECT sum(regexp_count(rpad('', 8192, CASE WHEN i <= BIGINT '50000' THEN 'a' ELSE 'b' END), 'a+a+a+a+a+a+z')) FROM TABLE(sequence(1, 100000)) AS t(i)";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(ObservationFamilies::default())]

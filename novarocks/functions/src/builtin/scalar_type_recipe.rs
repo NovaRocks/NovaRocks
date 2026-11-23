@@ -16,12 +16,13 @@
 //! The original TypeSpec realization decision, consumed by either its pure
 //! constructor or exact selected-type comparison. Binding/pass authorization
 //! remains with the original resolver; this value is not a selection proof.
+use super::scalar_construction::{Failure, ScalarConstruction, pure_value};
 use super::signature::{Bindings, TypeSpec, realize};
 use crate::{FunctionBindingError, FunctionValueType};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     BorrowedTypedValueBinding, CharacterKind, CharacterType, CompileCheckpoints, ValueKind,
-    ValueLogicalType,
+    ValueLogicalType, ValueTypeError,
 };
 
 #[derive(Clone, Copy)]
@@ -49,21 +50,26 @@ impl<'a> ScalarTypeRecipe<'a> {
     fn child(self, spec: &'a TypeSpec, nullable: bool) -> Self {
         Self::new(spec, self.bindings, nullable)
     }
-    fn rule(self) -> Result<RealizationRule<'a>, String> {
+    fn rule<E>(self) -> Result<RealizationRule<'a>, Failure<E>> {
         Ok(match self.spec {
             TypeSpec::Any(name)
             | TypeSpec::Decimal128Of(name)
             | TypeSpec::Decimal256Of(name)
-            | TypeSpec::MapWithUninhabitedKey { map: name, .. } => RealizationRule::Source(
-                self.bindings
-                    .lookup_value_borrowed(name)
-                    .ok_or_else(|| format!("value type variable {name} is unbound"))?,
-            ),
+            | TypeSpec::MapWithUninhabitedKey { map: name, .. } => {
+                RealizationRule::Source(self.bindings.lookup_value_borrowed(name).ok_or_else(
+                    || Failure::Rule(format!("value type variable {name} is unbound")),
+                )?)
+            }
             TypeSpec::AnyType | TypeSpec::AnyDecimal128 => {
-                return Err("wildcard has no intrinsic result type".into());
+                return Err(Failure::Rule(
+                    "wildcard has no intrinsic result type".into(),
+                ));
             }
             TypeSpec::Character(kind, width) => {
-                let width = self.bindings.character_width(*width)?;
+                let width = self
+                    .bindings
+                    .character_width(*width)
+                    .map_err(Failure::Rule)?;
                 match (kind, width) {
                     (CharacterKind::Varchar, None) => {
                         RealizationRule::Scalar(DataType::Utf8, ValueLogicalType::Physical)
@@ -78,18 +84,21 @@ impl<'a> ScalarTypeRecipe<'a> {
                         let character = u32::try_from(width)
                             .ok()
                             .and_then(|width| CharacterType::new(*kind, width))
-                            .ok_or_else(|| "character result width is out of range".to_owned())?;
+                            .ok_or(ValueTypeError::InvalidCharacterWidth {
+                                kind: *kind,
+                                length: width,
+                            })?;
                         RealizationRule::Character(character)
                     }
                     (CharacterKind::Char, None) => {
-                        return Err("CHAR requires a finite width".into());
+                        return Err(Failure::Rule("CHAR requires a finite width".into()));
                     }
                 }
             }
             TypeSpec::List(item) => RealizationRule::List(item),
             TypeSpec::Map(key, value) => RealizationRule::Map(key, value),
             spec => RealizationRule::Scalar(
-                realize(spec, self.bindings)?,
+                realize(spec, self.bindings).map_err(Failure::Rule)?,
                 match spec {
                     TypeSpec::LargeInt => ValueLogicalType::LargeInt,
                     TypeSpec::Bitmap => ValueLogicalType::Bitmap,
@@ -99,14 +108,18 @@ impl<'a> ScalarTypeRecipe<'a> {
             ),
         })
     }
+    fn binding_rule(self) -> Result<RealizationRule<'a>, FunctionBindingError> {
+        self.rule().map_err(|error| match error {
+            Failure::Rule(message) => FunctionBindingError::InvalidBinding(message.into()),
+            error => pure_value(error).into(),
+        })
+    }
+
     pub(super) fn materialize_with_construction<E>(
         self,
-        creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
-    ) -> Result<FunctionValueType, super::scalar_construction::Failure<E>> {
-        let result = match self
-            .rule()
-            .map_err(super::scalar_construction::Failure::Rule)?
-        {
+        creation: &mut ScalarConstruction<'_, E>,
+    ) -> Result<FunctionValueType, Failure<E>> {
+        let result = match self.rule()? {
             RealizationRule::Source(source) => source.clone(),
             RealizationRule::Scalar(carrier, domain) => {
                 creation.value(carrier, self.nullable, domain)?
@@ -145,10 +158,7 @@ impl<'a> ScalarTypeRecipe<'a> {
         if actual.value_type().nullable() != self.nullable {
             return Ok(false);
         }
-        match self
-            .rule()
-            .map_err(|error| FunctionBindingError::InvalidBinding(error.into()))?
-        {
+        match self.binding_rule()? {
             RealizationRule::Source(source) => source
                 .typed_binding()
                 .borrowed()
@@ -226,10 +236,7 @@ impl<'a> ScalarTypeRecipe<'a> {
         if actual.value_type().nullable() != self.nullable {
             return Ok(false);
         }
-        let RealizationRule::Scalar(carrier, _) = self
-            .rule()
-            .map_err(|error| FunctionBindingError::InvalidBinding(error.into()))?
-        else {
+        let RealizationRule::Scalar(carrier, _) = self.binding_rule()? else {
             return Err(FunctionBindingError::InvalidBinding(
                 "fixed scalar result-domain override has no original scalar carrier".into(),
             ));

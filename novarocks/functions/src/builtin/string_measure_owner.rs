@@ -649,7 +649,8 @@ mod tests {
         let uses = [Some(ExpressionUseId::new(62))];
         for name in NAMES {
             let owner = owner(name);
-            for source in [FunctionValueType::new(DataType::LargeUtf8, true)] {
+            {
+                let source = FunctionValueType::new(DataType::LargeUtf8, true);
                 let raw = [argument(source)];
                 let selected = Arc::new(
                     owner

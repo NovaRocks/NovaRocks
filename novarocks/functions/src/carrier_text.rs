@@ -112,33 +112,6 @@ impl novarocks_failure_contract::FailureProjection for CarrierTextFailure {
     }
 }
 impl novarocks_failure_contract::OuterFailureProjection for CarrierTextFailure {}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    #[test]
-    fn primitive_integer_text_matches_original_arrow_rendering() {
-        let arrays: Vec<ArrayRef> = vec![
-            Arc::new(Int8Array::from(vec![Some(i8::MIN), None, Some(i8::MAX)])),
-            Arc::new(Int16Array::from(vec![Some(i16::MIN), None, Some(i16::MAX)])),
-            Arc::new(Int32Array::from(vec![Some(i32::MIN), None, Some(i32::MAX)])),
-            Arc::new(Int64Array::from(vec![Some(i64::MIN), None, Some(i64::MAX)])),
-            Arc::new(UInt8Array::from(vec![Some(0), None, Some(u8::MAX)])),
-            Arc::new(UInt16Array::from(vec![Some(0), None, Some(u16::MAX)])),
-            Arc::new(UInt32Array::from(vec![Some(0), None, Some(u32::MAX)])),
-            Arc::new(UInt64Array::from(vec![Some(0), None, Some(u64::MAX)])),
-            Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
-        ];
-        for array in arrays {
-            let original = arrow_cast::cast(&array, &DataType::Utf8).unwrap();
-            let original = original.as_any().downcast_ref::<StringArray>().unwrap();
-            for row in [0, 2] {
-                assert_eq!(render(array.as_ref(), row).unwrap(), original.value(row));
-            }
-        }
-    }
-}
-
 pub fn format_float64_for_varchar(value: f64) -> String {
     if value == 0.0 {
         return "0".to_string();
@@ -241,5 +214,32 @@ pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str
         format!("{timestamp_str} {tz}")
     } else {
         timestamp_str
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    #[test]
+    fn primitive_integer_text_matches_original_arrow_rendering() {
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![Some(i8::MIN), None, Some(i8::MAX)])),
+            Arc::new(Int16Array::from(vec![Some(i16::MIN), None, Some(i16::MAX)])),
+            Arc::new(Int32Array::from(vec![Some(i32::MIN), None, Some(i32::MAX)])),
+            Arc::new(Int64Array::from(vec![Some(i64::MIN), None, Some(i64::MAX)])),
+            Arc::new(UInt8Array::from(vec![Some(0), None, Some(u8::MAX)])),
+            Arc::new(UInt16Array::from(vec![Some(0), None, Some(u16::MAX)])),
+            Arc::new(UInt32Array::from(vec![Some(0), None, Some(u32::MAX)])),
+            Arc::new(UInt64Array::from(vec![Some(0), None, Some(u64::MAX)])),
+            Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+        ];
+        for array in arrays {
+            let original = arrow_cast::cast(&array, &DataType::Utf8).unwrap();
+            let original = original.as_any().downcast_ref::<StringArray>().unwrap();
+            for row in [0, 2] {
+                assert_eq!(render(array.as_ref(), row).unwrap(), original.value(row));
+            }
+        }
     }
 }

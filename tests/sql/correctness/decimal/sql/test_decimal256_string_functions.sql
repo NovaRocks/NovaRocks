@@ -113,7 +113,7 @@ ORDER BY id;
 SELECT
     'Test7_CASE_SPECIAL_FORMATTING' as test_name,
     id,
-    category,
+    CAST(category AS VARCHAR(10)) as category,
     d50_15,
     UPPER(CONCAT(category, '_', CAST(d50_15 AS VARCHAR))) as upper_formatted,
     LOWER(CONCAT(category, '_', CAST(d50_15 AS VARCHAR))) as lower_formatted

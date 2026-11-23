@@ -350,7 +350,7 @@ fn regexp_literal_and_column_patterns_have_the_same_data_error_policy() {
         assert_eq!(empty.values().data_type(), &DataType::Int64);
         assert!(empty.errors().is_empty());
     }
-    let (program, _) = text_program("regexp_count(s,'.')", &[source.clone()]).unwrap();
+    let (program, _) = text_program("regexp_count(s,'.')", std::slice::from_ref(&source)).unwrap();
     let actual = evaluate(
         &mut instance(&program, &allocation),
         &batch(&[source], vec![input]),

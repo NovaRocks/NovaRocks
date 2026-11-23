@@ -1,7 +1,7 @@
 -- query 3
--- types	varchar	varchar	varchar	varchar
-_col0	_col1	_col2	_col3
-AB01	ABAB	ABAC	61623031
+-- types	varchar	varchar	varchar	varchar	bigint	bigint	bigint
+_col0	_col1	_col2	_col3	c1_bytes	c2_bytes	c3_bytes
+AB01	ABAB	ABAC	61623031	2	2	2
 
 -- query 5
 -- types	varchar	varchar	varchar	varchar

@@ -70,7 +70,8 @@ SELECT from_hex('XY');
 SELECT from_base64('AA=');
 
 -- query 10
--- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+-- A negative replacement reaches the UTF-8 decoder when a byte must be replaced.
+-- @expect_trino_error=GENERIC_INTERNAL_ERROR,INTERNAL_ERROR
 SELECT from_utf8(X'FF', BIGINT '-1');
 
 -- query 11
@@ -134,3 +135,11 @@ SELECT c0, decoded = raw AS exact_bytes, crc32(decoded) AS crc,
        to_hex(md5(decoded)) AS digest_hex
 FROM prepared
 ORDER BY c0;
+
+-- query 23
+-- The replacement above the Unicode range fails validation even for valid UTF-8.
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT from_utf8(X'41', BIGINT '1114112');
+
+-- query 24
+SELECT from_utf8(X'41', BIGINT '-1') AS unchanged;

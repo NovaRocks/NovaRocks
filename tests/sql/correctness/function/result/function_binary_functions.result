@@ -34,7 +34,7 @@ c0	byte_count	raw_hex	decoded_hex	base64	decoded_base64	crc
 1	2	AB01	EFBFBD01	qwE=	69BD35	2066564939
 2	2	ABAB	EFBFBDEFBFBD	q6s=	69B69B	1294863805
 3	2	FF00	EFBFBD00	/wA=	FF00	3539857293
-4	0					0
+4	0	""	""	""	""	0
 5	NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 22
@@ -43,3 +43,8 @@ c0	exact_bytes	crc	digest_hex
 3	true	3539857293	E0E8BFAFBB0689563B2FBA789C97B3CC
 4	true	0	D41D8CD98F00B204E9800998ECF8427E
 5	NULL	NULL	NULL
+
+-- query 24
+-- types	varchar
+unchanged
+A

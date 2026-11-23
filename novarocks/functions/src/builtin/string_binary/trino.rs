@@ -469,7 +469,7 @@ fn visit(
                     if code > 0x10ffff || (0xd800..=0xdfff).contains(&narrowed) {
                         return Ok(Err("Invalid UTF-8 replacement code point"));
                     }
-                    char::from_u32(narrowed).map(|ch| &*ch.encode_utf8(&mut encoded).as_bytes())
+                    char::from_u32(narrowed).map(|ch| ch.encode_utf8(&mut encoded).as_bytes())
                 }
             };
             if !visit_utf8(bytes, replacement, work, emit)? {

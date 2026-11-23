@@ -8132,10 +8132,26 @@ mod tests {
             expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64
         );
-        for position in &args[1..] {
+        for (position, expected) in args[1..].iter().zip([1, 6]) {
             assert_eq!(
                 position.value_type.data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            let ExprKind::Cast {
+                expr,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
+                ..
+            } = &position.kind
+            else {
+                panic!("expected the original INTEGER position widened to BIGINT");
+            };
+            assert_eq!(
+                expr.value_type.data_type(),
                 &arrow::datatypes::DataType::Int32
+            );
+            assert_eq!(
+                super::resolve_expr::signed_int_literal_value(expr),
+                Some(expected)
             );
         }
     }

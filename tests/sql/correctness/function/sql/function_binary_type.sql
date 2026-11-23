@@ -16,19 +16,13 @@
 -- under the License.
 
 -- Migrated from dev/test/sql/test_binary_type
--- Test Objective:
--- 1. Validate BINARY(n) column type: padded storage, hex output.
--- 2. Validate BINARY (no length), VARBINARY, VARCHAR(n) in same table.
--- 3. Validate INSERT and SELECT to_hex() across binary column types.
--- 4. Validate INSERT INTO ... SELECT * across tables with matching binary schema.
--- 5. Validate INSERT of hex literal into varbinary column (equivalent
---    to the previous stream_load JSON path, which is not supported in
---    standalone-server).
+-- Preserve exact VARBINARY bytes and VARCHAR encoding through inserts and table copies.
+-- Integer encodings verify the fixed eight-byte representation and hexadecimal display.
 
 -- query 1
--- Create table with BINARY(16), BINARY, VARBINARY, VARCHAR columns
+-- Create a table with binary and character columns.
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t0(c0 INT, c1 binary(16), c2 VARBINARY, c3 varbinary, c4 varchar(16)) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t0(c0 INT, c1 VARBINARY, c2 VARBINARY, c3 VARBINARY, c4 varchar(16)) WITH (format_version = 3);
 
 -- query 2
 -- Insert one row using hex literals
@@ -36,8 +30,10 @@ CREATE TABLE ${case_db}.t0(c0 INT, c1 binary(16), c2 VARBINARY, c3 varbinary, c4
 INSERT INTO ${case_db}.t0 VALUES ROW(1, X'ab01', X'abab', X'abac', 'ab01');
 
 -- query 3
--- BINARY(16) pads to 16 bytes; BINARY pads to 1 byte; VARBINARY stores exact bytes
-SELECT to_hex(c1), to_hex(c2), to_hex(c3), to_hex(to_utf8(c4)) FROM ${case_db}.t0 ORDER BY c0;
+-- VARBINARY stores the exact inserted bytes and lengths.
+SELECT to_hex(c1), to_hex(c2), to_hex(c3), to_hex(to_utf8(c4)),
+       length(c1) AS c1_bytes, length(c2) AS c2_bytes, length(c3) AS c3_bytes
+FROM ${case_db}.t0 ORDER BY c0;
 
 -- query 4
 -- Insert second row; both rows should appear
@@ -50,7 +46,7 @@ SELECT to_hex(c1), to_hex(c2), to_hex(c3), to_hex(to_utf8(c4)) FROM ${case_db}.t
 -- query 6
 -- Create t1 with the same schema; insert via SELECT *
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1(c0 INT, c1 binary(16), c2 VARBINARY, c3 varbinary, c4 varchar(16)) WITH (format_version = 3);
+CREATE TABLE ${case_db}.t1(c0 INT, c1 VARBINARY, c2 VARBINARY, c3 VARBINARY, c4 varchar(16)) WITH (format_version = 3);
 
 -- query 7
 -- @skip_result_check=true

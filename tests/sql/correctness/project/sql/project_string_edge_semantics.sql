@@ -42,3 +42,15 @@ SELECT NORMALIZE(U&'e\0301', nfd);
 -- query 6
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT codepoint(CAST('a' AS VARCHAR));
+
+-- query 7
+SELECT typeof(concat(CAST('a' AS CHAR(32768)), CAST('b' AS CHAR(32768)))) AS char_concat_type,
+       typeof(concat(CAST(NULL AS CHAR(32768)), CAST(NULL AS CHAR(32768)))) AS null_char_concat_type;
+
+-- query 8
+-- @expect_trino_error=TYPE_NOT_FOUND,USER_ERROR
+SELECT typeof(concat(CAST('a' AS CHAR(32768)), CAST('b' AS CHAR(32769))));
+
+-- query 9
+-- @expect_trino_error=TYPE_NOT_FOUND,USER_ERROR
+SELECT typeof(concat(CAST(NULL AS CHAR(32768)), CAST(NULL AS CHAR(32769))));

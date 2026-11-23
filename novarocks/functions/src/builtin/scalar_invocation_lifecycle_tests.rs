@@ -22,7 +22,7 @@ use crate::{
     InvocationScalarEvaluationInstance, InvocationScalarKernelInstance,
     PreparedInvocationScalarKernel, ScalarCallInput, ScalarInvocationActivation,
 };
-use arrow_array::{Array, StringArray};
+use arrow_array::{Array, Int64Array};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
@@ -126,7 +126,7 @@ fn scalar_invocation_lifecycle_full_data_has_no_footer_latches_and_retains_actua
         Some(host.clone()),
     )
     .unwrap();
-    let input: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![Some("original")]));
+    let input: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![Some(42)]));
     let arguments = [crate::EvaluatedArgument::Column(&input)];
     let control = Control::default();
     let result = instance.evaluate(
@@ -173,7 +173,7 @@ fn scalar_invocation_lifecycle_all_seven_owner_causes_return_without_tail_or_rep
             Some(host.clone()),
         )
         .unwrap();
-        let input: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![Some("original")]));
+        let input: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![Some(42)]));
         let arguments = [crate::EvaluatedArgument::Column(&input)];
         let control = Control::default();
         assert_eq!(
@@ -217,7 +217,7 @@ fn scalar_invocation_lifecycle_actual_empty_activation_is_distinct_from_validati
             Some(host.clone()),
         )
         .unwrap();
-        let input: arrow_array::ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+        let input: arrow_array::ArrayRef = Arc::new(Int64Array::from(Vec::<Option<i64>>::new()));
         let arguments = [crate::EvaluatedArgument::Column(&input)];
         let activation = if activated {
             ScalarInvocationActivation::Activated
@@ -279,7 +279,7 @@ fn scalar_invocation_lifecycle_every_actual_callback_cause_has_no_tail() {
         Some(host.clone()),
     )
     .unwrap();
-    let input: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![Some("original")]));
+    let input: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![Some(42)]));
     let arguments = [crate::EvaluatedArgument::Column(&input)];
     let control = Control::default();
     let result = instance.evaluate(

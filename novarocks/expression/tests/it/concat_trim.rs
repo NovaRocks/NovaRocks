@@ -41,7 +41,7 @@ use std::{
 
 const CONCAT_NAMES: [&str; 2] = ["concat", "concat_ws"];
 const TRIM_NAMES: [&str; 3] = ["trim", "ltrim", "rtrim"];
-const WHITE: &str = "\t\n\u{b}\u{c}\r \u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+const WHITE: &str = "\t\n\u{b}\u{c}\r \u{1c}\u{1d}\u{1e}\u{1f}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{205f}\u{3000}";
 
 fn compiled_slot_program(
     name: &str,
@@ -230,15 +230,14 @@ fn c12_p1_trim_actual_compiled_slot_and_sparse_strict_null_match_v1() {
             } else {
                 strings(&[Some(" \u{2003}x\u{a0}"), None, Some(""), Some(WHITE)])
             }];
-            // U+2003 EM SPACE and U+00A0 NO-BREAK SPACE are Unicode
-            // White_Space; left/right retain the opposite boundary verbatim.
+            // Trino trims U+2003 EM SPACE and preserves U+00A0 NO-BREAK SPACE.
             let expected = if all_null {
                 [None; 4]
             } else {
                 match name {
-                    "trim" => [Some("x"), None, Some(""), Some("")],
+                    "trim" => [Some("x\u{a0}"), None, Some(""), Some("")],
                     "ltrim" => [Some("x\u{a0}"), None, Some(""), Some("")],
-                    "rtrim" => [Some(" \u{2003}x"), None, Some(""), Some("")],
+                    "rtrim" => [Some(" \u{2003}x\u{a0}"), None, Some(""), Some("")],
                     _ => unreachable!(),
                 }
             };
@@ -280,7 +279,11 @@ fn concat_trim_checked_constants_keep_pool_values_and_selection() {
         &arrays,
         &[None; 4],
     );
-    for (name, text) in [("trim", "x"), ("ltrim", "x\u{a0}"), ("rtrim", " \u{2003}x")] {
+    for (name, text) in [
+        ("trim", "x\u{a0}"),
+        ("ltrim", "x\u{a0}"),
+        ("rtrim", " \u{2003}x\u{a0}"),
+    ] {
         let arrays = [strings(&[Some("wrong"), None, Some(""), Some(WHITE)])];
         assert_selections(
             compiled_slot_program(name, &arrays, Some((0, Some(" \u{2003}x\u{a0}"))), false),

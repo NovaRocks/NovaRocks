@@ -377,6 +377,7 @@ fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_sele
     assert_eq!(original_cv.value_type().data_type().clone(), DataType::Null);
     let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
     let typed_cv = constant(&operational[0]).unwrap();
+    let ty = nullable_bounded_character(novarocks_type_contract::CharacterKind::Char, 0);
     assert_eq!(typed_cv.value_type(), &ty);
     assert_ne!(
         typed_cv.pool().backing_identity(),

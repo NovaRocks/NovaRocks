@@ -33,16 +33,16 @@ CREATE TABLE IF NOT EXISTS t0
 INSERT INTO t0
 (c0, c1, c2, c3)
 VALUES
-ROW('9', '8', '-23765.20', 'foo1'),
-ROW('7', '1', '92426.92', 'foo6'),
-ROW('2', '1', '-96540.02', 'foo10'),
-ROW('7', '8', '-96540.02', 'foo1'),
-ROW('5', '3', '70459.31', 'foo10'),
-ROW('6', '1', '66032.48', 'foo9'),
-ROW('4', '2', '-99763.42', 'foo2'),
-ROW('1', '2', '92426.92', 'foo1'),
-ROW('8', '9', '73215.84', 'foo10'),
-ROW('5', '3', '45826.02', 'foo6');
+ROW(9, 8, DECIMAL '-23765.20', 'foo1'),
+ROW(7, 1, DECIMAL '92426.92', 'foo6'),
+ROW(2, 1, DECIMAL '-96540.02', 'foo10'),
+ROW(7, 8, DECIMAL '-96540.02', 'foo1'),
+ROW(5, 3, DECIMAL '70459.31', 'foo10'),
+ROW(6, 1, DECIMAL '66032.48', 'foo9'),
+ROW(4, 2, DECIMAL '-99763.42', 'foo2'),
+ROW(1, 2, DECIMAL '92426.92', 'foo1'),
+ROW(8, 9, DECIMAL '73215.84', 'foo10'),
+ROW(5, 3, DECIMAL '45826.02', 'foo6');
 
 -- query 2
 USE ${case_db};

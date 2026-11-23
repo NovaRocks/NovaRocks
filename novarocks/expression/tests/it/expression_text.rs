@@ -369,7 +369,6 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
         Err(TextError::UnknownColumn { name, .. }) if name == "unknown"
     ));
     for (text, name) in [
-        ("TRIM(x)", "trim"),
         ("count(x)", "count"),
         ("x.y", "qualified name or field reference"),
     ] {
@@ -387,6 +386,16 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     assert_eq!(result.batch.result_type, columns[0].value_type);
     assert_eq!(result.batch.values.to_data(), values.to_data());
 
+    let trim = type_text("TRIM(x)").unwrap();
+    let values = Arc::new(StringArray::from(vec!["  original value  "]));
+    assert_eq!(
+        evaluate(&trim, &batch(&columns, vec![values]))
+            .batch
+            .values
+            .to_data(),
+        StringArray::from(vec!["original value"]).to_data()
+    );
+
     let cast = type_text("CAST(x AS BIGINT)").unwrap();
     let root = cast
         .unit()
@@ -402,7 +411,12 @@ fn parser_column_migration_and_type_errors_keep_their_identity() {
     ));
     assert!(matches!(
         type_text("TRIM('a' FROM x)"),
-        Err(TextError::UnsupportedSyntax(cause)) if cause.message == "explicit TRIM characters are not supported"
+        Err(TextError::Typing {
+            cause: TypingError::Binding(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(overload)
+            ),
+            ..
+        }) if overload.as_str() == "builtin.scalar/trim/trino-varchar-codepoints-v1"
     ));
     for source in [
         "-NULL",

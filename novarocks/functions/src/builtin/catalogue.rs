@@ -1052,6 +1052,7 @@ pub(super) fn binding_resolution_error(error: ResolveError) -> FunctionBindingEr
         ResolveError::AmbiguousSignature { .. } => FunctionBindingError::AmbiguousOverload,
         ResolveError::Control(error) => FunctionBindingError::Control(error),
         ResolveError::BadSignature(message) => FunctionBindingError::InvalidBinding(message.into()),
+        ResolveError::ResultType(error) => FunctionBindingError::ValueType(error),
     }
 }
 

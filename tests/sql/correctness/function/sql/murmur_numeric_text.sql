@@ -15,7 +15,7 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Assert the exact VARCHAR rendering and CRC32 of REAL, DOUBLE, and integral inputs.
+-- Assert exact VARCHAR rendering and CRC32 for REAL, DOUBLE, BIGINT, and DECIMAL.
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
@@ -33,18 +33,39 @@ FROM murmur_numeric_text ORDER BY id;
 
 -- query 3
 USE ${case_db};
+WITH bound AS (
+    SELECT CAST('-99999999999999999999999999999999999999' AS DECIMAL(38,0)) AS n
+)
 SELECT crc32(to_utf8(CAST(CAST(0 AS REAL) AS VARCHAR))) AS float_zero,
        crc32(to_utf8(CAST(CAST(7 AS DOUBLE) AS VARCHAR))) AS double_integral,
        crc32(to_utf8(CAST(CAST(NULL AS DOUBLE) AS VARCHAR))) AS null_crc32,
-       crc32(to_utf8(CAST(CAST('-170141183460469231731687303715884105728' AS LARGEINT) AS VARCHAR))) AS largeint_min;
+       CAST(n AS VARCHAR) AS decimal_text,
+       crc32(to_utf8(CAST(n AS VARCHAR))) AS decimal_crc32
+FROM bound;
 
 -- query 4
 USE ${case_db};
-SELECT CAST(CAST(123456789012345678901234567890.123456789 AS DOUBLE) AS VARCHAR) AS double_text,
-       crc32(to_utf8(CAST(CAST(123456789012345678901234567890.123456789 AS DOUBLE) AS VARCHAR))) AS double_crc32,
-       crc32(to_utf8(CAST(123456789012345678901234567890.123456789 AS VARCHAR))) AS exact_crc32;
+WITH exact AS (
+    SELECT CAST('123456789012345678901234567890.12345678' AS DECIMAL(38,8)) AS n
+)
+SELECT CAST(CAST(n AS DOUBLE) AS VARCHAR) AS double_text,
+       crc32(to_utf8(CAST(CAST(n AS DOUBLE) AS VARCHAR))) AS double_crc32,
+       CAST(n AS VARCHAR) AS exact_text,
+       crc32(to_utf8(CAST(n AS VARCHAR))) AS exact_crc32
+FROM exact;
 
 -- query 5
+-- These 39-digit values exceed the supported SQL DECIMAL precision. Keep their exact text bytes.
+SELECT i128_min_text, crc32(to_utf8(i128_min_text)) AS i128_min_crc32,
+       wide_decimal_text, crc32(to_utf8(wide_decimal_text)) AS wide_decimal_crc32
+FROM (
+    VALUES (
+        CAST('-170141183460469231731687303715884105728' AS VARCHAR),
+        CAST('123456789012345678901234567890.123456789' AS VARCHAR)
+    )
+) AS texts(i128_min_text, wide_decimal_text);
+
+-- query 6
 -- @skip_result_check=true
 USE ${case_db};
 DROP TABLE murmur_numeric_text;

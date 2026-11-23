@@ -18,6 +18,7 @@
 //! Public observation of complete optional-fold units before plan publication.
 
 use crate::fixtures::{compile_table_free, expression_sources, session, text};
+use arrow::array::BinaryArray;
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, ExprNode, RootOrdinal};
 use novarocks_functions::{ConstantPolicy, ConstantValue};
@@ -151,13 +152,43 @@ fn sql_fold_dependency_real_upper_removed_from_plan_keeps_exact_binding_and_cv()
     assert_eq!(args.len(), 1);
     assert_eq!(text(&receipt.constant(args[0])), "Straße");
     let result = receipt.result.as_ref().unwrap();
-    assert_eq!(text(result), "STRASSE");
+    assert_eq!(text(result), "STRAßE");
     assert_eq!(
         result.value_type().data_type(),
         function.result_type.data_type()
     );
     assert_eq!(function.result_type, receipt.root().ty);
     assert!(receipts.iter().all(|receipt| receipt.result.is_some()));
+}
+
+#[test]
+fn sql_fold_dependency_keeps_actual_binary_between_decode_and_encode() {
+    let probe = Arc::new(FoldProbe::default());
+    compile_table_free(
+        "SELECT to_base64(from_base64('/wA='))",
+        session(Default::default(), true),
+        &probe.control(),
+    )
+    .unwrap();
+    let receipts = probe.receipts.lock().unwrap();
+    let decoded = receipts
+        .iter()
+        .find(|receipt| receipt.is_call("builtin.scalar/from_base64/v1"))
+        .and_then(|receipt| receipt.result.as_ref())
+        .unwrap();
+    let bytes = decoded
+        .pool()
+        .array()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(bytes.value(decoded.ordinal() as usize), [0xff, 0]);
+    let encoded = receipts
+        .iter()
+        .find(|receipt| receipt.is_call("builtin.scalar/to_base64/v1"))
+        .and_then(|receipt| receipt.result.as_ref())
+        .unwrap();
+    assert_eq!(text(encoded), "/wA=");
 }
 
 #[test]

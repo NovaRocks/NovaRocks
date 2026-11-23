@@ -377,9 +377,15 @@ impl<H> ScopedFailure<H> for ResolutionFailure<H> {
         Self::Creator(error)
     }
     fn source(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
-        Self::Resolution(crate::FunctionResolutionError::BadSignature(
-            novarocks_type_contract::ValueTypeError::from(error).to_string(),
-        ))
+        use novarocks_type_contract::ValueTypeError;
+
+        let error = ValueTypeError::from(error);
+        Self::Resolution(match error {
+            ValueTypeError::InvalidCharacterWidth { .. } => {
+                crate::FunctionResolutionError::ResultType(error)
+            }
+            error => crate::FunctionResolutionError::BadSignature(error.to_string()),
+        })
     }
     fn rule(error: String) -> Self {
         Self::Resolution(crate::FunctionResolutionError::BadSignature(error))
