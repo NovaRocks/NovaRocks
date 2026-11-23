@@ -16,18 +16,21 @@
 -- under the License.
 
 -- @expect_error_tier=drift
--- Variant definitions are refused independently of the target format version.
+-- SQL admission refuses Variant independently of the target format version.
 -- The legacy case name is retained so the existing targeted selection stays valid.
 -- query 1
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 CREATE TABLE ${case_db}.variant_default_v2 (id INT,v VARIANT);
 
 -- query 2
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 CREATE TABLE ${case_db}.variant_explicit_v2 (id INT,v VARIANT) WITH (format_version = 2);
 
 -- query 3
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 CREATE TABLE ${case_db}.variant_explicit_v3 (id INT,v VARIANT) WITH (format_version = 3);
 
 -- query 4
@@ -41,25 +44,28 @@ CREATE TABLE ${case_db}.variant_alter_v3 (id INT,s ROW(x INT)) WITH (format_vers
 CREATE TABLE IF NOT EXISTS ${case_db}.variant_alter_v3 (id INT,v VARIANT) WITH (format_version = 3);
 
 -- query 6
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 ALTER TABLE ${case_db}.variant_alter_v2 ADD COLUMN v VARIANT;
 
 -- query 7
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 ALTER TABLE ${case_db}.variant_alter_v3 ADD COLUMN v VARIANT;
 
 -- query 8
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 ALTER TABLE ${case_db}.variant_alter_v3 ADD COLUMN s.v VARIANT;
 
 -- query 9
--- MODIFY retains the existing type-evolution rule instead of introducing Variant.
--- @expect_error=unsupported Iceberg type evolution from int to variant
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 ALTER TABLE ${case_db}.variant_alter_v3 ALTER COLUMN id SET DATA TYPE VARIANT;
 
 -- query 10
--- The new-definition refusal precedes the old Variant partition-source check.
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_ddl_cat_${suite_uuid0}.${case_db}.variant_partition_rejected, column v
+-- @expect_sql_code=sql.admit.unsupported_statement
+-- @expect_error=SQL type variant is not supported
 CREATE TABLE ${case_db}.variant_partition_rejected (id INT,v VARIANT) WITH (partitioning = ARRAY['v'], format_version = 3);
 
 -- query 11
