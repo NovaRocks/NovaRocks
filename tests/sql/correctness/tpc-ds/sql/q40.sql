@@ -34,8 +34,8 @@ select
  and i_item_sk          = cs_item_sk
  and cs_warehouse_sk    = w_warehouse_sk 
  and cs_sold_date_sk    = d_date_sk
- and d_date between date_add(cast ('2000-03-11' as date), -30)
-                and date_add(cast ('2000-03-11' as date), 30)
+ and d_date between date_add('day', -30, CAST('2000-03-11' AS DATE))
+                and date_add('day', 30, CAST('2000-03-11' AS DATE))
  group by
     w_state,i_item_id
  order by w_state,i_item_id

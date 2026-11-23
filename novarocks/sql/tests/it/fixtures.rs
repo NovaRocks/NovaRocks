@@ -64,6 +64,20 @@ pub(super) fn table_free_request(
     session: SqlSessionContext,
     control: &SqlCompileControl,
 ) -> SqlFinalPlanCompileRequest {
+    table_free_request_with_constant_policy(
+        sql,
+        session,
+        control,
+        novarocks_sql_testkit::sql_fixture_constant_policy(),
+    )
+}
+
+pub(super) fn table_free_request_with_constant_policy(
+    sql: &str,
+    session: SqlSessionContext,
+    control: &SqlCompileControl,
+    policy: novarocks_functions::ConstantPolicy,
+) -> SqlFinalPlanCompileRequest {
     SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([84; 16]).unwrap(),
         SqlStatementInput::parsed_query(novarocks_sql_testkit::parse_query(sql)),
@@ -72,7 +86,7 @@ pub(super) fn table_free_request(
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        novarocks_sql_testkit::sql_fixture_constant_policy(),
+        policy,
         control.clone(),
         PipelineDopDomain {
             min: 1,

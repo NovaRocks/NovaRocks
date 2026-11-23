@@ -94,6 +94,7 @@ pub fn installed_builtin_owner_catalogue() -> PureEngineFunctionCatalog {
         let records: Result<Vec<_>, crate::FunctionSpecializationFailure> = declaration
             .overloads()
             .iter()
+            .filter(|overload| !definition.is_declared_only_pure_overload(&overload.identity))
             .map(|overload| {
                 let actual = metadata.pure_overload_declaration_observed(
                     declaration.function_id(),

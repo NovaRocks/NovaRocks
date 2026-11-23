@@ -43,8 +43,9 @@ pub use literal::{LiteralEmission, LiteralSyntax, TypedLiteral, supports_typed_s
 pub use route::{ScalarTypingRoute, scalar_typing_route};
 pub use syntax_constant::{LiteralValue, admit_syntax_constant};
 pub use temporal::{
-    TemporalSyntax, at_zone_syntax, bind_temporal_syntax, clock_syntax, declared_temporal_type,
-    qualified_datetime_difference, select_temporal_cast, temporal_function_value_type,
+    TemporalSyntax, at_zone_syntax, bind_extract, bind_temporal_syntax, clock_syntax,
+    declared_temporal_type, qualified_datetime_difference, select_temporal_cast,
+    temporal_function_value_type,
 };
 
 /// Project numeric and comparison syntax into the installed operator vocabulary.
@@ -273,6 +274,7 @@ pub enum NodeTyping {
 pub enum TypingError {
     TypeMismatch(String),
     InvalidLiteral(String),
+    NumericOutOfRange(String),
     Unsupported(String),
     InvalidShape(&'static str),
     Binding(FunctionBindingError),
@@ -328,6 +330,7 @@ impl fmt::Display for TypingError {
         match self {
             Self::TypeMismatch(message)
             | Self::InvalidLiteral(message)
+            | Self::NumericOutOfRange(message)
             | Self::Unsupported(message) => f.write_str(message),
             Self::InvalidShape(message) => f.write_str(message),
             Self::Binding(error) => error.fmt(f),

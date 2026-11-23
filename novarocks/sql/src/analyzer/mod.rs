@@ -8167,7 +8167,7 @@ mod tests {
     #[test]
     fn date_trunc_return_type_comes_from_value_argument() {
         let resolved = parse_and_analyze(
-            "select date_trunc('week', o_orderstatus), date_trunc('week', o_orderdate) from orders",
+            "select date_trunc('week', TIMESTAMP '2026-11-22 00:00:00.123456'), date_trunc('week', o_orderdate) from orders",
         )
         .expect("date_trunc should analyze");
         let QueryBody::Select(sel) = &resolved.body else {

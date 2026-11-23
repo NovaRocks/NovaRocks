@@ -189,22 +189,22 @@ fingerprint
 32033071100705
 
 -- query 42
--- legacy
+-- types	bigint	bigint
 _col0	cnt
 1	1
 
 -- query 43
--- legacy
+-- types	bigint	bigint
 _col0	cnt
 1	1
 
 -- query 44
--- legacy
+-- types	bigint
 cnt
 1
 
 -- query 45
--- legacy
+-- types	bigint
 cnt
 1
 

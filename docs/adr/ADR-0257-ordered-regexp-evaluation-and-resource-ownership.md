@@ -1,5 +1,5 @@
 ---
-id: ADR-0256
+id: ADR-0257
 title: "Ordered regexp evaluation and resource ownership"
 domain: [sql-language, sql-compiler, expression-evaluation]
 status: active

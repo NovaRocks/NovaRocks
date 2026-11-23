@@ -546,6 +546,7 @@ enum BindingResolverOwnerKind {
     BorrowedTemporalArithmetic(
         Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
     ),
+    BorrowedDateShift(Arc<crate::builtin::date_shift_owner::DateShiftResolver>),
     BorrowedTemporalContext(Arc<crate::builtin::temporal_context::TemporalContextResolver>),
     BorrowedBinaryOperator(Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>),
     ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
@@ -583,6 +584,11 @@ impl FunctionBindingResolverOwner {
         owner: Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner))
+    }
+    pub(crate) fn borrowed_date_shift(
+        owner: Arc<crate::builtin::date_shift_owner::DateShiftResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedDateShift(owner))
     }
     pub(crate) fn borrowed_temporal_context(
         owner: Arc<crate::builtin::temporal_context::TemporalContextResolver>,
@@ -628,6 +634,9 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedDateShift(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
@@ -651,6 +660,7 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedDateShift(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),

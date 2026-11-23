@@ -332,6 +332,8 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
+
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
 
 - [ADR-0254](ADR-0254-exact-temporal-values-and-frozen-statement-time.md) — 精确时态值如何保留逐值时区，语句环境与规则如何在折叠、执行、存储和结果呈现之间传递（active）
@@ -342,7 +344,7 @@ code-anchors:
 - [ADR-0250](ADR-0250-standard-numeric-operator-semantics.md) — 标准数值怎样经共享定型和普通调用冻结，并保留遗留宽数消费者（active）
 
 - [ADR-0249](ADR-0249-trino-public-functions-and-internal-aggregate-identities.md) — Trino 公开候选如何尊重可见性，标准 DISTINCT 如何保留内部准确重载和状态（active）
-- [ADR-0256](ADR-0256-ordered-regexp-evaluation-and-resource-ownership.md) — 正则模式如何在原实参位置受控编译、搜索和归还资源（active）
+- [ADR-0257](ADR-0257-ordered-regexp-evaluation-and-resource-ownership.md) — 正则模式如何在原实参位置受控编译、搜索和归还资源（active）
 - [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
 - [ADR-0244](ADR-0244-operators-are-identified-catalogue-functions.md) — 隐藏目录函数为何按身份表示运算符，如何沿普通调用迁移、渲染和折叠（active；部分替代 ADR-0242 的取负范围）
 

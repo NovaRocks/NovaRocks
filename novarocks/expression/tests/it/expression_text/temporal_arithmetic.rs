@@ -341,3 +341,192 @@ fn temporal_arithmetic_live_time_rows_and_typed_date_errors_follow_the_same_oper
         DataFailureReason::Domain(INVALID_FUNCTION_ARGUMENT),
     );
 }
+
+#[test]
+fn temporal_date_add_keeps_month_end_and_actual_row_errors() {
+    use novarocks_function_contract::kernel_failure::DATE_RESULT_OUT_OF_RANGE;
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let result = constant("date_add('MoNtH', 1, DATE '2024-01-31')", &context);
+    let days = result
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    assert_eq!(days.value(0), 19782);
+
+    let rejected = compile(
+        "TRY(date_add('day', 1, DATE '+5881580-07-11'))",
+        &[],
+        &context,
+    );
+    let rows = evaluate(&rejected, &batch(&[], vec![]));
+    assert_eq!(rows.batch.errors.len(), 1);
+    assert_eq!(
+        rows.batch.errors[0].reason(),
+        DataFailureReason::Domain(DATE_RESULT_OUT_OF_RANGE)
+    );
+
+    let caught = constant("TRY(date_add('hour', 1, DATE '2024-01-31'))", &context);
+    assert!(caught.batch.values.is_null(0));
+    let unselected = constant(
+        "CASE WHEN false THEN date_add('day', 1, DATE '+5881580-07-11') ELSE DATE '1970-01-01' END",
+        &context,
+    );
+    let days = unselected
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    assert_eq!(days.value(0), 0);
+}
+
+#[test]
+fn calendar_difference_and_truncation_use_trino_units_and_precision() {
+    use novarocks_function_contract::kernel_failure::DATE_RESULT_OUT_OF_RANGE;
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for (sql, expected) in [
+        (
+            "date_diff('month', DATE '2024-01-31', DATE '2024-02-29')",
+            1,
+        ),
+        ("date_diff('day', DATE '2024-03-01', DATE '2024-02-28')", -2),
+        (
+            "date_diff('millisecond', TIMESTAMP '1969-12-31 23:59:59.9999', TIMESTAMP '1970-01-01 00:00:00.0001')",
+            1,
+        ),
+        (
+            "date_diff('hour', TIME '00:00:00+02:00', TIME '01:00:00+00:00')",
+            -21,
+        ),
+        (
+            "date_diff('day', DATE '2024-03-09', TIMESTAMP '2024-03-10 01:00:00.1234')",
+            1,
+        ),
+    ] {
+        let result = constant(sql, &context);
+        let values = result
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), expected, "{sql}");
+    }
+
+    let rejected = constant(
+        "TRY(date_trunc('microsecond', TIMESTAMP '1970-01-01 00:00:00.000000000001'))",
+        &context,
+    );
+    assert!(rejected.batch.values.is_null(0));
+
+    for sql in [
+        "TRY(date_trunc('week', DATE '-5877641-06-23'))",
+        "TRY(last_day_of_month(DATE '+5881580-07-11'))",
+    ] {
+        let unit = compile(sql, &[], &context);
+        let checked = evaluate(&unit, &batch(&[], vec![]));
+        assert_eq!(checked.batch.errors.len(), 1, "{sql}");
+        assert_eq!(
+            checked.batch.errors[0].reason(),
+            DataFailureReason::Domain(DATE_RESULT_OUT_OF_RANGE),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn extract_preserves_field_domain_binding_and_interval_capability() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for (sql, expected) in [
+        ("EXTRACT(YOW FROM DATE '2021-01-01')", 2020),
+        ("EXTRACT(WEEK FROM DATE '2021-01-01')", 53),
+        ("EXTRACT(DOW FROM DATE '2021-01-03')", 7),
+        ("day_of_year(DATE '2024-03-01')", 61),
+        ("hour(TIME '13:54:11')", 13),
+        ("EXTRACT(TIMEZONE_MINUTE FROM TIME '02:00:00-03:45')", -45),
+        (
+            "EXTRACT(MONTH FROM TIMESTAMP '2024-03-01 00:15:00+13:00')",
+            3,
+        ),
+    ] {
+        let result = constant(sql, &context);
+        let values = result
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), expected, "{sql}");
+    }
+    for sql in [
+        "EXTRACT(HOUR FROM DATE '2024-01-01')",
+        "EXTRACT(YEAR FROM INTERVAL '25' MONTH)",
+        "EXTRACT(DAY_OF_MONTH FROM INTERVAL '1' DAY)",
+    ] {
+        assert!(
+            matches!(
+                type_expression_text(sql, &[], &context, &HarnessControl),
+                Err(TextError::Typing {
+                    cause: TypingError::TypeMismatch(_),
+                    ..
+                })
+            ),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "year(INTERVAL '25' MONTH)",
+        "EXTRACT(HOUR FROM INTERVAL '36' HOUR)",
+    ] {
+        assert!(
+            matches!(
+                type_expression_text(sql, &[], &context, &HarnessControl),
+                Err(TextError::Typing {
+                    cause: TypingError::Binding(
+                        novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+                    ),
+                    ..
+                })
+            ),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn date_projection_reuses_the_exact_date_conversion() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for sql in [
+        "date(' 2024-2-29 ')",
+        "date(DATE '2024-02-29')",
+        "date(TIMESTAMP '2024-02-29 00:15:00+13:00')",
+        "date(TIMESTAMP '2024-02-29 23:30:00.9999')",
+    ] {
+        let result = constant(sql, &context);
+        let values = result
+            .batch
+            .values
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 19782, "{sql}");
+    }
+    assert!(
+        constant("TRY(date('2024-02-30'))", &context)
+            .batch
+            .values
+            .is_null(0)
+    );
+}

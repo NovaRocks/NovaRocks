@@ -254,7 +254,7 @@ fn installed_exact_scalar_owners_reauthor_nullable_numeric_text_calendar_and_col
     for (name, input, carrier) in [
         ("abs", DataType::Int64, DataType::FixedSizeBinary(16)),
         ("upper", DataType::Utf8, DataType::Utf8),
-        ("year", DataType::Date32, DataType::Int32),
+        ("year", DataType::Date32, DataType::Int64),
     ] {
         let selected = canonical(
             &catalog,

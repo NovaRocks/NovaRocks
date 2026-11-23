@@ -64,6 +64,29 @@ fn dedicated_syntax_maps_to_canonical_name_and_ordered_source_children() {
         ("EXTRACT(HOUR FROM x)", "hour", &["x"]),
         ("EXTRACT(MINUTE FROM x)", "minute", &["x"]),
         ("EXTRACT(SECOND FROM x)", "second", &["x"]),
+        ("EXTRACT(QUARTER FROM x)", "quarter", &["x"]),
+        ("EXTRACT(WEEK FROM x)", "week", &["x"]),
+        ("EXTRACT(DAY_OF_MONTH FROM x)", "day_of_month", &["x"]),
+        ("EXTRACT(DAY_OF_WEEK FROM x)", "day_of_week", &["x"]),
+        ("EXTRACT(DOW FROM x)", "day_of_week", &["x"]),
+        ("EXTRACT(DAY_OF_YEAR FROM x)", "day_of_year", &["x"]),
+        ("EXTRACT(DOY FROM x)", "day_of_year", &["x"]),
+        (
+            "EXTRACT(YEAR_OF_WEEK FROM x)",
+            "__extract_year_of_week",
+            &["x"],
+        ),
+        ("EXTRACT(YOW FROM x)", "__extract_year_of_week", &["x"]),
+        (
+            "EXTRACT(TIMEZONE_MINUTE FROM x)",
+            "__extract_timezone_minute",
+            &["x"],
+        ),
+        (
+            "EXTRACT(TIMEZONE_HOUR FROM x)",
+            "__extract_timezone_hour",
+            &["x"],
+        ),
     ];
     for &(source, name, expected_arguments) in cases {
         let expr = parse_expression(source).unwrap();
@@ -102,22 +125,6 @@ fn syntax_without_a_canonical_call_preserves_the_rejection() {
         ("\"if\"(a, b)", "two-argument IF is not supported"),
     ] {
         assert_unsupported(source, message);
-    }
-    for field in [
-        "quarter",
-        "week",
-        "day_of_month",
-        "day_of_week",
-        "dow",
-        "day_of_year",
-        "doy",
-        "year_of_week",
-        "yow",
-        "timezone_minute",
-        "timezone_hour",
-    ] {
-        let source = format!("EXTRACT({} FROM x)", field.to_ascii_uppercase());
-        assert_unsupported(&source, &format!("unsupported EXTRACT field: {field}"));
     }
 }
 

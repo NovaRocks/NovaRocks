@@ -95,6 +95,18 @@ impl<'a> TextTyping<'a> {
         }
         let span = expr.span();
         let next = depth + 1;
+        if let ast::Expr::Extract(extract) = expr {
+            let source = self.lower(&extract.expression, work, next)?;
+            work.flush()?;
+            let binding = crate::typing::bind_extract(
+                self.context.catalog,
+                extract.field,
+                &source.typing.argument(),
+                work.control(),
+            )
+            .map_err(|cause| typing_error(cause, span))?;
+            return Ok(TextNode::call(binding, None, vec![source]));
+        }
         if let Some(call) = canonical_call(expr).map_err(TextError::UnsupportedSyntax)? {
             let shape = if call.name == "row" {
                 Some(NodeShape::Row)

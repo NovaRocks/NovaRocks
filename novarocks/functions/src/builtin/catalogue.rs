@@ -2926,30 +2926,12 @@ fn scalar_overload_effects(
         super::array_element_at_owner::SUBSCRIPT_NAME => {
             Some(super::array_element_at_owner::subscript_effects())
         }
-        name if super::calendar_unixtime_owner::operation(name).is_some() => {
-            Some(super::calendar_unixtime_owner::effects())
-        }
         name if super::map_projection_owner::operation(name).is_some() => {
             Some(super::map_projection_owner::effects())
         }
         name if super::collection_cardinality_owner::operation(name).is_some() => {
             Some(super::collection_cardinality_owner::effects())
         }
-        name if super::calendar_period_diff_owner::operation(name).is_some() => {
-            Some(super::calendar_period_diff_owner::effects())
-        }
-        name if super::calendar_diff_owner::operation(name).is_some() => {
-            Some(super::calendar_diff_owner::effects())
-        }
-        name if super::calendar_extended_owner::operation(name).is_some() => {
-            Some(super::calendar_extended_owner::effects(
-                super::calendar_extended_owner::operation(name).expect("matched operation"),
-            ))
-        }
-        name if super::calendar_parts_owner::operation(name).is_some() => {
-            Some(super::calendar_parts_owner::effects())
-        }
-        name if super::date_owner::operation(name).is_some() => Some(super::date_owner::effects()),
         "reverse" => Some(super::string_reverse_owner::effects()),
         "dround" => Some(super::dround_owner::effects()),
         name if super::bit_shift_owner::operation(name).is_some() => {
@@ -3139,7 +3121,10 @@ pub fn contribute_builtin_functions(
     builder: &mut EngineFunctionCatalogBuilder,
 ) -> Result<(), FunctionCatalogError> {
     builder.register(super::value_conversion::value_conversion_definition()?)?;
-    builder.register(super::temporal_context::definition()?)?;
+    super::temporal_context::register(builder)?;
+    for &operation in super::date_shift_owner::FUNCTIONS {
+        builder.register(super::date_shift_owner::definition(operation)?)?;
+    }
     for operator in super::temporal_arithmetic_owner::OPERATORS {
         builder.register(super::temporal_arithmetic_owner::definition(operator)?)?;
     }
@@ -3276,29 +3261,11 @@ pub fn contribute_builtin_functions(
             "__array_element_at" | super::array_element_at_owner::SUBSCRIPT_NAME => {
                 super::array_element_at_owner::definition(&name, declaration, resolver)?
             }
-            name if super::calendar_unixtime_owner::operation(name).is_some() => {
-                super::calendar_unixtime_owner::definition(name, declaration, resolver)?
-            }
             name if super::map_projection_owner::operation(name).is_some() => {
                 super::map_projection_owner::definition(name, declaration, resolver)?
             }
             name if super::collection_cardinality_owner::operation(name).is_some() => {
                 super::collection_cardinality_owner::definition(name, declaration, resolver)?
-            }
-            name if super::calendar_period_diff_owner::operation(name).is_some() => {
-                super::calendar_period_diff_owner::definition(name, declaration, resolver)?
-            }
-            name if super::calendar_diff_owner::operation(name).is_some() => {
-                super::calendar_diff_owner::definition(name, declaration, resolver)?
-            }
-            name if super::calendar_extended_owner::operation(name).is_some() => {
-                super::calendar_extended_owner::definition(name, declaration, resolver)?
-            }
-            name if super::calendar_parts_owner::operation(name).is_some() => {
-                super::calendar_parts_owner::definition(name, declaration, resolver)?
-            }
-            name if super::date_owner::operation(name).is_some() => {
-                super::date_owner::definition(name, declaration, resolver)?
             }
             name if super::string_parse_url_owner::operation(name).is_some() => {
                 super::string_parse_url_owner::definition(name, declaration, resolver)?
@@ -3616,10 +3583,7 @@ pub fn builtin_engine_function_catalog() -> &'static EngineFunctionCatalog {
 ///   rather than with the clock functions.
 pub fn builtin_function_volatility(name: &str) -> FunctionVolatility {
     match name.to_ascii_lowercase().as_str() {
-        "rand" | "random" | "uuid" | "sleep" | "now" | "current_timestamp" | "current_date"
-        | "curdate" | "current_time" | "curtime" | "localtime" | "localtimestamp" => {
-            FunctionVolatility::Volatile
-        }
+        "rand" | "random" | "uuid" | "sleep" => FunctionVolatility::Volatile,
         _ => FunctionVolatility::Immutable,
     }
 }

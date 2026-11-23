@@ -386,7 +386,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(year(days_add('2025-01-01', v3))) over(partition by v1 order by v2) as arr_basic
+  array_agg(CAST(year(date_add('day', v3, DATE '2025-01-01')) AS INTEGER)) over(partition by v1 order by v2) as arr_basic
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(
@@ -398,7 +398,7 @@ CROSS JOIN UNNEST(concat(
 USE ${case_db};
 SELECT sum(fingerprint_value) AS fingerprint FROM (
   select v1, v2, v3,
-  array_agg(month(days_add('2025-01-01', v3))) over(partition by v1 order by v2) as arr_basic
+  array_agg(CAST(month(date_add('day', v3, DATE '2025-01-01')) AS INTEGER)) over(partition by v1 order by v2) as arr_basic
   from t0
 ) as t
 CROSS JOIN UNNEST(concat(

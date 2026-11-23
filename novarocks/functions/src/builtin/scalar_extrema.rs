@@ -359,7 +359,7 @@ fn evaluate_values(
                     decoded.push(None);
                 }
             } else {
-                let reader = super::calendar_extended::DateInput::raw(array.as_ref())
+                let reader = super::calendar_input::DateInput::raw(array.as_ref())
                     .map_err(|e| raw_error(e.legacy_message(), boundary))?;
                 for ordinal in 0..count {
                     work.step()?;

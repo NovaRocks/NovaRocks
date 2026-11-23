@@ -19,12 +19,12 @@ use super::*;
 use crate::constant::test_constant_policy;
 use crate::optimizer::test_optimizer_control;
 use arrow::array::{
-    Array, FixedSizeBinaryArray, Float32Array, Int32Array, UInt32Array, make_array, new_null_array,
+    Array, FixedSizeBinaryArray, Float32Array, Int32Array, StringArray, UInt32Array, make_array,
+    new_null_array,
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::i256;
 use novarocks_failure_contract::{FailureClass, FailureProjection};
-use novarocks_functions::ConstantError;
 use novarocks_type_contract::{
     CompileControlError, NR_LOGICAL_TYPE_KEY, ValueLayout, ValueTypeStorageLifetime,
 };
@@ -255,34 +255,18 @@ impl PureCompileControl for RecordingControl {
 }
 
 #[test]
-fn explicit_result_policy_refusal_is_typed_preparation_and_has_no_later_callback() {
-    let output = Arc::new(Int32Array::from(vec![3])) as ArrayRef;
-    let ty = FunctionValueType::new(DataType::Int32, false);
+fn optional_fold_declines_values_that_exceed_the_constant_pool_limit() {
+    let ty = FunctionValueType::new(DataType::Utf8, false);
     let policy = ConstantPolicy {
-        max_rows: 0,
+        max_retained_buffer_bytes: 256,
         ..test_constant_policy()
     };
-    let assert_limit = |control: &RecordingControl| {
-        let Err(SqlCompileError::CompilationSource(source)) =
-            admit_result(output.clone(), &ty, policy, control)
-        else {
-            panic!("the constant pool policy must reject the result");
-        };
-        assert!(matches!(
-            source.downcast_ref::<ConstantError>(),
-            Some(ConstantError::Limit(_))
-        ));
-    };
-    let recording = RecordingControl::default();
-    assert_limit(&recording);
-    let trace = recording.calls.into_inner().unwrap();
-    assert!(!trace.is_empty());
-    let refusing = RecordingControl {
-        fail_at: Some((trace.len(), CompileControlError::Cancelled)),
-        ..Default::default()
-    };
-    assert_limit(&refusing);
-    assert_eq!(refusing.calls.into_inner().unwrap(), trace);
+    let control = test_optimizer_control();
+    let small = Arc::new(StringArray::from(vec!["March"])) as ArrayRef;
+    let long_text = "t".repeat(2560);
+    let long = Arc::new(StringArray::from(vec![long_text.as_str()])) as ArrayRef;
+    assert!(admit_result(small, &ty, policy, control).unwrap().is_some());
+    assert!(admit_result(long, &ty, policy, control).unwrap().is_none());
 }
 
 #[test]

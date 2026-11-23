@@ -66,7 +66,6 @@ pub mod builtin;
 pub use builtin::regexp_count::f10::{PreparedRegexp, RegexpArgument, RegexpBatch, RegexpRow};
 pub mod calendar_julian;
 pub mod calendar_numeric;
-pub mod calendar_period_numeric;
 mod call_contract;
 #[cfg(test)]
 mod carrier_map_tests;

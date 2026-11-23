@@ -161,7 +161,12 @@ pub(super) fn admit_result(
         ));
         let data = output.to_data();
         work.flush()?;
-        let pool = ConstantPool::try_new(field, arena_type.clone(), data, policy, phase, control)?;
+        let pool =
+            match ConstantPool::try_new(field, arena_type.clone(), data, policy, phase, control) {
+                Ok(pool) => pool,
+                Err(novarocks_functions::ConstantError::Limit(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
         work.step()?;
         Ok(Some(pool.value(0)?))
     })();

@@ -773,6 +773,7 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.expression_not_scalar" => ExpressionNotScalar,
         "sql.admit.unknown_type" | "sql.analyze.unknown_type" => TypeNotFound,
         "sql.analyze.invalid_literal" => InvalidLiteral,
+        "sql.analyze.numeric_out_of_range" => NumericOutOfRange,
         "sql.analyze.invalid_function_argument" => InvalidFunctionArgument,
         "sql.analyze.missing_argument" => MissingArgument,
         "sql.analyze.expression_not_constant" => ExpressionNotConstant,
@@ -815,13 +816,15 @@ fn user_code(code: &str) -> Option<Code> {
         | "sql.admit.insert_unsupported_form"
         | "sql.admit.create_table_unsupported_form"
         | "UnsupportedCompiledShape"
-        | "query.execution.unsupported" => NotSupported,
+        | "query.execution.unsupported"
+        | "query.execution.unknown_epoch_time_zone" => NotSupported,
         "sql.admit.kill_denied" => PermissionDenied,
         "sql.analyze.internal"
         | "query.execution.invariant"
         | "query.execution.unexpected"
         | "query.execution.control"
-        | "query.execution.commit_unknown" => GenericInternal,
+        | "query.execution.commit_unknown"
+        | "query.execution.date_result_out_of_range" => GenericInternal,
         "query.execution.numeric_out_of_range" => NumericOutOfRange,
         "query.execution.division_by_zero" => DivisionByZero,
         "query.execution.invalid_cast_argument" => InvalidCastArgument,

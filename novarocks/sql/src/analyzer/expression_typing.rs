@@ -139,6 +139,32 @@ impl AnalyzerContext<'_> {
         })
     }
 
+    pub(super) fn type_extract(
+        &self,
+        field: ast::ExtractField,
+        source: TypedExpr,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        self.with_typing(span, |context, work| {
+            work.flush()?;
+            let argument = function_argument(&source, context.constant_policy, work.control())?;
+            let selected = typing::bind_extract(context.catalog, field, &argument, work.control())?;
+            let FunctionResultType::Scalar(value_type) = &selected.selected.result_type else {
+                return Err(TypingError::InvalidShape("EXTRACT result is not scalar"));
+            };
+            Ok(TypedExpr {
+                value_type: value_type.clone(),
+                kind: ExprKind::FunctionCall {
+                    name: novarocks_parser::extract_call_name(field).into(),
+                    volatility: selected.semantics.volatility,
+                    binding: SqlFunctionBinding::new(selected, context.decimal_overflow_policy),
+                    args: vec![source].into(),
+                    distinct: false,
+                },
+            })
+        })
+    }
+
     pub(super) fn type_clock(&self, expression: &ast::Expr) -> Result<TypedExpr, AnalyzeError> {
         let span = expression.span();
         self.with_typing(span, |context, work| {
@@ -539,6 +565,11 @@ pub(super) fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeErr
     match error {
         TypingError::TypeMismatch(message) => AnalyzeError::type_mismatch(message, span),
         TypingError::InvalidLiteral(message) => AnalyzeError::invalid_literal(message, span),
+        TypingError::NumericOutOfRange(message) => AnalyzeError::at(
+            crate::analyze_error::AnalyzeErrorKind::NumericOutOfRange,
+            message,
+            span,
+        ),
         TypingError::Unsupported(message) => AnalyzeError::unsupported_expression(message, span),
         TypingError::Control(error) => AnalyzeError::control(error),
         TypingError::Binding(error @ FunctionBindingError::AmbiguousOverload) => {
