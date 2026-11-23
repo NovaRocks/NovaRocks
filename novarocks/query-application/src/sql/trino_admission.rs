@@ -270,6 +270,7 @@ pub enum TrinoStatementPreparation {
     DropMaterializedView(ast::TrinoDropMaterializedView),
     RefreshMaterializedView(ast::TrinoRefreshMaterializedView),
     ExplainRefreshMaterializedView(ast::TrinoRefreshMaterializedView, Span),
+    ExplainDelete(ast::TrinoDelete),
     SetMaterializedViewProperties {
         name: ast::ObjectName,
         properties: ast::AstVec<ast::StatementProperty>,
@@ -474,6 +475,10 @@ fn select_trino_statement_owner(
         Statement::ShowBranches(node) => Prepare(Preparation::ShowBranches(node)),
         Statement::Insert(node) => Prepare(Preparation::Insert(node)),
         Statement::Delete(node) => {
+            if let Some(predicate) = &node.predicate {
+                super::dml_admission::admit_delete_predicate(source, predicate)
+                    .map_err(QueryServiceError::from_user_error)?;
+            }
             if node.predicate.is_none()
                 && node.table.query_period.is_none()
                 && let Some(branch) = &node.table.branch
@@ -637,6 +642,15 @@ fn admit_trino_explain(
         ast::TrinoStatement::Query(query) => Ok(TrinoStatementAction::Query(
             TrinoQueryAction::Explain(query),
         )),
+        ast::TrinoStatement::Delete(delete) => {
+            if let Some(predicate) = &delete.predicate {
+                super::dml_admission::admit_delete_predicate(source, predicate)
+                    .map_err(QueryServiceError::from_user_error)?;
+            }
+            Ok(TrinoStatementAction::Prepare(
+                TrinoStatementPreparation::ExplainDelete(delete),
+            ))
+        }
         ast::TrinoStatement::RefreshMaterializedView(refresh) => Ok(TrinoStatementAction::Prepare(
             TrinoStatementPreparation::ExplainRefreshMaterializedView(refresh, explain.span),
         )),
@@ -880,6 +894,38 @@ mod tests {
                 TrinoStatementPreparation::ExplainRefreshMaterializedView(..)
             )
         ));
+    }
+
+    #[test]
+    fn explain_delete_keeps_the_admitted_write_target_and_original_predicate() {
+        for sql in [
+            "EXPLAIN DELETE FROM lake.db.t WHERE part > 10",
+            "EXPLAIN (TYPE LOGICAL, FORMAT TEXT) DELETE FROM lake.db.t WHERE part > 10",
+            "EXPLAIN DELETE FROM lake.db.t",
+        ] {
+            let TrinoStatementAction::Prepare(TrinoStatementPreparation::ExplainDelete(delete)) =
+                admit(sql).unwrap()
+            else {
+                panic!("Expected the read-only DELETE explanation");
+            };
+            assert!(
+                delete
+                    .table
+                    .name
+                    .parts
+                    .iter()
+                    .map(|part| part.value.as_str())
+                    .eq(["lake", "db", "t"])
+            );
+            assert_eq!(delete.predicate.is_some(), sql.contains("WHERE"), "{sql}");
+        }
+        let sql = "EXPLAIN DELETE FROM lake.db.t WHERE part IN (SELECT 1)";
+        let refused = admit(sql).unwrap_err();
+        let execution = admit("DELETE FROM lake.db.t WHERE part IN (SELECT 1)").unwrap_err();
+        assert_eq!(
+            refused.user_error().unwrap().code(),
+            execution.user_error().unwrap().code()
+        );
     }
 
     #[test]

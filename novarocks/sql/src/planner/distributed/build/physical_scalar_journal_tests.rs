@@ -282,15 +282,16 @@ fn scalar_journal_conversion_retains_original_none_and_true_intermediate_constra
         kind: TypedKind::Constant(pool.value(1).unwrap()),
         value_type: json.clone(),
     };
-    let owner = authored(TypedExpr {
+    let conversion = TypedExpr {
         kind: TypedKind::Cast {
             cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(input),
-            target: DataType::LargeUtf8,
+            target: DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },
-        value_type: FunctionValueType::new(DataType::LargeUtf8, false),
-    });
+        value_type: FunctionValueType::new(DataType::Utf8, false),
+    };
+    let owner = authored(lower(conversion, DecimalOverflowPolicy::ReportError));
     let (fragment, node, expression) = source(&owner, "value_domain_conversion");
     let request = probe(&owner, fragment, node, expression, &Control::default()).unwrap();
     let FunctionArgument::Value {

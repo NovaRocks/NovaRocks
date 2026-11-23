@@ -4894,6 +4894,111 @@ mod session_tests {
         assert_original_client_deadline_and_existing_cancel(None, None, 1);
     }
     #[test]
+    fn update_count_assertion_uses_the_original_command_in_verify_and_record() {
+        use crate::types::{QueryMeta, UpdateCountExpectation as Count};
+
+        for mode in [crate::Mode::Verify, crate::Mode::Record] {
+            for (statement, update_type, actual, expected, passed) in [
+                (
+                    "DELETE FROM t",
+                    Some("DELETE"),
+                    Some(7),
+                    Count::Counted(7),
+                    true,
+                ),
+                (
+                    "DELETE FROM t",
+                    Some("DELETE"),
+                    Some(0),
+                    Count::Counted(0),
+                    true,
+                ),
+                ("DELETE FROM t", Some("DELETE"), None, Count::NoCount, true),
+                (
+                    "DELETE FROM t",
+                    Some("DELETE"),
+                    Some(9),
+                    Count::Counted(8),
+                    false,
+                ),
+                (
+                    "DELETE FROM t",
+                    Some("DELETE"),
+                    None,
+                    Count::Counted(0),
+                    false,
+                ),
+                (
+                    "DELETE FROM t",
+                    Some("DELETE"),
+                    Some(0),
+                    Count::NoCount,
+                    false,
+                ),
+                ("SELECT 7", None, None, Count::NoCount, false),
+            ] {
+                let mut response = match update_type {
+                    Some(kind) => serde_json::json!({"id":"q", "updateType":kind}),
+                    None => serde_json::from_str(&integer_result("v", 7)).unwrap(),
+                };
+                if let Some(actual) = actual {
+                    response["updateCount"] = serde_json::json!(actual);
+                }
+                let peer = Peer::start(vec![
+                    Reply::queued("/v1/statement", "/count"),
+                    Reply::json("GET", "/count", &response.to_string()),
+                ]);
+                let temp = tempfile::TempDir::new().unwrap();
+                let step = boundary_step(
+                    1,
+                    statement,
+                    QueryMeta {
+                        expect_update_count: Some(expected),
+                        skip_result_check: update_type.is_none(),
+                        retry_count: Some(2),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(crate::results_record::required(&step), ["update_count"]);
+                let (outcome, evidence, golden) = run_boundary_steps(
+                    &peer,
+                    &temp,
+                    mode,
+                    false,
+                    vec![step],
+                    None,
+                    Box::new(BoundaryServer),
+                );
+                assert_eq!(
+                    matches!(outcome.status, crate::CaseStatus::Pass),
+                    passed,
+                    "{}",
+                    outcome.log
+                );
+                let events: Vec<_> = evidence
+                    .executed
+                    .iter()
+                    .filter(|event| event["kind"] == "update_count")
+                    .collect();
+                assert_eq!(events.len(), 1);
+                let event = events[0];
+                assert_eq!(event["outcome"], if passed { "pass" } else { "fail" });
+                assert_eq!(event["policy"]["query_id"], "q");
+                assert_eq!(
+                    event["policy"]["update_type"],
+                    serde_json::json!(update_type)
+                );
+                assert_eq!(
+                    event["policy"]["actual_update_count"],
+                    serde_json::json!(actual)
+                );
+                assert!(!golden.exists());
+                assert_eq!(posted_requests(&peer.finish()), [statement]);
+            }
+        }
+    }
+
+    #[test]
     fn outer_record_conversion_emits_each_successful_explain_requirement_once() {
         for (mode, convert) in [(crate::Mode::Verify, false), (crate::Mode::Record, true)] {
             let peer = Peer::start(boundary_success_replies(3));

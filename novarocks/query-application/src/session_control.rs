@@ -1533,12 +1533,17 @@ impl GovernedQueryStatementOwner {
         self.registration.token()
     }
 
-    /// Transfer the one timing observation to the original command execution edge.
-    pub fn take_control_timing(&mut self) -> Option<ClientQueryTiming> {
-        std::mem::take(&mut self.control_start_pending).then(|| ClientQueryTiming {
+    /// Observe query planning without transferring the command control-start observation.
+    pub fn client_query_timing(&self) -> ClientQueryTiming {
+        ClientQueryTiming {
             port: Arc::downgrade(&self.service.port()),
             statement: self.token(),
-        })
+        }
+    }
+
+    /// Transfer the one timing observation to the original command execution edge.
+    pub fn take_control_timing(&mut self) -> Option<ClientQueryTiming> {
+        std::mem::take(&mut self.control_start_pending).then(|| self.client_query_timing())
     }
 
     pub fn observe_control_start(&mut self) {

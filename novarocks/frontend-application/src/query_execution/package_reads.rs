@@ -34,10 +34,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use novarocks_connector_contract::{
-    ConnectorReadDistribution, ConnectorReadMetadataKind, ConnectorReadOrderingKey,
+    Bound, ConnectorReadDistribution, ConnectorReadMetadataKind, ConnectorReadOrderingKey,
     ConnectorReadProperties, ConnectorReadPublicFacts, ConnectorReadRelationRecipeDraft,
-    ConnectorReadStaticFacts, FrozenConnectorRead, FrozenConnectorScan, ScanColumnId,
-    StaticScanAssignment, StaticScanDynamicFilter, TupleDomain,
+    ConnectorReadStaticFacts, ConnectorValue, ConnectorValueType, Domain, FrozenConnectorRead,
+    FrozenConnectorScan, Range, ScanColumnId, StaticScanAssignment, StaticScanDynamicFilter,
+    TupleDomain, ValueSet,
 };
 use novarocks_physical_plan::{
     Fragment, NodeKind, PhysicalNode, PhysicalPlan, ProviderReadOccurrenceId, Relation,
@@ -187,9 +188,9 @@ fn author_read(
             assignment.value_type(),
         ));
     }
-    let enforced = scan_domain(&encoding.enforced_predicate, &ordinals)
+    let enforced = scan_domain(&encoding.enforced_predicate, &ordinals, Some(&assignments))
         .map_err(|detail| refused(format!("enforced predicate {detail}")))?;
-    let unenforced = scan_domain(&encoding.unenforced_predicate, &ordinals)
+    let unenforced = scan_domain(&encoding.unenforced_predicate, &ordinals, None)
         .map_err(|detail| refused(format!("unenforced predicate {detail}")))?;
     let dynamic_filters =
         scan_dynamic_filters(plan, fragment, node, provider_outputs, encoding).map_err(refused)?;
@@ -251,6 +252,7 @@ fn author_read(
 fn scan_domain(
     domain: &TupleDomain<ConnectorReadColumnHandle>,
     ordinals: &BTreeMap<&ConnectorReadColumnHandle, ScanColumnId>,
+    exact_assignments: Option<&[StaticScanAssignment]>,
 ) -> Result<TupleDomain<ScanColumnId>, String> {
     let Some(domains) = domain.domains() else {
         return Ok(TupleDomain::none());
@@ -260,9 +262,59 @@ fn scan_domain(
         let ordinal = ordinals
             .get(column)
             .ok_or_else(|| "names a provider column the read does not assign".to_string())?;
-        by_ordinal.insert(*ordinal, value.clone());
+        let exact = exact_assignments
+            .and_then(|assignments| assignments.get(ordinal.index()))
+            .and_then(|assignment| declared_temporal_domain(value, assignment.value_type()));
+        by_ordinal.insert(*ordinal, exact.unwrap_or_else(|| value.clone()));
     }
     TupleDomain::with_column_domains(by_ordinal).map_err(|error| error.to_string())
+}
+
+/// Exact temporal offers can carry widened comparison bounds. Retag them
+/// only when every endpoint is already a value of the exact assignment
+/// declaration. The value and bound kind are unchanged, so membership on
+/// the declared column is unchanged. Other mismatches face the original
+/// frozen scan gate.
+fn declared_temporal_domain(domain: &Domain, declared: ConnectorValueType) -> Option<Domain> {
+    let (ConnectorValueType::Temporal(declared_type), ConnectorValueType::Temporal(offered_type)) =
+        (declared, domain.value_type())
+    else {
+        return None;
+    };
+    if declared_type == offered_type || !declared_type.is_lossless_widening_to(offered_type) {
+        return None;
+    }
+    let literal = |source: &ConnectorValue| -> Option<ConnectorValue> {
+        let ConnectorValue::Temporal { data_type, value } = source else {
+            return None;
+        };
+        if *data_type != offered_type {
+            return None;
+        }
+        Some(ConnectorValue::Temporal {
+            data_type: declared_type,
+            value: value
+                .validate(offered_type)
+                .ok()?
+                .validate(declared_type)
+                .ok()?,
+        })
+    };
+    let bound = |bound: &Bound| -> Option<Bound> {
+        Some(match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Inclusive(value) => Bound::Inclusive(literal(value)?),
+            Bound::Exclusive(value) => Bound::Exclusive(literal(value)?),
+        })
+    };
+    let mut ranges = Vec::with_capacity(domain.values().ranges().len());
+    for range in domain.values().ranges() {
+        ranges.push(Range::try_new(declared, bound(range.low())?, bound(range.high())?).ok()?);
+    }
+    Some(Domain::new(
+        ValueSet::of_ranges(declared, ranges).ok()?,
+        domain.null_allowed(),
+    ))
 }
 
 /// The provider's own static facts, with every column it names addressed by

@@ -1,0 +1,19 @@
+-- query 3
+-- types	bigint
+id
+2
+3
+
+-- query 5
+-- types	bigint
+id
+3
+
+-- query 6
+-- types	bigint
+id
+1
+2
+3
+4
+5

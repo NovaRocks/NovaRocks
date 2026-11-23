@@ -50,76 +50,156 @@ pub(super) fn lower_provider_predicates(
     row_mutation_match: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Box<[ProviderReadPredicateNeed]>, super::SqlCompileError> {
+    lower_provider_conjunction(scan, columns, row_mutation_match, false, work)
+}
+
+pub(super) fn lower_delete_provider_predicates(
+    scan: &PlanScanNode,
+    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Box<[ProviderReadPredicateNeed]>, super::SqlCompileError> {
+    lower_provider_conjunction(scan, columns, false, true, work)
+}
+
+fn lower_provider_conjunction(
+    scan: &PlanScanNode,
+    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+    row_mutation_match: bool,
+    delete_probe: bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Box<[ProviderReadPredicateNeed]>, super::SqlCompileError> {
     let mut predicates = Vec::new();
     for (ordinal, predicate) in scan.predicates.iter().enumerate() {
         work.step()?;
-        if !provider_guarantee_supports_atom(predicate, scan, columns) {
-            continue;
-        }
         let Ok(occurrence) = u32::try_from(ordinal) else {
             continue;
         };
-        let mut failure = None;
-        let atom = lower_atom_with_literal(
-            predicate,
-            |expression| lower_column(scan, columns, expression),
-            |expression, expected| {
-                if let ConnectorValueType::Temporal(declaration) = expected {
-                    let expression = unnest(expression);
-                    let ExprKind::Constant(value) = &expression.kind else {
-                        return None;
-                    };
-                    if expression.value_type.value_type().temporal() != Some(declaration)
-                        || value.value_type() != &expression.value_type
-                    {
-                        return None;
-                    }
-                    let decoded = work
-                        .flush()
-                        .map_err(novarocks_functions::ConstantError::from)
-                        .and_then(|()| {
-                            value.temporal_observed(
-                                novarocks_type_contract::CompilePhase::Validate,
-                                work.control(),
-                            )
-                        });
-                    match decoded {
-                        Ok(value) => value.map(|value| ConnectorValue::Temporal {
-                            data_type: declaration,
-                            value,
-                        }),
-                        Err(cause) => {
-                            failure = Some(match cause {
-                                novarocks_functions::ConstantError::Control(cause) => {
-                                    super::SqlCompileError::from(cause)
-                                }
-                                other => super::SqlCompileError::Compilation(other.to_string()),
-                            });
-                            None
-                        }
-                    }
-                } else if row_mutation_match {
-                    lower_row_mutation_literal(expression, expected)
-                } else {
-                    lower_literal(expression, expected)
-                }
-            },
-        );
-        if let Some(cause) = failure {
-            return Err(cause);
-        }
-        let Some((column, domain)) = atom else {
+        let lowered = if delete_probe {
+            lower_delete_predicate(scan, columns, predicate, work)?
+        } else {
+            lower_provider_atom(scan, columns, predicate, row_mutation_match, work)?
+        };
+        let Some((column, domain, exact_eligible)) = lowered else {
             continue;
         };
-        let domain = complete_datetime_offer(domain, work)?;
         if let Ok(summary) = TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])) {
-            predicates.push(ProviderReadPredicateNeed::new(
-                ProviderPredicateOccurrenceId::new(occurrence),
-                Constraint::of_summary(summary),
-            ));
+            predicates.push(
+                ProviderReadPredicateNeed::new(
+                    ProviderPredicateOccurrenceId::new(occurrence),
+                    Constraint::of_summary(summary),
+                )
+                .with_exact_eligibility(exact_eligible),
+            );
         }
     }
     Ok(predicates.into_boxed_slice())
+}
+
+/// A tuple domain can express a disjunction on one field as a union of
+/// complete domains. Retain other disjunctions in the original DELETE.
+#[recursive::recursive]
+fn lower_delete_predicate(
+    scan: &PlanScanNode,
+    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+    predicate: &TypedExpr,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(u32, Domain, bool)>, super::SqlCompileError> {
+    work.step()?;
+    let ExprKind::BinaryOp {
+        left,
+        op: BinOp::Or,
+        right,
+        ..
+    } = &unnest(predicate).kind
+    else {
+        return lower_provider_atom(scan, columns, predicate, false, work);
+    };
+    let Some((column, left, left_exact)) = lower_delete_predicate(scan, columns, left, work)?
+    else {
+        return Ok(None);
+    };
+    let Some((right_column, right, right_exact)) =
+        lower_delete_predicate(scan, columns, right, work)?
+    else {
+        return Ok(None);
+    };
+    if column != right_column {
+        return Ok(None);
+    }
+    Ok(left
+        .union(&right)
+        .ok()
+        .filter(|domain| !domain.is_all())
+        .map(|domain| (column, domain, left_exact && right_exact)))
+}
+
+fn lower_provider_atom(
+    scan: &PlanScanNode,
+    columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+    predicate: &TypedExpr,
+    row_mutation_match: bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(u32, Domain, bool)>, super::SqlCompileError> {
+    if !can_offer_atom(predicate, scan, columns) {
+        return Ok(None);
+    }
+    let mut failure = None;
+    let atom = lower_atom_with_literal(
+        predicate,
+        |expression| lower_column(scan, columns, expression),
+        |expression, expected| {
+            if let ConnectorValueType::Temporal(declaration) = expected {
+                let expression = unnest(expression);
+                let ExprKind::Constant(value) = &expression.kind else {
+                    return None;
+                };
+                if expression.value_type.value_type().temporal() != Some(declaration)
+                    || value.value_type() != &expression.value_type
+                {
+                    return None;
+                }
+                let decoded = work
+                    .flush()
+                    .map_err(novarocks_functions::ConstantError::from)
+                    .and_then(|()| {
+                        value.temporal_observed(
+                            novarocks_type_contract::CompilePhase::Validate,
+                            work.control(),
+                        )
+                    });
+                match decoded {
+                    Ok(value) => value.map(|value| ConnectorValue::Temporal {
+                        data_type: declaration,
+                        value,
+                    }),
+                    Err(cause) => {
+                        failure = Some(match cause {
+                            novarocks_functions::ConstantError::Control(cause) => {
+                                super::SqlCompileError::from(cause)
+                            }
+                            other => super::SqlCompileError::Compilation(other.to_string()),
+                        });
+                        None
+                    }
+                }
+            } else if row_mutation_match {
+                lower_row_mutation_literal(expression, expected)
+            } else {
+                lower_literal(expression, expected)
+            }
+        },
+    );
+    if let Some(cause) = failure {
+        return Err(cause);
+    }
+    let Some((column, domain)) = atom else {
+        return Ok(None);
+    };
+    Ok(Some((
+        column,
+        complete_datetime_offer(domain, work)?,
+        exact_atom(predicate),
+    )))
 }
 
 /// Every accepted comparison was already checked in its actual SQL type.
@@ -180,7 +260,31 @@ fn complete_datetime_offer(
     ))
 }
 
-fn provider_guarantee_supports_atom(
+/// Prove that the original expression, rather than its transported domain,
+/// has the closed comparison or intrinsic shape accepted by physical plans.
+fn exact_atom(predicate: &TypedExpr) -> bool {
+    let predicate = unnest(predicate);
+    let is_column = |expr: &TypedExpr| matches!(unnest(expr).kind, ExprKind::ColumnRef { .. });
+    let is_literal = |expr: &TypedExpr| {
+        !expr.value_type.nullable()
+            && matches!(
+                unnest(expr).kind,
+                ExprKind::Literal(_) | ExprKind::Constant(_)
+            )
+    };
+    if let Some((_, [left, right])) = crate::common::binary_operator::typed_comparison(predicate) {
+        return left.value_type.data_type() == right.value_type.data_type()
+            && left.value_type.value_type().temporal() == right.value_type.value_type().temporal()
+            && ((is_column(left) && is_literal(right)) || (is_literal(left) && is_column(right)));
+    }
+    match &predicate.kind {
+        ExprKind::IsNull { expr, .. } => is_column(expr),
+        ExprKind::InList { expr, list, .. } => is_column(expr) && list.iter().all(is_literal),
+        _ => false,
+    }
+}
+
+fn can_offer_atom(
     predicate: &TypedExpr,
     scan: &PlanScanNode,
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
@@ -726,6 +830,71 @@ mod tests {
         assert_eq!(offered[1].occurrence().get(), 2);
         assert_eq!(offered[0].constraint().summary().columns().count(), 1);
         assert!(offered[0].constraint().expression().is_constant_true());
+    }
+
+    #[test]
+    fn datetime_predicate_need_proves_plain_micro_and_nanosecond_comparisons() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{
+            CompilePhase, FunctionValueType, TemporalMicros, TemporalValue, ValueKind, ValueLayout,
+            ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for precision in [
+            TemporalPrecision::MICROSECONDS,
+            TemporalPrecision::NANOSECONDS,
+        ] {
+            let declared = TemporalType::Timestamp(precision);
+            let ty = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(
+                    ValueKind::Temporal(declared),
+                    false,
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+                ValueLayout::try_new(&declared.carrier(), ValueTypeStorageLifetime::pure())
+                    .unwrap(),
+            )
+            .unwrap();
+            let constant = novarocks_functions::ConstantValue::from_temporal(
+                Arc::new(Field::new("literal", ty.data_type().clone(), false)),
+                ty.clone(),
+                TemporalValue::Timestamp(TemporalMicros::from_picos(0).unwrap()),
+                crate::constant::test_constant_policy(),
+                CompilePhase::Validate,
+                &control,
+            )
+            .unwrap();
+            let literal = TypedExpr {
+                kind: ExprKind::Constant(constant),
+                value_type: ty.clone(),
+            };
+            let column = TypedExpr {
+                value_type: ty.clone(),
+                ..column_ref()
+            };
+            let mut scan = scan(vec![comparison(BinOp::Ge, column, literal)]);
+            scan.columns[0].value_type = ty;
+            let columns = BTreeMap::from([(
+                ColumnId(1),
+                ProviderPredicateColumn {
+                    ordinal: 0,
+                    value_type: ConnectorValueType::Temporal(declared),
+                },
+            )]);
+            let needs = offered(&scan, &columns);
+            let [need] = needs.as_ref() else {
+                panic!("expected one complete timestamp comparison")
+            };
+            assert!(need.exact_eligible());
+            let domain = need.constraint().summary().domain_for(&0).unwrap();
+            assert_eq!(
+                domain.value_type(),
+                ConnectorValueType::Temporal(TemporalType::Timestamp(
+                    TemporalPrecision::PICOSECONDS
+                ))
+            );
+        }
     }
 
     #[test]

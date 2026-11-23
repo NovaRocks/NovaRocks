@@ -1,0 +1,31 @@
+-- query 9
+-- types	boolean
+added_positions
+NULL
+
+-- query 10
+-- types	boolean
+has_delete_file
+false
+
+-- query 11
+-- types	bigint
+id
+2
+3
+4
+5
+6
+7
+
+-- query 17
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	3	true	true
+
+-- query 18
+-- types	bigint
+id
+4
+6
+7

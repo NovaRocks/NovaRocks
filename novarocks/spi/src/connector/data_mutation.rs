@@ -27,12 +27,13 @@ use sha2::{Digest, Sha256};
 use super::{
     ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorMetadata, ConnectorMutationOperationId,
-    ConnectorPayloadRetentionGuard, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableHandle, ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorPayloadRetentionGuard, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
+    ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
-pub const CONNECTOR_DATA_MUTATION_CONTRACT_VERSION: u16 = 4;
-pub const CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION: u16 = 3;
+pub const CONNECTOR_DATA_MUTATION_CONTRACT_VERSION: u16 = 5;
+pub const CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION: u16 = 4;
 pub const MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES: usize = 256;
 pub const MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 
@@ -41,6 +42,7 @@ const PLAN_DIGEST_DOMAIN: &[u8] = b"novarocks.connector-data-mutation.plan.v1\0"
 
 pub const REGISTER_EXISTING_FILES_KIND: &str = "register-existing-files";
 pub const TRUNCATE_KIND: &str = "truncate";
+pub const DELETE_KIND: &str = "delete";
 const RECEIPT_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"novarocks.connector-data-mutation.receipt-payload.v1\0";
 
@@ -81,6 +83,12 @@ impl ConnectorAddFilesRecursion {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorDeleteCondition {
+    AllRows,
+    SealedPredicate { digest: [u8; 32] },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorDataMutationOperation {
     RegisterExistingFiles {
@@ -88,6 +96,11 @@ pub enum ConnectorDataMutationOperation {
         location: Option<Arc<str>>,
         format: Option<ConnectorAddFilesFormat>,
         recursion: ConnectorAddFilesRecursion,
+    },
+    /// Metadata DELETE targets the main branch.
+    DeleteByCondition {
+        table: ConnectorTableHandle,
+        condition: ConnectorDeleteCondition,
     },
     /// SQL TRUNCATE TABLE. The target is the table's main branch.
     TruncateMain { table: ConnectorTableHandle },
@@ -132,6 +145,7 @@ impl ConnectorDataMutationOperation {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::RegisterExistingFiles { .. } => REGISTER_EXISTING_FILES_KIND,
+            Self::DeleteByCondition { .. } => DELETE_KIND,
             Self::TruncateMain { .. } | Self::Truncate { .. } => TRUNCATE_KIND,
         }
     }
@@ -140,13 +154,16 @@ impl ConnectorDataMutationOperation {
         match self {
             Self::RegisterExistingFiles { table, .. }
             | Self::TruncateMain { table }
-            | Self::Truncate { table, .. } => table,
+            | Self::Truncate { table, .. }
+            | Self::DeleteByCondition { table, .. } => table,
         }
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
         match self {
-            Self::RegisterExistingFiles { .. } | Self::TruncateMain { .. } => Ok(()),
+            Self::RegisterExistingFiles { .. }
+            | Self::TruncateMain { .. }
+            | Self::DeleteByCondition { .. } => Ok(()),
             Self::Truncate { target_ref, .. } => validate_bounded_text(
                 target_ref,
                 MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES,
@@ -174,11 +191,18 @@ impl ConnectorDataMutationOperation {
                 hasher.update([recursion.digest_tag()]);
             }
             Self::TruncateMain { .. } => {
-                // Existing full-ref DELETE digests and recovery envelopes stay stable.
+                // SQL TRUNCATE and legacy full-ref deletion have distinct intents.
                 digest_bytes(hasher, b"main");
                 digest_bytes(hasher, b"truncate-main");
             }
             Self::Truncate { target_ref, .. } => digest_bytes(hasher, target_ref.as_bytes()),
+            Self::DeleteByCondition { condition, .. } => match condition {
+                ConnectorDeleteCondition::AllRows => hasher.update([0]),
+                ConnectorDeleteCondition::SealedPredicate { digest } => {
+                    hasher.update([1]);
+                    hasher.update(digest);
+                }
+            },
         }
     }
 }
@@ -188,6 +212,7 @@ pub struct ConnectorDataMutationPlanningRequest {
     operation_id: ConnectorMutationOperationId,
     owner: ConnectorProviderBindingKey,
     operation: ConnectorDataMutationOperation,
+    process_local: Option<ConnectorProcessLocalPayload>,
     request_digest: [u8; 32],
     pub context: ConnectorRequestContext,
 }
@@ -199,18 +224,23 @@ impl ConnectorDataMutationPlanningRequest {
         operation: ConnectorDataMutationOperation,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        operation.validate()?;
-        if operation.table().owner() != &owner.instance_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector data mutation table handle does not match the exact owner",
-            ));
-        }
+        Self::try_new_with_process_local(operation_id, owner, operation, None, context)
+    }
+
+    pub fn try_new_with_process_local(
+        operation_id: ConnectorMutationOperationId,
+        owner: ConnectorProviderBindingKey,
+        operation: ConnectorDataMutationOperation,
+        process_local: Option<ConnectorProcessLocalPayload>,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        validate_planning_inputs(&owner, &operation, process_local.as_ref())?;
         let request_digest = request_digest(operation_id, &owner, &operation);
         Ok(Self {
             operation_id,
             owner,
             operation,
+            process_local,
             request_digest,
             context,
         })
@@ -228,22 +258,52 @@ impl ConnectorDataMutationPlanningRequest {
         &self.operation
     }
 
+    pub fn process_local(&self) -> Option<&ConnectorProcessLocalPayload> {
+        self.process_local.as_ref()
+    }
+
     pub const fn request_digest(&self) -> [u8; 32] {
         self.request_digest
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        self.operation.validate()?;
-        if self.operation.table().owner() != &self.owner.instance_id
-            || request_digest(self.operation_id, &self.owner, &self.operation)
-                != self.request_digest
-        {
+        validate_planning_inputs(&self.owner, &self.operation, self.process_local.as_ref())?;
+        if request_digest(self.operation_id, &self.owner, &self.operation) != self.request_digest {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector data mutation planning request digest or owner is invalid",
             ));
         }
         Ok(())
+    }
+}
+
+fn validate_planning_inputs(
+    owner: &ConnectorProviderBindingKey,
+    operation: &ConnectorDataMutationOperation,
+    process_local: Option<&ConnectorProcessLocalPayload>,
+) -> Result<(), ConnectorError> {
+    operation.validate()?;
+    if operation.table().owner() != &owner.instance_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector data mutation table handle does not match the exact owner",
+        ));
+    }
+    let requires_payload = matches!(
+        operation,
+        ConnectorDataMutationOperation::DeleteByCondition {
+            condition: ConnectorDeleteCondition::SealedPredicate { .. },
+            ..
+        }
+    );
+    match (requires_payload, process_local) {
+        (true, Some(payload)) => payload.validate_owner(owner),
+        (false, None) => Ok(()),
+        _ => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector data mutation predicate payload does not match the operation",
+        )),
     }
 }
 
@@ -488,6 +548,7 @@ pub struct ConnectorDataMutationExecuteRequest {
     pub plan: ConnectorDataMutationPlan,
     pub context: ConnectorRequestContext,
     payload_byte_author: Option<ConnectorPayloadRetentionGuard>,
+    delete_condition: Option<ConnectorProcessLocalPayload>,
 }
 
 impl ConnectorDataMutationExecuteRequest {
@@ -500,7 +561,34 @@ impl ConnectorDataMutationExecuteRequest {
             plan,
             context,
             payload_byte_author: None,
+            delete_condition: None,
         })
+    }
+
+    /// Hold the same process-local predicate presented for planning until execution exits.
+    pub fn with_delete_condition(
+        mut self,
+        payload: ConnectorProcessLocalPayload,
+    ) -> Result<Self, ConnectorError> {
+        if self.plan.operation_kind() != DELETE_KIND {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "delete predicate requires a delete operation",
+            ));
+        }
+        payload.validate_owner(self.plan.owner())?;
+        if self.delete_condition.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "delete predicate is already installed",
+            ));
+        }
+        self.delete_condition = Some(payload);
+        Ok(self)
+    }
+
+    pub fn delete_condition(&self) -> Option<&ConnectorProcessLocalPayload> {
+        self.delete_condition.as_ref()
     }
 
     /// Bind the original statement's byte author to registration execution.
@@ -534,6 +622,7 @@ impl ConnectorDataMutationExecuteRequest {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorDataMutationReceipt {
+    deleted_rows: Option<u64>,
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ProviderBindingEpoch,
     operation_id: ConnectorMutationOperationId,
@@ -564,6 +653,7 @@ impl ConnectorDataMutationReceipt {
         let provider_payload_digest =
             digest_with_domain(RECEIPT_PAYLOAD_DIGEST_DOMAIN, provider_payload.as_ref());
         Ok(Self {
+            deleted_rows: None,
             descriptor,
             incarnation,
             operation_id,
@@ -617,9 +707,29 @@ impl ConnectorDataMutationReceipt {
         self.provider_payload_digest
     }
 
+    pub const fn deleted_rows(&self) -> Option<u64> {
+        self.deleted_rows
+    }
+
+    pub fn try_with_deleted_rows(
+        mut self,
+        deleted_rows: Option<u64>,
+    ) -> Result<Self, ConnectorError> {
+        self.deleted_rows = deleted_rows;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_operation_kind(&self.operation_kind)?;
         validate_provider_payload(&self.provider_payload, "receipt")?;
+        if let Some(rows) = self.deleted_rows
+            && (self.operation_kind.as_ref() != DELETE_KIND || i64::try_from(rows).is_err())
+        {
+            return Err(corrupt(
+                "connector data mutation receipt has an invalid delete count",
+            ));
+        }
         if digest_with_domain(
             RECEIPT_PAYLOAD_DIGEST_DOMAIN,
             self.provider_payload.as_ref(),
@@ -656,6 +766,8 @@ impl ConnectorDataMutationReceipt {
                 + 8
                 + 8
                 + 4
+                + 1
+                + self.deleted_rows.map_or(0, |_| 8)
                 + payload.len(),
         );
         encoded.extend_from_slice(MAGIC);
@@ -671,6 +783,10 @@ impl ConnectorDataMutationReceipt {
         encoded.extend_from_slice(&self.summary.file_count.to_be_bytes());
         encoded.extend_from_slice(&self.summary.row_count.to_be_bytes());
         encoded.extend_from_slice(&self.summary.total_bytes.to_be_bytes());
+        encoded.push(u8::from(self.deleted_rows.is_some()));
+        if let Some(rows) = self.deleted_rows {
+            encoded.extend_from_slice(&rows.to_be_bytes());
+        }
         write_u32_bytes(&mut encoded, payload, "receipt provider payload")?;
         encoded.extend_from_slice(&self.provider_payload_digest);
         Ok(Bytes::from(encoded))
@@ -698,6 +814,11 @@ impl ConnectorDataMutationReceipt {
             reader.read_u64()?,
             reader.read_u64()?,
         );
+        let deleted_rows = match reader.read_array::<1>()?[0] {
+            0 => None,
+            1 => Some(reader.read_u64()?),
+            _ => return Err(corrupt("invalid connector delete count presence flag")),
+        };
         let provider_payload = Bytes::copy_from_slice(reader.read_bytes_u32("provider payload")?);
         let provider_payload_digest = reader.read_array()?;
         reader.finish()?;
@@ -715,6 +836,7 @@ impl ConnectorDataMutationReceipt {
             summary,
             provider_payload,
         )?;
+        let receipt = receipt.try_with_deleted_rows(deleted_rows)?;
         if receipt.provider_payload_digest != provider_payload_digest {
             return Err(corrupt(
                 "connector data mutation receipt payload digest does not match wire",
@@ -738,6 +860,7 @@ impl fmt::Debug for ConnectorDataMutationReceipt {
             .field("summary", &self.summary)
             .field("provider_payload_len", &self.provider_payload.len())
             .field("provider_payload_digest", &self.provider_payload_digest)
+            .field("deleted_rows", &self.deleted_rows)
             .finish()
     }
 }
@@ -887,10 +1010,21 @@ impl ConnectorDataMutationSession {
         operation: ConnectorDataMutationOperation,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorDataMutationPlan, ConnectorError> {
-        let request = ConnectorDataMutationPlanningRequest::try_new(
+        self.plan_operation_with_process_local(operation_id, operation, None, context)
+    }
+
+    pub fn plan_operation_with_process_local(
+        &self,
+        operation_id: ConnectorMutationOperationId,
+        operation: ConnectorDataMutationOperation,
+        process_local: Option<ConnectorProcessLocalPayload>,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorDataMutationPlan, ConnectorError> {
+        let request = ConnectorDataMutationPlanningRequest::try_new_with_process_local(
             operation_id,
             self.provider_binding_key.clone(),
             operation,
+            process_local,
             context,
         )?;
         self.plan_mutation(request)
@@ -1276,7 +1410,10 @@ fn validate_provider_payload(payload: &Bytes, kind: &str) -> Result<(), Connecto
 }
 
 fn validate_operation_kind(kind: &str) -> Result<(), ConnectorError> {
-    if matches!(kind, REGISTER_EXISTING_FILES_KIND | TRUNCATE_KIND) {
+    if matches!(
+        kind,
+        REGISTER_EXISTING_FILES_KIND | TRUNCATE_KIND | DELETE_KIND
+    ) {
         Ok(())
     } else {
         Err(ConnectorError::new(

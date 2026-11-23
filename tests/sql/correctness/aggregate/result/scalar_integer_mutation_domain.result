@@ -35,3 +35,8 @@ id	t	age
 -- types	integer	tinyint	smallint
 id	t	age
 3	NULL	7
+
+-- query 9
+-- types	integer	tinyint	smallint
+id	t	age
+1	127	1

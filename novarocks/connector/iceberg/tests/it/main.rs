@@ -42,6 +42,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_type_contract::{ValueKind, ValueLogicalType, ValueTypeStorageLifetime};
 
+mod absorption;
 mod temporal_projection;
 
 #[test]

@@ -31,6 +31,9 @@ pub(crate) struct ExplainPreparationPorts<'a> {
     pub(crate) io: Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>,
     pub(crate) state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
     pub(crate) timing: Option<novarocks_query_application::session_control::ClientQueryTiming>,
+    pub(crate) query_local_overlays:
+        Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
+    pub(crate) original_context: Option<novarocks_spi::connector::ConnectorPlanningContext>,
 }
 
 pub(crate) enum PreparedAsyncExplain {
@@ -53,7 +56,7 @@ impl FrontendQueryCompiler {
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
-        ports: ExplainPreparationPorts<'_>,
+        mut ports: ExplainPreparationPorts<'_>,
     ) -> Result<
         Result<PreparedAsyncExplain, FrontendQueryCompilerError>,
         StatementNativeHealthFailure,
@@ -62,13 +65,17 @@ impl FrontendQueryCompiler {
         let execution = context.execution();
         let current_catalog = context.session().current_catalog();
         let current_database = context.session().current_database();
-        let connector_planning_context = match self.connector_planning_context(
-            execution,
-            query_options.as_ref(),
-            Arc::clone(&ports.io),
-        ) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
+        let connector_planning_context = if let Some(original) = ports.original_context.take() {
+            original
+        } else {
+            match self.connector_planning_context(
+                execution,
+                query_options.as_ref(),
+                Arc::clone(&ports.io),
+            ) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            }
         };
         let connector_context = connector_planning_context.request();
         let analyze = explain.is_analyze();
@@ -132,7 +139,13 @@ impl FrontendQueryCompiler {
                     .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
                 let catalog = crate::query_execution::completion_facts::FrontendCatalogFacts::new(
                     self.completion_fact_owners(),
-                    scope.with_snapshot_planning(sql_compile_control_from_execution(execution), execution.cancellation().clone(), Arc::clone(planning_cpu)),
+                    scope
+                        .with_query_local_overlays(ports.query_local_overlays)
+                        .with_snapshot_planning(
+                            sql_compile_control_from_execution(execution),
+                            execution.cancellation().clone(),
+                            Arc::clone(planning_cpu),
+                        ),
                 );
                 Ok(catalog)
             }
@@ -213,6 +226,7 @@ impl FrontendQueryCompiler {
             cpu: planning_cpu,
             state_store,
             timing,
+            query_local_overlays,
             ..
         } = ports;
         let bindings = match QueryTableBindingStore::try_new() {
@@ -240,6 +254,7 @@ impl FrontendQueryCompiler {
                     state_store,
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
+                .with_query_local_overlays(query_local_overlays)
                 .with_snapshot_planning(
                     sql_compile_control_from_execution(execution),
                     execution.cancellation().clone(),

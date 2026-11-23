@@ -109,6 +109,8 @@ pub(crate) mod compiler;
 pub(crate) mod ctas_action;
 pub(crate) mod delete_action;
 mod explain_action;
+pub(crate) use explain_action::prepare_delete_explain;
+pub(crate) use query_session_action::QueryActionEnvironment;
 pub(crate) mod insert_action;
 mod maintenance_action;
 pub(crate) mod mutation_action;

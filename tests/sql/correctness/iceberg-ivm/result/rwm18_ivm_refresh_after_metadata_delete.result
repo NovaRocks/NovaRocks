@@ -1,0 +1,24 @@
+-- query 3
+-- types	varchar	bigint
+customer	amount
+A	10
+A	10
+A	20
+B	30
+
+-- query 5
+-- types	varchar	bigint	boolean
+operation	deleted_rows	no_delete_files
+delete	3	true
+
+-- query 10
+-- types	varchar	bigint
+customer	amount
+A	10
+B	30
+
+-- query 11
+-- types	bigint
+id
+3
+4

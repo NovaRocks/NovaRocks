@@ -19,6 +19,9 @@
 
 use super::write_action::{self, WriteCompletion, WriteStatementFamily, WriteStatementStart};
 use super::*;
+mod choice;
+mod metadata_commit;
+use crate::connector::write_target::ConnectorWriteTargetBinding;
 use crate::dml::attempt::DmlPublicationAttempt;
 use crate::query_execution::{
     compiler::PreparedDmlWriteAssembly,
@@ -50,6 +53,7 @@ impl WriteStatementFamily for DeleteFamily {
             &input.target,
             &input.reference,
             input.planning_pin.clone(),
+            input.retained_target.clone(),
             input.execution.clone(),
             &input.context,
             input.operation_id,
@@ -88,6 +92,7 @@ struct PreparationInput {
     context: ConnectorRequestContext,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    retained_target: Option<ConnectorWriteTargetBinding>,
     begin_receiving: Arc<WriteBeginReceiving>,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 }
@@ -136,6 +141,55 @@ pub(crate) fn prepare(
     let source_bytes = profile.geometry().metadata_bytes().get();
     let io =
         MetadataIoAdmission::new(root.clone(), profile, source_bytes).map_err(|e| e.to_string())?;
+    #[cfg(novarocks_dev_controls)]
+    if matches!(&input.statement, OwnedDeleteStatement::TrinoEquality { .. }) {
+        return prepare_row(kernel, input, target, reference, planning_pin, io, None);
+    }
+    let context = kernel
+        .connector_request_context_for_execution(
+            Some(&input.query_options),
+            input.context.execution(),
+        )?
+        .with_io_admission(io.clone());
+    #[cfg(novarocks_dev_controls)]
+    if let Some(nomination) = input.context.execution().test_statement_nomination() {
+        let installed = context.request_scope_extension_or_insert_with(|| (**nomination).clone());
+        if installed.as_ref() != nomination.as_ref() {
+            return Err("DELETE could not retain the original statement nomination"
+                .to_owned()
+                .into());
+        }
+    }
+    Ok(choice::prepare(choice::ChoiceStart {
+        kernel,
+        input,
+        target,
+        reference,
+        planning: planning_pin,
+        io,
+        context,
+    }))
+}
+
+fn prepare_row(
+    kernel: crate::query_execution::kernels::DmlExecutionKernel,
+    input: DeleteStatementInput,
+    target: crate::catalog_application::resolver::TargetBackend,
+    reference: String,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    io: Arc<MetadataIoAdmission>,
+    retained_target: Option<ConnectorWriteTargetBinding>,
+) -> Result<
+    Box<dyn GovernedStatementAction>,
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
+    let root = input
+        .context
+        .execution()
+        .result_capacity()
+        .ok_or_else(|| "DELETE has no original Root result capacity".to_owned())?
+        .root_scope()
+        .clone();
     let initial = InitialComputationReservation::new(
         input
             .launcher
@@ -181,6 +235,7 @@ pub(crate) fn prepare(
         context: context.clone(),
         execution: input.context.execution().clone(),
         planning_pin,
+        retained_target,
         begin_receiving: Arc::clone(&begin_receiving),
         operation_id: novarocks_spi::connector::ConnectorWriteOperationId::from(publication_id),
     });

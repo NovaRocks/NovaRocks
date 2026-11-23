@@ -88,6 +88,17 @@ CREATE TABLE ${case_db}.missing_name AS SELECT CAST(1 AS integer);
 
 verify、record 与 conversion 共用同一判定和 `expected_error` oracle。执行调用返回本次所有 attempt／statement 的实际提交、完成、typed result 与失败；后续查询不改写前次事实。普通多语句 conversion 仍保留成功 suffix 与全部失败，基础设施失败停止普通后继；多个错误不能被首个匹配错误变成通过。解析与 HTTP 边界回归属于原 runner 常规 Rust 测试，复用其本地独占 peer 与退出 owner，不需额外 fixture。
 
+## Trino 更新计数断言
+
+```sql
+-- @expect_update_count=3
+DELETE FROM ${case_db}.events WHERE day_key = 20260101;
+```
+
+`@expect_update_count` 接受非负十进制整数或 `NULL`。整数精确匹配实际完成响应的 `updateCount`，包括 0。`NULL` 要求响应带 `updateType` 且解码后无 `updateCount`。每步须有一条可执行 SQL。空步、shell、多语句和同一步的预期报错均拒绝。
+
+verify 和 record 都从原语句的完成响应取得实际计数，在 `update_count` oracle 中保留 query ID、命令类别、预期和实际计数。计数不符时直接判失败。
+
 ## golden 格式
 
 golden 保存按 Trino 列类型解码后的规范值，不是 CLI 显示文本。格式与来源裁决见 [ADR-0210](../../docs/adr/ADR-0210-sql-golden-is-canonical-rendering-of-typed-trino-results.md)，实现由 runner 的 [golden 模块](runner/library/src/golden/mod.rs) 统一拥有。

@@ -328,3 +328,5 @@ fn mutation_secondary_recovery_bridge_keeps_exact_unknown_or_committed_outcome()
     exercise_truncate(Behavior::PanicAfterIssue);
     exercise_truncate(Behavior::Commit);
 }
+
+mod delete;

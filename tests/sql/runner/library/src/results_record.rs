@@ -326,6 +326,9 @@ pub(crate) fn required(step: &SqlStep) -> Vec<&'static str> {
     if m.has_error_expectation() {
         kinds.push("expected_error");
     }
+    if m.expect_update_count.is_some() {
+        kinds.push("update_count");
+    }
     if !m.has_error_expectation() && crate::results::step_requires_recorded_result(step) {
         kinds.push("result_set");
     }

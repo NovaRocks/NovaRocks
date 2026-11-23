@@ -1389,7 +1389,7 @@ pub(in crate::query_execution) mod tests {
             .projection
             .iter()
             .zip(["id", "category"])
-            .zip(["INT", "STRING"])
+            .zip(["INT", "VARCHAR"])
             .map(|((item, name), ty)| (item, name, ty))
         {
             let novarocks_parser::ast::SelectItem::SingleColumn(single_column) = item else {

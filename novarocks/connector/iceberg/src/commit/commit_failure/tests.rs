@@ -39,6 +39,11 @@ fn known_conflict_uses_the_operation_style_and_public_detail() {
             ICEBERG_COMMIT_ERROR,
             "Failed to commit during truncate: ",
         ),
+        (
+            CommitOperation::Delete,
+            ICEBERG_COMMIT_ERROR,
+            "Failed to commit during delete: ",
+        ),
     ] {
         let failure = commit_failure(
             operation,

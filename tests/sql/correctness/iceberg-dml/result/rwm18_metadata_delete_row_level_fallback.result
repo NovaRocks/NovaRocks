@@ -1,0 +1,45 @@
+-- query 5
+-- types	boolean
+added_positions
+NULL
+
+-- query 6
+-- types	boolean
+has_delete_file
+false
+
+-- query 7
+-- types	bigint
+id
+2
+3
+
+-- query 12
+-- types	boolean
+added_positions
+true
+
+-- query 13
+-- types	boolean
+has_delete_file
+true
+
+-- query 16
+-- types	boolean
+added_positions
+NULL
+
+-- query 17
+-- types	boolean
+has_delete_file
+false
+
+-- query 18
+-- types	bigint
+id
+3
+
+-- query 20
+-- types	bigint
+id
+3

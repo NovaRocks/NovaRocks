@@ -71,8 +71,8 @@ use novarocks_spi::connector::{
         ConnectorReadMetadataKind, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
         ConnectorReadNullOrdering, ConnectorReadProperties, ConnectorReadPublicSchema,
         ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadSortDirection,
-        ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, Constraint,
-        SchemaTableName, TupleDomain,
+        ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, ConnectorValueType,
+        Constraint, SchemaTableName, TupleDomain,
         negotiation::{
             ReadFreezeRequest, ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp,
             ReadPushdownOutcome,
@@ -644,6 +644,9 @@ struct ReadOpening {
     // Keep the original admitted materialization/generation through the
     // request control and Provider facts' actual destruction.
     admitted: AdmittedRead,
+    original_reference: Option<String>,
+    original_table:
+        Option<novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation>,
     name: String,
 }
 
@@ -660,6 +663,8 @@ fn prepare_read_opening(
     // admitted as a materialization; a cohort a provider froze for this
     // request is admitted as its own carrier, because the cohort is the read
     // and nothing could resolve it from a name and a version.
+    let mut original_table = None;
+    let mut original_reference = None;
     let admitted = if let ProviderReadRelationNeed::MvTarget {
         target_table_uuid,
         target_snapshot_id,
@@ -694,6 +699,36 @@ fn prepare_read_opening(
         let binding = bindings.binding(need.binding())?;
         use crate::catalog_application::query_bindings::QueryTableBindingAdmission;
         match &binding.admission {
+            QueryTableBindingAdmission::OriginalTableObservation(_, reference) => {
+                if !matches!(relation, ProviderReadRelationNeed::Data { .. })
+                    || input != QueryFrozenReadInput::Current
+                {
+                    return Err(
+                        "ordinary scan differs from its original Current observation"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                let original = binding.source_metadata.as_ref().ok_or_else(|| {
+                    "ordinary scan lost its original table observation".to_string()
+                })?;
+                let materialization = bindings.frozen_read_input(need.binding(), input)?;
+                if materialization.table != original.table {
+                    return Err("ordinary scan names another original table"
+                        .to_string()
+                        .into());
+                }
+                original_table = Some(
+                    novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation {
+                        table: original.table.clone(),
+                        source: original.source_read_facts().cloned().ok_or_else(|| {
+                            "ordinary scan has no original provider source provenance".to_string()
+                        })?,
+                    },
+                );
+                original_reference = reference.clone();
+                AdmittedRead::Relation(materialization)
+            }
             QueryTableBindingAdmission::RowMutationCurrent(_, source) => {
                 if !matches!(
                     relation,
@@ -794,6 +829,8 @@ fn prepare_read_opening(
     Ok(ReadOpening {
         name,
         admitted,
+        original_table,
+        original_reference,
         planning_pin,
         read,
         request_control,
@@ -850,7 +887,12 @@ async fn prepare_observation(
         *observation = Some(ReadObservation::OriginalPreparedSource);
         return Ok(());
     }
-    let kind = if let AdmittedRead::RowMutationCurrent { source, .. } = &opening.admitted {
+    let kind = if let Some(reference) = &opening.original_reference {
+        K::Table {
+            version: ConnectorReadRelationVersion::Reference,
+            reference: Some(reference.clone()),
+        }
+    } else if let AdmittedRead::RowMutationCurrent { source, .. } = &opening.admitted {
         K::RowMutationCurrent(source.clone())
     } else if let AdmittedRead::RowMutationMatch {
         materialization,
@@ -954,7 +996,11 @@ async fn prepare_observation(
             relation => return Err(unsupported_family(relation).into()),
         }
     };
-    let request = Request::new(opening.table.clone(), kind);
+    let mut request =
+        Request::new(opening.table.clone(), kind).with_filter_offer(!need.predicates().is_empty());
+    if let Some(original) = &opening.original_table {
+        request = request.with_original_table(original.clone());
+    }
     let metadata = opening.request_control.metadata();
     let prepared = metadata
         .prepare_relation(session, &request)
@@ -963,6 +1009,119 @@ async fn prepare_observation(
         .ok_or_else(|| relation_open_missing(need.relation(), opening))?;
     *observation = Some(ReadObservation::Physical(prepared));
     Ok(())
+}
+
+/// Resolve the exact original DELETE read without producing a plan or split
+/// capability. The caller retains the original metadata admission throughout.
+pub(crate) async fn probe_delete_filter(
+    need: &ProviderReadNeed,
+    control: &ConnectorControlHost,
+    bindings: &QueryTableBindingStore,
+    context: &ConnectorRequestContext,
+    original: &novarocks_spi::connector::ConnectorTableMetadata,
+    session: &ConnectorSession,
+) -> Result<novarocks_spi::connector::read_stack::ConnectorDeleteConditionOutcome, ProviderReadError>
+{
+    use novarocks_spi::connector::read_stack::{
+        ConnectorDeleteConditionOutcome as Outcome, ConnectorReadOriginalTableObservation,
+        ConnectorReadRelationPreparationKind as Kind,
+        ConnectorReadRelationPreparationRequest as Request,
+    };
+
+    let opening = prepare_read_opening(need, control, bindings, context)?;
+    let Some(source) = original.source_read_facts() else {
+        return Ok(Outcome::Refused {
+            reason: "DELETE target has no original provider read facts".into(),
+        });
+    };
+    let request = Request::new(
+        opening.table.clone(),
+        Kind::Table {
+            version: relation_version(ProviderReadVersionNeed::Current),
+            reference: None,
+        },
+    )
+    .with_filter_offer(true)
+    .with_original_table(ConnectorReadOriginalTableObservation {
+        table: original.table.clone(),
+        source: source.clone(),
+    });
+    let metadata = opening.request_control.metadata();
+    let prepared = metadata
+        .prepare_relation(session, &request)
+        .await
+        .map_err(|error| relation_open_error(need.relation(), &opening, error))?
+        .ok_or_else(|| relation_open_missing(need.relation(), &opening))?;
+    let opened = metadata
+        .create_prepared_relation(prepared)
+        .map_err(|error| relation_open_error(need.relation(), &opening, error))?
+        .ok_or_else(|| relation_open_missing(need.relation(), &opening))?;
+    let (handle, _) = opened.into_parts();
+    let columns = metadata.get_column_bindings(session, &handle)?;
+    let assignments = assignments_for(need.columns(), &columns, &opening.name)?;
+    if assignments.iter().any(|assignment| {
+        columns
+            .iter()
+            .any(|column| column.is_hidden() && column.column() == assignment.column())
+    }) {
+        return Ok(Outcome::Refused {
+            reason: "DELETE predicate depends on a metadata column".into(),
+        });
+    }
+    let offer = offered_ops(need, &assignments, &column_ordinals(&assignments))?;
+    let operation = ReadNegotiation {
+        handle,
+        ops: offer.ops.clone(),
+    };
+    let negotiated = metadata.negotiate(session, &operation)?;
+    negotiated.verify_shape(operation.ops.len())?;
+    if !entire_filter_exact(need, &offer, &negotiated.outcomes) {
+        return Ok(Outcome::Refused {
+            reason: "Provider did not absorb the complete DELETE predicate".into(),
+        });
+    }
+    opening
+        .request_control
+        .seal_delete_condition(&negotiated.handle)
+        .await
+        .map_err(ProviderReadError::from)
+}
+
+pub(crate) fn observe_delete_target(
+    control: &ConnectorControlHost,
+    original: &crate::connector::write_target::ConnectorWriteTargetBinding,
+    context: &ConnectorRequestContext,
+) -> Result<
+    Option<novarocks_spi::connector::read_stack::ConnectorDeleteTargetFacts>,
+    ProviderReadError,
+> {
+    observe_delete_target_on_ref(control, original, context, None)
+}
+
+pub(crate) fn observe_delete_target_on_ref(
+    control: &ConnectorControlHost,
+    original: &crate::connector::write_target::ConnectorWriteTargetBinding,
+    context: &ConnectorRequestContext,
+    reference: Option<&str>,
+) -> Result<
+    Option<novarocks_spi::connector::read_stack::ConnectorDeleteTargetFacts>,
+    ProviderReadError,
+> {
+    use novarocks_spi::connector::read_stack::ConnectorReadOriginalTableObservation;
+    let Some(source) = original.metadata().source_read_facts() else {
+        return Ok(None);
+    };
+    let read = control.typed_read_for_planning_pin(original.planning_pin())?;
+    let request = request_control_for(&read, context)?;
+    request
+        .observe_delete_target_on_ref(
+            &ConnectorReadOriginalTableObservation {
+                table: original.handle().clone(),
+                source: source.clone(),
+            },
+            reference,
+        )
+        .map_err(ProviderReadError::from)
 }
 
 fn relation_open_error(
@@ -1260,8 +1419,11 @@ fn finish_read_from_opened(
             ProviderReadError::from(error)
                 .context(format!("provider read of {name} has no frozen relation"))
         })?;
-    let (enforced_predicate, unenforced_predicate, remaining_expression) =
-        filter_responsibility(&offer, &negotiated.outcomes);
+    let (enforced_predicate, unenforced_predicate, remaining_expression) = filter_responsibility(
+        &offer,
+        &negotiated.outcomes,
+        entire_filter_exact(need, &offer, &negotiated.outcomes),
+    );
     let (schema, named_columns) = column_facts(
         need.columns(),
         &assignments,
@@ -1826,23 +1988,41 @@ fn provider_constraint(
     )
 }
 
-/// What the provider guaranteed, per predicate occurrence.
-///
-/// Only `Exact` relieves the engine. A provider that merely prunes has
-/// answered about its own work, not about which rows the query returns, so
-/// every occurrence stays the engine's to evaluate.
+/// Whether the provider consumed the entire offer and SQL can prove each
+/// offered occurrence in its original expression. Callers that require the
+/// original WHERE must separately prove that every original atom was offered.
+fn entire_filter_exact(
+    need: &ProviderReadNeed,
+    offer: &OfferedOps,
+    outcomes: &[ReadPushdownOutcome],
+) -> bool {
+    !need.predicates().is_empty()
+        && need
+            .predicates()
+            .iter()
+            .all(|predicate| predicate.exact_eligible())
+        && offer
+            .filter
+            .and_then(|index| outcomes.get(index))
+            .is_some_and(|outcome| {
+                outcome.disposition == ReadPushdownDisposition::Exact
+                    && outcome.residual.as_ref().is_some_and(|residual| {
+                        residual.summary().is_all() && residual.expression().is_constant_true()
+                    })
+            })
+}
+
+/// The whole Filter ownership decision applies to each offered occurrence.
 fn predicate_facts(
     need: &ProviderReadNeed,
     offer: &OfferedOps,
     outcomes: &[ReadPushdownOutcome],
 ) -> Box<[ProviderReadPredicateFact]> {
-    let guarantee = offer
-        .filter
-        .and_then(|index| outcomes.get(index))
-        .filter(|outcome| outcome.disposition == ReadPushdownDisposition::Exact)
-        .map_or(PredicateGuaranteeKind::PruningOnly, |_| {
-            PredicateGuaranteeKind::Exact
-        });
+    let guarantee = if entire_filter_exact(need, offer, outcomes) {
+        PredicateGuaranteeKind::Exact
+    } else {
+        PredicateGuaranteeKind::PruningOnly
+    };
     need.predicates()
         .iter()
         .map(|predicate| ProviderReadPredicateFact::new(predicate.occurrence(), guarantee))
@@ -1899,6 +2079,7 @@ fn offered_constraint(offer: &OfferedOps) -> ConnectorReadConstraint {
 fn filter_responsibility(
     offer: &OfferedOps,
     outcomes: &[ReadPushdownOutcome],
+    sql_filter_exact: bool,
 ) -> (
     TupleDomain<ConnectorReadColumnHandle>,
     TupleDomain<ConnectorReadColumnHandle>,
@@ -1933,6 +2114,20 @@ fn filter_responsibility(
                 // and guessing "nothing remains" would drop rows.
                 return nothing_for_the_reader;
             };
+            // A provider can accept an exactly projected wider temporal
+            // domain even when SQL retains the original coercion and filter.
+            // For that query the original offer remains pruning information.
+            if !sql_filter_exact
+                && residual.summary().is_all()
+                && residual.expression().is_constant_true()
+                && offered.summary().domains().is_some_and(|domains| {
+                    domains.values().any(|domain| {
+                        matches!(domain.value_type(), ConnectorValueType::Temporal(_))
+                    })
+                })
+            {
+                return (TupleDomain::all(), offered.summary().clone(), None);
+            }
             let unenforced = residual.summary().clone();
             // Enforcement is claimed only for a column the provider kept
             // whole. A column handed back partially is covered by its own
@@ -2078,7 +2273,7 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
 #[cfg(test)]
 mod tests {
     use novarocks_physical_plan::{ProviderReadOccurrenceId, ValueType};
-    use novarocks_spi::connector::read_stack::{ConnectorValueType, TupleDomain};
+    use novarocks_spi::connector::read_stack::TupleDomain;
     use novarocks_sql::binding::SqlTableBindingAllocator;
     use novarocks_sql::compiler::fixtures;
     use novarocks_types::naming::TableIdentity;
@@ -2282,7 +2477,11 @@ mod tests {
                 PredicateGuaranteeKind::PruningOnly,
             ),
         ] {
-            let outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
+            let mut outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
+            if disposition == ReadPushdownDisposition::Exact {
+                let filter = &mut outcomes[offer.filter.unwrap()];
+                filter.residual = Some(ConnectorReadConstraint::of_summary(TupleDomain::all()));
+            }
             let facts = predicate_facts(&need, &offer, &outcomes);
             assert_eq!(facts.len(), 1);
             assert_eq!(facts[0].guarantee(), expected, "{disposition:?}");
@@ -2303,7 +2502,8 @@ mod tests {
             ReadPushdownDisposition::Exact,
         ] {
             let outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
-            let (enforced, unenforced, remaining) = filter_responsibility(&offer, &outcomes);
+            let (enforced, unenforced, remaining) = filter_responsibility(&offer, &outcomes, false);
+            assert!(!entire_filter_exact(&need, &offer, &outcomes));
             assert_eq!(enforced, TupleDomain::all(), "{disposition:?}");
             assert_eq!(unenforced, TupleDomain::all(), "{disposition:?}");
             assert!(remaining.is_none(), "{disposition:?}");

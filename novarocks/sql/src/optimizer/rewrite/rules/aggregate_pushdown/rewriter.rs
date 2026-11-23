@@ -910,7 +910,7 @@ mod tests {
                 name,
                 &[arg],
                 &[],
-                false,
+                true,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )

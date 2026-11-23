@@ -72,7 +72,8 @@ impl QueryFamily {
     }
 }
 
-pub(super) struct QueryActionEnvironment {
+#[derive(Clone)]
+pub(crate) struct QueryActionEnvironment {
     pub(super) compiler: compiler::FrontendQueryCompiler,
     pub(super) topology: BackendTopologyService,
     pub(super) role: ClusterRole,

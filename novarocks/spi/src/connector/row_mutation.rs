@@ -157,6 +157,7 @@ pub struct ConnectorMutationTargetField {
     target_ordinal: u32,
     storage_type: Option<novarocks_type_contract::FunctionValueType>,
     execution_type: Option<novarocks_type_contract::FunctionValueType>,
+    temporal_match_source: Option<[u8; 32]>,
 }
 
 impl ConnectorMutationTargetField {
@@ -184,12 +185,49 @@ impl ConnectorMutationTargetField {
             target_ordinal,
             storage_type: None,
             execution_type: Some(execution_type),
+            temporal_match_source: None,
         })
     }
+
+    /// Seal the exact provider field that supplies the same declared scalar
+    /// temporal value through its format-specific read projection.
+    pub fn with_temporal_match_source(
+        mut self,
+        source: &Field,
+        declaration: novarocks_type_contract::TemporalType,
+    ) -> Result<Self, ConnectorError> {
+        let temporal = self
+            .execution_type()
+            .and_then(|value| value.value_type().temporal());
+        if self.storage_type.is_some()
+            || self.temporal_match_source.is_some()
+            || temporal != Some(declaration)
+            || source.name() != self.field.name()
+            || (source.is_nullable() && !self.field.is_nullable())
+            || !matches!(
+                source.data_type(),
+                DataType::Time64(_) | DataType::Timestamp(..)
+            )
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "row-mutation temporal source differs from its signed declaration",
+            ));
+        }
+        self.temporal_match_source = Some(temporal_match_source_digest(source)?);
+        Ok(self)
+    }
+
     pub fn with_storage_type(
         mut self,
         storage: novarocks_type_contract::FunctionValueType,
     ) -> Result<Self, ConnectorError> {
+        if self.temporal_match_source.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "row-mutation temporal source cannot carry a write storage projection",
+            ));
+        }
         let input = self.execution_type.as_ref().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -559,22 +597,26 @@ impl ConnectorRowMutationPreparation {
         base_version.validate()?;
         match_contract.validate()?;
         let match_source_schema_digest = canonical_schema_digest(match_source_schema.as_ref())?;
-        for (expected, storage, before) in match_contract
+        for (expected, storage, before, temporal_source) in match_contract
             .identity_fields()
             .iter()
-            .map(|field| (field.field(), None, None))
-            .chain(
-                match_contract
-                    .before_fields()
-                    .iter()
-                    .map(|field| (field.field(), None, Some(field))),
-            )
-            .chain(
-                match_contract
-                    .after_fields()
-                    .iter()
-                    .map(|field| (field.field(), field.storage_type(), None)),
-            )
+            .map(|field| (field.field(), None, None, None))
+            .chain(match_contract.before_fields().iter().map(|field| {
+                (
+                    field.field(),
+                    None,
+                    Some(field),
+                    field.temporal_match_source,
+                )
+            }))
+            .chain(match_contract.after_fields().iter().map(|field| {
+                (
+                    field.field(),
+                    field.storage_type(),
+                    None,
+                    field.temporal_match_source,
+                )
+            }))
         {
             let mut matching = match_source_schema
                 .fields()
@@ -595,7 +637,9 @@ impl ConnectorRowMutationPreparation {
             };
             let matches = matching.next().is_none()
                 && !(actual.is_nullable() && !expected.is_nullable())
-                && if let Some(storage) = storage {
+                && if let Some(source_digest) = temporal_source {
+                    temporal_match_source_digest(actual)? == source_digest
+                } else if let Some(storage) = storage {
                     // The match source keeps formal storage. When a before
                     // field uses the same checked byte projection as the
                     // canonical input, the after field supplies the original
@@ -870,6 +914,10 @@ fn match_digest(
                 Ok::<_, ConnectorError>(())
             },
         )?;
+        if let Some(source) = field.temporal_match_source {
+            hasher.update(b"temporal-match-source\0");
+            hasher.update(source);
+        }
     }
     hasher.update(effect.token.to_bytes());
     hasher.update(effect.target_ordinal.to_be_bytes());
@@ -1207,6 +1255,19 @@ fn canonical_schema_digest(schema: &Schema) -> Result<[u8; 32], ConnectorError> 
     for field in schema.fields() {
         state.field(field, 0, true)?;
     }
+    Ok(state.hasher.finalize().into())
+}
+
+fn temporal_match_source_digest(field: &Field) -> Result<[u8; 32], ConnectorError> {
+    let mut state = CanonicalSchemaHash {
+        hasher: Sha256::new(),
+        retained_bytes: 0,
+        types: 0,
+    };
+    state
+        .hasher
+        .update(b"novarocks.connector-row-mutation-temporal-source-field.v1\0");
+    state.field(field, 0, true)?;
     Ok(state.hasher.finalize().into())
 }
 

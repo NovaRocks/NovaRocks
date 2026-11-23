@@ -345,3 +345,51 @@ fn commit_and_rollback_have_their_distinct_transaction_result() {
         );
     }
 }
+
+#[test]
+fn explain_analyze_delete_does_not_admit_a_write() {
+    let sql = "EXPLAIN ANALYZE DELETE FROM lake.db.t WHERE part = 1";
+    let statement = parse_statement(sql).unwrap();
+    assert!(matches!(statement, TrinoStatement::ExplainAnalyze(_)));
+    let error = admit_trino_statement(sql, statement).unwrap_err();
+    let user = error.user_error().unwrap();
+    assert_eq!(user.code().as_str(), UNSUPPORTED);
+    assert_eq!(
+        user.message(),
+        "EXPLAIN ANALYZE for this statement is not supported"
+    );
+    assert_eq!(
+        user.location().unwrap().column() as usize,
+        sql.find("DELETE").unwrap() + 1
+    );
+}
+
+#[test]
+fn explain_delete_execute_immediate_preserves_body_parameter_positions() {
+    use std::sync::Arc;
+
+    use novarocks_query_application::{
+        session_value::PreparedStatementSnapshot,
+        sql::trino_admission::admit_trino_statement_request,
+    };
+
+    let sql: Arc<str> =
+        "EXECUTE IMMEDIATE 'EXPLAIN DELETE FROM lake.db.t WHERE part > ?' USING 10".into();
+    let statement = parse_statement(&sql).unwrap();
+    let admitted =
+        admit_trino_statement_request(sql, statement, &PreparedStatementSnapshot::default())
+            .unwrap();
+    let parameters = admitted.parameters.unwrap();
+    let [position] = parameters.positions() else {
+        panic!("EXPLAIN DELETE must retain the original positional parameter");
+    };
+    assert_eq!(
+        &admitted.source.sql()[position.start()..position.end()],
+        "?"
+    );
+    assert!(matches!(
+        admitted.action,
+        TrinoStatementAction::Prepare(TrinoStatementPreparation::ExplainDelete(node))
+            if node.predicate.is_some()
+    ));
+}

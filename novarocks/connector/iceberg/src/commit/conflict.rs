@@ -50,7 +50,14 @@ pub(crate) trait MayMatch: fmt::Display + Send + Sync {
 }
 
 pub(crate) fn validation_conflict(message: impl Into<Arc<str>>) -> ConnectorMutationFailure {
-    validation_failure(CommitOperation::Write, message)
+    validation_conflict_for(CommitOperation::Write, message)
+}
+
+pub(super) fn validation_conflict_for(
+    operation: CommitOperation,
+    message: impl Into<Arc<str>>,
+) -> ConnectorMutationFailure {
+    validation_failure(operation, message)
 }
 
 pub(crate) fn commit_state_unknown(original: ConnectorMutationFailure) -> ConnectorMutationFailure {
