@@ -928,10 +928,20 @@ mod tests {
     }
 
     #[test]
+    fn show_tables_and_describe_admit_typed_metadata_queries() {
+        assert!(matches!(
+            admit("SHOW TABLES").unwrap(),
+            TrinoStatementAction::Query(TrinoQueryAction::Show(TrinoShowAction::Tables(_)))
+        ));
+        assert!(matches!(
+            admit("DESCRIBE db.t").unwrap(),
+            TrinoStatementAction::Query(TrinoQueryAction::Show(TrinoShowAction::Columns(_)))
+        ));
+    }
+
+    #[test]
     fn parsed_only_statements_and_transactions_return_distinct_typed_errors() {
         for (sql, subject) in [
-            ("SHOW TABLES", "SHOW TABLES"),
-            ("DESCRIBE db.t", "SHOW COLUMNS or DESCRIBE table"),
             (
                 "SET SESSION AUTHORIZATION 'reader'",
                 "SET SESSION AUTHORIZATION",

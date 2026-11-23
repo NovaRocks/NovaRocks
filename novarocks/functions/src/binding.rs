@@ -299,7 +299,8 @@ impl FunctionPublicSignature {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The original execution binding. Public signatures are a display projection.
+#[derive(Clone, Debug)]
 pub struct FunctionBindingDeclaration {
     function_id: FunctionId,
     kind: FunctionKind,
@@ -307,6 +308,17 @@ pub struct FunctionBindingDeclaration {
     scalar_invocation_data: Box<[FunctionOverloadId]>,
     public_signatures: Box<[Vec<FunctionPublicSignature>]>,
 }
+
+impl PartialEq for FunctionBindingDeclaration {
+    fn eq(&self, other: &Self) -> bool {
+        self.function_id == other.function_id
+            && self.kind == other.kind
+            && self.overloads == other.overloads
+            && self.scalar_invocation_data == other.scalar_invocation_data
+    }
+}
+
+impl Eq for FunctionBindingDeclaration {}
 
 impl FunctionBindingDeclaration {
     /// A complete metadata declaration, not proof of installed CPU coverage.
