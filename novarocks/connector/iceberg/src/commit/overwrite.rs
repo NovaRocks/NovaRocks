@@ -330,10 +330,7 @@ async fn prepare_snapshot_change_with_summary(
             max_ref_age_ms: None,
         });
     let mut requirements = Vec::new();
-    if !matches!(
-        intent.protocol(),
-        super::model::CommitProtocol::RewriteFiles { .. }
-    ) {
+    if intent.protocol().output_spec_requirement().is_none() {
         requirements.extend([
             TableRequirement::CurrentSchemaIdMatch {
                 current_schema_id: metadata.current_schema_id(),

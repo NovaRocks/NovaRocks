@@ -28,16 +28,19 @@ use novarocks_failure_contract::{
 fn commit_failure_projects_the_original_typed_category_and_message() {
     use novarocks_spi::connector::ConnectorMutationFailureKind::{Conflict, Unavailable};
 
-    let validation = validation_conflict("Cannot commit, missing data files: path");
+    let validation = validation_conflict(
+        CommitOperation::Write,
+        "Cannot commit, missing data files: path",
+    );
     let rejected = original_commit_failure(
         CommitOperation::Write,
         CommitFailureKind::Contention { attempts: 3 },
         ConnectorMutationFailure::new(Conflict, "Catalog returned HTTP 409"),
     );
-    let unknown = commit_state_unknown(ConnectorMutationFailure::new(
-        Unavailable,
-        "Catalog response was lost",
-    ));
+    let unknown = commit_state_unknown(
+        CommitOperation::Write,
+        ConnectorMutationFailure::new(Unavailable, "Catalog response was lost"),
+    );
 
     for (failure, kind, reason, message) in [
         (

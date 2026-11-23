@@ -88,7 +88,8 @@ fn invariant(message: impl Into<String>) -> Error {
 
 pub(crate) fn commit_validation_error(message: impl Into<String>) -> Error {
     let message = message.into();
-    let failure = super::conflict::validation_conflict(message.clone());
+    let failure =
+        super::conflict::validation_conflict(super::model::CommitOperation::Write, message.clone());
     Error::new(ErrorKind::DataInvalid, message).with_source(failure)
 }
 

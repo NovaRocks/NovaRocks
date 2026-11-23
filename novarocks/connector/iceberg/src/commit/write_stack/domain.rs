@@ -470,8 +470,7 @@ impl IcebergFrozenRewriteBranchInput {
 /// rewrite into a failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergEmptyWriteDecision {
-    /// Publish the empty write as an ordinary snapshot. This is what a zero-row
-    /// `INSERT` has always done.
+    /// Publish the empty write as a snapshot.
     Commit,
     /// Terminate the session with no external commit at all. The target ref
     /// keeps the head the session was frozen against.
@@ -2620,10 +2619,14 @@ impl IcebergWriteCommitSession {
             session_id,
             creation_scope: None,
             mutation_read: None,
-            commit_protocol: if flavor.is_distributed_rewrite() {
-                crate::commit::model::WriteSessionCommitProtocol::RewriteFiles
-            } else {
-                crate::commit::model::WriteSessionCommitProtocol::Legacy
+            commit_protocol: match flavor {
+                IcebergWriteFlavor::Append => {
+                    crate::commit::model::WriteSessionCommitProtocol::Append
+                }
+                flavor if flavor.is_distributed_rewrite() => {
+                    crate::commit::model::WriteSessionCommitProtocol::RewriteFiles
+                }
+                _ => crate::commit::model::WriteSessionCommitProtocol::Legacy,
             },
             table,
             flavor,
@@ -2895,12 +2898,12 @@ impl IcebergWriteCommitSession {
 
     /// What an empty prepared write set means for this session.
     ///
-    /// Artifact-only row deltas and explicit managed aborts can finish without
+    /// Empty inserts, artifact-only row deltas and explicit managed aborts finish without
     /// publishing. A rewrite session already owns a nonempty removal set and
     /// settles it even when no rows survive. A plan with no groups starts no
     /// session.
     pub fn empty_write_decision(&self) -> IcebergEmptyWriteDecision {
-        if self.flavor.is_artifact_row_delta() {
+        if self.flavor == IcebergWriteFlavor::Append || self.flavor.is_artifact_row_delta() {
             return IcebergEmptyWriteDecision::SkipExternalCommit;
         }
         let disposition = self

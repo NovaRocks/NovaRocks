@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod append;
 mod rewrite_files;
 mod row_delta_window;
 mod truncate;
@@ -45,6 +46,7 @@ struct ControlledPublisher<'a> {
     fixture: &'a Fixture,
     metadata: Mutex<TableMetadata>,
     dispatch: Dispatch,
+    missing_target: bool,
     cancel_after_load: bool,
     load_delay: Duration,
     recovery_refused: bool,
@@ -61,6 +63,7 @@ impl<'a> ControlledPublisher<'a> {
             fixture,
             metadata: Mutex::new(metadata),
             dispatch,
+            missing_target: false,
             cancel_after_load: false,
             load_delay: Duration::ZERO,
             recovery_refused: false,
@@ -97,6 +100,12 @@ impl Publisher for ControlledPublisher<'_> {
     }
     async fn load_target(&self, _: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.loads.fetch_add(1, Ordering::SeqCst);
+        if self.missing_target {
+            return Err(Error::new(
+                ErrorKind::TableNotFound,
+                "Table db.t does not exist",
+            ));
+        }
         if !self.load_delay.is_zero() {
             tokio::time::sleep(self.load_delay).await;
         }

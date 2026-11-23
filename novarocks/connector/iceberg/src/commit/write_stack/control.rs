@@ -1305,10 +1305,8 @@ fn validate_document_records(
 
 /// Terminate a session whose empty prepared write set means "do nothing".
 ///
-/// This is the provider's own decision, taken from the session's flavor and —
-/// for a publication — the disposition its caller declared. It is deliberately
-/// not derivable from "there were no fragments": a zero-row `INSERT` reaches
-/// `finish_write` exactly the same way and still publishes an empty snapshot.
+/// The session flavor and the caller's declared publication disposition
+/// decide whether an empty write can settle without publication.
 ///
 /// Nothing external is touched here: no snapshot is created, the target ref
 /// keeps the head the session froze, and the outcome names the version the
@@ -1390,7 +1388,10 @@ fn project_released_state(
                 failure: if handle.commit_protocol().operation().style()
                     == crate::commit::model::CommitStyle::Transaction
                 {
-                    crate::commit::conflict::commit_state_unknown(failure)
+                    crate::commit::conflict::commit_state_unknown(
+                        handle.commit_protocol().operation(),
+                        failure,
+                    )
                 } else {
                     failure
                 },
@@ -1434,7 +1435,10 @@ impl IcebergWriteSessionControl {
             && handle.commit_protocol().operation().style()
                 == crate::commit::model::CommitStyle::Transaction
         {
-            *failure = crate::commit::conflict::commit_state_unknown(failure.clone());
+            *failure = crate::commit::conflict::commit_state_unknown(
+                handle.commit_protocol().operation(),
+                failure.clone(),
+            );
         }
         retain_reconciled_committed_fact(handle, &mut outcome);
         Ok(outcome)
@@ -5662,6 +5666,9 @@ impl IcebergWriteSessionControl {
         validate_context(request.context)?;
         if handle.flavor().is_artifact_row_delta() && request.row_count != 0 {
             return Err(corrupt("nonzero logical row delta produced no artifact"));
+        }
+        if handle.flavor() == IcebergWriteFlavor::Append && request.row_count != 0 {
+            return Err(corrupt("nonzero insert produced no artifact"));
         }
         empty_write_needed(handle).map(Some)
     }

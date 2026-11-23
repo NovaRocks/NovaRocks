@@ -1745,9 +1745,8 @@ fn a_document_publication_prepares_exact_keyed_records_closure_and_session_marke
 
 #[test]
 fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
-    // The decision is the caller's declared disposition, not an inference from
-    // "there were no fragments": a zero-row INSERT reaches finish exactly the
-    // same way and still publishes.
+    // A zero-row INSERT skips publication. An empty managed write follows
+    // the independently declared publication disposition.
     let (append, _) = flavor_session(
         plan_ordinary_branches(
             IcebergWriteFlavor::Append,
@@ -1757,7 +1756,7 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
     );
     assert_eq!(
         append.empty_write_decision(),
-        IcebergEmptyWriteDecision::Commit
+        IcebergEmptyWriteDecision::SkipExternalCommit
     );
 
     let publication = |empty_input| {
@@ -4749,9 +4748,48 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
 }
 
 #[test]
+fn empty_insert_settles_without_contacting_the_catalog() {
+    use novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion;
+
+    // The catalog binding is unreachable. An empty write must settle using
+    // the already admitted ref and publish its original NoOp completion.
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        ProviderBindingEpoch::new(),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        runtime,
+    );
+    let (handle, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .unwrap(),
+    );
+    let snapshot = handle.table().base_snapshot_id();
+    let commit = adapter("unit", 1).wrap_commit_session(handle);
+    let outcome = futures::executor::block_on(
+        control
+            .finish_write_needed_original(empty_finish_request(&commit, &request_context()), None),
+    )
+    .unwrap();
+    let ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } = outcome else {
+        panic!("empty INSERT must have a known completion");
+    };
+    assert_eq!(needed.effect(), ExternalMutationEffect::NoOp);
+    assert_eq!(
+        needed.receipt().committed_version().unwrap().snapshot_id(),
+        snapshot
+    );
+}
+
+#[test]
 fn empty_data_replacements_and_managed_publications_keep_their_own_decision() {
     for flavor in [
-        IcebergWriteFlavor::Append,
         IcebergWriteFlavor::Overwrite,
         IcebergWriteFlavor::PartitionOverwrite,
         IcebergWriteFlavor::TableMaintenance,

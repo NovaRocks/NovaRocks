@@ -580,6 +580,12 @@ impl<'a> WriteRecipe<'a> {
             WriteSessionCommitProtocol::Legacy => {
                 (self.dependencies.clone(), CommitProtocol::Legacy)
             }
+            WriteSessionCommitProtocol::Append => (
+                Vec::new(),
+                CommitProtocol::Append {
+                    output_spec_id: self.writer.default_spec_id,
+                },
+            ),
             WriteSessionCommitProtocol::RewriteFiles => (
                 Vec::new(),
                 CommitProtocol::RewriteFiles {

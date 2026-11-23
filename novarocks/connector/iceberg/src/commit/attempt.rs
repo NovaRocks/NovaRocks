@@ -29,16 +29,15 @@ use novarocks_spi::connector::{
 };
 
 use super::commit_failure::{CommitFailureKind, original_commit_failure, validation_failure};
-use super::conflict::validation_conflict;
 #[cfg(test)]
 use super::dependency::ValidationInputs;
 use super::dependency::{self, Verdict};
 #[cfg(test)]
 use super::model::ObjectIdentity;
 use super::model::{
-    ArtifactReferences, ArtifactWriter, CleanupScope, FrozenRequest, IcebergCleanupReport,
-    OperationIntent, PublicationOutcome, PublicationReport, RequestShape, WindowValidation,
-    validate_target_branch,
+    ArtifactReferences, ArtifactWriter, CleanupScope, CommitOperation, CommitProtocol,
+    FrozenRequest, IcebergCleanupReport, OperationIntent, PublicationOutcome, PublicationReport,
+    RequestShape, WindowValidation, validate_target_branch,
 };
 use super::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use super::staging::{PreparedChange, Preparer, StagingBase, StagingEngine};
@@ -375,11 +374,12 @@ async fn run_in_phase(
         .await;
     }
     let started = Instant::now();
-    let deadline = started
+    let request_deadline = operation.request_context().deadline();
+    let retry_deadline = started
         .checked_add(policy.total_timeout)
-        .map_or(operation.request_context().deadline(), |deadline| {
-            deadline.min(operation.request_context().deadline())
-        });
+        .filter(|deadline| *deadline < request_deadline);
+    let deadline = retry_deadline.unwrap_or(request_deadline);
+    let commit_operation = intent.protocol().operation();
     if let Err(error) = operation.bind_preparation_deadline(deadline) {
         return rejected(operation, before_dispatch_failure(&error)).await;
     }
@@ -410,7 +410,8 @@ async fn run_in_phase(
                             .await
                     };
                     let base = loaded.map_err(|error| {
-                        if intent.protocol().requires_target_branch()
+                        if (intent.protocol().requires_target_branch()
+                            || matches!(intent.protocol(), CommitProtocol::Append { .. }))
                             && error.kind() == ErrorKind::TableNotFound
                         {
                             return validation_failure(
@@ -453,7 +454,15 @@ async fn run_in_phase(
             .await;
         let (attempt, request, retained) = match prepared {
             Ok(prepared) => prepared,
-            Err(failure) => return rejected(operation, failure).await,
+            Err(failure) => {
+                let failure = classify_retry_deadline(
+                    commit_operation,
+                    failure,
+                    retry_deadline,
+                    attempt_number,
+                );
+                return rejected(operation, failure).await;
+            }
         };
         match publisher.dispatch_once(request).await {
             CatalogOutcome::KnownCommitted { receipt, .. } => {
@@ -511,7 +520,13 @@ async fn run_in_phase(
                     .observe_preparation_async(operation.pause(wait), before_dispatch_failure)
                     .await
                 {
-                    return rejected(operation, before_dispatch_failure(&error)).await;
+                    let failure = classify_retry_deadline(
+                        commit_operation,
+                        before_dispatch_failure(&error),
+                        retry_deadline,
+                        attempt_number + 1,
+                    );
+                    return rejected(operation, failure).await;
                 }
                 attempt_number += 1;
             }
@@ -530,14 +545,38 @@ async fn run_in_phase(
                 return rejected(operation, failure).await;
             }
             CatalogOutcome::KnownUncommitted { failure } => {
-                let kind = if failure.kind() == ConnectorMutationFailureKind::Conflict {
-                    Some(CommitFailureKind::Contention {
-                        attempts: attempt_number + 1,
-                    })
-                } else if intent.protocol().requires_target_branch() {
-                    Some(CommitFailureKind::Rejected)
-                } else {
-                    None
+                if matches!(
+                    commit_operation,
+                    CommitOperation::Insert | CommitOperation::CreateTable
+                ) && matches!(
+                    failure.kind(),
+                    ConnectorMutationFailureKind::Cancelled
+                        | ConnectorMutationFailureKind::DeadlineExceeded
+                        | ConnectorMutationFailureKind::Interrupted
+                ) {
+                    let failure = classify_retry_deadline(
+                        commit_operation,
+                        failure,
+                        retry_deadline,
+                        attempt_number + 1,
+                    );
+                    return rejected(operation, failure).await;
+                }
+                let kind = match (commit_operation, failure.kind()) {
+                    (CommitOperation::CreateTable, ConnectorMutationFailureKind::AlreadyExists) => {
+                        None
+                    }
+                    (CommitOperation::CreateTable, _) => Some(CommitFailureKind::Rejected),
+                    (_, ConnectorMutationFailureKind::Conflict) => {
+                        Some(CommitFailureKind::Contention {
+                            attempts: attempt_number + 1,
+                        })
+                    }
+                    (CommitOperation::Insert, _) => Some(CommitFailureKind::Rejected),
+                    _ if intent.protocol().requires_target_branch() => {
+                        Some(CommitFailureKind::Rejected)
+                    }
+                    _ => None,
                 };
                 let failure = match kind {
                     Some(kind) => {
@@ -558,6 +597,28 @@ async fn run_in_phase(
                 .await;
             }
         }
+    }
+}
+
+fn classify_retry_deadline(
+    operation: CommitOperation,
+    failure: ConnectorMutationFailure,
+    retry_deadline: Option<Instant>,
+    attempts: u32,
+) -> ConnectorMutationFailure {
+    // Only the strictly earlier retry deadline was installed as a retry
+    // bound. Keep its attribution even if both deadlines have since elapsed.
+    if operation == CommitOperation::Insert
+        && failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded
+        && retry_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        original_commit_failure(
+            operation,
+            CommitFailureKind::Contention { attempts },
+            failure,
+        )
+    } else {
+        failure
     }
 }
 
@@ -645,11 +706,15 @@ async fn prepare(
     if let StagingBase::Existing { metadata, .. } = &base {
         if intent.target().uuid != Some(metadata.uuid()) {
             let message = "Iceberg commit target table UUID was replaced";
-            return Err(if protocol.requires_target_branch() {
-                validation_failure(protocol.operation(), message)
-            } else {
-                ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message)
-            });
+            return Err(
+                if protocol.requires_target_branch()
+                    || matches!(protocol, CommitProtocol::Append { .. })
+                {
+                    validation_failure(protocol.operation(), message)
+                } else {
+                    ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message)
+                },
+            );
         }
         if protocol.requires_target_branch() {
             validate_target_branch(metadata, intent.target_ref())
@@ -693,11 +758,11 @@ async fn prepare(
         for requirement in writer.requirements() {
             requirement
                 .check(Some(metadata))
-                .map_err(|error| validation_conflict(error.to_string()))?;
+                .map_err(|error| validation_failure(protocol.operation(), error.to_string()))?;
             prefix.requirements.push(requirement);
         }
     }
-    if let Some(requirement) = protocol.rewrite_output_requirement() {
+    if let Some(requirement) = protocol.output_spec_requirement() {
         requirement
             .check(Some(metadata))
             .map_err(|error| validation_failure(protocol.operation(), error.to_string()))?;

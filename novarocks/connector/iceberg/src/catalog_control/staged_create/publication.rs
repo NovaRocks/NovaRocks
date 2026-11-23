@@ -113,7 +113,11 @@ pub(super) fn create_intent(
             removed: vec![],
         },
         dependencies: vec![],
-        protocol: crate::commit::model::CommitProtocol::Legacy,
+        protocol: if prepared.document_properties.is_some() {
+            crate::commit::model::CommitProtocol::Legacy
+        } else {
+            crate::commit::model::CommitProtocol::CreateTable
+        },
         shape: RequestShape::Create,
         summary: BTreeMap::new(),
         token,

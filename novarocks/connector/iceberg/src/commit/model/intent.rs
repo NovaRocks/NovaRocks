@@ -102,6 +102,18 @@ impl OperationIntent {
                 "Row-delta requires a snapshot operation with one validation window",
             ));
         }
+        if matches!(&parts.protocol, CommitProtocol::Append { .. })
+            && (parts.shape != RequestShape::SnapshotProducing || !parts.dependencies.is_empty())
+        {
+            return Err(invalid(
+                "Append requires a snapshot operation without a read dependency",
+            ));
+        }
+        if matches!(&parts.protocol, CommitProtocol::CreateTable)
+            && parts.shape != RequestShape::Create
+        {
+            return Err(invalid("Create-table protocol requires a create request"));
+        }
         if parts.shape == RequestShape::Create && parts.start.is_some() {
             return Err(invalid(
                 "Create intent cannot carry an existing start snapshot",

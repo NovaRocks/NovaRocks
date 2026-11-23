@@ -103,6 +103,8 @@ pub(crate) fn commit_failure(
     let prefix = match operation {
         CommitOperation::Legacy => return original,
         CommitOperation::Write => "Failed to commit the transaction during write: ",
+        CommitOperation::Insert => "Failed to commit the transaction during insert: ",
+        CommitOperation::CreateTable => "Failed to commit the transaction during create table: ",
         CommitOperation::Optimize => "Failed to commit the transaction during optimize: ",
         CommitOperation::Truncate => "Failed to commit during truncate: ",
         CommitOperation::OptimizeManifests => "Failed to commit during optimize_manifests: ",

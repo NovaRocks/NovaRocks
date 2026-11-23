@@ -25,6 +25,11 @@ fn original(kind: ConnectorMutationFailureKind) -> ConnectorMutationFailure {
 fn known_conflict_uses_the_operation_style_and_public_detail() {
     for (operation, reason, prefix) in [
         (
+            CommitOperation::Insert,
+            COMMIT_TRANSACTION_CONFLICT,
+            "Failed to commit the transaction during insert: ",
+        ),
+        (
             CommitOperation::Write,
             COMMIT_TRANSACTION_CONFLICT,
             "Failed to commit the transaction during write: ",
@@ -121,4 +126,43 @@ fn row_delta_commit_retains_public_affixes_outside_the_original_body_bound() {
     assert_eq!(cause.prefixed_public_detail(), Some(expected.as_str()));
     assert_eq!(expected.len(), 575);
     assert!(cause.detail().len() <= 512);
+}
+
+#[test]
+fn insert_and_create_table_preserve_transaction_failure_facts() {
+    // The public failure projection preserves the transaction operation name
+    // and distinguishes validation, rejection, and uncertain publication.
+    for (operation, name) in [
+        (CommitOperation::Insert, "insert"),
+        (CommitOperation::CreateTable, "create table"),
+    ] {
+        for (kind, reason, marker) in [
+            (
+                CommitFailureKind::Validation,
+                ICEBERG_COMMIT_VALIDATION_CONFLICT,
+                "",
+            ),
+            (CommitFailureKind::Rejected, ICEBERG_COMMIT_ERROR, ""),
+            (
+                CommitFailureKind::Unknown,
+                ICEBERG_COMMIT_STATE_UNKNOWN,
+                "[CommitUnknown] ",
+            ),
+        ] {
+            let failure = commit_failure(
+                operation,
+                kind,
+                original(ConnectorMutationFailureKind::Unavailable),
+                "Catalog did not confirm the write",
+            );
+            assert_eq!(failure.failure_fact().reason(), reason);
+            let detail = format!(
+                "Failed to commit the transaction during {name}: {marker}Catalog did not confirm the write"
+            );
+            assert_eq!(
+                failure.connector_source().unwrap().public_failure_detail(),
+                Some(detail.as_str())
+            );
+        }
+    }
 }
