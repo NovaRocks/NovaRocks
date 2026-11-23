@@ -28,6 +28,7 @@ pub(crate) mod conflict;
 pub(crate) mod conflict_scope;
 mod data_file;
 pub mod data_writer;
+pub(crate) mod delete_condition;
 pub(crate) mod dependency;
 pub mod equality_delete_writer;
 pub(crate) mod fast_append;

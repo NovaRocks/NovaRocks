@@ -522,20 +522,48 @@ pub enum ConnectorReadRelationPreparationKind {
     },
 }
 
+/// The exact base-table metadata and read facts from one original observation.
+#[derive(Clone, Debug)]
+pub struct ConnectorReadOriginalTableObservation {
+    pub table: crate::connector::ConnectorTableHandle,
+    pub source: crate::connector::ConnectorProcessLocalPayload,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectorReadRelationPreparationRequest {
     name: SchemaTableName,
     kind: ConnectorReadRelationPreparationKind,
+    filter_offer: bool,
+    original_table: Option<ConnectorReadOriginalTableObservation>,
 }
 impl ConnectorReadRelationPreparationRequest {
     pub const fn new(name: SchemaTableName, kind: ConnectorReadRelationPreparationKind) -> Self {
-        Self { name, kind }
+        Self {
+            name,
+            kind,
+            filter_offer: false,
+            original_table: None,
+        }
+    }
+    pub const fn with_filter_offer(mut self, filter_offer: bool) -> Self {
+        self.filter_offer = filter_offer;
+        self
+    }
+    pub const fn has_filter_offer(&self) -> bool {
+        self.filter_offer
     }
     pub const fn name(&self) -> &SchemaTableName {
         &self.name
     }
     pub const fn kind(&self) -> &ConnectorReadRelationPreparationKind {
         &self.kind
+    }
+    pub fn with_original_table(mut self, original: ConnectorReadOriginalTableObservation) -> Self {
+        self.original_table = Some(original);
+        self
+    }
+    pub fn original_table(&self) -> Option<&ConnectorReadOriginalTableObservation> {
+        self.original_table.as_ref()
     }
 }
 
@@ -909,6 +937,49 @@ impl ConnectorReadRequestControl {
         }
     }
 
+    /// Inspect only the original, already admitted DELETE target observation.
+    pub fn observe_delete_target(
+        &self,
+        original: &ConnectorReadOriginalTableObservation,
+    ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
+        self.observe_delete_target_on_ref(original, None)
+    }
+
+    /// Select a DELETE branch from the same original table observation.
+    pub fn observe_delete_target_on_ref(
+        &self,
+        original: &ConnectorReadOriginalTableObservation,
+        reference: Option<&str>,
+    ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
+        match &self.attempt_access {
+            ConnectorReadAttemptAccessMode::Provider(sealer) => {
+                sealer.observe_delete_target(original, reference)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Ask the original provider for the exact partition proof behind DELETE.
+    pub async fn seal_delete_condition(
+        &self,
+        frozen: &ConnectorReadTableHandle,
+    ) -> Result<ConnectorDeleteConditionOutcome, ConnectorError> {
+        if frozen.binding() != &self.binding {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Delete predicate belongs to another read binding",
+            ));
+        }
+        match &self.attempt_access {
+            ConnectorReadAttemptAccessMode::Provider(sealer) => {
+                sealer.seal_delete_condition(frozen).await
+            }
+            _ => Ok(ConnectorDeleteConditionOutcome::Refused {
+                reason: "Connector read binding does not provide a delete predicate".into(),
+            }),
+        }
+    }
+
     /// Seal the final, already-negotiated handle into a provider-owned
     /// per-attempt access source. Providers without request-vended access use
     /// an exact static rebind to these same generation services.
@@ -966,6 +1037,26 @@ impl ConnectorReadRequestControl {
 /// Provider-owned predicate evidence bound to an exact rewritten-target scan.
 pub type ConnectorRewrittenTargetFact = crate::connector::ConnectorProcessLocalPayload;
 
+/// Read-only facts from the exact admitted main DELETE observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorDeleteTargetFacts {
+    pub snapshot_id: Option<i64>,
+    pub row_delete_strategy: Option<crate::connector::ConnectorRowMutationStrategy>,
+}
+
+/// The provider's disposition after the fully offered predicate was negotiated.
+#[derive(Clone, Debug)]
+pub enum ConnectorDeleteConditionOutcome {
+    Empty,
+    Condition {
+        payload: crate::connector::ConnectorProcessLocalPayload,
+        digest: [u8; 32],
+    },
+    Refused {
+        reason: Arc<str>,
+    },
+}
+
 /// Provider-owned factory sealed against one exact, final read handle.
 pub trait ConnectorReadAttemptAccessSealer: Send + Sync {
     fn seal(
@@ -973,6 +1064,26 @@ pub trait ConnectorReadAttemptAccessSealer: Send + Sync {
         frozen: &ConnectorReadTableHandle,
         mint: ConnectorReadAttemptAccessMint,
     ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError>;
+
+    fn observe_delete_target(
+        &self,
+        _original: &ConnectorReadOriginalTableObservation,
+        _reference: Option<&str>,
+    ) -> Result<Option<ConnectorDeleteTargetFacts>, ConnectorError> {
+        Ok(None)
+    }
+
+    fn seal_delete_condition<'a>(
+        &'a self,
+        _frozen: &'a ConnectorReadTableHandle,
+    ) -> futures::future::BoxFuture<'a, Result<ConnectorDeleteConditionOutcome, ConnectorError>>
+    {
+        Box::pin(async {
+            Ok(ConnectorDeleteConditionOutcome::Refused {
+                reason: "Connector read binding does not provide a delete predicate".into(),
+            })
+        })
+    }
 
     /// Project the final predicate of an admitted row-mutation match scan.
     fn rewritten_target_fact(

@@ -1,0 +1,59 @@
+-- query 5
+-- types	boolean
+added_positions
+true
+
+-- query 6
+-- types	bigint
+covered_positions
+1
+
+-- query 9
+-- types	varchar	bigint	bigint	bigint
+operation	physical_rows	removed_positions	removed_dvs
+delete	2	1	0
+
+-- query 10
+-- types	bigint
+delete_files
+0
+
+-- query 11
+-- types	bigint
+id
+3
+
+-- query 16
+-- types	boolean
+added_positions
+true
+
+-- query 17
+-- types	bigint
+covered_positions
+1
+
+-- query 20
+-- types	varchar	bigint	bigint	bigint
+operation	physical_rows	removed_positions	removed_dvs
+delete	2	1	1
+
+-- query 21
+-- types	bigint
+delete_files
+0
+
+-- query 22
+-- types	bigint
+id
+3
+
+-- query 27
+-- types	varchar	bigint	boolean	boolean
+operation	physical_rows	removed_data_files	no_new_delete_files
+delete	1	true	true
+
+-- query 28
+-- types	bigint
+id
+2

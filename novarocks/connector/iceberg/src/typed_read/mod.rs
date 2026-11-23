@@ -31,6 +31,7 @@
 //! * anything this stack cannot prove fails closed -- there is no fallback
 //!   format, no inferred default, and no partially supported read.
 
+mod absorption;
 pub mod change_window;
 pub mod change_window_page_source;
 pub mod codec;

@@ -18,6 +18,10 @@ partially-supersedes:
   - id: ADR-0244
     scope: "Rule 7's ownership of the public commit failure message for ordinary Iceberg row-level writes"
     link: "ADR-0244-iceberg-row-dml-conflict-validation.md"
+partially-superseded-by:
+  - id: ADR-0260
+    scope: "Rule 6's deferred validation of general filter-delete conditions"
+    link: "ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md"
 date: 2026-11-22
 provenance:
   - "discussion: 2026-11-21 operation-shaped Iceberg maintenance commits"

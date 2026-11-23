@@ -19,11 +19,9 @@
 //!
 //! Distributed position-delete path:
 //! 1. Resolve + load the iceberg table.
-//! 2. Run pre-lowering validators and choose the Iceberg write mode.
-//! 3. Validate the parser-owned WHERE before constructing the generated sink query. Phase 1
-//!    supports comparison operators (`= != < <= > >=`), `IN (...)`, and
-//!    `AND` / `OR` against primitive columns (int / long / string / bool / timestamp).
-//!    Other expressions are rejected with an explicit error.
+//! 2. Use the original DELETE path decision and choose the Iceberg write mode.
+//! 3. Keep the original match predicate. Explicit branches retain their existing
+//!    WHERE validation.
 //! 4. Rewrite DELETE into a SELECT of `_file`, `_pos`, and partition source
 //!    columns, then run it through the distributed `ICEBERG_DELETE_SINK`.
 //! 5. The supervised write action consumes the completed plan and retains the
@@ -87,9 +85,7 @@ fn delete_where_expr<'a>(
     parameters: Option<&SqlPreparedParameters>,
 ) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
-        "DELETE requires a WHERE clause; for full table replacement use \
-         INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
-            .to_string()
+        "Explicit branch row-level DELETE lost its original WHERE predicate".to_owned()
     })?;
     validate_bound_where(
         where_clause,
@@ -99,7 +95,7 @@ fn delete_where_expr<'a>(
     Ok(where_clause)
 }
 
-async fn load_delete_target(
+pub(crate) async fn load_delete_target(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
     planning_pin: ConnectorControlPlanningPin,
@@ -132,6 +128,12 @@ pub(super) async fn describe_predicate_delete(
     parameters: &SqlPreparedParameters,
 ) -> Result<(Query, QueryLocalTableOverlay), DmlExecutionError> {
     let target_binding = load_delete_target(state, target, planning_pin, connector_context).await?;
+    if !statement.target.branch_is_explicit() {
+        return Ok((
+            super::absorption::predicate_query(target, statement.selection.clone())?,
+            super::absorption::original_target_overlay(target, &target_binding)?,
+        ));
+    }
     let predicate = delete_where_expr(statement, &target_binding, Some(parameters))?;
     let (_, mutation) = target_binding.prepare_row_mutation(
         target_ref,
@@ -166,18 +168,23 @@ pub(super) async fn prepare_delete_statement_async(
     stmt: &PreparedPredicateDelete,
     target: &TargetBackend,
     target_ref: &str,
-    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    target_binding: ConnectorWriteTargetBinding,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: ConnectorWriteOperationId,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
-    let target_binding = load_delete_target(state, target, planning_pin, connector_context).await?;
-    let where_expr = delete_where_expr(
-        stmt,
-        &target_binding,
-        execution.prepared_parameters().map(Arc::as_ref),
-    )?;
+    let where_expr = if stmt.target.branch_is_explicit() {
+        delete_where_expr(
+            stmt,
+            &target_binding,
+            execution.prepared_parameters().map(Arc::as_ref),
+        )?
+    } else {
+        stmt.selection
+            .as_ref()
+            .ok_or_else(|| "Row-level DELETE lost its original predicate".to_owned())?
+    };
     // This provider author is pure over the frozen table metadata. It keeps
     // the original operation identity and signs strategy, base and routing.
     let (write_lease, mutation) = target_binding.prepare_row_mutation(

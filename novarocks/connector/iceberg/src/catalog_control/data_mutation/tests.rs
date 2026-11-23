@@ -113,6 +113,7 @@ impl IcebergDataMutationBackend for FakeBackend {
     fn execute(
         &self,
         planned: &PlannedIcebergMutation,
+        _condition: Option<Arc<IcebergDeleteConditionFact>>,
         marker: &IcebergDataMutationMarkerV1,
         recovery: &MutationRecoveryTemplate,
         context: &ConnectorRequestContext,
@@ -1080,6 +1081,10 @@ fn planning_refuses_hms_and_background_hadoop_before_backend_io() {
         ));
         let adapter = IcebergDataMutationAdapter::try_new(provider).expect("adapter");
         for operation in [
+            ConnectorDataMutationOperation::DeleteByCondition {
+                table: admission_table(adapter.key.instance_id.clone()),
+                condition: ConnectorDeleteCondition::AllRows,
+            },
             ConnectorDataMutationOperation::truncate(
                 admission_table(adapter.key.instance_id.clone()),
                 "main",

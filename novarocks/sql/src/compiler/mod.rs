@@ -53,7 +53,9 @@ pub use required_constant::{
 pub use table_sequence::{TableSequenceArgumentFact, TableSequenceArgumentNeed};
 
 mod captured_catalog;
+mod delete_absorption;
 mod dml_catalog;
+pub use delete_absorption::DeleteAbsorption;
 mod write_assignment;
 pub use write_assignment::{SqlWriteAssignmentSite, SqlWriteAssignments};
 mod logical_explain;
@@ -69,7 +71,9 @@ pub use crate::planner::distributed::build::{
 };
 pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]
-pub(crate) use completion_driver::compile_authored_aggregate_for_test;
+pub(crate) use completion_driver::{
+    compile_authored_aggregate_for_test, complete_with_catalog_for_test,
+};
 pub use dml_catalog::{
     SqlDmlAnalysisProgress, SqlDmlCatalogPreparation, SqlDmlTableSequenceAnalysis,
 };
@@ -424,6 +428,23 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     fn resolve_scalar_operator_binding(
         &self,
         _operator: novarocks_type_contract::OperatorFunction,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// Resolve syntax-owned scalar calls by identity before argument conversion.
+    fn resolve_trusted_scalar_binding(
+        &self,
+        _function: &novarocks_functions::FunctionId,
         _request: novarocks_functions::FunctionBindingRequest<'_>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<

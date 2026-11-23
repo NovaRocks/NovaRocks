@@ -105,6 +105,7 @@ pub(crate) fn commit_failure(
         CommitOperation::Write => "Failed to commit the transaction during write: ",
         CommitOperation::Optimize => "Failed to commit the transaction during optimize: ",
         CommitOperation::Truncate => "Failed to commit during truncate: ",
+        CommitOperation::Delete => "Failed to commit during delete: ",
         CommitOperation::OptimizeManifests => "Failed to commit during optimize_manifests: ",
         CommitOperation::ExpireSnapshots => "Failed to commit during expire_snapshots: ",
     };

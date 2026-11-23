@@ -238,6 +238,8 @@ pub enum QueryTableBindingAdmission {
     /// A connector-owned table admission retains the exact generation that
     /// admitted its read materialization or terminal write target.
     Exact(ConnectorControlPlanningPin),
+    /// The ordinary Current data read of a table observed by this statement.
+    OriginalTableObservation(ConnectorControlPlanningPin, Option<String>),
     /// One statement's signed mutation target scan and admitted base.
     RowMutationMatch(ConnectorControlPlanningPin, Option<i64>, [u8; 32]),
     /// An ordinary Current source sharing the admitted mutation table and base.
@@ -256,6 +258,7 @@ impl QueryTableBindingAdmission {
     pub fn exact_planning_pin(&self) -> Result<ConnectorControlPlanningPin, String> {
         match self {
             Self::Exact(lease)
+            | Self::OriginalTableObservation(lease, _)
             | Self::FrozenRead(lease)
             | Self::RowMutationMatch(lease, _, _)
             | Self::RowMutationCurrent(lease, _) => Ok(lease.clone()),
@@ -715,6 +718,7 @@ impl QueryTableBindingStore {
                 material.extend_from_slice(Sha256::digest(pin.data_version.as_bytes()).as_slice());
             }
             if let QueryTableBindingAdmission::Exact(lease)
+            | QueryTableBindingAdmission::OriginalTableObservation(lease, _)
             | QueryTableBindingAdmission::FrozenRead(lease)
             | QueryTableBindingAdmission::RowMutationMatch(lease, _, _)
             | QueryTableBindingAdmission::RowMutationCurrent(lease, _) = &binding.admission

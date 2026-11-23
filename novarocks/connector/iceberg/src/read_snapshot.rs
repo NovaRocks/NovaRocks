@@ -29,8 +29,8 @@ use crate::delete_semantics::{
 #[cfg(test)]
 use crate::iceberg::spec::Literal;
 use crate::iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestFile, ManifestStatus,
-    NestedField, PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestFile,
+    ManifestStatus, NestedField, PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
 };
 use crate::iceberg::table::Table;
 use crate::manifest::binding::BoundEntry;
@@ -45,7 +45,11 @@ use crate::read_model::{
     IcebergDataFileMetadata, IcebergReadFile, IcebergReadSnapshot, iceberg_partition_key,
 };
 use crate::scan_model::IcebergColumnStats;
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorPayloadRetentionGuard,
+    ConnectorRequestContext,
+};
+use std::num::NonZeroU64;
 
 // Small metadata-only pruning work is bounded independently of the full suffix.
 const MAX_STATS_DELETE_MEMBERS: usize = 256;
@@ -194,6 +198,193 @@ pub(crate) async fn build_read_snapshot_at_with_control(
     build_read_snapshot_in_domain(table, domain, control).await
 }
 
+/// The selected snapshot's authorized list, retained for the coordinator's
+/// exact read only. The worker receives the predicate, never this inventory.
+pub(crate) struct PreparedReadManifestList {
+    table_uuid: uuid::Uuid,
+    metadata_identity: String,
+    snapshot_id: i64,
+    entries: Box<[ManifestFile]>,
+    spec_ids: Vec<i32>,
+    owned_bytes: u64,
+    _retention: Option<ConnectorPayloadRetentionGuard>,
+}
+
+impl PartialEq for PreparedReadManifestList {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for PreparedReadManifestList {}
+
+impl std::fmt::Debug for PreparedReadManifestList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedReadManifestList")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("spec_ids", &self.spec_ids)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedReadManifestList {
+    pub(crate) async fn prepare(
+        table: &Table,
+        snapshot_id: i64,
+        context: Option<&ConnectorRequestContext>,
+    ) -> Result<Arc<Self>, ConnectorError> {
+        use crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure;
+        let active = || context.map_or(Ok(()), ConnectorRequestContext::check_active);
+        active()?;
+        let metadata = table.metadata();
+        let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg prepared snapshot is absent",
+            )
+        })?;
+        let input = table
+            .file_io()
+            .new_input(snapshot.manifest_list())
+            .map_err(raw_read_failure)?;
+        let governed = context.filter(|context| context.io_admission().is_some());
+        let observed_size = if let Some(context) = governed {
+            let size = input.metadata().await.map_err(raw_read_failure)?.size;
+            if let Some(size) = NonZeroU64::new(size) {
+                context.reserve_owned_metadata(size).await?;
+            }
+            Some(size)
+        } else {
+            None
+        };
+        let list = {
+            let bytes = input.read().await.map_err(raw_read_failure)?;
+            active()?;
+            if observed_size.is_some_and(|size| bytes.len() as u64 != size) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Immutable Iceberg manifest list size changed during read",
+                ));
+            }
+            crate::manifest::decode_manifest_list(&bytes, metadata).map_err(raw_read_failure)?
+        };
+        active()?;
+        let slots = metadata
+            .partition_specs_iter()
+            .len()
+            .min(list.entries().len())
+            .max(1);
+        let allocation_error = || {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg prepared manifest-list backing overflow",
+            )
+        };
+        let metadata_identity = metadata_identity(metadata).map_err(read_snapshot_error)?;
+        let (retention, owned_bytes) = if let Some(context) = governed {
+            let owned = crate::manifest::target_query::descriptor_bytes(list.entries().iter())
+                .map_err(raw_read_failure)?;
+            let header = novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<Self>(),
+            )
+            .map_err(|_| allocation_error())?
+            .size();
+            let backing = slots
+                .checked_mul(std::mem::size_of::<i32>())
+                .and_then(|bytes| bytes.checked_add(metadata_identity.capacity()))
+                .and_then(|bytes| bytes.checked_add(header))
+                .ok_or_else(allocation_error)?;
+            let peak = owned
+                .checked_add(backing as u64)
+                .and_then(NonZeroU64::new)
+                .ok_or_else(allocation_error)?;
+            context.reserve_owned_metadata(peak).await?;
+            (context.retain_owned_metadata()?, peak.get())
+        } else {
+            (None, 0)
+        };
+        let mut spec_ids = Vec::new();
+        spec_ids
+            .try_reserve_exact(slots)
+            .map_err(|_| allocation_error())?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(list.entries().len())
+            .map_err(|_| allocation_error())?;
+        for entry in list.consume_entries() {
+            active()?;
+            if entry.content == ManifestContentType::Data
+                // A rewrite can keep a manifest containing only deleted
+                // entries. Missing summary counts still admit live files.
+                && (entry.has_added_files() || entry.has_existing_files())
+                && metadata
+                    .partition_spec_by_id(entry.partition_spec_id)
+                    .is_some()
+                && let Err(position) = spec_ids.binary_search(&entry.partition_spec_id)
+            {
+                spec_ids.insert(position, entry.partition_spec_id);
+            }
+            entries.push(entry);
+        }
+        if spec_ids.is_empty() {
+            spec_ids.push(metadata.default_partition_spec_id());
+        }
+        Ok(Arc::new(Self {
+            table_uuid: metadata.uuid(),
+            metadata_identity,
+            snapshot_id,
+            entries: entries.into_boxed_slice(),
+            spec_ids,
+            owned_bytes,
+            _retention: retention,
+        }))
+    }
+
+    pub(crate) const fn owned_bytes(&self) -> u64 {
+        self.owned_bytes
+    }
+
+    pub(crate) fn spec_ids(&self) -> &[i32] {
+        &self.spec_ids
+    }
+
+    pub(crate) fn validate(&self, domain: &ReadDomain) -> Result<(), ConnectorError> {
+        let endpoint = domain.endpoint();
+        self.validate_identity(
+            endpoint.table_uuid(),
+            endpoint.metadata_identity(),
+            endpoint.snapshot_id(),
+        )
+    }
+
+    pub(crate) fn validate_observation(
+        &self,
+        metadata: &TableMetadata,
+        snapshot_id: i64,
+    ) -> Result<(), ConnectorError> {
+        let identity = metadata_identity(metadata).map_err(read_snapshot_error)?;
+        self.validate_identity(metadata.uuid(), &identity, snapshot_id)
+    }
+
+    fn validate_identity(
+        &self,
+        table_uuid: uuid::Uuid,
+        metadata_identity: &str,
+        snapshot_id: i64,
+    ) -> Result<(), ConnectorError> {
+        if self.table_uuid != table_uuid
+            || self.metadata_identity != metadata_identity
+            || self.snapshot_id != snapshot_id
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg manifest list differs from the pinned read domain",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Observe every distinct manifest exactly once. Facts remain bound to their
 /// entry, including separate blobs and descriptions sharing one physical path.
 pub(crate) async fn build_read_snapshot_in_domain(
@@ -201,10 +392,21 @@ pub(crate) async fn build_read_snapshot_in_domain(
     domain: Arc<ReadDomain>,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<IcebergReadSnapshot, ConnectorError> {
+    build_read_snapshot_with_prepared_list(table, domain, control, None).await
+}
+
+pub(crate) async fn build_read_snapshot_with_prepared_list(
+    table: &Table,
+    domain: Arc<ReadDomain>,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+    prepared: Option<&PreparedReadManifestList>,
+) -> Result<IcebergReadSnapshot, ConnectorError> {
     let snapshot_id = domain.endpoint().snapshot_id();
-    let files = observe_read_files::<DataFile>(table, domain, control, None)
-        .await
-        .map_err(ReadFailure::into_connector)?;
+    let files = observe_read_files_original::<DataFile>(
+        table, domain, control, None, None, None, None, prepared,
+    )
+    .await
+    .map_err(ReadFailure::into_connector)?;
     Ok(IcebergReadSnapshot {
         snapshot_id: Some(snapshot_id),
         files,
@@ -234,6 +436,7 @@ pub(crate) async fn build_rewrite_read_snapshot_at(
         None,
         None,
         Some(&mut entries),
+        None,
     )
     .await
     .map_err(ReadFailure::into_connector)?;
@@ -323,6 +526,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 Some(io.as_ref()),
                 referenced_specs.as_mut(),
                 None,
+                None,
             )
             .await?
         }
@@ -335,6 +539,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 Some(io.as_ref()),
                 None,
                 rewrite_entries.as_mut(),
+                None,
             )
             .await?
         }
@@ -349,6 +554,7 @@ pub(crate) async fn make_scoped_read_snapshot(
     )
 }
 
+#[cfg(test)]
 /// One common observation retains the original entry, delete and lineage checks.
 /// Only the data-file storage projection differs between scan and scoped callers.
 async fn observe_read_files<P: ObservedDataFileProjection>(
@@ -357,7 +563,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     capture: Option<&CaptureScope<'_>>,
 ) -> Result<Vec<P::File>, ReadFailure> {
-    observe_read_files_original::<P>(table, domain, control, capture, None, None, None).await
+    observe_read_files_original::<P>(table, domain, control, capture, None, None, None, None).await
 }
 
 /// Index by physical path, but retain the original descriptor as a borrowed
@@ -386,6 +592,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     io: Option<&crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotIoGate>,
     mut referenced_specs: Option<&mut crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ReferencedSpecInventory>,
     mut rewrite_entries: Option<&mut rewrite_entries::RewriteEntries>,
+    prepared: Option<&PreparedReadManifestList>,
 ) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
     check_scoped_active(capture)?;
@@ -411,16 +618,28 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         .iter()
         .map(|f| (f.id, f.name.clone()))
         .collect();
-    let manifest_list = match io {
-        Some(io) => {
-            let bytes = io.read(snapshot.manifest_list()).await?;
-            crate::manifest::decode_manifest_list(&bytes, metadata).map_err(|error| {
-                ReadFailure::Original(crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error).into())
-            })?
+    let loaded_manifest_list;
+    let entries = match (prepared, io) {
+        (Some(prepared), None) => {
+            prepared
+                .validate(&domain)
+                .map_err(|error| ReadFailure::Original(error.into()))?;
+            prepared.entries.as_ref()
         }
-        None => crate::manifest::load_manifest_list(snapshot, table.file_io(), metadata)
-            .await
-            .map_err(|e| format!("load manifest list: {e}"))?,
+        (None, Some(io)) => {
+            let bytes = io.read(snapshot.manifest_list()).await?;
+            loaded_manifest_list = crate::manifest::decode_manifest_list(&bytes, metadata)
+                .map_err(|error| ReadFailure::Original(crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error).into()))?;
+            loaded_manifest_list.entries()
+        }
+        (None, None) => {
+            loaded_manifest_list =
+                crate::manifest::load_manifest_list(snapshot, table.file_io(), metadata)
+                    .await
+                    .map_err(|e| format!("load manifest list: {e}"))?;
+            loaded_manifest_list.entries()
+        }
+        (Some(_), Some(_)) => unreachable!("scoped observation owns its original list read"),
     };
     if let Some(inventory) = referenced_specs.as_deref_mut() {
         let gate = io.ok_or_else(|| {
@@ -435,7 +654,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         // Exact manifest-list slot count, before any inventory allocation.
         // Repeated physical paths leave unused paid capacity, not extra reads.
         inventory
-            .reserve_slots(gate, manifest_list.entries().len(), || {
+            .reserve_slots(gate, entries.len(), || {
                 check_read_control(control)?;
                 check_scoped_active(capture)
             })
@@ -444,7 +663,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     let mut seen_manifests: HashSet<ManifestReferenceKey<'_>> = HashSet::new();
     let mut delete_manifests = Vec::new();
     let mut observed_data = Vec::new();
-    for manifest_file in manifest_list.entries() {
+    for manifest_file in entries {
         check_read_control(control)?;
         check_scoped_active(capture)?;
 
@@ -1387,6 +1606,302 @@ mod tests {
             .disable_cache()
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prepared_list_uses_data_specs_and_never_reopens_the_list() {
+        let data_file = file(
+            "partitioned",
+            DataContentType::Data,
+            Struct::from_iter([Some(Literal::string("apple"))]),
+        )
+        .build()
+        .unwrap();
+        let delete_file = file(
+            "equality",
+            DataContentType::EqualityDeletes,
+            Struct::from_iter([Some(Literal::string("ap"))]),
+        )
+        .equality_ids(Some(vec![1]))
+        .build()
+        .unwrap();
+        let evolved = table_with_delete_spec(
+            vec![vec![(data_file, 5)], vec![(delete_file, 4)]],
+            None,
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(evolved.metadata().partition_specs_iter().len(), 2);
+        let partitioned = PreparedReadManifestList::prepare(&evolved, 77, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            partitioned.spec_ids(),
+            &[evolved.metadata().default_partition_spec_id()]
+        );
+
+        use crate::typed_read::{
+            IcebergColumnHandle, IcebergTableHandle, IcebergTableHandleParams,
+        };
+        use novarocks_spi::connector::read_stack::{
+            ConnectorValue, Constraint, Domain, SchemaTableName, TupleDomain,
+        };
+        let metadata = evolved.metadata();
+        let schema = metadata.current_schema();
+        let default = metadata.default_partition_spec_id();
+        let base = IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "t").unwrap(),
+            snapshot_id: Some(77),
+            read_domain: Some(mint_read_domain(metadata, 77, schema).unwrap()),
+            table_schema_json: serde_json::to_string(schema).unwrap(),
+            spec_id: Some(default),
+            partition_spec_jsons: metadata
+                .partition_specs_iter()
+                .map(|spec| (spec.spec_id(), serde_json::to_string(spec).unwrap()))
+                .collect(),
+            format_version: 3,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: Default::default(),
+            name_mapping_json: None,
+            table_location: metadata.location().into(),
+            storage_properties: Default::default(),
+            pinned_data_files: None,
+        })
+        .unwrap();
+        let region = IcebergColumnHandle::base_column_of(schema, 2).unwrap();
+        let offer = Constraint::of_summary(
+            TupleDomain::with_column_domains(BTreeMap::from([(
+                region,
+                Domain::single_value(ConnectorValue::Varchar(Arc::from("apple"))).unwrap(),
+            )]))
+            .unwrap(),
+        );
+        assert!(
+            !base
+                .apply_filter(&offer)
+                .unwrap()
+                .remaining_filter()
+                .is_all()
+        );
+        let with_list = base
+            .with_prepared_manifest_list(Some(partitioned), None)
+            .unwrap();
+        let filtered = with_list.apply_filter(&offer).unwrap();
+        assert!(filtered.remaining_filter().is_all());
+        let worker = IcebergTableHandle::from_proto(&filtered.handle().to_proto()).unwrap();
+        assert!(worker.prepared_manifest_list().is_none());
+        assert_eq!(
+            worker.enforced_predicate(),
+            filtered.handle().enforced_predicate()
+        );
+
+        let (table, _) = descriptor_context_table().await;
+        let metadata = table.metadata();
+        let prepared = PreparedReadManifestList::prepare(&table, 77, None)
+            .await
+            .unwrap();
+        let domain = mint_read_domain(metadata, 77, metadata.current_schema()).unwrap();
+        table
+            .file_io()
+            .delete(metadata.snapshot_by_id(77).unwrap().manifest_list())
+            .await
+            .unwrap();
+        assert!(
+            build_read_snapshot_in_domain(&table, domain.clone(), None)
+                .await
+                .is_err()
+        );
+        let snapshot =
+            build_read_snapshot_with_prepared_list(&table, domain, None, Some(&prepared))
+                .await
+                .unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, "a");
+
+        let foreign_domain =
+            mint_read_domain(evolved.metadata(), 77, evolved.metadata().current_schema()).unwrap();
+        let error =
+            build_read_snapshot_with_prepared_list(&evolved, foreign_domain, None, Some(&prepared))
+                .await
+                .err()
+                .unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn prepared_list_ignores_old_spec_only_when_its_live_counts_are_both_zero() {
+        let io = FileIO::new_with_memory();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "p",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let builder = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory:///c6".to_owned(),
+            FormatVersion::V1,
+            HashMap::new(),
+        )
+        .unwrap();
+        let metadata = builder.build().unwrap().metadata;
+        let old_spec_id = metadata.default_partition_spec_id();
+        let identity = PartitionSpec::builder(metadata.current_schema().clone())
+            .add_partition_field("p", "p_part", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let list_path = "memory:///c6-list.avro";
+        let metadata = metadata
+            .into_builder(None)
+            .add_partition_spec(identity.into_unbound())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(77)
+            .with_parent_snapshot_id(None)
+            .with_sequence_number(0)
+            .with_timestamp_ms(metadata.last_updated_ms())
+            .with_manifest_list(list_path.to_owned())
+            .with_summary(Summary {
+                operation: Operation::Replace,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let metadata = metadata
+            .into_builder(None)
+            .add_snapshot(snapshot)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let old_spec = metadata.partition_spec_by_id(old_spec_id).unwrap();
+        let current_spec_id = metadata.default_partition_spec_id();
+        assert_ne!(old_spec_id, current_spec_id);
+        let mut old_manifest = ManifestWriterBuilder::new(
+            io.new_output("memory:///c6-old.avro").unwrap(),
+            Some(77),
+            metadata.current_schema().clone(),
+            old_spec.as_ref().clone(),
+        )
+        .build_v1();
+        old_manifest
+            .add_delete_file(data("removed"), 0, Some(0))
+            .unwrap();
+        let old_descriptor = old_manifest.write_manifest_file().await.unwrap();
+        assert_eq!(old_descriptor.added_files_count, Some(0));
+        assert_eq!(old_descriptor.existing_files_count, Some(0));
+        assert_eq!(old_descriptor.deleted_files_count, Some(1));
+
+        let mut current_manifest = ManifestWriterBuilder::new(
+            io.new_output("memory:///c6-current.avro").unwrap(),
+            Some(77),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+        )
+        .build_v1();
+        let live = file(
+            "live",
+            DataContentType::Data,
+            Struct::from_iter([Some(Literal::int(10))]),
+        )
+        .build()
+        .unwrap();
+        current_manifest.add_file(live, 0).unwrap();
+        let current_descriptor = current_manifest.write_manifest_file().await.unwrap();
+        let table = Table::builder()
+            .runtime(crate::iceberg::Runtime::try_current().unwrap())
+            .file_io(io.clone())
+            .metadata(metadata)
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .disable_cache()
+            .build()
+            .unwrap();
+        for (added, existing) in [(Some(0), Some(0)), (None, Some(0)), (Some(0), None)] {
+            let old_descriptor = ManifestFile {
+                added_files_count: added,
+                existing_files_count: existing,
+                ..old_descriptor.clone()
+            };
+            let mut writer = ManifestListWriter::v1(
+                io.new_output(list_path).unwrap().writer().await.unwrap(),
+                77,
+                None,
+            );
+            writer
+                .add_manifests([old_descriptor, current_descriptor.clone()].into_iter())
+                .unwrap();
+            writer.close().await.unwrap();
+
+            let prepared = PreparedReadManifestList::prepare(&table, 77, None)
+                .await
+                .unwrap();
+            if added.is_some() && existing.is_some() {
+                assert_eq!(prepared.spec_ids(), &[current_spec_id]);
+            } else {
+                assert_eq!(prepared.spec_ids(), &[old_spec_id, current_spec_id]);
+            }
+            assert_eq!(prepared.entries.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn original_delete_probe_and_matching_read_share_one_manifest_list() {
+        use crate::typed_read::table_handle::OriginalDeleteFilter;
+        use novarocks_spi::connector::{
+            ConnectorStopOwner, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        };
+
+        let (table, _) = descriptor_context_table().await;
+        let stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            stop.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let probe = context.request_scope_extension_or_insert_with(OriginalDeleteFilter::default);
+        let first = probe
+            .prepare_manifest_list(&table, 77, &context)
+            .await
+            .unwrap();
+        let manifest_list = table.metadata().snapshot_by_id(77).unwrap().manifest_list();
+        table.file_io().delete(manifest_list).await.unwrap();
+        drop(probe);
+
+        let matching = context.clone();
+        let observation =
+            matching.request_scope_extension_or_insert_with(OriginalDeleteFilter::default);
+        let reused = observation
+            .prepare_manifest_list(&table, 77, &matching)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        let error = observation
+            .prepare_manifest_list(&table, 78, &matching)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            OriginalDeleteFilter::default()
+                .prepare_manifest_list(&table, 77, &context)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

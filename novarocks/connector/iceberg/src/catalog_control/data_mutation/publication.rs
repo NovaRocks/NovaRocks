@@ -22,6 +22,8 @@ use crate::catalog_control::add_files::{
     RegistrationPreparation, commit_error, procedure_error, registration_error,
 };
 use crate::commit::fast_append::CompactFastAppendPreparer;
+use crate::commit::filter_delete::FilterDeletePreparer;
+use crate::iceberg::{TableUpdate, spec::Operation};
 use novarocks_failure_contract::FailureProjection;
 
 mod registration_checks;
@@ -31,11 +33,11 @@ use crate::catalog::publication::CatalogEvidencePolicy;
 use crate::catalog::publication_dispatch::{PreparationResult, PreparedPublication};
 #[cfg(test)]
 use crate::catalog::transaction::CommitProof;
+use crate::commit::attempt;
 #[cfg(test)]
 use crate::commit::attempt::Publisher;
 use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::{CatalogPublisher, PublicationPreparer};
-use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
     ArtifactWriter, CommitProtocol, Dependency, FileChanges, FrozenRequest, OperationIntent,
     OperationIntentParts, RequestShape, TableTarget,
@@ -121,9 +123,32 @@ fn freeze_intent(
     operation: &IcebergCommitOperation,
     marker: &IcebergDataMutationMarkerV1,
 ) -> crate::iceberg::Result<OperationIntent> {
-    let (payload, source) = planned
-        .truncate_parts()
-        .ok_or_else(|| format_error(invalid("TRUNCATE publication requires a truncate plan")))?;
+    if let PlannedIcebergMutation::Delete { payload, .. } = planned {
+        return OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: TableIdent::new(
+                    NamespaceIdent::new(payload.namespace.clone()),
+                    payload.table.clone(),
+                ),
+                uuid: Some(uuid::Uuid::parse_str(&payload.table_uuid).map_err(|_| {
+                    format_error(corrupt("Iceberg DELETE plan has an invalid target UUID"))
+                })?),
+            },
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges::default(),
+            dependencies: vec![],
+            protocol: CommitProtocol::Delete,
+            shape: RequestShape::SnapshotProducing,
+            summary: marker_summary(marker)?,
+            token: operation.token(),
+        });
+    }
+    let (payload, source) = planned.truncate_parts().ok_or_else(|| {
+        format_error(invalid(
+            "Data mutation publication requires a snapshot-removal plan",
+        ))
+    })?;
     let start = source_snapshot(source, &payload.target_ref).map_err(format_error)?;
     if source.uuid().to_string() != payload.table_uuid
         || start.map(|s| s.snapshot_id) != payload.base_snapshot_id
@@ -218,16 +243,27 @@ impl RegisteredIcebergDataMutationBackend {
     pub(super) fn execute_publication(
         &self,
         planned: &PlannedIcebergMutation,
+        condition: Option<Arc<IcebergDeleteConditionFact>>,
         marker: &IcebergDataMutationMarkerV1,
         recovery: &MutationRecoveryTemplate,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
-        let (payload, source) = planned
-            .truncate_parts()
-            .ok_or_else(|| invalid("TRUNCATE execution requires a truncate plan"))?;
+        let (location, catalog_operation) = match planned {
+            PlannedIcebergMutation::Truncate {
+                source_metadata, ..
+            } => (source_metadata.location(), CatalogOperation::Truncate),
+            PlannedIcebergMutation::Delete { table_location, .. } => {
+                (table_location.as_str(), CatalogOperation::Delete)
+            }
+            PlannedIcebergMutation::RegisterExistingFiles { .. } => {
+                return Err(invalid(
+                    "Data mutation execution requires a snapshot-removal plan",
+                ));
+            }
+        };
         let operation = match IcebergCommitOperation::new(
             OperationToken::from_mutation(recovery.plan.operation_id()),
-            source.location(),
+            location,
             self.runtime.resources().planning_binding().clone(),
             context.clone(),
             self.runtime.resources().catalog_runtime().clone(),
@@ -252,7 +288,12 @@ impl RegisteredIcebergDataMutationBackend {
             .catalog_runtime()
             .observe_preparation(
                 || {
-                    if !planned.is_main_truncate() {
+                    if let PlannedIcebergMutation::Truncate {
+                        mode: TruncateMode::WholeBranch,
+                        payload,
+                        ..
+                    } = planned
+                    {
                         let table =
                             self.reload_table(&payload.namespace, &payload.table, context)?;
                         validate_frozen_table(&table, payload)?;
@@ -260,8 +301,14 @@ impl RegisteredIcebergDataMutationBackend {
                     }
                     let intent = freeze_intent(planned, &operation, marker)
                         .map_err(|error| corrupt(error.to_string()))?;
-                    let policy = RetryPolicy::from_properties(source.properties())
-                        .map_err(|error| invalid(error.to_string()))?;
+                    let policy = match planned {
+                        PlannedIcebergMutation::Truncate {
+                            source_metadata, ..
+                        } => RetryPolicy::from_properties(source_metadata.properties())
+                            .map_err(|error| invalid(error.to_string()))?,
+                        PlannedIcebergMutation::Delete { policy, .. } => *policy,
+                        PlannedIcebergMutation::RegisterExistingFiles { .. } => unreachable!(),
+                    };
                     Ok::<_, ConnectorError>((intent, policy))
                 },
                 |error| attempt::before_dispatch_failure(&format_error(error.clone())),
@@ -279,41 +326,45 @@ impl RegisteredIcebergDataMutationBackend {
                     .map(project_external);
             }
         };
-        let direct = self.catalog_publisher(
-            &journal,
-            recovery,
-            &intent,
-            &operation,
-            CatalogOperation::Truncate,
-        );
-        let main_truncate = planned.is_main_truncate();
-        let (publisher, prefix): (Arc<dyn PublicationPreparer>, PreparedChange) = if main_truncate {
-            (direct, PreparedChange::default())
-        } else {
-            (
-                Arc::new(MutationPublisher {
-                    inner: direct,
-                    payload: payload.clone(),
-                    runtime: Arc::clone(&self.runtime),
-                }),
-                PreparedChange {
-                    updates: vec![],
-                    requirements: vec![
-                        crate::iceberg::TableRequirement::CurrentSchemaIdMatch {
-                            current_schema_id: payload.schema_id,
-                        },
-                        crate::iceberg::TableRequirement::DefaultSpecIdMatch {
-                            default_spec_id: payload.default_spec_id,
-                        },
-                    ],
-                },
-            )
-        };
+        let direct =
+            self.catalog_publisher(&journal, recovery, &intent, &operation, catalog_operation);
+        let (publisher, prefix): (Arc<dyn PublicationPreparer>, PreparedChange) =
+            if let PlannedIcebergMutation::Truncate {
+                mode: TruncateMode::WholeBranch,
+                payload,
+                ..
+            } = planned
+            {
+                (
+                    Arc::new(MutationPublisher {
+                        inner: direct,
+                        payload: payload.clone(),
+                        runtime: Arc::clone(&self.runtime),
+                    }),
+                    PreparedChange {
+                        updates: vec![],
+                        requirements: vec![
+                            crate::iceberg::TableRequirement::CurrentSchemaIdMatch {
+                                current_schema_id: payload.schema_id,
+                            },
+                            crate::iceberg::TableRequirement::DefaultSpecIdMatch {
+                                default_spec_id: payload.default_spec_id,
+                            },
+                        ],
+                    },
+                )
+            } else {
+                (direct, PreparedChange::default())
+            };
         let publisher = journal.observe_prepared(publisher);
         let running_operation = operation.clone();
         let report = operation.runtime().block_on(async move {
-            let filtered =
-                main_truncate.then(crate::commit::filter_delete::FilterDeletePreparer::always_true);
+            let filtered = intent.protocol().requires_target_branch().then(|| {
+                condition.map_or_else(
+                    FilterDeletePreparer::always_true,
+                    FilterDeletePreparer::for_condition,
+                )
+            });
             let legacy = crate::commit::truncate::TruncatePreparer;
             let preparer: &dyn crate::commit::staging::Preparer = match &filtered {
                 Some(filtered) => filtered,
@@ -331,6 +382,11 @@ impl RegisteredIcebergDataMutationBackend {
         });
         let mut outcome = self.project_bridge(&operation, &journal, report)?;
         self.finish_committed(&journal, &recovery.finalization(), context, &mut outcome);
+        if catalog_operation == CatalogOperation::Delete
+            && matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. })
+        {
+            journal.retire_concluded_preparations();
+        }
         Ok(project_external(outcome))
     }
 
@@ -534,9 +590,8 @@ impl RegisteredIcebergDataMutationBackend {
                             "Snapshot-producing mutation has no published snapshot",
                         ))
                     })?;
-                let receipt = template
-                    .publication_receipt(snapshot)
-                    .map_err(format_error)?;
+                let receipt =
+                    preflight_receipt(&template, request, snapshot).map_err(format_error)?;
                 preflight_journal.record(evidence, receipt, request)
             },
         );
@@ -646,6 +701,68 @@ impl RegisteredIcebergDataMutationBackend {
         }
         Ok(())
     }
+}
+
+fn preflight_receipt(
+    template: &MutationRecoveryTemplate,
+    request: &FrozenRequest,
+    snapshot_id: i64,
+) -> Result<DataPublication, ConnectorError> {
+    let mut publication = template.publication_receipt(snapshot_id)?;
+    if template.plan.operation_kind() == DELETE_KIND {
+        let summary = request
+            .updates()
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } if snapshot.snapshot_id() == snapshot_id => {
+                    Some(snapshot.summary())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| corrupt("Iceberg DELETE publication is missing its new snapshot"))?;
+        if summary.operation != Operation::Delete {
+            return Err(corrupt(
+                "Iceberg DELETE publication carries a non-delete snapshot",
+            ));
+        }
+        let count = deleted_rows_from_summary(&summary.additional_properties)?;
+        if count.is_none() {
+            tracing::debug!(
+                operation = ?template.plan.operation_id(),
+                snapshot_id,
+                deleted_records = ?summary.additional_properties.get("deleted-records"),
+                removed_positions = ?summary.additional_properties.get("removed-position-deletes"),
+                removed_equalities = ?summary.additional_properties.get("removed-equality-deletes"),
+                "Iceberg DELETE summary has no representable BIGINT update count"
+            );
+        }
+        publication.receipt = publication.receipt.try_with_deleted_rows(count)?;
+    }
+    Ok(publication)
+}
+
+fn deleted_rows_from_summary(
+    properties: &HashMap<String, String>,
+) -> Result<Option<u64>, ConnectorError> {
+    let get = |key| {
+        properties
+            .get(key)
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| corrupt(format!("Invalid Iceberg DELETE summary property {key}")))
+            })
+            .transpose()
+    };
+    let deleted = get("deleted-records")?;
+    let positions = get("removed-position-deletes")?.unwrap_or_default();
+    let equalities = get("removed-equality-deletes")?.unwrap_or_default();
+    Ok(deleted.and_then(|deleted| {
+        let count = i128::from(deleted) - i128::from(positions) - i128::from(equalities);
+        u64::try_from(count)
+            .ok()
+            .filter(|count| i64::try_from(*count).is_ok())
+    }))
 }
 
 pub(super) fn project_for_operation(

@@ -584,6 +584,7 @@ impl fmt::Debug for ProviderReadRelationNeed {
 pub struct ProviderReadPredicateNeed {
     occurrence: ProviderPredicateOccurrenceId,
     constraint: Constraint<u32>,
+    exact_eligible: bool,
 }
 
 impl ProviderReadPredicateNeed {
@@ -594,7 +595,17 @@ impl ProviderReadPredicateNeed {
         Self {
             occurrence,
             constraint,
+            exact_eligible: true,
         }
+    }
+
+    pub(super) const fn with_exact_eligibility(mut self, exact_eligible: bool) -> Self {
+        self.exact_eligible = exact_eligible;
+        self
+    }
+
+    pub const fn exact_eligible(&self) -> bool {
+        self.exact_eligible
     }
 
     pub const fn occurrence(&self) -> ProviderPredicateOccurrenceId {
@@ -611,6 +622,7 @@ impl fmt::Debug for ProviderReadPredicateNeed {
         formatter
             .debug_struct("ProviderReadPredicateNeed")
             .field("occurrence", &self.occurrence)
+            .field("exact_eligible", &self.exact_eligible)
             .field(
                 "summary_columns",
                 &self.constraint.summary().columns().count(),

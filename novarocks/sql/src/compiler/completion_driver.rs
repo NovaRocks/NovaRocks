@@ -1225,7 +1225,7 @@ impl ProviderColumnProjectionError {
     }
 }
 
-type ProviderColumnProjection = (
+pub(super) type ProviderColumnProjection = (
     Box<[ProviderReadColumnNeed]>,
     BTreeMap<crate::column_id::ColumnId, ProviderPredicateColumn>,
 );
@@ -1245,7 +1245,7 @@ fn preflight_provider_value_type(
     })
 }
 
-fn provider_columns(
+pub(super) fn provider_columns(
     output_columns: &[crate::analysis::OutputColumn],
     scan: &crate::planner::payload::PlanScanNode,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
@@ -2071,18 +2071,48 @@ mod tests {
     }
 
     fn catalog_facts(compilation: &SqlCompilation) -> SqlFactBatch {
+        catalog_facts_with(compilation, resolved_table)
+    }
+
+    fn catalog_facts_with(
+        compilation: &SqlCompilation,
+        resolve: fn(&CatalogRelationNeed) -> ResolvedAnalyzerTable,
+    ) -> SqlFactBatch {
         let needs = match compilation.needs() {
-            SqlNeedBatch::CatalogRelations(needs) => needs.to_vec(),
+            SqlNeedBatch::CatalogRelations(needs) => needs,
             other => panic!("expected catalog needs, got {other:?}"),
         };
         let facts = needs
             .iter()
-            .map(|need| {
-                CatalogRelationFact::resolved(need, resolved_table(need))
-                    .expect("resolved catalog fact")
-            })
+            .map(|need| CatalogRelationFact::resolved(need, resolve(need)).expect("catalog fact"))
             .collect::<Vec<_>>();
         SqlFactBatch::CatalogRelations(facts.into_boxed_slice())
+    }
+
+    pub(crate) fn complete_with_catalog_for_test(
+        request: SqlFinalPlanCompileRequest,
+        resolve: fn(&CatalogRelationNeed) -> ResolvedAnalyzerTable,
+        sql: &str,
+    ) -> super::super::SqlCompletedPlan {
+        let control = SqlCompileControl::unbounded();
+        let progress = SqlCompiler::start(request.try_into_completion().unwrap(), &control)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let compilation = incomplete(progress);
+        let facts = catalog_facts_with(&compilation, resolve);
+        let mut progress = SqlCompiler::finish(compilation, facts, &control)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        loop {
+            match progress {
+                SqlCompileProgress::Complete(completed) => return completed,
+                SqlCompileProgress::Incomplete(compilation) => {
+                    progress = match compilation.needs() {
+                        SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
+                        SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
+                        other => panic!("unexpected observation for {sql}: {other:?}"),
+                    };
+                }
+            }
+        }
     }
 
     pub(super) fn answer_catalog(compilation: SqlCompilation) -> SqlCompileProgress {
@@ -4272,6 +4302,9 @@ mod tests {
         assert!(completed.scalar_schema().is_err());
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::complete_with_catalog_for_test;
 
 #[cfg(test)]
 pub(crate) fn compile_authored_aggregate_for_test(sql: &str) -> super::SqlAuthoredPhysicalPlan {

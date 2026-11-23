@@ -20,7 +20,9 @@
 use super::*;
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
-use novarocks_result_contract::{CharacterKind, CharacterType, NativeRenderType, RenderTimeUnit};
+use novarocks_result_contract::{
+    CharacterKind, CharacterType, NativeRenderType, RenderTemporalType,
+};
 use novarocks_type_contract::ValueLogicalType;
 
 #[test]
@@ -36,10 +38,7 @@ fn public_sql_map_subscript_widens_integer_probe_and_preserves_value_declaration
         (
             "SELECT map_agg(BIGINT '11111', CAST('2024-09-01 18:00:00' AS TIMESTAMP(6)))[11111]",
             DataType::Timestamp(TimeUnit::Microsecond, None),
-            NativeRenderType::Timestamp {
-                unit: RenderTimeUnit::Microsecond,
-                timezone: None,
-            },
+            NativeRenderType::Temporal(RenderTemporalType::Timestamp(6)),
         ),
         (
             "SELECT map_agg(BIGINT '11111', DECIMAL '9223372036854775808')[11111]",

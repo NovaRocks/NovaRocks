@@ -20,6 +20,68 @@ use super::{
     QueryMeta, TrinoErrorExpectation, merge_meta, parse_meta, validate_trino_error_expectation,
 };
 
+#[test]
+fn update_count_expectation_parses_and_validates_one_statement() {
+    use super::{UpdateCountExpectation, validate_update_count_expectation};
+
+    let re = meta_re();
+    for (text, expected) in [
+        ("42", UpdateCountExpectation::Counted(42)),
+        ("0", UpdateCountExpectation::Counted(0)),
+        ("NULL", UpdateCountExpectation::NoCount),
+    ] {
+        let meta = parse_meta(&[format!("-- @expect_update_count={text}")], &re).unwrap();
+        assert_eq!(meta.expect_update_count, Some(expected));
+        assert_eq!(
+            merge_meta(&meta, &QueryMeta::default()).expect_update_count,
+            Some(expected)
+        );
+        validate_update_count_expectation(
+            &meta,
+            Some("DELETE FROM t WHERE k = ';'; -- trailing comment"),
+        )
+        .unwrap();
+        for sql in [
+            "",
+            "-- comment only",
+            "shell: exit 0",
+            "DELETE FROM t; DELETE FROM t",
+        ] {
+            assert!(
+                validate_update_count_expectation(&meta, Some(sql)).is_err(),
+                "{sql}"
+            );
+        }
+    }
+    for text in ["", "-1", "+2", "1.0", "18446744073709551616", "none"] {
+        assert!(
+            parse_meta(&[format!("-- @expect_update_count={text}")], &re).is_err(),
+            "{text}"
+        );
+    }
+    assert!(parse_meta(&["-- @expect_update_count".into()], &re).is_err());
+    assert!(
+        parse_meta(
+            &[
+                "-- @expect_update_count=0".into(),
+                "-- @expect_error=denied".into()
+            ],
+            &re
+        )
+        .is_err()
+    );
+    assert!(
+        parse_meta(
+            &[
+                "-- @expect_update_count=0".into(),
+                "-- @expect_update_count=NULL".into()
+            ],
+            &re
+        )
+        .is_err()
+    );
+}
+
 /// Observes the private merge and validation of Trino error metadata and statement counts.
 #[test]
 fn trino_error_expectation_checks_protocol_fields_and_optional_ordinal() {

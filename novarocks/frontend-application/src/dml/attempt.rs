@@ -173,7 +173,6 @@ impl DmlPublicationAttempt {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn phase(&self) -> DmlPublicationPhase {
         self.phase
     }

@@ -153,6 +153,7 @@ pub(crate) struct ConnectorOperationJob<T: Send + 'static> {
     published: bool,
     result_observed: bool,
     actual_exited: bool,
+    withdrawn: bool,
     failure: Option<ConnectorBlockingIoError>,
     secondary: [Option<ConnectorBlockingIoError>; 2],
 }
@@ -275,6 +276,7 @@ impl ConnectorBlockingIoSupervisor {
             published: false,
             result_observed: false,
             actual_exited: false,
+            withdrawn: false,
             failure: None,
             secondary: [None, None],
         }
@@ -636,6 +638,43 @@ impl<T: Send + 'static> ConnectorOperationJob<T> {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some()
     }
+    /// Dispose the same original blocking call only while it has never reached
+    /// the worker queue. A successful withdrawal includes the input and all
+    /// unpublished reservations. It does not create a physical exit receipt.
+    pub(crate) fn withdraw_unpublished_blocking(&mut self) -> bool {
+        if self.published || self.withdrawn {
+            return false;
+        }
+        let Dispatch::Blocking {
+            prepared, receipt, ..
+        } = &mut self.dispatch
+        else {
+            return false;
+        };
+        drop(prepared.take());
+        drop(receipt.take());
+        let header = self.header();
+        let call = header.call.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(call.expect("unpublished call still has its original input"));
+        let Dispatch::Blocking {
+            source,
+            admission,
+            grant,
+            ..
+        } = &mut self.dispatch
+        else {
+            unreachable!()
+        };
+        drop(grant.take());
+        drop(admission.take());
+        drop(source.take());
+        for pin in &self.header().pins {
+            pin.joined.store(true, Ordering::Release);
+        }
+        self.withdrawn = true;
+        true
+    }
+
     pub(crate) fn actual_exit_observed(&self) -> bool {
         self.actual_exited
     }
@@ -655,7 +694,7 @@ impl<T: Send + 'static> Drop for ConnectorOperationJob<T> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
-        if !self.actual_exited || !empty || call_retained {
+        if !(self.actual_exited || self.withdrawn) || !empty || call_retained {
             // Invalid whole-owner Drop is not shutdown. Keep this same charged
             // original source/pins rather than schedule detached retirement or
             // let ordinary field cleanup forge physical/source exit.

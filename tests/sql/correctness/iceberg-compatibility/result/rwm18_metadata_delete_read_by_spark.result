@@ -1,0 +1,9 @@
+-- query 5
+-- types	bigint	integer	integer
+id	part	score
+3	30	30
+
+-- query 9
+-- types	bigint	integer	integer
+id	part	score
+3	30	30

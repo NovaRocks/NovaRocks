@@ -25,7 +25,13 @@ use super::read_action::{
 use super::statement_computation::StatementStageAdmission;
 use super::*;
 use crate::query::compiler::{ExplainPreparationPorts, PreparedAsyncExplain, PreparedAsyncProfile};
-use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
+use crate::query_execution::completion_facts::{
+    FrontendCompletionCustody, FrontendPlanningCpuSource,
+};
+use crate::query_execution::dml::delete::{
+    self, DeleteExplainStatementInput, DeletePath, OwnedDeleteStatement,
+};
+use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::logical_execution::OriginalComputationStart;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::StatementNativeHealthFailure;
@@ -59,6 +65,211 @@ use super::{
     compiler::ExplainInput,
     query_session_action::{QueryActionEnvironment, QueryActionInputs},
 };
+
+/// A read-only projection of the DELETE path already proved in the original
+/// statement. Row-level input is the ordinary rendered matching read.
+pub(super) enum DeleteExplainPlan<'a> {
+    Empty,
+    Metadata {
+        target: &'a crate::catalog_application::resolver::TargetBackend,
+        snapshot_id: Option<i64>,
+        constrained_columns: &'a [String],
+    },
+    RowLevel {
+        target: &'a crate::catalog_application::resolver::TargetBackend,
+        snapshot_id: Option<i64>,
+        strategy: novarocks_spi::connector::ConnectorRowMutationStrategy,
+        matching_read: Vec<String>,
+    },
+}
+
+pub(super) fn render_delete_plan(
+    plan: DeleteExplainPlan<'_>,
+) -> Result<Vec<String>, QueryServiceError> {
+    use novarocks_spi::connector::ConnectorRowMutationStrategy;
+
+    let layout = "    Layout: [rows:bigint]".to_owned();
+    match plan {
+        DeleteExplainPlan::Empty => Ok(vec![
+            "Values (0 rows)".to_owned(),
+            layout,
+            "    (bigint '0')".to_owned(),
+        ]),
+        DeleteExplainPlan::Metadata {
+            target,
+            snapshot_id,
+            constrained_columns,
+        } => {
+            if snapshot_id.is_none() && !constrained_columns.is_empty() {
+                return Err(internal_error(
+                    "Filtered TableDelete has no original snapshot",
+                ));
+            }
+            let target = delete_target_label(target, snapshot_id);
+            let condition = if constrained_columns.is_empty() {
+                String::new()
+            } else {
+                let columns = constrained_columns
+                    .iter()
+                    .map(|column| delete_explain_identifier(column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" constraint on [{columns}]")
+            };
+            Ok(vec![
+                format!("TableDelete[target = {target}{condition}]"),
+                layout,
+            ])
+        }
+        DeleteExplainPlan::RowLevel {
+            target,
+            snapshot_id,
+            strategy,
+            matching_read,
+        } => {
+            let format = match strategy {
+                ConnectorRowMutationStrategy::DeletionVector => "DeletionVector",
+                ConnectorRowMutationStrategy::PositionDelete => "PositionDelete",
+                other => {
+                    return Err(internal_error(format!(
+                        "Cannot explain DELETE strategy {other:?}"
+                    )));
+                }
+            };
+            if matching_read.is_empty() {
+                return Err(internal_error("Row-level DELETE has no matching read plan"));
+            }
+            let target = delete_target_label(target, snapshot_id);
+            let mut lines = Vec::with_capacity(matching_read.len() + 2);
+            lines.push(format!(
+                "RowLevelDelete[target = {target}, format = {format}]"
+            ));
+            lines.push(layout);
+            lines.extend(matching_read);
+            Ok(lines)
+        }
+    }
+}
+
+fn delete_target_label(
+    target: &crate::catalog_application::resolver::TargetBackend,
+    snapshot_id: Option<i64>,
+) -> String {
+    use std::fmt::Write;
+    let mut label = format!(
+        "{}:{}.{}",
+        delete_explain_identifier(&target.catalog),
+        delete_explain_identifier(&target.namespace),
+        delete_explain_identifier(&target.table),
+    );
+    if let Some(snapshot_id) = snapshot_id {
+        write!(&mut label, "@{snapshot_id}").expect("write to a String");
+    }
+    label
+}
+
+fn delete_explain_identifier(value: &str) -> String {
+    let name =
+        novarocks_parser::build::object_name(vec![novarocks_parser::build::ident_from_catalog(
+            value,
+        )])
+        .expect("one identifier forms a name");
+    novarocks_parser::printer::print_object_name(&name)
+}
+
+pub(super) fn explain_lines_result(lines: Vec<String>) -> Result<QueryResult, QueryServiceError> {
+    build_string_query_result("Explain String", lines).map_err(internal_error)
+}
+
+#[cfg(test)]
+mod delete_explain_tests {
+    use super::*;
+    use crate::catalog_application::resolver::TargetBackend;
+    use novarocks_spi::connector::{ConnectorProviderId, ConnectorRowMutationStrategy};
+
+    fn target() -> TargetBackend {
+        TargetBackend {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            catalog: "lake".into(),
+            namespace: "schema.with.dot".into(),
+            table: "source_table".into(),
+        }
+    }
+
+    #[test]
+    fn explain_delete_displays_the_original_metadata_target_and_layout() {
+        let target = target();
+        let lines = render_delete_plan(DeleteExplainPlan::Metadata {
+            target: &target,
+            snapshot_id: Some(57),
+            constrained_columns: &["p".into(), "Part Id".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            lines,
+            [
+                r#"TableDelete[target = lake:"schema.with.dot".source_table@57 constraint on [p, "Part Id"]]"#,
+                "    Layout: [rows:bigint]",
+            ]
+        );
+        let all_rows = render_delete_plan(DeleteExplainPlan::Metadata {
+            target: &target,
+            snapshot_id: None,
+            constrained_columns: &[],
+        })
+        .unwrap();
+        assert_eq!(
+            all_rows[0],
+            r#"TableDelete[target = lake:"schema.with.dot".source_table]"#
+        );
+        let result = explain_lines_result(lines).unwrap();
+        assert_eq!(result.row_count(), 2);
+        assert_eq!(result.columns[0].name(), "Explain String");
+    }
+
+    #[test]
+    fn explain_delete_zero_path_displays_the_completed_zero_value() {
+        assert_eq!(
+            render_delete_plan(DeleteExplainPlan::Empty).unwrap(),
+            [
+                "Values (0 rows)",
+                "    Layout: [rows:bigint]",
+                "    (bigint '0')",
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_delete_preserves_the_read_plan_and_provider_format() {
+        let target = target();
+        let read = vec!["SCAN t".to_owned(), "  Filter: data > 5".to_owned()];
+        for (strategy, label) in [
+            (
+                ConnectorRowMutationStrategy::DeletionVector,
+                "DeletionVector",
+            ),
+            (
+                ConnectorRowMutationStrategy::PositionDelete,
+                "PositionDelete",
+            ),
+        ] {
+            let lines = render_delete_plan(DeleteExplainPlan::RowLevel {
+                target: &target,
+                snapshot_id: Some(57),
+                strategy,
+                matching_read: read.clone(),
+            })
+            .unwrap();
+            assert_eq!(
+                lines[0],
+                format!(
+                    r#"RowLevelDelete[target = lake:"schema.with.dot".source_table@57, format = {label}]"#
+                )
+            );
+            assert_eq!(lines[2..], read);
+        }
+    }
+}
 
 struct ExplainPreparationInput {
     compiler: FrontendQueryCompiler,
@@ -178,6 +389,8 @@ async fn make_explain_preparation(
                 cpu: &input.planning_cpu,
                 io: input.io,
                 state_store: input.state_store,
+                query_local_overlays: Vec::new(),
+                original_context: None,
             },
         )
         .await?;
@@ -204,6 +417,7 @@ struct ExplainStatementAction {
     // Outside the polled preparation F: async unwind may destroy its fields.
     provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
+    prefix: Option<Arc<FrontendCompletionCustody>>,
     preparation_health: Option<StatementNativeHealthFailure>,
     provider_close: Option<ProviderClose>,
     provider_close_result: Option<Result<(), StatementNativeHealthFailure>>,
@@ -233,6 +447,11 @@ impl GovernedStatementAction for ExplainStatementAction {
             .clone()
             .or_else(|| self.planning_cpu.local_health_failure())
             .or_else(|| self.provider_source.local_health_failure())
+            .or_else(|| {
+                self.prefix
+                    .as_ref()
+                    .and_then(|prefix| prefix.local_health_failure())
+            })
             .or_else(|| {
                 self.provider_close_result
                     .as_ref()
@@ -371,9 +590,7 @@ impl ExplainStatementAction {
                 Ok(PreparedExplain {
                     value: PreparedAsyncExplain::Lines(lines),
                 }) => {
-                    self.raw_result = Some(
-                        build_string_query_result("Explain String", lines).map_err(internal_error),
-                    );
+                    self.raw_result = Some(explain_lines_result(lines));
                 }
                 Ok(PreparedExplain {
                     value: PreparedAsyncExplain::Profile(profile),
@@ -589,6 +806,318 @@ pub(super) fn build_explain_action(
         #[cfg(novarocks_dev_controls)]
             statement_token: _,
     } = inputs;
+    let prepared_scope = scope.clone();
+    let prepared_cancellation = cancellation.clone();
+    #[cfg(novarocks_dev_controls)]
+    let observation_for_preparation = observation.clone();
+    build_scoped_explain(
+        environment,
+        ExplainActionAdmission {
+            scope,
+            deadline,
+            cancellation,
+            family,
+            planning_cpu,
+            prefix: None,
+            preparation_bytes: std::mem::size_of::<ExplainPreparationInput>(),
+            #[cfg(novarocks_dev_controls)]
+            observation,
+        },
+        move |services| {
+            let scope = prepared_scope;
+            let cancellation = prepared_cancellation;
+            let input = ExplainPreparationInput {
+                compiler: environment.compiler.clone(),
+                topology: environment.topology.clone(),
+                role: environment.role,
+                optimizer_limit: environment.optimizer_limit,
+                sql,
+                explain,
+                parameters,
+                state,
+                statement_time,
+                deadline,
+                cancellation,
+                scope,
+                window,
+                provider_source: services.provider.clone(),
+                planning_cpu: services.cpu.clone(),
+                io: services.io.clone(),
+                state_store: services.state_store,
+                #[cfg(novarocks_dev_controls)]
+                observation: observation_for_preparation,
+            };
+            Box::pin(make_explain_preparation(input))
+        },
+    )
+}
+
+struct DeleteExplainPreparation {
+    kernel: DmlExecutionKernel,
+    target: crate::catalog_application::resolver::TargetBackend,
+    planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+    input: DeleteExplainStatementInput,
+    prefix: Arc<FrontendCompletionCustody>,
+    sources: ExplainActionSources,
+}
+
+pub(crate) fn prepare_delete_explain(
+    kernel: DmlExecutionKernel,
+    input: DeleteExplainStatementInput,
+) -> Result<Box<dyn GovernedStatementAction>, QueryServiceError> {
+    let (target, _) = delete::resolve_target(
+        &kernel,
+        &input.statement,
+        input.context.session().current_catalog(),
+        input.context.session().current_database(),
+    )
+    .map_err(|error| error.into_service())?;
+    let planning = crate::connector::acquire_metadata_planning_pin(
+        kernel.connector_control().as_ref(),
+        &target.catalog,
+    )
+    .map_err(|error| {
+        let error = crate::catalog_application::resolver::TargetResolutionError::from(error);
+        error.into_service()
+    })?;
+    let prefix = FrontendCompletionCustody::new();
+    let admission = ExplainActionAdmission {
+        scope: input.command.scope().clone(),
+        deadline: input.context.execution().deadline(),
+        cancellation: input.context.execution().cancellation().clone(),
+        family: input.family,
+        planning_cpu: None,
+        prefix: Some(prefix.clone()),
+        preparation_bytes: std::mem::size_of::<DeleteExplainPreparation>(),
+        #[cfg(novarocks_dev_controls)]
+        observation: input.observation.clone(),
+    };
+    let environment = input.environment.clone();
+    build_scoped_explain(&environment, admission, move |sources| {
+        Box::pin(make_delete_explain_preparation(DeleteExplainPreparation {
+            kernel,
+            target,
+            planning,
+            input,
+            prefix,
+            sources,
+        }))
+    })
+}
+
+async fn make_delete_explain_preparation(
+    preparation: DeleteExplainPreparation,
+) -> Result<Result<PreparedExplain, QueryServiceError>, StatementNativeHealthFailure> {
+    let DeleteExplainPreparation {
+        kernel,
+        target,
+        planning,
+        input,
+        prefix,
+        sources,
+    } = preparation;
+    let statement = match input.statement {
+        OwnedDeleteStatement::Predicate(statement) => statement,
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { .. } => {
+            return Ok(Err(internal_error("EXPLAIN expected a SQL DELETE")));
+        }
+    };
+    let reference = if statement.target.branch_is_explicit() {
+        if statement.selection.is_none() {
+            return Ok(Err(QueryServiceError::new(
+                QueryServiceErrorKind::Unsupported,
+                "EXPLAIN does not support a whole-branch DELETE",
+            )));
+        }
+        match statement.target.table_and_reference() {
+            Ok((_, reference)) => Some(reference.to_owned()),
+            Err(error) => return Ok(Err(internal_error(error))),
+        }
+    } else {
+        None
+    };
+    let connector = input
+        .command
+        .connector_context()
+        .clone()
+        .with_io_admission(sources.io.clone())
+        .with_original_table_preparation_reuse();
+    let proved = delete::select_delete_path(
+        &kernel,
+        &target,
+        planning,
+        &statement,
+        &input.context,
+        &connector,
+        &prefix,
+    )
+    .await;
+    prefix.close().await?;
+    let (original, decision) = match proved {
+        Ok(proved) => proved,
+        Err(error) => {
+            return Ok(Err(routed_execution_service_error(
+                dml_result::<()>(Err(error.into_dml_error(Some(&input.sql)))).unwrap_err(),
+            )));
+        }
+    };
+    let rendered = match decision.path {
+        DeletePath::Empty => render_delete_plan(DeleteExplainPlan::Empty),
+        DeletePath::Metadata { .. } => render_delete_plan(DeleteExplainPlan::Metadata {
+            target: &target,
+            snapshot_id: decision.snapshot_id,
+            constrained_columns: &decision.constrained_columns,
+        }),
+        DeletePath::RowLevel => {
+            let (snapshot_id, strategy) = if let Some(reference) = &reference {
+                match crate::query_execution::provider_read_facts::observe_delete_target_on_ref(
+                    kernel.typed_connector_control(),
+                    &original,
+                    &connector,
+                    Some(reference),
+                ) {
+                    Ok(Some(facts)) => (facts.snapshot_id, facts.row_delete_strategy),
+                    Ok(None) => {
+                        return Ok(Err(internal_error(
+                            "DELETE branch has no original read facts",
+                        )));
+                    }
+                    Err(error) => {
+                        let projected = match error.into_original_cause() {
+                            Ok(cause) => QueryServiceError::from_failure_cause(cause),
+                            Err(error) => internal_error(error.to_string()),
+                        };
+                        return Ok(Err(projected));
+                    }
+                }
+            } else {
+                (decision.snapshot_id, decision.row_delete_strategy)
+            };
+            let Some(strategy) = strategy else {
+                return Ok(Err(QueryServiceError::new(
+                    QueryServiceErrorKind::Unsupported,
+                    "Iceberg table format does not support row-level DELETE",
+                )));
+            };
+            let prepared = (|| {
+                let query = delete::absorption::predicate_query(&target, statement.selection)
+                    .map_err(internal_error)?;
+                let overlay = delete::absorption::original_target_explain_overlay(
+                    &target, &original, reference,
+                )
+                .map_err(internal_error)?;
+                let planning_context =
+                    novarocks_spi::connector::ConnectorPlanningContext::try_from_request(connector)
+                        .map_err(|error| internal_error(error.to_string()))?;
+                Ok::<_, QueryServiceError>((query, overlay, planning_context))
+            })();
+            let (query, overlay, planning_context) = match prepared {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            let mut context = input.context;
+            if context.execution().topology().targets().is_empty() {
+                let execution = context.execution();
+                let topology = wait_for_initial_query_topology(
+                    &input.environment.topology,
+                    execution.cancellation(),
+                    execution.deadline(),
+                )
+                .await;
+                let execution = match topology.and_then(|topology| {
+                    execution
+                        .clone()
+                        .with_first_compute_topology(topology)
+                        .map_err(|error| internal_error(error.to_string()))
+                }) {
+                    Ok(execution) => execution,
+                    Err(error) => return Ok(Err(error)),
+                };
+                context = RequestContext::new(context.session().clone(), execution);
+            }
+            let mut options = *input.query_options.as_proto();
+            options.query_timeout = 0;
+            let matching = input
+                .environment
+                .compiler
+                .prepare_explain_async(
+                    ExplainInput::plan(Box::new(query)),
+                    input.detail,
+                    &context,
+                    Some(QueryOptions::from_proto(options)),
+                    input.command.scope(),
+                    ExplainPreparationPorts {
+                        provider: &sources.provider,
+                        cpu: &sources.cpu,
+                        io: sources.io,
+                        state_store: sources.state_store,
+                        query_local_overlays: vec![overlay],
+                        original_context: Some(planning_context),
+                    },
+                )
+                .await?;
+            let matching_read = match matching {
+                Ok(PreparedAsyncExplain::Lines(lines)) => lines,
+                Ok(PreparedAsyncExplain::Profile(_)) => {
+                    return Ok(Err(internal_error(
+                        "EXPLAIN DELETE acquired a Profile computation",
+                    )));
+                }
+                Err(error) => {
+                    return Ok(Err(routed_execution_service_error(
+                        routed_compiler_failure(error, &input.sql),
+                    )));
+                }
+            };
+            render_delete_plan(DeleteExplainPlan::RowLevel {
+                target: &target,
+                snapshot_id,
+                strategy,
+                matching_read,
+            })
+        }
+    };
+    Ok(rendered.map(|lines| PreparedExplain {
+        value: PreparedAsyncExplain::Lines(lines),
+    }))
+}
+
+struct ExplainActionAdmission {
+    scope: novarocks_workload_control::WorkScope,
+    deadline: Option<Instant>,
+    cancellation: QueryCancellationView,
+    family: novarocks_result_contract::ClientPresentationFamily,
+    planning_cpu: Option<Arc<FrontendPlanningCpuSource>>,
+    prefix: Option<Arc<FrontendCompletionCustody>>,
+    preparation_bytes: usize,
+    #[cfg(novarocks_dev_controls)]
+    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+}
+
+struct ExplainActionSources {
+    provider: Arc<FrontendCompletionCustody>,
+    cpu: Arc<FrontendPlanningCpuSource>,
+    io: Arc<ReadMetadataIoSource>,
+    state_store: Option<Arc<dyn StateStoreExecutionRequests>>,
+}
+
+fn build_scoped_explain(
+    environment: &QueryActionEnvironment,
+    admission: ExplainActionAdmission,
+    make_preparation: impl FnOnce(ExplainActionSources) -> PreparationFuture,
+) -> Result<Box<dyn GovernedStatementAction>, QueryServiceError> {
+    let ExplainActionAdmission {
+        scope,
+        deadline,
+        cancellation,
+        family,
+        planning_cpu,
+        prefix,
+        preparation_bytes,
+        #[cfg(novarocks_dev_controls)]
+        observation,
+    } = admission;
     environment
         .compiler
         .validate_original_read_runtime()
@@ -611,7 +1140,7 @@ pub(super) fn build_explain_action(
         .state_store
         .as_ref()
         .map_or(&[][..], |binding| binding.blocking_dependency_facts());
-    let profile = explain_preparation_profile(dependencies)
+    let profile = explain_preparation_profile(dependencies, preparation_bytes)
         .map_err(|error| internal_error(error.to_string()))?;
     let io = ReadMetadataIoSource::new(scope.clone(), profile.clone());
     io.configure_read_source(&profile)
@@ -625,34 +1154,27 @@ pub(super) fn build_explain_action(
         crate::query_execution::completion_facts::FrontendCompletionCustody::new();
     let planning_cpu =
         planning_cpu.unwrap_or_else(|| environment.compiler.new_planning_cpu_source());
-    let input = ExplainPreparationInput {
-        compiler: environment.compiler.clone(),
-        topology: environment.topology.clone(),
-        role: environment.role,
-        optimizer_limit: environment.optimizer_limit,
-        sql,
-        explain,
-        parameters,
-        state,
-        statement_time,
-        deadline,
-        cancellation,
-        scope: scope.clone(),
-        window,
-        provider_source: Arc::clone(&provider_source),
-        planning_cpu: Arc::clone(&planning_cpu),
-        io: Arc::clone(&io),
+    let close_prefix = prefix.clone();
+    let close_provider_source = provider_source.clone();
+    let close_cpu = planning_cpu.clone();
+    let provider_close = Some(Box::pin(async move {
+        let prefix_closed = match close_prefix {
+            Some(prefix) => prefix.close().await,
+            None => Ok(()),
+        };
+        let provider_closed = close_provider(close_provider_source, close_cpu).await;
+        prefix_closed.and(provider_closed)
+    }) as ProviderClose);
+    let preparation = make_preparation(ExplainActionSources {
+        provider: provider_source.clone(),
+        cpu: planning_cpu.clone(),
+        io: io.clone(),
         state_store: state_store_requests,
-        #[cfg(novarocks_dev_controls)]
-        observation: observation.clone(),
-    };
-    let provider_close = Some(Box::pin(close_provider(
-        Arc::clone(&provider_source),
-        Arc::clone(&planning_cpu),
-    )) as ProviderClose);
+    });
     Ok(Box::new(ExplainStatementAction {
         family,
         provider_source,
+        prefix,
         planning_cpu,
         preparation_health: None,
         provider_close,
@@ -665,7 +1187,7 @@ pub(super) fn build_explain_action(
         bootstrap_ready: false,
         result_transferred: false,
         error: None,
-        preparation: Some(Box::pin(make_explain_preparation(input))),
+        preparation: Some(preparation),
         preparation_started: false,
         prepared: None,
         profile: None,
@@ -683,6 +1205,7 @@ pub(super) fn build_explain_action(
 
 fn explain_preparation_profile(
     dependencies: &[SharedDependency],
+    preparation_bytes: usize,
 ) -> Result<ConnectorMetadataMaintenanceIoProfile, WorkError> {
     let mut dependencies = dependencies.to_vec();
     if !dependencies.contains(&SharedDependency::LocalHost) {
@@ -692,7 +1215,7 @@ fn explain_preparation_profile(
         std::num::NonZeroUsize::new(1).unwrap(),
         std::num::NonZeroU64::new(crate::query_execution::maintenance::io_admission::MetadataIoAdmission::request_metadata_bytes())
             .ok_or(WorkError::ArithmeticOverflow)?,
-        std::num::NonZeroU64::new(std::mem::size_of::<ExplainPreparationInput>() as u64)
+        std::num::NonZeroU64::new(preparation_bytes as u64)
             .ok_or(WorkError::ArithmeticOverflow)?,
         dependencies,
     ).map_err(|_| WorkError::InvalidConfig("local EXPLAIN preparation source declaration"))
@@ -815,6 +1338,7 @@ mod tests {
                 ),
             ),
             preparation_health: None,
+            prefix: None,
             provider_close: None,
             provider_close_result: Some(Ok(())),
             tail: None,

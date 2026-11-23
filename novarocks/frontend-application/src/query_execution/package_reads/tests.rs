@@ -251,6 +251,87 @@ fn a_complete_frozen_read_is_authored() {
 }
 
 #[test]
+fn frozen_exact_filter_restores_only_representable_temporal_bounds() {
+    use super::{Bound, ConnectorValue, Domain, FrozenConnectorScan, Range, scan_domain};
+    use novarocks_connector_contract::{
+        ScanColumnId, StaticConnectorScanError, StaticScanAssignment, ValueSet,
+    };
+    use novarocks_type_contract::{TemporalMicros, TemporalPrecision, TemporalType, TemporalValue};
+
+    let (plan, encodings) = fixture();
+    let authored = author_frozen_reads(&plan, &encodings, &SqlCompileControl::unbounded()).unwrap();
+    let recipe = authored.values().next().unwrap().scan().recipe().clone();
+    let column = encodings.values().next().unwrap().assignments[0].column();
+    let ordinal = ScanColumnId::new(0);
+    let ordinals = BTreeMap::from([(column, ordinal)]);
+    let original = TemporalType::Timestamp(TemporalPrecision::MICROSECONDS);
+    let picos = TemporalType::Timestamp(TemporalPrecision::PICOSECONDS);
+    let declared = ConnectorValueType::Temporal(original);
+    let widened = ConnectorValueType::Temporal(picos);
+    let assignments = [StaticScanAssignment::new(Arc::from("c"), declared)];
+    let value = |kind, instant| ConnectorValue::Temporal {
+        data_type: kind,
+        value: TemporalValue::Timestamp(instant),
+    };
+    let low = TemporalMicros::whole_micros(-86_400_000_000);
+    let high = TemporalMicros::whole_micros(0);
+    let offered_domain = |low| {
+        let range = Range::try_new(
+            widened,
+            Bound::Inclusive(value(picos, low)),
+            Bound::Exclusive(value(picos, high)),
+        )
+        .unwrap();
+        let domain = Domain::new(ValueSet::of_ranges(widened, vec![range]).unwrap(), true);
+        TupleDomain::with_column_domains(BTreeMap::from([(column.clone(), domain)])).unwrap()
+    };
+    let offered = offered_domain(low);
+    let enforced = scan_domain(&offered, &ordinals, Some(&assignments)).unwrap();
+    let stored = enforced.domain_for(&ordinal).unwrap();
+    assert_eq!(stored.value_type(), declared);
+    assert!(stored.null_allowed());
+    let [range] = stored.values().ranges() else {
+        panic!("the exact interval remains one range");
+    };
+    assert_eq!(range.low(), &Bound::Inclusive(value(original, low)));
+    assert_eq!(range.high(), &Bound::Exclusive(value(original, high)));
+
+    let freeze = |enforced, unenforced| {
+        FrozenConnectorScan::try_new(
+            recipe.clone(),
+            assignments.to_vec(),
+            enforced,
+            unenforced,
+            None,
+            Vec::new(),
+        )
+    };
+    freeze(enforced, TupleDomain::all()).unwrap();
+
+    let pruning = scan_domain(&offered, &ordinals, None).unwrap();
+    assert_eq!(pruning.domain_for(&ordinal).unwrap().value_type(), widened);
+    freeze(TupleDomain::all(), pruning).unwrap();
+
+    let unaligned = offered_domain(TemporalMicros::new(-1, 999_999).unwrap());
+    let unproven = scan_domain(&unaligned, &ordinals, Some(&assignments)).unwrap();
+    assert_eq!(
+        freeze(unproven, TupleDomain::all()).unwrap_err(),
+        StaticConnectorScanError::PredicateTypeMismatch,
+    );
+
+    let non_temporal = Domain::single_value(ConnectorValue::Integer(20)).unwrap();
+    let assignment = [StaticScanAssignment::new(
+        Arc::from("c"),
+        ConnectorValueType::Integer,
+    )];
+    let offered =
+        TupleDomain::with_column_domains(BTreeMap::from([(column.clone(), non_temporal.clone())]))
+            .unwrap();
+    let exact = scan_domain(&offered, &ordinals, Some(&assignment)).unwrap();
+    assert_eq!(exact.domain_for(&ordinal), Some(&non_temporal));
+}
+
+#[test]
 fn a_frozen_read_without_public_schema_is_refused() {
     let (plan, mut encodings) = fixture();
     let encoding = encodings.values_mut().next().unwrap();

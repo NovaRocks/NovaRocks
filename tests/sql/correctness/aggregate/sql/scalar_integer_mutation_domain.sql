@@ -49,5 +49,16 @@ SELECT id,t,age FROM ${case_db}.scalar_integer_mutation ORDER BY id;
 
 -- query 8
 -- @skip_result_check=true
+-- @expect_update_count=1
+-- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+DELETE FROM ${case_db}.scalar_integer_partition WHERE age = 3;
+
+-- query 9
+SELECT id,t,age FROM ${case_db}.scalar_integer_partition ORDER BY id;
+
+-- query 10
+-- @skip_result_check=true
 DROP TABLE ${case_db}.scalar_integer_mutation ;
 DROP TABLE ${case_db}.scalar_integer_partition ;

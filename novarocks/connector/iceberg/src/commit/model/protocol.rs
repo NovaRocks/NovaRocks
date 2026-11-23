@@ -28,6 +28,7 @@ pub(crate) enum CommitOperation {
     Write,
     Optimize,
     Truncate,
+    Delete,
     OptimizeManifests,
     ExpireSnapshots,
 }
@@ -44,7 +45,9 @@ impl CommitOperation {
         match self {
             Self::Legacy => CommitStyle::Legacy,
             Self::Write | Self::Optimize => CommitStyle::Transaction,
-            Self::Truncate | Self::OptimizeManifests | Self::ExpireSnapshots => CommitStyle::Update,
+            Self::Truncate | Self::Delete | Self::OptimizeManifests | Self::ExpireSnapshots => {
+                CommitStyle::Update
+            }
         }
     }
 }
@@ -100,6 +103,7 @@ impl WriteSessionCommitProtocol {
 pub(crate) enum CommitProtocol {
     Legacy,
     Truncate,
+    Delete,
     RowDelta {
         window: RowDeltaWindowCheck,
         writer: WriterSchemaSpec,
@@ -115,6 +119,7 @@ impl CommitProtocol {
         match self {
             Self::Legacy => CommitOperation::Legacy,
             Self::Truncate => CommitOperation::Truncate,
+            Self::Delete => CommitOperation::Delete,
             Self::RowDelta { .. } => CommitOperation::Write,
             Self::RewriteFiles { .. } => CommitOperation::Optimize,
         }
@@ -122,7 +127,7 @@ impl CommitProtocol {
 
     pub(crate) fn window(&self) -> WindowValidation<'_> {
         match self {
-            Self::Legacy | Self::Truncate => WindowValidation::None,
+            Self::Legacy | Self::Truncate | Self::Delete => WindowValidation::None,
             Self::RowDelta { window, .. } => WindowValidation::RowDelta(window),
             Self::RewriteFiles { replaced, .. } => WindowValidation::RewriteFiles(replaced),
         }
@@ -130,7 +135,7 @@ impl CommitProtocol {
 
     pub(crate) const fn writer_schema_spec(&self) -> Option<WriterSchemaSpec> {
         match self {
-            Self::Legacy | Self::Truncate | Self::RewriteFiles { .. } => None,
+            Self::Legacy | Self::Truncate | Self::Delete | Self::RewriteFiles { .. } => None,
             Self::RowDelta { writer, .. } => Some(*writer),
         }
     }
@@ -141,12 +146,15 @@ impl CommitProtocol {
                     default_spec_id: *output_spec_id,
                 })
             }
-            Self::Legacy | Self::Truncate | Self::RowDelta { .. } => None,
+            Self::Legacy | Self::Truncate | Self::Delete | Self::RowDelta { .. } => None,
         }
     }
 
     pub(crate) const fn requires_target_branch(&self) -> bool {
-        matches!(self, Self::Truncate | Self::RewriteFiles { .. })
+        matches!(
+            self,
+            Self::Truncate | Self::Delete | Self::RewriteFiles { .. }
+        )
     }
 }
 

@@ -291,6 +291,18 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         self.admit(binding, control)
     }
 
+    fn resolve_trusted_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let binding = self
+            .original
+            .resolve_trusted_scalar_binding(function, request, control)?;
+        self.admit(binding, control)
+    }
+
     fn finish_scalar_binding(
         &self,
         function: &novarocks_functions::FunctionId,
