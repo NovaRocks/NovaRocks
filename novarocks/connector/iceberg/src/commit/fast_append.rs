@@ -21,8 +21,10 @@ use crate::iceberg::spec::Operation;
 use async_trait::async_trait;
 
 /// An append freezes file facts once and prepares fresh manifests per attempt.
+#[cfg(test)]
 pub(crate) struct FastAppendPreparer;
 
+#[cfg(test)]
 #[async_trait]
 impl super::staging::Preparer for FastAppendPreparer {
     async fn prepare(

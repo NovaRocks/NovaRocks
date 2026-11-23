@@ -25,7 +25,6 @@ use serde::{Deserialize, Serialize};
 
 use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorWriteReceipt};
 
-use crate::commit::WrittenFile;
 use crate::commit::report::{IcebergColumnStats, IcebergWriterReport};
 use crate::delete_file::IcebergFileContent;
 use crate::iceberg::spec::TableMetadata;
@@ -135,13 +134,8 @@ pub(crate) fn seal_compact_staged_files(
     };
     use sha2::{Digest, Sha256};
 
-    let files = received.compact_files().ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::Internal,
-            "Iceberg staged create has no compact receiving",
-        )
-    })?;
     let corrupt = |message: &str| ConnectorError::new(ConnectorErrorKind::CorruptData, message);
+    let files = received.compact_files();
     if files.has_delete_effects() || files.counts.data.rows != row_count {
         return Err(corrupt(
             "Iceberg staged seal does not match its finalized data rows",
@@ -188,9 +182,7 @@ pub(crate) fn seal_compact_staged_files(
         .inventory
         .lock()
         .expect("new Iceberg staged seal inventory") = Some(StagedWriteInventory {
-        files: received
-            .take_compact_files()
-            .expect("validated staged receiving"),
+        files: received.take_compact_files(),
         codec,
     });
     Ok(receipt)
@@ -554,47 +546,6 @@ impl From<IcebergWrittenOutputFactsV1> for IcebergWrittenOutputFacts {
             data_rows: value.data_rows,
         }
     }
-}
-
-pub(crate) fn written_output_facts(
-    files: &[WrittenFile],
-) -> Result<IcebergWrittenOutputFacts, String> {
-    let mut facts = IcebergWrittenOutputFacts::default();
-    for file in files {
-        match file.content {
-            crate::iceberg::spec::DataContentType::Data => {
-                facts.data_files = facts
-                    .data_files
-                    .checked_add(1)
-                    .ok_or_else(|| "Iceberg output data file count overflow".to_string())?;
-                facts.data_rows = facts
-                    .data_rows
-                    .checked_add(file.record_count)
-                    .ok_or_else(|| "Iceberg output data row count overflow".to_string())?;
-            }
-            crate::iceberg::spec::DataContentType::PositionDeletes
-                if file.content_offset.is_some() =>
-            {
-                facts.deletion_vectors = facts
-                    .deletion_vectors
-                    .checked_add(1)
-                    .ok_or_else(|| "Iceberg output deletion-vector count overflow".to_string())?;
-            }
-            crate::iceberg::spec::DataContentType::PositionDeletes => {
-                facts.position_delete_files =
-                    facts.position_delete_files.checked_add(1).ok_or_else(|| {
-                        "Iceberg output position-delete file count overflow".to_string()
-                    })?;
-            }
-            crate::iceberg::spec::DataContentType::EqualityDeletes => {
-                facts.equality_delete_files =
-                    facts.equality_delete_files.checked_add(1).ok_or_else(|| {
-                        "Iceberg output equality-delete file count overflow".to_string()
-                    })?;
-            }
-        }
-    }
-    Ok(facts)
 }
 
 pub fn encode_write_receipt(snapshot_id: i64) -> Result<Bytes, String> {

@@ -621,6 +621,7 @@ impl IcebergCommitOperation {
     }
 
     /// The exact provider publication declares this received object outside manifests.
+    #[cfg(test)]
     pub(crate) fn adopt_operation_reference(&self, object: ObjectIdentity) -> Result<()> {
         self.inner
             .artifacts

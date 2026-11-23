@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum AddedManifestAuthor {
     IntentData,
+    #[cfg(test)]
     EntryGroups,
     #[cfg(test)]
     PhysicalRewrite,

@@ -153,16 +153,6 @@ pub enum IcebergWriteFlavor {
     ManagedPublication,
     /// Distributed compaction / rewrite of a frozen data file set.
     DistributedRewrite,
-    /// Distributed repack of a frozen position-delete artifact set.
-    ///
-    /// It is a separate flavor from [`Self::DistributedRewrite`] rather than a
-    /// flag on it because the two seal different physical branches: this one
-    /// republishes deletion vectors and never writes a data file, and the other
-    /// republishes data files and never writes a delete artifact. Keeping them
-    /// apart is what lets `allowed_session_branches` refuse each one's branch on
-    /// the other.
-    /// Provider-owned maintenance such as `TRUNCATE`.
-    TableMaintenance,
 }
 
 impl IcebergWriteFlavor {
@@ -180,7 +170,6 @@ impl IcebergWriteFlavor {
             ),
             Self::ManagedPublication => CatalogOperation::PublishDocuments,
             Self::DistributedRewrite => CatalogOperation::RewriteDataFiles,
-            Self::TableMaintenance => CatalogOperation::Truncate,
         }
     }
 
@@ -205,7 +194,6 @@ impl IcebergWriteFlavor {
             // input set; what differs is which half of that set they replace,
             // and the commit reads that off the session's flavor.
             Self::DistributedRewrite => CommitOpKind::SelectedRewrite,
-            Self::TableMaintenance => CommitOpKind::Truncate,
         }
     }
 
@@ -231,8 +219,7 @@ impl IcebergWriteFlavor {
             Self::Append
             | Self::StagedCreate
             | Self::ManagedPublication
-            | Self::DistributedRewrite
-            | Self::TableMaintenance => &[IcebergWriteBranch::Data],
+            | Self::DistributedRewrite => &[IcebergWriteBranch::Data],
             Self::RowMutationPositionDelete => {
                 &[IcebergWriteBranch::Data, IcebergWriteBranch::PositionDelete]
             }
@@ -468,7 +455,6 @@ impl IcebergWriteFlavor {
             Self::StagedCreate => "staged-create",
             Self::ManagedPublication => "managed-publication",
             Self::DistributedRewrite => "distributed-rewrite",
-            Self::TableMaintenance => "table-maintenance",
             Self::EqualityDelete => "equality-delete",
         }
     }
@@ -2419,12 +2405,15 @@ impl IcebergWriteCommitSession {
     }
 
     pub(crate) fn with_mutation_read(mut self, recipe: IcebergMutationReadRecipe) -> Self {
+        assert!(
+            self.progress
+                .get_mut()
+                .expect("new write session progress")
+                .receiving
+                .is_unstarted(),
+            "fixed mutation must be bound before receiving"
+        );
         self.mutation_read = Some(recipe);
-        self.progress
-            .get_mut()
-            .expect("new write session progress")
-            .receiving
-            .enable_fixed_mutation(self.flavor);
         self
     }
 
@@ -2568,13 +2557,6 @@ impl IcebergWriteCommitSession {
                 flavor.as_str()
             )));
         }
-        let compact_receiving = matches!(
-            flavor,
-            IcebergWriteFlavor::Append
-                | IcebergWriteFlavor::StagedCreate
-                | IcebergWriteFlavor::EqualityDelete
-        ) || flavor.is_distributed_rewrite()
-            || document_publication.is_some();
         let rewrite_groups = flavor.is_distributed_rewrite().then_some(targets.len());
         Ok(Self {
             session_id,
@@ -2613,7 +2595,7 @@ impl IcebergWriteCommitSession {
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             progress: Mutex::new(IcebergWriteSessionProgress {
                 state: IcebergWriteSessionState::Active,
-                receiving: IcebergReceiving::with_compact_mode(compact_receiving, rewrite_groups),
+                receiving: IcebergReceiving::new(rewrite_groups),
             }),
         })
     }
@@ -3364,7 +3346,6 @@ mod tests {
             IcebergWriteFlavor::StagedCreate,
             IcebergWriteFlavor::ManagedPublication,
             IcebergWriteFlavor::DistributedRewrite,
-            IcebergWriteFlavor::TableMaintenance,
         ] {
             let branches = flavor.branches();
             assert!(!branches.is_empty(), "{} has no branch", flavor.as_str());

@@ -129,7 +129,7 @@ fn a_duplicate_record_leaves_first_receipt_and_no_publication() {
     handle
         .with_active_receiving(|state| {
             assert!(state.require_complete().is_err());
-            assert_eq!(state.compact_files().unwrap().entries().count(), 1);
+            assert_eq!(state.compact_files().entries().count(), 1);
             Ok(())
         })
         .unwrap();

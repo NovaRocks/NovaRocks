@@ -21,7 +21,7 @@
 use super::*;
 use novarocks_spi::connector::write_stack::ConnectorWriteRowChange;
 
-pub(super) fn project_compact(
+pub(super) fn project(
     handle: &IcebergWriteCommitSession,
     counts: crate::commit::write_stack::receiving::compact::AddedCounters,
 ) -> Result<Option<ConnectorWriteRowChange>, ConnectorError> {
@@ -30,12 +30,16 @@ pub(super) fn project_compact(
     }
     match handle.commit_op_kind() {
         CommitOpKind::FullRefresh
-            if counts.position_deletes.files == 0 && counts.newly_deleted_rows == 0 =>
+            if counts.position_deletes.files == 0
+                && counts.equality_deletes.files == 0
+                && counts.newly_deleted_rows == 0 =>
         {
             Ok(Some(ConnectorWriteRowChange::Replace(counts.data.rows)))
         }
         CommitOpKind::FastAppend
-            if counts.position_deletes.files == 0 && counts.newly_deleted_rows == 0 =>
+            if counts.position_deletes.files == 0
+                && counts.equality_deletes.files == 0
+                && counts.newly_deleted_rows == 0 =>
         {
             Ok(Some(ConnectorWriteRowChange::Delta {
                 inserted: counts.data.rows,
@@ -51,50 +55,4 @@ pub(super) fn project_compact(
         )),
         _ => Ok(None),
     }
-}
-
-pub(super) fn project(
-    handle: &IcebergWriteCommitSession,
-    validated: &[ValidatedFragment<'_>],
-) -> Result<Option<ConnectorWriteRowChange>, ConnectorError> {
-    if handle.document_publication().is_none() {
-        return Ok(None);
-    }
-    let op = handle.commit_op_kind();
-    if !matches!(
-        op,
-        CommitOpKind::FastAppend | CommitOpKind::FullRefresh | CommitOpKind::MaterializedRowDelta
-    ) {
-        return Ok(None);
-    }
-    let mut inserted = 0_u64;
-    let mut deleted = 0_u64;
-    for entry in validated {
-        match entry.fragment.artifact() {
-            IcebergCommitArtifact::DataFile(file) => {
-                inserted = inserted
-                    .checked_add(file.metrics().record_count())
-                    .ok_or_else(|| {
-                        corrupt("Iceberg prepared logical insertion count overflowed")
-                    })?;
-            }
-            IcebergCommitArtifact::FinalDelete(effect)
-                if op == CommitOpKind::MaterializedRowDelta =>
-            {
-                deleted = deleted
-                    .checked_add(effect.newly_deleted_rows())
-                    .ok_or_else(|| corrupt("Iceberg prepared logical deletion count overflowed"))?;
-            }
-            _ => {
-                return Err(invalid(
-                    "Iceberg prepared artifact contradicts its logical publication operation",
-                ));
-            }
-        }
-    }
-    Ok(Some(if op == CommitOpKind::FullRefresh {
-        ConnectorWriteRowChange::Replace(inserted)
-    } else {
-        ConnectorWriteRowChange::Delta { inserted, deleted }
-    }))
 }

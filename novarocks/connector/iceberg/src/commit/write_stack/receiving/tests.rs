@@ -19,33 +19,36 @@
 
 use novarocks_spi::connector::write_stack::{
     ConnectorWriteControl, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
-    ConnectorWriteSessionAbortRequest,
+    ConnectorWriteSessionAbortRequest, ConnectorWriterPhysicalContext,
 };
 use novarocks_spi::connector::{ConnectorPayloadRetentionGuard, ExternalMutationOutcome};
 
 use super::*;
-use crate::commit::write_stack::domain::IcebergWriteBranch;
-use crate::commit::write_stack::test_support::{received_write_proof, write_query_identity};
+use crate::commit::write_stack::domain::{IcebergWriteBranch, IcebergWriteFlavor};
+use crate::commit::write_stack::test_support::{
+    paid_fragments, received_write_proof, write_query_identity,
+};
 use crate::commit::write_stack::tests::{
-    FrozenRewriteLake, adapter, data_fragment, ordinary_async_test_begin, request_context,
+    FrozenRewriteLake, adapter, data_fragment, dv_session, ordinary_async_test_begin,
+    request_context,
 };
 
 #[test]
 fn registration_and_arrival_are_atomic_for_sealed_target_subsets() {
-    let zero = WriteTargetOrdinal::try_new(0).unwrap();
-    let one = WriteTargetOrdinal::try_new(1).unwrap();
-    let targets = [
-        IcebergSealedWriteTarget::new(one, IcebergWriteBranch::Data),
-        IcebergSealedWriteTarget::new(zero, IcebergWriteBranch::Data),
-    ];
+    let (handle, adapter) = dv_session();
+    let [data, delete] = handle.targets() else {
+        panic!("expected data and delete targets");
+    };
+    let data = data.ordinal();
+    let delete = delete.ordinal();
     let query = write_query_identity();
     let mut received = IcebergReceiving::default();
     let outside = WriteTargetOrdinal::try_new(2).unwrap();
-    let physical = ConnectorWriterPhysicalContext::new([2; 16], 1, [3; 16], 0, 1);
-    let mut proof = Some(received_write_proof(one, physical));
+    let physical = ConnectorWriterPhysicalContext::new([2; 16], 1, [3; 16], 0, data.get());
+    let mut proof = Some(received_write_proof(data, physical));
     assert_eq!(
         received
-            .begin_query(query, &[outside], &mut proof, &targets, None)
+            .begin_query(query, &[outside], &mut proof, handle.targets(), None)
             .unwrap_err()
             .kind(),
         ConnectorErrorKind::InvalidRequest
@@ -53,66 +56,80 @@ fn registration_and_arrival_are_atomic_for_sealed_target_subsets() {
     assert!(received.is_unstarted());
     assert!(proof.is_some());
     received
-        .begin_query(query, &[one], &mut proof, &targets, None)
+        .begin_query(query, &[data], &mut proof, handle.targets(), None)
         .unwrap();
     assert!(proof.is_none());
-    let adapter = adapter("unit", 1);
-    let mut fragments = vec![
-        (
-            one,
-            adapter.wrap_commit_fragment(data_fragment("s3://b/valid.parquet")),
-        ),
-        (
-            zero,
-            adapter.wrap_commit_fragment(data_fragment("s3://b/wrong-target.parquet")),
-        ),
-    ];
+    let arrive = |received: &mut IcebergReceiving, targets: &[(WriteTargetOrdinal, &str)]| {
+        let (fragments, author) = paid_fragments(
+            &adapter,
+            targets
+                .iter()
+                .map(|(_, path)| adapter.wrap_commit_fragment(data_fragment(path)))
+                .collect(),
+        );
+        received.arrive_original(
+            &handle,
+            &adapter,
+            query,
+            targets
+                .iter()
+                .map(|(target, _)| *target)
+                .zip(fragments)
+                .collect(),
+            &author,
+        )
+    };
+    let valid = (data, "s3://b/valid.parquet");
+    let foreign = (delete, "s3://b/wrong-target.parquet");
     assert_eq!(
-        received.arrive(query, &mut fragments).unwrap_err().kind(),
+        arrive(&mut received, &[valid, foreign]).unwrap_err().kind(),
         ConnectorErrorKind::InvalidRequest
     );
-    assert_eq!(fragments.len(), 2);
-    assert_eq!(received.fragments().count(), 0);
-    fragments.pop();
-    received.arrive(query, &mut fragments).unwrap();
-    assert!(fragments.is_empty());
+    assert!(received.is_empty());
+    arrive(&mut received, &[valid]).unwrap();
     received.confirm(query).unwrap();
-    assert_eq!(received.fragments().count(), 1);
+    assert_eq!(received.compact_files().entries().count(), 1);
 }
 
 #[test]
 fn same_target_queries_keep_separate_proofs_and_completion() {
+    let (handle, adapter) = dv_session();
     let target = WriteTargetOrdinal::try_new(0).unwrap();
-    let sealed = [IcebergSealedWriteTarget::new(
-        target,
-        IcebergWriteBranch::Data,
-    )];
     let query1 = write_query_identity();
     let query2 = write_query_identity();
     let writer1 = ConnectorWriterPhysicalContext::new([1; 16], 1, [3; 16], 0, 0);
     let writer2 = ConnectorWriterPhysicalContext::new([2; 16], 1, [3; 16], 0, 0);
-    let adapter = adapter("unit", 1);
     let mut received = IcebergReceiving::default();
     received
         .begin_query(
             query1,
             &[target],
             &mut Some(received_write_proof(target, writer1)),
-            &sealed,
+            handle.targets(),
             None,
         )
         .unwrap();
     received
-        .begin_query(query2, &[target], &mut None, &sealed, None)
+        .begin_query(query2, &[target], &mut None, handle.targets(), None)
         .unwrap();
     for (query, path) in [
         (query1, "s3://b/one.parquet"),
         (query2, "s3://b/two.parquet"),
     ] {
+        let (fragments, author) = paid_fragments(
+            &adapter,
+            vec![adapter.wrap_commit_fragment(data_fragment(path))],
+        );
         received
-            .arrive(
+            .arrive_original(
+                &handle,
+                &adapter,
                 query,
-                &mut vec![(target, adapter.wrap_commit_fragment(data_fragment(path)))],
+                fragments
+                    .into_iter()
+                    .map(|fragment| (target, fragment))
+                    .collect(),
+                &author,
             )
             .unwrap();
     }
@@ -122,14 +139,19 @@ fn same_target_queries_keep_separate_proofs_and_completion() {
         ConnectorErrorKind::Internal
     );
     assert!(received.confirm(query1).is_err());
-    assert!(received.arrive(query1, &mut Vec::new()).is_err());
+    let (_, author) = paid_fragments(&adapter, Vec::new());
+    assert!(
+        received
+            .arrive_original(&handle, &adapter, query1, Vec::new(), &author)
+            .is_err()
+    );
     received.confirm(query2).unwrap();
     received.require_complete().unwrap();
-    let fragments: Vec<_> = received.fragments().collect();
-    assert_eq!(fragments.len(), 2);
-    assert!(fragments[0].admits_creation(&writer1).unwrap());
-    assert!(!fragments[0].admits_creation(&writer2).unwrap());
-    assert!(!fragments[1].admits_creation(&writer1).unwrap());
+    assert_eq!(received.compact_files().entries().count(), 2);
+    let proof = received.queries[&query1].production.as_ref().unwrap();
+    assert!(proof.admits(target, &writer1).unwrap());
+    assert!(!proof.admits(target, &writer2).unwrap());
+    assert!(received.queries[&query2].production.is_none());
 }
 
 #[test]

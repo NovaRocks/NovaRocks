@@ -91,6 +91,7 @@ pub(super) fn clone_data_file_with_manifest_values(
 
 /// Freeze every writer-provided physical fact. Logical DV identity includes
 /// the blob range; statistics and row lineage are never inferred or dropped.
+#[cfg(test)]
 pub(crate) fn from_written_file(src: &super::WrittenFile) -> crate::iceberg::Result<DataFile> {
     into_written_file(src.clone())
 }

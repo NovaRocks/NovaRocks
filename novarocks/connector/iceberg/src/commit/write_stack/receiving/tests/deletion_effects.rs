@@ -141,12 +141,11 @@ fn v2_keeps_one_exact_partition_witness_and_every_position_file() {
     .unwrap();
     handle
         .with_active_receiving(|received| {
-            let compact = received.compact_files().unwrap();
+            let compact = received.compact_files();
             assert_eq!(compact.v2_targets.len(), 1);
             assert_eq!(compact.v2_targets[target], original);
             assert_eq!(compact.counts.position_deletes.files, 2);
             assert_eq!(compact.entries().count(), 2);
-            assert_eq!(received.fragments().count(), 0);
             Ok(())
         })
         .unwrap();
@@ -239,7 +238,7 @@ fn v3_arrival_keeps_exact_replace_and_remove_effects() {
     .unwrap();
     handle
         .with_active_receiving(|received| {
-            let compact = received.compact_files().unwrap();
+            let compact = received.compact_files();
             let mut entries = compact.entries();
             let replacement = entries.next().unwrap();
             let effect = replacement.delete_effect.as_ref().unwrap();
@@ -290,11 +289,11 @@ fn observation_quote_does_not_repay_provider_partition_backing() {
     )
     .unwrap();
     let path = "s3://b/data.parquet";
-    let quote = observation_target_bytes(path, &small, true).unwrap();
-    assert_eq!(observation_target_bytes(path, &large, true).unwrap(), quote);
+    let quote = observation_target_bytes(path, &small).unwrap();
+    assert_eq!(observation_target_bytes(path, &large).unwrap(), quote);
     let longer_key = format!("{path}/new-key");
     assert_eq!(
-        observation_target_bytes(&longer_key, &large, true).unwrap(),
+        observation_target_bytes(&longer_key, &large).unwrap(),
         quote + u64::try_from(longer_key.len() - path.len()).unwrap(),
     );
 }

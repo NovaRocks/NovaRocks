@@ -20,11 +20,22 @@
 use super::*;
 use crate::commit::fast_append::FastAppendPreparer;
 use crate::commit::filter_delete::FilterDeletePreparer;
-use crate::commit::model::AddedContent;
+use crate::commit::model::{AddedContent, ObjectIdentity};
+use crate::commit::new_manifests::PendingNewFiles;
 use crate::commit::overwrite::preparer_tests::{Fixture, data};
 use crate::commit::row_delta::RowDeltaPreparer;
 use crate::commit::staging::{StagingBase, StagingEngine};
-use crate::commit::write_stack::test_support::sample_partition;
+use crate::commit::write_stack::codec::CompactFragmentCodec;
+use crate::commit::write_stack::domain::{
+    IcebergCommitFragment, IcebergContentRange, IcebergDataFileArtifact,
+    IcebergDeletionVectorArtifact, IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
+};
+use crate::commit::write_stack::receiving::IcebergReceiving;
+use crate::commit::write_stack::test_support::{
+    paid_fragments, sample_metrics, sample_partition, write_query_identity,
+};
+use crate::commit::write_stack::tests::dv_session;
+use crate::delete_file::IcebergFileFormat;
 use crate::iceberg::spec::{DataFileBuilder, DataFileFormat, FormatVersion, Struct};
 use novarocks_spi::connector::ConnectorMutationFailure;
 
@@ -41,26 +52,162 @@ async fn initial(fixture: &Fixture) -> TableMetadata {
     fixture.stage(base, &intent, &FastAppendPreparer).await.0
 }
 
+async fn observe_target(
+    source: Arc<TableMetadata>,
+    io: &dyn ArtifactWriter,
+    path: &str,
+) -> Result<TargetObservation> {
+    let id = source
+        .current_snapshot_id()
+        .ok_or_else(|| invalid("fixture source is empty"))?;
+    let mut scope = ManifestReadScope::new(source, id)?;
+    let partition = TypedPartition::bind_type(
+        scope.metadata().default_partition_spec(),
+        &scope.domain().endpoint().partition_type(0).unwrap(),
+        &Struct::empty(),
+    )
+    .unwrap();
+    scope
+        .observe(
+            BTreeMap::from([(path.to_owned(), partition)]),
+            io.file_io(),
+            || io.check_active(),
+        )
+        .await
+}
+
+pub(crate) async fn observed_materialized_staging_fixture(
+    metadata: Arc<TableMetadata>,
+    operation: &IcebergCommitOperation,
+    io: &dyn ArtifactWriter,
+    additions: Vec<DataFile>,
+) -> Result<impl Preparer> {
+    let mut fragments = Vec::with_capacity(additions.len());
+    for file in additions {
+        let metrics = sample_metrics(file.record_count(), file.file_size_in_bytes());
+        match file.content_type() {
+            DataContentType::Data => fragments.push(IcebergCommitFragment::data_file(
+                IcebergDataFileArtifact::try_new(
+                    file.file_path().to_owned(),
+                    IcebergFileFormat::Parquet,
+                    sample_partition(),
+                    metrics,
+                    file.first_row_id(),
+                )
+                .unwrap(),
+            )),
+            DataContentType::PositionDeletes => {
+                let path = file.referenced_data_file().unwrap();
+                let observed = observe_target(Arc::clone(&metadata), io, &path).await?;
+                let facts = &observed.files[&path];
+                let locator = facts.data_locator(&observed.completion)?;
+                let merged = exclusive_positions(facts)?.into_keys().cloned().collect();
+                let vector = IcebergDeletionVectorArtifact::try_new(
+                    file.file_path().to_owned(),
+                    sample_partition(),
+                    metrics,
+                    path,
+                    IcebergContentRange::try_new(
+                        file.content_offset().unwrap(),
+                        file.content_size_in_bytes().unwrap(),
+                    )
+                    .unwrap(),
+                    file.record_count(),
+                    merged,
+                )
+                .unwrap();
+                let effect = IcebergFinalDeleteEffect::try_new(
+                    locator,
+                    1,
+                    IcebergFinalDeleteKind::ReplacePositions(Box::new(vector)),
+                )
+                .unwrap();
+                fragments.push(IcebergCommitFragment::final_delete(effect));
+            }
+            _ => panic!("unexpected materialized fixture content"),
+        }
+    }
+    observed_compact_step(metadata, operation, io, fragments).await
+}
+
+async fn observed_compact_step(
+    metadata: Arc<TableMetadata>,
+    operation: &IcebergCommitOperation,
+    io: &dyn ArtifactWriter,
+    fragments: Vec<IcebergCommitFragment>,
+) -> Result<Arc<MaterializedDeleteStep>> {
+    let id = metadata.current_snapshot_id().unwrap();
+    let (handle, adapter) = dv_session();
+    let query = write_query_identity();
+    let (targets, fragments): (Vec<_>, Vec<_>) = fragments
+        .into_iter()
+        .map(|fragment| {
+            let target = handle
+                .targets()
+                .iter()
+                .find(|target| target.branch() == fragment.branch())
+                .unwrap()
+                .ordinal();
+            (target, adapter.wrap_commit_fragment(fragment))
+        })
+        .unzip();
+    let (fragments, author) = paid_fragments(&adapter, fragments);
+    let mut receiving = IcebergReceiving::default();
+    receiving
+        .begin_query(
+            query,
+            &handle.expected_targets(),
+            &mut None,
+            handle.targets(),
+            None,
+        )
+        .unwrap();
+    receiving
+        .arrive_original(
+            &handle,
+            &adapter,
+            query,
+            targets.into_iter().zip(fragments).collect(),
+            &author,
+        )
+        .map_err(|error| invalid(error.message()))?;
+    receiving.confirm(query).unwrap();
+    receiving.require_complete().unwrap();
+    let received = receiving.take_compact_files();
+    for addition in received
+        .entries()
+        .filter_map(|entry| entry.addition.as_ref())
+    {
+        operation.adopt_session_data(ObjectIdentity::from_shared_path(Arc::clone(
+            &addition.object_path,
+        ))?)?;
+    }
+    let counts = received.counts;
+    operation.install_stage_new_files(
+        0,
+        PendingNewFiles {
+            received,
+            source: Arc::clone(&metadata),
+            codec: CompactFragmentCodec::for_adapter(&adapter),
+        },
+    )?;
+    let step = Arc::new(MaterializedDeleteStep::compact(
+        operation.clone(),
+        0,
+        counts,
+    ));
+    step.observe(metadata, id, io, operation.request_context())
+        .await?;
+    Ok(step)
+}
+
 async fn remove_target(
     fixture: &Fixture,
     source: &TableMetadata,
     io: &dyn ArtifactWriter,
 ) -> Arc<MaterializedDeleteStep> {
-    let id = source.current_snapshot_id().unwrap();
-    let mut scope = ManifestReadScope::new(Arc::new(source.clone()), id).unwrap();
-    let endpoint = scope.domain().endpoint();
-    let partition = TypedPartition::bind_type(
-        source.default_partition_spec(),
-        &endpoint.partition_type(0).unwrap(),
-        &Struct::empty(),
-    )
-    .unwrap();
-    let observed = scope
-        .observe(
-            BTreeMap::from([(TARGET.to_owned(), partition)]),
-            io.file_io(),
-            || io.check_active(),
-        )
+    let source = Arc::new(source.clone());
+    let observed = observe_target(Arc::clone(&source), io, TARGET)
         .await
         .unwrap();
     let facts = &observed.files[TARGET];
@@ -70,32 +217,23 @@ async fn remove_target(
         .into_keys()
         .cloned()
         .collect();
-    let partition = sample_partition();
     let effect = IcebergFinalDeleteEffect::try_new(
         locator,
         3,
         IcebergFinalDeleteKind::RemoveDataFile {
-            partition: partition.clone(),
+            partition: sample_partition(),
             old_exclusive_deletes,
         },
     )
     .unwrap();
-    let step = Arc::new(MaterializedDeleteStep::new(BTreeMap::from([(
-        TARGET.to_owned(),
-        Target {
-            partition,
-            final_effect: Some(effect),
-        },
-    )])));
-    step.observe(
-        Arc::new(source.clone()),
-        id,
+    observed_compact_step(
+        source,
+        &fixture.operation,
         io,
-        fixture.operation.request_context(),
+        vec![IcebergCommitFragment::final_delete(effect)],
     )
     .await
-    .unwrap();
-    step
+    .unwrap()
 }
 
 async fn add_dv(fixture: &Fixture, base: TableMetadata) -> TableMetadata {
@@ -132,6 +270,7 @@ async fn rebound_full_file_removal_also_deletes_a_concurrent_dv() {
 
     let base = add_dv(&fixture, source.clone()).await;
     let intent = fixture.intent(&source, "main", Vec::new());
+    let intent = intent.with_compact_stage(0).unwrap();
     let mut staging = StagingEngine::begin(
         StagingBase::Existing {
             metadata: base,
@@ -168,6 +307,7 @@ async fn rebound_missing_target_reports_validation_conflict() {
         .stage(source, &intent, &FilterDeletePreparer::always_true())
         .await
         .0;
+    let intent = intent.with_compact_stage(0).unwrap();
     let mut staging = StagingEngine::begin(
         StagingBase::Existing {
             metadata: base,
@@ -270,6 +410,7 @@ async fn locates_the_original_entry_after_a_manifest_rewrite() {
         )
         .await
         .0;
+    let intent = intent.with_compact_stage(0).unwrap();
     let mut staging = StagingEngine::begin(
         StagingBase::Existing {
             metadata: base,
@@ -287,25 +428,13 @@ async fn locates_the_original_entry_after_a_manifest_rewrite() {
 
 #[tokio::test]
 async fn replacing_an_already_replaced_dv_reports_a_missing_required_delete() {
-    use crate::commit::write_stack::domain::{IcebergContentRange, IcebergDeletionVectorArtifact};
-    use crate::commit::write_stack::test_support::sample_metrics;
     use std::error::Error as _;
 
     let fixture = Fixture::new();
     let start = initial(&fixture).await;
     let source = add_dv(&fixture, start).await;
     let io = fixture.operation.begin_attempt().unwrap();
-    let id = source.current_snapshot_id().unwrap();
-    let mut scope = ManifestReadScope::new(Arc::new(source.clone()), id).unwrap();
-    let ty = scope.domain().endpoint().partition_type(0).unwrap();
-    let typed =
-        TypedPartition::bind_type(source.default_partition_spec(), &ty, &Struct::empty()).unwrap();
-    let observation = scope
-        .observe(
-            BTreeMap::from([(TARGET.to_owned(), typed)]),
-            io.file_io(),
-            || io.check_active(),
-        )
+    let observation = observe_target(Arc::new(source.clone()), &io, TARGET)
         .await
         .unwrap();
     let facts = &observation.files[TARGET];
@@ -331,18 +460,11 @@ async fn replacing_an_already_replaced_dv_reports_a_missing_required_delete() {
         IcebergFinalDeleteKind::ReplacePositions(Box::new(vector)),
     )
     .unwrap();
-    let step = Arc::new(MaterializedDeleteStep::new(BTreeMap::from([(
-        TARGET.into(),
-        Target {
-            partition: sample_partition(),
-            final_effect: Some(effect),
-        },
-    )])));
-    step.observe(
+    let step = observed_compact_step(
         Arc::new(source.clone()),
-        id,
+        &fixture.operation,
         &io,
-        fixture.operation.request_context(),
+        vec![IcebergCommitFragment::final_delete(effect)],
     )
     .await
     .unwrap();
@@ -369,6 +491,7 @@ async fn replacing_an_already_replaced_dv_reports_a_missing_required_delete() {
         )
         .await
         .0;
+    let intent = intent.with_compact_stage(0).unwrap();
     let mut staging = StagingEngine::begin(
         StagingBase::Existing {
             metadata: base,

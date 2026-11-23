@@ -758,7 +758,7 @@ async fn assert_keyed_unknown_retains_artifacts(fixture: Fixture, prepared: Prep
         .unwrap();
     iceberg_handle(&fixture, &plan)
         .with_active_receiving(|receiving| {
-            assert!(receiving.compact_files().is_some());
+            assert!(receiving.compact_files().is_empty());
             Ok(())
         })
         .unwrap();

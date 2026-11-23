@@ -360,10 +360,6 @@ async fn mor_frozen_before_another_branch_commit_inherits_actual_publication_seq
     )
     .await
     .unwrap();
-    fixture
-        .operation
-        .adopt_session_data(object.clone())
-        .unwrap();
     let dv = dv_data_file(
         &WrittenDvFile::from(written),
         &LiveFile {
@@ -389,24 +385,21 @@ async fn mor_frozen_before_another_branch_commit_inherits_actual_publication_seq
             snapshot_id: source_id,
             sequence_number: source_sequence,
         }),
-        changes: FileChanges {
-            added: vec![
-                AddedContent::new_logical_data(data(&updated_path, 1, Struct::empty()), 0).unwrap(),
-                AddedContent::new_logical_data(dv, 0).unwrap(),
-            ],
-            removed: vec![],
-        },
+        changes: FileChanges::default(),
         dependencies: vec![Dependency::RefUnchanged],
         protocol: crate::commit::model::CommitProtocol::Legacy,
         shape: RequestShape::SnapshotProducing,
         summary: Default::default(),
         token: fixture.operation.token(),
     })
+    .unwrap()
+    .with_compact_stage(0)
     .unwrap();
     let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
         std::sync::Arc::new(source.clone()),
-        &intent,
+        &fixture.operation,
         &writer,
+        vec![data(&updated_path, 1, Struct::empty()), dv],
     )
     .await
     .unwrap();

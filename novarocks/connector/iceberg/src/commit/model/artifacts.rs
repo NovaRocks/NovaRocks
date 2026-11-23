@@ -37,6 +37,7 @@ use crate::commit::new_manifests::RegisteredPaths;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceivedPublication {
     ViaManifest,
+    #[cfg(test)]
     WithRequest,
 }
 

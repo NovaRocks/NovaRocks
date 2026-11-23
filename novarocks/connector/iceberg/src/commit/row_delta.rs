@@ -22,7 +22,9 @@
 
 use std::collections::HashMap;
 
-use crate::iceberg::spec::{DataContentType, ManifestFile, Operation};
+#[cfg(test)]
+use crate::iceberg::spec::DataContentType;
+use crate::iceberg::spec::{ManifestFile, Operation};
 use async_trait::async_trait;
 
 use super::manifest_sources::SnapshotSources;
@@ -35,8 +37,10 @@ fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
 }
 
 /// Position/equality-delete preparation consumes frozen additions once per attempt.
+#[cfg(test)]
 pub(crate) struct RowDeltaPreparer;
 
+#[cfg(test)]
 #[async_trait]
 impl crate::commit::staging::Preparer for RowDeltaPreparer {
     async fn prepare(

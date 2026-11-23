@@ -17,13 +17,16 @@
 
 //! Shared immutable v3 row-lineage facts, validation and canonical entry writing.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 use crate::commit::WrittenPuffinDv;
 use crate::iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, ManifestContentType, ManifestFile,
-    PartitionSpecRef, TableMetadata,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, PartitionSpecRef, TableMetadata,
 };
+
+#[cfg(test)]
+use crate::iceberg::spec::{ManifestContentType, ManifestFile};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrittenDvFile {
@@ -142,23 +145,13 @@ pub(crate) fn logical_file_size(file: &DataFile) -> crate::iceberg::Result<u64> 
 }
 
 /// Write immutable intent additions by their actual spec and row-ID assignment.
+#[cfg(test)]
 pub(crate) async fn write_added_entry_groups(
     view: &crate::commit::staging::StagedView<'_>,
     snapshot_id: i64,
     files: impl IntoIterator<Item = crate::commit::model::AddedContent>,
 ) -> crate::iceberg::Result<Vec<ManifestFile>> {
-    write_added_entry_groups_with_partitions(view, snapshot_id, files, None).await
-}
-
-pub(crate) async fn write_added_entry_groups_with_partitions(
-    view: &crate::commit::staging::StagedView<'_>,
-    snapshot_id: i64,
-    files: impl IntoIterator<Item = crate::commit::model::AddedContent>,
-    historical: Option<&BTreeMap<i32, crate::iceberg::spec::StructType>>,
-) -> crate::iceberg::Result<Vec<ManifestFile>> {
-    use crate::commit::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
-    use crate::commit::staging::{ManifestEntryWrite, write_manifest, write_sourced_manifest};
-    use std::sync::Arc;
+    use crate::commit::staging::{ManifestEntryWrite, write_manifest};
     let mut grouped: BTreeMap<(i32, bool, bool), Vec<crate::commit::model::AddedContent>> =
         BTreeMap::new();
     for added in files {
@@ -187,47 +180,6 @@ pub(crate) async fn write_added_entry_groups_with_partitions(
         }
         let first = files.iter().filter_map(|a| a.file().first_row_id()).min();
         let spec = partition_spec_by_id(view.metadata(), spec_id)?;
-        if deletes && let Some(historical) = historical {
-            let partition_type = historical.get(&spec_id).ok_or_else(|| {
-                to_iceberg_unexpected("New position output has no historical partition type".into())
-            })?;
-            if files.iter().any(|added| {
-                let file = added.file();
-                file.content_type() != DataContentType::PositionDeletes
-                    || !file.lower_bounds().is_empty()
-                    || !file.upper_bounds().is_empty()
-            }) {
-                return Err(to_iceberg_unexpected(
-                    "Historical position output cannot carry table-column bounds".into(),
-                ));
-            }
-            let source = Arc::new(ManifestWriteSource::for_position_output(
-                view.metadata().current_schema().clone(),
-                (*spec).clone(),
-                partition_type.clone(),
-            ));
-            let entries = files
-                .into_iter()
-                .map(|added| SourcedManifestEntry {
-                    source: source.clone(),
-                    entry: ManifestEntryWrite::Added(added),
-                })
-                .collect();
-            let manifest = write_sourced_manifest(
-                view.artifacts(),
-                view.metadata(),
-                snapshot_id,
-                spec.as_ref(),
-                ManifestContentType::Deletes,
-                entries,
-                &[],
-            )
-            .await?;
-            view.artifacts()
-                .remember_reusable_manifest(basis, manifest.clone())?;
-            out.push(manifest);
-            continue;
-        }
         let mut mf = write_manifest(
             view.artifacts(),
             view.metadata().format_version(),
@@ -261,6 +213,7 @@ pub(crate) async fn write_added_entry_groups_with_partitions(
 mod t8b_tests {
     use super::*;
     use crate::commit::model::*;
+    use crate::commit::overwrite::preparer_tests::Fixture;
     use crate::commit::staging::*;
     use crate::iceberg::io::FileIO;
     use crate::iceberg::spec::*;
@@ -523,7 +476,7 @@ mod t8b_tests {
     fn intent(
         metadata: &TableMetadata,
         added: Vec<DataFile>,
-        removed: Vec<FrozenEntry>,
+        token: OperationToken,
     ) -> OperationIntent {
         OperationIntent::new(OperationIntentParts {
             target: TableTarget {
@@ -540,17 +493,20 @@ mod t8b_tests {
                     .into_iter()
                     .map(|f| AddedContent::new_logical_data(f, 0).unwrap())
                     .collect(),
-                removed,
+                removed: Vec::new(),
             },
             dependencies: vec![Dependency::RefUnchanged],
             protocol: crate::commit::model::CommitProtocol::Legacy,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),
-            token: token(),
+            token,
         })
         .unwrap()
     }
-    async fn live(writer: &Writer, metadata: &TableMetadata) -> crate::commit::dependency::LiveSet {
+    async fn live(
+        writer: &dyn ArtifactWriter,
+        metadata: &TableMetadata,
+    ) -> crate::commit::dependency::LiveSet {
         let mut inputs = crate::commit::dependency::ValidationInputs::new(
             metadata,
             metadata.current_snapshot_id(),
@@ -579,7 +535,10 @@ mod t8b_tests {
         physical
     }
 
-    async fn raw_entries(writer: &Writer, metadata: &TableMetadata) -> Vec<ManifestEntry> {
+    async fn raw_entries(
+        writer: &dyn ArtifactWriter,
+        metadata: &TableMetadata,
+    ) -> Vec<ManifestEntry> {
         let list = crate::manifest::load_manifest_list(
             metadata.current_snapshot().unwrap(),
             writer.file_io(),
@@ -618,30 +577,25 @@ mod t8b_tests {
         let writer = Writer::new();
         let metadata = baseline(&writer, false, true).await;
         let before = live(&writer, &metadata).await;
-        let old = before
-            .values()
-            .find(|e| e.file.referenced_data_file().as_deref() == Some("a.parquet"))
-            .unwrap()
-            .frozen
-            .clone();
         let untouched = before
             .values()
             .find(|e| e.file.referenced_data_file().as_deref() == Some("b.parquet"))
             .unwrap()
             .clone();
-        let intent = intent(
-            &metadata,
-            vec![dv("replacement.puffin", 4, "a.parquet", 2)],
-            vec![old],
-        );
+        let fixture = Fixture::new();
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let intent = intent(&metadata, vec![], fixture.operation.token())
+            .with_compact_stage(0)
+            .unwrap();
         let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
             Arc::new(metadata.clone()),
-            &intent,
-            &writer,
+            &fixture.operation,
+            &attempt,
+            vec![dv("replacement.puffin", 4, "a.parquet", 2)],
         )
         .await
         .unwrap();
-        let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
+        let mut engine = StagingEngine::begin(base(metadata), &intent, &attempt).unwrap();
         engine.stage(&preparer).await.unwrap();
         let snapshot = engine.metadata().current_snapshot().unwrap();
         assert_eq!(snapshot.summary().operation, Operation::Delete);
@@ -654,7 +608,7 @@ mod t8b_tests {
             snapshot.summary().additional_properties["removed-files-size"],
             "11"
         );
-        let after = live(&writer, engine.metadata()).await;
+        let after = live(&attempt, engine.metadata()).await;
         assert_eq!(assert_physical_record_total(engine.metadata(), &after), 6);
         assert!(
             !snapshot
@@ -684,7 +638,7 @@ mod t8b_tests {
             .unwrap();
         assert_eq!(replacement.frozen.facts().data_sequence, Some(2));
         assert_eq!(replacement.frozen.facts().file_sequence, Some(2));
-        let raw = raw_entries(&writer, engine.metadata()).await;
+        let raw = raw_entries(&attempt, engine.metadata()).await;
         let added = raw
             .iter()
             .find(|e| e.data_file().file_path() == "replacement.puffin")
@@ -721,28 +675,29 @@ mod t8b_tests {
     async fn t8b_mor_first_assigns_historical_rows_and_new_merge_rows() {
         let writer = Writer::new();
         let metadata = baseline(&writer, true, false).await;
-        let intent = intent(
-            &metadata,
+        let fixture = Fixture::new();
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let intent = intent(&metadata, vec![], fixture.operation.token())
+            .with_compact_stage(0)
+            .unwrap();
+        let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
+            Arc::new(metadata.clone()),
+            &fixture.operation,
+            &attempt,
             vec![
                 dv("new.puffin", 4, "a.parquet", 1),
                 data("new.parquet", 1, None),
             ],
-            vec![],
-        );
-        let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
-            Arc::new(metadata.clone()),
-            &intent,
-            &writer,
         )
         .await
         .unwrap();
-        let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
+        let mut engine = StagingEngine::begin(base(metadata), &intent, &attempt).unwrap();
         engine.stage(&preparer).await.unwrap();
         let snapshot = engine.metadata().current_snapshot().unwrap();
         assert_eq!(snapshot.summary().operation, Operation::Overwrite);
         assert_eq!(snapshot.added_rows_count(), Some(7));
         assert_eq!(engine.metadata().next_row_id(), 7);
-        let after = live(&writer, engine.metadata()).await;
+        let after = live(&attempt, engine.metadata()).await;
         assert_eq!(assert_physical_record_total(engine.metadata(), &after), 7);
         assert!(
             !snapshot
@@ -767,7 +722,7 @@ mod t8b_tests {
     async fn t8b_data_only_mor_is_append_and_allocates_new_rows() {
         let writer = Writer::new();
         let metadata = baseline(&writer, false, true).await;
-        let intent = intent(&metadata, vec![data("insert.parquet", 2, None)], vec![]);
+        let intent = intent(&metadata, vec![data("insert.parquet", 2, None)], token());
         let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
         engine
             .stage(&crate::commit::fast_append::FastAppendPreparer)
@@ -815,16 +770,18 @@ mod t8b_tests {
             additions.push(dv_data_file(&WrittenDvFile::from(written), &source).unwrap());
             input_paths.push(object.path().to_owned());
         }
-        let intent = intent(&metadata, additions, vec![]);
+        let fixture = Fixture::new();
+        let attempt = fixture.operation.begin_attempt().unwrap();
         let error = crate::commit::write_stack::control::observed_materialized_staging_fixture(
             Arc::new(metadata),
-            &intent,
-            &writer,
+            &fixture.operation,
+            &attempt,
+            additions,
         )
         .await
         .err()
         .expect("a second final effect for the same file must be refused");
-        assert!(error.to_string().contains("multiple deletion vectors"));
+        assert!(error.to_string().contains("more than one delete artifact"));
         for path in input_paths {
             assert!(
                 writer
@@ -853,7 +810,7 @@ mod t8b_tests {
             .referenced_data_file(Some("a.parquet".into()))
             .build()
             .unwrap();
-        let intent = intent(&metadata, vec![delete], vec![]);
+        let intent = intent(&metadata, vec![delete], token());
         let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
         engine
             .stage(&crate::commit::row_delta::RowDeltaPreparer)

@@ -157,10 +157,7 @@ fn compact_rewrite_freezes_data_age_and_lineage_on_the_original_paid_arrival() {
                     &author,
                 )?;
                 state.confirm(query)?;
-                let compact = state
-                    .compact_files()
-                    .expect("rewrite uses compact receiving");
-                assert_eq!(state.fragments().count(), 0);
+                let compact = state.compact_files();
                 assert_eq!(compact.counts.data.rows, 2);
                 let mut entries = compact.entries();
                 let entry = entries.next().expect("rewrite has one paid addition");
@@ -240,7 +237,7 @@ fn invalid_stored_lineage_refuses_the_entire_root_record_and_returns_its_receipt
                 assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
                 assert!(error.message().contains(detail), "{error}");
                 assert_eq!(live.load(Ordering::SeqCst), 0);
-                let compact = state.compact_files().unwrap();
+                let compact = state.compact_files();
                 assert!(compact.is_empty());
                 assert_eq!(compact.counts.data.rows, 0);
             }

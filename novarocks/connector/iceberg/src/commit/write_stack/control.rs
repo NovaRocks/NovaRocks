@@ -335,36 +335,6 @@ pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), 
     Ok(())
 }
 
-/// One typed fragment resolved against the sealed target set.
-#[derive(Debug)]
-pub(crate) struct ValidatedFragment<'a> {
-    fragment: &'a IcebergCommitFragment,
-}
-
-/// Validate the complete received fragments against the sealed session.
-///
-/// Every check here is a fail-closed precondition of the single external
-/// commit: a fragment that names an unsealed target, a branch its target does
-/// not drive, a duplicate path, a partition spec the table does not have, or a
-/// delete artifact whose data file is owned by another target would each make
-/// the resulting snapshot wrong in a way no later step could detect.
-pub(crate) fn validate_received_set<'a>(
-    handle: &IcebergWriteCommitSession,
-    adapter: &IcebergWriteAdapter,
-    received: &'a IcebergReceiving,
-) -> Result<Vec<ValidatedFragment<'a>>, ConnectorError> {
-    let mut admission = super::receiving::validation::FragmentAdmission::for_whole_set(handle);
-    let mut validated = Vec::new();
-    for received in received.fragments() {
-        let fragment = adapter.commit_fragment(received.fragment)?;
-        admission.admit_whole_fragment(received.target, fragment, |physical| {
-            received.admits_creation(physical)
-        })?;
-        validated.push(ValidatedFragment { fragment });
-    }
-    Ok(validated)
-}
-
 fn validate_statistics_artifacts(
     handle: &IcebergWriteCommitSession,
     artifacts: &[novarocks_spi::connector::write_stack::WriteStatisticsArtifact],
@@ -805,22 +775,6 @@ fn decode_bounds(
 }
 
 impl IcebergWriteSessionControl {
-    /// Check the received fragments and accepted row count before dispatch.
-    pub(super) fn validate_received_commit<'a>(
-        &self,
-        handle: &IcebergWriteCommitSession,
-        received: &'a IcebergReceiving,
-        row_count: u64,
-        context: &ConnectorRequestContext,
-    ) -> Result<Vec<ValidatedFragment<'a>>, ConnectorError> {
-        validate_context(context)?;
-        let validated = validate_received_set(handle, &self.adapter, received)?;
-        if validated.is_empty() && handle.flavor().is_artifact_row_delta() && row_count != 0 {
-            return Err(corrupt("nonzero logical row delta produced no artifact"));
-        }
-        Ok(validated)
-    }
-
     /// Publish the inventory moved by this session's sole finish claim.
     async fn commit_received_set_async(
         &self,
@@ -851,17 +805,10 @@ impl IcebergWriteSessionControl {
             phase_started,
         );
         validate_context(context)?;
-        let validated = if let Some(compact) = received.compact_files() {
-            if compact.is_empty()
-                && handle.flavor().is_artifact_row_delta()
-                && request.row_count != 0
-            {
-                return Err(corrupt("nonzero logical row delta produced no artifact"));
-            }
-            None
-        } else {
-            Some(self.validate_received_commit(handle, received, request.row_count, context)?)
-        };
+        if received.is_empty() && handle.flavor().is_artifact_row_delta() && request.row_count != 0
+        {
+            return Err(corrupt("nonzero logical row delta produced no artifact"));
+        }
 
         #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
@@ -890,11 +837,8 @@ impl IcebergWriteSessionControl {
             "publication_dispatch_enter",
             phase_started,
         );
-        let prepared = if let Some(validated) = validated {
-            self.prepare_received_operation(handle, &validated, document_publication, context)?
-        } else {
-            self.prepare_compact_operation(handle, received, document_publication, context)?
-        };
+        let prepared =
+            self.prepare_compact_operation(handle, received, document_publication, context)?;
         // The retained operation now owns the objects and their frozen recipe.
         drop(std::mem::take(received));
         let publication::WritePublicationDispatch {
@@ -3444,12 +3388,7 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         let handle = self.adapter.commit_session(commit)?;
         let result = handle.with_active_receiving(|receiving| {
             receiving.require_complete()?;
-            if let Some(compact) = receiving.compact_files() {
-                logical_rows::project_compact(handle, compact.counts)
-            } else {
-                let validated = validate_received_set(handle, &self.adapter, receiving)?;
-                logical_rows::project(handle, &validated)
-            }
+            logical_rows::project(handle, receiving.compact_files().counts)
         })?;
         validate_context(context)?;
         Ok(result)

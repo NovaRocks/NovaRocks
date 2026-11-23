@@ -25,14 +25,8 @@ use crate::commit::helpers::{snapshot_total_records, target_ref_snapshot_id};
 use crate::commit::manifest_sources::{LocatedEntry, SnapshotSources};
 use crate::commit::model::{ArtifactWriter, EntryIdentity, FrozenEntry, OperationIntent};
 use crate::commit::operation::IcebergCommitOperation;
-use crate::commit::row_delta_dv_metadata::{
-    logical_file_size, write_added_entry_groups_with_partitions,
-};
 use crate::commit::staging::{PreparedChange, Preparer, StagedView};
-use crate::commit::write_stack::domain::{
-    IcebergArtifactPartition, IcebergDeleteTargetLocator, IcebergFinalDeleteEffect,
-    IcebergFinalDeleteKind,
-};
+use crate::commit::write_stack::domain::{IcebergArtifactPartition, IcebergDeleteTargetLocator};
 use crate::commit::write_stack::receiving::ReceivedCompactFiles;
 use crate::commit::write_stack::receiving::compact::{
     AddedCounters, CompactDeleteKind, PhysicalAdditionCounts,
@@ -44,12 +38,7 @@ use crate::manifest::target_query::{ManifestReadScope, TargetFacts, TargetObserv
 use crate::write_descriptor::decode_partition_descriptor_with_type;
 
 pub(in crate::commit::write_stack) struct MaterializedDeleteStep {
-    targets: BTreeMap<String, Target>,
     observed: tokio::sync::OnceCell<CompletedStep>,
-    compact: Option<CompactStage>,
-}
-
-struct CompactStage {
     operation: IcebergCommitOperation,
     stage: usize,
     counts: AddedCounters,
@@ -67,30 +56,6 @@ struct EffectRef<'a> {
     removes_data: bool,
 }
 
-impl<'a> EffectRef<'a> {
-    fn from_whole(effect: &'a IcebergFinalDeleteEffect) -> Self {
-        let (old_references, removes_data) = match effect.kind() {
-            IcebergFinalDeleteKind::RemoveDataFile {
-                old_exclusive_deletes,
-                ..
-            } => (old_exclusive_deletes.as_ref(), true),
-            IcebergFinalDeleteKind::ReplacePositions(vector) => {
-                (vector.merged_old_references(), false)
-            }
-        };
-        Self {
-            locator: effect.target(),
-            old_references,
-            removes_data,
-        }
-    }
-}
-
-pub(super) struct Target {
-    pub(super) partition: IcebergArtifactPartition,
-    pub(super) final_effect: Option<IcebergFinalDeleteEffect>,
-}
-
 struct CompletedStep {
     scope: ManifestReadScope,
     targets: TargetObservation,
@@ -98,72 +63,49 @@ struct CompletedStep {
 }
 
 impl MaterializedDeleteStep {
-    pub(super) fn new(targets: BTreeMap<String, Target>) -> Self {
-        Self {
-            targets,
-            observed: tokio::sync::OnceCell::new(),
-            compact: None,
-        }
-    }
-
     pub(in crate::commit::write_stack) fn compact(
         operation: IcebergCommitOperation,
         stage: usize,
         counts: AddedCounters,
     ) -> Self {
         Self {
-            targets: BTreeMap::new(),
             observed: tokio::sync::OnceCell::new(),
-            compact: Some(CompactStage {
-                operation,
-                stage,
-                counts,
-            }),
+            operation,
+            stage,
+            counts,
         }
     }
 
-    fn observed_targets<'a>(
-        &'a self,
-        compact: Option<&'a ReceivedCompactFiles>,
-    ) -> impl Iterator<Item = ObservedTarget<'a>> {
-        self.targets
+    fn observed_targets(files: &ReceivedCompactFiles) -> impl Iterator<Item = ObservedTarget<'_>> {
+        files
+            .v2_targets
             .iter()
-            .map(|(path, target)| ObservedTarget {
+            .map(|(path, partition)| ObservedTarget {
                 path,
-                partition: &target.partition,
-                effect: target.final_effect.as_ref().map(EffectRef::from_whole),
+                partition,
+                effect: None,
             })
-            .chain(compact.into_iter().flat_map(|files| {
-                files
-                    .v2_targets
-                    .iter()
-                    .map(|(path, partition)| ObservedTarget {
-                        path,
+            .chain(files.entries().filter_map(|entry| {
+                let effect = entry.delete_effect.as_ref()?;
+                let (partition, old_references, removes_data) = match &effect.kind {
+                    CompactDeleteKind::RemoveDataFile {
                         partition,
-                        effect: None,
-                    })
-                    .chain(files.entries().filter_map(|entry| {
-                        let effect = entry.delete_effect.as_ref()?;
-                        let (partition, old_references, removes_data) = match &effect.kind {
-                            CompactDeleteKind::RemoveDataFile {
-                                partition,
-                                old_exclusive_deletes,
-                            } => (partition, old_exclusive_deletes.as_ref(), true),
-                            CompactDeleteKind::ReplacePositions {
-                                partition,
-                                merged_old_references,
-                            } => (partition.as_ref(), merged_old_references.as_slice(), false),
-                        };
-                        Some(ObservedTarget {
-                            path: effect.target.data_file_path(),
-                            partition,
-                            effect: Some(EffectRef {
-                                locator: &effect.target,
-                                old_references,
-                                removes_data,
-                            }),
-                        })
-                    }))
+                        old_exclusive_deletes,
+                    } => (partition, old_exclusive_deletes.as_ref(), true),
+                    CompactDeleteKind::ReplacePositions {
+                        partition,
+                        merged_old_references,
+                    } => (partition.as_ref(), merged_old_references.as_slice(), false),
+                };
+                Some(ObservedTarget {
+                    path: effect.target.data_file_path(),
+                    partition,
+                    effect: Some(EffectRef {
+                        locator: &effect.target,
+                        old_references,
+                        removes_data,
+                    }),
+                })
             }))
     }
 
@@ -179,26 +121,16 @@ impl MaterializedDeleteStep {
             .get_or_try_init(|| async {
                 let mut scope =
                     ManifestReadScope::new(source, snapshot_id)?.with_owned_request(request);
-                let pending = self
-                    .compact
-                    .as_ref()
-                    .map(|compact| compact.operation.pending_stage_new_files(compact.stage))
-                    .transpose()?;
-                let compact_files = pending.as_ref().map(|pending| &pending.received);
-                let target_bytes =
-                    self.observed_targets(compact_files)
-                        .try_fold(0u64, |total, target| {
-                            total
-                                .checked_add(observation_target_bytes(
-                                    target.path,
-                                    target.partition,
-                                    compact_files.is_some(),
-                                )?)
-                                .ok_or_else(|| invalid("materialized target backing overflow"))
-                        })?;
+                let pending = self.operation.pending_stage_new_files(self.stage)?;
+                let targets = || Self::observed_targets(&pending.received);
+                let target_bytes = targets().try_fold(0u64, |total, target| {
+                    total
+                        .checked_add(observation_target_bytes(target.path, target.partition)?)
+                        .ok_or_else(|| invalid("materialized target backing overflow"))
+                })?;
                 scope.reserve_owned(target_bytes).await?;
                 let mut typed = BTreeMap::new();
-                for target in self.observed_targets(compact_files) {
+                for target in targets() {
                     io.check_active()?;
                     let spec_id = target.partition.partition_spec_id();
                     let spec = scope
@@ -227,7 +159,7 @@ impl MaterializedDeleteStep {
                 let mut removed = Vec::new();
                 let mut removed_ids = BTreeSet::new();
                 let sources = scope.snapshot_sources()?;
-                for target in self.observed_targets(compact_files) {
+                for target in targets() {
                     let data = observation.files.get(target.path).ok_or_else(|| {
                         invalid("materialized target is absent from the completed observation")
                     })?;
@@ -293,44 +225,24 @@ impl MaterializedDeleteStep {
 pub(in crate::commit::write_stack) fn observation_target_bytes(
     path: &str,
     partition: &IcebergArtifactPartition,
-    compact: bool,
 ) -> Result<u64> {
     // Compact target input is already covered by the original receipt.
     // Reserve the newly created typed-map slot, decoding scratch and output.
     use crate::delete_semantics::CanonicalScalar;
     use crate::iceberg::spec::{Literal, PrimitiveType};
 
-    let (fixed, field_bytes) = if compact {
-        let arc_headers = 4 * std::mem::size_of::<std::sync::atomic::AtomicUsize>();
-        let fields = 2 * std::mem::size_of::<(i32, PrimitiveType)>()
-            + 2 * std::mem::size_of::<Option<CanonicalScalar>>();
-        (
-            std::mem::size_of::<(String, TypedPartition)>() + arc_headers,
-            std::mem::size_of::<Option<Literal>>() + fields,
-        )
-    } else {
-        (
-            std::mem::size_of::<(String, Target, TypedPartition)>(),
-            std::mem::size_of::<crate::write_descriptor::IcebergPartitionValueDescriptor>(),
-        )
-    };
+    let arc_headers = 4 * std::mem::size_of::<std::sync::atomic::AtomicUsize>();
+    let fields = 2 * std::mem::size_of::<(i32, PrimitiveType)>()
+        + 2 * std::mem::size_of::<Option<CanonicalScalar>>();
+    let fixed = std::mem::size_of::<(String, TypedPartition)>() + arc_headers;
+    let field_bytes = std::mem::size_of::<Option<Literal>>() + fields;
     let bytes = partition
         .descriptor()
         .values
         .iter()
         .try_fold(fixed, |total, field| {
-            let value_bytes = field.datum_bytes.as_ref().map_or(0, |bytes| {
-                if compact {
-                    bytes.len()
-                } else {
-                    bytes.capacity()
-                }
-            });
-            let peak_value = if compact {
-                value_bytes.checked_mul(2)
-            } else {
-                Some(value_bytes)
-            };
+            let value_bytes = field.datum_bytes.as_ref().map_or(0, Vec::len);
+            let peak_value = value_bytes.checked_mul(2);
             peak_value
                 .and_then(|bytes| total.checked_add(bytes))
                 .and_then(|total| total.checked_add(field_bytes))
@@ -378,89 +290,6 @@ fn push_removal(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) async fn observed_materialized_staging_fixture(
-    metadata: Arc<TableMetadata>,
-    intent: &OperationIntent,
-    io: &dyn ArtifactWriter,
-) -> Result<impl Preparer> {
-    let snapshot = intent
-        .start()
-        .ok_or_else(|| invalid("fixture source is empty"))?;
-    let mut scope = ManifestReadScope::new(metadata, snapshot.snapshot_id)?;
-    let mut partitions = BTreeMap::new();
-    let mut targets = BTreeMap::new();
-    for addition in &intent.changes().added {
-        let file = addition.file();
-        if file.content_type() != DataContentType::PositionDeletes {
-            continue;
-        }
-        let path = file
-            .referenced_data_file()
-            .ok_or_else(|| invalid("fixture output has no referenced data file"))?;
-        let spec_id = addition.partition_spec_id();
-        let spec = scope
-            .metadata()
-            .partition_spec_by_id(spec_id)
-            .ok_or_else(|| invalid("fixture output has no partition spec"))?;
-        let ty = scope
-            .domain()
-            .endpoint()
-            .partition_type(spec_id)
-            .map_err(|error| invalid(error.to_string()))?;
-        let partition = TypedPartition::bind_type(spec, &ty, file.partition())
-            .map_err(|error| invalid(error.to_string()))?;
-        if partitions.insert(path.clone(), partition).is_some() {
-            return Err(invalid(
-                "fixture produced multiple deletion vectors for one data file",
-            ));
-        }
-        let descriptor =
-            crate::write_descriptor::encode_partition_descriptor_with_type(file.partition(), &ty)
-                .map_err(|error| invalid(error.to_string()))?;
-        targets.insert(
-            path,
-            Target {
-                partition: IcebergArtifactPartition::try_new(
-                    String::new(),
-                    String::new(),
-                    spec_id,
-                    descriptor,
-                )
-                .map_err(|error| invalid(error.message()))?,
-                final_effect: None,
-            },
-        );
-    }
-    let observed = scope
-        .observe(partitions, io.file_io(), || io.check_active())
-        .await?;
-    let sources = scope.snapshot_sources()?;
-    let mut seen = BTreeSet::new();
-    let mut removed = Vec::new();
-    for removal in &intent.changes().removed {
-        let entry = observed
-            .files
-            .values()
-            .find_map(|target| {
-                std::iter::once(&target.data)
-                    .chain(target.positions.iter().map(|position| &position.entry))
-                    .find(|entry| entry.frozen == *removal)
-            })
-            .ok_or_else(|| invalid("fixture removal was outside the observed range"))?;
-        push_removal(&mut removed, &mut seen, &sources, entry)?;
-    }
-    let step = Arc::new(MaterializedDeleteStep::new(targets));
-    step.observed
-        .set(CompletedStep {
-            scope,
-            targets: observed,
-            removed,
-        })
-        .map_err(|_| invalid("fixture observation was already set"))?;
-    Ok(step)
-}
-
 #[async_trait::async_trait]
 impl Preparer for Arc<MaterializedDeleteStep> {
     async fn prepare(
@@ -488,11 +317,7 @@ impl Preparer for Arc<MaterializedDeleteStep> {
             .snapshot_by_id(source_id)
             .ok_or_else(|| invalid("completed source snapshot is absent"))?;
         let version = view.metadata().format_version();
-        if self
-            .compact
-            .as_ref()
-            .is_some_and(|compact| compact.counts.position_deletes.files != 0)
-        {
+        if self.counts.position_deletes.files != 0 {
             crate::commit::new_manifests::validate_position_format(
                 observed.scope.metadata().format_version(),
                 version,
@@ -512,13 +337,10 @@ impl Preparer for Arc<MaterializedDeleteStep> {
         };
         let sources = scope.snapshot_sources()?;
         let removed = removed.iter().collect::<Vec<_>>();
-        let mut summary = match &self.compact {
-            Some(compact) => Summary {
-                data: compact.counts.data.into(),
-                position: compact.counts.position_deletes.into(),
-                ..Summary::default()
-            },
-            None => legacy_addition_summary(view, intent, &self.targets)?,
+        let mut summary = Summary {
+            data: self.counts.data.into(),
+            position: self.counts.position_deletes.into(),
+            ..Summary::default()
         };
         for entry in &removed {
             let count = entry.frozen.facts().record_count;
@@ -553,25 +375,14 @@ impl Preparer for Arc<MaterializedDeleteStep> {
             observed.scope.schema(),
         )
         .map_err(invalid)?;
-        let added = if let Some(compact) = &self.compact {
-            let (added, _) = crate::commit::new_manifests::prepare_added_manifests(
-                &compact.operation,
-                view,
-                compact.stage,
-                snapshot,
-                Some(&historical),
-            )
-            .await?;
-            added
-        } else {
-            write_added_entry_groups_with_partitions(
-                view,
-                snapshot,
-                intent.changes().added.clone(),
-                Some(&historical),
-            )
-            .await?
-        };
+        let (added, _) = crate::commit::new_manifests::prepare_added_manifests(
+            &self.operation,
+            view,
+            self.stage,
+            snapshot,
+            Some(&historical),
+        )
+        .await?;
         let manifests = crate::commit::manifest_transform::ordinary_manifests_scoped(
             view,
             snapshot,
@@ -636,41 +447,6 @@ impl CompletedStep {
         .await?;
         Ok((scope, removed))
     }
-}
-
-fn legacy_addition_summary(
-    view: &StagedView<'_>,
-    intent: &OperationIntent,
-    targets: &BTreeMap<String, Target>,
-) -> Result<Summary> {
-    let mut summary = Summary::default();
-    let mut output_ids = BTreeSet::new();
-    for added in &intent.changes().added {
-        view.artifacts().check_active()?;
-        let file = added.file();
-        let identity = EntryIdentity::try_from(file)?;
-        if !output_ids.insert(identity.clone()) {
-            return Err(invalid(
-                "materialized write has a repeated or non-inheriting addition",
-            ));
-        }
-        let declared_target = file
-            .referenced_data_file()
-            .filter(|path| targets.contains_key(path));
-        crate::commit::write_stack::receiving::validation::validate_materialized_addition(
-            &identity,
-            declared_target.as_deref(),
-            added,
-        )
-        .map_err(|error| invalid(error.message()))?;
-        let counters = match file.content_type() {
-            DataContentType::Data => &mut summary.data,
-            DataContentType::PositionDeletes => &mut summary.position,
-            _ => unreachable!("validated materialized addition content"),
-        };
-        counters.add(file.record_count(), logical_file_size(file)?)?;
-    }
-    Ok(summary)
 }
 
 #[derive(Default)]
@@ -749,3 +525,5 @@ fn invalid(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::observed_materialized_staging_fixture;

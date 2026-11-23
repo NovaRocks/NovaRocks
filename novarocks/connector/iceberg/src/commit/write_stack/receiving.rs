@@ -27,8 +27,7 @@ use std::sync::Arc;
 use novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact;
 use novarocks_spi::connector::write_stack::{
     ConnectorCommitFragment, ConnectorWriteProductionProof, ConnectorWriteQueryIdentity,
-    ConnectorWriterPhysicalContext, WriteTargetOrdinal, validate_query_target_ordinals,
-    validate_write_fragment_targets,
+    WriteTargetOrdinal, validate_query_target_ordinals, validate_write_fragment_targets,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard, ConnectorProviderBindingKey,
@@ -42,7 +41,7 @@ use crate::iceberg::spec::TableMetadata;
 
 use super::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergSealedWriteTarget,
-    IcebergWriteCommitSession, IcebergWriteFlavor, invalid,
+    IcebergWriteCommitSession, invalid,
 };
 use super::runtime::IcebergWriteAdapter;
 use compact::{AddedCounters, AdditionKind, CompactEntry};
@@ -56,8 +55,7 @@ type WriteFragment = (WriteTargetOrdinal, ConnectorCommitFragment);
 #[derive(Debug, Default)]
 pub(crate) struct IcebergReceiving {
     queries: BTreeMap<ConnectorWriteQueryIdentity, QueryReceiving>,
-    records: Vec<ReceivedRecord>,
-    compact: Option<CompactReceiving>,
+    compact: CompactReceiving,
     rewrite_groups: Option<usize>,
     rewritten_target: Option<Box<RewrittenTargetReceiving>>,
 }
@@ -169,30 +167,6 @@ impl QueryReceiving {
     }
 }
 
-#[derive(Debug)]
-struct ReceivedRecord {
-    query: ConnectorWriteQueryIdentity,
-    fragments: Vec<WriteFragment>,
-}
-
-pub(crate) struct ReceivedFragment<'a> {
-    pub(crate) target: WriteTargetOrdinal,
-    pub(crate) fragment: &'a ConnectorCommitFragment,
-    production: Option<&'a dyn ConnectorWriteProductionProof>,
-}
-
-impl ReceivedFragment<'_> {
-    pub(crate) fn admits_creation(
-        &self,
-        physical: &ConnectorWriterPhysicalContext,
-    ) -> Result<bool, ConnectorError> {
-        match self.production {
-            Some(production) => production.admits(self.target, physical),
-            None => Ok(false),
-        }
-    }
-}
-
 fn matches_rewritten_target(metadata: &TableMetadata, binding: RewrittenTargetBinding) -> bool {
     metadata.uuid() == binding.table_uuid
         && match binding.snapshot_id {
@@ -205,33 +179,18 @@ impl IcebergReceiving {
     #[cfg(test)]
     pub(crate) fn from_compact_files(files: ReceivedCompactFiles) -> Self {
         Self {
-            compact: Some(CompactReceiving {
+            compact: CompactReceiving {
                 files,
                 ..CompactReceiving::default()
-            }),
+            },
             ..Self::default()
         }
     }
 
-    pub(super) fn with_compact_mode(compact: bool, rewrite_groups: Option<usize>) -> Self {
+    pub(super) fn new(rewrite_groups: Option<usize>) -> Self {
         Self {
-            compact: compact.then(CompactReceiving::default),
             rewrite_groups,
             ..Self::default()
-        }
-    }
-
-    pub(super) fn enable_fixed_mutation(&mut self, flavor: IcebergWriteFlavor) {
-        if matches!(
-            flavor,
-            IcebergWriteFlavor::RowMutationPositionDelete
-                | IcebergWriteFlavor::RowMutationDeletionVector
-        ) {
-            assert!(
-                self.is_unstarted(),
-                "fixed mutation must be bound before receiving"
-            );
-            self.compact = Some(CompactReceiving::default());
         }
     }
 
@@ -295,12 +254,12 @@ impl IcebergReceiving {
         ConflictScope::compose(fact, written, source).map(Some)
     }
 
-    pub(crate) fn compact_files(&self) -> Option<&ReceivedCompactFiles> {
-        self.compact.as_ref().map(|compact| &compact.files)
+    pub(crate) fn compact_files(&self) -> &ReceivedCompactFiles {
+        &self.compact.files
     }
 
-    pub(crate) fn take_compact_files(&mut self) -> Option<ReceivedCompactFiles> {
-        self.compact.take().map(|compact| compact.files)
+    pub(crate) fn take_compact_files(&mut self) -> ReceivedCompactFiles {
+        std::mem::take(&mut self.compact).files
     }
 
     pub(crate) fn arrive_original(
@@ -308,12 +267,10 @@ impl IcebergReceiving {
         handle: &IcebergWriteCommitSession,
         adapter: &IcebergWriteAdapter,
         query: ConnectorWriteQueryIdentity,
-        mut fragments: Vec<WriteFragment>,
+        fragments: Vec<WriteFragment>,
         author: &ConnectorPayloadRetentionGuard,
     ) -> Result<(), ConnectorError> {
-        let Some(compact) = self.compact.as_mut() else {
-            return self.arrive(query, &mut fragments);
-        };
+        let compact = &mut self.compact;
         let registration = self
             .queries
             .get(&query)
@@ -462,9 +419,9 @@ impl IcebergReceiving {
                 ));
             }
             (Some(expected), Some(fact)) => {
-                if !self.queries.is_empty() || self.compact.is_none() {
+                if !self.queries.is_empty() {
                     return Err(rewritten_target_error(
-                        "Iceberg row-level write expected one compact receiving query",
+                        "Iceberg row-level write expected one receiving query",
                     ));
                 }
                 fact.validate_owner(&expected.owner).map_err(|_| {
@@ -497,26 +454,6 @@ impl IcebergReceiving {
             rewritten_target: fact,
             confirmed: false,
         });
-        Ok(())
-    }
-
-    /// Check the entire root record before transferring any fragment.
-    pub(crate) fn arrive(
-        &mut self,
-        query: ConnectorWriteQueryIdentity,
-        fragments: &mut Vec<WriteFragment>,
-    ) -> Result<(), ConnectorError> {
-        let registration = self
-            .queries
-            .get(&query)
-            .ok_or_else(|| invalid("Iceberg write arrival names an unregistered query"))?;
-        registration.validate_arrival(fragments)?;
-        if !fragments.is_empty() {
-            self.records.push(ReceivedRecord {
-                query,
-                fragments: std::mem::take(fragments),
-            });
-        }
         Ok(())
     }
 
@@ -578,29 +515,11 @@ impl IcebergReceiving {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.records.is_empty()
-            && self
-                .compact
-                .as_ref()
-                .is_none_or(|compact| compact.files.is_empty())
+        self.compact.files.is_empty()
     }
 
     pub(crate) fn is_unstarted(&self) -> bool {
         self.queries.is_empty()
-    }
-
-    pub(crate) fn fragments(&self) -> impl Iterator<Item = ReceivedFragment<'_>> {
-        self.records.iter().flat_map(|record| {
-            let production = self.queries[&record.query].production.as_deref();
-            record
-                .fragments
-                .iter()
-                .map(move |(target, fragment)| ReceivedFragment {
-                    target: *target,
-                    fragment,
-                    production,
-                })
-        })
     }
 }
 
