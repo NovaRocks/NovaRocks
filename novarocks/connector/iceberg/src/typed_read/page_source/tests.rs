@@ -122,7 +122,7 @@ fn typed_bigint_lower_bound_becomes_a_physical_file_predicate() {
     let predicate = TupleDomain::with_column_domains([(column, domain)].into_iter().collect())
         .expect("tuple domain");
 
-    let predicates = static_file_predicates(&predicate);
+    let predicates = static_file_predicates(&predicate, None);
 
     assert_eq!(predicates.len(), 1);
     assert_eq!(predicates[0].column(), "id");
@@ -152,7 +152,7 @@ fn nullable_typed_domain_stays_residual() {
     let predicate = TupleDomain::with_column_domains([(column, domain)].into_iter().collect())
         .expect("tuple domain");
 
-    assert!(static_file_predicates(&predicate).is_empty());
+    assert!(static_file_predicates(&predicate, None).is_empty());
 }
 
 fn arrow_file_schema() -> Arc<ArrowSchema> {

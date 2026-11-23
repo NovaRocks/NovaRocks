@@ -722,11 +722,7 @@ impl BackendRuntimeFilterSession {
                     ),
                 ) {
                     worker_runtime_filter::materializer::MaterializationOutcome::Published(bundle) => {
-                        match worker_runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery::membership(
-                            &bundle,
-                            schema.data_type().clone(),
-                            schema.null_semantics(),
-                        ) {
+                        match worker_runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery::membership_typed(&bundle, schema) {
                             Ok(query) => SnapshotAcquireOutcome::Published(Arc::new(
                                 RuntimeFilterSnapshot::new(
                                     consumer.contract.binding_id(),

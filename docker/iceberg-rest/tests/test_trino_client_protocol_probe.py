@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import trino_client_protocol_probe as probe
+from scratch import ScratchIdentity
 
 
 def signature(name, *arguments):
@@ -98,16 +99,62 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(probe.ProbeFailure, "oracle rejected"):
             probe.compare_column("ts_zoned", {"error": {"errorName": "REMOTE_TASK_ERROR"}}, result(signature("timestamp"), ["a"]))
 
+    def test_nested_variant_registers_only_the_existing_provider_refusal(self):
+        sig = signature("array", {"kind": "TYPE", "value": signature("json")})
+        reference = result(sig, [["1", None]])
+        error = {"errorName": "GENERIC_INTERNAL_ERROR", "message": (
+            "provider read of fixture.variant_values could not be negotiated: Unsupported: "
+            "reading Iceberg Variant nested inside STRUCT, LIST or MAP is not supported: column variant_array.element"
+        )}
+        difference = probe.compare_column("variant_array", reference, {"error": error})
+        self.assertEqual(difference["owner"], "IRU-9")
+        self.assertEqual(difference["novarocks_error"], error)
+        for invalid in ({**error, "message": "unexpected internal failure"},
+                        {**error, "message": error["message"].replace(".element", ".value")}):
+            with self.assertRaisesRegex(probe.ProbeFailure, "unregistered"):
+                probe.compare_column("variant_array", reference, {"error": invalid})
+        with self.assertRaisesRegex(probe.ProbeFailure, "NULL differs"):
+            probe.compare_column("variant_array", reference, result(sig, [[None, None]]))
+
 
 class ReferenceInputTests(unittest.TestCase):
     def probe(self, **args):
         value = probe.Probe.__new__(probe.Probe)
-        value.args = SimpleNamespace(nova="http://127.0.0.1:8080", user="root", trino_jdbc_jar="/declared/driver.jar", **args)
+        defaults = {"nova": "http://127.0.0.1:8080", "user": "root", "trino_jdbc_jar": "/declared/driver.jar", "mode": "official-cli"}
+        value.args = SimpleNamespace(**(defaults | args))
         value.root = Path("/retained/probe")
         value.repository = Path("/repository")
         value.env_file = Path("/original/fixture.env")
         value.image = "exact-entry-image"
         return value
+
+    def test_all_probe_modes_allocate_valid_distinct_scratch_names(self):
+        identity = ScratchIdentity.create("s3://test-bucket/worktree")
+        names = {identity.resource_name(purpose) for purpose in probe.SCRATCH_PURPOSES.values()}
+        self.assertEqual(len(names), 3)
+        for name in names:
+            self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
+
+    def test_encoding_preflight_checks_host_http_without_docker_host_network(self):
+        value = self.probe(mode="encoding-conformance")
+        value.request = Mock(return_value=(200, b"", b'{"nodeVersion":{"version":"test"}}'))
+        value.run_image = Mock()
+        with patch.object(probe.shutil, "which", return_value="/usr/bin/docker"), patch.object(probe.platform, "system", return_value="Darwin"), patch.object(probe, "write_json") as write:
+            value.preflight()
+        value.request.assert_called_once_with("nova", "GET", value.args.nova + "/v1/info", {})
+        value.run_image.assert_not_called()
+        self.assertEqual(write.call_args.args[1]["nova_http_verified_against"], value.args.nova)
+
+    def test_encoding_reads_the_same_table_through_each_published_catalog(self):
+        value = self.probe(mode="encoding-conformance")
+        value.namespace = "probe_namespace"
+        value.query = Mock()
+        value.read_encoding_column("trino", "time_values", "time_value", "read-time", "")
+        value.read_encoding_column("nova", "time_values", "time_value", "read-time", "")
+        self.assertEqual([call.args for call in value.query.call_args_list], [
+            ("trino", "SELECT time_value FROM iceberg.probe_namespace.time_values ORDER BY id", "read-time", ""),
+            ("nova", "SELECT time_value FROM ice_rest.probe_namespace.time_values ORDER BY id", "read-time", ""),
+        ])
 
     def test_preflight_uses_the_entry_image_without_candidate_inspection(self):
         value = self.probe()

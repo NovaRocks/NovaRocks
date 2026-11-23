@@ -43,7 +43,7 @@ fn by_runtime_memory_ready_original_regroup_schema_and_field_escape_are_independ
     let control = Control::new(None);
     let drops = Arc::new(AtomicUsize::new(0));
     let mut work = Work::new(&control, drops.clone());
-    let stage = stages::regroup(&source, &keys, &mut work).unwrap();
+    let stage = stages::regroup(&source, &keys, None, &mut work).unwrap();
     let schema = stage.value.schema();
     assert!(
         !Arc::ptr_eq(&schema, &original_schema),

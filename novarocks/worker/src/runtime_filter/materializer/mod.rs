@@ -365,6 +365,10 @@ fn membership_value_count(
         novarocks_execution::runtime_filter::contribution::MembershipValues::Int64(values) => {
             values.len()
         }
+        novarocks_execution::runtime_filter::contribution::MembershipValues::Temporal {
+            values,
+            ..
+        } => values.len(),
         novarocks_execution::runtime_filter::contribution::MembershipValues::LargeInt(values) => {
             values.len()
         }

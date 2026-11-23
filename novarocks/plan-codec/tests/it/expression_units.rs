@@ -59,6 +59,11 @@ fn pair_with_unary(unary: bool) -> p::FragmentPackage {
         &Control,
     )
     .unwrap();
+    pair_with_constant(cv, unary)
+}
+fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
+    let policy = FROZEN_CONSTANT_POLICY;
+    let ty = cv.value_type().clone();
     let address = p::ConstantReference {
         pool: p::ConstantPoolId::new(u32::MAX),
         ordinal: cv.ordinal(),
@@ -178,6 +183,74 @@ fn pair_with_unary(unary: bool) -> p::FragmentPackage {
     )
     .unwrap();
     fragments.into_values().next().unwrap()
+}
+
+#[test]
+fn expression_unit_round_trips_temporal_precision_and_observable_value_zone() {
+    use arrow::array::{Array, FixedSizeBinaryArray};
+    use novarocks_type_contract::{
+        TemporalCarrier, TemporalMicros, TemporalPrecision, TemporalType, TemporalValue,
+        TimeZoneKey, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+    let observed = TemporalValue::TimestampWithTimeZone {
+        instant: TemporalMicros::from_picos(-1).unwrap(),
+        zone: TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+    };
+    let TemporalCarrier::ZonedTimestamp(bytes) = observed.to_carrier(declaration).unwrap() else {
+        panic!("unexpected carrier");
+    };
+    let array = FixedSizeBinaryArray::try_from_iter([bytes.as_slice()].into_iter()).unwrap();
+    let storage = ValueTypeStorageLifetime::pure();
+    let ty = p::ValueType::try_from_value(
+        ValueTypeRef::try_new(ValueKind::Temporal(declaration), false, storage.clone()).unwrap(),
+        ValueLayout::try_new(&declaration.carrier(), storage).unwrap(),
+    )
+    .unwrap();
+    let constant = p::ConstantPool::try_new(
+        Arc::new(ty.try_to_field("exact").unwrap()),
+        ty.clone(),
+        array.into_data(),
+        FROZEN_CONSTANT_POLICY,
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap()
+    .value(0)
+    .unwrap();
+    let package = pair_with_constant(constant, false);
+    let encoded =
+        encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let raw = encoded.encode_to_vec();
+    let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
+    let decoded =
+        decode_fragment_package(&raw, &model, &PackageDecodeLimits::FROZEN, &Control).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let value = decoded
+        .constants()
+        .resolve_observed(
+            p::ConstantReference {
+                pool: p::ConstantPoolId::new(u32::MAX),
+                ordinal: 0,
+            },
+            &ty,
+            &mut work,
+        )
+        .unwrap();
+    work.finish().unwrap();
+    assert_eq!(value.value_type(), &ty);
+    assert_eq!(
+        value
+            .temporal_observed(CompilePhase::Validate, &Control)
+            .unwrap(),
+        Some(observed)
+    );
+    assert_eq!(
+        encode_fragment_package(&decoded, &PackageEncodeLimits::FROZEN, &Control)
+            .unwrap()
+            .encode_to_vec(),
+        raw
+    );
 }
 #[test]
 fn node_units_keep_local_zero_distinct_ports_source_pool_and_repeated_outputs() {

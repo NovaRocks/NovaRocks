@@ -841,17 +841,17 @@ fn compile_feedback_declaration(
                 BindingRole::Consumer {
                     feedback_scan_type: Some(value_type),
                     ..
-                } => Some(FrontendRuntimeFilterFeedbackScanBinding {
-                    fragment_id: binding.fragment_id,
-                    plan_node_id: binding.node_id,
-                    binding_id: binding.binding_id,
-                    data_type: value_type.data_type().clone(),
-                }),
-                BindingRole::Consumer {
-                    feedback_scan_type: None,
-                    ..
+                } if value_type.value_type().temporal().is_none() => {
+                    Some(FrontendRuntimeFilterFeedbackScanBinding {
+                        fragment_id: binding.fragment_id,
+                        plan_node_id: binding.node_id,
+                        binding_id: binding.binding_id,
+                        data_type: value_type.data_type().clone(),
+                    })
                 }
-                | BindingRole::Producer { .. } => None,
+                // The feedback port has only physical scalar domains. The
+                // exact runtime-filter row binding still consumes temporal keys.
+                BindingRole::Consumer { .. } | BindingRole::Producer { .. } => None,
             })
             .collect::<Vec<_>>();
         if scan_bindings.is_empty()

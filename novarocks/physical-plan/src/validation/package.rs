@@ -181,11 +181,6 @@ fn validate_package_core(
         }
     }
     usage.add_items(input.parameters.entries().len());
-    for value in input.parameters.entries().values() {
-        if let novarocks_type_contract::SemanticParameterValue::TimeZone(zone) = value {
-            usage.add_bytes(zone.len());
-        }
-    }
     usage.add_items(input.annotations.len());
     for annotation in &input.annotations {
         usage.add_bytes(annotation.key.len());

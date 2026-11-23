@@ -57,6 +57,26 @@ pub(super) fn current_constraint(
             work.step()?;
             Ok(Some(target))
         }
+        SqlResultConstraintOrigin::TemporalSelected { own_nullable } => {
+            let mut nullable = *own_nullable;
+            for argument in arguments {
+                work.step()?;
+                let novarocks_functions::FunctionArgument::Value { value_type, .. } = argument
+                else {
+                    return Err(invalid("temporal constraint has a non-value argument"));
+                };
+                nullable |= value_type.nullable();
+            }
+            let target = binding
+                .result_constraint()
+                .ok_or_else(|| invalid("temporal constraint lost its original target"))?;
+            work.flush()?;
+            target.with_nullable(nullable).map(Some).map_err(|error| {
+                ContractLoweringError::InvalidFunctionBinding {
+                    detail: error.to_string(),
+                }
+            })
+        }
         SqlResultConstraintOrigin::ValueDomainConversion { final_target } => {
             let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
             else {

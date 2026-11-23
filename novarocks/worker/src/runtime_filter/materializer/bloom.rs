@@ -180,6 +180,7 @@ fn value_count(values: &MembershipValues) -> usize {
         MembershipValues::Int32(v) => v.len(),
         MembershipValues::Int64(v) => v.len(),
         MembershipValues::LargeInt(v) => v.len(),
+        MembershipValues::Temporal { values, .. } => values.len(),
         MembershipValues::Float32(v) => v.len(),
         MembershipValues::Float64(v) => v.len(),
         MembershipValues::Utf8(v) => v.len(),
@@ -218,6 +219,7 @@ fn for_each_frame(values: &MembershipValues, mut visit: impl FnMut(&[u8])) {
         MembershipValues::Int32(v) => fixed!(4, v, |x: &i32| x.to_be_bytes()),
         MembershipValues::Int64(v) => fixed!(5, v, |x: &i64| x.to_be_bytes()),
         MembershipValues::LargeInt(v) => fixed!(6, v, |x: &i128| x.to_be_bytes()),
+        MembershipValues::Temporal { values, .. } => fixed!(13, values, |key: &[u8; 12]| *key),
         MembershipValues::Float32(v) => fixed!(7, v, |x: &CanonicalF32| x.bits().to_be_bytes()),
         MembershipValues::Float64(v) => fixed!(8, v, |x: &CanonicalF64| x.bits().to_be_bytes()),
         MembershipValues::Utf8(v) => {

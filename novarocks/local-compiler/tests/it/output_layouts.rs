@@ -333,6 +333,14 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
         "utf8_to_largeint_null_invalid",
         "null_to_typed_nullable",
         "array_common_coercion",
+        "nested_temporal_write_assignment",
+        "temporal",
+        "temporal_clock",
+        "temporal_widen",
+        "temporal_zone",
+        "try_temporal",
+        "try_temporal_clock",
+        "try_temporal_zone",
         "operator_decimal_float_coercion",
     ] {
         manifest.push(InstalledPureKernel {

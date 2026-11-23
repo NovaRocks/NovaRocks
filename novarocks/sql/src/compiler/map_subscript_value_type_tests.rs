@@ -105,6 +105,7 @@ fn public_sql_map_subscript_widens_integer_probe_and_preserves_value_declaration
             crate::compiler::RenderFamilyRequest::TrinoJson(
                 &novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 },

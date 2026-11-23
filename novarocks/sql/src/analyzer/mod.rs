@@ -80,7 +80,7 @@ mod value_conversion;
 mod view;
 #[cfg(test)]
 mod window_canonical_tests;
-mod write_assignment;
+pub(crate) mod write_assignment;
 pub use resolve_from::TableNameView;
 mod scope;
 mod subquery_rewrite;
@@ -214,11 +214,38 @@ pub(crate) fn analyze_mv_definition(
     ),
     AnalyzeError,
 > {
-    analyze_with_factory_and_function_catalog_and_assignments_inner(
+    analyze_mv_definition_with_factory(
         query,
         catalog,
         current_database,
         crate::column_id::ColumnRefFactory::new(),
+        function_catalog,
+        constant_policy,
+        control,
+    )
+}
+
+pub(crate) fn analyze_mv_definition_with_factory(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    factory: crate::column_id::ColumnRefFactory,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
+> {
+    analyze_with_factory_and_function_catalog_and_assignments_inner(
+        query,
+        catalog,
+        current_database,
+        factory,
         function_catalog,
         &crate::sql_mode::SqlSemanticSettings::default(),
         constant_policy,
@@ -1408,6 +1435,24 @@ impl<'a> AnalyzerContext<'a> {
                 })
             })
             .collect::<Result<Vec<_>, AnalyzeError>>()?;
+        for (ordinal, column) in output_cols.iter().enumerate() {
+            if column.value_type.value_type().temporal().is_none() {
+                continue;
+            }
+            for cell in resolved_rows
+                .iter_mut()
+                .filter_map(|row| row.get_mut(ordinal))
+            {
+                self.check_control()?;
+                if !cell.value_type.same_value_domain(&column.value_type) {
+                    *cell = self.cast_to_value_type(
+                        cell.clone(),
+                        column.value_type.clone(),
+                        values.span,
+                    )?;
+                }
+            }
+        }
         Ok((
             ResolvedValues {
                 rows: resolved_rows,

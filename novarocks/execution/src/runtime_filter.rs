@@ -26,7 +26,7 @@ use novarocks_local_program::{
 };
 
 pub use novarocks_functions::FunctionValueType;
-pub use novarocks_local_program::is_aggregate_topn_key_carrier;
+pub use novarocks_local_program::{is_aggregate_topn_key_carrier, temporal_order_key_type_bytes};
 
 pub mod contribution;
 pub mod evaluator;

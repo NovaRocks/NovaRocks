@@ -617,6 +617,8 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
             );
         }
     }
+    session_time_zone_effects(actor)?;
+    context.action("verified typed time zone assignment and LOCAL reset across client requests");
     let pages = success(actor, "SET SESSION query_timeout = 1")?;
     let end = terminal(&pages)?;
     ensure!(
@@ -704,6 +706,93 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
     context.action("verified name headers, qualified USE without session clearing, evaluated SET effects, exact double rendering, typed 14/44 refusals, strict header decoding and system-before-catalog validation in both mixed orders");
     Ok(())
 }
+fn session_time_zone_effects(actor: &TrinoClient) -> Result<()> {
+    let mut client = actor.with_session(&[
+        ("x-trino-time-zone", "UTC"),
+        ("x-trino-client-capabilities", "PARAMETRIC_DATETIME"),
+    ]);
+    let verify_zone = |request: &TrinoClient, expected: &str| -> Result<()> {
+        let pages = success(request, "SELECT TIMESTAMP '2024-01-01 00:00:00' AT LOCAL")?;
+        let rows = pages
+            .iter()
+            .map(RawResponse::assert_success)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|value| value["data"].as_array().cloned())
+            .flatten()
+            .collect::<Vec<_>>();
+        ensure!(
+            rows == [json!([format!("2024-01-01 00:00:00 {expected}")])],
+            "expected effective zone {expected} after the session effect, got {rows:?}"
+        );
+        Ok(())
+    };
+    verify_zone(&client, "UTC")?;
+    for (sql, effect, zone) in [
+        (
+            "SET TIME ZONE 'Asia/Shanghai'",
+            "time_zone_id=Asia%2FShanghai",
+            "Asia/Shanghai",
+        ),
+        (
+            "SET TIME ZONE INTERVAL '-05:30' HOUR TO MINUTE",
+            "time_zone_id=-05%3A30",
+            "-05:30",
+        ),
+    ] {
+        let pages = success(&client, sql)?;
+        let end = terminal(&pages)?;
+        ensure!(end.json()?["updateType"] == "SET TIME ZONE");
+        ensure!(
+            end.headers
+                .get("x-trino-set-session")
+                .context("SET TIME ZONE omitted effect")?
+                == effect
+        );
+        ensure!(!end.headers.contains_key("x-trino-clear-session"));
+        client.apply_effects(end)?;
+        verify_zone(&client, zone)?;
+    }
+    for (sql, expected) in [
+        (
+            "SET TIME ZONE 'Mars/Olympus'",
+            (13, "NOT_SUPPORTED", "USER_ERROR"),
+        ),
+        ("SET TIME ZONE 42", (58, "TYPE_MISMATCH", "USER_ERROR")),
+        (
+            "SET TIME ZONE INTERVAL '00:00:01' HOUR TO SECOND",
+            (59, "INVALID_LITERAL", "USER_ERROR"),
+        ),
+        (
+            "SET TIME ZONE INTERVAL '14:01' HOUR TO MINUTE",
+            (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
+        ),
+    ] {
+        let pages = client.execute(sql)?;
+        require_error(terminal(&pages)?, expected)?;
+        ensure!(
+            pages
+                .iter()
+                .all(|page| !page.headers.contains_key("x-trino-set-session")
+                    && !page.headers.contains_key("x-trino-clear-session"))
+        );
+    }
+    verify_zone(&client, "-05:30")?;
+    let pages = success(&client, "SET TIME ZONE LOCAL")?;
+    let end = terminal(&pages)?;
+    ensure!(end.json()?["updateType"] == "SET TIME ZONE");
+    ensure!(
+        end.headers
+            .get("x-trino-clear-session")
+            .context("LOCAL omitted effect")?
+            == "time_zone_id"
+    );
+    ensure!(!end.headers.contains_key("x-trino-set-session"));
+    client.apply_effects(end)?;
+    verify_zone(&client, "UTC")?;
+    Ok(())
+}
+
 fn cancel(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     let before = observation(context, "delete-before")?;
     let post = actor.submit("SELECT sleep(60)")?;
@@ -873,8 +962,174 @@ fn refusals(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
         "retired type error omitted the original declaration location"
     );
     context.action("verified Host/user HTTP refusals, unsupported feature errors and the LARGEINT type declaration diagnostic");
+
+    temporal_result_capabilities(actor)?;
+    context.action("verified independently negotiated temporal metadata, signed interval keys, and terminal legacy MAP collision refusal");
     Ok(())
 }
+
+fn temporal_result_capabilities(actor: &TrinoClient) -> Result<()> {
+    let exact = actor.with_session(&[
+        ("x-trino-time-zone", "UTC"),
+        (
+            "x-trino-client-capabilities",
+            "PARAMETRIC_DATETIME,PARAMETRIC_INTERVAL",
+        ),
+    ]);
+    let legacy = actor.with_session(&[
+        ("x-trino-time-zone", "UTC"),
+        ("x-trino-client-capabilities", ""),
+    ]);
+    let datetimes = actor.with_session(&[
+        ("x-trino-time-zone", "UTC"),
+        ("x-trino-client-capabilities", "PARAMETRIC_DATETIME"),
+    ]);
+    let intervals = actor.with_session(&[
+        ("x-trino-time-zone", "UTC"),
+        ("x-trino-client-capabilities", "PARAMETRIC_INTERVAL"),
+    ]);
+    // These assertions use the two independent Trino 484 capability projections.
+    let scalar_sql = "SELECT ARRAY[TIMESTAMP '2024-01-01 00:00:00.123456 America/New_York'] AS zoned, TIME '12:00:00.123456 +05:30' AS clock, INTERVAL '1 00:00:00.123' DAY TO SECOND AS elapsed";
+    for (client, exact_datetime, exact_interval) in [
+        (&legacy, false, false),
+        (&exact, true, true),
+        (&datetimes, true, false),
+        (&intervals, false, true),
+    ] {
+        let datetime_args = if exact_datetime {
+            json!([{"kind":"LONG","value":6}])
+        } else {
+            json!([])
+        };
+        let interval_args = if exact_interval {
+            json!([
+                {"kind":"LONG","value":2}, {"kind":"LONG","value":5},
+                {"kind":"LONG","value":1}, {"kind":"LONG","value":6},
+            ])
+        } else {
+            json!([])
+        };
+        let timestamp = if exact_datetime {
+            "timestamp(6) with time zone"
+        } else {
+            "timestamp with time zone"
+        };
+        let time = if exact_datetime {
+            "time(6) with time zone"
+        } else {
+            "time with time zone"
+        };
+        let interval = if exact_interval {
+            "INTERVAL DAY(1) TO SECOND(6)"
+        } else {
+            "interval day to second"
+        };
+        let expected_columns = json!([
+            {"name":"zoned", "type":format!("array({timestamp})"), "typeSignature": {
+                "rawType":"array", "arguments":[{"kind":"TYPE","value":{
+                    "rawType":"timestamp with time zone","arguments":datetime_args
+                }}]
+            }},
+            {"name":"clock", "type":time, "typeSignature": {
+                "rawType":"time with time zone", "arguments":datetime_args
+            }},
+            {"name":"elapsed", "type":interval, "typeSignature": {
+                "rawType":"interval day to second", "arguments":interval_args
+            }}
+        ]);
+        let datetime_fraction = if exact_datetime { "123456" } else { "123" };
+        let interval_fraction = if exact_interval { "123000" } else { "123" };
+        let expected_row = json!([
+            [format!(
+                "2024-01-01 00:00:00.{datetime_fraction} America/New_York"
+            )],
+            format!("12:00:00.{datetime_fraction}+05:30"),
+            format!("1 00:00:00.{interval_fraction}"),
+        ]);
+        let (columns, rows) = temporal_result(client, scalar_sql)?;
+        ensure!(
+            columns == expected_columns,
+            "unexpected temporal column signatures: {columns}"
+        );
+        ensure!(
+            rows == [expected_row],
+            "unexpected temporal result: {rows:?}"
+        );
+    }
+
+    // The installed MAP_AGG produces the same typed keys and values as the
+    // reference MAP constructor. Nest this result to exercise recursion and
+    // make sure the containing array never publishes a partially rendered row.
+    let collision_sql = "SELECT ARRAY[MAP_AGG(k, v)] AS times FROM (VALUES (INTERVAL '0.0001' SECOND, 1), (INTERVAL '0.0002' SECOND, 2)) AS inputs(k, v)";
+    let exact_map_signature = json!({
+        "rawType":"map", "arguments":[
+            {"kind":"TYPE", "value":{"rawType":"interval day to second", "arguments":[
+                {"kind":"LONG","value":5},{"kind":"LONG","value":5},
+                {"kind":"LONG","value":1},{"kind":"LONG","value":4}
+            ]}},
+            {"kind":"TYPE", "value":{"rawType":"integer","arguments":[]}}
+        ]
+    });
+    let (columns, exact_rows) = temporal_result(&exact, collision_sql)?;
+    ensure!(
+        columns
+            == json!([{
+                "name":"times", "type":"array(map(INTERVAL SECOND(1, 4), integer))", "typeSignature":{
+                    "rawType":"array","arguments":[{"kind":"TYPE","value":exact_map_signature}]
+                }
+            }])
+    );
+    ensure!(exact_rows == [json!([[{"0 00:00:00.0001":1,"0 00:00:00.0002":2}]])]);
+    let pages = legacy.execute(collision_sql)?;
+    let error = require_error(terminal(&pages)?, (13, "NOT_SUPPORTED", "USER_ERROR"))?;
+    ensure!(
+        error["error"]["message"]
+            == "Interval map keys collide at millisecond precision; use a client supporting PARAMETRIC_INTERVAL"
+    );
+    for page in pages {
+        ensure!(
+            page.json()?.get("data").is_none(),
+            "colliding keys leaked a row"
+        );
+    }
+
+    let signed_sql = "SELECT MAP_AGG(k, v) AS times FROM (VALUES (INTERVAL '-0.0006' SECOND, 1), (INTERVAL '0.0005' SECOND, 2)) AS inputs(k, v)";
+    let (columns, exact_rows) = temporal_result(&exact, signed_sql)?;
+    ensure!(
+        columns
+            == json!([{
+                "name":"times", "type":"map(INTERVAL SECOND(1, 4), integer)", "typeSignature":exact_map_signature
+            }])
+    );
+    let (_, legacy_rows) = temporal_result(&legacy, signed_sql)?;
+    ensure!(exact_rows == [json!([{"-0 00:00:00.0006":1,"0 00:00:00.0005":2}])]);
+    ensure!(legacy_rows == [json!([{"-0 00:00:00.001":1,"0 00:00:00.001":2}])]);
+    Ok(())
+}
+
+fn temporal_result(client: &TrinoClient, sql: &str) -> Result<(Value, Vec<Value>)> {
+    let pages = success(client, sql)?;
+    let mut columns = None;
+    let mut rows = Vec::new();
+    for page in pages {
+        let mut value = page.json()?;
+        if let Some(metadata) = value.get_mut("columns") {
+            if let Some(previous) = &columns {
+                ensure!(
+                    previous == metadata,
+                    "column signatures changed while paging"
+                );
+            } else {
+                columns = Some(metadata.take());
+            }
+        }
+        if let Some(data) = value.get_mut("data").and_then(Value::as_array_mut) {
+            rows.append(data);
+        }
+    }
+    Ok((columns.context("missing temporal columns")?, rows))
+}
+
 fn row_budget(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     let before = observation(context, "row-budget-before")?;
     // Each legal scalar remains at the existing 1 MiB string boundary; seven

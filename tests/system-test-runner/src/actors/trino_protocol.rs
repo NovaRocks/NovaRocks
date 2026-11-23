@@ -561,10 +561,6 @@ impl TrinoClient {
         );
         let mut headers = HeaderMap::new();
         headers.insert("x-trino-user", HeaderValue::from_str(&self.user)?);
-        headers.insert(
-            "x-trino-client-capabilities",
-            HeaderValue::from_static("PARAMETRIC_DATETIME,VARIANT,VARIANT_BINARY"),
-        );
         headers.insert("accept-encoding", HeaderValue::from_static("identity"));
         for (name, value) in &self.session {
             headers.append(
@@ -578,6 +574,11 @@ impl TrinoClient {
                 HeaderValue::from_str(value)?,
             );
         }
+        headers
+            .entry("x-trino-client-capabilities")
+            .or_insert(HeaderValue::from_static(
+                "PARAMETRIC_DATETIME,PARAMETRIC_INTERVAL,VARIANT,VARIANT_BINARY",
+            ));
         let mut request = self
             .client
             .request(method, target)

@@ -124,9 +124,24 @@ pub struct SqlSemanticSettings {
     /// Raw value projected from the actual admitted SessionExecutionSettings.
     group_concat_max_len: Option<i64>,
     recursive_cte_max_depth: Option<i32>,
+    statement_time: Option<novarocks_type_contract::StatementTimeEnvironment>,
 }
 
 impl SqlSemanticSettings {
+    pub const fn statement_time(
+        &self,
+    ) -> Option<novarocks_type_contract::StatementTimeEnvironment> {
+        self.statement_time
+    }
+
+    pub fn with_statement_time(
+        mut self,
+        value: novarocks_type_contract::StatementTimeEnvironment,
+    ) -> Self {
+        self.statement_time = Some(value);
+        self
+    }
+
     pub const fn recursive_cte_max_depth(&self) -> Option<i32> {
         self.recursive_cte_max_depth
     }

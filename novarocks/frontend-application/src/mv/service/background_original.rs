@@ -53,6 +53,7 @@ pub(super) struct OriginalWorkerDependencies {
     product_service: Arc<novarocks_mv_application::service::MvProductOperations>,
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
+    statement_clock: crate::application::StatementClock,
     attempt_timeout: Duration,
     runtime: tokio::runtime::Handle,
 }
@@ -68,6 +69,7 @@ impl From<&RefreshWorkerDependencies> for OriginalWorkerDependencies {
             product_service: original.product_service.original_operations(),
             root_admission: original.root_admission.clone(),
             optimizer_query_mem_limit_bytes: original.optimizer_query_mem_limit_bytes,
+            statement_clock: original.statement_clock.clone(),
             attempt_timeout: original.attempt_timeout,
             runtime: original.runtime.clone(),
         }
@@ -93,6 +95,7 @@ impl crate::wake::StatusIntakeWake for BackgroundWake {
 /// An existing cadence is real management work, with no query permit or P.
 /// This value is a named field of the original fixed worker before I/O.
 struct BackgroundManagementPass {
+    statement_time: novarocks_type_contract::StatementTimeEnvironment,
     io: Option<Arc<MetadataIoAdmission>>,
     store: Option<StateStoreOriginalOwner>,
     requests: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
@@ -107,10 +110,14 @@ struct BackgroundManagementPass {
     root: Option<novarocks_workload_control::RootWork>,
 }
 impl BackgroundManagementPass {
-    fn new(admission: &RootAdmissionHandle) -> Result<Self, QueryServiceError> {
+    fn new(
+        admission: &RootAdmissionHandle,
+        clock: &crate::application::StatementClock,
+    ) -> Result<Self, QueryServiceError> {
         // No child F or physical Source is constructed here. The caller puts
         // this Root in its original slot before polling initialization.
         let mut original = Self {
+            statement_time: clock.capture().map_err(protocol)?.1,
             io: None,
             store: None,
             requests: None,
@@ -172,7 +179,8 @@ impl BackgroundManagementPass {
                     ),
                     ..Default::default()
                 },
-                Default::default(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default()
+                    .with_statement_time(self.statement_time),
                 None,
             ))
             .with_result_capacity(capacity.clone())
@@ -353,6 +361,7 @@ impl GovernedBackgroundAction for BackgroundMvAction {
 /// The original worker installs this before admission, action preparation,
 /// start or notification. Business Ready and the actual exit observer differ.
 pub(super) struct ScheduledCall {
+    statement_time: novarocks_type_contract::StatementTimeEnvironment,
     pub(super) request: ScheduledRefreshRequest,
     owner: Option<WorkOwner>,
     scope: novarocks_workload_control::WorkScope,
@@ -381,6 +390,7 @@ impl ScheduledCall {
         dependencies: &OriginalWorkerDependencies,
         request: ScheduledRefreshRequest,
     ) -> Result<Self, QueryServiceError> {
+        let statement_time = dependencies.statement_clock.capture().map_err(protocol)?.1;
         let root = dependencies
             .root_admission
             .begin_warehouse_root(WorkRequest::new(WorkClass::MaterializedView))
@@ -388,6 +398,7 @@ impl ScheduledCall {
         let scope = root.owner.scope();
         let cancel = root.owner.cancellation_requester();
         Ok(Self {
+            statement_time,
             request,
             owner: Some(root.owner),
             scope,
@@ -527,7 +538,8 @@ impl ScheduledCall {
                     ),
                     ..Default::default()
                 },
-                Default::default(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default()
+                    .with_statement_time(self.statement_time),
                 None,
             ))
             .with_result_capacity(capacity)
@@ -725,7 +737,10 @@ impl SchedulerOriginal {
                 body.management.is_none() && body.call.is_none(),
                 "previous scheduler event actually closed"
             );
-            match BackgroundManagementPass::new(&self.dependencies.root_admission) {
+            match BackgroundManagementPass::new(
+                &self.dependencies.root_admission,
+                &self.dependencies.statement_clock,
+            ) {
                 Ok(pass) => body.management = Some(pass),
                 Err(error) => {
                     tracing::warn!(%error,"MV scheduler management admission failed");
@@ -977,7 +992,10 @@ impl MaintenanceOriginal {
             "previous maintenance event actually exited"
         );
         body.report = Some(Default::default());
-        match BackgroundManagementPass::new(&self.dependencies.root_admission) {
+        match BackgroundManagementPass::new(
+            &self.dependencies.root_admission,
+            &self.dependencies.statement_clock,
+        ) {
             Ok(pass) => body.management = Some(pass),
             Err(error) => {
                 tracing::warn!(%error, "MV maintenance management admission failed");
@@ -1184,11 +1202,7 @@ mod management_root_tests {
     };
     use std::{num::NonZeroUsize, task::Waker};
 
-    fn original_management() -> (
-        WorkloadControl,
-        JointProgressDriver,
-        BackgroundManagementPass,
-    ) {
+    fn management_control() -> (WorkloadControl, JointProgressDriver) {
         let control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: 8,
             business_limit: 8,
@@ -1210,7 +1224,20 @@ mod management_root_tests {
             .configure_control_storage(ControlStorageConfig::new(8, &[]))
             .unwrap();
         control.mark_ready().unwrap();
-        let pass = BackgroundManagementPass::new(&control.root_admission()).unwrap();
+        (control, driver)
+    }
+
+    fn original_management() -> (
+        WorkloadControl,
+        JointProgressDriver,
+        BackgroundManagementPass,
+    ) {
+        let (control, driver) = management_control();
+        let pass = BackgroundManagementPass::new(
+            &control.root_admission(),
+            &crate::application::StatementClock::default(),
+        )
+        .unwrap();
         (control, driver, pass)
     }
     fn drive(driver: &mut JointProgressDriver) {
@@ -1220,6 +1247,36 @@ mod management_root_tests {
             }
         }
         panic!("same original management responsibility driver did not become idle");
+    }
+
+    #[test]
+    fn statement_environment_is_captured_once_for_each_independent_management_root() {
+        use novarocks_type_contract::TimeZoneKey;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::UNIX_EPOCH;
+
+        let (control, mut driver) = management_control();
+        let samples = Arc::new(AtomicU64::new(0));
+        let zone = TimeZoneKey::parse("Europe/Warsaw").unwrap();
+        let clock = crate::application::StatementClock::with_test_sample(zone, {
+            let samples = Arc::clone(&samples);
+            move || UNIX_EPOCH + Duration::from_nanos(samples.fetch_add(1, Ordering::Relaxed))
+        });
+        for expected in [0, 1] {
+            let mut pass =
+                BackgroundManagementPass::new(&control.root_admission(), &clock).unwrap();
+            assert_eq!(pass.statement_time.start.nanos(), expected);
+            assert_eq!(pass.statement_time.zone, zone);
+            assert_eq!(samples.load(Ordering::Relaxed), u64::from(expected + 1));
+            let mut cx = Context::from_waker(Waker::noop());
+            let close = pass.close();
+            tokio::pin!(close);
+            assert!(matches!(close.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            drive(&mut driver);
+        }
+        control.close_admission();
+        drive(&mut driver);
+        assert!(control.shutdown().is_ok());
     }
 
     #[test]

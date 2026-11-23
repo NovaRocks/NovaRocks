@@ -52,11 +52,13 @@ fn table() -> SemanticParameters {
     SemanticParameters::try_new([
         (
             SemanticParameterId::new(0),
-            SemanticParameterValue::StatementStartUtc(-17),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(-17, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(1),
-            SemanticParameterValue::TimeZone("UTC".into()),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
         ),
         (
             SemanticParameterId::new(2),
@@ -94,7 +96,9 @@ fn exact_values_sparse_ids_and_input_are_preserved() {
     assert_eq!(input, before);
     assert_eq!(
         output.get(SemanticParameterId::new(0)),
-        Some(&SemanticParameterValue::StatementStartUtc(-17))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            crate::StatementStartUtc::try_new(-17, 0).unwrap()
+        ))
     );
     assert_eq!(
         output.get(SemanticParameterId::new(u32::MAX)),
@@ -111,11 +115,11 @@ fn every_repeated_reference_is_checked_and_one_definition_is_retained() {
     let input = SemanticParameters::try_new([
         (
             SemanticParameterId::new(0),
-            SemanticParameterValue::TimeZone("UTC".into()),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("UTC").unwrap()),
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::TimeZone("+08:00".into()),
+            SemanticParameterValue::TimeZone(crate::TimeZoneKey::parse("+08:00").unwrap()),
         ),
     ])
     .unwrap();
@@ -138,7 +142,7 @@ fn every_repeated_reference_is_checked_and_one_definition_is_retained() {
     else {
         panic!("expected time zone")
     };
-    assert_ne!(input_zone.as_ptr(), output_zone.as_ptr());
+    assert_eq!(input_zone, output_zone);
     assert_eq!(
         control.checkpoints.into_inner().unwrap(),
         vec![

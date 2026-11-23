@@ -289,7 +289,7 @@ fn a_missing_column_with_an_initial_default_materializes_it() {
         bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
     assert!(matches!(
         binding.columns()[0].source(),
-        IcebergColumnSource::InitialDefault
+        IcebergColumnSource::InitialDefault(_)
     ));
 
     assert!(binding.root_projection().is_empty());
@@ -305,6 +305,85 @@ fn a_missing_column_with_an_initial_default_materializes_it() {
         .downcast_ref::<Int64Array>()
         .expect("int64 default");
     assert_eq!(grade.value(0), 42);
+}
+
+#[test]
+fn absent_zoned_defaults_preserve_frozen_field_values_at_both_levels() {
+    use arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+
+    let metadata = |id, name, primitive, value| {
+        Arc::new(
+            NestedField::optional(id, name, Type::Primitive(primitive))
+                .with_initial_default(IcebergLiteral::long(value)),
+        )
+    };
+    let nanos = 1_704_067_200_123_456_790;
+    let micros = 1_704_067_200_123_457;
+    let schema = IcebergSchema::builder()
+        .with_fields(vec![
+            metadata(3, "instant", PrimitiveType::TimestamptzNs, nanos),
+            Arc::new(NestedField::optional(
+                10,
+                "detail",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::required(
+                        11,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    metadata(12, "seen_at", PrimitiveType::Timestamptz, micros),
+                ])),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let children: Fields =
+        vec![Field::new("id", DataType::Int64, false).with_metadata(field_id_metadata(11))].into();
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("detail", DataType::Struct(children.clone()), true)
+            .with_metadata(field_id_metadata(10)),
+    ]));
+    let batch = RecordBatch::try_new(
+        file_schema.clone(),
+        vec![Arc::new(StructArray::new(
+            children,
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+            None,
+        ))],
+    )
+    .unwrap();
+    let columns = vec![handle(&schema, 3), handle(&schema, 10)];
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).unwrap();
+    let values = binding
+        .materialize(
+            &batch,
+            None,
+            &IcebergSplitFacts {
+                path: "before-schema-change.parquet",
+                file_first_row_id: None,
+                data_sequence_number: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        values[0]
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .values(),
+        &[nanos, nanos],
+    );
+    let detail = values[1].as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(
+        detail
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .values(),
+        &[micros, micros],
+    );
 }
 
 #[test]

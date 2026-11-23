@@ -123,17 +123,8 @@ fn complete_ordered_key_domains_keep_endpoint_nullability_and_global_bindings() 
 
 #[test]
 fn complete_ordered_unsupported_domains_are_rejected_by_name() {
-    // Float keys are already refused by the original PhysicalPlan comparator,
-    // before a package can reach this narrower installation gate.
     for ty in [
         ValueType::new(DataType::Boolean, false),
-        ValueType::new(DataType::FixedSizeBinary(16), false),
-        ValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(16),
-            false,
-            ValueLogicalType::Uuid,
-        )
-        .unwrap(),
         ValueType::new(
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
@@ -146,6 +137,27 @@ fn complete_ordered_unsupported_domains_are_rejected_by_name() {
             AGGREGATE,
             "Aggregate TopN runtime-filter order key type",
         );
+    }
+    // The frozen comparator refuses an unrelated fixed-width carrier or
+    // nominal UUID before the narrower installation gate sees a package.
+    for ty in [
+        ValueType::new(DataType::FixedSizeBinary(16), false),
+        ValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap(),
+    ] {
+        let Err(novarocks_physical_plan::PlanConstructionError::Structure(errors)) =
+            try_aggregate_topn_typed(ty.clone(), ty)
+        else {
+            panic!("expected the frozen comparison contract to reject the order domain");
+        };
+        assert!(errors.errors().iter().any(|error| {
+            error.message()
+                == "ordered runtime-filter key type is unsupported by its comparison algorithm"
+        }));
     }
 }
 

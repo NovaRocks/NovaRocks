@@ -18,8 +18,10 @@
 //! Exact selected fixed-width extrema with inline state and original four phases.
 //! Utf8 retained state belongs to its own kernel; OVER folds through this one.
 
+use super::temporal_output::TemporalOutputBuilder;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
+use crate::temporal_cast::Type;
 use crate::*;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
@@ -29,6 +31,8 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, i256};
 use arrow_schema::{DataType, TimeUnit};
+use novarocks_type_contract::{TemporalType, TemporalValue};
+use novarocks_value_arrays::decode::PreparedTemporalArray;
 use std::{alloc::Layout, cmp::Ordering, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +47,7 @@ pub(super) enum ExtremaValue {
     F64(f64),
     I128(i128),
     I256(i256),
+    Temporal(TemporalValue),
 }
 #[derive(Debug)]
 pub(super) struct ExtremaKernel {
@@ -80,7 +85,10 @@ fn observed<T>(
     work.finish()?;
     result
 }
-fn class(array: &dyn Array) -> bool {
+fn class(array: &dyn Array, binding: &FunctionValueType) -> bool {
+    if let Some(declaration) = binding.value_type().temporal() {
+        return PreparedTemporalArray::bind(declaration, array, binding.nullable()).is_ok();
+    }
     match array.data_type() {
         DataType::Boolean => array.as_any().is::<BooleanArray>(),
         DataType::Int8 => array.as_any().is::<Int8Array>(),
@@ -109,9 +117,20 @@ fn class(array: &dyn Array) -> bool {
 fn read(
     array: &dyn Array,
     row: usize,
+    binding: &FunctionValueType,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<ExtremaValue>, KernelFailure> {
-    let concrete = class(array);
+    if let Some(declaration) = binding.value_type().temporal() {
+        let source = PreparedTemporalArray::bind(declaration, array, binding.nullable())
+            .map_err(|_| internal("MIN/MAX temporal carrier differs from its exact binding"))?;
+        work.step()?;
+        let value = source
+            .value(row)
+            .map_err(|_| internal("MIN/MAX selected temporal value violates its binding"))?;
+        work.step()?;
+        return Ok(value.map(ExtremaValue::Temporal));
+    }
+    let concrete = class(array, binding);
     work.step()?;
     if !concrete {
         return Err(internal(
@@ -180,6 +199,7 @@ fn update(
     state: &mut Option<ExtremaValue>,
     value: Option<ExtremaValue>,
     operation: ExtremaOperation,
+    temporal: Option<TemporalType>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
     let Some(value) = value else {
@@ -192,6 +212,16 @@ fn update(
         (Some(ExtremaValue::F64(a)), ExtremaValue::F64(b)) => Some(b.total_cmp(&a)),
         (Some(ExtremaValue::I128(a)), ExtremaValue::I128(b)) => Some(b.cmp(&a)),
         (Some(ExtremaValue::I256(a)), ExtremaValue::I256(b)) => Some(b.cmp(&a)),
+        (Some(ExtremaValue::Temporal(a)), ExtremaValue::Temporal(b)) => {
+            let declaration =
+                temporal.ok_or_else(|| internal("MIN/MAX temporal state has no declaration"))?;
+            let key = |value: TemporalValue| {
+                value
+                    .relation_key(declaration)
+                    .map_err(|_| internal("MIN/MAX temporal state violates its declared ordering"))
+            };
+            Some(key(b)?.cmp(&key(a)?))
+        }
         _ => {
             work.step()?;
             return Err(internal(
@@ -212,6 +242,22 @@ fn update(
     }
     Ok(())
 }
+
+impl ExtremaKernel {
+    fn source_type(&self) -> &FunctionValueType {
+        self.contract
+            .logical_argument_types()
+            .next()
+            .expect("checked MIN/MAX logical value channel")
+    }
+
+    fn merge_type(&self) -> Result<&FunctionValueType, KernelFailure> {
+        self.contract
+            .state_input_type()
+            .ok_or_else(|| invalid("MIN/MAX merge is missing its exact state input type"))
+    }
+}
+
 impl PreparedAggregateKernel for ExtremaKernel {
     fn clone_for_local_phase(
         &self,
@@ -266,7 +312,10 @@ impl PreparedAggregateKernel for ExtremaKernel {
                     "MIN/MAX update differs from its exact phase or channels",
                 ));
             }
-            let concrete = class(input.logical_arguments()[0].array().as_ref());
+            let concrete = class(
+                input.logical_arguments()[0].array().as_ref(),
+                self.source_type(),
+            );
             work.step()?;
             if !concrete {
                 return Err(internal(
@@ -290,8 +339,15 @@ impl PreparedAggregateKernel for ExtremaKernel {
                 row.ok_or_else(|| invalid("MIN/MAX selected update ordinal is out of bounds"))?;
             let argument = prepared.logical_arguments()[0];
             let address = argument.value_row(ordinal, row);
-            let value = read(argument.array().as_ref(), address, work)?;
-            update(state, value, self.operation, work)
+            let source = self.source_type();
+            let value = read(argument.array().as_ref(), address, source, work)?;
+            update(
+                state,
+                value,
+                self.operation,
+                source.value_type().temporal(),
+                work,
+            )
         })
     }
     fn prepare_merge<'batch>(
@@ -306,7 +362,7 @@ impl PreparedAggregateKernel for ExtremaKernel {
             if !valid {
                 return Err(invalid("MIN/MAX merge differs from its exact phase"));
             }
-            let concrete = class(input.state().array().as_ref());
+            let concrete = class(input.state().array().as_ref(), self.merge_type()?);
             work.step()?;
             if !concrete {
                 return Err(internal(
@@ -329,12 +385,20 @@ impl PreparedAggregateKernel for ExtremaKernel {
             let row =
                 row.ok_or_else(|| invalid("MIN/MAX selected merge ordinal is out of bounds"))?;
             let argument = prepared.state();
+            let source = self.merge_type()?;
             let value = read(
                 argument.array().as_ref(),
                 argument.value_row(ordinal, row),
+                source,
                 work,
             )?;
-            update(state, value, self.operation, work)
+            update(
+                state,
+                value,
+                self.operation,
+                source.value_type().temporal(),
+                work,
+            )
         })
     }
     fn build_intermediate<'state, I>(
@@ -345,11 +409,7 @@ impl PreparedAggregateKernel for ExtremaKernel {
     where
         I: ExactSizeIterator<Item = &'state Self::State>,
     {
-        build(
-            states,
-            self.contract.intermediate_type().data_type(),
-            control,
-        )
+        build(states, self.contract.intermediate_type(), control)
     }
     fn build_final<'state, I>(
         &self,
@@ -359,7 +419,7 @@ impl PreparedAggregateKernel for ExtremaKernel {
     where
         I: ExactSizeIterator<Item = &'state Self::State>,
     {
-        build(states, self.contract.final_type().data_type(), control)
+        build(states, self.contract.final_type(), control)
     }
 }
 fn bitmap_bytes(rows: usize) -> Result<usize, KernelFailure> {
@@ -445,12 +505,51 @@ fn build_primitive<
     work.flush()?;
     Ok(array)
 }
+fn build_temporal<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
+    states: I,
+    declaration: TemporalType,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let rows = states.len();
+    work.flush()?;
+    let mut output = TemporalOutputBuilder::new(Type::Temporal(declaration), rows)?;
+    work.flush()?;
+    let mut emitted = 0;
+    for state in states {
+        work.step()?;
+        if emitted == rows {
+            return Err(internal(
+                "MIN/MAX emission iterator exceeds admitted extent",
+            ));
+        }
+        match state {
+            None => output.null(),
+            Some(ExtremaValue::Temporal(value)) => output.temporal(declaration, *value)?,
+            Some(_) => return Err(internal("MIN/MAX output lacks its exact temporal state")),
+        }
+        emitted += 1;
+    }
+    if emitted != rows {
+        return Err(internal(
+            "MIN/MAX emission iterator changed its exact extent",
+        ));
+    }
+    work.flush()?;
+    let array = output.finish();
+    work.flush()?;
+    Ok(array)
+}
+
 fn build<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
     states: I,
-    ty: &DataType,
+    binding: &FunctionValueType,
     control: &dyn KernelEvaluationControl,
 ) -> Result<ArrayRef, KernelFailure> {
     observed(control, |work| {
+        if let Some(declaration) = binding.value_type().temporal() {
+            return build_temporal(states, declaration, work);
+        }
+        let ty = binding.data_type();
         macro_rules! integer {
             ($t:ty, $native:ty) => {
                 build_primitive::<$t, _>(states, ty, work, |v| match v {

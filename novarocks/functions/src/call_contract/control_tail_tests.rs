@@ -91,7 +91,10 @@ impl Fixture {
         ];
         let environment = [SemanticParameterRef {
             id: SemanticParameterId::new(u32::MAX),
-            expected_key: SemanticParameterValue::TimeZone("UTC".into()).key(),
+            expected_key: SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            )
+            .key(),
         }];
         Self {
             function: FunctionId::try_new("fixture/call-footer").unwrap(),
@@ -124,11 +127,15 @@ impl Fixture {
             parameters: SemanticParameters::try_new([
                 (
                     SemanticParameterId::new(u32::MAX),
-                    SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+                    SemanticParameterValue::TimeZone(
+                        novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+                    ),
                 ),
                 (
                     SemanticParameterId::new(0),
-                    SemanticParameterValue::TimeZone("UTC".into()),
+                    SemanticParameterValue::TimeZone(
+                        novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+                    ),
                 ),
             ])
             .unwrap(),

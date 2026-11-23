@@ -328,6 +328,36 @@ fn fixed_hashes(
     let (array, mapping) = prepared.tuples().physical_component(column)?;
     let rows = prepared.input.unique_rows();
     let unmatchable = prepared.spec.nulls()[column] == NullPolicy::Unmatchable;
+    let binding = &prepared.spec.types()[column];
+    if let (Some(declaration), KeyEquality::SqlGrouping(_)) = (
+        binding.value_type().temporal(),
+        prepared.spec.equalities()[column],
+    ) {
+        let values = novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+            declaration,
+            array.as_ref(),
+            binding.nullable(),
+        )
+        .map_err(ExecutionFailure::from_domain)?;
+        for (ordinal, &row) in rows.iter().enumerate() {
+            checkpoint_at(ordinal, checkpoint)?;
+            let key = values
+                .relation_key(physical_row(mapping, row)?)
+                .map_err(ExecutionFailure::from_domain)?;
+            if let Some(key) = key {
+                let mut state = Xxh3::with_seed(seed);
+                state.update(&[1]);
+                state.update(&key.order_bytes());
+                output[ordinal] = state.digest();
+            } else {
+                output[ordinal] = null_hash(seed);
+                if unmatchable {
+                    valid[ordinal] = 0;
+                }
+            }
+        }
+        return Ok(());
+    }
     macro_rules! primitive {
         ($ty:ty, $canonical:expr) => {
             primitive!($ty, $canonical, |_| true)

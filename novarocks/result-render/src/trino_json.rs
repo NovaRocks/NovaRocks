@@ -17,12 +17,19 @@
 
 //! Trino JSON presentation over the shared bounded row machine.
 use super::*;
+use novarocks_functions::temporal_value::{TemporalFormatError, TemporalTextFormat};
 use novarocks_result_contract::ClientPresentationFamily;
+use novarocks_type_contract::TemporalType;
+use novarocks_value_arrays::decode::PreparedTemporalArray;
 
 pub struct ArrowTrinoJsonEncoder(ArrowClientRowEncoder);
 impl ArrowTrinoJsonEncoder {
     pub const fn scratch_capacity_bound_bytes() -> usize {
         super::scratch_capacity_bound_bytes() - size_of::<ArrowClientRowEncoder>()
+            + size_of::<Self>()
+    }
+    pub fn scratch_capacity_bound_for_schema(schema: &ClientRenderSchema) -> usize {
+        super::scratch_capacity_bound_for_schema(schema) - size_of::<ArrowClientRowEncoder>()
             + size_of::<Self>()
     }
     pub fn try_new(
@@ -94,9 +101,11 @@ impl CellCursor {
         row: usize,
         path: Path,
         schema: &ClientRenderSchema,
-        key: bool,
+        mode: ValueText,
         budget: &mut Budget,
+        legacy_key_fields: &[usize],
     ) -> Result<(), RenderError> {
+        let key = mode != ValueText::Json;
         // Fixed descriptor work uses the same reserved operation quantum as
         // the shared cursor; variable source bytes are scanned by Stream.
         budget.scan(32);
@@ -107,7 +116,7 @@ impl CellCursor {
             return Err(error(E::SchemaMismatch));
         }
         if array.is_null(row) || matches!(field.native_type, N::Null) {
-            if key {
+            if mode == ValueText::MapKey {
                 return Err(invalid_value());
             }
             if !field.nullable && !matches!(field.native_type, N::Null) {
@@ -116,7 +125,7 @@ impl CellCursor {
             return self.literal(b"null");
         }
         match &field.native_type {
-            N::List(_) if !key => {
+            N::List(_) => {
                 let (values, start, end) = list_values(&array, row)?;
                 self.literal(b"]")?;
                 self.push(EncodeStep::List {
@@ -125,6 +134,7 @@ impl CellCursor {
                     end,
                     path,
                     first: true,
+                    object_text: key,
                 })?;
                 self.literal(b"[")?;
             }
@@ -134,6 +144,19 @@ impl CellCursor {
                 let end = usize::try_from(map.value_offsets()[row + 1]).map_err(|_| invalid())?;
                 if start > end || end > map.keys().len() || end > map.values().len() {
                     return Err(invalid());
+                }
+                if end - start > 1 && !legacy_key_fields.is_empty() {
+                    budget.scan(usize::BITS as usize);
+                    if legacy_key_fields
+                        .binary_search(&std::ptr::from_ref(field).addr())
+                        .is_ok()
+                    {
+                        let minimum_elements = self.elements + 2 * (end - start);
+                        if minimum_elements > V::MAX_ELEMENTS_PER_ROW {
+                            return Err(extent_error(E::ElementLimit, minimum_elements));
+                        }
+                        self.legacy_keys = Some((map.keys().clone(), start, end, path.child(0)?));
+                    }
                 }
                 self.literal(b"}")?;
                 self.push(EncodeStep::Map {
@@ -146,13 +169,14 @@ impl CellCursor {
                 })?;
                 self.literal(b"{")?;
             }
-            N::Struct(_) if !key => {
+            N::Struct(_) => {
                 self.literal(b"]")?;
                 self.push(EncodeStep::Struct {
                     array,
                     row,
                     path,
                     next: 0,
+                    object_text: key,
                 })?;
                 self.literal(b"[")?;
             }
@@ -161,6 +185,8 @@ impl CellCursor {
                     Source::array(array, row),
                     if matches!(field.native_type, N::Binary) {
                         Mode::Base64
+                    } else if key {
+                        Mode::RawUtf8
                     } else {
                         Mode::Json
                     },
@@ -174,9 +200,13 @@ impl CellCursor {
                 if let N::BoundedCharacter(character) = field.native_type {
                     stream.character = Some((character, character.length()));
                 }
-                self.literal(b"\"")?;
+                if !key {
+                    self.literal(b"\"")?;
+                }
                 self.push(EncodeStep::Stream(stream))?;
-                self.literal(b"\"")?;
+                if !key {
+                    self.literal(b"\"")?;
+                }
             }
             N::Variant if key => {
                 let source = Source::array(array, row);
@@ -220,7 +250,7 @@ impl CellCursor {
                     "null"
                 };
                 self.push(EncodeStep::Atom(atom!(
-                    "\"Variant[basicType={basic}, primitiveType={primitive}]\""
+                    "Variant[basicType={basic}, primitiveType={primitive}]"
                 )))?;
             }
             N::Variant if !key => {
@@ -263,6 +293,32 @@ impl CellCursor {
                     }
                 }
             }
+            N::Temporal(ty) => {
+                let ty = TemporalType::try_from(*ty).map_err(|_| invalid())?;
+                let value = PreparedTemporalArray::bind(ty, array.as_ref(), field.nullable)
+                    .and_then(|decoder| decoder.value(row))
+                    .map_err(|_| invalid_value())?
+                    .ok_or_else(invalid_value)?;
+                let mut atom = Atom::new();
+                novarocks_functions::temporal_value::format(
+                    &mut atom,
+                    ty,
+                    value,
+                    TemporalTextFormat::Trino {
+                        parametric_datetime: facts.parametric_datetime || key,
+                        parametric_interval: facts.parametric_interval,
+                    },
+                )
+                .map_err(|cause| match cause {
+                    TemporalFormatError::Destination => error(E::CursorInvariant),
+                    TemporalFormatError::InvalidValue | TemporalFormatError::Range => {
+                        invalid_value()
+                    }
+                })?;
+                let atom = if key { atom } else { quoted(atom)? };
+                budget.scan(atom.len * 2 + 32);
+                self.push(EncodeStep::Atom(atom))?;
+            }
             N::Boolean
             | N::SignedInteger(_)
             | N::Float32
@@ -273,7 +329,11 @@ impl CellCursor {
             | N::Date
             | N::Time { .. }
             | N::Timestamp { .. } => {
-                let atom = scalar(&array, row, field, facts.parametric_datetime, key, budget)?;
+                let mut atom = scalar(&array, row, field, facts.parametric_datetime, key, budget)?;
+                if key && atom.data[0] == b'"' {
+                    atom.at = 1;
+                    atom.len -= 1;
+                }
                 budget.scan(atom.len * 2 + 32);
                 self.push(EncodeStep::Atom(atom))?;
             }

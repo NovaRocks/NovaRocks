@@ -21,6 +21,7 @@ use super::*;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{Field, Schema, i256};
 use novarocks_result_contract::{NamedRenderField, RenderPresentation as P, TrinoJsonFacts};
+use novarocks_type_contract::TemporalValue;
 fn field(native_type: N, nullable: bool) -> RenderField {
     RenderField {
         native_type,
@@ -937,5 +938,254 @@ fn date32_full_range_uses_trino_sqldate_wire_year_format_and_original_bounded_en
             5
         ),
         [r#"[["-5877641-06-23",null,"+5881580-07-11"]]"#]
+    );
+}
+
+fn exact_temporal_array(ty: TemporalType, values: &[TemporalValue]) -> ArrayRef {
+    use novarocks_type_contract::TemporalCarrier;
+    let DataType::FixedSizeBinary(width) = ty.carrier() else {
+        panic!("test requires the canonical fixed-width temporal carrier");
+    };
+    let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), width);
+    for value in values {
+        match value.to_carrier(ty).unwrap() {
+            TemporalCarrier::ZonedTime(bytes) => builder.append_value(bytes).unwrap(),
+            TemporalCarrier::Wide(bytes) => builder.append_value(bytes).unwrap(),
+            TemporalCarrier::ZonedTimestamp(bytes) => builder.append_value(bytes).unwrap(),
+            _ => unreachable!("expected a fixed-width temporal value"),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+#[test]
+fn exact_time_offsets_and_timestamp_zones_survive_presentation() {
+    use novarocks_result_contract::RenderTemporalType as R;
+    use novarocks_type_contract::{PICOS_PER_DAY, TemporalMicros as M, TimeZoneKey};
+    let time = R::TimeWithTimeZone(12);
+    let timestamp = R::TimestampWithTimeZone(12);
+    let times = exact_temporal_array(
+        time.try_into().unwrap(),
+        &[
+            TemporalValue::TimeWithTimeZone {
+                picos: 0,
+                offset_minutes: 330,
+            },
+            TemporalValue::TimeWithTimeZone {
+                picos: PICOS_PER_DAY - 1,
+                offset_minutes: -660,
+            },
+        ],
+    );
+    let instant = M::new(123_456, 789_123).unwrap();
+    let timestamps = exact_temporal_array(
+        timestamp.try_into().unwrap(),
+        &[
+            TemporalValue::TimestampWithTimeZone {
+                instant,
+                zone: TimeZoneKey::UTC,
+            },
+            TemporalValue::TimestampWithTimeZone {
+                instant,
+                zone: TimeZoneKey::parse("America/New_York").unwrap(),
+            },
+        ],
+    );
+    let render = |parametric_datetime| {
+        payloads(
+            encoder(
+                vec![times.clone(), timestamps.clone()],
+                vec![
+                    field(N::Temporal(time), false),
+                    field(N::Temporal(timestamp), false),
+                ],
+                TrinoJsonFacts {
+                    parametric_datetime,
+                    ..Default::default()
+                },
+            ),
+            5,
+        )
+    };
+    assert_eq!(
+        render(true),
+        [
+            r#"["00:00:00.000000000000+05:30","1970-01-01 00:00:00.123456789123 UTC"]"#,
+            r#"["23:59:59.999999999999-11:00","1969-12-31 19:00:00.123456789123 America/New_York"]"#,
+        ]
+    );
+    assert_eq!(
+        render(false),
+        [
+            r#"["00:00:00.000+05:30","1970-01-01 00:00:00.123 UTC"]"#,
+            r#"["00:00:00.000-11:00","1969-12-31 19:00:00.123 America/New_York"]"#,
+        ]
+    );
+}
+
+fn day_to_seconds_field() -> RenderField {
+    use novarocks_result_contract::{RenderIntervalField as F, RenderTemporalType as R};
+    field(
+        N::Temporal(R::Interval {
+            start: F::Day,
+            end: F::Second,
+            leading_precision: 2,
+            fractional_precision: 6,
+        }),
+        false,
+    )
+}
+
+fn legacy_interval_keys(micros: Vec<i64>, ragged: bool) -> (ArrayRef, RenderField) {
+    let count = micros.len();
+    let intervals: ArrayRef = Arc::new(Int64Array::from(micros));
+    let interval = day_to_seconds_field();
+    let (keys, key) = if ragged {
+        let offsets = OffsetBuffer::new(ScalarBuffer::from_iter(0..=count as i32));
+        let array = ListArray::new(
+            Arc::new(Field::new("item", intervals.data_type().clone(), false)),
+            offsets,
+            intervals,
+            None,
+        );
+        (
+            Arc::new(array) as ArrayRef,
+            field(N::List(Box::new(interval)), false),
+        )
+    } else {
+        (intervals, interval)
+    };
+    map(
+        keys,
+        Arc::new(Int32Array::from(vec![1; count])),
+        key,
+        field(N::SignedInteger(32), false),
+    )
+}
+
+#[test]
+fn legacy_interval_keys_collide_in_scalar_and_container_object_keys_before_publication() {
+    for nested_key in [false, true] {
+        let (array, metadata) = legacy_interval_keys(vec![100, 200], nested_key);
+        let mut legacy = encoder(
+            vec![array.clone()],
+            vec![metadata.clone()],
+            TrinoJsonFacts::default(),
+        );
+        let mut out = [0; 1024];
+        let error = legacy.step(&mut out).unwrap_err();
+        assert_eq!(error.kind, E::LegacyIntervalMapKeyCollision);
+        assert_eq!(error.output_ordinal, Some(0));
+        assert_eq!(out, [0; 1024]);
+
+        let expected = if nested_key {
+            r#"[{"[0 00:00:00.000100]":1,"[0 00:00:00.000200]":1}]"#
+        } else {
+            r#"[{"0 00:00:00.000100":1,"0 00:00:00.000200":1}]"#
+        };
+        let exact = encoder(
+            vec![array],
+            vec![metadata],
+            TrinoJsonFacts {
+                parametric_interval: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(payloads(exact, 5), [expected]);
+    }
+}
+
+#[test]
+fn legacy_interval_map_check_resumes_and_detects_a_collision_across_windows() {
+    let mut micros = (0..900).map(|m| m * 1000 + 100).collect::<Vec<_>>();
+    micros.push(700_200);
+    let (array, metadata) = legacy_interval_keys(micros, false);
+    let mut legacy = encoder(vec![array], vec![metadata], TrinoJsonFacts::default());
+    let mut output = [0; 16];
+    let mut yields = 0;
+    loop {
+        match legacy.step(&mut output) {
+            Ok(turn) => {
+                assert_eq!(turn.emitted_bytes, 0);
+                assert!(turn.examined_bytes <= V::EMIT_BYTES_PER_TURN);
+                assert!(turn.visited_cells <= V::CELLS_PER_TURN);
+                assert!(turn.examined_bytes > 0);
+                yields += 1;
+                assert!(yields < 256);
+            }
+            Err(error) => {
+                assert_eq!(error.kind, E::LegacyIntervalMapKeyCollision);
+                break;
+            }
+        }
+    }
+    assert!(yields > 1);
+}
+
+#[test]
+fn nested_interval_key_exact_comparison_crosses_turns_before_large_row_publication() {
+    let long_prefix = "prefix, \"with delimiters\"\t".repeat(4096);
+    let label = Arc::new(StringArray::from(vec![long_prefix.clone(), long_prefix]));
+    let interval = Arc::new(Int64Array::from(vec![100, 200]));
+    let arrow_fields = vec![
+        Arc::new(Field::new("label", DataType::Utf8, false)),
+        Arc::new(Field::new("interval", DataType::Int64, false)),
+    ]
+    .into();
+    let key = field(
+        N::Struct(vec![
+            NamedRenderField {
+                name: "label".into(),
+                field: field(N::String, false),
+            },
+            NamedRenderField {
+                name: "interval".into(),
+                field: day_to_seconds_field(),
+            },
+        ]),
+        false,
+    );
+    let (array, metadata) = map(
+        Arc::new(StructArray::new(arrow_fields, vec![label, interval], None)),
+        Arc::new(Int32Array::from(vec![1, 2])),
+        key,
+        field(N::SignedInteger(32), false),
+    );
+    let mut legacy = encoder(vec![array], vec![metadata], TrinoJsonFacts::default());
+    let mut output = [0; 1024];
+    let mut yields = 0;
+    loop {
+        match legacy.step(&mut output) {
+            Ok(turn) => {
+                assert_eq!(turn.emitted_bytes, 0);
+                assert!(turn.examined_bytes <= V::EMIT_BYTES_PER_TURN);
+                assert!(turn.visited_cells <= V::CELLS_PER_TURN);
+                yields += 1;
+                assert!(yields < 512);
+            }
+            Err(error) => {
+                assert_eq!(error.kind, E::LegacyIntervalMapKeyCollision);
+                break;
+            }
+        }
+    }
+    assert!(yields > 2);
+    assert_eq!(output, [0; 1024]);
+}
+
+#[test]
+fn legacy_datetime_negotiation_keeps_exact_signed_timestamp_map_keys() {
+    use novarocks_result_contract::RenderTemporalType as T;
+
+    let (array, metadata) = map(
+        Arc::new(TimestampMicrosecondArray::from(vec![-500, -499])),
+        Arc::new(Int32Array::from(vec![1, 2])),
+        field(N::Temporal(T::Timestamp(6)), false),
+        field(N::SignedInteger(32), false),
+    );
+    let legacy = encoder(vec![array], vec![metadata], TrinoJsonFacts::default());
+    assert_eq!(
+        payloads(legacy, 5),
+        [r#"[{"1969-12-31 23:59:59.999500":1,"1969-12-31 23:59:59.999501":2}]"#]
     );
 }

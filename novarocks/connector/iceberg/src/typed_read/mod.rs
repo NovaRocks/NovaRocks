@@ -103,6 +103,7 @@ pub use split_source::{
     IcebergDeleteFileFacts, IcebergPlannedDataFile, IcebergSplitSource, IcebergSplitSourceOptions,
     READ_SPLIT_TARGET_SIZE_PROPERTY, plan_change_window_splits,
 };
+pub(crate) use system_page_source::metadata_temporal_declaration;
 pub(crate) use system_page_source::publish_read_schema_with_metadata;
 pub use system_page_source::{
     IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type, derived_row_type_json,

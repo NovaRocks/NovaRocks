@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_local_program::FilterMembershipSchemaError;
+use novarocks_type_contract::FunctionValueType;
+
 /// The comparator this plan's ordered runtime filter is compared under.
 ///
 /// Both the wire contract and the facts an attempt deploys from name the
@@ -27,22 +30,32 @@ pub fn runtime_filter_comparator_digest(
         return Ok(None);
     };
     let (comparator_digest, _) =
-        runtime_filter_order_digests(key.ty.data_type(), key.direction, key.null_ordering)?;
+        runtime_filter_order_digests(&key.ty, key.direction, key.null_ordering)?;
     Ok(Some(comparator_digest))
 }
 
 fn runtime_filter_order_digests(
-    data_type: &arrow::datatypes::DataType,
+    value_type: &FunctionValueType,
     direction: novarocks_physical_plan::SortDirection,
     null_ordering: novarocks_physical_plan::NullOrdering,
 ) -> Result<([u8; 32], [u8; 32]), String> {
-    runtime_filter_order_digests_observed(data_type, direction, null_ordering, || Ok(()))
+    runtime_filter_order_digests_observed(value_type, direction, null_ordering, || Ok(())).map_err(
+        |error: FilterMembershipSchemaError| match error {
+            FilterMembershipSchemaError::UnsupportedType => {
+                "runtime-filter ordered key type is unsupported".to_string()
+            }
+            FilterMembershipSchemaError::TimezoneLengthOverflow { .. } => {
+                "runtime-filter timezone length exceeds u32".to_string()
+            }
+            other => other.detail().to_string(),
+        },
+    )
 }
 
 /// Feed the same canonical bytes into both fixed-size digest states. No
 /// timezone-dependent temporary Vec or assumed fixed key size is allocated.
-pub(crate) fn runtime_filter_order_digests_observed<E: From<String>>(
-    data_type: &arrow::datatypes::DataType,
+fn runtime_filter_order_digests_observed<E: From<FilterMembershipSchemaError>>(
+    value_type: &FunctionValueType,
     direction: novarocks_physical_plan::SortDirection,
     null_ordering: novarocks_physical_plan::NullOrdering,
     observe: impl FnMut() -> Result<(), E>,
@@ -57,61 +70,15 @@ pub(crate) fn runtime_filter_order_digests_observed<E: From<String>>(
             novarocks_physical_plan::NullOrdering::First => FilterNullOrder::First,
             novarocks_physical_plan::NullOrdering::Last => FilterNullOrder::Last,
         },
-        |emit| visit_runtime_filter_key_type(data_type, &mut |bytes| emit(bytes)),
+        |emit| {
+            novarocks_local_program::visit_ordered_filter_key_type(
+                value_type.data_type(),
+                value_type.value_type().temporal(),
+                emit,
+            )
+        },
         observe,
     )
-}
-
-pub(crate) fn visit_runtime_filter_key_type<E: From<String>>(
-    data_type: &arrow::datatypes::DataType,
-    emit: &mut impl FnMut(&[u8]) -> Result<(), E>,
-) -> Result<(), E> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    match data_type {
-        DataType::Boolean => emit(&[1])?,
-        DataType::Int8 => emit(&[2])?,
-        DataType::Int16 => emit(&[3])?,
-        DataType::Int32 => emit(&[4])?,
-        DataType::Int64 => emit(&[5])?,
-        DataType::FixedSizeBinary(16) => emit(&[6])?,
-        DataType::Utf8 => emit(&[9])?,
-        DataType::Date32 => emit(&[10])?,
-        DataType::Timestamp(unit, timezone) => {
-            emit(&[
-                11,
-                match unit {
-                    TimeUnit::Second => 1,
-                    TimeUnit::Millisecond => 2,
-                    TimeUnit::Microsecond => 3,
-                    TimeUnit::Nanosecond => 4,
-                },
-            ])?;
-            if let Some(timezone) = timezone {
-                let length = u32::try_from(timezone.len()).map_err(|_| {
-                    E::from("runtime-filter timezone length exceeds u32".to_string())
-                })?;
-                emit(&[1])?;
-                emit(&length.to_be_bytes())?;
-                emit(timezone.as_bytes())?;
-            } else {
-                emit(&[0])?;
-            }
-        }
-        DataType::Decimal128(precision, scale)
-            if *precision != 0
-                && *precision <= 38
-                && *scale <= 38
-                && (*scale <= 0 || (*scale as u8) <= *precision) =>
-        {
-            emit(&[12, *precision, *scale as u8])?;
-        }
-        _ => {
-            return Err(E::from(
-                "runtime-filter ordered key type is unsupported".to_string(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -121,7 +88,7 @@ mod tests {
     #[test]
     fn ordered_runtime_filter_digest_matches_canonical_int64_golden() {
         let (comparator, order) = runtime_filter_order_digests(
-            &DataType::Int64,
+            &FunctionValueType::new(DataType::Int64, false),
             novarocks_physical_plan::SortDirection::Ascending,
             novarocks_physical_plan::NullOrdering::Last,
         )
@@ -136,7 +103,7 @@ mod tests {
         );
         assert!(
             runtime_filter_order_digests(
-                &DataType::Float64,
+                &FunctionValueType::new(DataType::Float64, false),
                 novarocks_physical_plan::SortDirection::Ascending,
                 novarocks_physical_plan::NullOrdering::Last,
             )
@@ -151,16 +118,19 @@ mod tests {
             Invalid(String),
             Control(novarocks_type_contract::CompileControlError),
         }
-        impl From<String> for Failure {
-            fn from(value: String) -> Self {
-                Self::Invalid(value)
+        impl From<FilterMembershipSchemaError> for Failure {
+            fn from(value: FilterMembershipSchemaError) -> Self {
+                Self::Invalid(value.detail().to_string())
             }
         }
         use novarocks_type_contract::CompileControlError;
         let timezone = "UTC".repeat(80);
-        let ty = DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Nanosecond,
-            Some(timezone.clone().into()),
+        let ty = FunctionValueType::new(
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                Some(timezone.clone().into()),
+            ),
+            false,
         );
         let direction = novarocks_physical_plan::SortDirection::Descending;
         let nulls = novarocks_physical_plan::NullOrdering::First;
@@ -195,5 +165,33 @@ mod tests {
                 assert_eq!(seen, stop + 1);
             }
         }
+    }
+
+    #[test]
+    fn ordered_runtime_filter_digest_includes_the_temporal_declaration() {
+        use novarocks_type_contract::{
+            TemporalPrecision, TemporalType, ValueKind, ValueLayout, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+
+        let direction = novarocks_physical_plan::SortDirection::Ascending;
+        let nulls = novarocks_physical_plan::NullOrdering::Last;
+        let storage = ValueTypeStorageLifetime::pure();
+        let digests = |precision| {
+            let temporal = TemporalType::TimestampWithTimeZone(precision);
+            let layout = ValueLayout::try_new(&temporal.carrier(), storage.clone()).unwrap();
+            let value_type =
+                ValueTypeRef::try_new(ValueKind::Temporal(temporal), false, storage.clone())
+                    .unwrap();
+            let ty = FunctionValueType::try_from_value(value_type, layout).unwrap();
+            runtime_filter_order_digests(&ty, direction, nulls).unwrap()
+        };
+        let nanos = digests(TemporalPrecision::NANOSECONDS);
+        let picos = digests(TemporalPrecision::PICOSECONDS);
+        assert_ne!(nanos.0, picos.0);
+        assert_ne!(nanos.1, picos.1);
+
+        let raw = FunctionValueType::new(DataType::FixedSizeBinary(14), false);
+        assert!(runtime_filter_order_digests(&raw, direction, nulls).is_err());
     }
 }

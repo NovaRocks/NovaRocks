@@ -168,11 +168,7 @@ pub fn dispatch_delivery_frame(
             };
             let query = match consumer.contract().contract() {
                 RuntimeFilterExecutionContract::Membership(schema) => {
-                    BackendRuntimeFilterArtifactQuery::membership(
-                        &bundle,
-                        schema.data_type().clone(),
-                        schema.null_semantics(),
-                    )
+                    BackendRuntimeFilterArtifactQuery::membership_typed(&bundle, schema)
                 }
                 RuntimeFilterExecutionContract::Ordered(order) => {
                     BackendRuntimeFilterArtifactQuery::ordered(&bundle, order)

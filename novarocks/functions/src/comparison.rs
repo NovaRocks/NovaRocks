@@ -107,6 +107,7 @@ pub struct PreparedComparisonRecipe {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FlatLeaf {
+    Temporal(novarocks_type_contract::TemporalType),
     Null,
     Boolean,
     Int8,
@@ -224,11 +225,17 @@ impl PreparedComparisonRecipe {
             if !allowed {
                 return Err(ComparisonPrepareError::Unsupported);
             }
+            let temporal = left.value_type().temporal();
+            if temporal != right.value_type().temporal() {
+                return Err(ComparisonPrepareError::TypeMismatch);
+            }
             let character = char_declaration(left);
             if character != char_declaration(right) {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
-            let leaf = if character.is_some() {
+            let leaf = if let Some(declaration) = temporal {
+                FlatLeaf::Temporal(declaration)
+            } else if character.is_some() {
                 if left.data_type() != &DataType::Utf8 {
                     return Err(ComparisonPrepareError::Unsupported);
                 }
@@ -378,6 +385,19 @@ impl PreparedComparisonRecipe {
             }};
         }
         match self.leaf {
+            FlatLeaf::Temporal(declaration) => {
+                use novarocks_value_arrays::decode::PreparedTemporalArray;
+                let left = PreparedTemporalArray::bind(declaration, left, self.left.nullable())
+                    .and_then(|values| values.relation_key(l))
+                    .map_err(|error| internal(&error.to_string()))?;
+                let right = PreparedTemporalArray::bind(declaration, right, self.right.nullable())
+                    .and_then(|values| values.relation_key(r))
+                    .map_err(|error| internal(&error.to_string()))?;
+                work.step()?;
+                Ok(left
+                    .zip(right)
+                    .map(|(left, right)| self.operator.apply(left.cmp(&right))))
+            }
             FlatLeaf::Null => {
                 cast::<NullArray>(left)?;
                 cast::<NullArray>(right)?;

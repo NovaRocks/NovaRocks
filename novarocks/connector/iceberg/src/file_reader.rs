@@ -178,6 +178,9 @@ pub fn physical_predicates_to_file_predicates(
                 }
                 IcebergPhysicalPredicateValue::Int32(value) => MinMaxPredicateValue::Int32(*value),
                 IcebergPhysicalPredicateValue::Int64(value) => MinMaxPredicateValue::Int64(*value),
+                IcebergPhysicalPredicateValue::Temporal(value) => {
+                    MinMaxPredicateValue::Int64(*value)
+                }
                 // Parquet exposes DATE statistics as INT32 day counts.
                 IcebergPhysicalPredicateValue::Date32(value) => MinMaxPredicateValue::Int32(*value),
             };

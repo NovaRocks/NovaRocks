@@ -457,6 +457,7 @@ pub enum ValueKind {
     BoundedCharacter(crate::CharacterType),
     Binary,
     Nominal(ValueLogicalType),
+    Temporal(crate::TemporalType),
     List(ValueTypeRef),
     FixedSizeList {
         item: ValueTypeRef,
@@ -681,6 +682,23 @@ impl ValueTypeRef {
             _ => None,
         }
     }
+    /// Complete SQL temporal declaration, independent of its Arrow carrier.
+    pub fn temporal(&self) -> Option<crate::TemporalType> {
+        match self.kind() {
+            ValueKind::Temporal(declaration) => Some(*declaration),
+            _ => None,
+        }
+    }
+
+    /// Whether the semantic tree needs temporal-aware value handling.
+    pub fn contains_temporal(&self) -> bool {
+        self.temporal().is_some()
+            || (0..self.child_count()).any(|index| {
+                self.child_type_at(index)
+                    .is_some_and(Self::contains_temporal)
+            })
+    }
+
     pub fn child_count(&self) -> usize {
         match self.kind() {
             ValueKind::List(_) | ValueKind::FixedSizeList { .. } => 1,

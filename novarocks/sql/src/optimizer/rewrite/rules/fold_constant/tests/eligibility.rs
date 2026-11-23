@@ -224,7 +224,7 @@ fn wire_whitelist_accepts_exactly_the_decodable_literal_types() {
         DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
     ] {
         assert!(
-            is_wire_encodable_literal_type(&accepted),
+            is_wire_encodable_literal_type(&FunctionValueType::new(accepted.clone(), true)),
             "{accepted:?} must be foldable"
         );
     }
@@ -232,6 +232,7 @@ fn wire_whitelist_accepts_exactly_the_decodable_literal_types() {
     for rejected in [
         DataType::Timestamp(TimeUnit::Microsecond, None),
         DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        DataType::FixedSizeBinary(14),
         DataType::Date64,
         DataType::Null,
         DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
@@ -242,9 +243,18 @@ fn wire_whitelist_accepts_exactly_the_decodable_literal_types() {
         DataType::Struct(arrow::datatypes::Fields::empty()),
     ] {
         assert!(
-            !is_wire_encodable_literal_type(&rejected),
+            !is_wire_encodable_literal_type(&FunctionValueType::new(rejected.clone(), true)),
             "{rejected:?} must not be foldable"
         );
+    }
+    use novarocks_type_contract::{TemporalPrecision, TemporalType};
+    for temporal in [
+        TemporalType::Timestamp(TemporalPrecision::MICROSECONDS),
+        TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS),
+    ] {
+        let typed = novarocks_expression::typing::temporal_function_value_type(temporal, true)
+            .expect("exact temporal declaration");
+        assert!(is_wire_encodable_literal_type(&typed));
     }
 }
 

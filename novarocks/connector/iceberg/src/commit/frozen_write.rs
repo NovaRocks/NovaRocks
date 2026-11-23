@@ -84,6 +84,7 @@ pub(crate) struct PreparedFrozenWriteSchema {
     pub(crate) metadata: TableMetadata,
     pub(crate) writer_schema: Arc<crate::iceberg::spec::Schema>,
     pub(crate) arrow_schema: ArrowSchemaRef,
+    pub(crate) temporals: Box<[crate::temporal::TemporalReadProjection]>,
 }
 
 struct SchemaWork<'a>(Option<CompileCheckpoints<'a>>);
@@ -219,14 +220,25 @@ fn prepare_schema_core(
         schema_to_arrow_schema(&writer_schema)
             .map_err(|error| format!("convert frozen Iceberg writer schema to Arrow: {error}"))
     })?);
+    let temporals: Box<[_]> = writer_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| crate::temporal::TemporalReadProjection::from_type(&field.field_type))
+        .collect();
     work.opaque_source(|| {
-        super::write_adaptation::validate_batch_schema(input_schema, &arrow_schema)
+        super::write_adaptation::validate_temporal_batch_schema(
+            input_schema,
+            &arrow_schema,
+            &temporals,
+        )
     })?;
     let metadata = build_target_table_metadata(facts, writer_schema.as_ref(), work)?;
     Ok(PreparedFrozenWriteSchema {
         metadata,
         writer_schema,
         arrow_schema,
+        temporals,
     })
 }
 
@@ -263,6 +275,7 @@ pub(crate) fn staged_write_context_with_file_io(
         prepared.arrow_schema,
         facts.target_partition_spec_id,
     )?
+    .with_temporal_storage(prepared.temporals)
     .with_frozen_file_shaping(
         facts.target_file_size_bytes,
         facts.max_partitions_per_writer,
@@ -732,10 +745,18 @@ mod pure_schema_tests {
             ordered
                 .into_iter()
                 .map(|name| {
-                    target_arrow
-                        .field_with_name(name)
-                        .unwrap()
+                    let source = expected.field_by_name(name).unwrap();
+                    let arrow = target_arrow.field_with_name(name).unwrap();
+                    let declaration = match source.field_type.as_ref() {
+                        Type::Primitive(primitive) => crate::temporal::declaration(primitive),
+                        _ => None,
+                    };
+                    arrow
                         .clone()
+                        .with_data_type(
+                            declaration
+                                .map_or_else(|| arrow.data_type().clone(), |ty| ty.carrier()),
+                        )
                         .with_metadata(std::collections::HashMap::from([(
                             "PARQUET:field_id".into(),
                             "9999".into(),

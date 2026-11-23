@@ -80,6 +80,9 @@ pub fn connector_type_for_value_type(
     value_type: &novarocks_type_contract::FunctionValueType,
 ) -> Option<ConnectorValueType> {
     value_type.validate().ok()?;
+    if let Some(temporal) = value_type.value_type().temporal() {
+        return Some(ConnectorValueType::Temporal(temporal));
+    }
     if value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Uuid {
         Some(ConnectorValueType::Uuid)
     } else {
@@ -101,6 +104,9 @@ pub fn connector_type_accepts_arrow(
     connector_type: ConnectorValueType,
     data_type: &arrow_schema::DataType,
 ) -> bool {
+    if let ConnectorValueType::Temporal(temporal) = connector_type {
+        return temporal.carrier() == *data_type;
+    }
     connector_type_for_arrow(data_type) == Some(connector_type)
         || (connector_type == ConnectorValueType::Uuid
             && *data_type == arrow_schema::DataType::FixedSizeBinary(16))

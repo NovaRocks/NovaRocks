@@ -540,7 +540,10 @@ fn service_error(
             let public = error.diagnostic_with_execution_detail(&message, effect);
             return project_public_diagnostic(query_id, code, &public, None);
         }
-        if code == Code::IcebergTooManyOpenPartitions || code.uses_iceberg_maintenance_detail() {
+        if code == Code::IcebergTooManyOpenPartitions
+            || code.uses_iceberg_maintenance_detail()
+            || is_legacy_interval_key_collision(input)
+        {
             let effect = StatementExternalEffectDisposition::combine(
                 error.external_effect_disposition(),
                 effect,
@@ -645,7 +648,18 @@ fn commit_failure_code(input: &ExecutionFailureInput) -> Option<Code> {
     }
 }
 
+fn is_legacy_interval_key_collision(input: &ExecutionFailureInput) -> bool {
+    let fact = input.fact();
+    fact.class() == FailureClass::Unsupported
+        && fact.reason() == novarocks_result_render::LEGACY_INTERVAL_MAP_KEY_COLLISION
+}
+
 fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage<'_> {
+    if is_legacy_interval_key_collision(input) {
+        return PublicMessage::Borrowed(
+            "Interval map keys collide at millisecond precision; use a client supporting PARAMETRIC_INTERVAL",
+        );
+    }
     if commit_failure_code(input).is_some() || code.uses_iceberg_maintenance_detail() {
         return PublicMessage::Borrowed(input.detail().as_str());
     }
@@ -656,6 +670,9 @@ fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage
 }
 
 fn execution_code(input: &ExecutionFailureInput) -> Code {
+    if is_legacy_interval_key_collision(input) {
+        return Code::NotSupported;
+    }
     if let Some(code) = commit_failure_code(input) {
         return code;
     }
@@ -931,6 +948,50 @@ mod effect_projection_tests {
             None,
         );
         assert_eq!(no_effect, original);
+    }
+}
+
+#[cfg(test)]
+mod legacy_interval_map_projection_tests {
+    use super::*;
+    use novarocks_execution_contract::{SafeDetail, failure::FailureFact};
+    use novarocks_query_application::execution_error::ExecutionFailureSite;
+
+    #[test]
+    fn legacy_interval_collision_projects_a_typed_trino_refusal() {
+        let fact = FailureFact::new(
+            FailureClass::Unsupported,
+            novarocks_result_render::LEGACY_INTERVAL_MAP_KEY_COLLISION,
+        );
+        let input = ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("private render diagnostic"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let execution = QueryExecutionError::from_execution(input.clone());
+        let service = QueryServiceError::from_execution_failure(input);
+        let sql =
+            "SELECT MAP(ARRAY[INTERVAL '0.0001' SECOND, INTERVAL '0.0002' SECOND], ARRAY[1, 2])";
+        for source in [
+            TrinoErrorSource::Execution {
+                error: &execution,
+                sql,
+            },
+            TrinoErrorSource::Service {
+                error: &service,
+                sql,
+            },
+        ] {
+            let error = query_error(source);
+            assert_eq!(
+                (error.error_code, error.error_name, error.error_type),
+                (13, "NOT_SUPPORTED", "USER_ERROR")
+            );
+            assert_eq!(
+                error.message,
+                "Interval map keys collide at millisecond precision; use a client supporting PARAMETRIC_INTERVAL"
+            );
+        }
     }
 }
 

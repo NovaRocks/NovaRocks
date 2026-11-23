@@ -1093,15 +1093,17 @@ fn snapshots_reports_a_zoned_commit_time_and_a_summary_map() {
         .expect("pages");
     let columns = &pages[0];
 
-    let committed_at = columns[0]
-        .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-        .expect("zoned timestamp");
+    let declaration = crate::temporal::declaration(&PrimitiveType::Timestamptz).unwrap();
+    let committed_at = novarocks_value_arrays::decode::PreparedTemporalArray::bind(
+        declaration,
+        columns[0].as_ref(),
+        false,
+    )
+    .expect("zoned timestamp");
     assert_eq!(
-        committed_at.data_type(),
-        &DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into()))
+        committed_at.value(0).unwrap(),
+        Some(crate::temporal::from_storage(declaration, 1_700_000_000_000 * 1_000).unwrap())
     );
-    assert_eq!(committed_at.value(0), 1_700_000_000_000 * 1_000);
     assert_eq!(long_column(columns, 1), vec![Some(SNAPSHOT_ID)]);
     assert_eq!(long_column(columns, 2), vec![None]);
     assert_eq!(string_column(columns, 3), vec![Some("append".to_string())]);

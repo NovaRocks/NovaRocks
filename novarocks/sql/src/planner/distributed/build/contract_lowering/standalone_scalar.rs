@@ -89,6 +89,7 @@ struct StandaloneDraft {
     policy: novarocks_constant_contract::ConstantPolicy,
     allow_throw_exception: bool,
     root_used: bool,
+    parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
 }
 impl StandaloneDraft {
     fn new(
@@ -113,6 +114,7 @@ impl StandaloneDraft {
             policy,
             allow_throw_exception,
             root_used: false,
+            parameters: BTreeMap::new(),
         }
     }
     fn emission<'emission, 'control>(
@@ -124,6 +126,7 @@ impl StandaloneDraft {
             root_allow_throw_exception: self.allow_throw_exception,
             constant_policy: self.policy,
             root_allow_throw_exception_used: &mut self.root_used,
+            parameters: &mut self.parameters,
             functions: &self.functions,
             control,
             work,
@@ -234,7 +237,7 @@ pub(crate) fn lower_standalone_scalar_unit(
         let parameters = scalar_emission::freeze_semantic_parameters(
             source.root_used,
             source.allow_throw_exception,
-            BTreeMap::new(),
+            std::mem::take(&mut source.parameters),
         )?;
         let site = ScalarSourceSite::Standalone(source.brand.clone());
         let loan = SqlUnitSourceLoan {

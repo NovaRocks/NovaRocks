@@ -325,7 +325,7 @@ fn valid_environment_references(
             "from_unixtime semantic reference has the wrong value kind".into(),
         ));
     };
-    match super::calendar_unixtime::parse_tz(zone){Some(zone @ (super::calendar_unixtime::TimeZoneSpec::Fixed(_)|super::calendar_unixtime::TimeZoneSpec::Named(_)))=>Ok(zone),_=>Err(FunctionBindingError::InvalidBinding("from_unixtime original ProcessLocal fallback has no frozen rule author; no default is allowed".into()))}
+    match super::calendar_unixtime::parse_tz(zone.name()){Some(zone @ (super::calendar_unixtime::TimeZoneSpec::Fixed(_)|super::calendar_unixtime::TimeZoneSpec::Named(_)))=>Ok(zone),_=>Err(FunctionBindingError::InvalidBinding("from_unixtime original ProcessLocal fallback has no frozen rule author; no default is allowed".into()))}
 }
 fn prepare_profile(
     input: CallEffectInput<'_>,
@@ -458,6 +458,13 @@ pub(super) fn prepared_for_test(
         region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
+    let zone = zone
+        .map(|text| {
+            novarocks_type_contract::TimeZoneKey::parse(text).ok_or(
+                crate::FunctionSpecializationFailure::InvalidInput("invalid statement time zone"),
+            )
+        })
+        .transpose()?;
     let refs = zone
         .map(|_| {
             vec![SemanticParameterRef {
@@ -470,7 +477,7 @@ pub(super) fn prepared_for_test(
         zone.map(|zone| {
             vec![(
                 SemanticParameterId::new(17),
-                SemanticParameterValue::TimeZone(zone.into()),
+                SemanticParameterValue::TimeZone(zone),
             )]
         })
         .unwrap_or_default(),

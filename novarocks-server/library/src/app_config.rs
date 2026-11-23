@@ -1071,6 +1071,8 @@ impl ConnectorConfig {
 pub struct StandaloneServerConfig {
     #[serde(default = "default_trino_port")]
     pub trino_port: u16,
+    #[serde(default = "default_trino_time_zone")]
+    pub trino_default_time_zone: String,
     #[serde(default = "default_trino_client_timeout_ms")]
     pub trino_client_timeout_ms: u64,
     #[serde(default)]
@@ -1105,6 +1107,10 @@ pub struct StandaloneServerConfig {
     pub iceberg_maintenance_action_cooldown_ms: i64,
     #[serde(default = "default_standalone_iceberg_maintenance_max_consecutive_failures")]
     pub iceberg_maintenance_max_consecutive_failures: u32,
+}
+
+fn default_trino_time_zone() -> String {
+    "UTC".to_owned()
 }
 
 fn default_trino_port() -> u16 {
@@ -1170,10 +1176,20 @@ fn default_standalone_iceberg_maintenance_max_consecutive_failures() -> u32 {
     4
 }
 
+impl StandaloneServerConfig {
+    pub(crate) fn validated_trino_time_zone(
+        &self,
+    ) -> anyhow::Result<novarocks_type_contract::TimeZoneKey> {
+        novarocks_type_contract::TimeZoneKey::parse(&self.trino_default_time_zone)
+            .ok_or_else(|| anyhow::anyhow!("invalid standalone_server.trino_default_time_zone"))
+    }
+}
+
 impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
             trino_port: default_trino_port(),
+            trino_default_time_zone: default_trino_time_zone(),
             trino_client_timeout_ms: default_trino_client_timeout_ms(),
             trino_query_max_length: novarocks_trino_adapter::QueryTextLimit::default(),
             user: default_standalone_server_user(),
@@ -4449,6 +4465,7 @@ grpc_port = 19080
             cfg.standalone_server,
             Some(StandaloneServerConfig {
                 trino_port: 8080,
+                trino_default_time_zone: "UTC".to_owned(),
                 trino_client_timeout_ms: 300_000,
                 trino_query_max_length: novarocks_trino_adapter::QueryTextLimit::default(),
                 user: "root".to_string(),
@@ -4468,6 +4485,32 @@ grpc_port = 19080
                 iceberg_maintenance_max_consecutive_failures: 4,
             })
         );
+    }
+
+    #[test]
+    fn standalone_server_config_validates_the_frontend_statement_time_zone() {
+        let defaults: StandaloneServerConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.validated_trino_time_zone().unwrap().name(), "UTC");
+        for (setting, canonical) in [
+            ("Asia/Shanghai", "Asia/Shanghai"),
+            ("+14:00", "+14:00"),
+            ("Z", "UTC"),
+        ] {
+            let config: StandaloneServerConfig =
+                toml::from_str(&format!("trino_default_time_zone = {setting:?}")).unwrap();
+            assert_eq!(
+                config.validated_trino_time_zone().unwrap().name(),
+                canonical
+            );
+        }
+        for invalid in ["+14:01", "+00:00:01", "Not/A_Zone"] {
+            let config: StandaloneServerConfig =
+                toml::from_str(&format!("trino_default_time_zone = {invalid:?}")).unwrap();
+            assert_eq!(
+                config.validated_trino_time_zone().unwrap_err().to_string(),
+                "invalid standalone_server.trino_default_time_zone"
+            );
+        }
     }
 
     #[test]

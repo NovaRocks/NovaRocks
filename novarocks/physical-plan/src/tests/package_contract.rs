@@ -1825,10 +1825,17 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     assert_ne!(contexts[0].context.use_id, contexts[1].context.use_id);
     let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.parameters = SemanticParameters::try_new([
-        (first.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            first.id,
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
+        ),
         (
             second.id,
-            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+            ),
         ),
     ])
     .unwrap();
@@ -1863,9 +1870,13 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     );
 
     let mut missing = input.clone();
-    missing.parameters =
-        SemanticParameters::try_new([(first.id, SemanticParameterValue::TimeZone("UTC".into()))])
-            .unwrap();
+    missing.parameters = SemanticParameters::try_new([(
+        first.id,
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
+    )])
+    .unwrap();
     assert!(
         FragmentPackage::try_new(missing, package_admission(), &Control)
             .unwrap_err()
@@ -1874,7 +1885,12 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     );
     let mut wrong_key = input.clone();
     wrong_key.parameters = SemanticParameters::try_new([
-        (first.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            first.id,
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
+        ),
         (second.id, SemanticParameterValue::AllowThrowException(true)),
     ])
     .unwrap();
@@ -1885,14 +1901,23 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
             .contains("expected key")
     );
     input.parameters = SemanticParameters::try_new([
-        (first.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            first.id,
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
+        ),
         (
             second.id,
-            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(8),
-            SemanticParameterValue::TimeZone("Europe/London".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("Europe/London").unwrap(),
+            ),
         ),
     ])
     .unwrap();
@@ -1926,7 +1951,9 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
     let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.parameters = SemanticParameters::try_new([(
         active.id,
-        SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+        ),
     )])
     .unwrap();
     let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
@@ -1962,7 +1989,9 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
     let plan = builder.finish_observed(&Control).unwrap();
     let snapshot = SemanticParameters::try_new([(
         active.id,
-        SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+        ),
     )])
     .unwrap();
     let packages = extract_fragment_packages(
@@ -1978,9 +2007,13 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
         packages[&FragmentId::new(81)].parameters(),
         checked.parameters()
     );
-    input.parameters =
-        SemanticParameters::try_new([(legacy.id, SemanticParameterValue::TimeZone("UTC".into()))])
-            .unwrap();
+    input.parameters = SemanticParameters::try_new([(
+        legacy.id,
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
+    )])
+    .unwrap();
     assert!(
         FragmentPackage::try_new(input.clone(), package_admission(), &Control)
             .unwrap_err()
@@ -2014,7 +2047,9 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     let fragment = parameter_fragment(reference);
     let parameters = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+        ),
     )])
     .unwrap();
     let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy())
@@ -2026,16 +2061,22 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     assert_eq!(input.parameters.entries().len(), 1);
     assert_eq!(
         input.parameters.require(reference).unwrap(),
-        &SemanticParameterValue::TimeZone("Asia/Shanghai".into())
+        &SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap()
+        )
     );
     input.parameters = SemanticParameters::try_new([
         (
             reference.id,
-            SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(1),
-            SemanticParameterValue::TimeZone("UTC".into()),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
         ),
     ])
     .unwrap();
@@ -2311,7 +2352,9 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     );
     let parameters = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::TimeZone("UTC".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
     )])
     .unwrap();
     let mut input = package_input(fragment.clone(), &mut constants);
@@ -2803,7 +2846,9 @@ fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority()
     let mut input = package_input(fragment, &mut constants);
     input.parameters = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::TimeZone("UTC".into()),
+        SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+        ),
     )])
     .unwrap();
     let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();

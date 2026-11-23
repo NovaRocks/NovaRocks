@@ -42,6 +42,8 @@ use novarocks_spi::connector::{
 };
 use novarocks_type_contract::{ValueKind, ValueLogicalType, ValueTypeStorageLifetime};
 
+mod temporal_projection;
+
 #[test]
 fn fixed_and_uuid_keep_distinct_public_read_types_and_source_identity() {
     let runtime = tokio::runtime::Runtime::new().unwrap();

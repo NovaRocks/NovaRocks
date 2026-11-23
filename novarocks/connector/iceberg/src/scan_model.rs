@@ -54,6 +54,7 @@ pub enum IcebergPhysicalPredicateValue {
     Int32(i32),
     Int64(i64),
     Date32(i32),
+    Temporal(i64),
 }
 
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
@@ -98,6 +99,8 @@ pub enum IcebergPartitionValue {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergPartitionFieldValue {
+    #[serde(default)]
+    pub source_field_id: Option<i32>,
     pub source_column: String,
     pub field_name: String,
     pub transform: String,
@@ -108,6 +111,7 @@ impl IcebergPartitionFieldValue {
     #[doc(hidden)]
     pub fn identity_int64_for_test(source_column: &str, value: i64) -> Self {
         Self {
+            source_field_id: None,
             source_column: source_column.to_string(),
             field_name: source_column.to_string(),
             transform: "identity".to_string(),

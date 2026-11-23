@@ -28,18 +28,24 @@ message SemanticParameters {
   repeated SemanticParameter entries = 1;
 }
 message SemanticParameter {
+  reserved 2;
+  reserved "statement_start_utc_micros";
   uint32 id = 1;
   reserved 5;
   reserved "decimal_overflow_to_double";
   // The value variant determines the one stable key. No separate key or type
   // may override it; runtime settings and process defaults do not fill gaps.
   oneof value {
-    sint64 statement_start_utc_micros = 2;
     string time_zone = 3;
     bool allow_throw_exception = 4;
     bool group_concat_legacy = 6;
     sint64 group_concat_max_len = 7;
+    StatementStartUtc statement_start_utc = 8;
   }
+}
+message StatementStartUtc {
+  optional sint64 seconds = 1;
+  optional uint32 nanos = 2;
 }
 enum SemanticParameterKey {
   SEMANTIC_PARAMETER_KEY_UNSPECIFIED = 0;

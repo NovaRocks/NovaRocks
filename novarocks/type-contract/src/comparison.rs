@@ -76,9 +76,9 @@ impl JoinKeyMatch {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum OrderedComparisonAlgorithm {
     /// NovaRocks scalar comparison. LARGEINT and Decimal128 compare as signed
-    /// integers, Date32 and Timestamp compare by their Arrow physical epoch
-    /// representation, and Utf8 compares by unsigned UTF-8 bytes. NULL
-    /// placement is supplied by the key.
+    /// integers, physical Date32 and Timestamp use their Arrow epoch values,
+    /// and Utf8 compares by unsigned UTF-8 bytes. Ordered runtime filters
+    /// consume nominal temporal relation keys. The key supplies NULL placement.
     NativeScalarOrderV1,
 }
 
@@ -98,6 +98,15 @@ impl OrderedComparisonAlgorithm {
             ty.logical_type() == crate::ValueLogicalType::Physical
         };
         identity && self.supports_order_key(ty.data_type())
+    }
+
+    /// Ordered runtime filters interpret a frozen temporal declaration through
+    /// its relation key. The declaration distinguishes same-width carriers.
+    pub fn supports_runtime_filter_key(self, ty: &crate::FunctionValueType) -> bool {
+        match (self, ty.value_type().temporal()) {
+            (Self::NativeScalarOrderV1, Some(temporal)) => temporal.carrier() == *ty.data_type(),
+            (_, None) => self.supports_value_type(ty),
+        }
     }
 
     /// Reports the exact Arrow scalar domain frozen by this revision.
@@ -152,6 +161,36 @@ mod tests {
             DataType::List(arrow_schema::Field::new_list_field(DataType::Int64, false).into()),
         ] {
             assert!(!algorithm.supports_order_key(&unsupported));
+        }
+    }
+
+    #[test]
+    fn ordered_runtime_filters_admit_the_typed_temporal_key() {
+        use crate::{
+            FunctionValueType, TemporalPrecision, TemporalType, ValueKind, ValueLayout,
+            ValueTypeRef, ValueTypeStorageLifetime,
+        };
+
+        let algorithm = OrderedComparisonAlgorithm::NativeScalarOrderV1;
+        let storage = ValueTypeStorageLifetime::pure();
+        for declaration in [
+            TemporalType::Timestamp(TemporalPrecision::MICROSECONDS),
+            TemporalType::Timestamp(TemporalPrecision::PICOSECONDS),
+            TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS),
+        ] {
+            let carrier = declaration.carrier();
+            let typed = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(ValueKind::Temporal(declaration), false, storage.clone())
+                    .unwrap(),
+                ValueLayout::try_new(&carrier, storage.clone()).unwrap(),
+            )
+            .unwrap();
+            assert!(algorithm.supports_runtime_filter_key(&typed));
+            if matches!(carrier, DataType::FixedSizeBinary(_)) {
+                assert!(!algorithm.supports_value_type(&typed));
+                let untyped = FunctionValueType::new(carrier, false);
+                assert!(!algorithm.supports_runtime_filter_key(&untyped));
+            }
         }
     }
 }

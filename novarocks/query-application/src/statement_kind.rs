@@ -83,6 +83,7 @@ pub enum StatementKind {
     Merge,
     AddEqualityDelete,
     SetSession,
+    SetTimeZone,
     ResetSession,
     Use,
     KillQuery,
@@ -158,6 +159,7 @@ impl StatementKind {
             | Self::Merge
             | Self::AddEqualityDelete
             | Self::SetSession
+            | Self::SetTimeZone
             | Self::ResetSession
             | Self::Use
             | Self::KillQuery

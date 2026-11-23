@@ -17,6 +17,8 @@
 syntax = "proto3";
 package novarocks.result;
 
+import "value_type.proto";
+
 // Frozen semantic vocabulary. Runtime dictionary/view encodings are absent.
 enum RenderTypeKind {
   RENDER_TYPE_KIND_UNSPECIFIED = 0;
@@ -41,6 +43,7 @@ enum RenderTypeKind {
   STRUCT = 19;
   CHAR = 20;
   VARCHAR = 21;
+  TEMPORAL = 22;
 }
 enum RenderTimeUnit {
   RENDER_TIME_UNIT_UNSPECIFIED = 0;
@@ -86,6 +89,7 @@ message NativeRenderType {
   // List: one child named item. Map: key then value. Struct: ordered names.
   repeated NamedRenderField children = 8;
   optional uint32 character_length = 9;
+  novarocks.value_type.TemporalType temporal_type = 10;
 }
 message RenderColumn {
   uint32 source_ordinal = 1;
@@ -97,6 +101,7 @@ message TrinoJsonFamily {
   bool parametric_datetime = 1;
   bool variant = 2;
   bool variant_binary = 3;
+  bool parametric_interval = 4;
 }
 // A tree encoded as a flat table: protobuf depth is independent of semantic
 // nesting. Every node is referenced exactly once; sharing/cycles are refused.

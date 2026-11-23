@@ -18,6 +18,7 @@ chrono-tz.workspace = true
 novarocks-functions.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-type-contract.workspace = true
+novarocks-value-arrays.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

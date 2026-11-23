@@ -141,6 +141,7 @@ pub fn encode_client_schema(schema: &ClientRenderSchema) -> wire::ClientRenderSc
             ClientPresentationFamily::TrinoJson(facts) => {
                 wire::client_render_schema::Family::TrinoJson(wire::TrinoJsonFamily {
                     parametric_datetime: facts.parametric_datetime,
+                    parametric_interval: facts.parametric_interval,
                     variant: facts.variant,
                     variant_binary: facts.variant_binary,
                 })
@@ -202,6 +203,13 @@ fn encode_type(
         }
         NativeRenderType::Binary => K::Binary,
         NativeRenderType::Date => K::Date,
+        NativeRenderType::Temporal(temporal) => {
+            let temporal = (*temporal)
+                .try_into()
+                .expect("the frozen client schema checked the temporal declaration");
+            out.temporal_type = Some(crate::temporal_type::encode(temporal));
+            K::Temporal
+        }
         NativeRenderType::Time { unit } => {
             out.time_unit = encode_time_unit(*unit);
             K::Time
@@ -285,6 +293,7 @@ pub fn decode_client_schema(
         Some(wire::client_render_schema::Family::TrinoJson(facts)) => {
             ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
                 parametric_datetime: facts.parametric_datetime,
+                parametric_interval: facts.parametric_interval,
                 variant: facts.variant,
                 variant_binary: facts.variant_binary,
             })
@@ -495,6 +504,7 @@ fn decode_type(
         || (!matches!(kind, K::Time | K::Timestamp) && src.time_unit != 0)
         || (kind != K::Timestamp && src.time_zone.is_some())
         || (kind != K::Opaque && src.opaque_kind != 0)
+        || ((kind == K::Temporal) != src.temporal_type.is_some())
         || (matches!(kind, K::Char | K::Varchar) != src.character_length.is_some())
         || (!matches!(kind, K::List | K::Map | K::Struct) && !src.children.is_empty())
         || (kind == K::List && (src.children.len() != 1 || src.children[0].name != "item"))
@@ -538,6 +548,11 @@ fn decode_type(
         }
         K::Binary => NativeRenderType::Binary,
         K::Date => NativeRenderType::Date,
+        K::Temporal => NativeRenderType::Temporal(
+            crate::temporal_type::decode(src.temporal_type.as_ref().expect("validated presence"))
+                .map_err(|message| invalid(path.clone(), message))?
+                .into(),
+        ),
         K::Time => NativeRenderType::Time {
             unit: decode_time_unit(src.time_unit, path.clone())?,
         },
@@ -620,9 +635,10 @@ mod schema_tests {
     }
     #[test]
     fn trino_facts_round_trip_and_missing_or_retired_wire_values_are_refused() {
-        for mask in 0..8 {
+        for mask in 0..16 {
             let facts = TrinoJsonFacts {
                 parametric_datetime: mask & 1 != 0,
+                parametric_interval: mask & 8 != 0,
                 variant: mask & 2 != 0,
                 variant_binary: mask & 4 != 0,
             };
@@ -691,6 +707,7 @@ mod schema_tests {
         let schema = ClientRenderSchema::try_new(
             ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true,
             }),
@@ -718,6 +735,7 @@ mod schema_tests {
         let schema = ClientRenderSchema::try_new(
             ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true,
             }),
@@ -758,10 +776,75 @@ mod schema_tests {
             schema.family(),
             &ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
                 parametric_datetime: true,
+                parametric_interval: false,
                 variant: true,
                 variant_binary: true
             })
         );
+    }
+
+    #[test]
+    fn nested_exact_temporal_declarations_are_independent_of_client_capabilities() {
+        use novarocks_result_contract::{RenderIntervalField as F, RenderTemporalType as T};
+        let leaf = |ty| RenderField {
+            nullable: false,
+            native_type: NativeRenderType::Temporal(ty),
+            presentation: RenderPresentation::TrinoValue,
+        };
+        let schema = ClientRenderSchema::try_new(
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
+            vec![
+                col(
+                    0,
+                    NativeRenderType::Map {
+                        key: Box::new(leaf(T::TimestampWithTimeZone(12))),
+                        value: Box::new(leaf(T::Interval {
+                            start: F::Hour,
+                            end: F::Second,
+                            leading_precision: 3,
+                            fractional_precision: 9,
+                        })),
+                    },
+                    RenderPresentation::TrinoValue,
+                ),
+                col(
+                    1,
+                    NativeRenderType::BoundedCharacter(
+                        CharacterType::new(CharacterKind::Char, 4).unwrap(),
+                    ),
+                    RenderPresentation::TrinoValue,
+                ),
+            ],
+            2,
+        )
+        .unwrap();
+        let encoded = encode_client_schema(&schema);
+        let bytes = encoded.encode_to_vec();
+        let parsed = wire::ClientRenderSchema::decode(bytes.as_slice()).unwrap();
+        assert_eq!(
+            decode_client_schema(&parsed, 2, FieldPath::root("schema")).unwrap(),
+            schema
+        );
+
+        let mut missing = parsed.clone();
+        let leaf = missing
+            .field_nodes
+            .iter_mut()
+            .filter_map(|field| field.native_type.as_mut())
+            .find(|ty| ty.temporal_type.is_some())
+            .unwrap();
+        leaf.temporal_type = None;
+        assert!(decode_client_schema(&missing, 2, FieldPath::root("schema")).is_err());
+
+        let mut foreign = parsed;
+        let leaf = foreign
+            .field_nodes
+            .iter_mut()
+            .filter_map(|field| field.native_type.as_mut())
+            .find(|ty| ty.temporal_type.is_some())
+            .unwrap();
+        leaf.character_length = Some(4);
+        assert!(decode_client_schema(&foreign, 2, FieldPath::root("schema")).is_err());
     }
 
     #[test]

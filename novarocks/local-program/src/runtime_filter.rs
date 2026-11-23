@@ -108,6 +108,9 @@ pub fn single_key_ordered_filter_digests_observed<E>(
 pub fn is_ordered_filter_flat_payload_type(
     value_type: &novarocks_type_contract::FunctionValueType,
 ) -> bool {
+    if value_type.value_type().temporal().is_some() {
+        return true;
+    }
     use novarocks_type_contract::ValueKind;
     if value_type.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt {
         return matches!(value_type.data_type(), DataType::FixedSizeBinary(16));
@@ -153,6 +156,9 @@ pub fn is_aggregate_topn_key_carrier(data_type: &DataType) -> bool {
 /// Installed single-key Aggregate TopN domain. A 16-byte carrier alone never
 /// establishes LARGEINT; the complete declared semantic identity is required.
 pub fn is_aggregate_topn_key_type(value_type: &novarocks_type_contract::FunctionValueType) -> bool {
+    if value_type.value_type().temporal().is_some() {
+        return true;
+    }
     use novarocks_type_contract::ValueLogicalType;
     match value_type.logical_type() {
         ValueLogicalType::Physical => {
@@ -256,6 +262,9 @@ impl StaticFilterContract {
         value_type: &novarocks_type_contract::FunctionValueType,
         null_semantics: FilterNullSemantics,
     ) -> Result<Self, FilterMembershipSchemaError> {
+        if !is_semantic_filter_key_type(value_type) {
+            return Err(FilterMembershipSchemaError::UnsupportedType);
+        }
         let canonical = FilterMembershipSchema::try_new(value_type.data_type(), null_semantics)?;
         Ok(Self::Membership {
             canonical,
@@ -625,8 +634,62 @@ pub fn encode_filter_key_type(
 /// Whether the canonical membership schema can represent this physical key.
 /// Planner placement and preparation share the canonical encoder's domain.
 // Design: ADR-0236 (docs/adr/ADR-0236-installed-optimization-domains-and-partition-rank-retention.md)
+pub fn is_semantic_filter_key_type(
+    value_type: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    if matches!(
+        value_type.data_type(),
+        DataType::FixedSizeBinary(10 | 12 | 14)
+    ) {
+        return value_type.value_type().temporal().is_some();
+    }
+    is_filter_key_type(value_type.data_type())
+}
+
 pub fn is_filter_key_type(data_type: &DataType) -> bool {
     visit_filter_key_type::<FilterMembershipSchemaError>(data_type, |_| Ok(())).is_ok()
+}
+
+/// Typed ordered comparators have a separate nominal tag. Equal-width
+/// timestamp, time and interval payloads never share a comparator identity.
+pub fn temporal_order_key_type_bytes(temporal: novarocks_type_contract::TemporalType) -> [u8; 5] {
+    use novarocks_type_contract::TemporalType;
+    match temporal {
+        TemporalType::Time(p) => [14, 1, p.digits(), 0, 0],
+        TemporalType::TimeWithTimeZone(p) => [14, 2, p.digits(), 0, 0],
+        TemporalType::Timestamp(p) => [14, 3, p.digits(), 0, 0],
+        TemporalType::TimestampWithTimeZone(p) => [14, 4, p.digits(), 0, 0],
+        TemporalType::Interval(q) => [
+            14,
+            5 + q.start() as u8,
+            q.end() as u8,
+            q.leading_precision(),
+            q.fractional_precision().digits(),
+        ],
+    }
+}
+
+pub fn visit_ordered_filter_key_type<E: From<FilterMembershipSchemaError>>(
+    data_type: &DataType,
+    temporal: Option<novarocks_type_contract::TemporalType>,
+    mut write: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    match temporal {
+        Some(declaration) => {
+            if data_type != &declaration.carrier() {
+                return Err(FilterMembershipSchemaError::UnsupportedType.into());
+            }
+            write(&temporal_order_key_type_bytes(declaration))
+        }
+        None if matches!(
+            data_type,
+            DataType::FixedSizeBinary(10 | 12 | 14) | DataType::Float32 | DataType::Float64
+        ) =>
+        {
+            Err(FilterMembershipSchemaError::UnsupportedType.into())
+        }
+        None => visit_filter_key_type(data_type, write),
+    }
 }
 
 /// Visit canonical physical key bytes without allocating a shadow buffer.
@@ -642,6 +705,7 @@ pub fn visit_filter_key_type<E: From<FilterMembershipSchemaError>>(
         DataType::Int32 => write(&[4])?,
         DataType::Int64 => write(&[5])?,
         DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => write(&[6])?,
+        DataType::FixedSizeBinary(width @ (10 | 12 | 14)) => write(&[13, *width as u8])?,
         DataType::Float32 => write(&[7])?,
         DataType::Float64 => write(&[8])?,
         DataType::Utf8 => write(&[9])?,
@@ -694,6 +758,10 @@ fn decode_filter_key_type(
         4 => Ok(DataType::Int32),
         5 => Ok(DataType::Int64),
         6 => Ok(DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH)),
+        13 => match cursor.u8()? {
+            width @ (10 | 12 | 14) => Ok(DataType::FixedSizeBinary(i32::from(width))),
+            _ => Err(FilterMembershipSchemaError::UnsupportedType),
+        },
         7 => Ok(DataType::Float32),
         8 => Ok(DataType::Float64),
         9 => Ok(DataType::Utf8),

@@ -90,7 +90,7 @@ ci_list_stages() {
     {"name": "shared benchmark fixture contract", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "cargo fmt", "tier": "admission", "domain": ["**"]},
     {"name": "cargo clippy", "tier": "admission", "domain": ["**"]},
-    {"name": "joint tests and binaries preparation", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "joint tests and binaries preparation", "tier": "admission", "domain": ["tools/ci/**", "tests/compile-to-execute/**"]},
     {"name": "main binary build information", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "SQL error manifest freshness", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "functional default scenario selection", "tier": "admission", "domain": ["tools/ci/**"]},

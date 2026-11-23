@@ -86,6 +86,13 @@ impl ScalarPresenceCatalog {
     }
 }
 impl SqlFunctionCatalog for ScalarPresenceCatalog {
+    fn scalar_time_dependencies(
+        &self,
+        binding: &ResolvedFunctionBinding,
+    ) -> &[novarocks_type_contract::SemanticParameterKey] {
+        self.original.scalar_time_dependencies(binding)
+    }
+
     fn admit_bound_lifecycle_observed(
         &self,
         binding: &ResolvedFunctionBinding,
@@ -172,11 +179,33 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
                         control,
                     )
                 } else {
-                    // No ordinary lexical environment author exists on this original binding.
+                    let (references, entries): (Vec<_>, Vec<_>) = binding
+                        .statement_time_parameters()
+                        .map(|(reference, value)| (reference, (reference.id, value)))
+                        .unzip();
+                    if references.is_empty() {
+                        return self.admit_bound_environment_observed(
+                            binding.resolved(),
+                            &[],
+                            &SemanticParameters::default(),
+                            control,
+                        );
+                    }
+                    let parameters = SemanticParameters::try_new_observed(entries, &mut work)
+                        .map_err(|error| match error {
+                            SemanticParameterProjectionError::Control(cause) => {
+                                FunctionBindingError::Control(cause)
+                            }
+                            SemanticParameterProjectionError::Parameter(_) => {
+                                FunctionBindingError::UnavailableImplementation(
+                                    binding.selected.overload.clone(),
+                                )
+                            }
+                        })?;
                     self.admit_bound_environment_observed(
                         binding.resolved(),
-                        &[],
-                        &SemanticParameters::default(),
+                        &references,
+                        &parameters,
                         control,
                     )
                 }

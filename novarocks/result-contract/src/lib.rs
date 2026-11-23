@@ -56,8 +56,8 @@ pub use character_type::{CharacterKind, CharacterType};
 mod render_schema;
 pub use render_schema::{
     ClientPresentationFamily, ClientRenderSchema, NamedRenderField, NativeRenderType,
-    OpaqueRenderType, RenderColumn, RenderField, RenderPresentation, RenderTimeUnit,
-    TrinoJsonFacts,
+    OpaqueRenderType, RenderColumn, RenderField, RenderIntervalField, RenderPresentation,
+    RenderTemporalType, RenderTimeUnit, TrinoJsonFacts,
 };
 
 mod write_counts;

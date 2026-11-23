@@ -18,6 +18,8 @@ use super::{
 
 const MAX_DECIMAL_PRECISION: u32 = 38;
 
+use novarocks_type_contract::{TemporalMicros, TemporalType, TemporalValue, TimeZoneKey};
+
 /// Decode a generated value type, enforcing that its parameters are present
 /// exactly for the kinds that require them.
 pub fn decode_value_type(
@@ -29,6 +31,12 @@ pub fn decode_value_type(
 
     let decimal_present = raw.decimal_precision.is_some() || raw.decimal_scale.is_some();
     let fixed_present = raw.fixed_length.is_some();
+    if kind != dto::ValueTypeKind::Temporal && raw.temporal.is_some() {
+        return Err(inconsistent(
+            path.field("temporal"),
+            "unexpected temporal declaration",
+        ));
+    }
 
     let value_type = match kind {
         dto::ValueTypeKind::Unspecified => {
@@ -94,6 +102,24 @@ pub fn decode_value_type(
             }
             ConnectorValueType::Fixed { length }
         }
+        dto::ValueTypeKind::Temporal => {
+            if decimal_present || fixed_present {
+                return Err(inconsistent(
+                    path.field("temporal"),
+                    "unexpected scalar type parameters",
+                ));
+            }
+            let declaration = raw.temporal.as_ref().ok_or_else(|| {
+                missing(
+                    path.clone().field("temporal"),
+                    "missing temporal declaration",
+                )
+            })?;
+            ConnectorValueType::Temporal(
+                crate::temporal_type::decode(declaration)
+                    .map_err(|error| invalid(path.field("temporal"), error))?,
+            )
+        }
         simple => {
             if decimal_present {
                 return Err(inconsistent(
@@ -128,7 +154,8 @@ pub fn decode_value_type(
                 dto::ValueTypeKind::NonComparable => ConnectorValueType::NonComparable,
                 dto::ValueTypeKind::Unspecified
                 | dto::ValueTypeKind::Decimal
-                | dto::ValueTypeKind::Fixed => unreachable!("handled above"),
+                | dto::ValueTypeKind::Fixed
+                | dto::ValueTypeKind::Temporal => unreachable!("handled above"),
             }
         }
     };
@@ -142,6 +169,7 @@ pub fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
         decimal_precision: None,
         decimal_scale: None,
         fixed_length: None,
+        temporal: None,
     };
     encoded.kind = match value_type {
         ConnectorValueType::NonComparable => dto::ValueTypeKind::NonComparable,
@@ -164,6 +192,10 @@ pub fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
         ConnectorValueType::TimestampTzMicros => dto::ValueTypeKind::TimestampTzMicros,
         ConnectorValueType::TimestampNanos => dto::ValueTypeKind::TimestampNanos,
         ConnectorValueType::TimestampTzNanos => dto::ValueTypeKind::TimestampTzNanos,
+        ConnectorValueType::Temporal(declaration) => {
+            encoded.temporal = Some(crate::temporal_type::encode(declaration));
+            dto::ValueTypeKind::Temporal
+        }
         ConnectorValueType::Varchar => dto::ValueTypeKind::Varchar,
         ConnectorValueType::Varbinary => dto::ValueTypeKind::Varbinary,
         ConnectorValueType::Uuid => dto::ValueTypeKind::Uuid,
@@ -239,6 +271,11 @@ pub fn decode_value(
         dto::value::Value::TimestampTzMicros(value) => ConnectorValue::TimestampTzMicros(*value),
         dto::value::Value::TimestampNanos(value) => ConnectorValue::TimestampNanos(*value),
         dto::value::Value::TimestampTzNanos(value) => ConnectorValue::TimestampTzNanos(*value),
+        dto::value::Value::Temporal(value) => {
+            let (data_type, value) = decode_temporal_value(value)
+                .map_err(|error| invalid(path.clone().field("temporal"), error))?;
+            ConnectorValue::Temporal { data_type, value }
+        }
         dto::value::Value::Varchar(value) => {
             bounded_text(value, MAX_SCALAR_BYTES, path.clone().field("varchar"), true)?;
             ConnectorValue::Varchar(Arc::from(value.as_str()))
@@ -293,6 +330,9 @@ pub fn encode_value(value: &ConnectorValue) -> dto::Value {
         ConnectorValue::TimestampTzMicros(value) => dto::value::Value::TimestampTzMicros(*value),
         ConnectorValue::TimestampNanos(value) => dto::value::Value::TimestampNanos(*value),
         ConnectorValue::TimestampTzNanos(value) => dto::value::Value::TimestampTzNanos(*value),
+        ConnectorValue::Temporal { data_type, value } => {
+            dto::value::Value::Temporal(encode_temporal_value(*data_type, *value))
+        }
         ConnectorValue::Varchar(value) => dto::value::Value::Varchar(value.to_string()),
         ConnectorValue::Varbinary(value) => dto::value::Value::Varbinary(value.to_vec()),
         ConnectorValue::Uuid(value) => dto::value::Value::Uuid(value.to_vec()),
@@ -301,6 +341,96 @@ pub fn encode_value(value: &ConnectorValue) -> dto::Value {
     dto::Value {
         value: Some(encoded),
     }
+}
+
+pub fn encode_temporal_value(
+    ty: TemporalType,
+    value: TemporalValue,
+) -> dto::TemporalPredicateValue {
+    let (whole, fraction, offset, zone) = match value {
+        TemporalValue::Time(value) => (value, None, None, None),
+        TemporalValue::TimeWithTimeZone {
+            picos,
+            offset_minutes,
+        } => (picos, None, Some(i32::from(offset_minutes)), None),
+        TemporalValue::Timestamp(value) | TemporalValue::IntervalDayTime(value) => (
+            value.micros(),
+            Some(value.picoseconds_of_microsecond()),
+            None,
+            None,
+        ),
+        TemporalValue::TimestampWithTimeZone { instant, zone } => (
+            instant.micros(),
+            Some(instant.picoseconds_of_microsecond()),
+            None,
+            Some(u32::from(zone.raw())),
+        ),
+        TemporalValue::IntervalYearMonth(value) => (i64::from(value), None, None, None),
+    };
+    dto::TemporalPredicateValue {
+        data_type: Some(crate::temporal_type::encode(ty)),
+        whole: Some(whole),
+        picoseconds_of_microsecond: fraction,
+        offset_minutes: offset,
+        zone_key: zone,
+    }
+}
+
+pub fn decode_temporal_value(
+    encoded: &dto::TemporalPredicateValue,
+) -> Result<(TemporalType, TemporalValue), &'static str> {
+    let declaration = crate::temporal_type::decode(
+        encoded
+            .data_type
+            .as_ref()
+            .ok_or("missing temporal scalar declaration")?,
+    )?;
+    let whole = encoded.whole.ok_or("missing temporal whole component")?;
+    let value = match (
+        declaration,
+        encoded.picoseconds_of_microsecond,
+        encoded.offset_minutes,
+        encoded.zone_key,
+    ) {
+        (TemporalType::Time(_), None, None, None) => TemporalValue::Time(whole),
+        (TemporalType::TimeWithTimeZone(_), None, Some(offset), None) => {
+            TemporalValue::TimeWithTimeZone {
+                picos: whole,
+                offset_minutes: i16::try_from(offset).map_err(|_| "invalid temporal offset")?,
+            }
+        }
+        (TemporalType::Timestamp(_), Some(fraction), None, None) => TemporalValue::Timestamp(
+            TemporalMicros::new(whole, fraction).ok_or("invalid temporal fraction")?,
+        ),
+        (TemporalType::TimestampWithTimeZone(_), Some(fraction), None, Some(zone)) => {
+            TemporalValue::TimestampWithTimeZone {
+                instant: TemporalMicros::new(whole, fraction).ok_or("invalid temporal fraction")?,
+                zone: u16::try_from(zone)
+                    .ok()
+                    .and_then(TimeZoneKey::from_raw)
+                    .ok_or("invalid time-zone key")?,
+            }
+        }
+        (TemporalType::Interval(qualifier), None, None, None) if qualifier.is_year_month() => {
+            TemporalValue::IntervalYearMonth(
+                i32::try_from(whole).map_err(|_| "invalid interval months")?,
+            )
+        }
+        (TemporalType::Interval(qualifier), Some(fraction), None, None)
+            if !qualifier.is_year_month() =>
+        {
+            TemporalValue::IntervalDayTime(
+                TemporalMicros::new(whole, fraction).ok_or("invalid interval fraction")?,
+            )
+        }
+        _ => return Err("temporal value components differ from their declaration"),
+    };
+    Ok((
+        declaration,
+        value
+            .validate(declaration)
+            .map_err(|_| "invalid temporal scalar value")?,
+    ))
 }
 
 #[cfg(test)]
@@ -350,6 +480,7 @@ mod tests {
             decimal_precision: None,
             decimal_scale: None,
             fixed_length: None,
+            temporal: None,
         };
         let error = decode_value_type(&unspecified, root()).expect_err("unspecified");
         assert_eq!(error.kind(), &crate::ProtocolErrorKind::InvalidEnum);
@@ -373,6 +504,7 @@ mod tests {
             decimal_precision: Some(10),
             decimal_scale: None,
             fixed_length: None,
+            temporal: None,
         };
         assert_eq!(
             decode_value_type(&missing_scale, root())
@@ -386,6 +518,7 @@ mod tests {
             decimal_precision: Some(10),
             decimal_scale: Some(2),
             fixed_length: None,
+            temporal: None,
         };
         assert_eq!(
             decode_value_type(&stray, root())
@@ -399,6 +532,7 @@ mod tests {
             decimal_precision: Some(10),
             decimal_scale: Some(11),
             fixed_length: None,
+            temporal: None,
         };
         assert_eq!(
             decode_value_type(&out_of_range_scale, root())

@@ -84,6 +84,8 @@ fn string_type(raw: &str) -> bool {
             | "time with time zone"
             | "timestamp"
             | "timestamp with time zone"
+            | "interval year to month"
+            | "interval day to second"
             | "json"
     )
 }
@@ -199,7 +201,12 @@ fn render(signature: &TypeSignature, value: &TrinoValue, nested: bool) -> Result
 fn map_key(signature: &TypeSignature, value: &TrinoValue) -> Result<String> {
     match value {
         TrinoValue::Null => bail!("golden map key cannot be null"),
-        TrinoValue::Text(text) if string_type(&signature.raw_type) => Ok(text.clone()),
+        TrinoValue::Text(text)
+            if string_type(&signature.raw_type)
+                || matches!(signature.raw_type.as_str(), "array" | "row" | "map") =>
+        {
+            Ok(text.clone())
+        }
         TrinoValue::Binary(bytes) if signature.raw_type == "varbinary" => {
             Ok(STANDARD.encode(bytes))
         }

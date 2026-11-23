@@ -716,9 +716,12 @@ fn validate_exchange_inputs(
                     if slot == key {
                         occurrences += 1;
                         supported = algorithm.is_some_and(|algorithm| {
-                            algorithm.supports_partition_key(
-                                transport.schema().field(ordinal).data_type(),
-                            )
+                            let data_type = transport.schema().field(ordinal).data_type();
+                            if let Some((semantic, _)) = transport.slot_metadata_at(ordinal) {
+                                algorithm.supports_partition_binding(semantic, data_type)
+                            } else {
+                                algorithm.supports_partition_key(data_type)
+                            }
                         });
                     }
                     work.step().map_err(LocalProgramCompileError::Control)?;

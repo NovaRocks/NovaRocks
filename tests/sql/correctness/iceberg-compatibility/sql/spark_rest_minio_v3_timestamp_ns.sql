@@ -118,20 +118,19 @@ printf 'CATALOG_OK schema=timestamp_ns records=%s\n' "$rec_count"
 
 -- query 5
 -- NovaRocks reads the table back and asserts 9-digit nanosecond precision.
--- CAST(ts AS STRING) renders the full nanosecond value, bypassing the MySQL
--- wire protocol's microsecond truncation.
+-- CAST(ts AS VARCHAR) renders all nine fractional digits from the declaration.
 SELECT id, CAST(ts AS VARCHAR) AS s
   FROM iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
   ORDER BY id;
 
 -- query 6
 -- Nanosecond predicate precision check.
--- ts > '2024-01-02 03:04:05.000000001' matches only row 1 (.123456789).
+-- The strict nanosecond boundary excludes the first nanosecond itself.
 -- If the predicate were rounded to microseconds (.000000), rows 1 and 2 would
 -- both pass (COUNT=2), proving the nanosecond path is exercised end-to-end.
 SELECT COUNT(*) AS cnt
   FROM iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
-  WHERE ts > '2024-01-02 03:04:05.000000001';
+  WHERE ts > TIMESTAMP '2024-01-02 03:04:05.000000001';
 
 -- query 7
 -- @skip_result_check=true

@@ -102,6 +102,14 @@ impl<'a> OutputColumn<'a> {
         }
     }
 
+    pub const fn source(&self) -> &'a ArrayRef {
+        self.source
+    }
+
+    pub const fn is_constant(&self) -> bool {
+        self.constant
+    }
+
     /// The provider's binding has verified the selected Fixed storage
     /// occurrences and has authored Binary at the corresponding output leaves.
     pub const fn with_fixed_binary_projection(mut self) -> Self {
@@ -182,6 +190,19 @@ impl<'a> PrefixPlanner<'a> {
         soft_target_new_column_bytes: u64,
         work: &mut Work<'_, E>,
     ) -> Result<OutputPrefix<'_>, ValueFailure<E>> {
+        self.plan_prefix_with_additional_storage(max_rows, soft_target_new_column_bytes, None, work)
+    }
+
+    /// Include the caller's additional, row-indexed materialized column
+    /// storage in the same soft prefix decision. The callback consumes
+    /// source row indices; the original build still owns its physical shape.
+    pub fn plan_prefix_with_additional_storage<E>(
+        &mut self,
+        max_rows: NonZeroU32,
+        soft_target_new_column_bytes: u64,
+        mut additional_storage: Option<&mut dyn FnMut(usize) -> Result<u128, E>>,
+        work: &mut Work<'_, E>,
+    ) -> Result<OutputPrefix<'_>, ValueFailure<E>> {
         work(0).map_err(ValueFailure::Caller)?;
         if self.planned_rows != 0 {
             return Err(ValueError::Invariant(ValueViolation::RowTransaction).into());
@@ -195,7 +216,7 @@ impl<'a> PrefixPlanner<'a> {
         let mut new_column_bytes = 0;
         let mut shares_source = false;
         let mut len = 0;
-        if self.uniform && cap > 0 {
+        if self.uniform && cap > 0 && additional_storage.is_none() {
             let ordinal = self.next_row;
             self.prepare_boundary_row(ordinal, work)?;
             // A column's constant/fixed-width row facts can be scaled without
@@ -224,12 +245,29 @@ impl<'a> PrefixPlanner<'a> {
             }
             len = low;
         } else {
+            let mut additional_bytes = 0_u128;
             while len < cap {
                 let ordinal = self.next_row + len;
                 self.prepare_boundary_row(ordinal, work)?;
+                let additional = match additional_storage.as_deref_mut() {
+                    Some(measure) => additional_bytes
+                        .checked_add(
+                            measure(self.rows.get(ordinal)?).map_err(ValueFailure::Caller)?,
+                        )
+                        .ok_or_else(arithmetic)?,
+                    None => 0,
+                };
                 let result = match self.candidate(len, 1) {
-                    Ok(result) if len == 0 || result.new_bytes <= soft_target => result,
-                    Ok(_) => break,
+                    Ok(mut result) => {
+                        result.new_bytes = result
+                            .new_bytes
+                            .checked_add(additional)
+                            .ok_or_else(arithmetic)?;
+                        if len > 0 && result.new_bytes > soft_target {
+                            break;
+                        }
+                        result
+                    }
                     Err(ValueError::Representation(_)) if len > 0 => break,
                     Err(error) => return Err(error.into()),
                 };
@@ -238,6 +276,7 @@ impl<'a> PrefixPlanner<'a> {
                 }
                 (logical_bytes, new_column_bytes, shares_source) =
                     (result.logical_bytes, result.new_bytes, result.shares_source);
+                additional_bytes = additional;
                 len += 1;
             }
         }

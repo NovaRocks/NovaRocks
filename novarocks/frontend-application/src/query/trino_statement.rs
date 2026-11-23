@@ -74,7 +74,11 @@ impl FrontendQuerySession {
         &self,
         source: Arc<str>,
     ) -> Result<QuerySessionStatement, QueryServiceError> {
-        let statement_started_at = std::time::SystemTime::now();
+        let (statement_started_at, statement_time) = self
+            .service
+            .statement_clock
+            .capture()
+            .map_err(internal_error)?;
         let statement = novarocks_query_application::sql::parse_single_statement(&source)
             .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(&source)))?;
         match admit_trino_statement(&source, statement)? {
@@ -85,17 +89,20 @@ impl FrontendQuerySession {
                         StatementKind::Explain
                     }
                 };
-                let result = self.execute_trino_query_family(source, action).await?;
+                let result = self
+                    .execute_trino_query_family(source, action, statement_time)
+                    .await?;
                 Ok(QuerySessionStatement::output_owned(result, kind))
             }
             TrinoStatementAction::Session(action) => {
-                self.execute_trino_session_action(source, action).await
+                self.execute_trino_session_action(source, action, statement_time)
+                    .await
             }
             TrinoStatementAction::Product(command) => {
                 let plan = product_plan(&command)?;
                 let kind = plan.admission.kind;
                 let result = match self
-                    .start_trino_command(&source, plan, statement_started_at)
+                    .start_trino_command(&source, plan, statement_started_at, statement_time)
                     .await?
                 {
                     CommandStart::Ready(entry) => {
@@ -109,7 +116,7 @@ impl FrontendQuerySession {
                 let plan = preparation_plan(&preparation)?;
                 let kind = plan.admission.kind;
                 let result = match self
-                    .start_trino_command(&source, plan, statement_started_at)
+                    .start_trino_command(&source, plan, statement_started_at, statement_time)
                     .await?
                 {
                     CommandStart::Ready(entry) => {
@@ -128,12 +135,14 @@ impl FrontendQuerySession {
         source: &Arc<str>,
         plan: CommandPlan,
         statement_started_at: std::time::SystemTime,
+        statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<CommandStart, QueryServiceError> {
         self.admission.publish(plan.admission);
         *self.output_shape.lock().map_err(poisoned_state)? = Some(plan.admission.shape);
-        let (session_deadline, _) = {
+        let (state, session_deadline) = {
             let state = self.state.lock().map_err(poisoned_state)?;
-            governed_query_deadline(&state)?
+            let (session_deadline, _) = governed_query_deadline(&state)?;
+            (state.clone(), session_deadline)
         };
         let deadline = if plan.publication_deadline {
             Some(
@@ -219,8 +228,8 @@ impl FrontendQuerySession {
                 )));
             }
         };
-        let state = self.state.lock().map_err(poisoned_state)?.clone();
         let presentation = state.presentation().copied();
+        let statement_time = state.statement_time(statement_time);
         let (catalog, database, settings, mut optimizer, semantics, properties) =
             state.into_query_attempt_inputs();
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
@@ -244,7 +253,7 @@ impl FrontendQuerySession {
                     deadline,
                     cancellation.clone(),
                     optimizer,
-                    semantics,
+                    semantics.with_statement_time(statement_time),
                     presentation,
                 )
                 .with_session_property_inputs(properties),

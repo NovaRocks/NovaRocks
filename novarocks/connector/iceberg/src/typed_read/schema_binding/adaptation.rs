@@ -29,11 +29,14 @@ use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use novarocks_spi::connector::ConnectorError;
 use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
 
-use crate::default_value::{ICEBERG_INITIAL_DEFAULT_META_KEY, build_iceberg_default_array};
+use crate::default_value::materialize_initial_default;
+use crate::iceberg::spec::{NestedField, Schema};
 use crate::schema_mapping::field_id_for_arrow_field;
 
 use super::super::column_handle::corrupt;
-use super::{IcebergPhysicalAdaptation, apply_adaptation, physical_adaptation};
+use super::{
+    IcebergPhysicalAdaptation, apply_adaptation, initial_default_field, physical_adaptation,
+};
 
 #[derive(Debug)]
 pub(super) enum AdaptationError {
@@ -76,7 +79,7 @@ enum Adaptation {
     Struct(Vec<StructMember>),
     List(Box<FieldAdaptation>),
     Map(Box<FieldAdaptation>),
-    InitialDefault,
+    InitialDefault(Arc<NestedField>),
     TypedNull,
     RequiredMissing,
 }
@@ -146,21 +149,27 @@ fn visit_field_leaf_ids(field: &Field, visit: &mut impl FnMut(i32)) -> Result<()
 }
 
 impl FieldAdaptation {
-    pub(super) fn bind(source: Option<&Field>, target: &FieldRef) -> Result<Self, AdaptationError> {
-        Self::bind_with_layout(source, target, BindingLayout::Canonical)
+    pub(super) fn bind(
+        source: Option<&Field>,
+        target: &FieldRef,
+        table_schema: &Schema,
+    ) -> Result<Self, AdaptationError> {
+        Self::bind_with_layout(source, target, BindingLayout::Canonical, table_schema)
     }
 
     pub(super) fn bind_for_scan(
         source: Option<&Field>,
         target: &FieldRef,
+        table_schema: &Schema,
     ) -> Result<Self, AdaptationError> {
-        Self::bind_with_layout(source, target, BindingLayout::ScanRoot)
+        Self::bind_with_layout(source, target, BindingLayout::ScanRoot, table_schema)
     }
 
     fn bind_with_layout(
         source: Option<&Field>,
         target: &FieldRef,
         layout: BindingLayout,
+        table_schema: &Schema,
     ) -> Result<Self, AdaptationError> {
         // Resolve the physical field by ID before choosing its byte layout.
         // This preserves decoder storage even when struct members were reordered.
@@ -174,15 +183,12 @@ impl FieldAdaptation {
             _ => Arc::clone(target),
         };
         let kind = match source {
-            None if target
-                .metadata()
-                .contains_key(ICEBERG_INITIAL_DEFAULT_META_KEY) =>
-            {
-                Adaptation::InitialDefault
-            }
-            None if target.is_nullable() => Adaptation::TypedNull,
-            None => Adaptation::RequiredMissing,
-            Some(source) => Self::bind_present(source, &target, layout.child())?,
+            None => match initial_default_field(table_schema, target_id(&target)?) {
+                Some(field) => Adaptation::InitialDefault(field),
+                None if target.is_nullable() => Adaptation::TypedNull,
+                None => Adaptation::RequiredMissing,
+            },
+            Some(source) => Self::bind_present(source, &target, layout.child(), table_schema)?,
         };
         let has_required_missing = match &kind {
             Adaptation::Struct(children) => children
@@ -203,6 +209,7 @@ impl FieldAdaptation {
         source: &Field,
         target: &Field,
         child_layout: BindingLayout,
+        table_schema: &Schema,
     ) -> Result<Adaptation, AdaptationError> {
         let physical = source.data_type();
         let desired = target.data_type();
@@ -210,15 +217,16 @@ impl FieldAdaptation {
             return Ok(Adaptation::Leaf(IcebergPhysicalAdaptation::Identity));
         }
         Ok(match (physical, desired) {
-            (DataType::Struct(source), DataType::Struct(target)) => {
-                Adaptation::Struct(bind_struct_members(source, target, child_layout)?)
-            }
+            (DataType::Struct(source), DataType::Struct(target)) => Adaptation::Struct(
+                bind_struct_members(source, target, child_layout, table_schema)?,
+            ),
             (DataType::List(source), DataType::List(target))
             | (DataType::LargeList(source), DataType::LargeList(target)) => {
                 Adaptation::List(Box::new(Self::bind_with_layout(
                     same_id(source, target)?,
                     target,
                     child_layout,
+                    table_schema,
                 )?))
             }
             (DataType::FixedSizeList(source, n), DataType::FixedSizeList(target, m)) if n == m => {
@@ -226,6 +234,7 @@ impl FieldAdaptation {
                     same_id(source, target)?,
                     target,
                     child_layout,
+                    table_schema,
                 )?))
             }
             (DataType::Map(source, s), DataType::Map(target, t)) if s == t => {
@@ -234,6 +243,7 @@ impl FieldAdaptation {
                     Some(source),
                     target,
                     child_layout,
+                    table_schema,
                 )?))
             }
             _ => {
@@ -271,7 +281,7 @@ impl FieldAdaptation {
                 Ok(())
             }
             Adaptation::List(child) | Adaptation::Map(child) => child.visit_bound_leaf_ids(visit),
-            Adaptation::InitialDefault | Adaptation::TypedNull | Adaptation::RequiredMissing => {
+            Adaptation::InitialDefault(_) | Adaptation::TypedNull | Adaptation::RequiredMissing => {
                 Ok(())
             }
         }
@@ -320,8 +330,8 @@ impl FieldAdaptation {
         path: &str,
     ) -> Result<ArrayRef, ConnectorError> {
         let source = match &self.kind {
-            Adaptation::InitialDefault => {
-                return build_iceberg_default_array(self.target.as_ref(), len)
+            Adaptation::InitialDefault(field) => {
+                return materialize_initial_default(field, self.target.data_type(), len)
                     .map_err(|error| corrupt(format!("iceberg initial default: {error}")));
             }
             Adaptation::RequiredMissing => {
@@ -393,7 +403,7 @@ impl FieldAdaptation {
                     path,
                 )
             }
-            Adaptation::InitialDefault | Adaptation::TypedNull | Adaptation::RequiredMissing => {
+            Adaptation::InitialDefault(_) | Adaptation::TypedNull | Adaptation::RequiredMissing => {
                 unreachable!("absent fields have no physical carrier")
             }
         }
@@ -469,7 +479,7 @@ impl FieldAdaptation {
     fn has_source(&self) -> bool {
         !matches!(
             self.kind,
-            Adaptation::InitialDefault | Adaptation::TypedNull | Adaptation::RequiredMissing
+            Adaptation::InitialDefault(_) | Adaptation::TypedNull | Adaptation::RequiredMissing
         )
     }
 
@@ -506,6 +516,7 @@ fn bind_struct_members(
     source: &Fields,
     target: &Fields,
     child_layout: BindingLayout,
+    table_schema: &Schema,
 ) -> Result<Vec<StructMember>, AdaptationError> {
     let mut slots = HashMap::with_capacity(source.len());
     for (slot, field) in source.iter().enumerate() {
@@ -524,6 +535,7 @@ fn bind_struct_members(
                 source_slot.map(|slot| source[slot].as_ref()),
                 field,
                 child_layout,
+                table_schema,
             )?;
             Ok(StructMember {
                 source_slot,

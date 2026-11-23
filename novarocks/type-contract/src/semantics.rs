@@ -101,14 +101,59 @@ pub struct SemanticParameterRef {
 
 pub const MAX_SEMANTIC_PARAMETERS: usize = 4096;
 
+/// The actual start of an admitted statement, measured on the FE wall clock.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct StatementStartUtc {
+    seconds: i64,
+    nanos: u32,
+}
+
+impl StatementStartUtc {
+    pub const fn try_new(seconds: i64, nanos: u32) -> Option<Self> {
+        if nanos >= 1_000_000_000 {
+            return None;
+        }
+        Some(Self { seconds, nanos })
+    }
+
+    pub const fn seconds(self) -> i64 {
+        self.seconds
+    }
+
+    pub const fn nanos(self) -> u32 {
+        self.nanos
+    }
+}
+
+/// The exact time facts resolved at the original statement admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatementTimeEnvironment {
+    pub start: StatementStartUtc,
+    pub zone: crate::TimeZoneKey,
+}
+
+impl StatementTimeEnvironment {
+    /// Resolve an individual declared dependency. Other semantic facts belong
+    /// to their original authors.
+    pub const fn parameter(self, key: SemanticParameterKey) -> Option<SemanticParameterValue> {
+        match key {
+            SemanticParameterKey::StatementStartUtc => {
+                Some(SemanticParameterValue::StatementStartUtc(self.start))
+            }
+            SemanticParameterKey::TimeZone => Some(SemanticParameterValue::TimeZone(self.zone)),
+            _ => None,
+        }
+    }
+}
+
 /// The value variant fixes its semantic key and logical type. A codec must
 /// reject a different key/type instead of coercing or supplying a default.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticParameterValue {
-    /// Microseconds since the UTC Unix epoch, captured at statement entry.
-    StatementStartUtc(i64),
-    /// An exact rule name or fixed-offset spelling from the admitted setting.
-    TimeZone(Box<str>),
+    /// UTC epoch seconds and normalized nanoseconds from statement entry.
+    StatementStartUtc(StatementStartUtc),
+    /// The exact zone identity in the frozen rule index.
+    TimeZone(crate::TimeZoneKey),
     AllowThrowException(bool),
     GroupConcatLegacy(bool),
     /// Raw admitted setting; specialization applies the existing minimum clamp.
@@ -227,24 +272,6 @@ impl SemanticParameters {
                     ));
                 }
                 has_statement_start = true;
-            }
-            if let SemanticParameterValue::TimeZone(zone) = &value {
-                let invalid_length = zone.is_empty() || zone.len() > 255;
-                construction_step(&mut work)?;
-                if invalid_length {
-                    return Err(SemanticParameterProjectionError::Parameter(
-                        SemanticParameterError::InvalidTimeZone,
-                    ));
-                }
-                for character in zone.chars() {
-                    let invalid = character.is_control();
-                    construction_step(&mut work)?;
-                    if invalid {
-                        return Err(SemanticParameterProjectionError::Parameter(
-                            SemanticParameterError::InvalidTimeZone,
-                        ));
-                    }
-                }
             }
             construction_flush(&mut work)?;
             table.entries.insert(id, value);
@@ -455,9 +482,9 @@ impl fmt::Display for SemanticParameterError {
             Self::TooManyParameters => {
                 f.write_str("semantic parameter table exceeds its definition bound")
             }
-            Self::InvalidTimeZone => f.write_str(
-                "semantic time zone must contain 1..255 bytes and no control characters",
-            ),
+            Self::InvalidTimeZone => {
+                f.write_str("semantic time zone must name a canonical frozen zone")
+            }
         }
     }
 }
@@ -498,10 +525,17 @@ mod tests {
     fn projection_keeps_sparse_identity_and_frozen_values() {
         let clock = SemanticParameterId::new(u32::MAX);
         let table = SemanticParameters::try_new([
-            (clock, SemanticParameterValue::StatementStartUtc(-17)),
+            (
+                clock,
+                SemanticParameterValue::StatementStartUtc(
+                    crate::StatementStartUtc::try_new(-17, 0).unwrap(),
+                ),
+            ),
             (
                 SemanticParameterId::new(2),
-                SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
+                SemanticParameterValue::TimeZone(
+                    crate::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
+                ),
             ),
             (
                 SemanticParameterId::new(9),
@@ -524,7 +558,9 @@ mod tests {
         assert_eq!(projected.entries().len(), 1);
         assert_eq!(
             projected.get(clock),
-            Some(&SemanticParameterValue::StatementStartUtc(-17))
+            Some(&SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(-17, 0).unwrap()
+            ))
         );
         assert_eq!(projected.clone(), projected);
         assert!(matches!(
@@ -552,11 +588,15 @@ mod tests {
             [
                 (
                     SemanticParameterId::new(1),
-                    SemanticParameterValue::StatementStartUtc(1),
+                    SemanticParameterValue::StatementStartUtc(
+                        crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                    ),
                 ),
                 (
                     SemanticParameterId::new(2),
-                    SemanticParameterValue::StatementStartUtc(2),
+                    SemanticParameterValue::StatementStartUtc(
+                        crate::StatementStartUtc::try_new(2, 0).unwrap(),
+                    ),
                 ),
             ],
         ] {
@@ -613,23 +653,21 @@ mod tests {
     }
 
     #[test]
-    fn time_zone_spelling_is_bounded_without_environment_lookup() {
-        for zone in [String::new(), "x".repeat(256), "UTC\n".into()] {
-            assert_eq!(
-                SemanticParameters::try_new([(
-                    SemanticParameterId::new(0),
-                    SemanticParameterValue::TimeZone(zone.into())
-                )]),
-                Err(SemanticParameterError::InvalidTimeZone)
-            );
-        }
-        assert!(
-            SemanticParameters::try_new([(
-                SemanticParameterId::new(0),
-                SemanticParameterValue::TimeZone("x".repeat(255).into())
-            )])
-            .is_ok()
+    fn statement_environment_keeps_negative_seconds_and_full_nanoseconds() {
+        let start = StatementStartUtc::try_new(-1, 987_654_321).unwrap();
+        assert_eq!((start.seconds(), start.nanos()), (-1, 987_654_321));
+        assert!(StatementStartUtc::try_new(0, 1_000_000_000).is_none());
+        let zone = crate::TimeZoneKey::parse("America/New_York").unwrap();
+        let env = StatementTimeEnvironment { start, zone };
+        assert_eq!(
+            env.parameter(SemanticParameterKey::StatementStartUtc),
+            Some(SemanticParameterValue::StatementStartUtc(start))
         );
+        assert_eq!(
+            env.parameter(SemanticParameterKey::TimeZone),
+            Some(SemanticParameterValue::TimeZone(zone))
+        );
+        assert_eq!(env.parameter(SemanticParameterKey::GroupConcatLegacy), None);
     }
 
     #[test]

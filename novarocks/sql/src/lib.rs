@@ -46,6 +46,7 @@ mod type_syntax;
 pub use novarocks_expression::typing::declaration::{
     TypeDeclarationError, TypeDeclarationProblem, find_retired_type_in_query, resolve_trino_type,
 };
+pub use novarocks_expression::typing::declared_temporal_type;
 pub use type_syntax::{TypeSyntaxError, sql_type_syntax};
 
 pub(crate) mod optimizer;

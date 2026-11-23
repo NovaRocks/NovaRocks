@@ -1557,6 +1557,14 @@ fn aggregate_topn() -> Arc<FragmentPackage> {
 }
 
 fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage> {
+    try_aggregate_topn_typed(ty, domain)
+        .unwrap_or_else(|error| panic!("the aggregate TopN filter plan validates: {error:?}"))
+}
+
+fn try_aggregate_topn_typed(
+    ty: ValueType,
+    domain: ValueType,
+) -> Result<Arc<FragmentPackage>, novarocks_physical_plan::PlanConstructionError> {
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan_typed(
         &mut builder,
@@ -1629,9 +1637,7 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
         5,
     ))
     .unwrap();
-    let plan = plan
-        .finish_observed(&FixtureControl)
-        .unwrap_or_else(|error| panic!("the aggregate TopN filter plan validates: {error:?}"));
+    let plan = plan.finish_observed(&FixtureControl)?;
     let read = frozen_read_declared_typed(
         true,
         &[connector_type_for_value_type(&ty).unwrap()],
@@ -1643,7 +1649,7 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
         Box::from([ty]),
         vec![dynamic_filter()],
     );
-    packages(&plan, Some(read)).remove(&PROBE).unwrap()
+    Ok(packages(&plan, Some(read)).remove(&PROBE).unwrap())
 }
 
 // ---------------------------------------------------------------------------

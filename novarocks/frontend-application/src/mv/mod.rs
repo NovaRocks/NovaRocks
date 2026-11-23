@@ -32,6 +32,7 @@ pub mod startup_isolation_file;
 pub(crate) mod startup_restore;
 
 pub use service::FrontendMvProductAdapter;
+pub(crate) use service::MvRefreshRuntimeSettings;
 
 #[cfg(novarocks_dev_controls)]
 pub mod test_controls;

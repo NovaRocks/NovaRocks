@@ -191,6 +191,124 @@ fn map_agg_core_actual_host_first_wins_partial_roundtrip_and_last_drop() {
     drop(allocator);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
+
+#[test]
+fn map_agg_temporal_partial_keeps_the_first_zone_and_distinct_fraction() {
+    use crate::builtin::temporal_output::TemporalOutputBuilder;
+    use novarocks_type_contract::{
+        TemporalMicros, TemporalPrecision, TemporalType, TemporalValue, TimeZoneKey, ValueKind,
+        ValueTypeStorageLifetime,
+    };
+    use novarocks_value_arrays::decode::PreparedTemporalArray;
+
+    let temporal = TemporalType::TimestampWithTimeZone(TemporalPrecision::NANOSECONDS);
+    let at = |picos, zone| TemporalValue::TimestampWithTimeZone {
+        instant: TemporalMicros::new(0, picos).unwrap(),
+        zone,
+    };
+    let first = at(1000, TimeZoneKey::UTC);
+    let duplicate = at(1000, TimeZoneKey::from_offset_minutes(60).unwrap());
+    let different = at(2000, TimeZoneKey::from_offset_minutes(60).unwrap());
+    let mut keys =
+        TemporalOutputBuilder::new(crate::temporal_cast::Type::Temporal(temporal), 3).unwrap();
+    for value in [first, duplicate, different] {
+        keys.temporal(temporal, value).unwrap();
+    }
+    let keys = keys.finish();
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+    let key_type = ValueTypeRef::try_new(
+        ValueKind::Temporal(temporal),
+        false,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let value_type = ValueTypeRef::try_new(
+        ValueKind::Scalar(DataType::Int64),
+        true,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let declaration = ValueTypeRef::try_new(
+        ValueKind::Map {
+            key: key_type.clone(),
+            value: value_type.clone(),
+        },
+        true,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let carrier = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", temporal.carrier(), false),
+                    Field::new("value", DataType::Int64, true),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut state = MapAggState::new(allocator.clone());
+    let mut work = ScalarWork::new(None);
+    for row in 0..3 {
+        update_from_arrays_observed(
+            &mut state,
+            (&keys, row, Some(&key_type)),
+            (&values, row, Some(&value_type)),
+            &mut work,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    }
+    let partial = build_array_checked_states(
+        &carrier,
+        Some(&declaration),
+        std::iter::once(Ok(&state)),
+        &mut work,
+    )
+    .unwrap();
+    let map = partial.as_any().downcast_ref::<MapArray>().unwrap();
+    assert_eq!(map.value_offsets(), &[0, 2]);
+    let keys = PreparedTemporalArray::bind(temporal, map.keys().as_ref(), false).unwrap();
+    assert_eq!(keys.value(0).unwrap(), Some(first));
+    assert_eq!(keys.value(1).unwrap(), Some(different));
+    assert_eq!(
+        map.values()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[1, 3]
+    );
+
+    let mut merged = MapAggState::new(allocator.clone());
+    let merge = merge_input(&partial).unwrap();
+    merge_row_observed(
+        &mut merged,
+        &merge,
+        0,
+        Some(&declaration),
+        &mut work,
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    let final_output = build_array_checked_states(
+        &carrier,
+        Some(&declaration),
+        std::iter::once(Ok(&merged)),
+        &mut work,
+    )
+    .unwrap();
+    assert_eq!(final_output.to_data(), partial.to_data());
+    drop((merged, state, allocator));
+    assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+}
+
 #[test]
 fn map_agg_core_every_update_callback_preserves_seven_causes_and_no_footer() {
     let input = update_input(&input()).unwrap();

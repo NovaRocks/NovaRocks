@@ -177,6 +177,8 @@ pub enum SqlType {
     /// read/insert; native CREATE of the tz variant is out of scope.
     DateTimeNs,
     Time,
+    /// Complete SQL temporal semantics paired with the column's actual layout.
+    Temporal(novarocks_type_contract::TemporalType),
     Array(Box<SqlType>),
     Map(Box<SqlType>, Box<SqlType>),
     Struct(Vec<(String, SqlType)>),

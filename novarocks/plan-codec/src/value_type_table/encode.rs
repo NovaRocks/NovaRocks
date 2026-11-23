@@ -145,6 +145,9 @@ impl Encoder<'_> {
             | ValueKind::BoundedCharacter(_)
             | ValueKind::Binary => Kind::Scalar(scalars::encode(value.kind(), context)?),
             ValueKind::Nominal(domain) => Kind::Nominal(scalars::encode_nominal(*domain)?),
+            ValueKind::Temporal(declaration) => {
+                Kind::Temporal(super::temporal::encode(*declaration))
+            }
             ValueKind::List(item) => Kind::ListItemTypeId(self.child(item, output, context)?),
             ValueKind::FixedSizeList { item, length } => {
                 Kind::FixedSizeList(wire::FixedSizeListValue {

@@ -37,7 +37,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::types::WrittenFile;
-use super::write_adaptation::{WriteAdaptationError, adapt_batch};
+use super::write_adaptation::{WriteAdaptationError, adapt_temporal_batch};
 use super::write_stack::equality_schema::EqualityDeleteFileTarget;
 
 use super::data_writer::StagedPathJournal;
@@ -122,7 +122,7 @@ async fn write_equality_delete_file_with_journal(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let batch = adapt_batch(&batch, &schema)?;
+    let batch = adapt_temporal_batch(&batch, &schema, &target.temporals)?;
     let path = format!(
         "{staging_dir}/equality-delete-{:08x}-{}.parquet",
         0,
@@ -209,16 +209,13 @@ mod tests {
 
     use super::*;
 
-    use crate::iceberg::arrow::schema_to_arrow_schema;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use arrow::array::{ArrayRef, Int8Array};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     fn target(fields: Vec<crate::iceberg::spec::NestedFieldRef>) -> EqualityDeleteFileTarget {
         let schema = Schema::builder().with_fields(fields).build().unwrap();
-        EqualityDeleteFileTarget {
-            arrow_schema: Arc::new(schema_to_arrow_schema(&schema).unwrap()),
-        }
+        EqualityDeleteFileTarget::from_schema(&schema).unwrap()
     }
 
     fn common_target() -> EqualityDeleteFileTarget {
@@ -454,8 +451,10 @@ mod tests {
 
     #[tokio::test]
     async fn equality_delete_sdk_target_preserves_timezone_and_dictionary_values() {
+        use arrow::array::builder::FixedSizeBinaryBuilder;
         use arrow::array::{DictionaryArray, LargeStringArray, TimestampMicrosecondArray};
-        use arrow::datatypes::{Int32Type, TimeUnit};
+        use arrow::datatypes::Int32Type;
+        use novarocks_type_contract::{TemporalCarrier, TemporalValue, TimeZoneKey};
         use parquet::basic::LogicalType;
         let dir = tempfile::tempdir().unwrap();
         let location = format!("file://{}", dir.path().display());
@@ -470,19 +469,30 @@ mod tests {
             )
             .unwrap(),
         );
+        let zoned = crate::temporal::declaration(&PrimitiveType::Timestamptz).unwrap();
+        let mut canonical = FixedSizeBinaryBuilder::new(14);
+        for micros in [Some(-1234567), None, Some(42)] {
+            if let Some(micros) = micros {
+                let instant = novarocks_type_contract::TemporalMicros::whole_micros(micros);
+                let value = TemporalValue::TimestampWithTimeZone {
+                    instant,
+                    zone: TimeZoneKey::UTC,
+                };
+                let TemporalCarrier::ZonedTimestamp(bytes) = value.to_carrier(zoned).unwrap()
+                else {
+                    panic!("expected the canonical zoned timestamp carrier");
+                };
+                canonical.append_value(bytes).unwrap();
+            } else {
+                canonical.append_null();
+            }
+        }
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
-                Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+                Field::new("ts", zoned.carrier(), true),
                 Field::new("s", dictionary.data_type().clone(), true),
             ])),
-            vec![
-                Arc::new(TimestampMicrosecondArray::from(vec![
-                    Some(-1234567),
-                    None,
-                    Some(42),
-                ])),
-                dictionary,
-            ],
+            vec![Arc::new(canonical.finish()), dictionary],
         )
         .unwrap();
         let written = write_equality_delete_file(

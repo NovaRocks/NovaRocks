@@ -128,21 +128,23 @@ fn comparison_recipe(
 ) -> Result<PreparedComparisonRecipe, FunctionBindingError> {
     let comparison = if operator.is_null_safe_comparison() {
         use DataType::*;
-        if !matches!(
-            left.data_type(),
-            Null | Boolean
-                | Int8
-                | Int16
-                | Int32
-                | Int64
-                | Float32
-                | Float64
-                | Utf8
-                | Date32
-                | Timestamp(_, None)
-                | Decimal128(..)
-                | Decimal256(..)
-        ) {
+        if left.value_type().temporal().is_none()
+            && !matches!(
+                left.data_type(),
+                Null | Boolean
+                    | Int8
+                    | Int16
+                    | Int32
+                    | Int64
+                    | Float32
+                    | Float64
+                    | Utf8
+                    | Date32
+                    | Timestamp(_, None)
+                    | Decimal128(..)
+                    | Decimal256(..)
+            )
+        {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
         ComparisonOperator::Eq

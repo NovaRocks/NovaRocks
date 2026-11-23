@@ -101,12 +101,13 @@ pub(crate) fn exact_requested_write_fields_from_declaration(
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     let arrow_schema =
         crate::scalar_integer_domain::sql_schema_from_document(iceberg_schema, document)?;
+    let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
     requested
         .iter()
         .map(|request| {
             creation.work(1).map_err(crate::metadata::metadata_creation_error)?;
             let requested_name = request.field().name();
-            let (ordinal, _iceberg_field) = iceberg_schema
+            let (ordinal, iceberg_field) = iceberg_schema
                 .as_struct()
                 .fields()
                 .iter()
@@ -124,7 +125,13 @@ pub(crate) fn exact_requested_write_fields_from_declaration(
                 invalid_write_activation("frozen writer execution declaration is absent")
             })?;
             creation.work(0).map_err(crate::metadata::metadata_creation_error)?;
-            ConnectorWriteFieldRequest::try_new_typed(arrow_field.clone(), value.clone())
+            let temporal = crate::temporal::TemporalReadProjection::from_type(&iceberg_field.field_type);
+            let field = if temporal.is_identity() {
+                arrow_field.clone()
+            } else {
+                project_write_field(arrow_field, value.data_type(), &temporal, &mut scratch, creation)?
+            };
+            ConnectorWriteFieldRequest::try_new_typed(field, value.clone())
         })
         .collect()
 }
@@ -184,12 +191,14 @@ pub(crate) fn canonical_data_write_fields_from_declaration(
         let same = input
             .exactly_equals_checked_observed(storage, || creation.work(1))
             .map_err(crate::metadata::metadata_creation_error)?;
-        let raw = if same {
+        let temporal = crate::temporal::TemporalReadProjection::from_type(&field.field_type);
+        let raw = if same && temporal.is_identity() {
             clone_write_field(original.field(ordinal), &mut scratch, creation)?
         } else {
             project_write_field(
                 original.field(ordinal),
                 input.data_type(),
+                &temporal,
                 &mut scratch,
                 creation,
             )?
@@ -209,6 +218,7 @@ pub(crate) fn canonical_data_write_fields_from_declaration(
 fn project_write_field<'source>(
     source: &'source arrow::datatypes::Field,
     target: &arrow::datatypes::DataType,
+    temporal: &crate::temporal::TemporalReadProjection,
     scratch: &mut novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<
         'source,
     >,
@@ -221,14 +231,25 @@ fn project_write_field<'source>(
     if source.data_type() == target {
         return clone_write_field(source, scratch, creation);
     }
+    if let crate::temporal::TemporalReadProjection::Leaf(declaration) = temporal
+        && &declaration.carrier() == target
+    {
+        return rebuild_write_field(source, target.clone(), creation);
+    }
     let data_type = match (source.data_type(), target) {
         (DataType::FixedSizeBinary(_), DataType::Binary) => DataType::Binary,
         (DataType::Struct(fields), DataType::Struct(targets)) if fields.len() == targets.len() => {
             let mut output = creation
                 .reserve(fields.len())
                 .map_err(crate::metadata::metadata_creation_error)?;
-            for (field, target) in fields.iter().zip(targets) {
-                let projected = project_write_field(field, target.data_type(), scratch, creation)?;
+            for (ordinal, (field, target)) in fields.iter().zip(targets).enumerate() {
+                let projected = project_write_field(
+                    field,
+                    target.data_type(),
+                    temporal.child(ordinal),
+                    scratch,
+                    creation,
+                )?;
                 output.push(
                     creation
                         .arc(projected)
@@ -242,7 +263,13 @@ fn project_write_field<'source>(
             )
         }
         (DataType::List(field), DataType::List(target)) => {
-            let projected = project_write_field(field, target.data_type(), scratch, creation)?;
+            let projected = project_write_field(
+                field,
+                target.data_type(),
+                temporal.child(0),
+                scratch,
+                creation,
+            )?;
             DataType::List(
                 creation
                     .arc(projected)
@@ -252,7 +279,13 @@ fn project_write_field<'source>(
         (DataType::Map(field, sorted), DataType::Map(target, target_sorted))
             if sorted == target_sorted =>
         {
-            let projected = project_write_field(field, target.data_type(), scratch, creation)?;
+            let projected = project_write_field(
+                field,
+                target.data_type(),
+                temporal.child(0),
+                scratch,
+                creation,
+            )?;
             DataType::Map(
                 creation
                     .arc(projected)
@@ -262,7 +295,7 @@ fn project_write_field<'source>(
         }
         _ => {
             return Err(invalid_write_activation(
-                "canonical writer source layout differs beyond licensed raw Fixed leaves",
+                "canonical writer source layout differs beyond its admitted temporal and raw Fixed leaves",
             ));
         }
     };
@@ -542,7 +575,13 @@ mod tests {
             creation.work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound()).map_err(crate::metadata::metadata_creation_error)?;
             let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
             let output = if changed {
-                project_write_field(&source, &DataType::Binary, &mut scratch, &mut creation)?
+                project_write_field(
+                    &source,
+                    &DataType::Binary,
+                    &crate::temporal::TemporalReadProjection::Identity,
+                    &mut scratch,
+                    &mut creation,
+                )?
             } else {
                 clone_write_field(&source, &mut scratch, &mut creation)?
             };

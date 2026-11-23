@@ -40,6 +40,11 @@ pub(super) fn retain_received_buffer(
     let parts = partition_chunk_by_hash_arrays_created(
         input,
         &[input.columns()[0].clone()],
+        |column| {
+            Ok(input.chunk_schema().slots()[column]
+                .field_schema()
+                .value_type())
+        },
         3,
         false,
         sender,

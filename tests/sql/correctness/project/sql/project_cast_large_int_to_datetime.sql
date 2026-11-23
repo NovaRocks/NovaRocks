@@ -16,19 +16,21 @@
 -- under the License.
 
 -- Migrated from dev/test/sql/test_cast/T/test_cast_to_datetime
--- Test Objective:
--- 1. Validate that CAST of out-of-range integers as DATETIME returns NULL.
--- 2. Cover overflow, zero, one, and max uint64.
--- 3. These values cannot represent valid DATETIME and must return NULL.
+-- Numeric values have no cast to TIMESTAMP, including through TRY_CAST.
+-- The DECIMAL literals preserve the original magnitudes beyond signed BIGINT.
 
 -- query 1
-select cast(CAST('-18446744073709551494' AS LARGEINT) AS TIMESTAMP(6));
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(DECIMAL '-18446744073709551494' AS timestamp(6));
 
 -- query 2
-select cast(0 AS TIMESTAMP(6));
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(0 AS timestamp(6));
 
 -- query 3
-select cast(1 AS TIMESTAMP(6));
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT TRY_CAST(1 AS timestamp(6));
 
 -- query 4
-select cast(CAST('18446744073709551615' AS LARGEINT) AS TIMESTAMP(6));
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+SELECT CAST(DECIMAL '18446744073709551615' AS timestamp(6));

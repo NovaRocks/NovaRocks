@@ -27,19 +27,27 @@ import fixture_run
 import fixture_runtime as runtime
 import trino_run
 
-# Only temporal logical-type differences are accepted by the approved G1b route.
+# Temporal logical-type differences are owned by TRC-6c.
 DIFFERENCE_OWNERS = {
     "ts_ntz": "TRC-6c", "ts_zoned": "TRC-6c", "time_value": "TRC-6c",
     "time_array": "TRC-6c", "time_map": "TRC-6c",
     "ts_ntz_array": "TRC-6c", "ts_zoned_array": "TRC-6c",
     "nano_ntz": "TRC-6c", "nano_zoned": "TRC-6c",
 }
+NESTED_VARIANT_OWNER = "IRU-9"
+NESTED_VARIANT_PATHS = {
+    "variant_array": "variant_array.element",
+    "variant_map": "variant_map.value",
+    "variant_row": "variant_row.v",
+}
+REGISTERED_OWNERS = DIFFERENCE_OWNERS | dict.fromkeys(NESTED_VARIANT_PATHS, NESTED_VARIANT_OWNER)
 BASE_COLUMNS = ["bool_value", "int_value", "long_value", "real_value", "double_value",
                 "decimal_value", "text_value", "binary_value", "date_value", "ts_ntz",
                 "ts_zoned", "array_value", "map_value", "row_value", "binary_map",
                 "ts_ntz_array", "ts_zoned_array"]
 TIME_COLUMNS = ["time_value", "time_array", "time_map"]
 VARIANT_COLUMNS = ["variant_value", "variant_array", "variant_map", "variant_row"]
+SCRATCH_PURPOSES = {"encoding-conformance": "g1", "official-cli": "cli", "jdbc-probe": "jdbc"}
 
 
 class ProbeBlocked(Exception):
@@ -122,6 +130,13 @@ def compare_column(name, reference, candidate):
     actual_sig = candidate.get("columns", [{}])[0].get("typeSignature")
     if candidate_error or actual_sig != ref_sig:
         owner = DIFFERENCE_OWNERS.get(name)
+        variant_path = NESTED_VARIANT_PATHS.get(name)
+        if (variant_path and candidate_error
+                and candidate_error.get("errorName") == "GENERIC_INTERNAL_ERROR"
+                and candidate_error.get("message", "").endswith(
+                    "could not be negotiated: Unsupported: reading Iceberg Variant nested inside STRUCT, LIST or MAP "
+                    f"is not supported: column {variant_path}")):
+            owner = NESTED_VARIANT_OWNER
         if owner is None:
             raise ProbeFailure("unregistered G1b difference for " + name)
         return {"column": name, "owner": owner, "trino_signature": ref_sig,
@@ -151,7 +166,7 @@ class Probe:
         self.values, self.manifest, self.budget = fixture_run.admit(self.env_file)
         if self.budget is None:
             raise ProbeBlocked("a shared fixture with an original RunBudget is required")
-        self.purpose = {"encoding-conformance": "trc1_g1", "official-cli": "trc1_cli", "jdbc-probe": "trc1_jdbc"}[args.mode]
+        self.purpose = SCRATCH_PURPOSES[args.mode]
         self.namespace = self.budget.identity.resource_name(self.purpose)
         self.scope = self.budget.identity.scope_root + "/rest/" + self.namespace
         self.containers = []
@@ -195,6 +210,19 @@ class Probe:
     def preflight(self):
         if shutil.which("docker") is None:
             raise ProbeBlocked("Docker client is unavailable; no image pull attempted")
+        if self.args.mode == "encoding-conformance":
+            # Encoding uses this host for NovaRocks HTTP and docker exec for the oracle.
+            try:
+                status, _, body = self.request("nova", "GET", self.args.nova + "/v1/info", {})
+            except (OSError, http.client.HTTPException) as error:
+                raise ProbeBlocked("host cannot reach the NovaRocks HTTP endpoint") from error
+            if status != 200 or not isinstance(json.loads(body), dict):
+                raise ProbeFailure("NovaRocks /v1/info did not return server information")
+            write_json(self.root / "preflight.json", {
+                "status": "PASS", "reference": {"trino_image": {"image_id": self.image}},
+                "nova_http_verified_against": self.args.nova,
+            })
+            return
         if platform.system() != "Linux":
             raise ProbeBlocked("official client host-network execution requires a Linux Docker host")
         # Verify the actual host-network operation; image identity was resolved by the run entry.
@@ -353,7 +381,9 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
 """
         self.spark(sql, "spark-independent-fixture")
         template = self.repository / "tests/system-test-runner/src/scenarios/trino_interop/supplemental.scala"
-        self.shell(template.read_text().replace("__NAMESPACE__", ns).replace("__SCOPE__", scope), "spark-independent-time-variant")
+        supplemental = self.shell(template.read_text().replace("__NAMESPACE__", ns).replace("__SCOPE__", scope), "spark-independent-time-variant")
+        if b"TRC1_INDEPENDENT_TIME_VARIANT_WRITER_OK" not in supplemental.stdout.splitlines():
+            raise ProbeFailure("Spark shell did not confirm that it created the independent time and variant tables")
         write_json(self.root / "fixture-coverage.json", {"producer": "Spark3.5 SQL plus Iceberg1.11 GenericRecord API within original Spark JVM",
             "base_columns": BASE_COLUMNS, "time_columns": TIME_COLUMNS, "variant_columns": VARIANT_COLUMNS,
             "timestamp_precision_values": [0, 3, 6], "variant": "conditional on both endpoint reads"})
@@ -367,19 +397,18 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
             mode = "legacy-time" if not capability else "parametric-time"
             for table, names in (("encoding_values", BASE_COLUMNS), ("time_values", TIME_COLUMNS)):
                 for name in names:
-                    sql = f"SELECT {name} FROM ice_rest.{self.namespace}.{table} ORDER BY id"
                     label = mode + "-" + name
-                    reference = self.query("trino", sql, label, capability)
-                    candidate = self.query("nova", sql, label, capability)
+                    reference = self.read_encoding_column("trino", table, name, label, capability)
+                    candidate = self.read_encoding_column("nova", table, name, label, capability)
                     difference = compare_column(name, reference, candidate)
                     if difference:
                         differences.append(dict(mode=mode, **difference))
                     else:
                         compared.append({"mode": mode, "column": name, "rows": len(reference["data"])})
                     write_json(self.root / "g1a-comparison.json", {"status": "RUNNING", "compared": compared})
-                    write_json(self.root / "g1b-differences.json", {"status": "RUNNING", "registered_owners": DIFFERENCE_OWNERS, "differences": differences})
+                    write_json(self.root / "g1b-differences.json", {"status": "RUNNING", "registered_owners": REGISTERED_OWNERS, "differences": differences})
         # Conditional Variant coverage is discovered by real reads, not by image tag assumptions.
-        probes = {endpoint: self.query(endpoint, f"SELECT variant_value FROM ice_rest.{self.namespace}.variant_values ORDER BY id", "variant-support")
+        probes = {endpoint: self.read_encoding_column(endpoint, "variant_values", "variant_value", "variant-support")
                   for endpoint in ("trino", "nova")}
         if any("error" in value for value in probes.values()):
             if any(value.get("error", {}).get("errorName") not in (None, "NOT_SUPPORTED", "UNSUPPORTED_TYPE") for value in probes.values()):
@@ -389,10 +418,9 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
         else:
             for capability in ("PARAMETRIC_DATETIME", "PARAMETRIC_DATETIME,VARIANT", "PARAMETRIC_DATETIME,VARIANT,VARIANT_BINARY"):
                 for name in VARIANT_COLUMNS:
-                    sql = f"SELECT {name} FROM ice_rest.{self.namespace}.variant_values ORDER BY id"
                     label = capability.replace(",", "-") + "-" + name
-                    reference = self.query("trino", sql, label, capability)
-                    candidate = self.query("nova", sql, label, capability)
+                    reference = self.read_encoding_column("trino", "variant_values", name, label, capability)
+                    candidate = self.read_encoding_column("nova", "variant_values", name, label, capability)
                     difference = compare_column(name, reference, candidate)
                     if difference:
                         differences.append(dict(mode=capability, **difference))
@@ -400,7 +428,12 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
                         compared.append({"mode": capability, "column": name, "rows": len(reference["data"])})
             variant = {"status": "PASS"}
         write_json(self.root / "g1a-comparison.json", {"status": "PASS", "compared": compared, "variant": variant})
-        write_json(self.root / "g1b-differences.json", {"status": "PASS", "registered_owners": DIFFERENCE_OWNERS, "differences": differences})
+        write_json(self.root / "g1b-differences.json", {"status": "PASS", "registered_owners": REGISTERED_OWNERS, "differences": differences})
+
+    def read_encoding_column(self, endpoint, table, column, label, capabilities="PARAMETRIC_DATETIME"):
+        catalog = {"trino": "iceberg", "nova": "ice_rest"}[endpoint]
+        sql = f"SELECT {column} FROM {catalog}.{self.namespace}.{table} ORDER BY id"
+        return self.query(endpoint, sql, label, capabilities)
 
     def cleanup(self):
         errors = []
@@ -559,7 +592,7 @@ def resume_cleanup(args):
     if probe.budget.as_dict() != ledger["run"]:
         raise ProbeFailure("cleanup original deadline or identity changed")
     probe.namespace, probe.scope, probe.purpose = ledger["namespace"], ledger["scope"], ledger["purpose"]
-    if probe.purpose not in ("trc1_g1", "trc1_cli", "trc1_jdbc") or probe.namespace != probe.budget.identity.resource_name(probe.purpose) or probe.scope != probe.budget.identity.scope_root + "/rest/" + probe.namespace:
+    if probe.purpose not in SCRATCH_PURPOSES.values() or probe.namespace != probe.budget.identity.resource_name(probe.purpose) or probe.scope != probe.budget.identity.scope_root + "/rest/" + probe.namespace:
         raise ProbeFailure("cleanup resource location differs from the original run")
     probe.containers = ledger["containers"]
     for record in probe.containers:

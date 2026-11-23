@@ -97,6 +97,7 @@ fn scalar_to_string_inner(
             DataType::Timestamp(unit, tz) => format_timestamp(*unit, *v, tz.as_deref()),
             _ => Ok(v.to_string()),
         },
+        AggScalarValue::Temporal(..) => Err(crate::aggregate_scalar::temporal_scalar_contract()),
         AggScalarValue::Decimal128(v) => match data_type {
             DataType::Decimal128(_, scale) => Ok(format_decimal(*v, *scale)),
             _ => Ok(v.to_string()),

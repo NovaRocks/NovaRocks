@@ -129,6 +129,42 @@ fn policy() -> ConstantPolicy {
 }
 
 #[test]
+fn declared_timestamp_has_total_null_safe_comparison() {
+    use novarocks_type_contract::{
+        TemporalPrecision, TemporalType, ValueKind, ValueLayout, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    let declaration = TemporalType::Timestamp(TemporalPrecision::MICROSECONDS);
+    let ty = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::Temporal(declaration),
+            true,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&declaration.carrier(), ValueTypeStorageLifetime::pure()).unwrap(),
+    )
+    .unwrap();
+    let left: ArrayRef = Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![
+        None,
+        None,
+        Some(-1),
+        Some(-1),
+    ]));
+    let right: ArrayRef = Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![
+        None,
+        Some(0),
+        Some(-1),
+        Some(0),
+    ]));
+    let recipe =
+        PreparedNullSafeComparisonRecipe::try_new(&ty, &ty, &CompileControl::default()).unwrap();
+    for (ordinal, expected) in [true, false, true, false].into_iter().enumerate() {
+        assert_eq!(row(&recipe, &left, &right, ordinal), expected);
+    }
+}
+
+#[test]
 fn all_fourteen_legacy_nonnull_profiles_and_null_have_total_independent_truth_tables() {
     let mut profiles = Vec::<(ArrayRef, ArrayRef)>::new();
     macro_rules! p {

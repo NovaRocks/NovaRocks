@@ -16,13 +16,7 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Validate nanosecond-precision timestamp (TIMESTAMP_NS) create/insert/read
--- round-trip through the Iceberg REST catalog:
--- - CREATE TABLE with a TIMESTAMP_NS column
--- - INSERT three rows with nanosecond-precision literals
--- - SELECT id and CAST(ts AS STRING) to assert 9 fractional digits survive
---   (the MySQL wire protocol truncates to microseconds; CAST to STRING bypasses
---   that and renders the full nanosecond value)
+-- Validate the declaration and values of Iceberg REST's nanosecond timestamp.
 
 -- query 1
 -- @skip_result_check=true
@@ -30,26 +24,21 @@ CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
--- TIMESTAMP_NS requires Iceberg format-version 3 (timestamp_ntz / timestamp_tz
--- nanosecond precision was introduced in the v3 spec).
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0} (
   id BIGINT,
-  ts TIMESTAMP_NS
+  ts TIMESTAMP(9)
 ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
 VALUES
-  ROW(1, '2024-01-02 03:04:05.123456789'),
-  ROW(2, '2024-01-02 03:04:05.000000001'),
-  ROW(3, '1970-01-01 00:00:00.000000000');
+  ROW(1, TIMESTAMP '2024-01-02 03:04:05.123456789'),
+  ROW(2, TIMESTAMP '2024-01-02 03:04:05.000000001'),
+  ROW(3, TIMESTAMP '1970-01-01 00:00:00.000000000');
 
 -- query 4
--- Nanosecond-precision assertion: CAST to STRING renders 9 fractional digits.
--- The significant nanosecond digits (.789 and .001) must NOT be truncated to
--- microseconds (.123456 / .000000).
-SELECT id, CAST(ts AS VARCHAR) AS s
+SELECT id, ts
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
   ORDER BY id;
 
@@ -61,14 +50,11 @@ SELECT id, CAST(ts AS VARCHAR) AS s
 -- both pass (COUNT=2), proving the nanosecond path is exercised.
 SELECT COUNT(*) AS cnt
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
-  WHERE ts > '2024-01-02 03:04:05.000000001';
+  WHERE ts > TIMESTAMP '2024-01-02 03:04:05.000000001';
 
 -- query 6
--- CAST nanosecond timestamp to DATETIME (microsecond) demonstrates narrowing truncation.
--- ts .123456789 → .123456 (789 sub-microsecond ns discarded)
--- ts .000000001 → .000000 (1 sub-microsecond ns discarded)
--- ts epoch     → no fractional part shown
-SELECT id, CAST(CAST(ts AS TIMESTAMP(6)) AS VARCHAR) AS micros
+-- Narrowing to TIMESTAMP(6) rounds once at the requested precision.
+SELECT id, CAST(ts AS TIMESTAMP(6)) AS micros
   FROM iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
   ORDER BY id;
 
@@ -78,7 +64,7 @@ SELECT id, CAST(CAST(ts AS TIMESTAMP(6)) AS VARCHAR) AS micros
 -- @expect_error=nanosecond
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_part_${uuid0} (
   id BIGINT,
-  ts TIMESTAMP_NS
+  ts TIMESTAMP(9)
 ) WITH (partitioning = ARRAY['day(ts)'], format_version = 3);
 
 -- query 8

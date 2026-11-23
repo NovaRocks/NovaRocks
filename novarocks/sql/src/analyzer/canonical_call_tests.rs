@@ -148,7 +148,7 @@ fn assert_bound(
 }
 
 #[test]
-fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_fvt() {
+fn canonical_named_day_calls_keep_four_units_zones_and_source_fvt() {
     let mut carriers = vec![DataType::Date32];
     for unit in [
         TimeUnit::Second,
@@ -185,15 +185,9 @@ fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_
                 FunctionValueType::new(DataType::Int64, true),
             ];
             let result = FunctionValueType::new(target.clone(), true);
-            let sql = "SELECT x+CAST(5 AS INT), CAST(5 AS INT)+x, x-CAST(5 AS INT), days_add(x,CAST(5 AS INT)), days_sub(x,CAST(5 AS INT)) FROM temporal_source";
+            let sql = "SELECT days_add(x,CAST(5 AS INT)), days_sub(x,CAST(5 AS INT)) FROM temporal_source";
             let query = analyze(sql, &source, crate::constant::test_constant_policy()).unwrap();
-            for (ordinal, name) in [
-                (0, "days_add"),
-                (1, "days_add"),
-                (2, "days_sub"),
-                (3, "days_add"),
-                (4, "days_sub"),
-            ] {
+            for (ordinal, name) in [(0, "days_add"), (1, "days_sub")] {
                 let expression = project(&query, ordinal);
                 assert_bound(expression, name, &args, &result);
                 let date = &call(expression).2[0];
@@ -221,20 +215,12 @@ fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_
                     assert!(matches!(date.kind, ExprKind::ColumnRef { .. }));
                 }
             }
-            assert_eq!(
-                call(project(&query, 0)).1.selected,
-                call(project(&query, 3)).1.selected
-            );
-            assert_eq!(
-                call(project(&query, 2)).1.selected,
-                call(project(&query, 4)).1.selected
-            );
         }
     }
 }
 
 #[test]
-fn canonical_day_arithmetic_inherits_root_policy_and_required_nullable_sources() {
+fn canonical_named_day_calls_inherit_root_policy_and_preserve_nullable_sources() {
     use DecimalOverflowPolicy::{OutputNull, ReportError};
     let source = SourceCatalog {
         carrier: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -243,7 +229,7 @@ fn canonical_day_arithmetic_inherits_root_policy_and_required_nullable_sources()
     };
     for (outer, outer_policy) in [("ERROR_IF_OVERFLOW", ReportError), ("32", OutputNull)] {
         let sql = format!(
-            "WITH SESSION sql_mode = '{outer}' SELECT q.x+CAST(1 AS INT), days_add(q.x,CAST(1 AS INT)) FROM (SELECT x,x-CAST(1 AS INT) AS shifted FROM temporal_source) q"
+            "WITH SESSION sql_mode = '{outer}' SELECT days_add(q.x,CAST(1 AS INT)), days_sub(q.x,CAST(1 AS INT)) FROM (SELECT x,days_sub(x,CAST(1 AS INT)) AS shifted FROM temporal_source) q"
         );
         // The admitted root policy also governs expressions in the derived query.
         let query = analyze(&sql, &source, crate::constant::test_constant_policy()).unwrap();
@@ -284,18 +270,17 @@ fn canonical_day_arithmetic_inherits_root_policy_and_required_nullable_sources()
         };
         assert_eq!(*decimal_overflow_policy, outer_policy);
     }
-    // Typed temporal NULL is a legitimate source; it does not authorize a
-    // bare untyped NULL arithmetic domain or an extra raw carrier profile.
+    // An explicitly typed NULL retains the named function's argument contract.
     let query = analyze(
-        "SELECT CAST(NULL AS DATETIME)+1, days_add(CAST(NULL AS DATETIME),1)",
+        "SELECT days_add(CAST(NULL AS DATETIME),1), days_sub(CAST(NULL AS DATETIME),1)",
         &source,
         crate::constant::test_constant_policy(),
     )
     .unwrap();
-    for ordinal in [0, 1] {
+    for (ordinal, name) in [(0, "days_add"), (1, "days_sub")] {
         assert_bound(
             project(&query, ordinal),
-            "days_add",
+            name,
             &[
                 FunctionValueType::new(DataType::Timestamp(TimeUnit::Microsecond, None), true),
                 FunctionValueType::new(DataType::Int64, false),

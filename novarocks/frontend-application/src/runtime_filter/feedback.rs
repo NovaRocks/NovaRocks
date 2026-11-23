@@ -587,6 +587,9 @@ fn connector_values(
             .iter()
             .map(|value| ConnectorValue::try_decimal(*value, *precision, *scale).ok())
             .collect::<Option<Vec<_>>>()?,
+        // The feedback codec carries the relation key bytes but no temporal
+        // declaration. Its row application retains the original typed scope.
+        MembershipValues::Temporal { .. } => return None,
         MembershipValues::LargeInt(values) => values
             .iter()
             .map(|value| ConnectorValue::Fixed(value.to_be_bytes().into()))

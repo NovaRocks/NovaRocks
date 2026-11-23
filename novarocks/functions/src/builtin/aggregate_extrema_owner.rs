@@ -441,20 +441,21 @@ impl ExtremaOwner {
             else {
                 return Err(invalid("MIN/MAX requires its selected value channel"));
             };
-            let supported = (supported_type(source.data_type())
-                || source.data_type() == &DataType::Utf8)
-                && match source.logical_type() {
-                    ValueLogicalType::LargeInt => {
-                        source.data_type() == &DataType::FixedSizeBinary(16)
-                    }
-                    ValueLogicalType::Physical => {
-                        source.data_type() != &DataType::FixedSizeBinary(16)
-                    }
-                    // The installed resolver and original extrema kernel keep
-                    // this nominal tag while comparing the original UTF-8 bytes.
-                    ValueLogicalType::Json => source.data_type() == &DataType::Utf8,
-                    _ => false,
-                };
+            let temporal = source.value_type().temporal();
+            let supported = temporal.is_some()
+                || ((supported_type(source.data_type()) || source.data_type() == &DataType::Utf8)
+                    && match source.logical_type() {
+                        ValueLogicalType::LargeInt => {
+                            source.data_type() == &DataType::FixedSizeBinary(16)
+                        }
+                        ValueLogicalType::Physical => {
+                            source.data_type() != &DataType::FixedSizeBinary(16)
+                        }
+                        // The installed resolver and original extrema kernel keep
+                        // this nominal tag while comparing the original UTF-8 bytes.
+                        ValueLogicalType::Json => source.data_type() == &DataType::Utf8,
+                        _ => false,
+                    });
             work.step().map_err(compile_failure)?;
             if !supported {
                 return Err(invalid(
@@ -471,7 +472,9 @@ impl ExtremaOwner {
                 && final_type.nullable()
                 && intermediate.nullable()
                 && source.logical_type() == final_type.logical_type()
-                && source.logical_type() == intermediate.logical_type();
+                && source.logical_type() == intermediate.logical_type()
+                && temporal == final_type.value_type().temporal()
+                && temporal == intermediate.value_type().temporal();
             work.step().map_err(compile_failure)?;
             if !exact
                 || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(

@@ -1,0 +1,4 @@
+-- query 3
+-- types	timestamp(9)	time(6)	timestamp(9) with time zone
+event	clock	zoned
+2024-01-01 00:00:00.123456790	12:34:56.123400	2024-01-01 00:00:00.123456789 UTC

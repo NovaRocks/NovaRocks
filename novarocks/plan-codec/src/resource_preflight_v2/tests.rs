@@ -94,7 +94,8 @@ fn library_profile_is_the_actual_locked_workspace_decoder_and_container_version(
 #[test]
 fn actual_generated_root_depth_and_empty_input_have_explicit_allocation_domains() {
     let model = FragmentDecodeResourceModel::try_new(&Control::default()).unwrap();
-    assert_eq!(model.max_message_depth, 12);
+    let expected_depth = 14;
+    assert_eq!(model.max_message_depth, expected_depth);
     let result = model.preflight(&[], limits(), &Control::default()).unwrap();
     assert_eq!(result.status, ResourceCursorStatus::Complete);
     assert_eq!(result.usage.input_bytes, 0);
@@ -106,7 +107,7 @@ fn actual_generated_root_depth_and_empty_input_have_explicit_allocation_domains(
     );
     assert_eq!(
         result.usage.error_requested_heap_bytes_upper,
-        allocation::error_heap(12).unwrap()
+        allocation::error_heap(expected_depth).unwrap()
     );
     assert!(
         result.usage.cumulative_requested_heap_bytes_upper

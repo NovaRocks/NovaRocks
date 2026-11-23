@@ -152,6 +152,175 @@ fn prepared<'a>(
 }
 
 #[test]
+fn nested_temporal_grouping_keeps_the_first_observed_zone_through_compaction() {
+    use novarocks_type_contract::{
+        TemporalCarrier, TemporalMicros, TemporalPrecision, TemporalType, TemporalValue,
+        TimeZoneKey, ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let declaration = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+    let timestamp = TemporalMicros::from_picos(-1).unwrap();
+    let shanghai = TimeZoneKey::parse("Asia/Shanghai").unwrap();
+    let payload = |zone| {
+        let value = TemporalValue::TimestampWithTimeZone {
+            instant: timestamp,
+            zone,
+        };
+        let TemporalCarrier::ZonedTimestamp(bytes) = value.to_carrier(declaration).unwrap() else {
+            panic!("unexpected carrier");
+        };
+        bytes
+    };
+    let first = payload(shanghai);
+    let second = payload(TimeZoneKey::UTC);
+    // Invalid hidden bits must never be interpreted as an actual timestamp.
+    let hidden = [u8::MAX; 14];
+    let child = FixedSizeBinaryArray::try_from_iter(
+        [first.as_slice(), second.as_slice(), hidden.as_slice()].into_iter(),
+    )
+    .unwrap();
+    let fields = vec![Arc::new(Field::new("ts", declaration.carrier(), false))].into();
+    let array: ArrayRef = Arc::new(StructArray::new(
+        fields,
+        vec![Arc::new(child)],
+        Some(NullBuffer::from(vec![true, true, false])),
+    ));
+    let storage = ValueTypeStorageLifetime::pure();
+    let child =
+        ValueTypeRef::try_new(ValueKind::Temporal(declaration), false, storage.clone()).unwrap();
+    let root = ValueTypeRef::try_new(
+        ValueKind::Struct(vec![ValueField::new("ts", child, storage.clone())].into()),
+        true,
+        storage.clone(),
+    )
+    .unwrap();
+    let ty = FunctionValueType::try_from_value(
+        root,
+        ValueLayout::try_new(array.data_type(), storage).unwrap(),
+    )
+    .unwrap();
+
+    for (equality, expected) in [
+        (KeyEquality::SqlGrouping(NullPolicy::Equal), [0, 0, 1]),
+        (KeyEquality::ResultContent, [0, 1, 2]),
+    ] {
+        let (owner, tracker) = owner_with_tracker();
+        let types = std::slice::from_ref(&ty);
+        let spec =
+            KeySpec::with_equalities(types, &[equality], owner.as_ref(), &|| Ok(())).unwrap();
+        let keys = input(
+            std::slice::from_ref(&array),
+            types,
+            &[0, 1, 2],
+            owner.as_ref(),
+        );
+        let mut index = KeyIndex::new(
+            spec.clone(),
+            IndexPurpose::KeyIds,
+            tracker.clone(),
+            owner.as_ref(),
+        )
+        .unwrap();
+        let hashes = hash(&keys, &spec, index.policy(), owner.as_ref());
+        if equality != KeyEquality::ResultContent {
+            assert_eq!(hashes.hash(0).unwrap(), hashes.hash(1).unwrap());
+        }
+        let hashes = hashes.with_hashes_for_test(&[0; 3]);
+        let values = prepared(&spec, &keys, &tracker, owner.as_ref());
+        let matches = expected.map(|id| KeyMatch::Found(KeyId(id)));
+        assert_eq!(
+            index
+                .intern_batch(&values, &hashes, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .matches(),
+            matches
+        );
+        index.compact(owner.as_ref(), &CopyControl).unwrap();
+        assert_eq!(
+            index
+                .probe_batch(&values, &hashes, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .matches(),
+            matches
+        );
+        let output = index
+            .export_keys(&[KeyId(0)], types, owner.as_ref(), &CopyControl)
+            .unwrap();
+        let row = output.arrays()[0]
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let leaf = row
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(leaf.value(0), first);
+    }
+}
+
+#[test]
+fn nested_compact_temporal_key_uses_one_frame_for_comparison_and_output() {
+    use arrow::array::{BinaryArray, TimestampMicrosecondArray};
+    use novarocks_type_contract::{
+        TemporalPrecision, TemporalType, ValueField, ValueKind, ValueLayout, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+
+    let temporal = TemporalType::Timestamp(TemporalPrecision::MICROSECONDS);
+    let payload = [0x55_u8; 4096];
+    let array: ArrayRef = Arc::new(StructArray::new(
+        vec![
+            Field::new("ts", temporal.carrier(), false),
+            Field::new("payload", DataType::Binary, false),
+        ]
+        .into(),
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![-1_i64])),
+            Arc::new(BinaryArray::from(vec![payload.as_slice()])),
+        ],
+        None,
+    ));
+    let storage = ValueTypeStorageLifetime::pure();
+    let field = |name, kind| {
+        ValueField::new(
+            name,
+            ValueTypeRef::try_new(kind, false, storage.clone()).unwrap(),
+            storage.clone(),
+        )
+    };
+    let semantic = ValueTypeRef::try_new(
+        ValueKind::Struct(
+            vec![
+                field("ts", ValueKind::Temporal(temporal)),
+                field("payload", ValueKind::Binary),
+            ]
+            .into(),
+        ),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let ty = FunctionValueType::try_from_value(
+        semantic,
+        ValueLayout::try_new(array.data_type(), storage).unwrap(),
+    )
+    .unwrap();
+    let (owner, tracker) = owner_with_tracker();
+    let types = [ty];
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal], owner.as_ref(), &|| Ok(())).unwrap();
+    let input = input(&[array], &types, &[0], owner.as_ref());
+    let prepared = prepared(&spec, &input, &tracker, owner.as_ref());
+    let comparison = prepared
+        .encode_component_row::<false, false>(0, 0, &|| Ok(()))
+        .unwrap();
+    let output = prepared
+        .encode_component_row::<false, true>(0, 0, &|| Ok(()))
+        .unwrap();
+    assert_eq!(&*output, &*comparison);
+    assert_eq!(output[0], 1, "required non-NULL frame header");
+}
+
+#[test]
 fn content_and_grouping_classify_zero_nan_and_parent_null_through_storage_and_compaction() {
     for kind in 0..4 {
         for equality in [

@@ -259,9 +259,21 @@ fn type_parsed<'a>(
     let parameters = context
         .parameters
         .project_observed(
-            draft
-                .definitions()
-                .flat_map(|node| node.kind.intrinsic_parameter_references().copied()),
+            draft.definitions().flat_map(|node| {
+                let call_refs = match &node.kind {
+                    novarocks_expression_contract::ExprKind::FunctionCall { function, .. } => {
+                        function
+                            .legacy_metadata
+                            .as_ref()
+                            .map_or(&[][..], |info| info.semantic_parameters.as_ref())
+                    }
+                    _ => &[],
+                };
+                node.kind
+                    .intrinsic_parameter_references()
+                    .chain(call_refs)
+                    .copied()
+            }),
             CompilePhase::FunctionSpecialization,
             work.control(),
         )

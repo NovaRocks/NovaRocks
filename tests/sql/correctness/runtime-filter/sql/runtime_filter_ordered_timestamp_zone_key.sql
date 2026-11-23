@@ -18,8 +18,8 @@
 -- @order_sensitive=true
 -- @tags=runtime_filter,ordered_domain,timestamp_timezone
 -- Test Objective:
--- 1. The UTC timestamp key of an Iceberg metadata scan must not install an
---    optional ordered filter outside its declared key domain.
+-- 1. The ordered filter on the Iceberg metadata scan uses its declared
+--    zoned timestamp key.
 -- 2. Returning only the group count keeps the oracle independent of timestamps.
 -- One INSERT commits exactly one append snapshot. Both queries therefore return
 -- one, and neither exposes generated snapshot IDs or wall-clock timestamps.
@@ -31,7 +31,7 @@ SET SESSION disable_optimizer_rules = 'PushDownTopNToPreAgg';
 SET SESSION enable_global_runtime_filter = true;
 -- @explain_contains=LOCAL TOP-N (limit=1, offset=0)
 -- @explain_contains=HASH AGGREGATE (GLOBAL, group by: [rf_ordered_timestamp_zone$snapshots.committed_at])
--- @explain_not_contains=domain = OrderedBound
+-- @explain_contains=domain = OrderedBound
 SELECT COUNT(*) AS snapshots_at_first_commit
 FROM ${case_db}."rf_ordered_timestamp_zone$snapshots"
 GROUP BY committed_at ORDER BY committed_at LIMIT 1;

@@ -1865,3 +1865,65 @@ fn add_files_enum_binding_preserves_trino_property_messages() {
         );
     }
 }
+
+#[test]
+fn statement_environment_system_property_uses_checked_constants_and_preserves_live_zone() {
+    use novarocks_query_application::sql::session::{
+        SessionSqlState,
+        registry::{
+            SessionCatalogPropertyAdmission, SessionCatalogPropertyPort, SessionPropertyRegistry,
+            SessionPropertyScope, SessionPropertyType,
+        },
+    };
+    use novarocks_type_contract::{StatementStartUtc, StatementTimeEnvironment, TimeZoneKey};
+
+    struct NoCatalog;
+    impl SessionCatalogPropertyPort for NoCatalog {
+        fn session_property_catalog(
+            &self,
+            _: &str,
+        ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+            panic!("system property has no catalog dependency")
+        }
+    }
+
+    let registry = SessionPropertyRegistry::new().unwrap();
+    let environment = StatementTimeEnvironment {
+        start: StatementStartUtc::try_new(1, 999_999_999).unwrap(),
+        zone: TimeZoneKey::UTC,
+    };
+    let original = SessionSqlState::default();
+    let source = "WITH SESSION time_zone_id = '-05:30' SELECT 1";
+    let query = novarocks_parser::parser::parse_query(source).unwrap();
+    let control = Control::default();
+    let prepare = |value: Option<&str>| {
+        registry.prepare_query_session(
+            source,
+            &query.session_properties,
+            &original,
+            &NoCatalog,
+            &control,
+            |state, property, _| {
+                assert_eq!(property.value_type(), SessionPropertyType::Varchar);
+                assert_eq!(property.scope(), &SessionPropertyScope::System);
+                assert_eq!(state.statement_time(environment), environment);
+                Ok(text(value))
+            },
+        )
+    };
+
+    let local = prepare(Some("-05:30")).unwrap().statement_time(environment);
+    assert_eq!(local.start, environment.start);
+    assert_eq!(local.zone.name(), "-05:30");
+    assert_eq!(original.statement_time(environment), environment);
+    for invalid in [None, Some("-14:01"), Some("+00:00:01")] {
+        let error = match prepare(invalid) {
+            Ok(_) => panic!("invalid zone property passed"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.admit.invalid_session_property"
+        );
+    }
+}

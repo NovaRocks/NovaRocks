@@ -84,6 +84,88 @@ impl Parser<'_> {
         }
         Ok(self.text[start..self.position].parse()?)
     }
+    fn keyword(&mut self, expected: &str) -> bool {
+        let start = self.position;
+        if self
+            .word()
+            .is_ok_and(|word| word.eq_ignore_ascii_case(expected))
+        {
+            true
+        } else {
+            self.position = start;
+            false
+        }
+    }
+    fn interval_field(&mut self) -> Result<u64> {
+        Ok(match self.word()?.to_ascii_lowercase().as_str() {
+            "year" => 0,
+            "month" => 1,
+            "day" => 2,
+            "hour" => 3,
+            "minute" => 4,
+            "second" => 5,
+            _ => bail!("invalid Trino interval field"),
+        })
+    }
+    fn interval(&mut self) -> Result<TypeSignature> {
+        let start = self.interval_field()?;
+        if !self.consume('(') {
+            if !self.keyword("to") {
+                bail!("legacy Trino interval type requires a full family name");
+            }
+            return Ok(TypeSignature::simple(
+                match (start, self.interval_field()?) {
+                    (0, 1) => "interval year to month",
+                    (2, 5) => "interval day to second",
+                    _ => bail!("invalid legacy Trino interval family"),
+                },
+            ));
+        }
+        let leading = self.number()?;
+        let simple_fraction = if self.consume(',') {
+            Some(self.number()?)
+        } else {
+            None
+        };
+        self.expect(')')?;
+        let (end, fractional) = if self.keyword("to") {
+            if simple_fraction.is_some() || start == 5 {
+                bail!("invalid leading Trino interval field");
+            }
+            let end = self.interval_field()?;
+            if end <= start {
+                bail!("Trino interval end field must follow its start field");
+            }
+            let fractional = if end == 5 {
+                self.expect('(')?;
+                let digits = self.number()?;
+                self.expect(')')?;
+                digits
+            } else {
+                0
+            };
+            (end, fractional)
+        } else {
+            let fractional = match (start, simple_fraction) {
+                (5, Some(digits)) => digits,
+                (0..=4, None) => 0,
+                _ => bail!("invalid Trino interval fractional precision"),
+            };
+            (start, fractional)
+        };
+        let mut signature = TypeSignature::simple(if start <= 1 {
+            "interval year to month"
+        } else {
+            "interval day to second"
+        });
+        signature
+            .arguments
+            .extend([start, end, leading].map(TypeArgument::Long));
+        if start >= 2 {
+            signature.arguments.push(TypeArgument::Long(fractional));
+        }
+        Ok(signature)
+    }
     fn field_name(&mut self) -> Result<String> {
         if !self.consume('"') {
             return self.word();
@@ -170,6 +252,7 @@ impl Parser<'_> {
                     }
                 }
             }
+            "interval" | "INTERVAL" => signature = self.interval()?,
             "decimal" => {
                 self.expect('(')?;
                 signature.arguments.push(TypeArgument::Long(self.number()?));

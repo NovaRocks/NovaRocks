@@ -542,6 +542,10 @@ enum BindingResolverOwnerKind {
     Unnest(Arc<crate::builtin::UnnestOwner>),
     BorrowedAggregate(Arc<crate::builtin::catalogue::BuiltinAggregateResolver>),
     BorrowedConversion(Arc<crate::builtin::value_conversion::ValueConversionResolver>),
+    BorrowedTemporalArithmetic(
+        Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
+    ),
+    BorrowedTemporalContext(Arc<crate::builtin::temporal_context::TemporalContextResolver>),
     BorrowedBinaryOperator(Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>),
     ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
     Original(Arc<dyn FunctionBindingResolver>),
@@ -573,6 +577,16 @@ impl FunctionBindingResolverOwner {
         owner: Arc<crate::builtin::value_conversion::ValueConversionResolver>,
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedConversion(owner))
+    }
+    pub(crate) fn borrowed_temporal_arithmetic(
+        owner: Arc<crate::builtin::temporal_arithmetic_owner::TemporalArithmeticResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner))
+    }
+    pub(crate) fn borrowed_temporal_context(
+        owner: Arc<crate::builtin::temporal_context::TemporalContextResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedTemporalContext(owner))
     }
     pub(crate) fn borrowed_binary_operator(
         owner: Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>,
@@ -610,6 +624,12 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedConversion(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
@@ -629,6 +649,8 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::Unnest(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedTemporalArithmetic(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Original(owner) => owner.as_ref(),

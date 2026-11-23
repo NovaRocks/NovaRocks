@@ -35,7 +35,7 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use crate::iceberg::spec::{PartitionSpec, Schema, Transform};
+use crate::iceberg::spec::{PartitionSpec, Schema, Transform, Type};
 
 use super::column_handle::{
     ColumnIdentityCategory, IcebergColumnHandle, decode_tuple_domain, encode_tuple_domain, invalid,
@@ -632,6 +632,46 @@ impl IcebergTableHandle {
             .intersect(&self.unenforced_predicate)
     }
 
+    /// Split-open still receives the original SQL offer. Convert it under the
+    /// same frozen field declarations as the negotiated handle before joining
+    /// the two pruning constraints.
+    pub(crate) fn split_pruning_predicate(
+        &self,
+        offered: &TupleDomain<IcebergColumnHandle>,
+        schema: Option<&Schema>,
+    ) -> Result<TupleDomain<IcebergColumnHandle>, ConnectorError> {
+        let effective = self.effective_predicate()?;
+        let Some(domains) = offered.domains() else {
+            return Ok(TupleDomain::none());
+        };
+        if !domains
+            .values()
+            .any(|domain| matches!(domain.value_type(), ConnectorValueType::Temporal(_)))
+        {
+            return effective.intersect(offered);
+        }
+        let parsed;
+        let schema = match schema {
+            Some(schema) => schema,
+            None => {
+                parsed = self.parse_table_schema()?;
+                &parsed
+            }
+        };
+        let domains = domains
+            .iter()
+            .filter_map(|(column, domain)| {
+                if matches!(domain.value_type(), ConnectorValueType::Temporal(_)) {
+                    project_temporal_domain(schema, column, domain)
+                } else {
+                    Some(domain.clone())
+                }
+                .map(|domain| (column.clone(), domain))
+            })
+            .collect();
+        effective.intersect(&TupleDomain::with_column_domains(domains)?)
+    }
+
     /// Source field IDs that every partition spec of this snapshot partitions
     /// by with the identity transform.
     ///
@@ -685,6 +725,11 @@ impl IcebergTableHandle {
         let mut enforced: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         let mut unenforced: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         let mut remaining: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
+        let temporal_schema = summary_domains
+            .values()
+            .any(|domain| matches!(domain.value_type(), ConnectorValueType::Temporal(_)))
+            .then(|| self.parse_table_schema())
+            .transpose()?;
         for (column, domain) in summary_domains {
             if column.scalar_integer_domain()
                 != self
@@ -700,6 +745,18 @@ impl IcebergTableHandle {
                 ));
             }
             if !is_pushable(column) {
+                remaining.insert(column.clone(), domain.clone());
+                continue;
+            }
+            if matches!(domain.value_type(), ConnectorValueType::Temporal(_)) {
+                // The physical-unit projection belongs only to pruning. Even
+                // identity partitions do not consume the original SQL residual.
+                if let Some(projected) = temporal_schema
+                    .as_ref()
+                    .and_then(|schema| project_temporal_domain(schema, column, domain))
+                {
+                    unenforced.insert(column.clone(), projected);
+                }
                 remaining.insert(column.clone(), domain.clone());
                 continue;
             }
@@ -951,6 +1008,21 @@ impl ConnectorTableHandle for IcebergTableHandle {
 fn is_pushable(column: &IcebergColumnHandle) -> bool {
     column.is_base_column()
         && column.base_column_identity().category() == ColumnIdentityCategory::Primitive
+}
+
+fn project_temporal_domain(
+    schema: &Schema,
+    column: &IcebergColumnHandle,
+    domain: &Domain,
+) -> Option<Domain> {
+    if !is_pushable(column) {
+        return None;
+    }
+    let field = schema.field_by_id(column.base_field_id())?;
+    let Type::Primitive(primitive) = field.field_type.as_ref() else {
+        return None;
+    };
+    crate::temporal::project_domain(primitive, domain)
 }
 
 /// The source field IDs one partition spec partitions by with the identity
@@ -1662,6 +1734,66 @@ pub(super) mod tests {
         );
         assert!(result.remaining_filter().domain_for(&amount).is_some());
     }
+
+    #[test]
+    fn split_pruning_combines_the_negotiated_and_original_temporal_bounds() {
+        use novarocks_spi::connector::read_stack::Bound;
+        use novarocks_type_contract::{
+            TemporalMicros, TemporalPrecision, TemporalType, TemporalValue,
+        };
+
+        let schema = Schema::builder()
+            .with_fields(vec![StdArc::new(NestedField::optional(
+                17,
+                "instant",
+                Type::Primitive(PrimitiveType::Timestamp),
+            ))])
+            .build()
+            .unwrap();
+        let column = IcebergColumnHandle::base_column_of(&schema, 17).unwrap();
+        let handle = IcebergTableHandle::try_new(table_handle_params(&schema, None)).unwrap();
+        let data_type = TemporalType::Timestamp(TemporalPrecision::new(7).unwrap());
+        let value_type = ConnectorValueType::Temporal(data_type);
+        let bound = ConnectorValue::Temporal {
+            data_type,
+            value: TemporalValue::Timestamp(TemporalMicros::from_picos(-1_100_000).unwrap()),
+        };
+        let values = ValueSet::of_ranges(
+            value_type,
+            vec![Range::try_new(value_type, Bound::Unbounded, Bound::Exclusive(bound)).unwrap()],
+        )
+        .unwrap();
+        let offer = TupleDomain::with_column_domains(BTreeMap::from([(
+            column.clone(),
+            Domain::new(values, false),
+        )]))
+        .unwrap();
+
+        let negotiated = handle
+            .apply_filter(&Constraint::of_summary(offer.clone()))
+            .unwrap();
+        assert_eq!(negotiated.remaining_filter(), &offer);
+        assert!(negotiated.handle().enforced_predicate().is_all());
+        let combined = negotiated
+            .handle()
+            .split_pruning_predicate(&offer, Some(&schema))
+            .unwrap();
+        assert_eq!(combined, *negotiated.handle().unenforced_predicate());
+        let result = combined.domain_for(&column).unwrap();
+        assert!(
+            result
+                .values()
+                .contains_value(&ConnectorValue::TimestampMicros(-2))
+                .unwrap()
+        );
+        assert!(
+            !result
+                .values()
+                .contains_value(&ConnectorValue::TimestampMicros(-1))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn scalar_integer_table_payload_and_projection_keep_exact_field_authority() {
         use crate::scalar_integer_domain::ScalarIntegerDomain;

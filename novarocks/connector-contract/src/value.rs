@@ -25,6 +25,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use novarocks_type_contract::{TemporalType, TemporalValue};
+
 use crate::{ConnectorError, ConnectorErrorKind};
 
 /// Maximum decimal precision expressible by a connector value.
@@ -57,6 +59,7 @@ pub enum ConnectorValueType {
     TimestampTzMicros,
     TimestampNanos,
     TimestampTzNanos,
+    Temporal(TemporalType),
     Varchar,
     Varbinary,
     Uuid,
@@ -118,6 +121,10 @@ pub enum ConnectorValue {
     TimestampNanos(i64),
     /// Nanoseconds since the Unix epoch, in UTC.
     TimestampTzNanos(i64),
+    Temporal {
+        data_type: TemporalType,
+        value: TemporalValue,
+    },
     Varchar(Arc<str>),
     Varbinary(Arc<[u8]>),
     Uuid([u8; 16]),
@@ -147,6 +154,7 @@ impl ConnectorValue {
             Self::TimestampTzMicros(_) => ConnectorValueType::TimestampTzMicros,
             Self::TimestampNanos(_) => ConnectorValueType::TimestampNanos,
             Self::TimestampTzNanos(_) => ConnectorValueType::TimestampTzNanos,
+            Self::Temporal { data_type, .. } => ConnectorValueType::Temporal(*data_type),
             Self::Varchar(_) => ConnectorValueType::Varchar,
             Self::Varbinary(_) => ConnectorValueType::Varbinary,
             Self::Uuid(_) => ConnectorValueType::Uuid,
@@ -171,6 +179,7 @@ impl ConnectorValue {
             | Self::TimestampNanos(_)
             | Self::TimestampTzNanos(_) => 8,
             Self::Decimal { .. } | Self::Uuid(_) => 16,
+            Self::Temporal { .. } => std::mem::size_of::<(TemporalType, TemporalValue)>(),
             Self::Varchar(value) => value.len(),
             Self::Varbinary(value) | Self::Fixed(value) => value.len(),
         }
@@ -247,6 +256,20 @@ impl ConnectorValue {
             | (Self::TimestampTzNanos(left), Self::TimestampTzNanos(right)) => {
                 Some(left.cmp(right))
             }
+            (
+                Self::Temporal {
+                    data_type,
+                    value: left,
+                },
+                Self::Temporal {
+                    data_type: right_type,
+                    value: right,
+                },
+            ) if data_type == right_type => Some(
+                left.relation_key(*data_type)
+                    .ok()?
+                    .cmp(&right.relation_key(*data_type).ok()?),
+            ),
             (Self::Varchar(left), Self::Varchar(right)) => {
                 Some(left.as_bytes().cmp(right.as_bytes()))
             }
@@ -270,6 +293,28 @@ impl PartialEq for ConnectorValue {
         match (self, other) {
             (Self::Real(left), Self::Real(right)) => left.to_bits() == right.to_bits(),
             (Self::Double(left), Self::Double(right)) => left.to_bits() == right.to_bits(),
+            (
+                Self::Temporal {
+                    data_type,
+                    value: left,
+                },
+                Self::Temporal {
+                    data_type: right_type,
+                    value: right,
+                },
+            ) => {
+                if data_type != right_type {
+                    return false;
+                }
+                match (
+                    left.relation_key(*data_type),
+                    right.relation_key(*data_type),
+                ) {
+                    (Ok(left), Ok(right)) => left == right,
+                    (Err(_), Err(_)) => left == right,
+                    _ => false,
+                }
+            }
             _ => {
                 self.value_type() == other.value_type()
                     && self.try_compare_same_type(other) == Some(Ordering::Equal)

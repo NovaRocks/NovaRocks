@@ -575,6 +575,22 @@ impl LocalExchanger {
                 super::data_stream_sink::partition_chunk_by_hash_arrays_created(
                     chunk,
                     &arrays,
+                    |column| {
+                        let slot = slots.get(column).ok_or_else(|| {
+                            crate::runtime::task::ExecutionFailure::from_domain(
+                                LocalPartitionContract,
+                            )
+                        })?;
+                        chunk
+                            .chunk_schema()
+                            .slot(*slot)
+                            .map(|signed| signed.field_schema().value_type())
+                            .ok_or_else(|| {
+                                crate::runtime::task::ExecutionFailure::from_domain(
+                                    LocalPartitionContract,
+                                )
+                            })
+                    },
                     self.partition_count,
                     false,
                     factory,

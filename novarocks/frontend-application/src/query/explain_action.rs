@@ -68,6 +68,7 @@ struct ExplainPreparationInput {
     sql: String,
     explain: ExplainInput,
     state: SessionSqlState,
+    statement_time: novarocks_type_contract::StatementTimeEnvironment,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     scope: novarocks_workload_control::WorkScope,
@@ -109,6 +110,7 @@ async fn make_explain_preparation(
             topology
         };
         let presentation = input.state.presentation().copied();
+        let statement_time = input.state.statement_time(input.statement_time);
         let (catalog, database, execution, mut optimizer, semantics, property_inputs) =
             input.state.into_query_attempt_inputs();
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
@@ -136,7 +138,7 @@ async fn make_explain_preparation(
                 input.deadline,
                 input.cancellation,
                 optimizer,
-                semantics,
+                semantics.with_statement_time(statement_time),
                 presentation,
             )
             .with_session_property_inputs(property_inputs),
@@ -578,6 +580,7 @@ pub(super) fn build_explain_action(
         cancellation,
         window,
         planning_cpu,
+        statement_time,
         #[cfg(novarocks_dev_controls)]
         observation,
         #[cfg(novarocks_dev_controls)]
@@ -627,6 +630,7 @@ pub(super) fn build_explain_action(
         sql,
         explain,
         state,
+        statement_time,
         deadline,
         cancellation,
         scope: scope.clone(),
@@ -794,6 +798,7 @@ mod tests {
             family: novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 },

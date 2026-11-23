@@ -1466,9 +1466,11 @@ mod tests {
         );
     }
     #[test]
-    fn final_row_and_datetime_nodes_preserve_names_domains_and_microsecond_contract() {
+    fn final_row_and_datetime_nodes_preserve_names_and_exact_temporal_declarations() {
         use novarocks_parser::{Span, ast, build};
-        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        use novarocks_type_contract::{
+            TemporalPrecision, TemporalType, ValueKind, ValueLogicalType,
+        };
         let control = crate::compiler::SqlCompileControl::unbounded();
         let row = build::row_type(vec![ast::RowDataTypeField {
             name: None,
@@ -1484,24 +1486,57 @@ mod tests {
             fields[0].value_type().kind(),
             ValueKind::Nominal(ValueLogicalType::Json)
         ));
-        for kind in [ast::DateTimeType::Time, ast::DateTimeType::Timestamp] {
-            for precision in [None, Some(ast::AstBox::new(build::numeric_parameter(6)))] {
-                let ty = ast::TypeName {
-                    kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
-                        kind,
-                        with_time_zone: false,
-                        precision,
-                    }),
-                    span: Span::new(0, 12),
-                };
-                let expected = match kind {
-                    ast::DateTimeType::Time => DataType::Time64(TimeUnit::Microsecond),
-                    ast::DateTimeType::Timestamp => {
-                        DataType::Timestamp(TimeUnit::Microsecond, None)
-                    }
-                };
-                assert_eq!(sql_type_to_arrow(&ty).unwrap(), expected);
-            }
+        for (syntax, expected) in [
+            ("TIME", TemporalType::Time(TemporalPrecision::DEFAULT)),
+            (
+                "TIME(6)",
+                TemporalType::Time(TemporalPrecision::MICROSECONDS),
+            ),
+            (
+                "TIMESTAMP",
+                TemporalType::Timestamp(TemporalPrecision::DEFAULT),
+            ),
+            (
+                "TIMESTAMP(6)",
+                TemporalType::Timestamp(TemporalPrecision::MICROSECONDS),
+            ),
+            (
+                "TIMESTAMP(9)",
+                TemporalType::Timestamp(TemporalPrecision::NANOSECONDS),
+            ),
+            (
+                "TIME(4) WITH TIME ZONE",
+                TemporalType::TimeWithTimeZone(TemporalPrecision::new(4).unwrap()),
+            ),
+            (
+                "TIMESTAMP(12) WITH TIME ZONE",
+                TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS),
+            ),
+        ] {
+            let ty = parse_native_cast_type(&format!("SELECT CAST(NULL AS {syntax})"));
+            let value = super::sql_type_to_value_type(&ty, false, &control).unwrap();
+            assert_eq!(value.value_type().temporal(), Some(expected), "{syntax}");
+            assert_eq!(value.data_type(), &expected.carrier(), "{syntax}");
+            assert!(!value.nullable());
+        }
+        for parameter in [
+            build::numeric_parameter(13),
+            build::type_parameter(build::simple_type("BIGINT")),
+        ] {
+            let ty = ast::TypeName {
+                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                    kind: ast::DateTimeType::Timestamp,
+                    with_time_zone: false,
+                    precision: Some(ast::AstBox::new(parameter)),
+                }),
+                span: Span::new(0, 12),
+            };
+            let error = super::sql_type_to_value_type(&ty, false, &control).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+            );
+            assert_eq!(error.span(), Some(ty.span));
         }
     }
 
@@ -1521,11 +1556,6 @@ mod tests {
             }
         }
         let span = Span::new(20, 80);
-        let qualifier = ast::IntervalQualifier::Simple(ast::SimpleIntervalQualifier {
-            precision: None,
-            field: ast::IntervalQualifierField::Year,
-            span,
-        });
         let explicit = ast::TypeName {
             kind: ast::TypeKind::ExplicitArray(ast::ExplicitArrayDataType {
                 element: ast::AstBox::new(build::simple_type("INTEGER")),
@@ -1542,39 +1572,6 @@ mod tests {
                 build::ident("ARRAY", false),
                 vec![build::type_parameter(explicit)],
             ),
-            ast::TypeName {
-                kind: ast::TypeKind::Interval(ast::IntervalDataType {
-                    qualifier: qualifier.clone(),
-                    span,
-                }),
-                span,
-            },
-            ast::TypeName {
-                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
-                    kind: ast::DateTimeType::Timestamp,
-                    with_time_zone: true,
-                    precision: None,
-                }),
-                span,
-            },
-            ast::TypeName {
-                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
-                    kind: ast::DateTimeType::Time,
-                    with_time_zone: false,
-                    precision: Some(ast::AstBox::new(build::numeric_parameter(3))),
-                }),
-                span,
-            },
-            ast::TypeName {
-                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
-                    kind: ast::DateTimeType::Timestamp,
-                    with_time_zone: false,
-                    precision: Some(ast::AstBox::new(build::type_parameter(build::simple_type(
-                        "BIGINT",
-                    )))),
-                }),
-                span,
-            },
         ];
         let mut expressions = unsupported_types
             .into_iter()
@@ -1589,14 +1586,6 @@ mod tests {
                 span,
             }));
         }
-        expressions.push(ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Interval(ast::IntervalLiteral {
-                value: "1".into(),
-                sign: ast::IntervalSign::Positive,
-                qualifier,
-            }),
-            span,
-        }));
         for expression in expressions {
             let query =
                 &mut novarocks_parser::parser::parse_query("SELECT NULL FROM missing_type_input")

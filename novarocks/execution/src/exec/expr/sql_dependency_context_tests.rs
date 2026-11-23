@@ -35,6 +35,7 @@ fn statement() -> StatementAdmissionContext {
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 },
@@ -67,6 +68,7 @@ fn sql_dependency_context_default_admission_and_round_have_no_observer() {
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
                     parametric_datetime: true,
+                    parametric_interval: false,
                     variant: true,
                     variant_binary: true,
                 },

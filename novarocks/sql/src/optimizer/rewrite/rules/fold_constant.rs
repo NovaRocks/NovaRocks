@@ -29,7 +29,7 @@
 //! static-predicate extraction inspects the plan.
 
 use crate::compiler::SqlCompileError;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, FunctionValueType};
 use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
@@ -124,10 +124,13 @@ fn is_environment_sensitive_function(name: &str) -> bool {
 
 /// Output types a folded literal is allowed to have.
 ///
-/// Keep the existing folding coverage stable during evaluator migration.
-/// The compiled constant contract supports more carriers; extending this policy
-/// changes optimizer plans and belongs to a separately accepted change.
-fn is_wire_encodable_literal_type(data_type: &DataType) -> bool {
+/// Temporal constants carry their complete declaration through the original
+/// constant pool. The physical width alone grants no additional fold support.
+fn is_wire_encodable_literal_type(value_type: &FunctionValueType) -> bool {
+    if let Some(temporal) = value_type.value_type().temporal() {
+        return value_type.data_type() == &temporal.carrier();
+    }
+    let data_type = value_type.data_type();
     matches!(
         data_type,
         DataType::Boolean
@@ -687,7 +690,7 @@ fn try_fold_node_current(
     work.step()?;
     let node = arena.node(id);
     let out_type = arena.value_type(id);
-    if !is_wire_encodable_literal_type(out_type.data_type()) {
+    if !is_wire_encodable_literal_type(out_type) {
         return Ok(None);
     }
     if let ScalarNode::Nested(inner) = node {

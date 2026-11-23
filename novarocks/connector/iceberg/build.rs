@@ -5,6 +5,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 const IDL_DIR: &str = "idl";
+const SHARED_IDL_DIR: &str = "../../../idl/novarocks";
 const PROTO_FILES: &[&str] = &["common.proto", "read.proto", "write.proto"];
 
 fn main() {
@@ -13,6 +14,18 @@ fn main() {
         println!(
             "cargo:rerun-if-changed={}",
             Path::new(IDL_DIR).join(file).display()
+        );
+    }
+
+    for file in [
+        "catalog.proto",
+        "connector_common.proto",
+        "connector_read.proto",
+        "value_type.proto",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            Path::new(SHARED_IDL_DIR).join(file).display()
         );
     }
 
@@ -28,9 +41,20 @@ fn main() {
         .collect::<Vec<_>>();
     let mut config = prost_build::Config::new();
     config.btree_map(["."]);
+    config.extern_path(
+        ".novarocks.connector_read",
+        "::novarocks_proto_models::connector_read",
+    );
+    config.extern_path(
+        ".novarocks.value_type",
+        "::novarocks_proto_models::value_type",
+    );
     config.boxed(".novarocks.connector.iceberg.IcebergFinalDeleteEffect.effect.replace_positions");
     config.file_descriptor_set_path(out_dir.join("iceberg_connector_descriptor.bin"));
     config
-        .compile_protos(&proto_paths, &[PathBuf::from(IDL_DIR)])
+        .compile_protos(
+            &proto_paths,
+            &[PathBuf::from(IDL_DIR), PathBuf::from(SHARED_IDL_DIR)],
+        )
         .expect("compile Iceberg connector private protobuf DTOs");
 }

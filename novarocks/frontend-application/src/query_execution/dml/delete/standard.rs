@@ -48,7 +48,8 @@ use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_types::schema::ColumnDef;
+use novarocks_type_contract::TemporalType;
+use novarocks_types::schema::{ColumnDef, SqlType};
 
 pub(super) fn resolve_target(
     state: &DmlExecutionKernel,
@@ -440,7 +441,7 @@ fn validate_where_predicate(
                 }
                 let (col_name, value_expr, _flipped) =
                     extract_comparison(&expression.value, &comparison.right)?;
-                validate_literal_for_column(value_expr, columns, &col_name).map_err(Into::into)
+                validate_literal_for_column(value_expr, columns, &col_name)
             }
             Predicate::In(predicate) => {
                 let Expr::InList(list) = &predicate.value_list else {
@@ -651,7 +652,7 @@ fn validate_literal_for_column(
     expr: &Expr,
     columns: &[ColumnDef],
     column_name: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::dml::error::DmlExecutionError> {
     let column = columns
         .iter()
         .find(|column| column.name.eq_ignore_ascii_case(column_name))
@@ -663,7 +664,7 @@ fn validate_literal_for_column(
         | DataType::Map(_, _)) => {
             return Err(format!(
                 "phase 1 DELETE WHERE only supports primitive columns; column `{column_name}` is {nested:?}"
-            ));
+            ).into());
         }
         other => other,
     };
@@ -675,20 +676,42 @@ fn validate_literal_for_column(
                 other => {
                     return Err(format!(
                         "phase 1 DELETE WHERE expects a literal value, got -{other:?}"
-                    ));
+                    )
+                    .into());
                 }
             }
         }
         other => {
-            return Err(format!(
-                "phase 1 DELETE WHERE expects a literal value, got {other:?}"
-            ));
+            return Err(
+                format!("phase 1 DELETE WHERE expects a literal value, got {other:?}").into(),
+            );
         }
     };
     let negate = matches!(
         expr,
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus
     );
+    if !negate
+        && matches!(
+            column.logical_type,
+            Some(SqlType::Temporal(
+                TemporalType::Timestamp(_) | TemporalType::TimestampWithTimeZone(_)
+            ))
+        )
+        && let LiteralKind::Generic(value) = &lit_value.kind
+        && value.type_name.eq_ignore_ascii_case("TIMESTAMP")
+    {
+        return novarocks_functions::temporal_value::parse_timestamp_literal(&value.value)
+            .map(|_| ())
+            .map_err(|error| {
+                crate::dml::error::DmlExecutionError::Analyze(
+                    novarocks_sql::analyze_error::AnalyzeError::invalid_literal(
+                        error.to_string(),
+                        lit_value.span,
+                    ),
+                )
+            });
+    }
     let lit_str = match &lit_value.kind {
         LiteralKind::Decimal(s) | LiteralKind::String(s) => s.clone(),
         LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
@@ -710,12 +733,13 @@ fn validate_literal_for_column(
             return Err(format!(
                 "phase 1 DELETE WHERE does not support NULL literals; use IS NULL/IS NOT NULL instead \
                  (column `{column_name}`)"
-            ));
+            ).into());
         }
         other => {
             return Err(format!(
                 "phase 1 DELETE WHERE literal value `{other:?}` is not yet supported"
-            ));
+            )
+            .into());
         }
     };
     let owned;
@@ -764,6 +788,7 @@ fn validate_literal_for_column(
             "phase 1 DELETE WHERE primitive type {other:?} not yet supported (column `{column_name}`)"
         )),
     }
+    .map_err(Into::into)
 }
 
 /// Extract the string value from a SQL literal expression (`'...'` or `"..."`).
@@ -901,6 +926,35 @@ mod tests {
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
             ),
         ]
+    }
+
+    #[test]
+    fn delete_accepts_typed_timestamp_literals_using_the_column_declaration() {
+        use novarocks_type_contract::{TemporalPrecision, TemporalType};
+        use novarocks_types::schema::SqlType;
+
+        let precision = TemporalPrecision::NANOSECONDS;
+        for (declaration, value) in [
+            (
+                TemporalType::Timestamp(precision),
+                "2020-01-01 00:00:00.012345678",
+            ),
+            (
+                TemporalType::TimestampWithTimeZone(precision),
+                "2020-01-01 08:00:00.012345678 Asia/Shanghai",
+            ),
+        ] {
+            let mut target = column("ts", declaration.carrier());
+            let predicate = where_expr(&format!("ts = TIMESTAMP '{value}'"));
+            assert!(super::validate_where(&predicate, std::slice::from_ref(&target)).is_err());
+            target.logical_type = Some(SqlType::Temporal(declaration));
+            super::validate_where(&predicate, std::slice::from_ref(&target)).unwrap();
+            let invalid = where_expr("ts = TIMESTAMP '2020-02-31 00:00:00.000000000'");
+            assert!(matches!(
+                super::validate_where(&invalid, &[target]),
+                Err(crate::dml::error::DmlExecutionError::Analyze(_))
+            ));
+        }
     }
 
     #[test]
@@ -1205,6 +1259,9 @@ mod tests {
         });
         let error = super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
             .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");
+        let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+            panic!("expected the original DATETIME validation error");
+        };
         assert!(error.contains("DATETIME"), "{error}");
     }
 }

@@ -760,6 +760,26 @@ fn supported_temporal_defaults_keep_their_original_supported_values() {
 }
 
 #[test]
+fn omitted_zoned_default_keeps_stored_utc_and_negative_epoch_fraction() {
+    use novarocks_type_contract::{TemporalPrecision, TemporalType};
+    let ty = TemporalType::TimestampWithTimeZone(TemporalPrecision::NANOSECONDS);
+    let mut temporal = column("t", ty.carrier());
+    temporal.logical_type = Some(novarocks_types::schema::SqlType::Temporal(ty));
+    temporal.write_default = Some(ColumnDefault::TimestamptzNanos {
+        nanos_since_epoch: -1,
+    });
+    let ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::Generic(actual),
+        ..
+    }) = omitted_insert_expr(&temporal).unwrap()
+    else {
+        panic!("expected a typed temporal default");
+    };
+    assert_eq!(actual.type_name, "TIMESTAMP");
+    assert_eq!(actual.value, "1969-12-31 23:59:59.999999999 UTC");
+}
+
+#[test]
 fn column_mapping_reorders_and_fills_only_omitted_columns() {
     let mut b = column("b", decimal_type());
     b.write_default = Some(ColumnDefault::Decimal {

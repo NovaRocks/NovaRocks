@@ -19,7 +19,7 @@ use crate::StatementFailure;
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::collections::BTreeMap;
 
-pub const CLIENT_CAPABILITIES: &str = "PARAMETRIC_DATETIME,VARIANT";
+pub const CLIENT_CAPABILITIES: &str = "PARAMETRIC_DATETIME,PARAMETRIC_INTERVAL,VARIANT";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientSession {

@@ -130,6 +130,7 @@ struct SetStatementAction {
     source: Arc<str>,
     mutation: Option<SessionPropertyMutation>,
     live: Arc<Mutex<SessionSqlState>>,
+    statement_time: novarocks_type_contract::StatementTimeEnvironment,
     compiler: FrontendQueryCompiler,
     registry: Arc<SessionPropertyRegistry>,
     interpreter: Arc<RequiredConstantInterpreter>,
@@ -175,6 +176,7 @@ impl SetStatementAction {
                                 .take()
                                 .expect("one admitted session property mutation"),
                             staged,
+                            self.statement_time,
                             Arc::clone(&self.registry),
                             Arc::clone(&self.interpreter),
                             self.control.clone(),
@@ -274,6 +276,7 @@ impl FrontendQuerySession {
         mutation: ScopedSessionMutation,
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
+        statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<StatementResult, QueryServiceError> {
         let catalogs: Arc<
             dyn novarocks_query_application::sql::session::registry::SessionCatalogPropertyPort,
@@ -286,6 +289,7 @@ impl FrontendQuerySession {
             },
             deadline,
             statement,
+            statement_time,
         )
         .await
     }
@@ -296,6 +300,7 @@ impl FrontendQuerySession {
         mutation: SessionPropertyMutation,
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
+        statement_time: novarocks_type_contract::StatementTimeEnvironment,
     ) -> Result<StatementResult, QueryServiceError> {
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
@@ -306,6 +311,7 @@ impl FrontendQuerySession {
             source,
             mutation: Some(mutation),
             live: Arc::clone(&self.state),
+            statement_time,
             compiler: self.service.query_compiler.clone(),
             registry: Arc::clone(&self.service.session_properties),
             interpreter: Arc::clone(&self.service.required_constant_interpreter),

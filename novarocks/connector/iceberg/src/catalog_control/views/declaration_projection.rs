@@ -29,8 +29,8 @@ use novarocks_spi::connector::{
     read_stack::ConnectorReadSchemaCreation,
 };
 use novarocks_type_contract::{
-    CharacterKind, FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType,
-    ValueTypeRef,
+    CharacterKind, FunctionValueType, TemporalPrecision, TemporalType, ValueField, ValueKind,
+    ValueLayout, ValueLogicalType, ValueTypeRef,
 };
 use std::sync::Arc;
 
@@ -162,6 +162,24 @@ fn write_type(
         ValueKind::Nominal(ValueLogicalType::Variant) => {
             Type::Variant(crate::iceberg::spec::VariantType)
         }
+        ValueKind::Temporal(ty) => primitive(match ty {
+            TemporalType::Time(precision) if precision.fits_microseconds() => PrimitiveType::Time,
+            TemporalType::Timestamp(precision) if precision.fits_microseconds() => {
+                PrimitiveType::Timestamp
+            }
+            TemporalType::TimestampWithTimeZone(precision) if precision.fits_microseconds() => {
+                PrimitiveType::Timestamptz
+            }
+            TemporalType::Timestamp(precision) if *precision <= TemporalPrecision::NANOSECONDS => {
+                PrimitiveType::TimestampNs
+            }
+            TemporalType::TimestampWithTimeZone(precision)
+                if *precision <= TemporalPrecision::NANOSECONDS =>
+            {
+                PrimitiveType::TimestamptzNs
+            }
+            _ => return unsupported(),
+        }),
         ValueKind::Scalar(ty) => match ty {
             DataType::Boolean => primitive(PrimitiveType::Boolean),
             DataType::Int32 => primitive(PrimitiveType::Int),
@@ -269,17 +287,13 @@ fn read_type(
     visit(depth, nodes, creation)?;
     let storage = creation.storage();
     let (layout, kind) = match declaration {
+        Type::Primitive(primitive) if crate::temporal::declaration(primitive).is_some() => {
+            let ty = crate::temporal::declaration(primitive).unwrap();
+            (ty.carrier(), ValueKind::Temporal(ty))
+        }
         Type::Primitive(primitive) => {
             let ty = match primitive {
                 PrimitiveType::Fixed(_) => DataType::Binary,
-                PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
-                    let unit = if matches!(primitive, PrimitiveType::Timestamptz) {
-                        TimeUnit::Microsecond
-                    } else {
-                        TimeUnit::Nanosecond
-                    };
-                    DataType::Timestamp(unit, Some(arc_text("UTC", creation)?))
-                }
                 _ => crate::schema_mapping::typed_value::primitive_layout(primitive, None)?,
             };
             let kind = match primitive {

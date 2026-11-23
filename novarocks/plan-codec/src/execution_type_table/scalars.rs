@@ -269,6 +269,7 @@ pub(super) fn compatible<H>(
             true
         }
         (ValueKind::Nominal(nominal), actual) => nominal.validate_carrier(actual).is_ok(),
+        (ValueKind::Temporal(declaration), actual) => declaration.carrier() == *actual,
         _ => false,
     })
 }

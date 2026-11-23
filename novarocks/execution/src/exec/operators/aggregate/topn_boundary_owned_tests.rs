@@ -669,3 +669,118 @@ fn topn_boundary_owned_numeric_candidate_refuses_actual_container_growth() {
     drop(host);
     assert_eq!(tracker.current(), 0);
 }
+
+#[test]
+fn owned_topn_admits_zoned_keys_and_encodes_the_exact_instant_bound() {
+    use crate::exec::hash_table::key_index::{KeyReadRow, KeyReadValues};
+    use crate::runtime_filter::contribution::{
+        ContributionCodecExpectation, RuntimeFilterContribution, decode_contribution,
+    };
+    use arrow::array::FixedSizeBinaryBuilder;
+    use novarocks_type_contract::{
+        FunctionValueType, TemporalCarrier, TemporalMicros, TemporalPrecision, TemporalType,
+        TemporalValue, TimeZoneKey, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+
+    let temporal = TemporalType::TimestampWithTimeZone(TemporalPrecision::PICOSECONDS);
+    let carrier = temporal.carrier();
+    let storage = ValueTypeStorageLifetime::pure();
+    let ty = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(ValueKind::Temporal(temporal), false, storage.clone()).unwrap(),
+        ValueLayout::try_new(&carrier, storage).unwrap(),
+    )
+    .unwrap();
+    let ascending = RuntimeOrderSortDirection::Ascending;
+    let nulls_last = RuntimeOrderNullOrder::Last;
+    let order = Arc::new(RuntimeOrderContract::from_frozen(
+        [RuntimeOrderKey::with_value_type(
+            ty.clone(),
+            ascending,
+            nulls_last,
+        )],
+        [2; 32],
+        [3; 32],
+    ));
+    let tracker = MemTracker::new_root("zoned-ordered-boundary");
+    let host = OrderedTopNAllocationHost::new(tracker.clone());
+    let limit = NonZeroU32::new(1).unwrap();
+
+    for raw_key in [
+        RuntimeOrderKey::new(carrier.clone()),
+        RuntimeOrderKey::with_value_type(
+            FunctionValueType::new(carrier, false),
+            ascending,
+            nulls_last,
+        ),
+    ] {
+        let raw_contract = Arc::new(RuntimeOrderContract::from_frozen(
+            [raw_key],
+            [2; 32],
+            [3; 32],
+        ));
+        assert!(matches!(
+            OwnedAggregateTopNBoundaryState::try_new_owned(limit, raw_contract.into(), &host),
+            Err(OwnedTopNBoundaryError::Boundary(
+                AggregateTopNBoundaryError::UnsupportedOrderKeyType { .. }
+            ))
+        ));
+    }
+
+    let mut state =
+        OwnedAggregateTopNBoundaryState::try_new_owned(limit, order.clone().into(), &host).unwrap();
+    let late = TemporalMicros::new(1, 2).unwrap();
+    let early = TemporalMicros::new(1, 1).unwrap();
+    let shanghai = TimeZoneKey::parse("Asia/Shanghai").unwrap();
+    let utc = TimeZoneKey::UTC;
+    let mut array = FixedSizeBinaryBuilder::new(14);
+    for (instant, zone) in [(late, utc), (early, shanghai), (late, shanghai)] {
+        let value = TemporalValue::TimestampWithTimeZone { instant, zone };
+        let TemporalCarrier::ZonedTimestamp(bytes) = value.to_carrier(temporal).unwrap() else {
+            panic!("typed zoned timestamp must use its declared 14-byte carrier");
+        };
+        array.append_value(bytes).unwrap();
+    }
+    let array: ArrayRef = Arc::new(array.finish());
+    let mut projected = Vec::new();
+    let rows = [0, 1, 2].map(|row| KeyReadRow { ordinal: row, row });
+    let page = KeyReadValues::Fixed {
+        array: &array,
+        binding: &ty,
+    };
+    visit_key_read_page(&order, &page, &rows, &Pass, &mut |group, scalar| {
+        projected.push(scalar);
+        state.observe_owned_group(group, host.copy_scalar(scalar, &Pass)?, &Pass)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(projected[0], projected[2]);
+    assert_ne!(projected[0], projected[1]);
+
+    let bound = state.snapshot_owned(&Pass).unwrap().unwrap();
+    let expected_bytes = TemporalValue::TimestampWithTimeZone {
+        instant: early,
+        zone: utc,
+    }
+    .relation_key(temporal)
+    .unwrap()
+    .order_bytes();
+    let expected = OrderedTuple::new([Some(OrderedScalar::Temporal(expected_bytes))]);
+    let bytes = host
+        .encode_ordered_bound(bound.borrowed(), &order, 1024, &Pass)
+        .unwrap();
+    let decoded = decode_contribution(
+        bytes.as_slice(),
+        &order.digest(),
+        ContributionCodecExpectation::OrderedBound(&order),
+        1024,
+    )
+    .unwrap();
+    let RuntimeFilterContribution::OrderedBound(update) = decoded else {
+        panic!("the original ordered contribution decoder must return a bound");
+    };
+    assert_eq!(update.bound(), &expected);
+    drop(bytes);
+    drop(bound);
+    drop(state);
+    assert_eq!(tracker.current(), 0);
+}

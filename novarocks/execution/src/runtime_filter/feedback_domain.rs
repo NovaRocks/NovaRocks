@@ -247,6 +247,7 @@ fn is_singleton(values: &MembershipValues) -> bool {
         MembershipValues::Date32(v) => v.len() == 1,
         MembershipValues::Timestamp { values, .. } => values.len() == 1,
         MembershipValues::Decimal128 { values, .. } => values.len() == 1,
+        MembershipValues::Temporal { values, .. } => values.len() == 1,
     }
 }
 
@@ -295,7 +296,9 @@ fn enclosing_bounds(domain: &ValueDomainDelta) -> Option<(ValueDomainDelta, Valu
                 MembershipValues::decimal128(*precision, *scale, [upper]).ok()?,
             )
         }
-        MembershipValues::Float32(_) | MembershipValues::Float64(_) => return None,
+        MembershipValues::Float32(_)
+        | MembershipValues::Float64(_)
+        | MembershipValues::Temporal { .. } => return None,
     };
     Some((
         ValueDomainDelta::new(lower, false),

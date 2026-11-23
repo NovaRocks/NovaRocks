@@ -198,7 +198,7 @@ pub fn decode_leaf(
         }
         ArtifactKind::ValueSet => {
             let domain =
-                decode_domain_payload(parsed.payload, parsed.contains_null, &parsed.schema)?;
+                decode_domain_payload(parsed.payload, parsed.contains_null, expectations.schema)?;
             if domain.values().is_empty() && !parsed.contains_null {
                 return Err(ArtifactCodecError::NonCanonicalPayload);
             }
@@ -488,8 +488,21 @@ fn decode_domain_payload(
     canonical.extend_from_slice(contribution::FINGERPRINT_VERSION_TAG);
     canonical.extend_from_slice(payload);
     canonical.push(u8::from(contains_null));
-    contribution::decode_value_domain(&canonical, schema.data_type(), canonical.len())
-        .map_err(|_| ArtifactCodecError::NonCanonicalPayload)
+    let domain = contribution::decode_value_domain(&canonical, schema.data_type(), canonical.len())
+        .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?;
+    if let contribution::MembershipValues::Temporal { values, .. } = domain.values() {
+        let declaration = schema
+            .value_type()
+            .and_then(|value_type| value_type.value_type().temporal())
+            .ok_or(ArtifactCodecError::ContractViolation)?;
+        if values.iter().any(|&encoded| {
+            novarocks_type_contract::TemporalRelationKey::from_order_bytes(declaration, encoded)
+                .is_err()
+        }) {
+            return Err(ArtifactCodecError::NonCanonicalPayload);
+        }
+    }
+    Ok(domain)
 }
 
 fn inspect_membership_index(
@@ -516,6 +529,12 @@ fn inspect_membership_index(
         12 => {
             reader.u8()?;
             reader.u8()?;
+            reader.u64()?
+        }
+        13 => {
+            if !matches!(reader.u8()?, 10 | 12 | 14) {
+                return Err(ArtifactCodecError::NonCanonicalPayload);
+            }
             reader.u64()?
         }
         _ => reader.u64()?,
@@ -550,6 +569,7 @@ fn inspect_membership_index(
         4 | 7 | 10 => 4,
         5 | 8 | 11 => 8,
         6 | 12 => 16,
+        13 => 12,
         _ => return Err(ArtifactCodecError::NonCanonicalPayload),
     };
     let values_start = payload_offset + reader.offset();
@@ -587,6 +607,7 @@ pub enum MembershipProbe<'a> {
     Utf8(&'a str),
     Date32(i32),
     Timestamp(i64),
+    Temporal([u8; 12]),
     Decimal128(i128),
 }
 
@@ -851,6 +872,7 @@ enum FixedProbe {
     I32(i32),
     I64(i64),
     I128(i128),
+    Temporal([u8; 12]),
     U32(u32),
     U64(u64),
 }
@@ -869,6 +891,7 @@ fn fixed_probe(tag: u8, probe: MembershipProbe<'_>) -> Result<FixedProbe, Artifa
         (6, MembershipProbe::LargeInt(value)) | (12, MembershipProbe::Decimal128(value)) => {
             FixedProbe::I128(value)
         }
+        (13, MembershipProbe::Temporal(value)) => FixedProbe::Temporal(value),
         (7, MembershipProbe::Float32(value)) => FixedProbe::U32(canonical_probe_f32(value)),
         (8, MembershipProbe::Float64(value)) => FixedProbe::U64(canonical_probe_f64(value)),
         _ => return Err(ArtifactCodecError::ContractViolation),
@@ -890,6 +913,7 @@ fn compare_fixed(
         };
     }
     Ok(match (tag, needle) {
+        (13, FixedProbe::Temporal(needle)) => bytes.cmp(&needle),
         (1, FixedProbe::Bool(value)) => match bytes {
             [0] => false.cmp(&value),
             [1] => true.cmp(&value),

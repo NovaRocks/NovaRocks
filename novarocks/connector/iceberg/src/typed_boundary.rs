@@ -2274,9 +2274,7 @@ fn known_empty_prepared_table_source(
     if handle.pinned_data_files().is_some() {
         return Ok(None);
     }
-    let predicate = handle
-        .effective_predicate()
-        .and_then(|predicate| predicate.intersect(request.constraint.summary()));
+    let predicate = handle.split_pruning_predicate(request.constraint.summary(), None);
     if predicate
         .as_ref()
         .is_ok_and(|predicate| !predicate.is_none())
@@ -2578,12 +2576,11 @@ impl IcebergTypedBoundary {
         dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
         // Keep the original schema validation before predicate pruning and I/O.
-        let _schema = handle.parse_table_schema()?;
+        let schema = handle.parse_table_schema()?;
 
         if handle.pinned_data_files().is_none()
             && handle
-                .effective_predicate()?
-                .intersect(constraint.summary())?
+                .split_pruning_predicate(constraint.summary(), Some(&schema))?
                 .is_none()
         {
             return Ok(Vec::new());
@@ -2624,9 +2621,7 @@ impl IcebergTypedBoundary {
         let predicates = if pinned.is_some() {
             Vec::new()
         } else {
-            let predicate = handle
-                .effective_predicate()?
-                .intersect(constraint.summary())?;
+            let predicate = handle.split_pruning_predicate(constraint.summary(), Some(&schema))?;
             if predicate.is_none() {
                 return Ok(Vec::new());
             }
@@ -4105,6 +4100,7 @@ fn pruning_view(
                     .map(|source| source.name.clone())
                     .unwrap_or_else(|| format!("#{}", field.source_id));
                 decoded.push(IcebergPartitionFieldValue {
+                    source_field_id: Some(field.source_id),
                     source_column,
                     field_name: field.name.clone(),
                     transform: partition_transform_name(&field.transform),
@@ -4269,15 +4265,18 @@ fn physical_value(value: &ConnectorValue) -> Option<IcebergPhysicalPredicateValu
         ConnectorValue::SmallInt(value) => {
             Some(IcebergPhysicalPredicateValue::Int32(i32::from(*value)))
         }
+        ConnectorValue::TimeMicros(value)
+        | ConnectorValue::TimestampMicros(value)
+        | ConnectorValue::TimestampTzMicros(value)
+        | ConnectorValue::TimestampNanos(value)
+        | ConnectorValue::TimestampTzNanos(value) => {
+            Some(IcebergPhysicalPredicateValue::Temporal(*value))
+        }
         ConnectorValue::Real(_)
         | ConnectorValue::Double(_)
         | ConnectorValue::Decimal { .. }
-        | ConnectorValue::TimeMicros(_)
-        | ConnectorValue::TimestampMicros(_)
         | ConnectorValue::TimestampMillis(_)
-        | ConnectorValue::TimestampTzMicros(_)
-        | ConnectorValue::TimestampNanos(_)
-        | ConnectorValue::TimestampTzNanos(_)
+        | ConnectorValue::Temporal { .. }
         | ConnectorValue::Varchar(_)
         | ConnectorValue::Varbinary(_)
         | ConnectorValue::Uuid(_)

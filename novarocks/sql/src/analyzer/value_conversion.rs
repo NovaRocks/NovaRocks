@@ -57,45 +57,17 @@ impl super::AnalyzerContext<'_> {
         mode: novarocks_type_contract::TrinoCastMode,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
-        use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
-
-        super::helpers::validate_value_type(&source.value_type, self.control)?;
-        super::helpers::validate_value_type(&target, self.control)?;
-        let nullable = PreparedCastRecipe::trino_result_nullable(
-            &source.value_type,
-            &target,
+        cast_with_trino_mode(
+            source,
+            target,
             mode,
+            span,
+            self.function_catalog,
+            &self.sql_semantics,
+            self.constant_policy,
             self.control,
+            self.purpose == super::QueryAnalysisPurpose::MaterializedViewDefinition,
         )
-        .map_err(|error| {
-            if let Some(cause) = error.control_error() {
-                return AnalyzeError::control(cause);
-            }
-            let message = format!(
-                "Cannot cast {:?} to {:?}: {error}",
-                source.value_type.value_type().kind(),
-                target.value_type().kind(),
-            );
-            match error {
-                CastPrepareError::Illegal => AnalyzeError::type_mismatch(message, span),
-                CastPrepareError::Unsupported => {
-                    AnalyzeError::unsupported_expression(message, span)
-                }
-                _ => AnalyzeError::internal(message),
-            }
-        })?;
-        let target = target
-            .with_nullable(nullable)
-            .map_err(|error| AnalyzeError::internal(error.to_string()))?;
-        Ok(TypedExpr {
-            kind: ExprKind::Cast {
-                expr: novarocks_parser::ast::AstBox::new(source),
-                target: target.data_type().clone(),
-                decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                cast_mode: Some(mode),
-            },
-            value_type: target,
-        })
     }
 
     /// Preserve ordinary carrier CASTs, but select the exact conversion owner
@@ -119,6 +91,69 @@ impl super::AnalyzerContext<'_> {
     }
 }
 
+pub(super) fn cast_with_trino_mode(
+    source: TypedExpr,
+    target: FunctionValueType,
+    mode: novarocks_type_contract::TrinoCastMode,
+    span: Span,
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    settings: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn PureCompileControl,
+    forbid_time_dependencies: bool,
+) -> Result<TypedExpr, AnalyzeError> {
+    use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
+
+    super::helpers::validate_value_type(&source.value_type, control)?;
+    super::helpers::validate_value_type(&target, control)?;
+    if source.value_type.value_type().temporal().is_some()
+        || target.value_type().temporal().is_some()
+    {
+        return super::expression_typing::authored_temporal_cast(
+            catalog,
+            settings,
+            constant_policy,
+            control,
+            source,
+            target,
+            mode == novarocks_type_contract::TrinoCastMode::Try,
+            span,
+            forbid_time_dependencies,
+        );
+    }
+    let nullable =
+        PreparedCastRecipe::trino_result_nullable(&source.value_type, &target, mode, control)
+            .map_err(|error| {
+                if let Some(cause) = error.control_error() {
+                    return AnalyzeError::control(cause);
+                }
+                let message = format!(
+                    "Cannot cast {:?} to {:?}: {error}",
+                    source.value_type.value_type().kind(),
+                    target.value_type().kind(),
+                );
+                match error {
+                    CastPrepareError::Illegal => AnalyzeError::type_mismatch(message, span),
+                    CastPrepareError::Unsupported => {
+                        AnalyzeError::unsupported_expression(message, span)
+                    }
+                    _ => AnalyzeError::internal(message),
+                }
+            })?;
+    let target = target
+        .with_nullable(nullable)
+        .map_err(|error| AnalyzeError::internal(error.to_string()))?;
+    Ok(TypedExpr {
+        kind: ExprKind::Cast {
+            expr: novarocks_parser::ast::AstBox::new(source),
+            target: target.data_type().clone(),
+            decimal_overflow_policy: settings.sql_mode().decimal_overflow_policy(),
+            cast_mode: Some(mode),
+        },
+        value_type: target,
+    })
+}
+
 /// The sole assignment/CAST conversion author, also consumed by exact internal
 /// root-output declarations after ordinary query analysis has completed.
 pub(super) fn cast_to_value_type(
@@ -137,6 +172,21 @@ pub(super) fn cast_to_value_type(
         .map_err(AnalyzeError::control)?;
     if source.value_type == target {
         return Ok(source);
+    }
+    if source.value_type.value_type().temporal().is_some()
+        || target.value_type().temporal().is_some()
+    {
+        return super::expression_typing::authored_temporal_cast(
+            function_catalog,
+            sql_semantics,
+            constant_policy,
+            control,
+            source,
+            target,
+            false,
+            span,
+            false,
+        );
     }
     // The semantic cast walk observes the actual caller's control; its
     // checked owner preserves nested nominal domains across carrier casts.

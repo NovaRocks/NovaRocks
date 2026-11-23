@@ -27,6 +27,8 @@ use arrow_array::builder::*;
 use arrow_array::*;
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use arrow_schema::{DataType, TimeUnit};
+use novarocks_type_contract::{TemporalType, TemporalValue, ValueTypeRef};
+use novarocks_value_arrays::decode::PreparedTemporalArray;
 use std::sync::Arc;
 #[path = "aggregate_scalar/source_failure.rs"]
 mod source_failure;
@@ -88,6 +90,7 @@ pub enum AggScalarValue {
     Utf8(String),
     Date32(i32),
     Timestamp(i64),
+    Temporal(TemporalType, TemporalValue),
     Decimal128(i128),
     Decimal256(i256),
     Binary(Vec<u8>),
@@ -124,6 +127,7 @@ pub enum TrackedAggScalarValue<A: ScalarStateAllocator> {
     Utf8(ScalarVec<u8, A>),
     Date32(i32),
     Timestamp(i64),
+    Temporal(TemporalType, TemporalValue),
     Decimal128(i128),
     Decimal256(i256),
     Binary(ScalarVec<u8, A>),
@@ -155,7 +159,25 @@ pub fn tracked_scalar_from_array<A: ScalarStateAllocator>(
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<Option<TrackedAggScalarValue<A>>, KernelFailure> {
+    tracked_scalar_from_typed_array(array, row, None, allocator, work)
+}
+
+pub(crate) fn tracked_scalar_from_typed_array<A: ScalarStateAllocator>(
+    array: &ArrayRef,
+    row: usize,
+    declaration: Option<&ValueTypeRef>,
+    allocator: &A,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<Option<TrackedAggScalarValue<A>>, KernelFailure> {
     work.step()?;
+    if let Some(value_type) = declaration
+        && let Some(temporal) = value_type.temporal()
+    {
+        let value = PreparedTemporalArray::bind(temporal, array.as_ref(), value_type.nullable())
+            .and_then(|array| array.value(row))
+            .map_err(|_| temporal_scalar_contract())?;
+        return Ok(value.map(|value| TrackedAggScalarValue::Temporal(temporal, value)));
+    }
     if array.is_null(row) {
         return Ok(None);
     }
@@ -392,9 +414,10 @@ pub fn tracked_scalar_from_array<A: ScalarStateAllocator>(
             )?;
             for index in start..end {
                 work.step()?;
-                values.push(tracked_scalar_from_array(
+                values.push(tracked_scalar_from_typed_array(
                     array.values(),
                     index,
+                    declaration.and_then(|value| value.child_type_at(0)),
                     allocator,
                     work,
                 )?);
@@ -417,9 +440,15 @@ pub fn tracked_scalar_from_array<A: ScalarStateAllocator>(
                 "reserve aggregate struct scalar",
                 work,
             )?;
-            for column in array.columns() {
+            for (ordinal, column) in array.columns().iter().enumerate() {
                 work.step()?;
-                values.push(tracked_scalar_from_array(column, row, allocator, work)?);
+                values.push(tracked_scalar_from_typed_array(
+                    column,
+                    row,
+                    declaration.and_then(|value| value.child_type_at(ordinal)),
+                    allocator,
+                    work,
+                )?);
             }
             TrackedAggScalarValue::Struct(values)
         }
@@ -439,8 +468,20 @@ pub fn tracked_scalar_from_array<A: ScalarStateAllocator>(
             for index in start..end {
                 work.step()?;
                 entries.push((
-                    tracked_scalar_from_array(array.keys(), index, allocator, work)?,
-                    tracked_scalar_from_array(array.values(), index, allocator, work)?,
+                    tracked_scalar_from_typed_array(
+                        array.keys(),
+                        index,
+                        declaration.and_then(|value| value.child_type_at(0)),
+                        allocator,
+                        work,
+                    )?,
+                    tracked_scalar_from_typed_array(
+                        array.values(),
+                        index,
+                        declaration.and_then(|value| value.child_type_at(1)),
+                        allocator,
+                        work,
+                    )?,
                 ));
             }
             TrackedAggScalarValue::Map(entries)
@@ -453,6 +494,13 @@ pub fn tracked_scalar_from_array<A: ScalarStateAllocator>(
         }
     };
     Ok(Some(value))
+}
+
+pub(crate) fn temporal_scalar_contract() -> KernelFailure {
+    source_failure::contract(
+        ContractKind::ValueType,
+        "aggregate scalar differs from its complete temporal declaration",
+    )
 }
 
 /// Preserve the actual standard container error. Its stable API exposes no
@@ -498,6 +546,7 @@ pub fn tracked_scalar_to_output<A: ScalarStateAllocator>(
         ),
         TrackedAggScalarValue::Date32(value) => AggScalarValue::Date32(*value),
         TrackedAggScalarValue::Timestamp(value) => AggScalarValue::Timestamp(*value),
+        TrackedAggScalarValue::Temporal(ty, value) => AggScalarValue::Temporal(*ty, *value),
         TrackedAggScalarValue::Decimal128(value) => AggScalarValue::Decimal128(*value),
         TrackedAggScalarValue::Decimal256(value) => AggScalarValue::Decimal256(*value),
         TrackedAggScalarValue::Binary(value) => {
@@ -556,7 +605,16 @@ pub fn build_scalar_array(
     values: Vec<Option<AggScalarValue>>,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ArrayRef, KernelFailure> {
-    build_scalar_array_impl(output_type, values, work, false)
+    build_scalar_array_impl(output_type, values, work, false, None)
+}
+
+pub(crate) fn build_typed_scalar_array(
+    output_type: &DataType,
+    declaration: Option<&ValueTypeRef>,
+    values: Vec<Option<AggScalarValue>>,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<ArrayRef, KernelFailure> {
+    build_scalar_array_impl(output_type, values, work, false, declaration)
 }
 
 /// Explicit selected callers observe the original nested LARGEINT builder.
@@ -571,7 +629,7 @@ pub fn build_scalar_array_with_largeint_observation(
             "observed LARGEINT scalar builder requires evaluation control",
         ));
     }
-    build_scalar_array_impl(output_type, values, work, true)
+    build_scalar_array_impl(output_type, values, work, true, None)
 }
 
 fn build_scalar_array_impl(
@@ -579,7 +637,31 @@ fn build_scalar_array_impl(
     values: Vec<Option<AggScalarValue>>,
     work: &mut ScalarWork<'_, '_>,
     observe_largeint: bool,
+    declaration: Option<&ValueTypeRef>,
 ) -> Result<ArrayRef, KernelFailure> {
+    if let Some(temporal) = declaration.and_then(ValueTypeRef::temporal) {
+        if temporal.carrier() != *output_type {
+            return Err(temporal_scalar_contract());
+        }
+        use crate::builtin::temporal_output::TemporalOutputBuilder;
+        work.flush()?;
+        let mut output = TemporalOutputBuilder::new(
+            crate::temporal_cast::Type::Temporal(temporal),
+            values.len(),
+        )?;
+        for value in values {
+            work.step()?;
+            match value {
+                Some(AggScalarValue::Temporal(ty, value)) if ty == temporal => {
+                    output.temporal(ty, value)?
+                }
+                None => output.null(),
+                _ => return Err(temporal_scalar_contract()),
+            }
+        }
+        work.flush()?;
+        return Ok(output.finish());
+    }
     match output_type {
         DataType::Null => Ok(new_null_array(output_type, values.len())),
         DataType::Boolean => {
@@ -942,8 +1024,13 @@ fn build_scalar_array_impl(
                     }
                 }
             }
-            let child =
-                build_scalar_array_impl(item.data_type(), flat_values, work, observe_largeint)?;
+            let child = build_scalar_array_impl(
+                item.data_type(),
+                flat_values,
+                work,
+                observe_largeint,
+                declaration.and_then(|value| value.child_type_at(0)),
+            )?;
             let out = ListArray::try_new(
                 item.clone(),
                 OffsetBuffer::new(offsets.into()),
@@ -994,13 +1081,14 @@ fn build_scalar_array_impl(
                 }
             }
             let mut columns = Vec::with_capacity(fields.len());
-            for (field, values) in fields.iter().zip(field_values) {
+            for (ordinal, (field, values)) in fields.iter().zip(field_values).enumerate() {
                 work.step()?;
                 columns.push(build_scalar_array_impl(
                     field.data_type(),
                     values,
                     work,
                     observe_largeint,
+                    declaration.and_then(|value| value.child_type_at(ordinal)),
                 )?);
             }
             Ok(Arc::new(
@@ -1064,12 +1152,14 @@ fn build_scalar_array_impl(
                 key_values,
                 work,
                 observe_largeint,
+                declaration.and_then(|value| value.child_type_at(0)),
             )?;
             let values = build_scalar_array_impl(
                 entry_fields[1].data_type(),
                 value_values,
                 work,
                 observe_largeint,
+                declaration.and_then(|value| value.child_type_at(1)),
             )?;
             let entries = StructArray::try_new(entry_fields.clone(), vec![keys, values], None)
                 .map_err(|source| source_failure::construction(Construction::MapEntries, source))?;
@@ -1153,6 +1243,14 @@ pub fn compare_tracked_scalar_values_partial<A: ScalarStateAllocator>(
         }
         (TrackedAggScalarValue::Timestamp(left), TrackedAggScalarValue::Timestamp(right)) => {
             Ok(ScalarOrdering::Ordered(left.cmp(right)))
+        }
+        (TrackedAggScalarValue::Temporal(lt, left), TrackedAggScalarValue::Temporal(rt, right))
+            if lt == rt =>
+        {
+            use crate::aggregate_scalar_fingerprint::temporal_key;
+            Ok(ScalarOrdering::Ordered(
+                temporal_key(*lt, *left)?.cmp(&temporal_key(*rt, *right)?),
+            ))
         }
         (TrackedAggScalarValue::Decimal128(left), TrackedAggScalarValue::Decimal128(right)) => {
             Ok(ScalarOrdering::Ordered(left.cmp(right)))

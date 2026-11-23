@@ -223,7 +223,7 @@ fn branch_and_boolean_typing_own_the_full_conversion() {
 }
 
 #[test]
-fn literal_typing_preserves_date_and_json_and_authors_the_temporal_cast() {
+fn literal_typing_preserves_date_json_and_exact_temporal_values() {
     let catalogue = installed_builtin_owner_catalogue();
     let context = context(catalogue.metadata());
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
@@ -231,34 +231,21 @@ fn literal_typing_preserves_date_and_json_and_authors_the_temporal_cast() {
         type_node(&context, NodeShape::Literal(syntax), &[], work)
     };
 
-    let NodeTyping::Literal(LiteralEmission::Cast {
-        input,
-        declared_result,
-        conversion,
-    }) = literal(
+    let NodeTyping::Literal(LiteralEmission::Direct(date)) = literal(
         LiteralSyntax::TypedString {
             name: "DATE",
             value: "1970-01-02",
         },
         &mut work,
     )
-    .unwrap()
-    else {
-        panic!("expected the original DATE text CAST");
+    .unwrap() else {
+        panic!("expected direct DATE");
     };
     assert_eq!(
-        input.value,
-        novarocks_expression::typing::LiteralValue::String("1970-01-02".into())
+        date.value,
+        novarocks_expression::typing::LiteralValue::Int(1)
     );
-    assert_eq!(
-        declared_result,
-        FunctionValueType::new(DataType::Date32, false)
-    );
-    assert_eq!(conversion.target, declared_result);
-    assert_eq!(
-        conversion.mode,
-        Some(novarocks_type_contract::TrinoCastMode::Explicit)
-    );
+    assert_eq!(date.value_type.data_type(), &DataType::Date32);
     let NodeTyping::Literal(LiteralEmission::Direct(json)) = literal(
         LiteralSyntax::TypedString {
             name: "json",
@@ -274,37 +261,23 @@ fn literal_typing_preserves_date_and_json_and_authors_the_temporal_cast() {
         json.value,
         novarocks_expression::typing::LiteralValue::String(r#"{"b":1, "a":2}"#.into())
     );
-    let NodeTyping::Literal(LiteralEmission::Cast {
-        input,
-        declared_result,
-        conversion,
-    }) = literal(
+    let NodeTyping::Literal(LiteralEmission::Constant { value_type, value }) = literal(
         LiteralSyntax::TypedString {
             name: "TIME",
-            value: "01:02:03",
+            value: "01:02:03.000000000001",
         },
         &mut work,
     )
-    .unwrap()
-    else {
-        panic!("expected temporal string CAST");
+    .unwrap() else {
+        panic!("expected exact temporal constant");
     };
-    assert_eq!(input.value_type.data_type(), &DataType::Utf8);
-    assert_eq!(declared_result.data_type(), conversion.target.data_type());
-    assert!(!declared_result.nullable());
+    use novarocks_type_contract::{TemporalPrecision, TemporalType};
     assert_eq!(
-        conversion.target.data_type(),
-        &DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+        value_type.value_type().temporal(),
+        Some(TemporalType::Time(TemporalPrecision::PICOSECONDS))
     );
-    assert!(!conversion.target.nullable());
-    assert_eq!(
-        conversion.mode,
-        Some(novarocks_type_contract::TrinoCastMode::Explicit)
-    );
-    assert!(matches!(
-        literal(LiteralSyntax::Interval, &mut work),
-        Err(TypingError::Unsupported(_))
-    ));
+    assert!(!value_type.nullable());
+    assert_eq!(value.pool().array().data_type(), &DataType::Int64);
 }
 
 #[test]

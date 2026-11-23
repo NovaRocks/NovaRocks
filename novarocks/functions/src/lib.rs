@@ -2766,6 +2766,10 @@ pub mod binary_text;
 pub mod decimal_float_cast;
 pub mod float_decimal128;
 
+mod temporal_arithmetic;
+mod temporal_cast;
+pub mod temporal_value;
+pub mod temporal_zone_rules;
 pub mod time_text_cast;
 
 pub mod time_calendar_cast;

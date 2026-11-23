@@ -19,4 +19,5 @@ mod frozen_output_contract;
 
 mod property_evaluation;
 
+mod statement_environment;
 mod unsupported_admission;
