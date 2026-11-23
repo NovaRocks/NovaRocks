@@ -382,6 +382,11 @@ impl RegisteredIcebergDataMutationBackend {
         });
         let mut outcome = self.project_bridge(&operation, &journal, report)?;
         self.finish_committed(&journal, &recovery.finalization(), context, &mut outcome);
+        if catalog_operation == CatalogOperation::Delete
+            && matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. })
+        {
+            journal.retire_concluded_preparations();
+        }
         Ok(project_external(outcome))
     }
 

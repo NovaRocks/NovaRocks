@@ -302,6 +302,11 @@ fn metadata_delete_adjudicates_the_actual_snapshot_count_after_a_lost_reply() {
         }
         let request =
             ConnectorDataMutationExecuteRequest::try_new(plan.clone(), table_context()).unwrap();
+        let extension = request
+            .context
+            .request_scope_extension_or_insert_with(|| 0_u64);
+        let weak = Arc::downgrade(&extension);
+        drop(extension);
         let ExternalMutationOutcome::CommitUnknown { failure, evidence } =
             adapter.execute(request.clone()).unwrap()
         else {
@@ -321,6 +326,13 @@ fn metadata_delete_adjudicates_the_actual_snapshot_count_after_a_lost_reply() {
         );
         let after = current_delete_test_table(&executor, &base);
         let snapshot = after.metadata().current_snapshot().unwrap();
+        seed_delete_test_data(&executor, &base, 2, 7);
+        assert_ne!(
+            current_delete_test_table(&executor, &base)
+                .metadata()
+                .current_snapshot_id(),
+            Some(snapshot.snapshot_id())
+        );
         let receipt = committed_delete_receipt(
             adapter
                 .reconcile(
@@ -343,6 +355,10 @@ fn metadata_delete_adjudicates_the_actual_snapshot_count_after_a_lost_reply() {
             receipt
         );
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        assert!(
+            weak.upgrade().is_none(),
+            "retained evidence must not pin the preparation scope"
+        );
     }
 }
 
