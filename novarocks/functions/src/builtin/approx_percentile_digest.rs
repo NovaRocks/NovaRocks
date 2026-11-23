@@ -78,7 +78,7 @@ impl<A: ScalarStateAllocator> Digest<A> {
         work.step()?;
         let weight = self.weight + entry.weight;
         if !weight.is_finite() {
-            return Err(super::approx_histogram_kernel::parameter(
+            return Err(crate::kernel_control::invalid_function_argument(
                 "approx_percentile total weight exceeds the digest carrier",
             ));
         }

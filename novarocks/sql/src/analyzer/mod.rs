@@ -500,9 +500,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         query_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
         &query_semantics
     };
-    let query =
-        crate::sql_mode::normalize_concat_query_with_semantics(query.clone(), sql_semantics);
-    let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
+    let query = query_prepass::preanalyze_with_semantics(query.clone(), sql_semantics)?;
     let materialized_source = materialized
         .map(|source| source.loan(&query, control))
         .transpose()

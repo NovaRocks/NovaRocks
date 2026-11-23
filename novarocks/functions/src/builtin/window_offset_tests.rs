@@ -23,6 +23,8 @@ use arrow_array::{
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field};
+use novarocks_failure_contract::FailureProjection;
+use novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT;
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     ExpressionUseId, FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior,
@@ -723,7 +725,7 @@ fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metad
 }
 
 #[test]
-fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_publication() {
+fn dynamic_offsets_and_typed_parameter_refusals_follow_partition_addresses() {
     let source = FunctionValueType::new(DataType::Int32, true);
     for name in NAMES {
         let dynamic = Fixture::with_arguments(
@@ -740,8 +742,53 @@ fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_public
             ],
             DecimalOverflowPolicy::OutputNull,
         );
+        let prepared = dynamic
+            .prepare(options(false), &CompileControl::default())
+            .unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+        let offsets: ArrayRef = Arc::new(Int64Array::from(vec![0, 1, 2]));
+        let arguments = [
+            EvaluatedArgument::Column(&values),
+            EvaluatedArgument::Column(&offsets),
+        ];
+        let peers = [WindowRowRange { start: 0, end: 3 }];
+        let frames = whole_frames(3);
+        let mut partition = WindowEvaluationPartition::begin(
+            prepared.clone(),
+            geometry(&prepared, &arguments, &peers, &frames),
+            &Control::default(),
+        )
+        .unwrap();
+        let expected = if name == "lead" {
+            [Some(10), Some(30), None]
+        } else {
+            [Some(10); 3]
+        };
+        assert_eq!(
+            ints(
+                &partition
+                    .evaluate(Selection::all(3), 3, &Control::default())
+                    .unwrap()
+            ),
+            expected
+        );
+        for offset in [None, Some(-1)] {
+            let offsets: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), offset, Some(2)]));
+            let arguments = [
+                EvaluatedArgument::Column(&values),
+                EvaluatedArgument::Column(&offsets),
+            ];
+            let Err(error) = WindowEvaluationPartition::begin(
+                prepared.clone(),
+                geometry(&prepared, &arguments, &peers, &frames),
+                &Control::default(),
+            ) else {
+                panic!("invalid dynamic offset must fail");
+            };
+            assert_eq!(error.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
+        }
+
         for fixture in [
-            dynamic,
             Fixture::offset(
                 name,
                 source.clone(),
@@ -755,12 +802,12 @@ fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_public
                 DecimalOverflowPolicy::OutputNull,
             ),
         ] {
-            assert!(matches!(
-                fixture.prepare(options(false), &CompileControl::default()),
-                Err(FunctionSpecializationFailure::Kernel(
-                    KernelFailure::InvalidProgram(_)
-                ))
-            ));
+            let Err(FunctionSpecializationFailure::Kernel(error)) =
+                fixture.prepare(options(false), &CompileControl::default())
+            else {
+                panic!("invalid checked offset must fail");
+            };
+            assert_eq!(error.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
         }
         for default in [
             FunctionValueType::new(DataType::Boolean, true),
@@ -828,9 +875,10 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                 let message = if offset == Some(-1) {
                     "LEAD/LAG offset must be non-negative"
                 } else {
-                    "LEAD/LAG offset must be a non-NULL integer constant"
+                    "LEAD/LAG offset must not be NULL"
                 };
-                assert_eq!(expected, crate::kernel_control::invalid(message));
+                assert_eq!(expected.failure_fact().reason(), INVALID_FUNCTION_ARGUMENT);
+                assert!(expected.to_string().contains(message));
                 for cause in [
                     CompileControlError::Cancelled,
                     CompileControlError::DeadlineExceeded,
@@ -845,7 +893,8 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                     else {
                         panic!("a later optional callback replaced the ordinary offset refusal");
                     };
-                    assert_eq!(actual, expected);
+                    assert_eq!(actual.failure_fact(), expected.failure_fact());
+                    assert_eq!(actual.to_string(), expected.to_string());
                     assert_eq!(*control.trace.lock().unwrap(), trace);
                 }
             }

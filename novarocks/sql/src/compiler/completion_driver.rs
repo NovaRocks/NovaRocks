@@ -180,11 +180,10 @@ impl SqlFinalPlanCompileRequest {
                 .map_err(SqlCompileError::from)?;
             &query_semantics
         };
-        let query = crate::sql_mode::normalize_concat_query_with_semantics(query, effective);
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_requires_semantic_snapshot(effective, &query);
         // Retain the producer's actual checked constants across discovery and
-        // catalog rounds. The loan is rebuilt against this normalized query;
+        // catalog rounds. The loan is rebuilt against the admitted query;
         // syntax transformations must validate the original structural sites.
         let materialized_source = match statement.kind {
             super::SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
@@ -2641,18 +2640,18 @@ mod tests {
     fn unsupported_caller_never_discovers_optional_mv_definitions() {
         use crate::sql_mode::SqlMode;
         for (sql, connection_mode) in [
-            ("SELECT order_key FROM orders", "GROUP_CONCAT_LEGACY"),
+            ("SELECT order_key FROM orders", "ERROR_IF_OVERFLOW"),
             (
-                "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
                 "32",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM (SELECT order_key FROM orders) d",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
         ] {
             let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
@@ -2685,7 +2684,7 @@ mod tests {
         for (sql, connection_mode) in [
             (
                 "WITH SESSION sql_mode = 32 SELECT order_key FROM orders",
-                "GROUP_CONCAT_LEGACY",
+                "ERROR_IF_OVERFLOW",
             ),
             (
                 "SELECT order_key FROM orders UNION ALL SELECT order_key FROM orders",
@@ -2745,7 +2744,7 @@ mod tests {
             table: "orders".to_string(),
         };
         let query = novarocks_parser::parser::parse_query(
-            "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT order_key FROM orders",
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT order_key FROM orders",
         )
         .unwrap();
         let definition = SqlMvRewriteDefinitionFacts::try_new(
@@ -3276,12 +3275,6 @@ mod tests {
                 .disabled_rules
                 .push("PushDownTopNToPreAgg".into());
         }
-        // Original compressed_key query 132 admits this value before 137.
-        input.session.sql_semantics = input
-            .session
-            .sql_semantics
-            .clone()
-            .with_group_concat_max_len(65_535);
         input.dop_domain = PipelineDopDomain {
             min: 2,
             max: 2,
@@ -3539,7 +3532,7 @@ mod tests {
             ),
             (
                 "original-137",
-                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result",
+                "WITH result AS (SELECT c1,c2,c3,COUNT(*) AS cnt FROM all_t0 GROUP BY c1,c2,c3 ORDER BY c1,c2,c3 LIMIT 100) SELECT 'Test Case 39' AS test_name, MD5(LISTAGG(CAST(c1 AS VARCHAR), ':') WITHIN GROUP (ORDER BY c1, c2, c3)) AS result_hash FROM result",
             ),
         ];
         let mut failures = Vec::new();

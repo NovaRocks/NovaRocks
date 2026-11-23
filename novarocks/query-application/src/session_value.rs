@@ -268,7 +268,7 @@ mod tests {
             state.sql_semantics().sql_mode().assignment(),
             "GROUP_CONCAT_LEGACY,32"
         );
-        assert!(state.sql_semantics().sql_mode().group_concat_legacy());
+        assert!(!state.sql_semantics().sql_mode().error_if_overflow());
     }
 
     #[test]

@@ -775,8 +775,6 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     declarations.extend([
         AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64"),
         AggregateDeclaration::ranged("multi_distinct_count", 1, usize::MAX, "(any...)->i64"),
-        AggregateDeclaration::ranged("group_concat", 2, usize::MAX, "(any,utf8...)->utf8"),
-        AggregateDeclaration::ranged("string_agg", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::exact("listagg", 5, "(utf8,utf8,bool,utf8,bool)->utf8"),
         AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
         AggregateDeclaration::exact("max_by", 2, "(any,any)->any"),
@@ -3433,6 +3431,27 @@ pub fn contribute_builtin_functions(
         builder.register(definition)?;
     }
     for declaration in builtin_aggregate_declarations() {
+        let mut register = |mut definition: FunctionDefinition| {
+            if matches!(
+                declaration.name,
+                "array_agg_distinct"
+                    | "booland_agg"
+                    | "boolor_agg"
+                    | "std"
+                    | "variance_pop"
+                    | "variance_samp"
+                    | "min_n"
+                    | "max_n"
+                    | "ndv"
+                    | "approx_count_distinct"
+                    | "approx_top_k"
+                    | "percentile_approx"
+                    | "percentile_approx_weighted"
+            ) {
+                definition.visibility = FunctionVisibility::Hidden;
+            }
+            builder.register(definition)
+        };
         let function_id = FunctionId::try_new(format!("builtin.aggregate/{}/v1", declaration.name))
             .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
                 subject: "builtin aggregate function",
@@ -3451,9 +3470,7 @@ pub fn contribute_builtin_functions(
                 })?;
         let overload = FunctionOverloadDeclaration {
             effects: match declaration.name {
-                "group_concat" | "string_agg" | "listagg" => Some(
-                    super::aggregate_concat_owner::effects(declaration.name == "listagg"),
-                ),
+                "listagg" => Some(super::aggregate_concat_owner::effects()),
                 "array_agg" | "array_agg_distinct" => Some(super::aggregate_array_owner::effects()),
                 "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
                 "map_agg" => Some(super::aggregate_map_owner::effects()),
@@ -3531,15 +3548,15 @@ pub fn contribute_builtin_functions(
         // the typed signature contract an aggregate is resolved through.
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
         if matches!(declaration.name, "array_agg" | "array_agg_distinct") {
-            builder.register(super::aggregate_array_owner::definition(
+            register(super::aggregate_array_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
             )?)?;
             continue;
         }
-        if matches!(declaration.name, "group_concat" | "string_agg" | "listagg") {
-            builder.register(super::aggregate_concat_owner::definition(
+        if declaration.name == "listagg" {
+            register(super::aggregate_concat_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3547,7 +3564,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "approx_top_k" {
-            builder.register(super::aggregate_top_k_owner::definition(
+            register(super::aggregate_top_k_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3555,7 +3572,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if matches!(declaration.name, "min_n" | "max_n") {
-            builder.register(super::aggregate_n_owner::definition(
+            register(super::aggregate_n_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3566,7 +3583,7 @@ pub fn contribute_builtin_functions(
             declaration.name,
             "percentile_approx" | "percentile_approx_weighted"
         ) {
-            builder.register(super::aggregate_approx_percentile_owner::definition(
+            register(super::aggregate_approx_percentile_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3574,7 +3591,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "map_agg" {
-            builder.register(super::aggregate_map_owner::definition(
+            register(super::aggregate_map_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3582,7 +3599,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if matches!(declaration.name, "max_by" | "min_by") {
-            builder.register(super::aggregate_by_owner::definition(
+            register(super::aggregate_by_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3590,7 +3607,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "any_value" {
-            builder.register(super::aggregate_any_value_owner::definition(
+            register(super::aggregate_any_value_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3598,7 +3615,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "multi_distinct_count" {
-            builder.register(super::aggregate_count_distinct_owner::definition(
+            register(super::aggregate_count_distinct_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3606,7 +3623,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if matches!(declaration.name, "ndv" | "approx_count_distinct") {
-            builder.register(super::aggregate_hll_owner::definition(
+            register(super::aggregate_hll_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3614,7 +3631,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "count" {
-            builder.register(super::aggregate_count_owner::definition(
+            register(super::aggregate_count_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3622,7 +3639,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if declaration.name == "sum" {
-            builder.register(super::aggregate_sum_owner::definition(
+            register(super::aggregate_sum_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3630,7 +3647,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if super::aggregate_extrema_owner::operation(declaration.name).is_some() {
-            builder.register(super::aggregate_extrema_owner::definition(
+            register(super::aggregate_extrema_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3638,7 +3655,7 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if super::aggregate_distinct_numeric_kernel::operation(declaration.name).is_some() {
-            builder.register(super::aggregate_distinct_numeric_owner::definition(
+            register(super::aggregate_distinct_numeric_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -3646,14 +3663,14 @@ pub fn contribute_builtin_functions(
             continue;
         }
         if super::aggregate_basic::operation(declaration.name).is_some() {
-            builder.register(super::aggregate_basic_owner::definition(
+            register(super::aggregate_basic_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
             )?)?;
             continue;
         }
-        builder.register(FunctionDefinition::bound_with_owner(
+        register(FunctionDefinition::bound_with_owner(
             declaration.name,
             FunctionVisibility::Public,
             binding_declaration,

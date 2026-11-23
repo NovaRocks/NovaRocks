@@ -70,8 +70,13 @@ impl Fixture {
                 ),
             ),
             (7, SemanticParameterValue::AllowThrowException(true)),
-            (300, SemanticParameterValue::GroupConcatLegacy(true)),
-            (19, SemanticParameterValue::GroupConcatMaxLen(-9)),
+            (300, SemanticParameterValue::AllowThrowException(true)),
+            (
+                19,
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(-9, 0).unwrap(),
+                ),
+            ),
         ];
         let environment = values
             .iter()
@@ -322,7 +327,9 @@ fn exact_nonempty_frozen_parameter_closure_preserves_values_and_drops_unused_sco
     );
     assert_eq!(
         contract.parameters().get(SemanticParameterId::new(19)),
-        Some(&SemanticParameterValue::GroupConcatMaxLen(-9))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(-9, 0).unwrap()
+        ))
     );
     assert!(Arc::ptr_eq(contract.selected_owner(), &fixture.selected));
     assert_eq!(contract.context(), input.context);

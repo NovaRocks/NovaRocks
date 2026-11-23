@@ -130,6 +130,7 @@ enum Code {
     FunctionNotAggregate,
     ExpressionNotScalar,
     ExpressionNotInDistinct,
+    MissingOrderBy,
     TypeNotFound,
     InvalidLiteral,
     MismatchedColumnAliases,
@@ -215,6 +216,7 @@ impl Code {
             FunctionNotAggregate => (72, "FUNCTION_NOT_AGGREGATE", "USER_ERROR"),
             ExpressionNotScalar => (74, "EXPRESSION_NOT_SCALAR", "USER_ERROR"),
             ExpressionNotInDistinct => (69, "EXPRESSION_NOT_IN_DISTINCT", "USER_ERROR"),
+            MissingOrderBy => (65, "MISSING_ORDER_BY", "USER_ERROR"),
             TypeNotFound => (43, "TYPE_NOT_FOUND", "USER_ERROR"),
             InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
             MismatchedColumnAliases => (61, "MISMATCHED_COLUMN_ALIASES", "USER_ERROR"),
@@ -759,7 +761,9 @@ fn user_code(code: &str) -> Option<Code> {
         | "sql.validate.invalid_structure" => Syntax,
         "sql.validate.duplicate_cte_name" => DuplicateNamedQuery,
         "sql.validate.duplicate_window_name" => DuplicateWindowName,
-        "sql.validate.invalid_window_frame_bounds" => InvalidWindowFrame,
+        "sql.validate.invalid_window_frame_bounds" | "sql.analyze.invalid_window_frame" => {
+            InvalidWindowFrame
+        }
         "sql.analyze.unknown_catalog" => CatalogNotFound,
         "sql.analyze.unknown_schema" => SchemaNotFound,
         "sql.analyze.unknown_table" => TableNotFound,
@@ -776,6 +780,7 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.function_not_aggregate" => FunctionNotAggregate,
         "sql.analyze.expression_not_scalar" => ExpressionNotScalar,
         "sql.analyze.expression_not_in_distinct" => ExpressionNotInDistinct,
+        "sql.analyze.missing_order_by" => MissingOrderBy,
         "sql.admit.unknown_type" => TypeNotFound,
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.numeric_out_of_range" => NumericOutOfRange,

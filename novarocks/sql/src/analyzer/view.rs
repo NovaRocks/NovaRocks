@@ -65,8 +65,7 @@ impl AnalyzerContext<'_> {
         })?;
         crate::sql_mode::validate_persisted_query_semantics_typed(&query, &self.sql_semantics)
             .map_err(|error| stored_body_error(view, error, span))?;
-        let query = crate::sql_mode::normalize_concat_query(query, &self.sql_semantics)
-            .and_then(super::query_prepass::preanalyze)
+        let query = super::query_prepass::preanalyze(query)
             .map_err(|error| stored_body_error(view, error, span))?;
         let catalog = SavedViewCatalog {
             inner: self.catalog,
@@ -782,10 +781,7 @@ mod tests {
 
     #[test]
     fn stored_replay_keeps_the_existing_uncaptured_semantics_refusals() {
-        for (hint, feature) in [
-            ("sql_mode='GROUP_CONCAT_LEGACY'", "GROUP_CONCAT_LEGACY"),
-            ("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW"),
-        ] {
+        for (hint, feature) in [("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW")] {
             let catalog = catalog(declaration(
                 &format!("WITH SESSION {hint} SELECT 1 AS x"),
                 "x",

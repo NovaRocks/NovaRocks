@@ -25,7 +25,7 @@ use crate::aggregate_scalar::{
     tracked_scalar_from_array,
 };
 use crate::approx_top_k_core::{ApproxTopKState, update_one_observed};
-use crate::kernel_control::invalid;
+use crate::kernel_control::{invalid, invalid_function_argument};
 use crate::{
     AggregateCallContract, AggregateKernelPhase, AggregateStateAllocator,
     AggregateStateMemoryPolicy, KernelEvaluationControl, KernelFailure, PreparedAggregateKernel,
@@ -40,33 +40,7 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_schema::DataType;
-use novarocks_failure_contract::{
-    FailureClass, FailureFact, FailureProjection, OuterFailureProjection,
-};
 use std::sync::Arc;
-
-#[derive(Debug)]
-struct InvalidParameter(&'static str);
-
-impl std::fmt::Display for InvalidParameter {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.write_str(self.0)
-    }
-}
-impl std::error::Error for InvalidParameter {}
-impl FailureProjection for InvalidParameter {
-    fn failure_fact(&self) -> FailureFact {
-        FailureFact::new(
-            FailureClass::Data,
-            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
-        )
-    }
-}
-impl OuterFailureProjection for InvalidParameter {}
-
-pub(super) fn parameter(message: &'static str) -> KernelFailure {
-    KernelFailure::from_domain(InvalidParameter(message))
-}
 
 #[derive(Debug, Clone, Copy)]
 enum NumericInput {
@@ -82,7 +56,7 @@ impl NumericInput {
                 let value = at::<Int64Array>(array)?.value(row);
                 let converted = value as f64;
                 if converted as i64 != value {
-                    return Err(parameter(
+                    return Err(invalid_function_argument(
                         "approx_percentile BIGINT value cannot be represented exactly as DOUBLE",
                     ));
                 }
@@ -92,7 +66,9 @@ impl NumericInput {
             Self::Double => at::<Float64Array>(array)?.value(row),
         };
         if !value.is_finite() {
-            return Err(parameter("approx_percentile value must be finite"));
+            return Err(invalid_function_argument(
+                "approx_percentile value must be finite",
+            ));
         }
         Ok(value)
     }
@@ -285,7 +261,7 @@ impl PreparedAggregateKernel for ApproxHistogramKernel {
                         let (weights, row) = cell(1)?;
                         let weight = at::<Float64Array>(weights)?.value(row);
                         if !weight.is_finite() || weight < 1.0 {
-                            return Err(parameter(
+                            return Err(invalid_function_argument(
                                 "approx_percentile weight must be finite and at least 1",
                             ));
                         }
@@ -411,9 +387,9 @@ fn at<T: Array + 'static>(array: &dyn Array) -> Result<&T, KernelFailure> {
 }
 
 fn positive_i32(value: i64, minimum: i32, message: &'static str) -> Result<usize, KernelFailure> {
-    let value = i32::try_from(value).map_err(|_| parameter(message))?;
+    let value = i32::try_from(value).map_err(|_| invalid_function_argument(message))?;
     if value < minimum {
-        return Err(parameter(message));
+        return Err(invalid_function_argument(message));
     }
     Ok(value as usize)
 }
@@ -422,7 +398,7 @@ fn checked_percentile(value: f64) -> Result<f64, KernelFailure> {
     if (0.0..=1.0).contains(&value) {
         Ok(value)
     } else {
-        Err(parameter(
+        Err(invalid_function_argument(
             "approx_percentile percentile must be between 0 and 1",
         ))
     }
@@ -447,7 +423,7 @@ fn prepare_targets(
     for index in begin..end {
         work.step()?;
         if values.is_null(index) {
-            return Err(parameter(
+            return Err(invalid_function_argument(
                 "approx_percentile percentile array cannot contain NULL",
             ));
         }

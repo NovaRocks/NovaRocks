@@ -142,8 +142,6 @@ impl SqlDmlCatalogPreparation {
                 ));
             }
         };
-        let query = crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
-            .map_err(SqlCompileError::from)?;
         let catalog = CatalogCompletionState::try_new_with_qualifications(
             query,
             &[],

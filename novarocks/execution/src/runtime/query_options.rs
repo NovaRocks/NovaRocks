@@ -32,7 +32,7 @@ pub struct QueryOptions {
     pub runtime_filter_scan_wait_time_ms: Option<i64>,
     pub runtime_filter_wait_timeout_ms: Option<i32>,
     pub allow_throw_exception: bool,
-    pub group_concat_max_len: Option<i64>,
+
     pub enable_join_runtime_bitset_filter: Option<bool>,
     pub global_runtime_filter_build_max_size: Option<i64>,
     pub cache: QueryCacheOptions,
@@ -57,7 +57,7 @@ pub struct QueryOptionsParts {
     pub runtime_filter_scan_wait_time_ms: Option<i64>,
     pub runtime_filter_wait_timeout_ms: Option<i32>,
     pub allow_throw_exception: bool,
-    pub group_concat_max_len: Option<i64>,
+
     pub enable_join_runtime_bitset_filter: Option<bool>,
     pub global_runtime_filter_build_max_size: Option<i64>,
     pub cache: QueryCacheOptions,
@@ -84,7 +84,7 @@ impl QueryOptions {
             runtime_filter_scan_wait_time_ms: parts.runtime_filter_scan_wait_time_ms,
             runtime_filter_wait_timeout_ms: parts.runtime_filter_wait_timeout_ms,
             allow_throw_exception: parts.allow_throw_exception,
-            group_concat_max_len: parts.group_concat_max_len,
+
             enable_join_runtime_bitset_filter: parts.enable_join_runtime_bitset_filter,
             global_runtime_filter_build_max_size: parts.global_runtime_filter_build_max_size,
             cache: parts.cache,
@@ -117,10 +117,6 @@ impl QueryOptions {
 
     pub const fn allow_throw_exception(&self) -> bool {
         self.allow_throw_exception
-    }
-
-    pub const fn group_concat_max_len(&self) -> Option<i64> {
-        self.group_concat_max_len
     }
 
     pub const fn runtime_filter_scan_wait_time_ms(&self) -> Option<i64> {

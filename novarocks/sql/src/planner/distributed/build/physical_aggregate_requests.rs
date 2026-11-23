@@ -632,13 +632,6 @@ pub(in crate::planner::distributed::build) fn checked_aggregate_state_semantics_
     producer_binding: &AggregateBinding,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), super::lowered_draft::SqlSourceJournalError> {
-    let expected = consumer.binding().group_concat_source();
-    let actual = producer.binding().group_concat_source();
-    let same_semantics = match (expected, actual) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.legacy == b.legacy && a.max_len == b.max_len,
-        _ => false,
-    };
     let same_source_receipt = match (
         consumer.binding().aggregate_state_source(),
         producer.binding().aggregate_state_source(),
@@ -665,7 +658,7 @@ pub(in crate::planner::distributed::build) fn checked_aggregate_state_semantics_
         }
         _ => false,
     };
-    if !same_semantics || !same_source_receipt || !same_state || !same_filter_source {
+    if !same_source_receipt || !same_state || !same_filter_source {
         return Err(super::lowered_draft::SqlSourceJournalError::InvalidSource(
             "aggregate state producer changes its original interpretation or semantic source",
         ));

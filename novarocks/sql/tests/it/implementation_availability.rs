@@ -423,7 +423,7 @@ mod fold_frontiers {
 
     const UNAUTHORED_ENVIRONMENT: &[(&str, &str)] = &[
         (
-            "SELECT GROUP_CONCAT(REVERSE('abc'))",
+            "SELECT LISTAGG(REVERSE('abc')) WITHIN GROUP (ORDER BY 1)",
             "builtin.aggregate/string_agg/",
         ),
         (
@@ -478,11 +478,11 @@ mod fold_frontiers {
 
     #[test]
     fn e08s1_logical_environment_exact_authored_raw_limit_keeps_original_logical_success() {
-        for raw in [-1, 4096] {
+        {
             let probe = Arc::new(FoldProbe::default());
-            let semantics = SqlSemanticSettings::default().with_group_concat_max_len(raw);
+            let semantics = SqlSemanticSettings::default();
             analyze_table_free(
-                "SELECT GROUP_CONCAT(REVERSE('abc'))",
+                "SELECT LISTAGG(REVERSE('abc')) WITHIN GROUP (ORDER BY 1)",
                 SqlCompileIntent::LogicalOnly,
                 session(semantics, true),
                 builtin_sql_function_catalog(),

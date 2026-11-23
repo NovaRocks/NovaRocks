@@ -52,25 +52,21 @@ pub(super) fn is_supported_aggregate_window_function(name: &str) -> bool {
             | "max_by"
             | "min_by"
             | "var_samp"
-            | "variance_samp"
             | "stddev_samp"
             | "bool_or"
-            | "boolor_agg"
             | "covar_pop"
             | "covar_samp"
             | "corr"
             | "array_agg"
-            | "array_agg_distinct"
-            | "approx_top_k"
     )
 }
 
 pub(super) fn aggregate_window_supports_distinct(name: &str) -> bool {
-    matches!(name, "array_agg" | "array_agg_distinct")
+    name == "array_agg"
 }
 
 pub(super) fn aggregate_window_supports_function_order_by(name: &str) -> bool {
-    matches!(name, "array_agg" | "array_agg_distinct")
+    name == "array_agg"
 }
 
 fn format_signature_type(data_type: &DataType, map_value_context: bool) -> String {

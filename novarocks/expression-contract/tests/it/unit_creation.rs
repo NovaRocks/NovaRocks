@@ -247,8 +247,6 @@ fn call_unit(environment: bool) -> BoundExprSet {
             SemanticParameterKey::StatementStartUtc,
             SemanticParameterKey::TimeZone,
             SemanticParameterKey::AllowThrowException,
-            SemanticParameterKey::GroupConcatLegacy,
-            SemanticParameterKey::GroupConcatMaxLen,
         ]
         .into_iter()
         .enumerate()

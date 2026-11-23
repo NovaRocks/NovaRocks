@@ -31,15 +31,13 @@ message SemanticParameter {
   reserved 2;
   reserved "statement_start_utc_micros";
   uint32 id = 1;
-  reserved 5;
-  reserved "decimal_overflow_to_double";
+  reserved 5, 6, 7;
+  reserved "decimal_overflow_to_double", "group_concat_legacy", "group_concat_max_len";
   // The value variant determines the one stable key. No separate key or type
   // may override it; runtime settings and process defaults do not fill gaps.
   oneof value {
     string time_zone = 3;
     bool allow_throw_exception = 4;
-    bool group_concat_legacy = 6;
-    sint64 group_concat_max_len = 7;
     StatementStartUtc statement_start_utc = 8;
   }
 }
@@ -52,10 +50,10 @@ enum SemanticParameterKey {
   SEMANTIC_PARAMETER_KEY_STATEMENT_START_UTC = 1;
   SEMANTIC_PARAMETER_KEY_TIME_ZONE = 2;
   SEMANTIC_PARAMETER_KEY_ALLOW_THROW_EXCEPTION = 3;
-  reserved 4;
-  reserved "SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE";
-  SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_LEGACY = 5;
-  SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_MAX_LEN = 6;
+  reserved 4, 5, 6;
+  reserved "SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE",
+           "SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_LEGACY",
+           "SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_MAX_LEN";
 }
 message SemanticParameterRef {
   optional uint32 id = 1;

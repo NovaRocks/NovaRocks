@@ -38,7 +38,7 @@ mod tests {
     fn preserves_the_exact_generated_query_options_message() {
         let raw = novarocks::QueryOptions {
             runtime_filter_wait_timeout_ms: Some(0),
-            group_concat_max_len: Some(0),
+
             ..Default::default()
         };
 

@@ -718,7 +718,7 @@ fn checked_arithmetic_package_refuses_missing_or_wrong_parameter_authority() {
     let mut input = package_input(&fixture);
     input.parameters = SemanticParameters::try_new([(
         SemanticParameterId::new(u32::MAX),
-        SemanticParameterValue::GroupConcatLegacy(true),
+        SemanticParameterValue::AllowThrowException(true),
     )])
     .unwrap();
     assert_eq!(

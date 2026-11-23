@@ -373,3 +373,146 @@ fn filtered_distinct_and_its_sibling_update_after_a_single_gather() {
     assert!(functions[0].order.is_distinct);
     assert!(functions[1].filter_root.is_none());
 }
+
+#[test]
+fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
+    use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
+    use novarocks_functions::{
+        AggregateStateColumn, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
+        SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
+        UnaccountedAggregateStateAllocator,
+    };
+    use novarocks_local_program::{ProgramCallSite, ProgramStateTemplate};
+    use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+
+    struct Control;
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("aggregate state transfer never waits");
+        }
+    }
+
+    let source = sql_source(
+        "SELECT approx_distinct(k) FILTER (WHERE k > 0) FROM fixture.source",
+        DataType::Int64,
+    );
+    let plan = source.plan();
+    let programs = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
+    let mut nodes = aggregates(plan).collect::<Vec<_>>();
+    nodes.sort_by_key(|(_, _, calls)| calls[0].binding.phase.produces_final_result());
+    let [
+        (producer, update, [partial]),
+        (consumer, merge, [final_call]),
+    ] = nodes.as_slice()
+    else {
+        panic!("one Partial and one Final HLL call");
+    };
+    assert!(matches!(
+        partial.binding.phase,
+        AggregatePhase::Partial { .. }
+    ));
+    assert!(matches!(
+        final_call.binding.phase,
+        AggregatePhase::Final { .. }
+    ));
+    assert_eq!(
+        partial.binding.phase.sequence(),
+        final_call.binding.phase.sequence()
+    );
+    assert_eq!(
+        partial.binding.state_format.as_str(),
+        "novarocks/approx_distinct/hll-xxhash64-p11-v1"
+    );
+    assert_eq!(
+        final_call.binding.state_format,
+        partial.binding.state_format
+    );
+    assert!(partial.filter_root.is_some());
+    assert!(final_call.filter_root.is_none());
+    let imported = input_value(consumer, merge, final_call.arguments[0]);
+    assert_eq!(
+        source_value(plan, consumer.id(), imported),
+        (producer.id(), partial.output)
+    );
+
+    let handle = |program: &LocalProgram, node: &PhysicalNode| {
+        let node = local_aggregate(program, node).local_id().unwrap();
+        let Some(ProgramStateTemplate::Aggregate { kernel, .. }) =
+            program.state_template(ProgramCallSite::Aggregate { node, call: 0 })
+        else {
+            panic!("compiled approximate aggregate handle");
+        };
+        kernel.clone()
+    };
+    let update = handle(&programs[&producer.id()], update);
+    let merge = handle(&programs[&consumer.id()], merge);
+    let mut payloads = Vec::new();
+    for values in [[1, -100, 2], [3, -200, 4]] {
+        let mut states = AggregateStateColumn::try_new(
+            update.clone(),
+            Arc::new(UnaccountedAggregateStateAllocator),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        states.push(&Control).unwrap();
+        let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+        let arguments = [EvaluatedArgument::Column(&values)];
+        let selected = Selection::try_sparse(3, &[0, 2]).unwrap();
+        let input = SelectedAggregateUpdateInput::try_new(
+            update.contract(),
+            selected,
+            &arguments,
+            &[],
+            &Control,
+        )
+        .unwrap();
+        states
+            .prepare_update_batch(&[0, 0], input, &Control)
+            .unwrap()
+            .run(&Control)
+            .unwrap();
+        let state = states.emit(&[0], 1, &Control).unwrap();
+        assert!(!state.is_null(0));
+        payloads.push(
+            state
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0)
+                .to_vec(),
+        );
+    }
+    assert_ne!(payloads[0], payloads[1]);
+    let states: ArrayRef = Arc::new(BinaryArray::from_iter_values(payloads.iter()));
+    let mut final_states = AggregateStateColumn::try_new(
+        merge.clone(),
+        Arc::new(UnaccountedAggregateStateAllocator),
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    final_states.push(&Control).unwrap();
+    let input = SelectedAggregateMergeInput::try_new(
+        merge.contract(),
+        Selection::all(2),
+        EvaluatedArgument::Column(&states),
+        &Control,
+    )
+    .unwrap();
+    final_states
+        .prepare_merge_batch(&[0, 0], input, &Control)
+        .unwrap()
+        .run(&Control)
+        .unwrap();
+    let result = final_states.emit(&[0], 1, &Control).unwrap();
+    assert_eq!(
+        result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        4
+    );
+}

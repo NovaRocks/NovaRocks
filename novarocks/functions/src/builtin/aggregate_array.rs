@@ -64,7 +64,7 @@ impl ArrayKernel {
     fn kind(&self) -> ArrayAggKind<'_> {
         match self.operation {
             Operation::Array => ArrayAggKind::Array {
-                distinct: false,
+                distinct: self.contract.distinct(),
                 ascending: &self.ascending,
                 nulls_first: &self.nulls_first,
             },

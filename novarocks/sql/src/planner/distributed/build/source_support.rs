@@ -103,9 +103,6 @@ pub(super) fn admit_original_binding_observed(
             control,
         )
     };
-    if let Some(facts) = original.group_concat_source() {
-        return admit(&facts.environment());
-    }
     let mut time = original
         .statement_time_parameters()
         .map(|(reference, _)| reference);

@@ -403,12 +403,12 @@ fn e08s1_table_fold_original_source_keeps_real_child_evaluation() {
 }
 
 #[test]
-fn e08s1_fold_environment_exact_original_concat_raw_limits_keep_child_fold() {
-    for raw in [-1, 4096] {
-        let semantics = SqlSemanticSettings::default().with_group_concat_max_len(raw);
+fn listagg_original_arguments_keep_child_fold() {
+    {
+        let semantics = SqlSemanticSettings::default();
         let probe = Arc::new(FoldProbe::default());
         crate::fixtures::optimize_table_free(
-            "SELECT GROUP_CONCAT(REVERSE('abc'))",
+            "SELECT LISTAGG(REVERSE('abc')) WITHIN GROUP (ORDER BY 1)",
             session(semantics, true),
             novarocks_sql::compiler::builtin_sql_function_catalog(),
             &probe.control(),

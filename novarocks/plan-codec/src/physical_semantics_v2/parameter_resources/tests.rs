@@ -89,8 +89,14 @@ fn source() -> wire::SemanticParameters {
             ),
             entry(0, TimeZone("Asia/Shanghai".into())),
             entry(2, AllowThrowException(true)),
-            entry(4, GroupConcatLegacy(true)),
-            entry(5, GroupConcatMaxLen(i64::MIN)),
+            entry(4, AllowThrowException(true)),
+            entry(
+                5,
+                wire::semantic_parameter::Value::StatementStartUtc(wire::StatementStartUtc {
+                    seconds: Some(i64::MIN),
+                    nanos: Some(0),
+                }),
+            ),
             entry(6, AllowThrowException(false)),
         ],
     }
@@ -119,11 +125,13 @@ fn bounded_parameters_keep_all_raw_variants_scoped_keys_and_sparse_ids() {
     );
     assert_eq!(
         table.get(SemanticParameterId::new(4)),
-        Some(&SemanticParameterValue::GroupConcatLegacy(true))
+        Some(&SemanticParameterValue::AllowThrowException(true))
     );
     assert_eq!(
         table.get(SemanticParameterId::new(5)),
-        Some(&SemanticParameterValue::GroupConcatMaxLen(i64::MIN))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(i64::MIN, 0).unwrap()
+        ))
     );
     assert_eq!(
         table.get(SemanticParameterId::new(6)),

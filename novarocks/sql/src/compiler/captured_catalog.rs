@@ -151,9 +151,7 @@ impl SqlCapturedCatalogPreparation {
         let semantics = crate::sql_mode::SqlSemanticSettings::default();
         crate::sql_mode::validate_persisted_query_semantics_typed(self.catalog.query(), &semantics)
             .map_err(SqlCompileError::from)?;
-        let query =
-            crate::sql_mode::normalize_concat_query(self.catalog.query().clone(), &semantics)
-                .map_err(SqlCompileError::from)?;
+        let query = self.catalog.query().clone();
         let functions = functions.snapshot_for_scalar_presence();
         let table_sequence = super::table_sequence::TableSequencePass::SchemaOnly(sealed_functions);
         let (resolved, _, factory) =

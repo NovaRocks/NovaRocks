@@ -75,12 +75,6 @@ impl SqlLogicalExplainCatalog {
                 ));
             }
         };
-        let query = if root_session_admitted {
-            crate::sql_mode::normalize_concat_query_with_semantics(query, &session.sql_semantics)
-        } else {
-            crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
-                .map_err(SqlCompileError::from)?
-        };
         let catalog = CatalogCompletionState::try_new_with_qualifications(
             query,
             &[],

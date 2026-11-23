@@ -472,8 +472,6 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 "builtin.aggregate/sum/v1" | "builtin.aggregate/avg/v1" => Some(DataType::Float64),
                 "builtin.aggregate/bool_or/v1"
                 | "builtin.aggregate/bool_and/v1"
-                | "builtin.aggregate/boolor_agg/v1"
-                | "builtin.aggregate/booland_agg/v1"
                 | "builtin.aggregate/every/v1"
                 | "builtin.aggregate/count_if/v1" => Some(DataType::Boolean),
                 _ => None,
@@ -645,7 +643,6 @@ fn public_aggregate_target(name: &str, distinct: bool) -> PublicAggregateTarget<
         (true, "count") => PublicAggregateTarget::Distinct(DistinctAggregate::Count),
         (true, "sum") => PublicAggregateTarget::Distinct(DistinctAggregate::Sum),
         (true, "avg") => PublicAggregateTarget::Distinct(DistinctAggregate::Avg),
-        (true, "array_agg") => PublicAggregateTarget::Named("array_agg_distinct"),
         _ => PublicAggregateTarget::Named(name),
     }
 }

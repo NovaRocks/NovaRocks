@@ -2249,13 +2249,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
             });
         }
-        if matches!(name.as_str(), "group_concat" | "string_agg") && arg_exprs.is_empty() {
-            return Err(AnalyzeError::invalid_argument(
-                "group_concat should have at least one input.",
-                func.span,
-            ));
-        }
-        if matches!(name.as_str(), "array_agg" | "array_agg_distinct") {
+        if name == "array_agg" {
             if arg_exprs.is_empty() {
                 return Err(AnalyzeError::invalid_argument(
                     "array_agg should have at least one input.",
@@ -2424,10 +2418,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
 
-        let needs_boolean_args = matches!(
-            name.as_str(),
-            "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" | "count_if"
-        );
+        let needs_boolean_args = matches!(name.as_str(), "bool_or" | "bool_and" | "count_if");
         if needs_boolean_args {
             let boolean = novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true);
             args_typed = args_typed
@@ -2526,11 +2517,6 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
 
-        validate_group_concat_separator_argument(&name, &arg_exprs, &args_typed)
-            .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
-        validate_group_concat_value_arguments(&name, &args_typed)
-            .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
-
         // Extract ORDER BY within function args (for aggregates like array_agg)
         let func_order_by = match func.original {
             Some(original) => self.extract_function_order_by(original, scope, &args_typed)?,
@@ -2612,21 +2598,36 @@ impl<'a> super::AnalyzerContext<'a> {
                     func.span,
                 ));
             }
-            // StarRocks rejects LEAD/LAG when the third (default) argument
-            // doesn't match a per-shape type rule. The error message echoes
-            // the value column's type (INT/FLOAT/DECIMAL...) and is asserted
-            // by SQL regression tests.
-            if matches!(name.as_str(), "lead" | "lag") && args_typed.len() >= 3 {
-                let value_type = args_typed[0].value_type.data_type().clone();
-                let default_arg = &args_typed[2];
-                if !is_lead_lag_default_arg_acceptable(default_arg, &value_type) {
-                    return Err(AnalyzeError::type_mismatch(
-                        format!(
-                            "The type of the third parameter of LEAD/LAG not match the type {}.",
-                            lead_lag_type_display(&value_type)
-                        ),
+            if matches!(name.as_str(), "lead" | "lag") {
+                if let ast::Window::Specification(specification) = window_type {
+                    if specification.order_by.is_none() {
+                        return Err(AnalyzeError::missing_order_by(
+                            format!("{name} requires an ORDER BY window clause"),
+                            specification.span,
+                        ));
+                    }
+                    if let Some(frame) = &specification.window_frame {
+                        return Err(AnalyzeError::invalid_window_frame(
+                            format!("Cannot specify a window frame for {name}"),
+                            frame.span,
+                        ));
+                    }
+                }
+                if let [value, _, default] = args_typed.as_mut_slice() {
+                    let common = self.require_common_trino_type(
+                        &value.value_type,
+                        &default.value_type,
                         func.span,
-                    ));
+                    )?;
+                    *value = self.coerce_common_value(value.clone(), &common, func.span)?;
+                    *default = self.coerce_common_value(default.clone(), &common, func.span)?;
+                }
+                if let Some(offset) = args_typed.get_mut(1) {
+                    let bigint = novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        offset.value_type.nullable(),
+                    );
+                    *offset = self.coerce_common_value(offset.clone(), &bigint, func.span)?;
                 }
             }
             let (partition_by, order_by, window_frame) =
@@ -2682,35 +2683,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 },
                 value_type: result,
             });
-        }
-
-        if matches!(name.as_str(), "group_concat" | "string_agg") {
-            args_typed = args_typed
-                .into_iter()
-                .map(|arg| {
-                    if matches!(
-                        arg.value_type.data_type(),
-                        DataType::Utf8 | DataType::LargeUtf8
-                    ) {
-                        Ok(arg)
-                    } else {
-                        let result = novarocks_type_contract::FunctionValueType::new(
-                            DataType::Utf8,
-                            arg.value_type.nullable(),
-                        );
-                        self.cast_with_trino_mode(
-                            arg,
-                            result,
-                            novarocks_type_contract::TrinoCastMode::Explicit,
-                            func.span,
-                        )
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            arg_types = args_typed
-                .iter()
-                .map(|arg| arg.value_type.data_type().clone())
-                .collect();
         }
 
         if name == "if" && !args_typed.is_empty() {
@@ -2885,14 +2857,6 @@ impl<'a> super::AnalyzerContext<'a> {
                         keys.into_boxed_slice(),
                     ),
                 });
-                if matches!(name.as_str(), "group_concat" | "string_agg") {
-                    signature = signature.with_group_concat_source(
-                        crate::binding::GroupConcatSourceFacts {
-                            legacy: self.sql_semantics.sql_mode().group_concat_legacy(),
-                            max_len: self.sql_semantics.group_concat_max_len(),
-                        },
-                    );
-                }
                 work.finish().map_err(AnalyzeError::control)?;
             }
             let value_type = crate::functions::aggregate_result_type(&signature).clone();
@@ -3138,10 +3102,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             && (1..=visible_args.len()).contains(&pos_index)
                         {
                             visible_args[pos_index - 1].clone()
-                        } else if matches!(
-                            func_name.as_str(),
-                            "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
-                        ) {
+                        } else if matches!(func_name.as_str(), "array_agg" | "array_agg_distinct") {
                             let display_name = if func_name == "string_agg" {
                                 "group_concat"
                             } else {
@@ -4506,201 +4467,6 @@ fn is_analyzer_aggregate_syntax(name: &str) -> bool {
     name == "every"
 }
 
-fn validate_group_concat_separator_argument(
-    name: &str,
-    arg_exprs: &[&ast::Expr],
-    args: &[TypedExpr],
-) -> Result<(), String> {
-    if !matches!(name, "group_concat" | "string_agg") {
-        return Ok(());
-    }
-    let Some(separator) = args.last() else {
-        return Ok(());
-    };
-    if matches!(
-        separator.value_type.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
-    ) {
-        return Ok(());
-    }
-    Err(format!(
-        "group_concat requires separator to be of getType() STRING: {}.",
-        group_concat_separator_signature(arg_exprs)
-    ))
-}
-
-fn group_concat_separator_signature(arg_exprs: &[&ast::Expr]) -> String {
-    let args = arg_exprs
-        .iter()
-        .map(|arg| expr_display_name(arg))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("group_concat({args})")
-}
-
-fn validate_group_concat_value_arguments(name: &str, args: &[TypedExpr]) -> Result<(), String> {
-    if !matches!(name, "group_concat" | "string_agg") || args.is_empty() {
-        return Ok(());
-    }
-    let value_args = &args[..args.len().saturating_sub(1)];
-    if value_args.iter().all(is_supported_group_concat_value_type) {
-        return Ok(());
-    }
-    Err(format!(
-        "No matching function with signature: group_concat({}).",
-        args.iter()
-            .enumerate()
-            .map(|(idx, arg)| group_concat_signature_type(arg, idx == args.len() - 1))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
-}
-
-fn is_supported_group_concat_value_type(expr: &TypedExpr) -> bool {
-    !matches!(
-        expr.value_type.data_type(),
-        DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Map(_, _)
-            | DataType::Struct(_)
-            | DataType::Union(_, _)
-    )
-}
-
-fn group_concat_signature_type(expr: &TypedExpr, separator: bool) -> String {
-    if separator
-        && matches!(
-            expr.value_type.data_type(),
-            DataType::Utf8 | DataType::LargeUtf8
-        )
-    {
-        return "varchar".to_string();
-    }
-    match &expr.kind {
-        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => {
-            let item = infer_literal_signature_type(args).unwrap_or_else(|| {
-                match &expr.value_type.data_type() {
-                    DataType::List(item) => {
-                        group_concat_data_type_signature(item.data_type(), false)
-                    }
-                    _ => group_concat_data_type_signature(expr.value_type.data_type(), false),
-                }
-            });
-            format!("array<{item}>")
-        }
-        ExprKind::FunctionCall { name, args, .. } if name == "map" => {
-            let (keys, values): (Vec<_>, Vec<_>) = args
-                .chunks(2)
-                .filter_map(|chunk| match chunk {
-                    [key, value] => Some((key.clone(), value.clone())),
-                    _ => None,
-                })
-                .unzip();
-            let key_type = infer_literal_signature_type(&keys).unwrap_or_else(|| {
-                map_entry_data_type(expr.value_type.data_type(), 0)
-                    .map(|data_type| group_concat_data_type_signature(data_type, false))
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
-            let value_type = infer_literal_signature_type(&values).unwrap_or_else(|| {
-                map_entry_data_type(expr.value_type.data_type(), 1)
-                    .map(|data_type| group_concat_data_type_signature(data_type, true))
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
-            format!("map<{key_type},{value_type}>")
-        }
-        _ => group_concat_data_type_signature(expr.value_type.data_type(), false),
-    }
-}
-
-fn infer_literal_signature_type(args: &[TypedExpr]) -> Option<String> {
-    let mut rank = None;
-    for arg in args {
-        let ExprKind::Literal(LiteralValue::Int(value)) = arg.kind else {
-            return None;
-        };
-        let current = integer_literal_signature_rank(value);
-        rank = Some(rank.map_or(current, |existing: usize| existing.max(current)));
-    }
-    rank.map(integer_literal_signature_type)
-}
-
-fn integer_literal_signature_rank(value: i64) -> usize {
-    if i32::try_from(value).is_ok() { 2 } else { 3 }
-}
-
-fn integer_literal_signature_type(rank: usize) -> String {
-    match rank {
-        0 => "tinyint(4)",
-        1 => "smallint(6)",
-        2 => "int(11)",
-        _ => "bigint(20)",
-    }
-    .to_string()
-}
-
-fn map_entry_data_type(data_type: &DataType, index: usize) -> Option<&DataType> {
-    let DataType::Map(entries, _) = data_type else {
-        return None;
-    };
-    let DataType::Struct(fields) = entries.data_type() else {
-        return None;
-    };
-    fields.get(index).map(|field| field.data_type())
-}
-
-fn group_concat_data_type_signature(data_type: &DataType, map_value_context: bool) -> String {
-    match data_type {
-        DataType::Null => "null_type".to_string(),
-        DataType::Boolean => "boolean".to_string(),
-        DataType::Int8 => "tinyint(4)".to_string(),
-        DataType::Int16 => "smallint(6)".to_string(),
-        DataType::Int32 => "int(11)".to_string(),
-        DataType::Int64 => "bigint(20)".to_string(),
-        DataType::Float32 => "float".to_string(),
-        DataType::Float64 => "double".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => {
-            if map_value_context {
-                "varchar(20)".to_string()
-            } else {
-                "varchar".to_string()
-            }
-        }
-        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
-        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-            format!("decimal({precision},{scale})")
-        }
-        DataType::List(item) => {
-            format!(
-                "array<{}>",
-                group_concat_data_type_signature(item.data_type(), false)
-            )
-        }
-        DataType::Map(entries, _) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return "map<unknown,unknown>".to_string();
-            };
-            if fields.len() != 2 {
-                return "map<unknown,unknown>".to_string();
-            }
-            format!(
-                "map<{},{}>",
-                group_concat_data_type_signature(fields[0].data_type(), false),
-                group_concat_data_type_signature(fields[1].data_type(), true)
-            )
-        }
-        DataType::Struct(fields) => format!(
-            "struct<{}>",
-            fields
-                .iter()
-                .map(|field| group_concat_data_type_signature(field.data_type(), false))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        other => format!("{other:?}").to_lowercase(),
-    }
-}
-
 fn ordinal_name(index: usize) -> &'static str {
     match index {
         0 => "first",
@@ -4756,136 +4522,6 @@ fn strip_casts(expr: &TypedExpr) -> &TypedExpr {
         ExprKind::Cast { expr, .. } => strip_casts(expr),
         ExprKind::Nested(inner) => strip_casts(inner),
         _ => expr,
-    }
-}
-
-/// StarRocks's LEAD/LAG default-argument check uses different rules per
-/// expression shape:
-///   - Plain literal (or NULL): always accepted; runtime coerces to the value
-///     type.
-///   - Bare column reference: type must be in the same broad family as the
-///     value column (numeric/string/temporal).
-///   - Constant expression (literals + arithmetic on literals): type must be
-///     in the same *narrow* numeric family as the value column (INT-INT,
-///     FLOAT-FLOAT, DECIMAL-DECIMAL...). This is stricter than the bare
-///     ColumnRef rule because StarRocks doesn't constant-fold the expression
-///     for type purposes.
-///   - Anything else (function calls, column-bearing arithmetic): rejected
-///     for INT/FLOAT/DECIMAL value columns; VARCHAR allows them through
-///     because StarRocks stringifies arbitrary scalars.
-fn is_lead_lag_default_arg_acceptable(default_arg: &TypedExpr, value_type: &DataType) -> bool {
-    // VARCHAR is the lenient case: StarRocks stringifies arbitrary scalars,
-    // so any expression is accepted as the default.
-    if matches!(value_type, DataType::Utf8 | DataType::LargeUtf8) {
-        return true;
-    }
-    let stripped = strip_casts(default_arg);
-    // Plain (signed) literal — `1`, `-1`, `(1)`, etc. — is always accepted.
-    // The native parser represents `-1` as a unary minus around `Literal(1)`,
-    // so peel the unary minus before deciding.
-    if is_signed_literal(stripped) {
-        return true;
-    }
-    if matches!(stripped.kind, ExprKind::ColumnRef { .. }) {
-        return lead_lag_family_compatible(value_type, default_arg.value_type.data_type());
-    }
-    if is_constant_default_expression(stripped) {
-        return lead_lag_narrow_numeric_compatible(value_type, stripped.value_type.data_type());
-    }
-    false
-}
-
-fn is_signed_literal(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::Literal(_) | ExprKind::Constant(_) => true,
-        ExprKind::Nested(inner) => is_signed_literal(inner),
-        ExprKind::UnaryOp { expr: inner, .. } => is_signed_literal(inner),
-        ExprKind::Cast { expr: inner, .. } => is_signed_literal(inner),
-        _ => false,
-    }
-}
-
-fn is_constant_default_expression(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::Literal(_) | ExprKind::Constant(_) => true,
-        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
-            is_constant_default_expression(expr)
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            is_constant_default_expression(left) && is_constant_default_expression(right)
-        }
-        ExprKind::FunctionCall { .. } => crate::common::binary_operator::typed_operands(expr)
-            .is_some_and(|(_, [left, right])| {
-                is_constant_default_expression(left) && is_constant_default_expression(right)
-            }),
-        ExprKind::UnaryOp { expr, .. } => is_constant_default_expression(expr),
-        _ => false,
-    }
-}
-
-fn lead_lag_family_compatible(value: &DataType, default: &DataType) -> bool {
-    if value == default || matches!(default, DataType::Null) {
-        return true;
-    }
-    if value.is_numeric() && default.is_numeric() {
-        return true;
-    }
-    let is_str = |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8);
-    if is_str(value) && is_str(default) {
-        return true;
-    }
-    let is_temporal = |t: &DataType| {
-        matches!(
-            t,
-            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
-        )
-    };
-    if is_temporal(value) && is_temporal(default) {
-        return true;
-    }
-    false
-}
-
-fn lead_lag_narrow_numeric_compatible(value: &DataType, default: &DataType) -> bool {
-    use DataType::*;
-    if matches!(default, Null) {
-        return true;
-    }
-    let is_int = |t: &DataType| matches!(t, Int8 | Int16 | Int32 | Int64);
-    let is_float = |t: &DataType| matches!(t, Float32 | Float64);
-    let is_decimal = |t: &DataType| matches!(t, Decimal128(_, _) | Decimal256(_, _));
-    let is_str = |t: &DataType| matches!(t, Utf8 | LargeUtf8);
-    if is_int(value) && is_int(default) {
-        return true;
-    }
-    if is_float(value) && is_float(default) {
-        return true;
-    }
-    if is_decimal(value) && is_decimal(default) {
-        return true;
-    }
-    if is_str(value) && is_str(default) {
-        return true;
-    }
-    value == default
-}
-
-fn lead_lag_type_display(t: &DataType) -> &'static str {
-    use DataType::*;
-    match t {
-        Int8 => "TINYINT",
-        Int16 => "SMALLINT",
-        Int32 => "INT",
-        Int64 => "BIGINT",
-        Float32 => "FLOAT",
-        Float64 => "DOUBLE",
-        Decimal128(_, _) | Decimal256(_, _) => "DECIMAL",
-        Utf8 | LargeUtf8 => "VARCHAR",
-        Date32 | Date64 => "DATE",
-        Timestamp(_, _) => "DATETIME",
-        Boolean => "BOOLEAN",
-        Binary | LargeBinary => "VARBINARY",
-        _ => "UNKNOWN",
     }
 }
 
@@ -6937,6 +6573,34 @@ mod tests {
     }
 
     #[test]
+    fn lag_and_lead_bind_common_value_and_validate_original_window_shape() {
+        for name in ["lag", "lead"] {
+            let statement =
+                format!("SELECT {name}(CAST(1 AS INTEGER), 0, BIGINT '2') OVER (ORDER BY 1)");
+            let expression = analyze_projection_expr(&statement).unwrap();
+            assert_eq!(expression.value_type.data_type(), &DataType::Int64);
+            let ExprKind::WindowCall { args, .. } = expression.kind else {
+                panic!("window selection");
+            };
+            assert!(
+                args.iter()
+                    .all(|argument| argument.value_type.data_type() == &DataType::Int64)
+            );
+            let missing_order =
+                analyze_projection_expr(&format!("SELECT {name}(1) OVER ()")).unwrap_err();
+            assert!(missing_order.contains("requires an ORDER BY window clause"));
+            let explicit_frame = analyze_projection_expr(&format!(
+                "SELECT {name}(1) OVER (ORDER BY 1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+            )).unwrap_err();
+            assert!(explicit_frame.contains("Cannot specify a window frame"));
+            assert!(
+                analyze_projection_expr(&format!("SELECT {name}('a', 1, 2) OVER (ORDER BY 1)"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn approximate_aggregate_sql_selects_exact_supported_and_declared_overloads() {
         for (sql, expected) in [
             ("SELECT approx_distinct(TRUE)", DataType::Int64),
@@ -8641,41 +8305,6 @@ mod tests {
     }
 
     #[test]
-    fn group_concat_and_string_agg_keep_implicit_utf8_coercion() {
-        for name in ["group_concat", "string_agg"] {
-            let expr = analyze_projection_expr(&format!("select {name}(1, ',')"))
-                .expect("aggregate should preserve implicit string coercion");
-            let crate::analysis::ExprKind::AggregateCall { args, .. } = expr.kind else {
-                panic!("expected AggregateCall, got {:?}", expr.kind);
-            };
-            assert!(!args.is_empty());
-            assert!(
-                args.iter()
-                    .all(|arg| *arg.value_type.data_type() == DataType::Utf8)
-            );
-            assert!(args.iter().all(|arg| matches!(
-                arg.kind,
-                crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::String(_))
-                    | crate::analysis::ExprKind::Cast {
-                        target: DataType::Utf8,
-                        ..
-                    }
-            )));
-        }
-    }
-
-    #[test]
-    fn canonical_concat_zero_arguments_keep_the_original_analysis_refusal() {
-        for sql in ["SELECT group_concat()", "SELECT string_agg()"] {
-            let error = analyze_projection_expr(sql).expect_err("zero value arguments are invalid");
-            assert!(
-                error.contains("group_concat should have at least one input."),
-                "{sql}: {error}"
-            );
-        }
-    }
-
-    #[test]
     fn ordered_aggregate_binding_freezes_every_update_channel() {
         let expr = analyze_projection_expr(
             "select string_agg('v' \n,\n '|'\norder by 1, cast(7 as bigint) \n)",
@@ -9134,65 +8763,6 @@ mod tests {
     }
 
     #[test]
-    fn concat_modes_control_argument_channels_ordinals_and_output_names() {
-        fn resolved(
-            sql: &str,
-            mode: &str,
-        ) -> Result<crate::analysis::ResolvedQuery, crate::analyze_error::AnalyzeError> {
-            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
-            super::super::analyze_with_function_catalog_and_sql_semantics(
-                query,
-                &EmptyCatalog,
-                "default",
-                crate::functions::builtin_sql_function_catalog(),
-                &crate::sql_mode::SqlSemanticSettings::default()
-                    .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode)),
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .map(|(query, _, _)| query)
-        }
-        for (mode, args_len, heading) in [
-            ("32", 3, "group_concat('a','-' SEPARATOR ',')"),
-            ("GROUP_CONCAT_LEGACY", 2, "group_concat('a' SEPARATOR '-')"),
-        ] {
-            let query = resolved("SELECT group_concat('a','-')", mode).unwrap();
-            let QueryBody::Select(select) = query.body else {
-                panic!("select");
-            };
-            assert_eq!(select.projection[0].output_name, heading);
-            let crate::analysis::ExprKind::AggregateCall { args, .. } =
-                &select.projection[0].expr.kind
-            else {
-                panic!("aggregate");
-            };
-            assert_eq!(args.len(), args_len);
-        }
-        resolved("SELECT group_concat('a','-' ORDER BY 2)", "32").unwrap();
-        let error = resolved(
-            "SELECT group_concat('a','-' ORDER BY 2)",
-            "GROUP_CONCAT_LEGACY",
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("ORDER BY position 2 is not in group_concat output list")
-        );
-        for mode in ["32", "GROUP_CONCAT_LEGACY"] {
-            let query = resolved("SELECT string_agg('a','-' \n,\n '|'\n\n)", mode).unwrap();
-            let QueryBody::Select(select) = query.body else {
-                panic!("select");
-            };
-            assert_eq!(
-                select.projection[0].output_name,
-                "group_concat('a','-' SEPARATOR '|')"
-            );
-            assert!(resolved("SELECT string_agg('a','-' ORDER BY 2)", mode).is_err());
-        }
-    }
-
-    #[test]
     fn concat_array_family_preserves_the_exact_argument_shapes() {
         for (sql, list_arguments) in [
             (
@@ -9450,12 +9020,12 @@ mod tests {
             &expected_type
         );
         let legacy = crate::sql_mode::SqlSemanticSettings::default().with_sql_mode(
-            crate::sql_mode::SqlMode::from_assignment("GROUP_CONCAT_LEGACY"),
+            crate::sql_mode::SqlMode::from_assignment("ERROR_IF_OVERFLOW"),
         );
         for sql in [
-            "WITH t AS (SELECT group_concat('a','-') x) SELECT x FROM t",
-            "SELECT x FROM (SELECT group_concat('a','-') x) t",
-            "SELECT group_concat('a','-') UNION ALL SELECT group_concat('b','-')",
+            "WITH t AS (SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1) x) SELECT x FROM t",
+            "SELECT x FROM (SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1) x) t",
+            "SELECT LISTAGG('a', '-') WITHIN GROUP (ORDER BY 1) UNION ALL SELECT LISTAGG('b', '-') WITHIN GROUP (ORDER BY 1)",
         ] {
             resolved(sql, &legacy);
         }
@@ -10070,8 +9640,8 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "group_concat_source_tests.rs"]
-mod group_concat_source_tests;
+#[path = "aggregate_state_source_tests.rs"]
+mod aggregate_state_source_tests;
 
 /// Project one complete child and its exact physical layout through the same
 /// pure SQL construction body and the original cancellation/deadline observer.
