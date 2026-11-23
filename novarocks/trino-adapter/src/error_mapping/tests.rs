@@ -905,6 +905,37 @@ fn invalid_function_argument_keeps_the_original_fact_at_both_client_exits() {
 }
 
 #[test]
+fn temporal_row_errors_keep_their_data_fact_at_both_client_exits() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+
+    for (code, expected) in [(53, "GENERIC_INTERNAL_ERROR"), (54, "NOT_SUPPORTED")] {
+        let reason = FailureReason::new(domain::KERNEL, NonZeroU16::new(code).unwrap());
+        let fact = FailureFact::new(FailureClass::Data, reason);
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("temporal value failure"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let original = error.execution_failure().unwrap();
+        assert_eq!(original.fact(), fact);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT 1",
+        });
+        assert_wire(&wire, expected);
+        let service = QueryServiceError::from_execution_failure(original.clone());
+        assert_eq!(
+            wire,
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "SELECT 1",
+            }),
+        );
+    }
+}
+
+#[test]
 fn invalid_function_words_do_not_reclassify_other_facts() {
     use novarocks_execution_contract::failure::{FailureReason, domain};
     use std::num::NonZeroU16;
