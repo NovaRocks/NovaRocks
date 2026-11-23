@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, Int32Array},
+    array::{Array, Int64Array},
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
@@ -471,7 +471,7 @@ fn extract_matches_the_unit_and_has_an_independent_result() {
     assert_eq!(result.shape.input_rows, 1);
     assert_eq!(
         result.values.to_data(),
-        Int32Array::from(vec![2025]).to_data()
+        Int64Array::from(vec![2025]).to_data()
     );
 }
 

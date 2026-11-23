@@ -49,7 +49,7 @@ fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values
             Arc::new(Int64Array::from(vec![0, 1, -1, 0])),
         ),
         (
-            "FLOAT",
+            "REAL",
             ["0e0", "1e0", "'NaN'", "'-0'"],
             Arc::new(arrow::array::Float32Array::from(vec![
                 0.0,
@@ -150,13 +150,10 @@ fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values
         );
         for (literal, expected) in literals.into_iter().zip([true, false, false, true]) {
             let expression = format!("NOT CAST({literal} AS {sql_type})");
-            // The text parser yields NULL for a NaN spelling in the frozen
-            // mode. The typed column above supplies IEEE NaN to numeric NOT.
-            let expected = (literal != "'NaN'").then_some(expected);
             Fixture::compile(&expression, Family::Not, "32", &functions).assert_both(
                 &functions,
                 FoldOutcome::Folded,
-                Expected::Value(boolean(expected)),
+                Expected::Value(boolean(Some(expected))),
             );
         }
     }
