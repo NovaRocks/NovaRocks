@@ -20,7 +20,7 @@ WITH t AS (SELECT 1 AS c) SELECT missing FROM t;
 SELECT sqlp7_not_a_function(1);
 
 -- query 4
--- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT substring('x', 1, 2, 3);
 
 -- query 5
