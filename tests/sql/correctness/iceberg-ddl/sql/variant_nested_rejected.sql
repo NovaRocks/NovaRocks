@@ -15,25 +15,28 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- @expect_error_tier=drift
 -- query 1
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_ddl_cat_${suite_uuid0}.${case_db}.variant_nested_struct, column s.v
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.admit.unsupported_statement] SQL type variant is not supported
 CREATE TABLE ${case_db}.variant_nested_struct (s ROW(v VARIANT)) WITH (format_version = 3);
 
 -- query 2
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_ddl_cat_${suite_uuid0}.${case_db}.variant_nested_list, column a.element
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.admit.unsupported_statement] SQL type variant is not supported
 CREATE TABLE ${case_db}.variant_nested_list (a ARRAY<VARIANT>) WITH (format_version = 3);
 
 -- query 3
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_ddl_cat_${suite_uuid0}.${case_db}.variant_nested_map, column m.value
-CREATE TABLE ${case_db}.variant_nested_map (m MAP<STRING,VARIANT>) WITH (format_version = 3);
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.admit.unsupported_statement] SQL type variant is not supported
+CREATE TABLE ${case_db}.variant_nested_map (m MAP<VARCHAR,VARIANT>) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.variant_nested_alter (id INT) WITH (format_version = 3);
 
 -- query 5
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_ddl_cat_${suite_uuid0}.${case_db}.variant_nested_alter, column s.v
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_error=[sql.admit.unsupported_statement] SQL type variant is not supported
 ALTER TABLE ${case_db}.variant_nested_alter ADD COLUMN s ROW(v VARIANT);
 
 -- query 6

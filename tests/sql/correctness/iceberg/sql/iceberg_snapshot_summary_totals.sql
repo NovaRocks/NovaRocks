@@ -47,10 +47,10 @@ SELECT total_data_files_is_2, total_records_is_3, has_total_files_size, has_engi
 FROM (
   SELECT
     committed_at,
-    summary['total-data-files'] = '2'        AS total_data_files_is_2,
-    summary['total-records'] = '3'           AS total_records_is_3,
-    summary['total-files-size'] IS NOT NULL  AS has_total_files_size,
-    summary['engine-name'] IS NOT NULL       AS has_engine_name
+    summary[CAST('total-data-files' AS VARCHAR)] = '2'        AS total_data_files_is_2,
+    summary[CAST('total-records' AS VARCHAR)] = '3'           AS total_records_is_3,
+    summary[CAST('total-files-size' AS VARCHAR)] IS NOT NULL  AS has_total_files_size,
+    summary[CAST('engine-name' AS VARCHAR)] IS NOT NULL       AS has_engine_name
   FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}."t_${uuid0}$snapshots"
   ORDER BY committed_at DESC
   LIMIT 1
@@ -67,8 +67,8 @@ SELECT total_records_is_3, has_engine_name
 FROM (
   SELECT
     committed_at,
-    summary['total-records'] = '3'          AS total_records_is_3,
-    summary['engine-name'] IS NOT NULL      AS has_engine_name
+    summary[CAST('total-records' AS VARCHAR)] = '3'          AS total_records_is_3,
+    summary[CAST('engine-name' AS VARCHAR)] IS NOT NULL      AS has_engine_name
   FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}."t_${uuid0}$snapshots"
   ORDER BY committed_at DESC
   LIMIT 1
