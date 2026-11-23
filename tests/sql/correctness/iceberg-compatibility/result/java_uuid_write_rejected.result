@@ -1,8 +1,8 @@
 -- query 2
--- types	integer	boolean
-id	key_is_null
-1	false
-2	true
+-- types	integer	boolean	uuid
+id	key_is_null	uuid_key
+1	false	f24f9b64-81fa-49d1-b74e-8c09a6e31c56
+2	true	NULL
 
 -- query 8
 -- types	bigint

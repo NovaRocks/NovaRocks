@@ -848,20 +848,38 @@ fn signature_arguments_keep_original_tags_order_and_refusals() {
             "{wire}"
         );
     }
-    let unsupported = sig(r#"{"rawType":"uuid"}"#);
+    let unsupported = sig(r#"{"rawType":"uuid","arguments":[{"kind":"LONG","value":16}]}"#);
     assert!(unsupported.validate().is_err());
 }
 
 #[test]
 fn unsupported_signatures_are_rejected_even_for_null_cells() {
     for ty in [
-        TypeSignature::simple("uuid"),
+        TypeSignature::simple("geometry"),
         TypeSignature::simple("decimal"),
         TypeSignature::simple("array"),
     ] {
         assert!(decode_value(&ty, RawValue::from_string("null".into()).unwrap().as_ref()).is_err());
     }
 }
+#[test]
+fn uuid_wire_values_require_the_exact_signature_and_canonical_text() {
+    let uuid = sig(r#"{"rawType":"uuid"}"#);
+    let canonical = "f24f9b64-81fa-49d1-b74e-8c09a6e31c56";
+    let decode = |value: &str| {
+        let raw = RawValue::from_string(value.into()).unwrap();
+        decode_value(&uuid, &raw)
+    };
+    assert_eq!(
+        decode(&format!("\"{canonical}\"")).unwrap(),
+        TrinoValue::Text(canonical.into())
+    );
+    assert_eq!(decode("null").unwrap(), TrinoValue::Null);
+    assert!(decode(&format!("\"{}\"", canonical.to_uppercase())).is_err());
+    assert!(decode("\"f24f9b6481fa49d1b74e8c09a6e31c56\"").is_err());
+    assert!(decode("16").is_err());
+}
+
 #[test]
 fn http_error_preview_truncates_at_a_character_boundary() {
     let error = StatementFailure::Http {

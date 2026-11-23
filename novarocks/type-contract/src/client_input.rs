@@ -141,6 +141,7 @@ fn matches_field(
         (N::Json, ValueKind::Nominal(V::Json))
         | (N::Variant, ValueKind::Nominal(V::Variant))
         | (N::LargeInt, ValueKind::Nominal(V::LargeInt))
+        | (N::Uuid, ValueKind::Nominal(V::Uuid))
         | (N::Opaque(O::Hll), ValueKind::Nominal(V::Hll))
         | (N::Opaque(O::Bitmap), ValueKind::Nominal(V::Bitmap))
         | (N::Opaque(O::Object), ValueKind::Nominal(V::Object))

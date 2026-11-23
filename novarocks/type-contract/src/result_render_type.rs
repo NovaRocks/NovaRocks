@@ -21,7 +21,7 @@
 
 use crate::{
     FunctionValueType, IntervalField, IntervalQualifier, TemporalPrecision, TemporalType,
-    TemporalTypeError, ValueKind, ValueTypeRef,
+    TemporalTypeError, ValueKind, ValueLogicalType, ValueTypeRef,
 };
 use novarocks_result_contract::{
     NativeRenderType, RenderField, RenderIntervalField, RenderTemporalType,
@@ -106,6 +106,8 @@ pub fn render_field_matches_declaration(
 fn render_exact_declarations_match(render: &RenderField, value: &ValueTypeRef) -> bool {
     use NativeRenderType as R;
     match (&render.native_type, value.kind()) {
+        (R::Uuid, ValueKind::Nominal(ValueLogicalType::Uuid)) => true,
+        (R::Uuid, _) | (_, ValueKind::Nominal(ValueLogicalType::Uuid)) => false,
         (R::BoundedCharacter(render), ValueKind::BoundedCharacter(declared)) => render == declared,
         (R::BoundedCharacter(_), _) | (_, ValueKind::BoundedCharacter(_)) => false,
         (R::Temporal(render), ValueKind::Temporal(declared)) => *render == (*declared).into(),
@@ -162,7 +164,7 @@ fn render_carrier_matches(
         | (R::UnsignedInteger(16), D::UInt16)
         | (R::UnsignedInteger(32), D::UInt32)
         | (R::UnsignedInteger(64), D::UInt64)
-        | (R::LargeInt, D::FixedSizeBinary(16))
+        | (R::LargeInt | R::Uuid, D::FixedSizeBinary(16))
         | (R::Float32, D::Float32)
         | (R::Float64, D::Float64)
         | (R::String | R::BoundedCharacter(_), D::Utf8 | D::LargeUtf8)

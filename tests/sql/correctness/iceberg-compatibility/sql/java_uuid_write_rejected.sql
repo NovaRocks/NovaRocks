@@ -28,7 +28,7 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode uuid --namespace ${case_db} --table java_uuid_rejected_${uuid0} --output "$receipt_dir"
 
 -- query 2
-SELECT id,k IS NULL AS key_is_null FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ORDER BY id;
+SELECT id,k IS NULL AS key_is_null,k AS uuid_key FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ORDER BY id;
 
 -- query 3
 -- @expect_error=Iceberg uuid writes are not supported

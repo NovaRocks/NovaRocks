@@ -317,6 +317,7 @@ fn type_info(ty: &NativeRenderType, facts: TrinoJsonFacts) -> Result<TypeInfo<'_
             })
         }
         N::Binary => plain("varbinary"),
+        N::Uuid => plain("uuid"),
         N::Date => plain("date"),
         N::Time { unit } | N::Timestamp { unit, .. } => {
             let (raw_type, keyword, suffix) = match ty {

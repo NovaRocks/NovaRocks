@@ -62,6 +62,7 @@ fn decode(signature: &TypeSignature, raw: &RawValue) -> Result<TrinoValue, State
         | "interval year to month"
         | "interval day to second"
         | "json" => TrinoValue::Text(serde_json::from_str(raw.get())?),
+        "uuid" => decode_uuid(serde_json::from_str(raw.get())?)?,
         "varbinary" => {
             let text: String = serde_json::from_str(raw.get())?;
             TrinoValue::Binary(
@@ -118,6 +119,23 @@ fn decode(signature: &TypeSignature, raw: &RawValue) -> Result<TrinoValue, State
         _ => return Err(StatementFailure::protocol("unsupported Trino type")),
     })
 }
+fn decode_uuid(text: String) -> Result<TrinoValue, StatementFailure> {
+    let canonical = text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        });
+    if !canonical {
+        return Err(StatementFailure::protocol(
+            "UUID value is not canonical lowercase text",
+        ));
+    }
+    Ok(TrinoValue::Text(text))
+}
+
 fn integer(signature: &TypeSignature, text: &str) -> Result<i64, StatementFailure> {
     let value: i64 = text
         .parse()
@@ -167,6 +185,7 @@ pub fn decode_map_key(
         | "interval year to month"
         | "interval day to second"
         | "json" => Ok(TrinoValue::Text(text.to_owned())),
+        "uuid" => decode_uuid(text.to_owned()),
         "varbinary" => Ok(TrinoValue::Binary(STANDARD.decode(text).map_err(|e| {
             StatementFailure::protocol(format!("invalid base64 map key: {e}"))
         })?)),

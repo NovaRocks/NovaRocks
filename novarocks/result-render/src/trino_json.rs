@@ -326,6 +326,7 @@ impl CellCursor {
             | N::Decimal {
                 bits: 128 | 256, ..
             }
+            | N::Uuid
             | N::Date
             | N::Time { .. }
             | N::Timestamp { .. } => {
@@ -345,6 +346,12 @@ impl CellCursor {
 
 fn quoted(atom: Atom) -> Result<Atom, RenderError> {
     Ok(atom!("\"{}\"", atom))
+}
+
+pub(super) fn uuid(bytes: [u8; 16]) -> Result<Atom, RenderError> {
+    quoted(Atom::literal(&novarocks_value_arrays::uuid::format_uuid(
+        bytes,
+    )))
 }
 
 pub(super) fn scalar(
@@ -397,6 +404,10 @@ pub(super) fn scalar(
             )?);
         }
         N::SignedInteger(_) => scalar_atom(array, row, field)?,
+        N::Uuid => {
+            let bytes = down::<FixedSizeBinaryArray>(array)?.value(row);
+            return uuid(bytes.try_into().map_err(|_| error(E::UnsupportedCarrier))?);
+        }
         _ => return Err(error(E::UnsupportedPresentation)),
     };
     if key {

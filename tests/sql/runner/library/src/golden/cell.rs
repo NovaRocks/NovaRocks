@@ -87,6 +87,7 @@ fn string_type(raw: &str) -> bool {
             | "interval year to month"
             | "interval day to second"
             | "json"
+            | "uuid"
     )
 }
 
@@ -102,6 +103,10 @@ fn render(signature: &TypeSignature, value: &TrinoValue, nested: bool) -> Result
     }
     let out = match (signature.raw_type.as_str(), value) {
         (raw, V::Text(text)) if string_type(raw) => {
+            if raw == "uuid" {
+                let value = RawValue::from_string(quote(text))?;
+                decode_value(signature, &value)?;
+            }
             if nested {
                 quote(text)
             } else {
@@ -201,6 +206,7 @@ fn render(signature: &TypeSignature, value: &TrinoValue, nested: bool) -> Result
 fn map_key(signature: &TypeSignature, value: &TrinoValue) -> Result<String> {
     match value {
         TrinoValue::Null => bail!("golden map key cannot be null"),
+        TrinoValue::Text(_) if signature.raw_type == "uuid" => render(signature, value, false),
         TrinoValue::Text(text)
             if string_type(&signature.raw_type)
                 || matches!(signature.raw_type.as_str(), "array" | "row" | "map") =>

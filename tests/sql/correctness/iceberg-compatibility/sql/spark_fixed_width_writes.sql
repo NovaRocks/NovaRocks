@@ -164,7 +164,7 @@ fi
 printf 'Spark created evidence retained at %s\n' "$spark_diag_dir"
 
 -- query 2
-SELECT id,to_hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n+1 AS next_n,n
+SELECT id,to_hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n+1 AS next_n,n,raw
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ORDER BY id;
 
 -- query 3

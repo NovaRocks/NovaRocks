@@ -47,6 +47,7 @@ pub mod carrier;
 pub mod control;
 pub mod error;
 pub mod reachability;
+pub mod uuid;
 
 pub use carrier::ByteLayout;
 pub use error::{ValueError, ValueFailure, ValueViolation};
